@@ -2,7 +2,7 @@
 
 `debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It will own repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, and diagnostics while using `dpkg` as the transaction backend.
 
-The project currently exposes typed configuration and request APIs, a CLI command vocabulary, a bounded parser/AST for Debian binary package relations, and a bounded validator for Debian binary package outer archives.
+The project currently exposes typed configuration and request APIs, a CLI command vocabulary, bounded parsers for DEB822, Debian versions, binary package relations and control records, and a bounded validator for Debian binary package outer archives. The control-record model validates required identity fields and typed scalar values, preserves unknown fields and source spans, and keeps relation policy decisions separate from syntax parsing.
 
 `debz.deb_archive.parse` validates the outer `ar` structure, required members, `debian-binary` version marker, supported compression suffixes, and configured archive/member/count limits. It returns borrowed member byte ranges and metadata without copying, decompressing, or unpacking files. Validation of the compressed streams and inner tar archives is separate follow-up work; callers must not treat outer-archive validation alone as package-content validation.
 
