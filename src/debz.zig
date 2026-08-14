@@ -14,6 +14,7 @@ pub const source = @import("source.zig");
 pub const release_metadata = @import("release_metadata.zig");
 pub const metadata_cache = @import("metadata_cache.zig");
 pub const repository_acquisition = @import("repository_acquisition.zig");
+pub const packages_index = @import("packages_index.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -103,4 +104,5 @@ test {
     _ = release_metadata;
     _ = metadata_cache;
     _ = repository_acquisition;
+    _ = packages_index;
 }

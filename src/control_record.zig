@@ -266,7 +266,19 @@ const Parser = struct {
             } else if (std.ascii.eqlIgnoreCase(field.name, "Installed-Size")) {
                 record.installed_size = try self.parseInstalledSize(field);
             } else if (relationFieldMember(field.name)) |member| {
-                @field(record, member) = try self.parseRelation(field);
+                const value = try self.parseRelation(field);
+                switch (member) {
+                    .built_using => record.built_using = value,
+                    .depends => record.depends = value,
+                    .pre_depends => record.pre_depends = value,
+                    .recommends => record.recommends = value,
+                    .suggests => record.suggests = value,
+                    .enhances => record.enhances = value,
+                    .provides => record.provides = value,
+                    .conflicts => record.conflicts = value,
+                    .breaks => record.breaks = value,
+                    .replaces => record.replaces = value,
+                }
             } else {
                 if (unknown.items.len >= self.limits.max_unknown_fields_per_record) {
                     return self.fail(.too_many_unknown_fields, field.span, field.name);
@@ -458,18 +470,31 @@ fn isIdentityField(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Architecture");
 }
 
-fn relationFieldMember(name: []const u8) ?[]const u8 {
+const RelationMember = enum {
+    built_using,
+    depends,
+    pre_depends,
+    recommends,
+    suggests,
+    enhances,
+    provides,
+    conflicts,
+    breaks,
+    replaces,
+};
+
+fn relationFieldMember(name: []const u8) ?RelationMember {
     const fields = .{
-        .{ "Built-Using", "built_using" },
-        .{ "Depends", "depends" },
-        .{ "Pre-Depends", "pre_depends" },
-        .{ "Recommends", "recommends" },
-        .{ "Suggests", "suggests" },
-        .{ "Enhances", "enhances" },
-        .{ "Provides", "provides" },
-        .{ "Conflicts", "conflicts" },
-        .{ "Breaks", "breaks" },
-        .{ "Replaces", "replaces" },
+        .{ "Built-Using", RelationMember.built_using },
+        .{ "Depends", RelationMember.depends },
+        .{ "Pre-Depends", RelationMember.pre_depends },
+        .{ "Recommends", RelationMember.recommends },
+        .{ "Suggests", RelationMember.suggests },
+        .{ "Enhances", RelationMember.enhances },
+        .{ "Provides", RelationMember.provides },
+        .{ "Conflicts", RelationMember.conflicts },
+        .{ "Breaks", RelationMember.breaks },
+        .{ "Replaces", RelationMember.replaces },
     };
     inline for (fields) |entry| {
         if (std.ascii.eqlIgnoreCase(name, entry[0])) return entry[1];
