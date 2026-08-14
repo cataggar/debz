@@ -37,3 +37,15 @@ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
 STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
 IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+
+XZ Utils liblzma
+================
+
+Source: https://tukaani.org/xz/
+Runtime/build dependency: system liblzma
+License: 0BSD for liblzma (XZ Utils 5.2.6 and later)
+
+debz uses only liblzma's in-process streaming decoder for xz metadata. The
+dependency is selected by the build system and no xz command-line tool is
+invoked in production. See the installed XZ Utils documentation for its full
+copyright and license notices.

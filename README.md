@@ -16,6 +16,14 @@ Repository sources can be supplied explicitly as canonical `.sources` stanzas or
 
 `debz.repository_acquisition` fetches bounded bytes from explicit `file:`, HTTP, or HTTPS URIs. Callers provide proxy, credential, redirect, retry, deadline, clock, and size policies; production HTTPS verifies certificates and hostnames, while injectable transport and file seams support hermetic tests. Provenance contains only redacted effective URIs.
 
+`debz.metadata_decompression` provides allocator-owned, bounded decompression
+for gzip, xz, and zstd repository metadata. Callers must explicitly select the
+format or derive it from a trusted selected filename; content magic is never
+used as a fallback. Compressed size, decompressed size, decoder memory, and an
+optional expected decompressed size are checked before a result is returned.
+gzip and zstd use Zig's standard library. xz uses the system liblzma streaming
+API with a caller-bounded memory limit and full integrity checking.
+
 ## Dependency solver
 
 The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. The pinned libsolv core is built with Debian EVR and dependency semantics. The current adapter does not load repositories, so libsolvext, repository loaders, compression backends, tools, conda, and multi-distribution semantics are explicitly disabled.
@@ -23,6 +31,7 @@ The public `SolverContext` adapter owns an empty libsolv pool and solver while k
 ## Requirements
 
 - Zig 0.16.0 or newer
+- liblzma development headers and library
 
 ## Build and test
 

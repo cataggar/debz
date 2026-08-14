@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     debz.linkLibrary(libsolv);
+    debz.link_libc = true;
+    debz.linkSystemLibrary("lzma", .{});
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
