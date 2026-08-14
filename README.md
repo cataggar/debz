@@ -10,9 +10,7 @@ The project currently exposes typed configuration and request APIs, a CLI comman
 
 ## Dependency solver
 
-The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. Debian repository parsing and dependency semantics are not implemented yet.
-
-The pinned libsolv Zig build currently leaves `LIBSOLVEXT_FEATURE_DEBIAN` disabled and does not compile `ext/repo_deb.c`. Enabling and validating Debian semantics is follow-up work; this initial integration intentionally does not carry a broad libsolv fork.
+The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. The pinned libsolv core is built with Debian EVR and dependency semantics. The current adapter does not load repositories, so libsolvext, repository loaders, compression backends, tools, conda, and multi-distribution semantics are explicitly disabled.
 
 ## Requirements
 

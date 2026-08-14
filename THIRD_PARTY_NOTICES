@@ -2,8 +2,11 @@ libsolv
 =======
 
 Source: https://github.com/cataggar/libsolv
-Commit: 99b33fe2ca708fd61652b1c36e0fc35edd59a5b1
+Commit: e190ef1433e5df60a2238b01438927eb76c285f5
 License: BSD-3-Clause
+Configuration: static core library with Debian semantics; libsolvext,
+repository loaders, compression backends, tools, conda, and multi-distribution
+semantics are disabled.
 
 libsolv includes work Copyright (c) 2007-2009, Novell Inc. and other
 contributors. Its LICENSE.BSD text follows:
