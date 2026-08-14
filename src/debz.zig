@@ -13,6 +13,7 @@ pub const control_record = @import("control_record.zig");
 pub const source = @import("source.zig");
 pub const release_metadata = @import("release_metadata.zig");
 pub const metadata_cache = @import("metadata_cache.zig");
+pub const repository_acquisition = @import("repository_acquisition.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -101,4 +102,5 @@ test {
     _ = dpkg_status;
     _ = release_metadata;
     _ = metadata_cache;
+    _ = repository_acquisition;
 }
