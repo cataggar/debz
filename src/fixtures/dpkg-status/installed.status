@@ -1,0 +1,25 @@
+Package: debz
+Status: install ok installed
+Priority: required
+Essential: yes
+Protected: no
+Installed-Size: 4096
+Architecture: amd64
+Multi-Arch: foreign
+Version: 2:1.0~rc1-03
+Pre-Depends: init-system (>= 1)
+Depends: libc6 (>= 2.39) | libc-alt,
+ libssl3
+Recommends: helper
+Suggests: docs
+Breaks: old-debz (<< 1)
+Conflicts: debz-legacy
+Replaces: debz-legacy
+Enhances: package-manager
+Provides: debz-api (= 2)
+
+Package: data-only
+Status: hold ok installed
+Architecture: all
+Version: 1
+Installed-Size: 0

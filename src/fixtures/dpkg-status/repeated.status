@@ -1,0 +1,9 @@
+Package: duplicate
+Version: 1
+Architecture: amd64
+Status: install ok installed
+
+Package: duplicate
+Version: 2
+Architecture: amd64
+Status: install ok installed

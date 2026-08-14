@@ -6,6 +6,8 @@ The project currently exposes typed configuration and request APIs, a CLI comman
 
 `debz.deb_archive.parse` validates the outer `ar` structure, required members, `debian-binary` version marker, supported compression suffixes, and configured archive/member/count limits. It returns borrowed member byte ranges and metadata without copying, decompressing, or unpacking files. Validation of the compressed streams and inner tar archives is separate follow-up work; callers must not treat outer-archive validation alone as package-content validation.
 
+`debz.dpkg_status` parses only caller-supplied status bytes or explicit paths. It preserves source diagnostics and models package identity, exact Debian versions, installation states, package flags, dependency relations, and installed size without implicitly reading the host dpkg database.
+
 ## Dependency solver
 
 The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. Debian repository parsing and dependency semantics are not implemented yet.

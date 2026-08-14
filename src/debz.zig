@@ -8,6 +8,7 @@ pub const SolverContext = solver.Context;
 pub const deb822 = @import("deb822.zig");
 pub const relation = @import("relation.zig");
 pub const deb_archive = @import("deb_archive.zig");
+pub const dpkg_status = @import("dpkg_status.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -88,4 +89,10 @@ test "CLI operations use stable spellings" {
 test "empty solver context can be created and destroyed" {
     const context = SolverContext.create();
     context.destroy();
+}
+
+test {
+    _ = deb822;
+    _ = relation;
+    _ = dpkg_status;
 }
