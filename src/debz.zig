@@ -11,6 +11,7 @@ pub const deb_archive = @import("deb_archive.zig");
 pub const dpkg_status = @import("dpkg_status.zig");
 pub const control_record = @import("control_record.zig");
 pub const source = @import("source.zig");
+pub const release_metadata = @import("release_metadata.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -97,4 +98,5 @@ test {
     _ = deb822;
     _ = relation;
     _ = dpkg_status;
+    _ = release_metadata;
 }
