@@ -1,0 +1,39 @@
+Package: state-installed
+Version: 1
+Architecture: all
+Status: install ok installed
+
+Package: state-config-files
+Version: 1
+Architecture: all
+Status: deinstall ok config-files
+
+Package: state-unpacked
+Version: 1
+Architecture: all
+Status: install ok unpacked
+
+Package: state-half-configured
+Version: 1
+Architecture: all
+Status: install ok half-configured
+
+Package: state-triggers-awaited
+Version: 1
+Architecture: all
+Status: install ok triggers-awaited
+
+Package: state-triggers-pending
+Version: 1
+Architecture: all
+Status: install ok triggers-pending
+
+Package: state-half-installed
+Version: 1
+Architecture: all
+Status: purge reinstreq half-installed
+
+Package: state-not-installed
+Version: 1
+Architecture: all
+Status: unknown ok not-installed
