@@ -27,6 +27,9 @@ pub const DuplicatePolicy = enum {
 pub const Options = struct {
     limits: Limits = .{},
     duplicate_policy: DuplicatePolicy = .reject,
+    /// Ignore whole lines whose first byte is '#'. DEB822 consumers that
+    /// define comment lines, such as Debian `.sources` files, opt in.
+    allow_comments: bool = false,
 };
 
 pub const ErrorKind = enum {
@@ -193,6 +196,8 @@ pub fn parseBorrowed(
             }
             continue;
         }
+
+        if (options.allow_comments and line.text[0] == '#') continue;
 
         if (line.text[0] == ' ' or line.text[0] == '\t') {
             if (fields.items.len == 0) {
@@ -585,4 +590,18 @@ test "accepts empty input and repeated blank lines" {
         defer document.deinit();
         try std.testing.expectEqual(0, document.paragraphs.len);
     }
+}
+
+test "comment lines are opt-in and do not split paragraphs" {
+    const input = "# heading\nName: one\n# between fields\nValue: two\n";
+    const result = try parseBorrowed(std.testing.allocator, input, .{
+        .allow_comments = true,
+    });
+    var document = switch (result) {
+        .document => |value| value,
+        .failure => return error.UnexpectedParseFailure,
+    };
+    defer document.deinit();
+    try std.testing.expectEqual(1, document.paragraphs.len);
+    try std.testing.expectEqual(2, document.paragraphs[0].fields.len);
 }
