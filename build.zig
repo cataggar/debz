@@ -4,11 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const libsolv_dependency = b.dependency("libsolv", .{
+        .target = target,
+        .optimize = optimize,
+        .ext = false,
+    });
+    const libsolv = libsolv_dependency.artifact("solv");
+
     const debz = b.addModule("debz", .{
         .root_source_file = b.path("src/debz.zig"),
         .target = target,
         .optimize = optimize,
     });
+    debz.linkLibrary(libsolv);
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
