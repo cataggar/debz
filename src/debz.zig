@@ -5,6 +5,7 @@ pub const version = "0.1.0";
 pub const DebianVersion = @import("debian_version.zig").DebianVersion;
 pub const DebianVersionParseError = @import("debian_version.zig").ParseError;
 pub const SolverContext = solver.Context;
+pub const deb822 = @import("deb822.zig");
 
 pub const Architecture = enum {
     amd64,
