@@ -1,8 +1,10 @@
 const std = @import("std");
+const solver = @import("solver.zig");
 
 pub const version = "0.1.0";
 pub const DebianVersion = @import("debian_version.zig").DebianVersion;
 pub const DebianVersionParseError = @import("debian_version.zig").ParseError;
+pub const SolverContext = solver.Context;
 
 pub const Architecture = enum {
     amd64,
@@ -78,4 +80,9 @@ test "configuration defaults are explicit" {
 test "CLI operations use stable spellings" {
     try std.testing.expectEqual(Operation.upgrade_all, parseOperation("upgrade-all").?);
     try std.testing.expect(parseOperation("unknown") == null);
+}
+
+test "empty solver context can be created and destroyed" {
+    const context = SolverContext.create();
+    context.destroy();
 }
