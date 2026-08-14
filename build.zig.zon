@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .libsolv = .{
-            .url = "git+https://github.com/cataggar/libsolv.git#99b33fe2ca708fd61652b1c36e0fc35edd59a5b1",
-            .hash = "libsolv-0.7.39-PoNzehBtIABMbRTsbiVIOYaZ-HaX_EtRRjQhXT_U1TWu",
+            .url = "git+https://github.com/cataggar/libsolv.git#e190ef1433e5df60a2238b01438927eb76c285f5",
+            .hash = "libsolv-0.7.39-PoNzeg2EIACYnSAYc3_WneVukScmmV-vyo_5guzBzqdO",
         },
     },
     .paths = .{

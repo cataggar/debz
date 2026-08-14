@@ -7,7 +7,16 @@ pub fn build(b: *std.Build) void {
     const libsolv_dependency = b.dependency("libsolv", .{
         .target = target,
         .optimize = optimize,
+        .shared = false,
+        .conda = false,
+        .@"multi-semantics" = false,
+        .debian = true,
         .ext = false,
+        .zlib = false,
+        .lzma = false,
+        .bzip2 = false,
+        .zstd = false,
+        .tools = false,
     });
     const libsolv = libsolv_dependency.artifact("solv");
 
