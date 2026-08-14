@@ -30,6 +30,10 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
+      - name: Install metadata decompression dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends liblzma-dev
       - name: Build and test
         run: |
           zig build
