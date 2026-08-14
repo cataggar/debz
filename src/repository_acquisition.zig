@@ -172,6 +172,7 @@ pub const Error = error{
     RedirectLimitExceeded,
     MissingRedirectLocation,
     InvalidRedirect,
+    NotFound,
     HttpStatus,
     OverallDeadlineExceeded,
 };
@@ -335,6 +336,7 @@ fn acquireHttp(
                 try deterministicBackoff(request_value, dependencies, attempts, started_ms);
                 continue;
             }
+            if (response.status == 404) return error.NotFound;
             return error.HttpStatus;
         }
 
@@ -910,12 +912,12 @@ test "safe transient status retries with deterministic backoff" {
     try std.testing.expectEqual(@as(u16, 2), result.provenance.timing.attempts);
 }
 
-test "non-transient status has no partial-success fallback" {
+test "not found status is explicit and has no partial-success fallback" {
     const allocator = std.testing.allocator;
     var fixture = TestFixture{
         .responses = &.{.{ .status = 404, .body = "not repository data" }},
     };
-    try std.testing.expectError(error.HttpStatus, acquire(allocator, .{
+    try std.testing.expectError(error.NotFound, acquire(allocator, .{
         .uri = try Uri.parse("https://example.test/missing"),
         .deadlines = testDeadlines(),
         .redirect_limit = 0,
