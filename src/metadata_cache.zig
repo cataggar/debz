@@ -70,6 +70,7 @@ pub const SnapshotId = struct {
 };
 
 pub const VerificationKind = enum {
+    unauthenticated_release,
     in_release,
     detached_release,
     trusted_snapshot,

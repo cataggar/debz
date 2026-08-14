@@ -24,6 +24,15 @@ optional expected decompressed size are checked before a result is returned.
 gzip and zstd use Zig's standard library. xz uses the system liblzma streaming
 API with a caller-bounded memory limit and full integrity checking.
 
+`debz.repository_refresh` composes bounded acquisition, `Release` and
+`Packages` parsing, SHA-256/size checks, Acquire-By-Hash, bounded
+decompression, and atomic cache publication into a complete snapshot refresh.
+Plain `Release` acquisition is explicitly `unauthenticated` and its result is
+not solver-eligible. Digest integrity is not repository authentication:
+OpenPGP verification of `InRelease` or `Release.gpg` is required before solver
+ingestion and remains the next security layer. A separate verified-byte input
+is reserved for that authentication layer; this pipeline never infers trust.
+
 ## Dependency solver
 
 The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. The pinned libsolv core is built with Debian EVR and dependency semantics. The current adapter does not load repositories, so libsolvext, repository loaders, compression backends, tools, conda, and multi-distribution semantics are explicitly disabled.

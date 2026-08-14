@@ -16,6 +16,7 @@ pub const metadata_cache = @import("metadata_cache.zig");
 pub const repository_acquisition = @import("repository_acquisition.zig");
 pub const packages_index = @import("packages_index.zig");
 pub const metadata_decompression = @import("metadata_decompression.zig");
+pub const repository_refresh = @import("repository_refresh.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -107,4 +108,5 @@ test {
     _ = repository_acquisition;
     _ = packages_index;
     _ = metadata_decompression;
+    _ = repository_refresh;
 }
