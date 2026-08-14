@@ -12,6 +12,8 @@ Repository sources can be supplied explicitly as canonical `.sources` stanzas or
 
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 
+`debz.metadata_cache` provides an explicit-root, versioned verified-metadata cache. Objects are addressed by SHA-256, repository/snapshot manifests are atomically published only after size and digest verification, cache-only reads reverify referenced bytes, and bounded garbage collection preserves manifest references. It does not perform network refreshes or use ambient host cache directories.
+
 ## Dependency solver
 
 The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. The pinned libsolv core is built with Debian EVR and dependency semantics. The current adapter does not load repositories, so libsolvext, repository loaders, compression backends, tools, conda, and multi-distribution semantics are explicitly disabled.
