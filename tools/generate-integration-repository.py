@@ -99,7 +99,8 @@ def build_deb(
     )
 
 
-def package_specs(architecture: str):
+def package_specs(suite: str, architecture: str):
+    suite_version = "1.0-1debian1" if suite == "debian-stable" else "1.0-1ubuntu1"
     return [
         ("base-dep", "1.0-1", architecture, {}, {}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
@@ -126,7 +127,7 @@ def package_specs(architecture: str):
         ("fixture-upgrade", "1.0-1", architecture, {}, {}),
         ("fixture-upgrade", "2.0-1", architecture, {}, {}),
         ("conffile-pkg", "1.0-1", architecture, {}, {"conffile": True}),
-        ("trigger-pkg", "1.0-1", architecture, {}, {"trigger": "/usr/share/debz-fixtures"}),
+        ("trigger-pkg", suite_version, architecture, {}, {"trigger": "/usr/share/debz-fixtures"}),
         ("fail-script", "1.0-1", architecture, {}, {"failing_postinst": True}),
         (
             "scenario-main",
@@ -150,7 +151,7 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
     pool.mkdir(parents=True)
 
     paragraphs: list[bytes] = []
-    for package, version, package_arch, fields, options in package_specs(architecture):
+    for package, version, package_arch, fields, options in package_specs(suite, architecture):
         deb = build_deb(package, version, package_arch, fields, **options)
         filename = f"pool/main/{package}_{version}_{package_arch}.deb"
         path = output / filename

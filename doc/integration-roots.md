@@ -23,20 +23,20 @@ zig build test-integration
 ```
 
 Accepted suites are `debian-stable` and `ubuntu-26.04`; architectures are
-`amd64` and `arm64`; modes are `smoke` and `full`. A missing `dpkg` skips only
-the full transaction subsection and prints the capability and reason. Refresh,
-planning, verified downloads, cache replay, payload validation, policy, and
-reproducibility remain mandatory on every host. No qemu or foreign executable
-is used. Foreign packages contain inert data only.
+`amd64` and `arm64`; modes are `smoke` and `full`. Full mode requires `dpkg`
+and fails rather than skipping transaction assertions.
+Refresh, planning, verified downloads, cache replay, payload validation, policy,
+and reproducibility remain mandatory on every host. No qemu or foreign
+executable is used. Foreign packages contain inert data only.
 
 ## Support claims
 
 The suite names identify fixture contracts, not downloaded vendor root
-filesystems. PR CI requires all four suite/architecture smoke combinations on
-an amd64 runner, which proves native amd64 and foreign arm64 metadata, solver,
-download, and validation flows. Scheduled/manual CI adds native arm64 runners,
-foreign arm64 roots on amd64, and dpkg-root transactions where dpkg is
-available.
+filesystems. Their signed repository identities and suite-marker versions
+differ, so Debian and Ubuntu rows cannot collapse to aliases. PR CI requires
+all four suite/architecture combinations in full mode on native amd64 and arm64
+runners, including mandatory dpkg-root transactions. Scheduled/manual CI adds
+foreign arm64 roots on amd64.
 
 The repository exercises dependencies and Pre-Depends, alternatives,
 versioned virtual Provides, Conflicts/Breaks/Replaces, Recommends policy,

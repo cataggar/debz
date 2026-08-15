@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 debz=$1
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
@@ -13,6 +14,12 @@ state="$workspace/state"
 source_file="$workspace/fixture.sources"
 keyring="$repo/fixture-keyring.gpg"
 stderr_file="$workspace/stderr"
+
+case "$workspace" in
+  "$PWD"/.zig-cache/integration-*) ;;
+  *) echo "refusing unsafe integration workspace: $workspace" >&2; exit 2 ;;
+esac
+test ! -L "$workspace"
 
 case "$suite:$architecture:$mode" in
   debian-stable:amd64:smoke|debian-stable:arm64:smoke|ubuntu-26.04:amd64:smoke|ubuntu-26.04:arm64:smoke) ;;
@@ -53,6 +60,10 @@ plan_a=$(run_json plan $common base-dep)
 plan_b=$(run_json plan $common base-dep)
 test "$plan_a" = "$plan_b"
 printf '%s' "$plan_a" | grep -q '"package":"base-dep"'
+case "$suite" in
+  debian-stable) run_json info $common trigger-pkg | grep -q '"version":"1.0-1debian1"' ;;
+  ubuntu-26.04) run_json info $common trigger-pkg | grep -q '"version":"1.0-1ubuntu1"' ;;
+esac
 
 run_json plan $common alt-consumer | grep -q '"package":"alt-a"\|"package":"alt-b"'
 run_json info $common pre-app | grep -q '"package":"pre-app"'
@@ -105,30 +116,33 @@ EOF
     printf '%s' "$corrupt" | grep -q '"exit_status":6'
     mv "$workspace/cache-object.backup" "$first_object"
   else
-    echo "SKIP cache-corruption: package cache object layout unavailable" >&2
+    echo "required package cache object was not published" >&2
+    exit 1
   fi
 
-  if command -v dpkg >/dev/null 2>&1; then
-    mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
-    dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
-    run_json install $mutating base-dep | grep -q '"exit_status":0'
-    run_json reinstall $mutating base-dep | grep -q '"exit_status":0'
-    run_json remove $mutating base-dep | grep -q '"exit_status":0'
-    set +e
-    failed_script=$("$debz" install $mutating fail-script 2>"$stderr_file")
-    failed_script_status=$?
-    set -e
-    test "$failed_script_status" -eq 7
-    printf '%s' "$failed_script" | grep -q '"id":"transaction_failed"'
-    set +e
-    recovery=$("$debz" recover $mutating 2>"$stderr_file")
-    recovery_status=$?
-    set -e
-    test "$recovery_status" -ne 0
-    printf '%s' "$recovery" | grep -q '"exit_status":7\|"exit_status":8'
-  else
-    echo "SKIP dpkg-root-transactions: /usr/bin/dpkg is unavailable" >&2
-  fi
+  command -v dpkg >/dev/null 2>&1 || {
+    echo "required dpkg-root-transactions capability is unavailable" >&2
+    exit 1
+  }
+  printf 'CAPABILITY dpkg-root-transactions: %s\n' "$(dpkg --version | head -n 1)"
+  mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
+  dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
+  run_json install $mutating base-dep | grep -q '"exit_status":0'
+  run_json reinstall $mutating base-dep | grep -q '"exit_status":0'
+  run_json remove $mutating base-dep | grep -q '"exit_status":0'
+  run_json clean $mutating | grep -q '"exit_status":0'
+  set +e
+  failed_script=$("$debz" install $mutating fail-script 2>"$stderr_file")
+  failed_script_status=$?
+  set -e
+  test "$failed_script_status" -eq 7
+  printf '%s' "$failed_script" | grep -q '"id":"transaction_failed"'
+  set +e
+  recovery=$("$debz" recover $mutating 2>"$stderr_file")
+  recovery_status=$?
+  set -e
+  test "$recovery_status" -ne 0
+  printf '%s' "$recovery" | grep -q '"exit_status":7\|"exit_status":8'
 fi
 
 printf 'integration-root: %s/%s %s passed\n' "$suite" "$architecture" "$mode"
