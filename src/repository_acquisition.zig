@@ -508,6 +508,10 @@ fn resolveUri(allocator: std.mem.Allocator, base: Uri, location: []const u8) ![]
             error.NoSpaceLeft => continue,
             else => return err,
         };
+        if (resolved.user != null or resolved.password != null) return error.InvalidRedirect;
+        if (std.ascii.eqlIgnoreCase(base.scheme, "https") and
+            std.ascii.eqlIgnoreCase(resolved.scheme, "http"))
+            return error.InvalidRedirect;
         return formatUri(allocator, resolved, false);
     }
     return error.InvalidRedirect;
@@ -889,6 +893,26 @@ test "redirect limit is bounded" {
         .redirect_limit = 0,
         .max_response_bytes = 16,
     }, fixture.dependencies()));
+}
+
+test "redirect rejects embedded credentials and HTTPS downgrade" {
+    const allocator = std.testing.allocator;
+    const locations = [_][]const u8{
+        "https://" ++ "user@" ++ "other.test/final",
+        "http://example.test/final",
+    };
+    for (locations) |location| {
+        var fixture = TestFixture{
+            .responses = &.{.{ .status = 302, .body = "", .location = location }},
+        };
+        try std.testing.expectError(error.InvalidRedirect, acquire(allocator, .{
+            .uri = try Uri.parse("https://example.test/start"),
+            .deadlines = testDeadlines(),
+            .redirect_limit = 1,
+            .max_response_bytes = 16,
+        }, fixture.dependencies()));
+        try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
+    }
 }
 
 test "safe transient status retries with deterministic backoff" {
