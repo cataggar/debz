@@ -2,6 +2,11 @@
 
 `debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It owns repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, diagnostics, and an install-root-aware `dpkg` execution boundary.
 
+Required PR smoke tests now exercise deterministic signed Debian stable and
+Ubuntu 26.04 fixture repositories for amd64 and arm64. Scheduled/manual lanes
+add native and foreign disposable dpkg roots; see
+[Hermetic integration roots](integration-roots.md).
+
 ## Deterministic transaction planning
 
 `debz.planTransaction` is the public typed planning API. It accepts authenticated repository snapshots, parsed dpkg state, explicit package policy, architecture, request, solver policy, and limits. The returned plan owns its data and can be serialized with `canonicalJson`; canonical schema version 2 is documented in [`schema/transaction-plan-v2.json`](../schema/transaction-plan-v2.json), while [version 1](../schema/transaction-plan-v1.json) remains published for compatibility with previously serialized plans.

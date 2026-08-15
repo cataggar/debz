@@ -9,13 +9,17 @@ after all of these steps succeed:
 
 1. acquire and strictly parse `InRelease`, or `Release` plus `Release.gpg`;
 2. verify the exact canonical-text or detached signed bytes;
-3. enforce explicit accepted-primary-fingerprint and verification-time policy;
+3. enforce verification-time policy and, when supplied, the accepted-primary-
+   fingerprint allowlist;
 4. validate Release identity, Date, Valid-Until, and selected index checksum;
 5. boundedly decompress and parse Packages;
 6. atomically publish the authenticated snapshot.
 
 `AuthenticationPolicy` requires caller-supplied keyring bytes or explicit
-paths, accepted primary fingerprints, and a verification timestamp. The
+paths, an optional accepted-primary-fingerprint allowlist, and a verification timestamp. An
+empty allowlist trusts any valid signing key in the explicit keyrings, matching
+the production CLI's `Signed-By` trust model; it never enables an ambient
+keyring. The
 default multiple-signature policy accepts at least one valid accepted signer
 and preserves every per-signature result. `.all` rejects any invalid extra.
 An optional `SignatureReporter` receives the complete borrowed result list for

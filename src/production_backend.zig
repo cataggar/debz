@@ -289,7 +289,8 @@ pub const Backend = struct {
         if (request.options.lock_output_path != null and request.options.lock_input_path == null)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output requires --lock-input for an exact authenticated closure");
         var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
-            try readLock(allocator, self.io, path)
+            readLock(allocator, self.io, path) catch
+                return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
         else
             null;
         defer if (lock) |*value| value.deinit();
@@ -345,15 +346,16 @@ pub const Backend = struct {
                 return error.MissingRepository;
             const normalized_repository = findNormalized(configuration.repositories, origin.repository_id) orelse
                 return error.MissingRepository;
+            const selected = try package_acquisition.SelectedPackage.fromSolverSelection(
+                repository_input,
+                origin,
+                try repository_acquisition.Uri.parse(normalized_repository.uri),
+            );
             var package = try package_acquisition.acquirePackage(
                 allocator,
                 &package_cache,
                 .{
-                    .selected = try package_acquisition.SelectedPackage.fromSolverSelection(
-                        repository_input,
-                        origin,
-                        try repository_acquisition.Uri.parse(normalized_repository.uri),
-                    ),
+                    .selected = selected,
                     .policy = .{
                         .mode = if (request.options.offline or request.options.cache_only) .cache_only else .online,
                         .workflow = if (request.operation == .download) .download_only else .transaction,
@@ -378,14 +380,19 @@ pub const Backend = struct {
                 .requested_package = action.package,
                 .requested_version = action.version,
                 .requested_architecture = action.architecture,
-                .filename = origin.source_location,
+                .filename = selected.record.transport.filename.value,
                 .size = package.provenance.declared_size,
                 .sha256 = package.provenance.expected_sha256.bytes,
             }, .{});
             switch (validation_result) {
-                .diagnostic => {
+                .diagnostic => |diagnostic| {
                     package.deinit();
-                    return error.InvalidPackagePayload;
+                    return api.failure(
+                        request.operation,
+                        .download,
+                        .download_failed,
+                        diagnostic.message(),
+                    );
                 },
                 .validation => |*validation| validation.deinit(),
             }
