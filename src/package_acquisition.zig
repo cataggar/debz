@@ -111,6 +111,9 @@ pub const Provenance = struct {
     attempts: u16,
 
     pub fn deinit(self: *Provenance, allocator: std.mem.Allocator) void {
+        allocator.free(self.package);
+        allocator.free(self.version);
+        allocator.free(self.architecture);
         allocator.free(self.resolved_uri);
         self.* = undefined;
     }
@@ -339,8 +342,15 @@ pub const Cache = struct {
             try names.append(allocator, try allocator.dupe(u8, entry.name));
         }
         sortNames(names.items);
-        for (names.items) |name| self.staging.deleteFile(self.io, name) catch {};
-        return .{ .scanned = names.items.len, .deleted = names.items.len, .complete = true };
+        var deleted: usize = 0;
+        for (names.items) |name| {
+            self.staging.deleteFile(self.io, name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => |e| return e,
+            };
+            deleted += 1;
+        }
+        return .{ .scanned = names.items.len, .deleted = deleted, .complete = true };
     }
 
     /// Deterministically deletes sorted, unretained CAS objects within all
@@ -361,7 +371,7 @@ pub const Cache = struct {
         while (try iterator.next(self.io)) |entry| {
             if (names.items.len == options.maximum_directory_entries)
                 return .{ .scanned = 0, .deleted = 0, .bytes_deleted = 0, .complete = false };
-            if (entry.kind == .file) try names.append(allocator, try allocator.dupe(u8, entry.name));
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
         }
         sortNames(names.items);
         var result: GcResult = .{ .scanned = 0, .deleted = 0, .bytes_deleted = 0, .complete = true };
@@ -371,15 +381,25 @@ pub const Cache = struct {
                 break;
             }
             result.scanned += 1;
-            const digest = Digest.parseHex(name) catch continue;
+            const digest = Digest.parseHex(name) catch {
+                result.complete = false;
+                continue;
+            };
             if (containsDigest(options.retained, digest)) continue;
             if (result.deleted == options.maximum_objects_deleted) {
                 result.complete = false;
                 continue;
             }
-            var file = self.objects.openFile(self.io, name, .{ .follow_symlinks = false, .resolve_beneath = true }) catch continue;
+            var file = self.objects.openFile(self.io, name, .{
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+            }) catch {
+                result.complete = false;
+                continue;
+            };
             const stat = file.stat(self.io) catch {
                 file.close(self.io);
+                result.complete = false;
                 continue;
             };
             file.close(self.io);
@@ -502,16 +522,24 @@ fn makeResult(
     attempts: u16,
 ) !VerifiedPackage {
     errdefer allocator.free(bytes);
+    const package = try allocator.dupe(u8, request.selected.record.control.package.text);
+    errdefer allocator.free(package);
+    const version = try allocator.dupe(u8, request.selected.record.control.version.value.original);
+    errdefer allocator.free(version);
+    const architecture = try allocator.dupe(u8, request.selected.record.control.architecture.text);
+    errdefer allocator.free(architecture);
+    const resolved_uri = try acquisition.redactUri(allocator, effective_uri);
+    errdefer allocator.free(resolved_uri);
     return .{
         .bytes = bytes,
         .allocator = allocator,
         .provenance = .{
             .repository_id = request.selected.repository_id,
             .repository_priority = request.selected.repository_priority,
-            .package = request.selected.record.control.package.text,
-            .version = request.selected.record.control.version.value.original,
-            .architecture = request.selected.record.control.architecture.text,
-            .resolved_uri = try acquisition.redactUri(allocator, effective_uri),
+            .package = package,
+            .version = version,
+            .architecture = architecture,
+            .resolved_uri = resolved_uri,
             .expected_sha256 = digest,
             .declared_size = request.selected.record.transport.size.value,
             .cache_key = cache_key,
@@ -538,6 +566,7 @@ fn resolvePackageUri(
 ) !struct { text: []u8, uri: acquisition.Uri } {
     try validateBaseUri(base);
     if (filename.len == 0 or filename[0] == '/' or filename[0] == '\\' or
+        std.mem.indexOfScalar(u8, filename, '\\') != null or
         std.mem.indexOfScalar(u8, filename, 0) != null)
         return error.InvalidBaseUri;
     var segments = std.mem.splitScalar(u8, filename, '/');
@@ -830,6 +859,35 @@ test "verified download publishes CAS and cache-only hit performs no network" {
     try std.testing.expectEqual(Workflow.download_only, cached.provenance.workflow);
 }
 
+test "package locations reject platform path separators" {
+    try std.testing.expectError(
+        error.InvalidBaseUri,
+        resolvePackageUri(
+            std.testing.allocator,
+            try acquisition.Uri.parse("file:///repository"),
+            "pool\\..\\outside.deb",
+        ),
+    );
+}
+
+test "verified result owns package identity provenance" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    var selection = try testSelection(std.testing.allocator, "owned");
+    var transport: TestTransport = .{ .responses = &.{.{ .body = "owned" }} };
+    var result = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = testPolicy(.online),
+    }, transport.dependencies());
+    selection.deinit(std.testing.allocator);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("demo", result.provenance.package);
+    try std.testing.expectEqualStrings("1.2.3-1", result.provenance.version);
+    try std.testing.expectEqualStrings("amd64", result.provenance.architecture);
+}
+
 test "cache-only miss never invokes transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1027,6 +1085,80 @@ const BusyLock = struct {
     fn release(_: *anyopaque, _: *anyopaque) void {}
 };
 
+const ConcurrentPublish = struct {
+    cache: *Cache,
+    staged: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn stagedHook(context: ?*anyopaque) !void {
+        const self: *ConcurrentPublish = @ptrCast(@alignCast(context.?));
+        self.staged.store(true, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn run(self: *ConcurrentPublish) void {
+        self.cache.publish(
+            std.testing.allocator,
+            Digest.of("concurrent"),
+            "concurrent".len,
+            "concurrent",
+            .fail_fast,
+            .{ .context = self, .stagedFn = stagedHook },
+        ) catch |err| {
+            self.failure = err;
+        };
+    }
+};
+
+test "concurrent publishers cannot expose or replace staged bytes" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first_cache = try testCache(&tmp);
+    defer first_cache.deinit();
+    var second_cache = try testCache(&tmp);
+    defer second_cache.deinit();
+    var context: ConcurrentPublish = .{ .cache = &first_cache };
+    const thread = try std.Thread.spawn(.{}, ConcurrentPublish.run, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        context.release.store(true, .release);
+        thread.join();
+    };
+    while (!context.staged.load(.acquire)) std.atomic.spinLoopHint();
+
+    try std.testing.expectError(error.LockBusy, second_cache.publish(
+        std.testing.allocator,
+        Digest.of("concurrent"),
+        "concurrent".len,
+        "concurrent",
+        .fail_fast,
+        .{},
+    ));
+    try std.testing.expectError(
+        error.CacheMiss,
+        second_cache.lookup(
+            std.testing.allocator,
+            Digest.of("concurrent"),
+            "concurrent".len,
+            .verify_sha256,
+        ),
+    );
+    context.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(context.failure == null);
+    const bytes = try second_cache.lookup(
+        std.testing.allocator,
+        Digest.of("concurrent"),
+        "concurrent".len,
+        .verify_sha256,
+    );
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("concurrent", bytes);
+}
+
 test "writer and garbage collector expose stable lock-busy semantics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1103,4 +1235,27 @@ test "abandoned staging cleanup is bounded" {
     const cleaned = try cache.cleanupStaging(std.testing.allocator, 2, .fail_fast);
     try std.testing.expect(cleaned.complete);
     try std.testing.expectEqual(@as(usize, 1), cleaned.deleted);
+}
+
+test "cache rejects object symlinks and bounds non-object garbage entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const digest = Digest.of("outside");
+    var name: [64]u8 = undefined;
+    digest.formatHex(&name);
+    try cache.objects.symLink(std.testing.io, "../../writer.lock", &name, .{});
+    try std.testing.expectError(
+        error.CorruptObject,
+        cache.lookup(std.testing.allocator, digest, "outside".len, .verify_sha256),
+    );
+    const bounded = try cache.garbageCollect(std.testing.allocator, .{
+        .maximum_directory_entries = 0,
+        .maximum_objects_scanned = 1,
+        .maximum_objects_deleted = 1,
+        .maximum_bytes_deleted = 1024,
+    });
+    try std.testing.expect(!bounded.complete);
+    try std.testing.expectEqual(@as(usize, 0), bounded.scanned);
 }

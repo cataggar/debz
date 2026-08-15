@@ -13,10 +13,9 @@ refresh. It rejects stale indices, changed identities,
 repository/priority conflicts, and credential-bearing base URIs. The separate
 `fromTrustedTest` constructor is only for hermetic tests.
 
-`acquirePackage` returns an owned `VerifiedPackage`; call `deinit`. Its
-provenance borrows package identity strings from the selected Packages index,
-so that index must outlive the handle. Package bytes and the redacted resolved
-URI are owned by the handle.
+`acquirePackage` returns an owned `VerifiedPackage`; call `deinit`. Package
+bytes, package identity strings, and the redacted resolved URI are owned by the
+handle, so the selected Packages index need only remain alive for the call.
 
 ## Acquisition policy
 
@@ -34,8 +33,9 @@ No ambient proxy, credential, APT, or cache configuration is consulted.
 Repository acquisition retries only connection/reset/timeout/temporary DNS and
 read/write transport failures, plus explicitly enabled HTTP 408, 429, and 5xx
 statuses. Backoff is caller supplied. Redirects are bounded, cannot change to
-unsupported schemes, and credentials are sent only to the original origin.
-TLS certificate and hostname verification is performed by Zig's HTTPS client.
+unsupported schemes, cannot downgrade HTTPS or embed credentials, and
+credentials are sent only to the original origin. TLS certificate and hostname
+verification is performed by Zig's HTTPS client.
 
 ## Verification and cache
 
