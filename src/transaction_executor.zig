@@ -29,7 +29,10 @@ pub const Policy = struct {
     risk: RiskPolicy = .{},
     validation_limits: deb_payload.Limits = .{},
     maximum_diagnostic_bytes: usize = 64 * 1024,
+    process_timeout_ms: u64 = 5 * 60 * 1000,
 };
+
+const maximum_diagnostic_limit = 1024 * 1024;
 
 /// A cached archive bound to one archive-producing action in an owned plan.
 /// The executor rereads and fully validates `path` immediately before dpkg.
@@ -77,6 +80,8 @@ pub const Invocation = struct {
     environment: []const EnvironmentEntry,
     phase: Phase,
     package: ?[]const u8,
+    timeout_ms: u64,
+    cancellation: Cancellation,
 };
 
 pub const ProcessRunner = struct {
@@ -162,6 +167,8 @@ pub const Dependencies = struct {
 pub const CommandProvenance = struct {
     phase: Phase,
     package: ?[]const u8,
+    version: ?[]const u8,
+    architecture: ?[]const u8,
     command_sha256: [32]u8,
     artifact_sha256: ?[32]u8,
 };
@@ -178,6 +185,7 @@ pub const FailureCode = enum {
     lock_error,
     lock_lost,
     process_spawn,
+    process_timeout,
     dpkg_failed,
     interrupted,
     out_of_memory,
@@ -286,6 +294,16 @@ pub fn execute(
             };
             return finish(allocator, arena_ptr, &state, plan_sha256);
         }
+        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+            state.failure = .{
+                .code = .invalid_root,
+                .phase = toPhase(ordered.kind),
+                .package = try arena.dupe(u8, ordered.package),
+                .diagnostic = try arena.dupe(u8, @errorName(err)),
+                .completed_commands = state.commands.items.len,
+            };
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        };
 
         const phase = toPhase(ordered.kind);
         const artifact = if (phase == .unpack)
@@ -320,6 +338,8 @@ pub fn execute(
         const provenance: CommandProvenance = .{
             .phase = phase,
             .package = try arena.dupe(u8, ordered.package),
+            .version = try arena.dupe(u8, ordered.version),
+            .architecture = try arena.dupe(u8, ordered.architecture),
             .command_sha256 = hashInvocation(argv, &audited_environment),
             .artifact_sha256 = artifact_digest,
         };
@@ -328,9 +348,11 @@ pub fn execute(
             .environment = &audited_environment,
             .phase = phase,
             .package = ordered.package,
+            .timeout_ms = request.policy.process_timeout_ms,
+            .cancellation = dependencies.cancellation,
         }) catch |err| {
             state.failure = .{
-                .code = .process_spawn,
+                .code = if (err == error.Timeout) .process_timeout else .process_spawn,
                 .phase = phase,
                 .package = try arena.dupe(u8, ordered.package),
                 .diagnostic = try arena.dupe(u8, @errorName(err)),
@@ -369,15 +391,26 @@ pub fn execute(
             };
             return finish(allocator, arena_ptr, &state, plan_sha256);
         }
+        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+            state.failure = .{
+                .code = .invalid_root,
+                .phase = .triggers,
+                .diagnostic = try arena.dupe(u8, @errorName(err)),
+                .completed_commands = state.commands.items.len,
+            };
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        };
         const argv = try buildTriggerArgv(arena, root_flag, admin_flag, request.policy);
         const result = dependencies.process.run(.{
             .argv = argv,
             .environment = &audited_environment,
             .phase = .triggers,
             .package = null,
+            .timeout_ms = request.policy.process_timeout_ms,
+            .cancellation = dependencies.cancellation,
         }) catch |err| {
             state.failure = .{
-                .code = .process_spawn,
+                .code = if (err == error.Timeout) .process_timeout else .process_spawn,
                 .phase = .triggers,
                 .diagnostic = try arena.dupe(u8, @errorName(err)),
                 .completed_commands = state.commands.items.len,
@@ -387,6 +420,8 @@ pub fn execute(
         try state.commands.append(arena, .{
             .phase = .triggers,
             .package = null,
+            .version = null,
+            .architecture = null,
             .command_sha256 = hashInvocation(argv, &audited_environment),
             .artifact_sha256 = null,
         });
@@ -431,6 +466,9 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     if (request.plan.mode != .plan_only) return error.NonExecutablePlanMode;
     if (request.plan.actions.len > 100_000 or request.plan.ordered_actions.len > 300_000)
         return error.PlanTooLarge;
+    if (request.policy.process_timeout_ms == 0) return error.InvalidProcessTimeout;
+    if (request.policy.maximum_diagnostic_bytes > maximum_diagnostic_limit)
+        return error.DiagnosticLimitTooLarge;
     try validateForces(request.policy.risk.force);
 
     var expected_sequence: usize = 0;
@@ -570,6 +608,7 @@ fn buildArgv(
     try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
     for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
+    try argv.append(allocator, "--no-triggers");
     switch (phase) {
         .remove => {
             try argv.append(allocator, "--remove");
@@ -580,7 +619,6 @@ fn buildArgv(
             try argv.append(allocator, artifact_path.?);
         },
         .configure => {
-            try argv.append(allocator, "--no-triggers");
             try argv.append(allocator, "--configure");
             try argv.append(allocator, try packageSpec(allocator, package, architecture));
         },
@@ -603,7 +641,7 @@ fn buildTriggerArgv(
     try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
     for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
-    try argv.append(allocator, "--configure");
+    try argv.append(allocator, "--triggers-only");
     try argv.append(allocator, "--pending");
     return argv.toOwnedSlice(allocator);
 }
@@ -861,12 +899,32 @@ pub const SystemProcessRunner = struct {
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
         for (invocation.environment) |entry| try environment.put(entry.key, entry.value);
-        const result = try std.process.run(self.allocator, self.io, .{
-            .argv = invocation.argv,
-            .environ_map = &environment,
-            .stdout_limit = .limited(self.stderr_limit),
-            .stderr_limit = .limited(self.stderr_limit),
-        });
+
+        const Outcome = union(enum) {
+            result: std.process.RunError!std.process.RunResult,
+            cancelled,
+        };
+        var outcomes: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        select.async(.result, runChild, .{ self, invocation, &environment });
+        select.async(.cancelled, waitCancellation, .{ self.io, invocation.cancellation });
+        errdefer select.cancelDiscard();
+        const result = switch (try select.await()) {
+            .result => |result| result: {
+                select.cancelDiscard();
+                break :result try result;
+            },
+            .cancelled => {
+                while (select.cancel()) |outcome| switch (outcome) {
+                    .result => |result| if (result) |completed| {
+                        self.allocator.free(completed.stdout);
+                        self.allocator.free(completed.stderr);
+                    } else |_| {},
+                    .cancelled => {},
+                };
+                return .{ .termination = .cancelled };
+            },
+        };
         self.allocator.free(result.stdout);
         self.last_stderr = result.stderr;
         const termination: ProcessTermination = switch (result.term) {
@@ -876,6 +934,32 @@ pub const SystemProcessRunner = struct {
             .unknown => |status| .{ .signaled = status },
         };
         return .{ .termination = termination, .stderr = result.stderr };
+    }
+
+    fn runChild(
+        self: *SystemProcessRunner,
+        invocation: Invocation,
+        environment: *const std.process.Environ.Map,
+    ) std.process.RunError!std.process.RunResult {
+        return std.process.run(self.allocator, self.io, .{
+            .argv = invocation.argv,
+            .environ_map = environment,
+            .stdout_limit = .limited(self.stderr_limit),
+            .stderr_limit = .limited(self.stderr_limit),
+            .timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@min(
+                    invocation.timeout_ms,
+                    @as(u64, std.math.maxInt(i64)),
+                ))),
+                .clock = .awake,
+            } },
+        });
+    }
+
+    fn waitCancellation(io: std.Io, cancellation: Cancellation) void {
+        while (!cancellation.cancelled()) {
+            io.sleep(.fromMilliseconds(10), .awake) catch return;
+        }
     }
 };
 
@@ -969,10 +1053,7 @@ pub const SystemLockManager = struct {
         const self: *SystemLockManager = @ptrCast(@alignCast(context));
         const started = std.Io.Clock.awake.now(self.io);
         while (true) {
-            const file = std.Io.Dir.createFileAbsolute(self.io, path, .{
-                .read = true,
-                .truncate = false,
-            }) catch |err| return err;
+            const file = try self.openLockFile(path);
             var record: std.os.linux.Flock = .{
                 .type = std.os.linux.F.WRLCK,
                 .whence = 0,
@@ -1001,9 +1082,45 @@ pub const SystemLockManager = struct {
                 }
                 return error.LockFailed;
             }
-            const token = try self.allocator.create(Token);
+            const token = self.allocator.create(Token) catch |err| {
+                file.close(self.io);
+                return err;
+            };
             token.* = .{ .file = file };
             return token;
+        }
+    }
+
+    fn openLockFile(self: *SystemLockManager, path: []const u8) !std.Io.File {
+        const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+        const basename = std.fs.path.basename(path);
+        var current = try std.Io.Dir.openDirAbsolute(self.io, "/", .{ .follow_symlinks = false });
+        defer current.close(self.io);
+        var components = std.mem.splitScalar(u8, parent[1..], '/');
+        while (components.next()) |component| {
+            if (component.len == 0) continue;
+            const next = try current.openDir(self.io, component, .{ .follow_symlinks = false });
+            current.close(self.io);
+            current = next;
+        }
+        while (true) {
+            return current.openFile(self.io, basename, .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+            }) catch |open_err| switch (open_err) {
+                error.FileNotFound => current.createFile(self.io, basename, .{
+                    .read = true,
+                    .truncate = false,
+                    .exclusive = true,
+                    .resolve_beneath = true,
+                }) catch |create_err| switch (create_err) {
+                    error.PathAlreadyExists => continue,
+                    else => return create_err,
+                },
+                else => return open_err,
+            };
         }
     }
 
@@ -1024,6 +1141,8 @@ pub const SystemLockManager = struct {
 const TestHarness = struct {
     bytes: []const u8,
     root_valid: bool = true,
+    root_validate_count: usize = 0,
+    root_fail_after: ?usize = null,
     corrupt_read: bool = false,
     lock_fail_at: ?usize = null,
     lock_acquires: usize = 0,
@@ -1033,6 +1152,7 @@ const TestHarness = struct {
     invocation_count: usize = 0,
     fail_at: ?usize = null,
     fail_termination: ProcessTermination = .{ .exited = 1 },
+    run_error: ?anyerror = null,
     stderr: []const u8 = "",
     cancelled_value: bool = false,
 
@@ -1057,7 +1177,9 @@ const TestHarness = struct {
 
     fn validateRoot(context: *anyopaque, _: []const u8) !void {
         const self: *TestHarness = @ptrCast(@alignCast(context));
-        if (!self.root_valid) return error.SymlinkRoot;
+        const current = self.root_validate_count;
+        self.root_validate_count += 1;
+        if (!self.root_valid or self.root_fail_after == current) return error.SymlinkRoot;
     }
 
     fn readArtifact(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
@@ -1092,6 +1214,7 @@ const TestHarness = struct {
         const current = self.invocation_count;
         self.invocations[current] = invocation;
         self.invocation_count += 1;
+        if (self.run_error) |err| return err;
         if (self.fail_at == current) return .{
             .termination = self.fail_termination,
             .stderr = self.stderr,
@@ -1211,9 +1334,14 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[0].argv[0]);
     try std.testing.expect(containsArg(harness.invocations[0].argv, "--root=/target"));
     try std.testing.expect(containsArg(harness.invocations[0].argv, "--force-confold"));
+    try std.testing.expect(containsArg(harness.invocations[0].argv, "--no-triggers"));
+    try std.testing.expect(containsArg(harness.invocations[1].argv, "--no-triggers"));
     try std.testing.expect(!containsArg(harness.invocations[0].argv, "sh"));
     try std.testing.expectEqual(@as(usize, audited_environment.len), harness.invocations[0].environment.len);
     try std.testing.expectEqualStrings("DEBIAN_FRONTEND", harness.invocations[0].environment[0].key);
+    try std.testing.expectEqual(@as(u64, 5 * 60 * 1000), harness.invocations[0].timeout_ms);
+    try std.testing.expectEqualStrings("1.0", report.commands[0].version.?);
+    try std.testing.expectEqualStrings("amd64", report.commands[0].architecture.?);
 }
 
 test "transaction_executor.test.plan order cycles and final triggers are deterministic" {
@@ -1238,8 +1366,9 @@ test "transaction_executor.test.plan order cycles and final triggers are determi
     try std.testing.expect(containsArg(harness.invocations[0].argv, "old:amd64"));
     try std.testing.expect(containsArg(harness.invocations[1].argv, "cycle-b:amd64"));
     try std.testing.expect(containsArg(harness.invocations[2].argv, "cycle-a:amd64"));
-    try std.testing.expect(containsArg(harness.invocations[3].argv, "--configure"));
+    try std.testing.expect(containsArg(harness.invocations[3].argv, "--triggers-only"));
     try std.testing.expect(containsArg(harness.invocations[3].argv, "--pending"));
+    try std.testing.expect(!containsArg(harness.invocations[3].argv, "--configure"));
     try std.testing.expect(containsArg(harness.invocations[3].argv, "--force-confnew"));
 }
 
@@ -1342,6 +1471,28 @@ test "transaction_executor.test.dpkg failure has package phase exit and never su
     try std.testing.expectEqual(@as(usize, 1), report.commands.len);
 }
 
+test "transaction_executor.test.process timeout is bounded and structured" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{ .bytes = "", .run_error = error.Timeout };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing, .process_timeout_ms = 17 },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
+    try std.testing.expectEqual(Phase.remove, report.failure.?.phase.?);
+    try std.testing.expectEqualStrings("demo", report.failure.?.package.?);
+    try std.testing.expectEqual(@as(usize, 0), report.failure.?.completed_commands);
+    try std.testing.expectEqual(@as(u64, 17), harness.invocations[0].timeout_ms);
+    try std.testing.expectEqual(@as(usize, 3), harness.lock_releases);
+}
+
 test "transaction_executor.test.provenance is stable redacted and interruption is recovery ready" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{
@@ -1419,6 +1570,26 @@ test "transaction_executor.test.host root symlink root malformed order and lock 
     try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
 }
 
+test "transaction_executor.test.install root is revalidated after locking before mutation" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{ .bytes = "", .root_fail_after = 1 };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.invalid_root, report.failure.?.code);
+    try std.testing.expectEqual(Phase.remove, report.failure.?.phase.?);
+    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
+    try std.testing.expectEqual(@as(usize, 3), harness.lock_releases);
+}
+
 test "transaction_executor.test.production adapters expose injectable interfaces" {
     var filesystem: SystemFileSystem = .{ .io = std.testing.io };
     var locks: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
@@ -1427,4 +1598,75 @@ test "transaction_executor.test.production adapters expose injectable interfaces
     _ = filesystem.interface();
     _ = locks.interface();
     _ = process.interface();
+}
+
+test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "safe");
+    try tmp.dir.symLink(std.testing.io, "safe", "linked", .{ .is_directory = true });
+    var target = try tmp.dir.createFile(std.testing.io, "safe/target", .{});
+    target.close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "target", "safe/linked-lock", .{});
+
+    var real_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_length = try tmp.dir.realPath(std.testing.io, &real_buffer);
+    const parent_link_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/linked/lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(parent_link_path);
+    const leaf_link_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/safe/linked-lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(leaf_link_path);
+    const safe_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/safe/lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(safe_path);
+
+    var locks: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    try std.testing.expectError(error.NotDir, locks.openLockFile(parent_link_path));
+    try std.testing.expectError(error.SymLinkLoop, locks.openLockFile(leaf_link_path));
+    var safe_file = try locks.openLockFile(safe_path);
+    safe_file.close(std.testing.io);
+}
+
+test "transaction_executor.test.production process adapter observes cancellation and reaps child" {
+    var harness: TestHarness = .{ .bytes = "", .cancelled_value = true };
+    var process: SystemProcessRunner = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer process.deinit();
+    const result = try process.interface().run(.{
+        .argv = &.{ "/usr/bin/sleep", "30" },
+        .environment = &audited_environment,
+        .phase = .configure,
+        .package = "demo",
+        .timeout_ms = 10_000,
+        .cancellation = harness.dependencies().cancellation,
+    });
+    try std.testing.expectEqual(ProcessTermination.cancelled, result.termination);
+}
+
+test "transaction_executor.test.production process adapter enforces timeout and reaps child" {
+    var process: SystemProcessRunner = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer process.deinit();
+    try std.testing.expectError(error.Timeout, process.interface().run(.{
+        .argv = &.{ "/usr/bin/sleep", "30" },
+        .environment = &audited_environment,
+        .phase = .configure,
+        .package = "demo",
+        .timeout_ms = 10,
+        .cancellation = Cancellation.never(),
+    }));
 }

@@ -23,7 +23,11 @@ Processes are invoked directly as `/usr/bin/dpkg`; no shell or command string
 is used. Every invocation replaces the environment with the fixed audited set
 `DEBIAN_FRONTEND`, `DPKG_COLORS`, `DPKG_FRONTEND_LOCKED`, `HOME`, `LC_ALL`,
 and `PATH`. The fixed locale is `C`. Dpkg receives both `--root` and
-`--admindir`.
+`--admindir`. Output capture is bounded and concurrent, and every child has a
+configurable nonzero deadline (five minutes by default); expiry terminates and
+reaps the child and produces a structured `process_timeout` failure. Production
+cancellation is observed while a command is running and likewise terminates and
+reaps the child before returning an interruption report.
 
 Callers must select one noninteractive conffile policy:
 
@@ -34,14 +38,14 @@ No general dpkg force option is enabled by default. Supported exceptions are a
 typed `ForceRisk` list and therefore appear in command provenance.
 
 The executor follows `ordered_actions` exactly, including planner-linearized
-cycles. Configure commands defer triggers with `--no-triggers`; one final
-`--configure --pending` command processes them deterministically. Planning
-refuses unhealthy pre-existing dpkg states, so this does not widen execution
-to unrelated pending packages.
+cycles. Remove, unpack, and configure commands defer triggers with
+`--no-triggers`; one final
+`--triggers-only --pending` command processes them deterministically without
+configuring unrelated pending packages.
 
-Failures include phase, package identity, exit status or signal, bounded dpkg
+Failures include phase, exact package identity, exit status or signal, bounded dpkg
 diagnostics, completed-command count, plan digest, and command/artifact
-digests. Cancellation and lock loss stop at command boundaries. A report is
+digests. Root safety and lock ownership are rechecked at command boundaries. A report is
 successful only after every ordered command and final trigger command exits
 zero. Recovery and post-state verification are intentionally deferred to #28.
 
