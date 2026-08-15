@@ -6,6 +6,7 @@
 
 - `debz.planTransaction` creates an owned, deterministic transaction plan from authenticated repository snapshots and parsed dpkg state.
 - `debz.acquirePackage` downloads or loads an authenticated solver-selected package, verifies its size and SHA-256, and publishes it to an explicit package CAS.
+- `debz.repository_policy` normalizes and atomically orchestrates explicitly declared multi-repository policy.
 - `debz.repository_refresh.refreshAuthenticated` verifies repository signatures and metadata before publishing a solver-eligible snapshot.
 - `debz.openpgp_verifier` verifies the project's supported OpenPGP profile without network, process, or ambient keyring access.
 - `debz.deb_payload.validate` performs complete bounded `.deb` payload and authenticated identity validation before transaction handoff.
