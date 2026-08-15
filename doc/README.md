@@ -1,5 +1,7 @@
 # Documentation
 
+- [Stable product API and CLI contract](product-api.md)
+
 - [Project status and API overview](project-status.md) describes implemented modules, public boundaries, limitations, and transaction-plan schema.
 - [Authenticated repository refresh](authenticated-refresh.md) explains trusted refresh usage, policy, provenance, and cache behavior.
 - [Verified package acquisition](package-acquisition.md) documents authenticated solver selection, download policy, SHA-256 CAS publication, offline use, and bounded garbage collection.

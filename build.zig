@@ -51,7 +51,12 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = debz });
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run unit and CLI integration tests");
+    test_step.dependOn(&run_tests.step);
+
+    const cli_tests = b.addSystemCommand(&.{ "sh", "tools/test-cli.sh" });
+    cli_tests.addArtifactArg(cli);
+    test_step.dependOn(&cli_tests.step);
 
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{
