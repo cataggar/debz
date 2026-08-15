@@ -34,6 +34,7 @@ pub const packages_index = @import("packages_index.zig");
 pub const metadata_decompression = @import("metadata_decompression.zig");
 pub const repository_refresh = @import("repository_refresh.zig");
 pub const signed_release_envelope = @import("signed_release_envelope.zig");
+pub const openpgp_verifier = @import("openpgp_verifier.zig");
 
 pub const Architecture = enum {
     amd64,
@@ -127,4 +128,5 @@ test {
     _ = metadata_decompression;
     _ = repository_refresh;
     _ = signed_release_envelope;
+    _ = openpgp_verifier;
 }
