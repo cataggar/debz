@@ -28,10 +28,16 @@ API with a caller-bounded memory limit and full integrity checking.
 `Packages` parsing, SHA-256/size checks, Acquire-By-Hash, bounded
 decompression, and atomic cache publication into a complete snapshot refresh.
 Plain `Release` acquisition is explicitly `unauthenticated` and its result is
-not solver-eligible. Digest integrity is not repository authentication:
-OpenPGP verification of `InRelease` or `Release.gpg` is required before solver
-ingestion and remains the next security layer. A separate verified-byte input
-is reserved for that authentication layer; this pipeline never infers trust.
+not solver-eligible. `refreshAuthenticated` acquires and strictly parses either
+clearsigned `InRelease` or detached `Release` plus `Release.gpg`, then verifies
+the exact OpenPGP signed bytes before parsing trusted fields. Callers must
+provide explicit keyring bytes or paths, accepted primary fingerprints, and a
+verification time; ambient GnuPG configuration, keyrings, homes, and network
+key discovery are never consulted. Authenticated cache-only loads reverify the
+stored envelope and signatures under the current caller policy. Only the
+distinct `AuthenticatedResult` type can be converted with
+`SolverRepositoryInput.fromRefresh`. See
+[`docs/authenticated-refresh.md`](docs/authenticated-refresh.md).
 
 `debz.openpgp_verifier` provides the separate, in-process repository-signature
 boundary. It accepts only caller-supplied signed bytes, binary OpenPGP signature

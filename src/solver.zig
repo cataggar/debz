@@ -111,12 +111,15 @@ pub const RepositoryInput = struct {
     eligibility: Eligibility,
     packages: *const packages_index.Index,
 
-    pub fn fromRefresh(result: *const repository_refresh.Result, priority: i32) RepositoryInput {
+    pub fn fromRefresh(
+        result: *const repository_refresh.AuthenticatedResult,
+        priority: i32,
+    ) RepositoryInput {
         return .{
-            .repository_id = result.provenance.repository_id,
+            .repository_id = result.snapshot.provenance.repository_id,
             .priority = priority,
-            .eligibility = if (result.solverEligible()) .verified_refresh else .untrusted,
-            .packages = &result.packages,
+            .eligibility = .verified_refresh,
+            .packages = &result.snapshot.packages,
         };
     }
 

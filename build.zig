@@ -60,6 +60,13 @@ pub fn build(b: *std.Build) void {
     const run_solver_tests = b.addRunArtifact(solver_tests);
     b.step("test-solver", "Run solver adapter tests").dependOn(&run_solver_tests.step);
 
+    const refresh_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"repository_refresh.test."},
+    });
+    const run_refresh_tests = b.addRunArtifact(refresh_tests);
+    b.step("test-refresh", "Run repository refresh tests").dependOn(&run_refresh_tests.step);
+
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
         .root_module = b.createModule(.{
