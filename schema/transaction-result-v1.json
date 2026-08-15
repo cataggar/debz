@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/transaction-result-v1",
+  "title": "debz transaction result and provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "target_architecture", "request_sha256",
+    "solver_policy_sha256", "executor_policy_sha256", "plan_sha256",
+    "lock_sha256", "repositories", "packages", "commands", "journal_steps",
+    "recovery_steps", "final_verification", "outcome", "diagnostic",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/transaction-result-v1" },
+    "version": { "const": 1 },
+    "target_architecture": { "type": "string", "minLength": 1 },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "executor_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "lock_sha256": { "$ref": "#/$defs/sha256" },
+    "repositories": { "type": "array" },
+    "packages": { "type": "array" },
+    "commands": { "type": "array" },
+    "journal_steps": { "type": "array" },
+    "recovery_steps": { "type": "array" },
+    "final_verification": { "type": "object" },
+    "outcome": { "enum": ["succeeded", "failed", "interrupted", "recovery_required"] },
+    "diagnostic": { "type": "string" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

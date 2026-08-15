@@ -8,6 +8,8 @@
 - `debz.acquirePackage` downloads or loads an authenticated solver-selected package, verifies its size and SHA-256, and publishes it to an explicit package CAS.
 - `debz.repository_policy` normalizes and atomically orchestrates explicitly declared multi-repository policy.
 - `debz.executeTransaction` revalidates cached artifacts and executes an owned plan against an explicit install root with bounded locks and structured failure provenance.
+- `debz.createExactClosureLock` and `debz.decodeExactClosureLock` create and validate canonical, digest-bound complete solved-closure locks.
+- `debz.createTransactionProvenance` records redacted, digest-bound repository, artifact, command, journal, recovery, and final-verification evidence.
 - `debz.repository_refresh.refreshAuthenticated` verifies repository signatures and metadata before publishing a solver-eligible snapshot.
 - `debz.openpgp_verifier` verifies the project's supported OpenPGP profile without network, process, or ambient keyring access.
 - `debz.deb_payload.validate` performs complete bounded `.deb` payload and authenticated identity validation before transaction handoff.
@@ -17,6 +19,9 @@
 Plan serialization uses canonical schema version 2 in
 [`schema/transaction-plan-v2.json`](schema/transaction-plan-v2.json); version 1
 remains published for compatibility.
+
+Exact lock and transaction result schemas are documented in
+[`doc/exact-locks-and-provenance.md`](doc/exact-locks-and-provenance.md).
 
 See the [documentation index](doc/README.md) and
 [solver planning semantics](doc/solver-planning.md) for current capabilities,

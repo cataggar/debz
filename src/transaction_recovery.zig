@@ -1,8 +1,9 @@
 const std = @import("std");
 const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
+const exact_lock = @import("exact_lock.zig");
 
-pub const journal_version: u32 = 1;
+pub const journal_version: u32 = 2;
 
 pub const State = enum {
     not_started,
@@ -29,6 +30,7 @@ pub const Journal = struct {
     plan_sha256: [32]u8,
     root_identity: [32]u8,
     policy_sha256: [32]u8,
+    lock_sha256: ?[32]u8 = null,
     next_command: usize,
     commands: []const Command,
     failure: ?[]const u8 = null,
@@ -349,6 +351,9 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
     try writeDigest(writer, "plan", journal.plan_sha256);
     try writeDigest(writer, "root", journal.root_identity);
     try writeDigest(writer, "policy", journal.policy_sha256);
+    try writer.writeAll("lock\t");
+    if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
+    try writer.writeByte('\n');
     try writer.print("next\t{d}\ncommands\t{d}\n", .{ journal.next_command, journal.commands.len });
     for (journal.commands) |command| {
         try writer.writeAll("command\t");
@@ -411,6 +416,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
     const plan = try parseDigestLine(lines.next(), "plan");
     const root = try parseDigestLine(lines.next(), "root");
     const policy = try parseDigestLine(lines.next(), "policy");
+    const lock = try parseOptionalDigestLine(lines.next(), "lock");
     const next = try parseIntLine(lines.next(), "next");
     const count = try parseIntLine(lines.next(), "commands");
     if (count > 300_001 or next > count) return error.ContradictoryJournal;
@@ -451,6 +457,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
             .plan_sha256 = plan,
             .root_identity = root,
             .policy_sha256 = policy,
+            .lock_sha256 = lock,
             .next_command = next,
             .commands = commands,
             .failure = failure,
@@ -486,6 +493,7 @@ pub fn verify(
             package.status.isFullyInstalled())
             return .{ .failure = .unrelated_package, .package = package.name.value };
     }
+
     for (plan.actions) |action| {
         const observed = database.database.find(action.package, action.architecture);
         if (action.kind == .remove) {
@@ -511,12 +519,113 @@ pub fn verify(
     return .{};
 }
 
+/// Verifies the complete installed closure, not only transaction actions.
+/// Exact version spelling and architecture are compared byte-for-byte.
+pub fn verifyExactLock(
+    allocator: std.mem.Allocator,
+    lock: exact_lock.Lock,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const source = reader.read(allocator, root, maximum_status_bytes) catch
+        return .{ .failure = .status_query_failed };
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return .{ .failure = .status_parse_failed },
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    var installed_count: usize = 0;
+    for (database.database.packages) |package| {
+        if (package.status.requiresRepair())
+            return .{ .failure = .unhealthy_package, .package = package.name.value };
+        if (!package.status.isFullyInstalled()) continue;
+        installed_count += 1;
+        const locked = lock.findIdentity(package.name.value, package.architecture.value) orelse
+            return .{ .failure = .unrelated_package, .package = package.name.value };
+        if (!std.mem.eql(u8, locked.version, package.version.spelling.value))
+            return .{
+                .failure = .expected_identity_mismatch,
+                .package = package.name.value,
+                .expected_version = locked.version,
+                .observed_version = package.version.spelling.value,
+            };
+    }
+    if (installed_count != lock.packages.len) {
+        for (lock.packages) |locked| {
+            const package = database.database.find(locked.name, locked.architecture) orelse
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+            if (!package.status.isFullyInstalled())
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+        }
+        return .{ .failure = .expected_package_missing };
+    }
+    return .{};
+}
+
 fn findAction(actions: []const solver.PlanAction, package: []const u8, architecture: []const u8) ?solver.PlanAction {
     for (actions) |action| {
         if (std.mem.eql(u8, action.package, package) and std.mem.eql(u8, action.architecture, architecture))
             return action;
     }
     return null;
+}
+
+const TestStatusReader = struct {
+    source: []const u8,
+
+    fn interface(self: *TestStatusReader) StatusReader {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, maximum: usize) ![]u8 {
+        const self: *TestStatusReader = @ptrCast(@alignCast(context));
+        if (self.source.len > maximum) return error.StreamTooLong;
+        return allocator.dupe(u8, self.source);
+    }
+};
+
+test "transaction_recovery.test.exact closure verification rejects drift" {
+    const repository_id: [64]u8 = @splat('a');
+    const package: exact_lock.Package = .{
+        .name = "demo",
+        .version = "1:2.0-3",
+        .architecture = "amd64",
+        .repository_id = repository_id,
+        .repository_snapshot_sha256 = @splat(1),
+        .sha256 = @splat(2),
+        .declared_size = 10,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    const lock: exact_lock.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(0),
+        .policy_sha256 = @splat(0),
+        .repositories = &.{},
+        .packages = &.{package},
+        .digest_sha256 = @splat(0),
+    };
+    var exact: TestStatusReader = .{ .source =
+        \\Package: demo
+        \\Status: install ok installed
+        \\Version: 1:2.0-3
+        \\Architecture: amd64
+        \\
+    };
+    try std.testing.expect((try verifyExactLock(std.testing.allocator, lock, "/target", exact.interface(), 4096)).succeeded());
+    var drift: TestStatusReader = .{ .source =
+        \\Package: demo
+        \\Status: install ok installed
+        \\Version: 1:2.0-4
+        \\Architecture: amd64
+        \\
+    };
+    const mismatch = try verifyExactLock(std.testing.allocator, lock, "/target", drift.interface(), 4096);
+    try std.testing.expectEqual(VerificationFailure.expected_identity_mismatch, mismatch.failure.?);
 }
 
 fn writeDigest(writer: anytype, name: []const u8, digest: [32]u8) !void {
@@ -555,6 +664,14 @@ fn parseDigestLine(line: ?[]const u8, name: []const u8) ![32]u8 {
     var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
     if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
     const result = try parseDigest(fields.next() orelse return error.MalformedJournal);
+    if (fields.next() != null) return error.MalformedJournal;
+    return result;
+}
+
+fn parseOptionalDigestLine(line: ?[]const u8, name: []const u8) !?[32]u8 {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
+    const result = try optionalDigest(fields.next() orelse return error.MalformedJournal);
     if (fields.next() != null) return error.MalformedJournal;
     return result;
 }

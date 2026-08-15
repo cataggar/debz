@@ -2,6 +2,7 @@ const std = @import("std");
 const solver = @import("solver.zig");
 const deb_payload = @import("deb_payload.zig");
 const recovery = @import("transaction_recovery.zig");
+const exact_lock = @import("exact_lock.zig");
 
 pub const Phase = enum { remove, unpack, configure, triggers, audit };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
@@ -49,6 +50,7 @@ pub const Request = struct {
     install_root: []const u8,
     artifacts: []const Artifact,
     policy: Policy,
+    exact_lock: ?*const exact_lock.Lock = null,
 };
 
 pub const EnvironmentEntry = struct {
@@ -173,6 +175,8 @@ pub const CommandProvenance = struct {
     package: ?[]const u8,
     version: ?[]const u8,
     architecture: ?[]const u8,
+    argv: []const []const u8 = &.{},
+    environment: []const EnvironmentEntry = &.{},
     command_sha256: [32]u8,
     artifact_sha256: ?[32]u8,
 };
@@ -221,6 +225,7 @@ pub const Report = struct {
     transaction_state: recovery.State,
     root_identity: [32]u8,
     policy_sha256: [32]u8,
+    lock_sha256: ?[32]u8,
     failure: ?Failure,
 
     pub fn succeeded(self: Report) bool {
@@ -239,6 +244,7 @@ pub const RecoveryRequest = struct {
     plan: *const solver.Plan,
     install_root: []const u8,
     policy: Policy,
+    exact_lock: ?*const exact_lock.Lock = null,
 };
 
 pub const RecoveryReport = struct {
@@ -249,6 +255,7 @@ pub const RecoveryReport = struct {
     plan_sha256: [32]u8,
     root_identity: [32]u8,
     policy_sha256: [32]u8,
+    lock_sha256: ?[32]u8,
     failure: ?Failure,
 
     pub fn succeeded(self: RecoveryReport) bool {
@@ -270,6 +277,7 @@ const State = struct {
     transaction_state: recovery.State = .not_started,
     root_identity: [32]u8 = @splat(0),
     policy_sha256: [32]u8 = @splat(0),
+    lock_sha256: ?[32]u8 = null,
 };
 
 pub fn execute(
@@ -287,6 +295,7 @@ pub fn execute(
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
+    state.lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
 
     preflight(arena, request, dependencies.filesystem) catch |err| {
         state.failure = .{
@@ -358,6 +367,7 @@ pub fn execute(
         .plan_sha256 = plan_sha256,
         .root_identity = state.root_identity,
         .policy_sha256 = state.policy_sha256,
+        .lock_sha256 = state.lock_sha256,
         .next_command = 0,
         .commands = journal_commands,
     };
@@ -444,6 +454,8 @@ pub fn execute(
             .package = try arena.dupe(u8, ordered.package),
             .version = try arena.dupe(u8, ordered.version),
             .architecture = try arena.dupe(u8, ordered.architecture),
+            .argv = argv,
+            .environment = &audited_environment,
             .command_sha256 = hashInvocation(argv, &audited_environment),
             .artifact_sha256 = artifact_digest,
         };
@@ -591,6 +603,8 @@ pub fn execute(
             .package = null,
             .version = null,
             .architecture = null,
+            .argv = argv,
+            .environment = &audited_environment,
             .command_sha256 = hashInvocation(argv, &audited_environment),
             .artifact_sha256 = null,
         });
@@ -666,7 +680,7 @@ pub fn execute(
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist verification boundary");
         return finish(allocator, arena_ptr, &state, plan_sha256);
     };
-    const verification = recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{}) catch |err| {
+    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status) catch |err| {
         journal.state = .verification_failed;
         journal.failure = @errorName(err);
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -726,12 +740,14 @@ pub fn recover(
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
+    state.lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
 
     preflight(arena, .{
         .plan = request.plan,
         .install_root = request.install_root,
         .artifacts = &.{},
         .policy = request.policy,
+        .exact_lock = request.exact_lock,
     }, dependencies.filesystem) catch |err| {
         // Recovery does not need package artifacts, so only retain root, plan,
         // and policy validation errors from the shared preflight.
@@ -757,9 +773,10 @@ pub fn recover(
     state.transaction_state = journal.state;
     if (!std.mem.eql(u8, &journal.plan_sha256, &plan_sha256) or
         !std.mem.eql(u8, &journal.root_identity, &state.root_identity) or
-        !std.mem.eql(u8, &journal.policy_sha256, &state.policy_sha256))
+        !std.mem.eql(u8, &journal.policy_sha256, &state.policy_sha256) or
+        !optionalDigestEqual(journal.lock_sha256, state.lock_sha256))
     {
-        state.failure = .{ .code = .journal_mismatch, .diagnostic = "journal plan, root, or executor policy does not match" };
+        state.failure = .{ .code = .journal_mismatch, .diagnostic = "journal plan, root, executor policy, or exact lock does not match" };
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     }
     const root_flag = try std.fmt.allocPrint(arena, "--root={s}", .{request.install_root});
@@ -790,7 +807,7 @@ pub fn recover(
             state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
-        const verification = try recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{});
+        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status);
         if (!verification.succeeded()) {
             journal.state = .verification_failed;
             journal.failure = @tagName(verification.failure.?);
@@ -880,6 +897,8 @@ pub fn recover(
             .package = null,
             .version = null,
             .architecture = null,
+            .argv = command.argv,
+            .environment = &audited_environment,
             .command_sha256 = hashInvocation(command.argv, &audited_environment),
             .artifact_sha256 = null,
         });
@@ -923,7 +942,7 @@ pub fn recover(
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
 
-    const verification = try recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{});
+    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status);
     if (!verification.succeeded()) {
         journal.state = .verification_failed;
         journal.failure = @tagName(verification.failure.?);
@@ -965,6 +984,7 @@ fn finishRecovery(
         .plan_sha256 = plan_sha256,
         .root_identity = state.root_identity,
         .policy_sha256 = state.policy_sha256,
+        .lock_sha256 = state.lock_sha256,
         .failure = state.failure,
     };
 }
@@ -984,8 +1004,21 @@ fn finish(
         .transaction_state = state.transaction_state,
         .root_identity = state.root_identity,
         .policy_sha256 = state.policy_sha256,
+        .lock_sha256 = state.lock_sha256,
         .failure = state.failure,
     };
+}
+
+fn verifyFinal(
+    allocator: std.mem.Allocator,
+    plan: solver.Plan,
+    lock: ?*const exact_lock.Lock,
+    root: []const u8,
+    status: recovery.StatusReader,
+) !recovery.Verification {
+    if (lock) |closure|
+        return recovery.verifyExactLock(allocator, closure.*, root, status, 64 * 1024 * 1024);
+    return recovery.verify(allocator, plan, root, status, .{});
 }
 
 fn buildJournalCommands(
@@ -1050,6 +1083,22 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     if (request.plan.mode != .plan_only) return error.NonExecutablePlanMode;
     if (request.plan.actions.len > 100_000 or request.plan.ordered_actions.len > 300_000)
         return error.PlanTooLarge;
+    if (request.exact_lock) |lock| {
+        if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
+            return error.LockArchitectureMismatch;
+        for (request.plan.actions) |action| {
+            if (action.kind == .remove) continue;
+            const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
+                return error.PlanOutsideLockedClosure;
+            if (action.repository == null or action.sha256 == null or action.package_size == null)
+                return error.MissingAuthenticatedArtifactMetadata;
+            const digest = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
+            if (!std.mem.eql(u8, &locked.repository_id, &action.repository.?.id) or
+                !std.mem.eql(u8, &locked.sha256, &digest) or
+                locked.declared_size != action.package_size.?)
+                return error.PlanLockEvidenceMismatch;
+        }
+    }
     if (request.policy.process_timeout_ms == 0) return error.InvalidProcessTimeout;
     if (request.policy.maximum_diagnostic_bytes > maximum_diagnostic_limit)
         return error.DiagnosticLimitTooLarge;
@@ -1497,6 +1546,11 @@ fn hashPolicy(policy: Policy) [32]u8 {
         hash.update("\x00");
     }
     return hash.finalResult();
+}
+
+fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, &left.?, &right.?);
 }
 
 fn preflightCode(err: anyerror) FailureCode {

@@ -9,3 +9,4 @@
 - [Transaction plan schema v2](../schema/transaction-plan-v2.json) is the current canonical schema; [v1](../schema/transaction-plan-v1.json) remains available for compatibility.
 - [Debian payload validation](deb-payload-validation.md) documents resource limits, tar/path/link policy, identity checks, inventories, diagnostics, and fuzzing.
 - [Dpkg transaction executor](transaction-executor.md) documents install-root safety, locks, argv/environment policy, ordering, triggers, force policy, and failure provenance.
+- [Exact closure locks and transaction provenance](exact-locks-and-provenance.md) documents canonical schemas, reproduction constraints, redaction, persistence, recovery evidence, and final verification.
