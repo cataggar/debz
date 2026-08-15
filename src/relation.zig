@@ -28,9 +28,23 @@ pub const VersionConstraint = struct {
     span: Span,
 };
 
-/// Reserved extension point for architecture and build-profile restrictions.
-/// The first parser intentionally accepts neither syntax yet.
-pub const RestrictionSet = struct {};
+pub const Restriction = struct {
+    name: Token,
+    negated: bool,
+    span: Span,
+};
+
+pub const RestrictionList = struct {
+    restrictions: []Restriction,
+    span: Span,
+};
+
+/// Architecture restrictions are one bracketed list. Build profiles preserve
+/// each angle-bracket group because groups are ANDed while entries are ORed.
+pub const RestrictionSet = struct {
+    architectures: ?RestrictionList = null,
+    build_profiles: []RestrictionList = &.{},
+};
 
 pub const PackageReference = struct {
     name: Token,
@@ -56,7 +70,16 @@ pub const Relation = struct {
     span: Span,
 
     pub fn deinit(self: *Relation, allocator: std.mem.Allocator) void {
-        for (self.groups) |group| allocator.free(group.alternatives);
+        for (self.groups) |group| {
+            for (group.alternatives) |alternative| {
+                if (alternative.restrictions.architectures) |list|
+                    allocator.free(list.restrictions);
+                for (alternative.restrictions.build_profiles) |list|
+                    allocator.free(list.restrictions);
+                allocator.free(alternative.restrictions.build_profiles);
+            }
+            allocator.free(group.alternatives);
+        }
         allocator.free(self.groups);
         self.* = undefined;
     }
@@ -69,6 +92,9 @@ pub const Limits = struct {
     max_total_alternatives: usize = 4096,
     max_package_name_bytes: usize = 255,
     max_architecture_qualifier_bytes: usize = 64,
+    max_restrictions_per_list: usize = 128,
+    max_build_profile_lists: usize = 32,
+    max_restriction_name_bytes: usize = 64,
     max_version_bytes: usize = 4096,
 };
 
@@ -88,7 +114,13 @@ pub const DiagnosticCode = enum {
     expected_closing_parenthesis,
     expected_separator,
     trailing_separator,
-    unsupported_restriction,
+    expected_restriction,
+    invalid_restriction,
+    restriction_name_too_long,
+    expected_closing_bracket,
+    expected_closing_angle,
+    duplicate_architecture_restriction,
+    too_many_restrictions,
     too_many_groups,
     too_many_alternatives,
 };
@@ -114,7 +146,13 @@ pub const Diagnostic = struct {
             .expected_closing_parenthesis => "expected ')' to close the version predicate",
             .expected_separator => "expected ',', '|', or the end of the relation",
             .trailing_separator => "expected another package after the separator",
-            .unsupported_restriction => "architecture and build-profile restrictions are not supported yet",
+            .expected_restriction => "expected a restriction name",
+            .invalid_restriction => "restriction names must contain only lowercase letters, digits, '+' or '-'",
+            .restriction_name_too_long => "restriction name exceeds the configured length limit",
+            .expected_closing_bracket => "expected ']' to close the architecture restriction list",
+            .expected_closing_angle => "expected '>' to close the build-profile restriction list",
+            .duplicate_architecture_restriction => "only one architecture restriction list is permitted per alternative",
+            .too_many_restrictions => "relation exceeds a configured restriction-count limit",
             .too_many_groups => "relation exceeds the configured dependency-group limit",
             .too_many_alternatives => "relation exceeds a configured alternative-count limit",
         };
@@ -223,9 +261,6 @@ const Parser = struct {
                 continue;
             }
 
-            if (self.peek() == '[' or self.peek() == '<') {
-                return self.fail(.unsupported_restriction, self.pointSpan());
-            }
             return self.fail(.expected_separator, self.pointSpan());
         }
     }
@@ -243,7 +278,36 @@ const Parser = struct {
         var version: ?VersionConstraint = null;
         if (self.consume('(')) version = try self.parseVersionConstraint(self.index - 1);
 
-        const end = if (version) |constraint|
+        var restrictions: RestrictionSet = .{};
+        errdefer {
+            if (restrictions.architectures) |list| self.allocator.free(list.restrictions);
+            for (restrictions.build_profiles) |list| self.allocator.free(list.restrictions);
+            self.allocator.free(restrictions.build_profiles);
+        }
+        var profile_lists: std.ArrayList(RestrictionList) = .empty;
+        defer profile_lists.deinit(self.allocator);
+        errdefer for (profile_lists.items) |list| self.allocator.free(list.restrictions);
+        self.skipWhitespace();
+        while (!self.atEnd() and (self.peek() == '[' or self.peek() == '<')) {
+            if (self.consume('[')) {
+                if (restrictions.architectures != null)
+                    return self.fail(.duplicate_architecture_restriction, self.pointSpan());
+                restrictions.architectures = try self.parseRestrictionList('[', ']');
+            } else {
+                _ = self.consume('<');
+                if (profile_lists.items.len >= self.limits.max_build_profile_lists)
+                    return self.fail(.too_many_restrictions, self.pointSpan());
+                try profile_lists.append(self.allocator, try self.parseRestrictionList('<', '>'));
+            }
+            self.skipWhitespace();
+        }
+        restrictions.build_profiles = try profile_lists.toOwnedSlice(self.allocator);
+
+        const end = if (restrictions.build_profiles.len != 0)
+            restrictions.build_profiles[restrictions.build_profiles.len - 1].span.end
+        else if (restrictions.architectures) |list|
+            list.span.end
+        else if (version) |constraint|
             constraint.span.end
         else if (package.architecture_qualifier) |qualifier|
             qualifier.span.end
@@ -253,7 +317,45 @@ const Parser = struct {
         return .{
             .package = package,
             .version = version,
+            .restrictions = restrictions,
             .span = .{ .start = start, .end = end },
+        };
+    }
+
+    fn parseRestrictionList(self: *Parser, open: u8, close: u8) Error!RestrictionList {
+        const start = self.index - 1;
+        var items: std.ArrayList(Restriction) = .empty;
+        errdefer items.deinit(self.allocator);
+        self.skipWhitespace();
+        while (!self.atEnd() and self.peek() != close) {
+            if (items.items.len >= self.limits.max_restrictions_per_list)
+                return self.fail(.too_many_restrictions, self.pointSpan());
+            const item_start = self.index;
+            const negated = self.consume('!');
+            const name_start = self.index;
+            if (self.atEnd() or !isRestrictionCharacter(self.peek()))
+                return self.fail(.expected_restriction, self.pointSpan());
+            while (!self.atEnd() and isRestrictionCharacter(self.peek())) self.index += 1;
+            if (self.index - name_start > self.limits.max_restriction_name_bytes)
+                return self.fail(.restriction_name_too_long, .{ .start = name_start, .end = self.index });
+            if (!self.atEnd() and !isWhitespace(self.peek()) and self.peek() != close)
+                return self.fail(.invalid_restriction, self.pointSpan());
+            try items.append(self.allocator, .{
+                .name = self.token(name_start, self.index),
+                .negated = negated,
+                .span = .{ .start = item_start, .end = self.index },
+            });
+            self.skipWhitespace();
+        }
+        if (items.items.len == 0) return self.fail(.expected_restriction, self.pointSpan());
+        if (self.atEnd()) return self.fail(
+            if (open == '[') .expected_closing_bracket else .expected_closing_angle,
+            .{ .start = start, .end = self.index },
+        );
+        self.index += 1;
+        return .{
+            .restrictions = try items.toOwnedSlice(self.allocator),
+            .span = .{ .start = start, .end = self.index },
         };
     }
 
@@ -419,6 +521,10 @@ fn isArchitectureCharacter(byte: u8) bool {
     return isLowerAlphaNumeric(byte) or byte == '-';
 }
 
+fn isRestrictionCharacter(byte: u8) bool {
+    return isLowerAlphaNumeric(byte) or byte == '-' or byte == '+';
+}
+
 fn isPackageDelimiter(byte: u8) bool {
     return isWhitespace(byte) or byte == ':' or byte == '(' or byte == '|' or byte == ',' or
         byte == '[' or byte == '<';
@@ -528,7 +634,7 @@ test "reports actionable malformed input diagnostics with source spans" {
         .{ .source = "foo (>= 1", .code = .expected_closing_parenthesis, .selected = "(>= 1" },
         .{ .source = "foo |", .code = .trailing_separator, .selected = "|" },
         .{ .source = "foo bar", .code = .expected_separator, .selected = "b" },
-        .{ .source = "foo [amd64]", .code = .unsupported_restriction, .selected = "[" },
+        .{ .source = "foo [amd64", .code = .expected_closing_bracket, .selected = "[amd64" },
     };
 
     for (cases) |case| {
@@ -536,6 +642,20 @@ test "reports actionable malformed input diagnostics with source spans" {
         try std.testing.expectEqualStrings(case.selected, diagnostic.span.slice(case.source));
         try std.testing.expect(diagnostic.message().len != 0);
     }
+}
+
+test "parses and preserves architecture and build profile restrictions" {
+    const source = "foo:any (>= 2) [amd64 !arm64] <stage1 !nocheck> <!cross>";
+    var parsed = try expectRelation(source);
+    defer parsed.deinit(std.testing.allocator);
+    const alternative = parsed.groups[0].alternatives[0];
+    const architectures = alternative.restrictions.architectures.?;
+    try std.testing.expectEqual(@as(usize, 2), architectures.restrictions.len);
+    try std.testing.expectEqualStrings("amd64", architectures.restrictions[0].name.text);
+    try std.testing.expect(architectures.restrictions[1].negated);
+    try std.testing.expectEqual(@as(usize, 2), alternative.restrictions.build_profiles.len);
+    try std.testing.expectEqualStrings("stage1", alternative.restrictions.build_profiles[0].restrictions[0].name.text);
+    try std.testing.expectEqualStrings("foo:any (>= 2) [amd64 !arm64] <stage1 !nocheck> <!cross>", alternative.span.slice(source));
 }
 
 test "enforces configurable input and count limits" {
