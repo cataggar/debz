@@ -59,6 +59,7 @@ pub const CommonOptions = struct {
     keyring_paths: []const []const u8 = &.{},
     cache_path: []const u8,
     state_path: []const u8,
+    status_path: ?[]const u8 = null,
     architecture: []const u8,
     default_release: ?[]const u8 = null,
     repository_policy: RepositoryPolicy = .strict_priority,
@@ -193,6 +194,8 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
     if (!validAbsolutePath(request.options.install_root) or
         !validAbsolutePath(request.options.cache_path) or
         !validAbsolutePath(request.options.state_path) or
+        (request.options.status_path != null and !validAbsolutePath(request.options.status_path.?)) or
+        (request.options.credential_reference != null and !validAbsolutePath(request.options.credential_reference.?)) or
         !validArchitecture(request.options.architecture) or
         request.options.deadline_ms == 0)
         return failure(request.operation, .usage, .invalid_request, "invalid explicit path, architecture, or deadline");

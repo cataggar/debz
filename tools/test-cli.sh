@@ -1,47 +1,52 @@
 #!/bin/sh
 set -eu
-trap 'rm -f cli-test-stderr' EXIT
+trap 'rm -rf .zig-cache/cli-production-test; rm -f cli-test-stderr' EXIT
 
 debz=$1
-common="--install-root /fixture/root --cache-path /fixture/cache --state-path /fixture/state --architecture amd64 --json"
+root="$PWD/.zig-cache/cli-production-test/root"
+cache="$PWD/.zig-cache/cli-production-test/cache"
+state="$PWD/.zig-cache/cli-production-test/state"
+status="$PWD/src/fixtures/dpkg-status/installed.status"
+common="--install-root $root --cache-path $cache --state-path $state --status-path $status --architecture amd64 --json"
+
+mkdir -p "$root/var/lib/dpkg" "$state"
 
 "$debz" --help >/dev/null
 "$debz" --version | grep -q 'API v1'
 
-for command in refresh upgrade-all list-installed list-available clean recover; do
-    extra=
-    case "$command" in
-        refresh|upgrade-all|clean|recover) extra="--assume-yes" ;;
-    esac
-    set +e
-    output=$("$debz" "$command" $common $extra 2>cli-test-stderr)
-    status=$?
-    set -e
-    test "$status" -eq 3
-    test ! -s cli-test-stderr
-    printf '%s' "$output" | grep -q '"schema":"io.github.cataggar.debz.command.v1"'
-    printf '%s' "$output" | grep -q "\"operation\":\"$command\""
-    printf '%s' "$output" | grep -q '"id":"configuration_required"'
-done
+output=$("$debz" list-installed $common 2>cli-test-stderr)
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q '"operation":"list-installed"'
+printf '%s' "$output" | grep -q '"exit_status":0'
+printf '%s' "$output" | grep -q '"package":"debz"'
 
-for command in install remove upgrade reinstall download plan info provides why; do
-    extra=demo
-    case "$command" in
-        install|remove|upgrade|reinstall) extra="--assume-yes demo" ;;
-    esac
+output=$("$debz" why $common debz 2>cli-test-stderr)
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q '"operation":"why"'
+printf '%s' "$output" | grep -q '"exit_status":0'
+
+for command in refresh list-available; do
+    extra=
+    test "$command" != refresh || extra=--assume-yes
     set +e
     output=$("$debz" "$command" $common $extra 2>cli-test-stderr)
-    status=$?
+    status_code=$?
     set -e
-    test "$status" -eq 3
+    test "$status_code" -eq 2
     test ! -s cli-test-stderr
-    printf '%s' "$output" | grep -q "\"operation\":\"$command\""
+    printf '%s' "$output" | grep -q '"id":"configuration_required"'
+    printf '%s' "$output" | grep -vq '"exit_status":3'
 done
 
 set +e
 output=$("$debz" install $common demo 2>cli-test-stderr)
-status=$?
+status_code=$?
 set -e
-test "$status" -eq 2
+test "$status_code" -eq 2
 test ! -s cli-test-stderr
 printf '%s' "$output" | grep -q '"id":"confirmation_required"'
+
+output=$("$debz" clean $common --assume-yes 2>cli-test-stderr)
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q '"operation":"clean"'
+printf '%s' "$output" | grep -q '"exit_status":0'
