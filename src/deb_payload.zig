@@ -16,6 +16,7 @@ pub const Limits = struct {
     max_inventory_bytes_per_tar: usize = 128 * 1024 * 1024,
     max_control_file_bytes: usize = 4 * 1024 * 1024,
     max_conffiles_bytes: usize = 4 * 1024 * 1024,
+    max_conffiles: usize = 100_000,
     max_total_entry_bytes: u64 = 4 * 1024 * 1024 * 1024,
 };
 
@@ -66,6 +67,8 @@ pub const Code = enum {
     request_mismatch,
     filename_mismatch,
     invalid_conffiles,
+    conffiles_limit,
+    duplicate_conffile,
     out_of_memory,
 };
 
@@ -110,6 +113,8 @@ pub const Diagnostic = struct {
             .request_mismatch => "authenticated selection differs from the solver request",
             .filename_mismatch => "repository filename does not match the accepted package filename convention",
             .invalid_conffiles => "conffiles contains an unsafe or malformed path",
+            .conffiles_limit => "conffiles exceeds the configured entry limit",
+            .duplicate_conffile => "conffiles contains a duplicate normalized path",
             .out_of_memory => "validation allocation failed",
         };
     }
@@ -354,6 +359,9 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             return setTarFailure(diagnostic, stage, .tar_entry_limit, member, offset, entries.items.len);
         if (!validChecksum(header))
             return setTarFailure(diagnostic, stage, .tar_bad_checksum, member, offset, entries.items.len);
+        if (!std.mem.eql(u8, header[257..263], "ustar\x00") or
+            !std.mem.eql(u8, header[263..265], "00"))
+            return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 257, entries.items.len);
         const size = parseOctal(header[124..136]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 124, entries.items.len);
         const mode_u64 = parseOctal(header[100..108]) orelse
@@ -399,20 +407,30 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
                 return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
             if (raw_link.len > limits.max_link_bytes)
                 return setTarFailure(diagnostic, stage, .link_too_long, member, offset + 157, entries.items.len);
-            link_target = resolveLink(allocator, path, raw_link, kind == .hardlink, limits.max_path_bytes) catch |err| switch (err) {
+            const target = resolveLink(allocator, path, raw_link, kind == .hardlink, limits.max_path_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return setTarFailure(diagnostic, stage, .out_of_memory, member, offset + 157, entries.items.len),
                 error.TooLong => return setTarFailure(diagnostic, stage, .link_too_long, member, offset + 157, entries.items.len),
                 else => return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len),
             };
-            errdefer allocator.free(link_target.?);
             if (kind == .hardlink) {
-                const target_kind = paths.get(link_target.?) orelse
+                const target_kind = paths.get(target) orelse {
+                    allocator.free(target);
                     return setTarFailure(diagnostic, stage, .forward_hardlink, member, offset + 157, entries.items.len);
-                if (target_kind != .regular)
+                };
+                if (target_kind != .regular) {
+                    allocator.free(target);
                     return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+                }
+            } else if (hasSymlinkAtOrAbove(&paths, target)) {
+                allocator.free(target);
+                return setTarFailure(diagnostic, stage, .conflicting_path, member, offset + 157, entries.items.len);
             }
+            link_target = target;
         }
+        errdefer if (link_target) |target| allocator.free(target);
         if (hasSymlinkAncestor(&paths, path))
+            return setTarFailure(diagnostic, stage, .conflicting_path, member, offset, entries.items.len);
+        if (kind == .symlink and makesExistingLinkTargetSymlinkMediated(entries.items, path))
             return setTarFailure(diagnostic, stage, .conflicting_path, member, offset, entries.items.len);
         inventory_bytes = std.math.add(usize, inventory_bytes, @sizeOf(Entry)) catch
             return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
@@ -560,6 +578,22 @@ fn hasSymlinkAncestor(paths: *const std.StringHashMap(EntryKind), path: []const 
     return false;
 }
 
+fn hasSymlinkAtOrAbove(paths: *const std.StringHashMap(EntryKind), path: []const u8) bool {
+    if (paths.get(path) == .symlink) return true;
+    return hasSymlinkAncestor(paths, path);
+}
+
+fn makesExistingLinkTargetSymlinkMediated(entries: []const Entry, path: []const u8) bool {
+    for (entries) |entry| {
+        if (entry.kind != .symlink) continue;
+        const target = entry.link_target.?;
+        if (std.mem.eql(u8, target, path) or
+            (target.len > path.len and std.mem.startsWith(u8, target, path) and target[path.len] == '/'))
+            return true;
+    }
+    return false;
+}
+
 fn validChecksum(header: []const u8) bool {
     const declared = parseOctal(header[148..156]) orelse return false;
     var sum: u64 = 0;
@@ -617,6 +651,8 @@ fn scriptName(path: []const u8) ?[]const u8 {
 
 fn parseConffiles(allocator: std.mem.Allocator, bytes: []const u8, entries: []const Entry, limits: Limits, member_offset: usize, diagnostic: *Diagnostic) error{Invalid}![]Conffile {
     var result: std.ArrayList(Conffile) = .empty;
+    var paths = std.StringHashMap(void).init(allocator);
+    defer paths.deinit();
     errdefer {
         for (result.items) |conffile| allocator.free(conffile.path);
         result.deinit(allocator);
@@ -638,9 +674,22 @@ fn parseConffiles(allocator: std.mem.Allocator, bytes: []const u8, entries: []co
             const qualifier = if (separator) |index| std.mem.trim(u8, line[index..], " \t") else "";
             if (qualifier.len != 0 and !std.mem.eql(u8, qualifier, "obsolete"))
                 return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
-            const path = canonicalPath(allocator, path_text[1..], limits.max_path_bytes, false) catch
-                return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
+            if (result.items.len >= limits.max_conffiles)
+                return setFailure(diagnostic, .conffiles, .conffiles_limit, member_offset + entry.content_offset);
+            const path = canonicalPath(allocator, path_text[1..], limits.max_path_bytes, false) catch |err| switch (err) {
+                error.OutOfMemory => return setFailure(diagnostic, .conffiles, .out_of_memory, member_offset + entry.content_offset),
+                else => return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset),
+            };
+            if (paths.contains(path)) {
+                allocator.free(path);
+                return setFailure(diagnostic, .conffiles, .duplicate_conffile, member_offset + entry.content_offset);
+            }
+            paths.put(path, {}) catch {
+                allocator.free(path);
+                return setFailure(diagnostic, .conffiles, .out_of_memory, member_offset + entry.content_offset);
+            };
             result.append(allocator, .{ .path = path, .obsolete = qualifier.len != 0 }) catch {
+                _ = paths.remove(path);
                 allocator.free(path);
                 return setFailure(diagnostic, .conffiles, .out_of_memory, member_offset + entry.content_offset);
             };
@@ -751,12 +800,12 @@ fn appendAr(allocator: std.mem.Allocator, ar: *std.ArrayList(u8), name: []const 
     if (content.len % 2 != 0) try ar.append(allocator, '\n');
 }
 
-fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
+fn testDebWithConffiles(allocator: std.mem.Allocator, bad_data_path: ?[]const u8, conffiles: []const u8) ![]u8 {
     var control: std.ArrayList(u8) = .empty;
     defer control.deinit(allocator);
     try appendTarEntry(allocator, &control, "./control", '0', 0o644, "", "Package: demo\nVersion: 1.0\nArchitecture: amd64\n");
     try appendTarEntry(allocator, &control, "./postinst", '0', 0o755, "", "#!/bin/sh\n");
-    try appendTarEntry(allocator, &control, "./conffiles", '0', 0o644, "", "/etc/demo.conf\n");
+    try appendTarEntry(allocator, &control, "./conffiles", '0', 0o644, "", conffiles);
     try finishTar(allocator, &control);
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
@@ -769,6 +818,10 @@ fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
     try appendAr(allocator, &ar, "control.tar/", control.items);
     try appendAr(allocator, &ar, "data.tar/", data.items);
     return ar.toOwnedSlice(allocator);
+}
+
+fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
+    return testDebWithConffiles(allocator, bad_data_path, "/etc/demo.conf\n");
 }
 
 fn expectedFor(bytes: []const u8) Expected {
@@ -876,6 +929,19 @@ test "rejects traversal identity digest limits and corrupt tar" {
     try std.testing.expectEqual(Code.tar_bad_checksum, validate(allocator, corrupt, expected, .{}).diagnostic.code);
 }
 
+test "conffiles inventory rejects duplicates and entry bombs" {
+    const allocator = std.testing.allocator;
+    const duplicate = try testDebWithConffiles(allocator, null, "/etc/demo.conf\n/etc/demo.conf\n");
+    defer allocator.free(duplicate);
+    try std.testing.expectEqual(Code.duplicate_conffile, validate(allocator, duplicate, expectedFor(duplicate), .{}).diagnostic.code);
+
+    const limited = try testDebWithConffiles(allocator, null, "/etc/a\n/etc/b\n");
+    defer allocator.free(limited);
+    try std.testing.expectEqual(Code.conffiles_limit, validate(allocator, limited, expectedFor(limited), .{
+        .max_conffiles = 1,
+    }).diagnostic.code);
+}
+
 test "rejects duplicate paths special files unsafe links and entry bombs" {
     const allocator = std.testing.allocator;
     var tar: std.ArrayList(u8) = .empty;
@@ -916,13 +982,36 @@ test "rejects duplicate paths special files unsafe links and entry bombs" {
     try appendTarEntry(allocator, &tar, "root/file", '0', 0o644, "", "");
     try finishTar(allocator, &tar);
     try std.testing.expectError(error.Conflict, parseTarTest(allocator, tar.items, member, .{}));
+
+    tar.clearRetainingCapacity();
+    try appendTarEntry(allocator, &tar, "a", '2', 0o777, "b", "");
+    try appendTarEntry(allocator, &tar, "b", '2', 0o777, "a", "");
+    try finishTar(allocator, &tar);
+    try std.testing.expectError(error.Conflict, parseTarTest(allocator, tar.items, member, .{}));
+
+    tar.clearRetainingCapacity();
+    try appendTarEntry(allocator, &tar, "a", '2', 0o777, "b/c", "");
+    try appendTarEntry(allocator, &tar, "b", '2', 0o777, "safe", "");
+    try finishTar(allocator, &tar);
+    try std.testing.expectError(error.Conflict, parseTarTest(allocator, tar.items, member, .{}));
+
+    tar.clearRetainingCapacity();
+    try appendTarEntry(allocator, &tar, "a", '0', 0o644, "", "");
+    try finishTar(allocator, &tar);
+    @memset(tar.items[257..265], 0);
+    var checksum_header = tar.items[0..512];
+    @memset(checksum_header[148..156], ' ');
+    var checksum: u64 = 0;
+    for (checksum_header) |byte| checksum += byte;
+    writeOctal(checksum_header[148..156], checksum);
+    try std.testing.expectError(error.Unsupported, parseTarTest(allocator, tar.items, member, .{}));
 }
 
 fn parseTarTest(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, limits: Limits) !void {
     var diagnostic: Diagnostic = undefined;
     var inventory = parseTar(allocator, bytes, member, .data_tar, limits, &diagnostic) catch switch (diagnostic.code) {
         .duplicate_path => return error.DuplicatePath,
-        .unsupported_file_type => return error.Unsupported,
+        .unsupported_file_type, .unsupported_tar_extension => return error.Unsupported,
         .unsafe_link => return error.UnsafeLink,
         .tar_entry_limit => return error.EntryLimit,
         .tar_metadata_limit => return error.MetadataLimit,
