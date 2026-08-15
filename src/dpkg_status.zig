@@ -40,7 +40,7 @@ pub const Status = struct {
 
     pub fn requiresRepair(self: Status) bool {
         return self.error_state == .reinst_required or switch (self.current) {
-            .half_installed, .half_configured, .triggers_awaited, .triggers_pending => true,
+            .half_installed, .unpacked, .half_configured, .triggers_awaited, .triggers_pending => true,
             else => false,
         };
     }
