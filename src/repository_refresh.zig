@@ -178,9 +178,6 @@ pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
     hash.update(&result.snapshot.provenance.index_digest.bytes);
     if (result.snapshot.provenance.authentication_evidence.signature_digest) |digest|
         hash.update(&digest.bytes);
-    hash.update(result.snapshot.provenance.selected_path);
-    hash.update("\x00");
-    hash.update(@tagName(result.snapshot.provenance.compression));
     for (result.snapshot.provenance.authentication_evidence.signatures) |signature| {
         if (signature.primary_fingerprint) |fingerprint| hash.update(&fingerprint);
         if (signature.signing_fingerprint) |fingerprint| hash.update(&fingerprint);

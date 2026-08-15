@@ -93,7 +93,10 @@ pub const ValidationError = error{
     EmptyArchitecture,
     EmptyClosure,
     InvalidIdentity,
+    MissingSigner,
+    DuplicateSigner,
     DuplicateRepository,
+    UnusedRepository,
     DuplicatePackage,
     MissingRepository,
     RepositorySnapshotMismatch,
@@ -117,9 +120,14 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
 
     const repositories = try owned.alloc(Repository, input.repositories.len);
     for (input.repositories, 0..) |repository, index| {
-        if (!validHex(&repository.id)) return error.InvalidIdentity;
+        if (!validLowerHex(&repository.id)) return error.InvalidIdentity;
+        if (repository.signer_fingerprints.len == 0) return error.MissingSigner;
         const fingerprints = try owned.dupe([20]u8, repository.signer_fingerprints);
         std.mem.sort([20]u8, fingerprints, {}, lessBytes20);
+        for (fingerprints, 0..) |fingerprint, signer_index| {
+            if (signer_index != 0 and std.mem.eql(u8, &fingerprint, &fingerprints[signer_index - 1]))
+                return error.DuplicateSigner;
+        }
         repositories[index] = repository;
         repositories[index].signer_fingerprints = fingerprints;
     }
@@ -132,7 +140,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
     const packages = try owned.alloc(Package, input.packages.len);
     for (input.packages, 0..) |package, index| {
         if (package.name.len == 0 or package.version.len == 0 or package.architecture.len == 0 or
-            !validHex(&package.repository_id))
+            !validLowerHex(&package.repository_id))
             return error.InvalidIdentity;
         const repository = findRepository(repositories, package.repository_id) orelse
             return error.MissingRepository;
@@ -147,6 +155,16 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
     for (packages, 0..) |package, index| {
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;
+    }
+    for (repositories) |repository| {
+        var referenced = false;
+        for (packages) |package| {
+            if (std.mem.eql(u8, &repository.id, &package.repository_id)) {
+                referenced = true;
+                break;
+            }
+        }
+        if (!referenced) return error.UnusedRepository;
     }
 
     var lock: Lock = .{
@@ -287,6 +305,7 @@ pub const Store = struct {
     pub fn writeAtomic(self: Store, allocator: std.mem.Allocator, lock: Lock) !void {
         const bytes = try lock.canonicalJson(allocator);
         defer allocator.free(bytes);
+        if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
         const stage = ".debz-lock.new";
         self.dir.deleteFile(self.io, stage) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -407,14 +426,14 @@ fn parseHex(comptime size: usize, value: []const u8) ValidationError![size]u8 {
 }
 
 fn parseRepositoryId(value: []const u8) ValidationError![64]u8 {
-    if (value.len != 64 or !validHex(value)) return error.InvalidIdentity;
+    if (value.len != 64 or !validLowerHex(value)) return error.InvalidIdentity;
     var result: [64]u8 = undefined;
     @memcpy(&result, value);
     return result;
 }
 
-fn validHex(value: []const u8) bool {
-    for (value) |byte| if (!std.ascii.isHex(byte)) return false;
+fn validLowerHex(value: []const u8) bool {
+    for (value) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     return true;
 }
 
@@ -514,4 +533,64 @@ test "exact_lock.test.canonical roundtrip tamper holds and closure ordering" {
     const version_offset = std.mem.indexOf(u8, unknown, "\"version\":1").? + "\"version\":".len;
     unknown[version_offset] = '2';
     try std.testing.expectError(error.UnsupportedSchema, decode(std.testing.allocator, unknown, maximum_document_bytes));
+}
+
+test "exact_lock.test.rejects ambiguous repository ownership and identities" {
+    const snapshot: [32]u8 = @splat(1);
+    const package: Package = .{
+        .name = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .repository_id = @splat('a'),
+        .repository_snapshot_sha256 = snapshot,
+        .sha256 = @splat(2),
+        .declared_size = 1,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    const duplicate_signers = [_][20]u8{ @splat(3), @splat(3) };
+    const duplicate_repository: Repository = .{
+        .id = @splat('a'),
+        .snapshot_sha256 = snapshot,
+        .release_sha256 = @splat(4),
+        .index_sha256 = @splat(5),
+        .signer_fingerprints = &duplicate_signers,
+    };
+    try std.testing.expectError(error.DuplicateSigner, create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &.{duplicate_repository},
+        .packages = &.{package},
+        .authenticated_metadata = true,
+    }));
+
+    var uppercase_repository = duplicate_repository;
+    uppercase_repository.id = @splat('A');
+    try std.testing.expectError(error.InvalidIdentity, create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &.{uppercase_repository},
+        .packages = &.{package},
+        .authenticated_metadata = true,
+    }));
+
+    const unused_repository: Repository = .{
+        .id = @splat('b'),
+        .snapshot_sha256 = @splat(8),
+        .release_sha256 = @splat(9),
+        .index_sha256 = @splat(10),
+        .signer_fingerprints = &.{@splat(11)},
+    };
+    var used_repository = duplicate_repository;
+    used_repository.signer_fingerprints = &.{@splat(3)};
+    try std.testing.expectError(error.UnusedRepository, create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &.{ used_repository, unused_repository },
+        .packages = &.{package},
+        .authenticated_metadata = true,
+    }));
 }

@@ -119,15 +119,23 @@ pub const Error = error{
     DigestMismatch,
     NonCanonicalDocument,
     InvalidIdentity,
+    DuplicateRepository,
+    DuplicatePackage,
+    DuplicateSigner,
+    DuplicateEnvironmentKey,
+    InvalidJournal,
     UnauthenticatedRepository,
+    RepositoryEvidenceMismatch,
     MissingPackageEvidence,
     PackageDigestMismatch,
     ContradictoryOutcome,
     InvalidDigest,
     MissingLockDigest,
+    LockDigestMismatch,
 };
 
 pub const ExecutionInput = struct {
+    exact_lock: *const exact_lock.Lock,
     target_architecture: []const u8,
     request_sha256: [32]u8,
     solver_policy_sha256: [32]u8,
@@ -146,6 +154,9 @@ pub fn createFromExecution(
     report: transaction_executor.Report,
 ) !OwnedResult {
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const arena = temporary.allocator();
@@ -194,6 +205,9 @@ pub fn createFromRecovery(
     report: transaction_executor.RecoveryReport,
 ) !OwnedResult {
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const arena = temporary.allocator();
@@ -310,6 +324,7 @@ pub const Store = struct {
     pub fn writeAtomic(self: Store, allocator: std.mem.Allocator, result: Result) !void {
         const bytes = try result.canonicalJson(allocator);
         defer allocator.free(bytes);
+        if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
         const stage = ".debz-result.new";
         self.dir.deleteFile(self.io, stage) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -351,8 +366,22 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
         repositories[index] = repository;
         repositories[index].signer_fingerprints = try owned.dupe([20]u8, repository.signer_fingerprints);
         std.mem.sort([20]u8, @constCast(repositories[index].signer_fingerprints), {}, lessFingerprint);
+        for (repositories[index].signer_fingerprints, 0..) |fingerprint, signer_index| {
+            if (signer_index != 0 and std.mem.eql(
+                u8,
+                &fingerprint,
+                &repositories[index].signer_fingerprints[signer_index - 1],
+            )) return error.DuplicateSigner;
+        }
     }
     std.mem.sort(RepositoryEvidence, repositories, {}, lessRepository);
+    for (repositories, 0..) |repository, index| {
+        if (index != 0 and std.mem.eql(
+            u8,
+            &repository.source_config_id,
+            &repositories[index - 1].source_config_id,
+        )) return error.DuplicateRepository;
+    }
 
     const packages = try owned.alloc(PackageEvidence, input.packages.len);
     for (input.packages, 0..) |package, index| {
@@ -361,12 +390,20 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
             return error.InvalidIdentity;
         if (!std.mem.eql(u8, &package.package_sha256, &package.cas_sha256))
             return error.PackageDigestMismatch;
+        const repository = findRepositoryEvidence(repositories, package.repository_id) orelse
+            return error.RepositoryEvidenceMismatch;
+        if (!std.mem.eql(u8, &repository.snapshot_sha256, &package.repository_snapshot_sha256))
+            return error.RepositoryEvidenceMismatch;
         packages[index] = package;
         packages[index].name = try owned.dupe(u8, package.name);
         packages[index].version = try owned.dupe(u8, package.version);
         packages[index].architecture = try owned.dupe(u8, package.architecture);
     }
     std.mem.sort(PackageEvidence, packages, {}, lessPackage);
+    for (packages, 0..) |package, index| {
+        if (index != 0 and samePackageIdentity(package, packages[index - 1]))
+            return error.DuplicatePackage;
+    }
 
     const commands = try owned.alloc(CommandEvidence, input.commands.len);
     for (input.commands, 0..) |command, index| {
@@ -380,6 +417,11 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
                 .value = if (secretName(entry.key)) try owned.dupe(u8, "<redacted>") else try redactAlloc(owned, entry.value),
             };
         }
+        std.mem.sort(EnvironmentEntry, environment, {}, lessEnvironment);
+        for (environment, 0..) |entry, environment_index| {
+            if (environment_index != 0 and std.mem.eql(u8, entry.key, environment[environment_index - 1].key))
+                return error.DuplicateEnvironmentKey;
+        }
         commands[index] = .{
             .phase = try owned.dupe(u8, command.phase),
             .package = if (command.package) |package| try owned.dupe(u8, package) else null,
@@ -392,6 +434,16 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
 
     const journal_steps = try copySteps(owned, input.journal_steps);
     const recovery_steps = try copySteps(owned, input.recovery_steps);
+    try validateSteps(journal_steps, commands.len, 0);
+    try validateSteps(
+        recovery_steps,
+        commands.len,
+        if (journal_steps.len == 0) 0 else std.math.add(
+            usize,
+            journal_steps[journal_steps.len - 1].sequence,
+            1,
+        ) catch return error.InvalidJournal,
+    );
     var result: Result = .{
         .target_architecture = try owned.dupe(u8, input.target_architecture),
         .request_sha256 = input.request_sha256,
@@ -418,7 +470,22 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
     return .{ .result = result, .arena = arena, .backing_allocator = allocator };
 }
 
-pub fn verifyLockEvidence(lock: exact_lock.Lock, packages: []const PackageEvidence) Error!void {
+pub fn verifyLockEvidence(
+    lock: exact_lock.Lock,
+    repositories: []const RepositoryEvidence,
+    packages: []const PackageEvidence,
+) Error!void {
+    if (lock.repositories.len != repositories.len) return error.RepositoryEvidenceMismatch;
+    for (lock.repositories) |locked| {
+        const repository = findRepositoryEvidence(repositories, locked.id) orelse
+            return error.RepositoryEvidenceMismatch;
+        if (!std.mem.eql(u8, &locked.snapshot_sha256, &repository.snapshot_sha256) or
+            !std.mem.eql(u8, &locked.release_sha256, &repository.release_sha256) or
+            !std.mem.eql(u8, &locked.index_sha256, &repository.metadata_sha256) or
+            !sameFingerprints(locked.signer_fingerprints, repository.signer_fingerprints) or
+            !repository.signature_verified)
+            return error.RepositoryEvidenceMismatch;
+    }
     if (lock.packages.len != packages.len) return error.MissingPackageEvidence;
     for (lock.packages) |locked| {
         var found = false;
@@ -478,6 +545,14 @@ fn secretAssignment(value: []const u8, start: usize) ?Assignment {
             end += 1;
         return .{ .value_start = start + name.len, .value_end = end };
     }
+    const path_names = [_][]const u8{ "auth-conf=", "auth_config=", "netrc=" };
+    for (path_names) |name| {
+        if (start + name.len > value.len or !std.ascii.eqlIgnoreCase(value[start .. start + name.len], name)) continue;
+        var end = start + name.len;
+        while (end < value.len and value[end] != '&' and value[end] != ' ' and value[end] != '\n' and value[end] != '\r')
+            end += 1;
+        return .{ .value_start = start + name.len, .value_end = end };
+    }
     return null;
 }
 
@@ -497,6 +572,41 @@ fn copySteps(allocator: std.mem.Allocator, input: []const JournalStep) ![]Journa
         .recovered = step.recovered,
     };
     return result;
+}
+
+fn validateSteps(steps: []const JournalStep, command_count: usize, first_sequence: usize) Error!void {
+    var expected = first_sequence;
+    for (steps) |step| {
+        if (step.sequence != expected or step.command_index > command_count or
+            step.boundary.len == 0 or step.state.len == 0)
+            return error.InvalidJournal;
+        expected = std.math.add(usize, expected, 1) catch return error.InvalidJournal;
+    }
+}
+
+fn findRepositoryEvidence(
+    repositories: []const RepositoryEvidence,
+    id: [64]u8,
+) ?RepositoryEvidence {
+    for (repositories) |repository| {
+        if (std.mem.eql(u8, &repository.source_config_id, &id)) return repository;
+    }
+    return null;
+}
+
+fn sameFingerprints(left: []const [20]u8, right: []const [20]u8) bool {
+    if (left.len != right.len) return false;
+    for (left) |left_value| {
+        var found = false;
+        for (right) |right_value| {
+            if (std.mem.eql(u8, &left_value, &right_value)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 fn digestPayload(result: Result) [32]u8 {
@@ -653,7 +763,7 @@ fn writeHex(writer: *std.Io.Writer, value: []const u8) !void {
 }
 
 fn validRepositoryId(id: *const [64]u8) bool {
-    for (id) |byte| if (!std.ascii.isHex(byte)) return false;
+    for (id) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     return true;
 }
 
@@ -667,6 +777,17 @@ fn lessPackage(_: void, left: PackageEvidence, right: PackageEvidence) bool {
     const arch = std.mem.order(u8, left.architecture, right.architecture);
     if (arch != .eq) return arch == .lt;
     return std.mem.order(u8, left.version, right.version) == .lt;
+}
+
+fn samePackageIdentity(left: PackageEvidence, right: PackageEvidence) bool {
+    return std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.architecture, right.architecture);
+}
+
+fn lessEnvironment(_: void, left: EnvironmentEntry, right: EnvironmentEntry) bool {
+    const key = std.mem.order(u8, left.key, right.key);
+    if (key != .eq) return key == .lt;
+    return std.mem.order(u8, left.value, right.value) == .lt;
 }
 
 fn lessFingerprint(_: void, left: [20]u8, right: [20]u8) bool {
@@ -730,7 +851,11 @@ test "transaction_provenance.test.deterministic provenance recovery and redactio
         .cas_sha256 = @splat(6),
         .declared_size = 99,
     }};
-    const argv = [_][]const u8{ "dpkg", "https://user:pass@example.invalid/pool/demo.deb?token=secret" };
+    const argv = [_][]const u8{
+        "dpkg",
+        "https://user:pass@example.invalid/pool/demo.deb?token=secret",
+        "--auth-conf=/home/user/private.conf",
+    };
     const environment = [_]EnvironmentEntry{.{ .key = "Authorization", .value = "Bearer secret" }};
     const commands = [_]CommandEvidence{.{
         .phase = "unpack",
@@ -762,6 +887,7 @@ test "transaction_provenance.test.deterministic provenance recovery and redactio
     try std.testing.expect(std.mem.indexOf(u8, json, "secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "hunter2") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "user:pass") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "/home/user/private.conf") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "recovery_steps") != null);
     var validated = try validateDocument(std.testing.allocator, json, maximum_document_bytes);
     defer validated.deinit();
@@ -770,4 +896,38 @@ test "transaction_provenance.test.deterministic provenance recovery and redactio
     defer std.testing.allocator.free(tampered);
     tampered[std.mem.indexOf(u8, tampered, "\"demo\"").? + 1] = 'x';
     try std.testing.expectError(error.DigestMismatch, validateDocument(std.testing.allocator, tampered, maximum_document_bytes));
+
+    const lock_repositories = [_]exact_lock.Repository{.{
+        .id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(4),
+        .signer_fingerprints = &.{@splat(5)},
+    }};
+    const lock_packages = [_]exact_lock.Package{.{
+        .name = "demo",
+        .version = "1:2.0-3",
+        .architecture = "amd64",
+        .repository_id = repository_id,
+        .repository_snapshot_sha256 = @splat(1),
+        .sha256 = @splat(6),
+        .declared_size = 99,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    }};
+    const lock: exact_lock.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(8),
+        .policy_sha256 = @splat(9),
+        .repositories = &lock_repositories,
+        .packages = &lock_packages,
+        .digest_sha256 = @splat(12),
+    };
+    try verifyLockEvidence(lock, &repositories, &packages);
+    var wrong_repository = repositories;
+    wrong_repository[0].metadata_sha256 = @splat(15);
+    try std.testing.expectError(
+        error.RepositoryEvidenceMismatch,
+        verifyLockEvidence(lock, &wrong_repository, &packages),
+    );
 }
