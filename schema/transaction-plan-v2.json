@@ -51,7 +51,12 @@
             }
           ]
         },
-        "sha256": { "type": ["string", "null"] },
+        "sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
         "package_size": { "type": ["integer", "null"], "minimum": 0 },
         "installed_size_delta_bytes": { "type": "integer" },
         "source_package": { "type": "string" },
