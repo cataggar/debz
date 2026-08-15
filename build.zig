@@ -6,7 +6,9 @@ pub fn build(b: *std.Build) void {
 
     const libsolv_dependency = b.dependency("libsolv", .{
         .target = target,
-        .optimize = optimize,
+        // libsolv relies on C's wrapping arithmetic and null-based container
+        // offset idioms that Zig safety instrumentation rejects.
+        .optimize = .ReleaseFast,
         .shared = false,
         .conda = false,
         .@"multi-semantics" = false,
