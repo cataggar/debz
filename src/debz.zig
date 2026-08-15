@@ -41,6 +41,7 @@ pub const SolverProblemKind = solver.ProblemKind;
 pub const deb822 = @import("deb822.zig");
 pub const relation = @import("relation.zig");
 pub const deb_archive = @import("deb_archive.zig");
+pub const deb_payload = @import("deb_payload.zig");
 pub const dpkg_status = @import("dpkg_status.zig");
 pub const control_record = @import("control_record.zig");
 pub const source = @import("source.zig");
@@ -142,6 +143,7 @@ test "empty solver context can be created and destroyed" {
 }
 
 test {
+    _ = deb_payload;
     _ = deb822;
     _ = relation;
     _ = dpkg_status;

@@ -8,6 +8,7 @@
 - `debz.acquirePackage` downloads or loads an authenticated solver-selected package, verifies its size and SHA-256, and publishes it to an explicit package CAS.
 - `debz.repository_refresh.refreshAuthenticated` verifies repository signatures and metadata before publishing a solver-eligible snapshot.
 - `debz.openpgp_verifier` verifies the project's supported OpenPGP profile without network, process, or ambient keyring access.
+- `debz.deb_payload.validate` performs complete bounded `.deb` payload and authenticated identity validation before transaction handoff.
 - `debz.SolverContext` imports eligible package indexes into a Debian-configured libsolv pool.
 - `debz.dpkg_status`, `debz.source`, and the parser modules expose typed APIs for caller-supplied Debian metadata.
 
