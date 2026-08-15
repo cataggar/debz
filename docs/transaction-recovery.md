@@ -26,9 +26,12 @@ package must avoid repair/intermediate states. Planned installs/upgrades must
 match package, architecture, and version exactly; planned removals must not be
 installed. Unrelated healthy installed packages are allowed by the documented
 default policy because a transaction plan describes its changed identities,
-not a complete root manifest.
+not a complete root manifest. The dpkg database lock is reacquired under the
+bounded lock policy before this final query, so completion is never decided
+from a concurrently changing status database.
 
 `SystemJournalStore` provides fsync-and-rename publication in an explicit
-directory. `SystemStatusFileReader` reads only the explicit install root.
+directory and refuses symlinked path components. `SystemStatusFileReader`
+securely walks and reads only the explicit install root.
 Process, filesystem, locks, journal, status, cancellation, and crash points are
 all injectable for host-isolated testing.

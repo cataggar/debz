@@ -451,6 +451,7 @@ pub fn execute(
         journal.boundary = .before_command;
         journal.next_command = command_index;
         journal.failure = null;
+        state.transaction_state = .in_progress;
         dependencies.crash.hit(.before_command_journal, command_index) catch |err| {
             journal.state = .interrupted;
             journal.failure = @errorName(err);
@@ -521,6 +522,10 @@ pub fn execute(
 
     if (request.plan.ordered_actions.len != 0) {
         if (dependencies.cancellation.cancelled()) {
+            journal.state = .interrupted;
+            journal.failure = "cancelled before trigger processing";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
             state.failure = interruption(.triggers, null, state.commands.items.len, "cancelled before trigger processing");
             return finish(allocator, arena_ptr, &state, plan_sha256);
         }
@@ -548,6 +553,15 @@ pub fn execute(
         journal.boundary = .before_command;
         journal.next_command = trigger_index;
         journal.failure = null;
+        state.transaction_state = .in_progress;
+        dependencies.crash.hit(.before_command_journal, trigger_index) catch |err| {
+            journal.state = .interrupted;
+            journal.failure = @errorName(err);
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = journalFailure(arena, err, .interrupted, "interrupted before trigger journal");
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        };
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
             state.failure = journalFailure(arena, err, .journal_io, "cannot persist trigger boundary");
             return finish(allocator, arena_ptr, &state, plan_sha256);
@@ -594,6 +608,14 @@ pub fn execute(
             state.failure = journalFailure(arena, err, .journal_io, "cannot persist completed triggers");
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
+        dependencies.crash.hit(.after_command_journal, trigger_index) catch |err| {
+            journal.state = .interrupted;
+            journal.failure = @errorName(err);
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = journalFailure(arena, err, .interrupted, "interrupted after trigger journal");
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        };
         if (!locksHeld(dependencies.locks, &held)) {
             state.failure = .{
                 .code = .lock_lost,
@@ -604,6 +626,32 @@ pub fn execute(
             return finish(allocator, arena_ptr, &state, plan_sha256);
         }
     }
+
+    held[2] = dependencies.locks.acquire(lock_paths[2], request.policy.locks.wait_ms) catch |err| {
+        journal.state = .interrupted;
+        journal.failure = "cannot establish stable verification lock";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = .{
+            .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
+            .lock_path = lock_paths[2],
+            .diagnostic = try arena.dupe(u8, @errorName(err)),
+            .completed_commands = state.commands.items.len,
+        };
+        return finish(allocator, arena_ptr, &state, plan_sha256);
+    };
+    dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+        journal.state = .interrupted;
+        journal.failure = "install root changed before verification";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = .{
+            .code = .invalid_root,
+            .diagnostic = try arena.dupe(u8, @errorName(err)),
+            .completed_commands = state.commands.items.len,
+        };
+        return finish(allocator, arena_ptr, &state, plan_sha256);
+    };
 
     journal.boundary = .verifying;
     dependencies.crash.hit(.before_verification_journal, journal.next_command) catch |err| {
@@ -714,20 +762,6 @@ pub fn recover(
         state.failure = .{ .code = .journal_mismatch, .diagnostic = "journal plan, root, or executor policy does not match" };
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     }
-    if (journal.state == .complete) {
-        const verification = try recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{});
-        if (!verification.succeeded()) {
-            state.transaction_state = .verification_failed;
-            state.failure = .{ .code = .verification_failed, .diagnostic = @tagName(verification.failure.?) };
-            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
-        }
-        recovery.archive(arena, dependencies.journal, request.install_root, journal) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_io, "cannot archive completed journal");
-            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
-        };
-        return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
-    }
-
     const root_flag = try std.fmt.allocPrint(arena, "--root={s}", .{request.install_root});
     const admin_path = try rootPath(arena, request.install_root, "var/lib/dpkg");
     const admin_flag = try std.fmt.allocPrint(arena, "--admindir={s}", .{admin_path});
@@ -751,15 +785,40 @@ pub fn recover(
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
     }
+    if (journal.state == .complete) {
+        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+            state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
+        const verification = try recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{});
+        if (!verification.succeeded()) {
+            journal.state = .verification_failed;
+            journal.failure = @tagName(verification.failure.?);
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
+                state.failure = journalFailure(arena, err, .journal_io, "cannot retain failed completion verification");
+                return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+            };
+            state.transaction_state = .verification_failed;
+            state.failure = .{ .code = .verification_failed, .diagnostic = @tagName(verification.failure.?) };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        }
+        recovery.archive(arena, dependencies.journal, request.install_root, journal) catch |err| {
+            state.failure = journalFailure(arena, err, .journal_io, "cannot archive completed journal");
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
+        return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+    }
     dependencies.locks.release(held[2].?);
     held[2] = null;
 
+    journal.state = .in_progress;
     journal.boundary = .recovering;
     journal.failure = null;
     recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist recovery boundary");
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
+    state.transaction_state = .in_progress;
 
     const recovery_commands = [_]struct { phase: Phase, argv: []const []const u8 }{
         .{ .phase = .audit, .argv = try buildRecoveryArgv(arena, root_flag, admin_flag, request.policy, .audit) },
@@ -775,6 +834,32 @@ pub fn recover(
             state.failure = interruption(command.phase, null, state.commands.items.len, "recovery cancelled");
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         }
+        if (!locksHeld(dependencies.locks, &held)) {
+            journal.state = .interrupted;
+            journal.failure = "recovery lock ownership was lost";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = .{
+                .code = .lock_lost,
+                .phase = command.phase,
+                .diagnostic = "recovery lock ownership was lost",
+                .completed_commands = state.commands.items.len,
+            };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        }
+        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+            journal.state = .interrupted;
+            journal.failure = "install root changed during recovery";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = .{
+                .code = .invalid_root,
+                .phase = command.phase,
+                .diagnostic = try arena.dupe(u8, @errorName(err)),
+                .completed_commands = state.commands.items.len,
+            };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
         const result = dependencies.process.run(.{
             .argv = command.argv,
             .environment = &audited_environment,
@@ -812,6 +897,32 @@ pub fn recover(
         }
     }
 
+    held[2] = dependencies.locks.acquire(lock_paths[2], request.policy.locks.wait_ms) catch |err| {
+        journal.state = .interrupted;
+        journal.failure = "cannot establish stable recovery verification lock";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = .{
+            .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
+            .lock_path = lock_paths[2],
+            .diagnostic = try arena.dupe(u8, @errorName(err)),
+            .completed_commands = state.commands.items.len,
+        };
+        return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+    };
+    dependencies.filesystem.validateRoot(request.install_root) catch |err| {
+        journal.state = .interrupted;
+        journal.failure = "install root changed before recovery verification";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = .{
+            .code = .invalid_root,
+            .diagnostic = try arena.dupe(u8, @errorName(err)),
+            .completed_commands = state.commands.items.len,
+        };
+        return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+    };
+
     const verification = try recovery.verify(arena, request.plan.*, request.install_root, dependencies.status, .{});
     if (!verification.succeeded()) {
         journal.state = .verification_failed;
@@ -832,11 +943,11 @@ pub fn recover(
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist recovered completion");
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
+    state.transaction_state = .complete;
     recovery.archive(arena, dependencies.journal, request.install_root, journal) catch |err| {
         state.failure = journalFailure(arena, err, .journal_io, "cannot archive recovered journal");
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
-    state.transaction_state = .complete;
     return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
 }
 
@@ -963,7 +1074,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     }
     for (request.plan.actions, 0..) |action, action_index| {
         for (request.plan.actions[0..action_index]) |prior| {
-            if (sameIdentity(prior.package, prior.version, prior.architecture, action.package, action.version, action.architecture))
+            if (samePackageArchitecture(prior.package, prior.architecture, action.package, action.architecture))
                 return error.DuplicatePlanAction;
         }
         var removes: usize = 0;
@@ -1261,6 +1372,16 @@ fn sameIdentity(
         std.mem.eql(u8, a_architecture, b_architecture);
 }
 
+fn samePackageArchitecture(
+    a_package: []const u8,
+    a_architecture: []const u8,
+    b_package: []const u8,
+    b_architecture: []const u8,
+) bool {
+    return std.mem.eql(u8, a_package, b_package) and
+        std.mem.eql(u8, a_architecture, b_architecture);
+}
+
 fn toPhase(kind: solver.OrderedActionKind) Phase {
     return switch (kind) {
         .remove => .remove,
@@ -1305,6 +1426,9 @@ fn parseHexDigest(hex: [64]u8) ![32]u8 {
 fn hashPlan(plan: solver.Plan) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("debz-plan-execution-v1\x00");
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, @intCast(plan.schema_version), .little);
+    hash.update(&number);
     hash.update(plan.target_architecture);
     hash.update("\x00");
     hash.update(@tagName(plan.mode));
@@ -1322,12 +1446,13 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
         if (action.sha256) |digest| hash.update(&digest);
         hash.update("\x00");
-        var size_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &size_bytes, action.package_size orelse 0, .little);
-        hash.update(&size_bytes);
+        std.mem.writeInt(u64, &number, action.package_size orelse 0, .little);
+        hash.update(&number);
     }
     hash.update("\xfe");
     for (plan.ordered_actions) |action| {
+        std.mem.writeInt(u64, &number, @intCast(action.sequence), .little);
+        hash.update(&number);
         hash.update(@tagName(action.kind));
         hash.update("\x00");
         hash.update(action.package);
@@ -1679,6 +1804,7 @@ const TestHarness = struct {
     journal_writes: usize = 0,
     journal_archived: bool = false,
     status_source: ?[]const u8 = null,
+    status_reads: usize = 0,
     crash_point: ?recovery.CrashPoint = null,
     crash_index: usize = 0,
 
@@ -1784,6 +1910,7 @@ const TestHarness = struct {
 
     fn readStatus(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
         const self: *TestHarness = @ptrCast(@alignCast(context));
+        self.status_reads += 1;
         if (self.status_source) |source| return allocator.dupe(u8, source);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
@@ -2339,6 +2466,117 @@ test "transaction_executor.test.unfinished journal blocks normal retry and binds
     defer retry.deinit();
     try std.testing.expectEqual(FailureCode.invalid_recovery_transition, retry.failure.?.code);
     try std.testing.expectEqual(before, harness.invocation_count);
+}
+
+test "transaction_executor.test.verification reacquires dpkg lock and never queries an unstable state" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{ .bytes = "", .lock_fail_at = 3, .status_source = "" };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.lock_timeout, report.failure.?.code);
+    try std.testing.expectEqual(recovery.State.interrupted, report.transaction_state);
+    try std.testing.expectEqual(@as(usize, 2), harness.invocation_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.status_reads);
+}
+
+test "transaction_executor.test.recovery verification reacquires dpkg lock" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{
+        .bytes = "",
+        .fail_at = 0,
+        .fail_termination = .{ .signaled = 15 },
+        .status_source = "",
+    };
+    var interrupted = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    interrupted.deinit();
+
+    harness.fail_at = null;
+    harness.lock_acquires = 0;
+    harness.lock_fail_at = 3;
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.lock_timeout, report.failure.?.code);
+    try std.testing.expectEqual(recovery.State.interrupted, report.state);
+    try std.testing.expectEqual(@as(usize, 0), harness.status_reads);
+}
+
+test "transaction_executor.test.plan rejects multiple final versions for one package architecture" {
+    var actions = [_]solver.PlanAction{ testRemoveAction("demo"), testRemoveAction("demo") };
+    actions[1].version = "2.0";
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .remove, .package = "demo", .version = "2.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{ .bytes = "" };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.invalid_plan, report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 0), harness.lock_acquires);
+    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
+}
+
+test "transaction_executor.test.completed recovery retains unhealthy-state evidence" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{ .bytes = "", .status_source = "" };
+    var completed = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    completed.deinit();
+    harness.status_source =
+        \\Package: broken
+        \\Version: 1
+        \\Architecture: amd64
+        \\Status: install ok unpacked
+        \\
+    ;
+    harness.lock_acquires = 0;
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.verification_failed, report.failure.?.code);
+    try std.testing.expectEqual(recovery.State.verification_failed, report.state);
+    try std.testing.expect(!harness.journal_archived);
+    var decoded = try recovery.decode(std.testing.allocator, harness.journal_bytes[0..harness.journal_len]);
+    defer decoded.deinit();
+    try std.testing.expectEqual(recovery.State.verification_failed, decoded.journal.state);
 }
 
 test "transaction_executor.test.production adapters expose injectable interfaces" {

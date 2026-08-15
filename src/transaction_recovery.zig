@@ -76,8 +76,7 @@ pub const SystemJournalStore = struct {
     const stage_name = ".transaction.journal.new";
 
     pub fn init(io: std.Io, directory_path: []const u8, expected_root: []const u8) !SystemJournalStore {
-        try std.Io.Dir.cwd().createDirPath(io, directory_path);
-        const dir = try std.Io.Dir.cwd().openDir(io, directory_path, .{ .follow_symlinks = false });
+        const dir = try openOrCreateDirectoryPath(io, directory_path);
         return .{ .io = io, .dir = dir, .owns_dir = true, .expected_root = expected_root };
     }
 
@@ -171,21 +170,68 @@ pub const SystemStatusFileReader = struct {
     fn read(context: *anyopaque, allocator: std.mem.Allocator, root: []const u8, maximum: usize) ![]u8 {
         const self: *SystemStatusFileReader = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, root, self.expected_root)) return error.WrongInstallRoot;
-        const path = if (std.mem.eql(u8, root, "/"))
-            "/var/lib/dpkg/status"
-        else
-            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/status", .{root});
-        defer if (!std.mem.eql(u8, root, "/")) allocator.free(path);
-        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{
+        var root_dir = try openDirectoryPath(self.io, root);
+        defer root_dir.close(self.io);
+        var dpkg_dir = try openDirectoryPathFrom(self.io, root_dir, "var/lib/dpkg");
+        defer dpkg_dir.close(self.io);
+        var file = try dpkg_dir.openFile(self.io, "status", .{
             .mode = .read_only,
             .allow_directory = false,
             .follow_symlinks = false,
+            .resolve_beneath = true,
         });
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
         return reader.interface.allocRemaining(allocator, .limited(maximum));
     }
 };
+
+fn openOrCreateDirectoryPath(io: std.Io, path: []const u8) !std.Io.Dir {
+    var current = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(io, ".", .{ .follow_symlinks = false });
+    errdefer current.close(io);
+    const components_source = if (std.fs.path.isAbsolute(path)) path[1..] else path;
+    var components = std.mem.splitScalar(u8, components_source, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return error.AmbiguousPath;
+        current.createDir(io, component, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const next = try current.openDir(io, component, .{ .follow_symlinks = false });
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
+fn openDirectoryPath(io: std.Io, path: []const u8) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidAbsolutePath;
+    const root = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    if (path.len == 1) return root;
+    return openDirectoryPathFromOwned(io, root, path[1..]);
+}
+
+fn openDirectoryPathFrom(io: std.Io, base: std.Io.Dir, path: []const u8) !std.Io.Dir {
+    return openDirectoryPathFromOwned(io, try base.openDir(io, ".", .{ .follow_symlinks = false }), path);
+}
+
+fn openDirectoryPathFromOwned(io: std.Io, initial: std.Io.Dir, path: []const u8) !std.Io.Dir {
+    var current = initial;
+    errdefer current.close(io);
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return error.AmbiguousPath;
+        const next = try current.openDir(io, component, .{ .follow_symlinks = false });
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
 
 fn syncDirectory(io: std.Io, dir: std.Io.Dir) !void {
     switch (@import("builtin").os.tag) {
@@ -389,6 +435,13 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
     if (failure_fields.next() != null) return error.MalformedJournal;
     if ((state == .complete or state == .not_started or state == .in_progress) and failure != null)
         return error.ContradictoryJournal;
+    if ((state == .dpkg_failed or state == .interrupted or state == .verification_failed) and failure == null)
+        return error.ContradictoryJournal;
+    if (state == .not_started and (boundary != .prepared or next != 0))
+        return error.ContradictoryJournal;
+    if (lines.next()) |trailing| {
+        if (trailing.len != 0 or lines.next() != null) return error.MalformedJournal;
+    }
 
     return .{
         .journal = .{
@@ -648,4 +701,33 @@ test "transaction_recovery system journal store atomically archives and reloads 
     defer decoded.deinit();
     try std.testing.expectEqual(State.complete, decoded.journal.state);
     try std.testing.expectError(error.WrongInstallRoot, interface.load(std.testing.allocator, "/other"));
+}
+
+test "transaction_recovery production paths reject journal and status symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "safe/root/var/lib/dpkg");
+    try tmp.dir.createDirPath(std.testing.io, "outside");
+    var status = try tmp.dir.createFile(std.testing.io, "outside/status", .{});
+    try status.writeStreamingAll(std.testing.io, "");
+    status.close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "outside", "linked", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "../../../../outside/status", "safe/root/var/lib/dpkg/status", .{});
+
+    var real_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_length = try tmp.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/safe/root", .{real_buffer[0..real_length]});
+    defer std.testing.allocator.free(root_path);
+    var reader: SystemStatusFileReader = .{ .io = std.testing.io, .expected_root = root_path };
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        reader.interface().read(std.testing.allocator, root_path, 1024),
+    );
+
+    const linked_journal = try std.fmt.allocPrint(std.testing.allocator, "{s}/linked/journal", .{real_buffer[0..real_length]});
+    defer std.testing.allocator.free(linked_journal);
+    try std.testing.expectError(
+        error.NotDir,
+        SystemJournalStore.init(std.testing.io, linked_journal, root_path),
+    );
 }
