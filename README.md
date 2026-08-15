@@ -35,7 +35,15 @@ is reserved for that authentication layer; this pipeline never infers trust.
 
 ## Dependency solver
 
-The public `SolverContext` adapter owns an empty libsolv pool and solver while keeping libsolv C types out of the debz API. The pinned libsolv core is built with Debian EVR and dependency semantics. The current adapter does not load repositories, so libsolvext, repository loaders, compression backends, tools, conda, and multi-distribution semantics are explicitly disabled.
+The public `SolverContext` adapter owns a Debian-configured libsolv pool while
+keeping all libsolv C types and IDs private. It imports explicitly identified
+and prioritized typed `Packages` indexes only when their solver-eligibility is
+marked as verified (or explicitly trusted test data). Imported package origins
+are retained as debz-owned identities for future diagnostics and planning.
+Dependencies, pre-dependencies, alternatives, version predicates, provides,
+conflicts, breaks, replaces, and separately represented recommends are mapped;
+unsupported qualifiers fail with typed errors. Transaction planning is not yet
+part of this API.
 
 ## Requirements
 

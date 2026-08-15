@@ -1,11 +1,15 @@
 const std = @import("std");
 const dpkg_status = @import("dpkg_status.zig");
+const packages_index = @import("packages_index.zig");
 const relation = @import("relation.zig");
+const repository_refresh = @import("repository_refresh.zig");
+const source = @import("source.zig");
 
 const libsolv = @cImport({
     @cInclude("solv/evr.h");
     @cInclude("solv/pool.h");
     @cInclude("solv/poolarch.h");
+    @cInclude("solv/queue.h");
     @cInclude("solv/repo.h");
     @cInclude("solv/solver.h");
     @cInclude("solv/solvable.h");
@@ -88,10 +92,133 @@ pub const ImportResult = union(enum) {
     diagnostic: Diagnostic,
 };
 
+pub const Eligibility = enum {
+    untrusted,
+    verified_refresh,
+    trusted_test,
+};
+
+pub const Limits = struct {
+    max_repositories: usize = 1_024,
+    max_packages_per_repository: usize = 250_000,
+    max_dependency_groups_per_package: usize = 16_384,
+    max_dependency_alternatives_per_package: usize = 65_536,
+};
+
+pub const RepositoryInput = struct {
+    repository_id: source.RepositoryId,
+    priority: i32,
+    eligibility: Eligibility,
+    packages: *const packages_index.Index,
+
+    pub fn fromRefresh(result: *const repository_refresh.Result, priority: i32) RepositoryInput {
+        return .{
+            .repository_id = result.provenance.repository_id,
+            .priority = priority,
+            .eligibility = if (result.solverEligible()) .verified_refresh else .untrusted,
+            .packages = &result.packages,
+        };
+    }
+
+    pub fn trustedTest(
+        repository_id: source.RepositoryId,
+        priority: i32,
+        packages: *const packages_index.Index,
+    ) RepositoryInput {
+        return .{
+            .repository_id = repository_id,
+            .priority = priority,
+            .eligibility = .trusted_test,
+            .packages = packages,
+        };
+    }
+};
+
+pub const PackageOrigin = struct {
+    repository_id: source.RepositoryId,
+    repository_priority: i32,
+    record_index: usize,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    source_location: []const u8,
+};
+
+pub const AvailableImportError = std.mem.Allocator.Error || error{
+    PoolAllocationFailed,
+    UntrustedRepository,
+    RepositoryIdentityMismatch,
+    DuplicateRepository,
+    TooManyRepositories,
+    TooManyPackages,
+    TooManyDependencyGroups,
+    TooManyDependencyAlternatives,
+    UnsupportedArchitectureQualifier,
+    UnsupportedProvidesAlternative,
+    UnsupportedProvidesPredicate,
+};
+
 const Mapping = struct {
     solvable_id: libsolv.Id,
     record_index: usize,
     metadata: InstalledMetadata,
+};
+
+const OriginOwned = struct {
+    repository_id: source.RepositoryId,
+    repository_priority: i32,
+    record_index: usize,
+    package: []u8,
+    version: []u8,
+    architecture: []u8,
+    source_location: []u8,
+    solvable_id: libsolv.Id,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        input: RepositoryInput,
+        record: packages_index.PackageRecord,
+        record_index: usize,
+        solvable_id: libsolv.Id,
+    ) !OriginOwned {
+        const package_name = try allocator.dupe(u8, record.control.package.text);
+        errdefer allocator.free(package_name);
+        const version = try allocator.dupe(u8, record.control.version.value.original);
+        errdefer allocator.free(version);
+        const architecture = try allocator.dupe(u8, record.control.architecture.text);
+        errdefer allocator.free(architecture);
+        const source_location = try allocator.dupe(u8, record.location.source);
+        return .{
+            .repository_id = input.repository_id,
+            .repository_priority = input.priority,
+            .record_index = record_index,
+            .package = package_name,
+            .version = version,
+            .architecture = architecture,
+            .source_location = source_location,
+            .solvable_id = solvable_id,
+        };
+    }
+
+    fn deinit(self: *OriginOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.package);
+        allocator.free(self.version);
+        allocator.free(self.architecture);
+        allocator.free(self.source_location);
+        self.* = undefined;
+    }
+
+    fn public(self: *const OriginOwned) PackageOrigin {
+        return .{
+            .repository_id = self.repository_id,
+            .repository_priority = self.repository_priority,
+            .record_index = self.record_index,
+            .package = self.package,
+            .version = self.version,
+            .architecture = self.architecture,
+            .source_location = self.source_location,
+        };
+    }
 };
 
 const Internal = struct {
@@ -103,10 +230,15 @@ const Internal = struct {
     mappings: []Mapping = &.{},
     blockers: []Blocker = &.{},
     summary: ?ImportSummary = null,
+    available_repositories: std.ArrayList(source.RepositoryId) = .empty,
+    origins: std.ArrayList(OriginOwned) = .empty,
 
     fn deinit(self: *Internal) void {
         if (self.mappings.len != 0) self.allocator.free(self.mappings);
         if (self.blockers.len != 0) self.allocator.free(self.blockers);
+        for (self.origins.items) |*origin| origin.deinit(self.allocator);
+        self.origins.deinit(self.allocator);
+        self.available_repositories.deinit(self.allocator);
         libsolv.solver_free(self.solver);
         libsolv.pool_free(self.pool);
         const allocator = self.allocator;
@@ -131,6 +263,18 @@ pub const Context = opaque {
             .solver = solver,
         };
         return @ptrCast(state);
+    }
+
+    pub fn createForArchitecture(
+        allocator: std.mem.Allocator,
+        architecture: []const u8,
+    ) std.mem.Allocator.Error!*Context {
+        const context = try createWithAllocator(allocator);
+        errdefer context.destroy();
+        const architecture_z = try allocator.dupeZ(u8, architecture);
+        defer allocator.free(architecture_z);
+        libsolv.pool_setarch(internal(context).pool, architecture_z);
+        return context;
     }
 
     pub fn destroy(self: *Context) void {
@@ -303,6 +447,97 @@ pub const Context = opaque {
         state.blockers = blockers;
         state.summary = summary;
         return .{ .imported = summary };
+    }
+
+    pub fn importAvailable(
+        self: *Context,
+        input: RepositoryInput,
+        limits: Limits,
+    ) AvailableImportError!void {
+        const state = internal(self);
+        if (input.eligibility == .untrusted) return error.UntrustedRepository;
+        if (!std.mem.eql(
+            u8,
+            input.repository_id.slice(),
+            input.packages.context.repository_id.slice(),
+        )) return error.RepositoryIdentityMismatch;
+        if (state.available_repositories.items.len >= limits.max_repositories)
+            return error.TooManyRepositories;
+        if (input.packages.records.len > limits.max_packages_per_repository)
+            return error.TooManyPackages;
+        for (state.available_repositories.items) |repository_id| {
+            if (std.mem.eql(u8, repository_id.slice(), input.repository_id.slice()))
+                return error.DuplicateRepository;
+        }
+        try validateAvailableRecords(input.packages.records, limits);
+
+        const repository_name = try state.allocator.dupeZ(u8, input.repository_id.slice());
+        defer state.allocator.free(repository_name);
+        const repo = libsolv.repo_create(state.pool, repository_name) orelse
+            return error.PoolAllocationFailed;
+        var keep_repo = false;
+        errdefer if (!keep_repo) libsolv.repo_free(repo, 1);
+        repo.*.priority = input.priority;
+        repo.*.subpriority = input.priority;
+
+        const origins_start = state.origins.items.len;
+        errdefer {
+            for (state.origins.items[origins_start..]) |*origin|
+                origin.deinit(state.allocator);
+            state.origins.shrinkRetainingCapacity(origins_start);
+        }
+
+        for (input.packages.records, 0..) |record, record_index| {
+            const solvable_id = libsolv.repo_add_solvable(repo);
+            if (solvable_id == 0) return error.PoolAllocationFailed;
+            const solvable = libsolv.pool_id2solvable(state.pool, solvable_id);
+            const control = record.control;
+            solvable.*.name = stringId(state.pool, control.package.text);
+            solvable.*.evr = stringId(state.pool, control.version.value.original);
+            solvable.*.arch = stringId(state.pool, control.architecture.text);
+
+            addAvailableRelation(state.pool, solvable, control.pre_depends, .requires_pre);
+            addAvailableRelation(state.pool, solvable, control.depends, .requires);
+            addAvailableRelation(state.pool, solvable, control.recommends, .recommends);
+            addAvailableRelation(state.pool, solvable, control.provides, .provides);
+            addAvailableRelation(state.pool, solvable, control.conflicts, .conflicts);
+            addAvailableRelation(state.pool, solvable, control.breaks, .conflicts);
+            addAvailableRelation(state.pool, solvable, control.replaces, .obsoletes);
+
+            const self_provide = libsolv.pool_rel2id(
+                state.pool,
+                solvable.*.name,
+                solvable.*.evr,
+                libsolv.REL_EQ,
+                1,
+            );
+            libsolv.solvable_add_deparray(solvable, libsolv.SOLVABLE_PROVIDES, self_provide, 0);
+
+            var origin = try OriginOwned.init(
+                state.allocator,
+                input,
+                record,
+                record_index,
+                solvable_id,
+            );
+            errdefer origin.deinit(state.allocator);
+            try state.origins.append(state.allocator, origin);
+        }
+
+        libsolv.repo_internalize(repo);
+        try state.available_repositories.append(state.allocator, input.repository_id);
+        keep_repo = true;
+        libsolv.pool_createwhatprovides(state.pool);
+    }
+
+    pub fn originCount(self: *const Context) usize {
+        return internalConst(self).origins.items.len;
+    }
+
+    pub fn originAt(self: *const Context, index: usize) ?PackageOrigin {
+        const origins = internalConst(self).origins.items;
+        if (index >= origins.len) return null;
+        return origins[index].public();
     }
 
     pub fn installedCount(self: *const Context) usize {
@@ -505,8 +740,89 @@ fn versionFlags(operator: relation.VersionOperator) c_int {
     };
 }
 
-fn parsedDatabase(source: []const u8) !dpkg_status.Database {
-    const result = try dpkg_status.parseBorrowed(std.testing.allocator, source, .{});
+const AvailableRelationTarget = enum {
+    requires_pre,
+    requires,
+    recommends,
+    provides,
+    conflicts,
+    obsoletes,
+};
+
+fn validateAvailableRecords(
+    records: []const packages_index.PackageRecord,
+    limits: Limits,
+) AvailableImportError!void {
+    for (records) |record| {
+        var groups: usize = 0;
+        var alternatives: usize = 0;
+        inline for (.{
+            record.control.pre_depends,
+            record.control.depends,
+            record.control.recommends,
+            record.control.provides,
+            record.control.conflicts,
+            record.control.breaks,
+            record.control.replaces,
+        }) |value| {
+            if (value) |relation_value| {
+                groups = std.math.add(usize, groups, relation_value.value.groups.len) catch
+                    return error.TooManyDependencyGroups;
+                for (relation_value.value.groups) |group| {
+                    alternatives = std.math.add(usize, alternatives, group.alternatives.len) catch
+                        return error.TooManyDependencyAlternatives;
+                    for (group.alternatives) |alternative| {
+                        if (alternative.package.architecture_qualifier != null)
+                            return error.UnsupportedArchitectureQualifier;
+                    }
+                }
+            }
+        }
+        if (groups > limits.max_dependency_groups_per_package)
+            return error.TooManyDependencyGroups;
+        if (alternatives > limits.max_dependency_alternatives_per_package)
+            return error.TooManyDependencyAlternatives;
+
+        if (record.control.provides) |provides| {
+            for (provides.value.groups) |group| {
+                if (group.alternatives.len != 1)
+                    return error.UnsupportedProvidesAlternative;
+                if (group.alternatives[0].version) |version| {
+                    if (version.operator != .equal)
+                        return error.UnsupportedProvidesPredicate;
+                }
+            }
+        }
+    }
+}
+
+fn addAvailableRelation(
+    pool: *libsolv.Pool,
+    solvable: *libsolv.Solvable,
+    value: ?@import("control_record.zig").RelationValue,
+    target: AvailableRelationTarget,
+) void {
+    const relation_value = value orelse return;
+    for (relation_value.value.groups) |group| {
+        const dependency = groupId(pool, group);
+        const key: libsolv.Id = switch (target) {
+            .requires_pre, .requires => libsolv.SOLVABLE_REQUIRES,
+            .recommends => libsolv.SOLVABLE_RECOMMENDS,
+            .provides => libsolv.SOLVABLE_PROVIDES,
+            .conflicts => libsolv.SOLVABLE_CONFLICTS,
+            .obsoletes => libsolv.SOLVABLE_OBSOLETES,
+        };
+        const marker: libsolv.Id = switch (target) {
+            .requires_pre => libsolv.SOLVABLE_PREREQMARKER,
+            .requires => -libsolv.SOLVABLE_PREREQMARKER,
+            else => 0,
+        };
+        libsolv.solvable_add_deparray(solvable, key, dependency, marker);
+    }
+}
+
+fn parsedDatabase(input_bytes: []const u8) !dpkg_status.Database {
+    const result = try dpkg_status.parseBorrowed(std.testing.allocator, input_bytes, .{});
     return switch (result) {
         .database => |database| database,
         .diagnostic => return error.UnexpectedDiagnostic,
@@ -714,4 +1030,181 @@ test "duplicate identities and malformed states fail before repository mutation"
     });
     try std.testing.expectEqual(DiagnosticCode.malformed_state, malformed_result.diagnostic.code);
     try std.testing.expect(internal(context).installed_repo == null);
+}
+
+fn testRepositoryId(byte: u8) source.RepositoryId {
+    return .{ .bytes = @splat(byte) };
+}
+
+fn availableIndex(
+    id: source.RepositoryId,
+    text: []const u8,
+) !packages_index.Index {
+    const result = try packages_index.parseBorrowed(std.testing.allocator, text, .{
+        .repository_id = id,
+        .component = "main",
+        .architecture = "amd64",
+        .source_location = "test/Packages",
+    }, .{});
+    return switch (result) {
+        .index => |index| index,
+        .diagnostic => return error.UnexpectedPackagesDiagnostic,
+    };
+}
+
+fn solveAvailable(context: *Context, name: []const u8) ![]PackageOrigin {
+    const state = internal(context);
+    var job: libsolv.Queue = undefined;
+    libsolv.queue_init(&job);
+    defer libsolv.queue_free(&job);
+    libsolv.queue_push2(
+        &job,
+        libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE_NAME,
+        stringId(state.pool, name),
+    );
+    if (libsolv.solver_solve(state.solver, &job) != 0) return error.Unsolvable;
+
+    var selected: std.ArrayList(PackageOrigin) = .empty;
+    defer selected.deinit(std.testing.allocator);
+    for (state.origins.items) |*origin| {
+        if (libsolv.solver_get_decisionlevel(state.solver, origin.solvable_id) > 0)
+            try selected.append(std.testing.allocator, origin.public());
+    }
+    return selected.toOwnedSlice(std.testing.allocator);
+}
+
+fn hasSelected(selected: []const PackageOrigin, name: []const u8) bool {
+    for (selected) |origin| {
+        if (std.mem.eql(u8, origin.package, name)) return true;
+    }
+    return false;
+}
+
+test "available import requires explicit trust and owns identities" {
+    const text =
+        "Package: base\nVersion: 1:2.0-3\nArchitecture: amd64\nFilename: pool/base.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const id = testRepositoryId('a');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+
+    var input = RepositoryInput.trustedTest(id, 500, &index);
+    input.eligibility = .untrusted;
+    try std.testing.expectError(error.UntrustedRepository, context.importAvailable(input, .{}));
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    const origin = context.originAt(0).?;
+    try std.testing.expectEqualStrings("base", origin.package);
+    try std.testing.expectEqualStrings("1:2.0-3", origin.version);
+    try std.testing.expectEqualStrings("amd64", origin.architecture);
+    try std.testing.expectEqual(@as(i32, 500), origin.repository_priority);
+}
+
+test "available solve handles alternatives and versioned provides" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: missing | virtual-api (>= 2)\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: old-provider\nVersion: 1\nArchitecture: amd64\nProvides: virtual-api (= 1)\nFilename: pool/old.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: new-provider\nVersion: 1\nArchitecture: amd64\nProvides: virtual-api (= 2)\nFilename: pool/new.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const id = testRepositoryId('b');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+
+    const selected = try solveAvailable(context, "root");
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(hasSelected(selected, "new-provider"));
+    try std.testing.expect(!hasSelected(selected, "old-provider"));
+}
+
+test "available solve enforces pre-depends conflicts breaks and replaces" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nPre-Depends: new\nDepends: old\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: old\nVersion: 1\nArchitecture: amd64\nFilename: pool/old.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: new\nVersion: 2\nArchitecture: amd64\nConflicts: old\nBreaks: old (<= 1)\nReplaces: old (<= 1)\nFilename: pool/new.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const id = testRepositoryId('c');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+
+    try std.testing.expectError(error.Unsolvable, solveAvailable(context, "root"));
+    const state = internal(context);
+    const replacement = libsolv.pool_id2solvable(state.pool, state.origins.items[2].solvable_id);
+    try std.testing.expect(replacement.*.obsoletes != 0);
+}
+
+test "architecture all and recommends retain distinct solver semantics" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: data\nRecommends: optional\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: data\nVersion: 1\nArchitecture: all\nFilename: pool/data.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: optional\nVersion: 1\nArchitecture: amd64\nFilename: pool/optional.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const id = testRepositoryId('d');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+
+    const selected = try solveAvailable(context, "root");
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(hasSelected(selected, "data"));
+    const root = libsolv.pool_id2solvable(internal(context).pool, internal(context).origins.items[0].solvable_id);
+    try std.testing.expect(root.*.requires != 0);
+    try std.testing.expect(root.*.recommends != 0);
+}
+
+test "repository priority gives stable provider ordering" {
+    const low_text =
+        "Package: low\nVersion: 1\nArchitecture: amd64\nProvides: virtual\nFilename: pool/low.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const high_text =
+        "Package: high\nVersion: 1\nArchitecture: amd64\nProvides: virtual\nFilename: pool/high.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const root_text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: virtual\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    var low = try availableIndex(testRepositoryId('e'), low_text);
+    defer low.deinit();
+    var high = try availableIndex(testRepositoryId('f'), high_text);
+    defer high.deinit();
+    var root = try availableIndex(testRepositoryId('g'), root_text);
+    defer root.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(testRepositoryId('e'), 100, &low), .{});
+    try context.importAvailable(RepositoryInput.trustedTest(testRepositoryId('f'), 900, &high), .{});
+    try context.importAvailable(RepositoryInput.trustedTest(testRepositoryId('g'), 500, &root), .{});
+
+    const selected = try solveAvailable(context, "root");
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(hasSelected(selected, "high"));
+    try std.testing.expect(!hasSelected(selected, "low"));
+}
+
+test "unsupported available relation qualifiers return typed errors" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: helper:any\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    const id = testRepositoryId('h');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try std.testing.expectError(
+        error.UnsupportedArchitectureQualifier,
+        context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{}),
+    );
 }
