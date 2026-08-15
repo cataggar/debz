@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-08-15",
+  "review_expires": "2026-11-13",
+  "production_dependencies": [
+    {
+      "name": "libsolv",
+      "source": "https://github.com/cataggar/libsolv",
+      "commit": "e190ef1433e5df60a2238b01438927eb76c285f5",
+      "zig_hash": "libsolv-0.7.39-PoNzeg2EIACYnSAYc3_WneVukScmmV-vyo_5guzBzqdO",
+      "version": "0.7.39",
+      "license": "BSD-3-Clause",
+      "vulnerability_sources": [
+        "https://github.com/openSUSE/libsolv/security/advisories",
+        "https://osv.dev/list?q=libsolv"
+      ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-15",
+        "result": "no_known_unresolved_advisories"
+      },
+      "reviewed_exceptions": []
+    },
+    {
+      "name": "liblzma",
+      "source": "distribution-system-library",
+      "minimum_version": "5.2.6",
+      "maximum_major_exclusive": 6,
+      "license": "0BSD",
+      "vulnerability_sources": [
+        "https://tukaani.org/xz/",
+        "https://osv.dev/list?q=xz-utils"
+      ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-15",
+        "result": "no_known_unresolved_advisories"
+      },
+      "reviewed_exceptions": []
+    }
+  ],
+  "allowed_production_licenses": [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "0BSD",
+    "MIT"
+  ],
+  "forbidden_production_licenses": [
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "AGPL-3.0"
+  ]
+}

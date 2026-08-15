@@ -1,0 +1,5 @@
+Package: demo
+Version: 1.0-1
+Architecture: amd64
+Depends: libc6 (>= 2.38)
+Description: fuzz seed

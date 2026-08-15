@@ -10,3 +10,6 @@
 - [Debian payload validation](deb-payload-validation.md) documents resource limits, tar/path/link policy, identity checks, inventories, diagnostics, and fuzzing.
 - [Dpkg transaction executor](transaction-executor.md) documents install-root safety, locks, argv/environment policy, ordering, triggers, force policy, and failure provenance.
 - [Exact closure locks and transaction provenance](exact-locks-and-provenance.md) documents canonical schemas, reproduction constraints, redaction, persistence, recovery evidence, and final verification.
+- [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
+- [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.
+- [Safety CI, fuzzing and audits](safety-ci.md) documents fuzz targets, bounded CI/local campaigns, safety modes, and static policy gates.

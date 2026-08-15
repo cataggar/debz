@@ -1,0 +1,7 @@
+Package: demo
+Version: 1.0
+Architecture: amd64
+Filename: pool/main/d/demo/demo_1.0_amd64.deb
+Size: 1
+SHA256: 0000000000000000000000000000000000000000000000000000000000000000
+Description: fuzz seed
