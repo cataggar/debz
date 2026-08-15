@@ -38,8 +38,13 @@ cache behavior, policy behavior, and API/schema references.
 ```sh
 zig build
 zig build test
+zig build fuzz
+zig build security-audit
 zig build run -- --help
 ```
+
+See [Safety CI, fuzzing and audits](doc/safety-ci.md) and the
+[security reporting policy](SECURITY.md).
 
 ## License
 

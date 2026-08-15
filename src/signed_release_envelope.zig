@@ -583,8 +583,10 @@ fn parseArmorBlock(
         return .{ .diagnostic = diag(.signature_too_large, input, body_start, ending.text.start) };
     const bytes = try allocator.alloc(u8, decoded_len);
     errdefer allocator.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, encoded.items) catch
+    std.base64.standard.Decoder.decode(bytes, encoded.items) catch {
+        allocator.free(bytes);
         return .{ .diagnostic = diag(.invalid_base64_padding, input, body_start, ending.text.start) };
+    };
     if (crc_value) |expected| {
         const actual = crc24(bytes);
         if (!std.mem.eql(u8, &actual, &expected)) {

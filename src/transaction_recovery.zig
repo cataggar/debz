@@ -4,6 +4,7 @@ const dpkg_status = @import("dpkg_status.zig");
 const exact_lock = @import("exact_lock.zig");
 
 pub const journal_version: u32 = 2;
+pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
 
 pub const State = enum {
     not_started,
@@ -392,6 +393,16 @@ pub const Decoded = struct {
 };
 
 pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
+    return decodeBounded(allocator, source, maximum_journal_bytes);
+}
+
+pub fn decodeBounded(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    maximum_bytes: usize,
+) !Decoded {
+    if (source.len > maximum_bytes or source.len > maximum_journal_bytes)
+        return error.JournalTooLarge;
     const checksum_marker = "\nchecksum\t";
     const marker = std.mem.lastIndexOf(u8, source, checksum_marker) orelse return error.MissingChecksum;
     const checksum_start = marker + checksum_marker.len;
@@ -434,6 +445,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
         };
         if (fields.next() != null) return error.MalformedJournal;
     }
+
     const failure_line = lines.next() orelse return error.MalformedJournal;
     var failure_fields = std.mem.splitScalar(u8, failure_line, '\t');
     if (!std.mem.eql(u8, failure_fields.next() orelse "", "failure")) return error.MalformedJournal;
@@ -466,6 +478,13 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !Decoded {
         .commands = commands,
         .allocator = allocator,
     };
+}
+
+test "transaction_recovery journal decoding is caller bounded" {
+    try std.testing.expectError(
+        error.JournalTooLarge,
+        decodeBounded(std.testing.allocator, "12345", 4),
+    );
 }
 
 pub fn verify(

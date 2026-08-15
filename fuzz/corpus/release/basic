@@ -1,0 +1,8 @@
+Origin: Debian
+Suite: stable
+Codename: stable
+Date: Sat, 15 Aug 2026 00:00:00 UTC
+Architectures: amd64 arm64
+Components: main
+SHA256:
+ 0000000000000000000000000000000000000000000000000000000000000000 0 main/binary-amd64/Packages
