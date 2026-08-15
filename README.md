@@ -1,5 +1,16 @@
 # debz
 
+## Deterministic transaction planning
+
+`debz.planTransaction` is the public typed planning API. It accepts authenticated
+repository snapshots, parsed dpkg state, explicit package policy, architecture,
+request, solver policy, and limits. The returned plan owns its data and can be
+serialized with `canonicalJson`; schema version 1 is documented in
+`schema/transaction-plan-v1.json`.
+
+Planning only computes actions. It does **not** download package archives,
+modify the filesystem, or execute dpkg.
+
 `debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It will own repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, and diagnostics while using `dpkg` as the transaction backend.
 
 The project currently exposes typed configuration and request APIs, a CLI command vocabulary, bounded parsers for DEB822, Debian versions, binary package relations, control records and repository `Release` metadata, typed repository source configuration, and a bounded validator for Debian binary package outer archives. The control-record model validates required identity fields and typed scalar values, preserves unknown fields and source spans, and keeps relation policy decisions separate from syntax parsing.
