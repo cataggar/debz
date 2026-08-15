@@ -7,20 +7,21 @@ root="$PWD/.zig-cache/cli-production-test/root"
 cache="$PWD/.zig-cache/cli-production-test/cache"
 state="$PWD/.zig-cache/cli-production-test/state"
 status="$PWD/src/fixtures/dpkg-status/installed.status"
-common="--install-root $root --cache-path $cache --state-path $state --status-path $status --architecture amd64 --json"
+common="--install-root $root --cache-path $cache --state-path $state --architecture amd64 --json"
+read_common="$common --status-path $status"
 
 mkdir -p "$root/var/lib/dpkg" "$state"
 
 "$debz" --help >/dev/null
 "$debz" --version | grep -q 'API v1'
 
-output=$("$debz" list-installed $common 2>cli-test-stderr)
+output=$("$debz" list-installed $read_common 2>cli-test-stderr)
 test ! -s cli-test-stderr
 printf '%s' "$output" | grep -q '"operation":"list-installed"'
 printf '%s' "$output" | grep -q '"exit_status":0'
 printf '%s' "$output" | grep -q '"package":"debz"'
 
-output=$("$debz" why $common debz 2>cli-test-stderr)
+output=$("$debz" why $read_common debz 2>cli-test-stderr)
 test ! -s cli-test-stderr
 printf '%s' "$output" | grep -q '"operation":"why"'
 printf '%s' "$output" | grep -q '"exit_status":0'
@@ -50,3 +51,19 @@ output=$("$debz" clean $common --assume-yes 2>cli-test-stderr)
 test ! -s cli-test-stderr
 printf '%s' "$output" | grep -q '"operation":"clean"'
 printf '%s' "$output" | grep -q '"exit_status":0'
+
+for arguments in \
+    "list-installed --json --install-root $root --install-root $root --cache-path $cache --state-path $state --architecture amd64" \
+    "install --json --install-root $root --cache-path $cache --state-path $state --architecture amd64 --assume-yes one two" \
+    "clean --json --install-root $root --cache-path $cache --state-path $state --status-path $status --architecture amd64 --assume-yes" \
+    "clean --json --install-root / --cache-path / --state-path / --architecture amd64 --assume-yes"
+do
+    set +e
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"id":"invalid_request"'
+    printf '%s' "$output" | grep -q '"exit_status":2'
+done

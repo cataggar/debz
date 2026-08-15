@@ -196,6 +196,11 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
         !validAbsolutePath(request.options.state_path) or
         (request.options.status_path != null and !validAbsolutePath(request.options.status_path.?)) or
         (request.options.credential_reference != null and !validAbsolutePath(request.options.credential_reference.?)) or
+        !validPaths(request.options.source_paths) or
+        !validPaths(request.options.config_paths) or
+        !validPaths(request.options.keyring_paths) or
+        (request.options.lock_input_path != null and !validAbsolutePath(request.options.lock_input_path.?)) or
+        (request.options.lock_output_path != null and !validAbsolutePath(request.options.lock_output_path.?)) or
         !validArchitecture(request.options.architecture) or
         request.options.deadline_ms == 0)
         return failure(request.operation, .usage, .invalid_request, "invalid explicit path, architecture, or deadline");
@@ -203,6 +208,8 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
         return failure(request.operation, .usage, .invalid_request, "invalid package argument count or spelling");
     if (request.options.cache_only and !request.options.offline)
         return failure(request.operation, .usage, .invalid_request, "cache-only requires offline mode");
+    if (request.operation.mutates() and request.options.status_path != null)
+        return failure(request.operation, .usage, .invalid_request, "--status-path is read-only and cannot verify a mutation");
     if (request.operation.mutates() and !request.options.assume_yes)
         return failure(request.operation, .usage, .confirmation_required, "mutating command requires --assume-yes");
     if (request.operation.mutates() and request.operation != .refresh and request.operation != .clean and
@@ -233,8 +240,10 @@ pub fn redact(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
 fn validPackages(request: Request) bool {
     const count_ok = switch (request.operation) {
-        .install, .remove, .reinstall, .download, .info, .provides, .why => request.packages.len != 0,
-        .upgrade, .plan => true,
+        .install, .remove, .reinstall, .download => request.packages.len == 1,
+        .info, .provides, .why => request.packages.len != 0,
+        .plan => request.packages.len <= 1,
+        .upgrade => true,
         .refresh, .upgrade_all, .list_installed, .list_available, .clean, .recover => request.packages.len == 0,
     };
     if (!count_ok) return false;
@@ -248,8 +257,17 @@ fn validPackages(request: Request) bool {
 }
 
 fn validAbsolutePath(path: []const u8) bool {
-    return path.len != 0 and path[0] == '/' and std.mem.indexOf(u8, path, "/../") == null and
-        !std.mem.endsWith(u8, path, "/..");
+    if (path.len <= 1 or path[0] != '/' or path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component|
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return false;
+    return true;
+}
+
+fn validPaths(paths: []const []const u8) bool {
+    for (paths) |path| if (!validAbsolutePath(path)) return false;
+    return true;
 }
 
 fn validArchitecture(value: []const u8) bool {
@@ -311,5 +329,53 @@ test "facade validates confirmation before backend routing" {
     const result = try execute(std.testing.allocator, request, .{ .context = &called, .executeFn = Fake.run });
     try std.testing.expectEqual(@as(usize, 1), result.diagnostic_count);
     try std.testing.expectEqual(ErrorId.confirmation_required, result.diagnostics[0].id);
+    try std.testing.expect(!called);
+}
+
+test "facade rejects ambiguous paths, external mutation status, and ignored package arguments" {
+    var called = false;
+    const Fake = struct {
+        fn run(context: *anyopaque, _: std.mem.Allocator, request: Request) !Result {
+            const flag: *bool = @ptrCast(@alignCast(context));
+            flag.* = true;
+            return .{ .operation = request.operation, .exit_status = .success, .summary = "ok" };
+        }
+    };
+    const backend: Backend = .{ .context = &called, .executeFn = Fake.run };
+    const invalid_path = try execute(std.testing.allocator, .{
+        .operation = .list_available,
+        .options = .{
+            .install_root = "/root",
+            .source_paths = &.{"/config/../sources.list"},
+            .cache_path = "/cache",
+            .state_path = "/state",
+            .architecture = "amd64",
+        },
+    }, backend);
+    try std.testing.expectEqual(ErrorId.invalid_request, invalid_path.diagnostics[0].id);
+    const external_status = try execute(std.testing.allocator, .{
+        .operation = .clean,
+        .options = .{
+            .install_root = "/root",
+            .cache_path = "/cache",
+            .state_path = "/state",
+            .status_path = "/status",
+            .architecture = "amd64",
+            .assume_yes = true,
+        },
+    }, backend);
+    try std.testing.expectEqual(ErrorId.invalid_request, external_status.diagnostics[0].id);
+    const extra_package = try execute(std.testing.allocator, .{
+        .operation = .install,
+        .packages = &.{ "one", "two" },
+        .options = .{
+            .install_root = "/root",
+            .cache_path = "/cache",
+            .state_path = "/state",
+            .architecture = "amd64",
+            .assume_yes = true,
+        },
+    }, backend);
+    try std.testing.expectEqual(ErrorId.invalid_request, extra_package.diagnostics[0].id);
     try std.testing.expect(!called);
 }

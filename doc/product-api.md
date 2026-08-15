@@ -35,6 +35,11 @@ Inputs are explicit: `--source`, `--config`, `--keyring`, `--status-path`,
 policies. Paths must be absolute and traversal-free. No host APT configuration,
 keyring, proxy, credential, or environment is inherited.
 
+`install`, `remove`, `reinstall`, and `download` accept exactly one package
+selector; `plan` accepts zero or one. Supplying unsupported extra selectors is
+a typed usage error rather than silently ignoring them. Singleton options
+cannot be repeated.
+
 Every mutating command requires `--assume-yes`. Noninteractive transaction
 commands additionally require `--conffile keep-existing` or
 `--conffile use-package-version`. `plan` and `download` are non-executing.
@@ -72,4 +77,7 @@ comes from `--status-path`, or from
 `INSTALL_ROOT/var/lib/dpkg/status` when the explicit status path is omitted.
 `--credential-reference` is an absolute path to a bounded file containing the
 HTTP Authorization value; it is never copied into diagnostics or provenance.
+One credential reference is restricted to the single normalized HTTP(S)
+origin shared by all configured repositories. `--status-path` is read-only;
+mutating commands always verify `INSTALL_ROOT/var/lib/dpkg/status`.
 No host APT, GnuPG, proxy, credential, or dpkg configuration is consulted.

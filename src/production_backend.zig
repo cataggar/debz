@@ -109,6 +109,7 @@ pub const Backend = struct {
                 .detail = if (package.status.want == .hold) "held" else "installed",
             });
         }
+        sortItems(items.items);
         return success(request.operation, false, "installed package state loaded", try items.toOwnedSlice(allocator));
     }
 
@@ -134,11 +135,14 @@ pub const Backend = struct {
                 .detail = "not installed",
             });
         }
+        sortItems(items.items);
         return success(request.operation, false, "installed-state reasons evaluated", try items.toOwnedSlice(allocator));
     }
 
     fn clean(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
-        var cache = try package_acquisition.Cache.init(self.io, request.options.cache_path, .{
+        var cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
+        defer cache_root.close(self.io);
+        var cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
         });
         defer cache.deinit();
@@ -149,7 +153,7 @@ pub const Backend = struct {
             .maximum_objects_deleted = 100_000,
             .maximum_bytes_deleted = std.math.maxInt(u64),
         });
-        var metadata = try metadata_cache.Cache.init(self.io, request.options.cache_path, .{});
+        var metadata = try metadata_cache.Cache.initFromDir(self.io, cache_root, .{});
         defer metadata.deinit();
         const metadata_gc = try metadata.garbageCollect(allocator, .{
             .max_objects_scanned = 100_000,
@@ -201,7 +205,9 @@ pub const Backend = struct {
                 return api.failure(request.operation, .usage, .configuration_required, "Signed-By path was not declared with --keyring");
         }
 
-        var metadata = try metadata_cache.Cache.init(self.io, request.options.cache_path, .{});
+        var cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
+        defer cache_root.close(self.io);
+        var metadata = try metadata_cache.Cache.initFromDir(self.io, cache_root, .{});
         defer metadata.deinit();
         var acquisition = repository_acquisition.Production{ .io = self.io };
         const credential_bytes: ?[]u8 = if (request.options.credential_reference) |path|
@@ -209,7 +215,11 @@ pub const Backend = struct {
         else
             null;
         defer if (credential_bytes) |value| allocator.free(value);
-        var credential_context = CredentialContext{ .authorization = credential_bytes orelse "" };
+        var credential_context = if (credential_bytes != null)
+            try CredentialContext.init(allocator, configuration.repositories, credential_bytes.?)
+        else
+            CredentialContext.empty();
+        defer credential_context.deinit(allocator);
         const credentials: repository_acquisition.CredentialsProvider = if (credential_bytes != null)
             .{ .context = &credential_context, .getFn = CredentialContext.get }
         else
@@ -319,7 +329,7 @@ pub const Backend = struct {
         };
         if (request.operation == .plan) return planResult(allocator, request.operation, plan.*);
 
-        var package_cache = try package_acquisition.Cache.init(self.io, request.options.cache_path, .{
+        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
         });
         defer package_cache.deinit();
@@ -393,7 +403,7 @@ pub const Backend = struct {
             try verified.append(allocator, package);
         }
         if (request.operation == .download)
-            return planResult(allocator, request.operation, plan.*);
+            return planResultChanged(allocator, request.operation, plan.*, false, "packages downloaded and verified");
 
         const executor_policy = try executionPolicy(allocator, effective_request);
         var system_process = transaction_executor.SystemProcessRunner{ .allocator = allocator, .io = self.io };
@@ -410,20 +420,12 @@ pub const Backend = struct {
             .io = self.io,
             .expected_root = request.options.install_root,
         };
-        var explicit_status = ExplicitStatusReader{
-            .io = self.io,
-            .expected_root = request.options.install_root,
-            .path = request.options.status_path orelse "",
-        };
         const dependencies: transaction_executor.Dependencies = .{
             .filesystem = system_files.interface(),
             .locks = system_locks.interface(),
             .process = self.process_runner orelse system_process.interface(),
             .journal = journal.interface(),
-            .status = if (request.options.status_path != null)
-                explicit_status.interface()
-            else
-                status_reader.interface(),
+            .status = status_reader.interface(),
         };
         if (request.operation == .recover) {
             var report = try self.executor.recoverFn(self.executor.context, allocator, .{
@@ -438,6 +440,7 @@ pub const Backend = struct {
                     try allocator.dupe(u8, failure.diagnostic)
                 else
                     "recovery failed");
+            try deleteRecoveryIntent(self.io, request.options.state_path);
             return success(request.operation, true, "transaction recovery completed", &.{});
         }
         try writeRecoveryIntent(allocator, self.io, request.options.state_path, effective_request);
@@ -454,6 +457,7 @@ pub const Backend = struct {
                 try allocator.dupe(u8, failure.diagnostic)
             else
                 "transaction failed");
+        try deleteRecoveryIntent(self.io, request.options.state_path);
         if (lock) |*value| try writeExecutionProvenance(
             allocator,
             self.io,
@@ -551,33 +555,77 @@ const LoadedDocuments = struct {
 
 const CredentialContext = struct {
     authorization: []const u8,
+    scheme: []const u8,
+    host: []const u8,
+    port: u16,
 
-    fn get(context: ?*anyopaque, _: repository_acquisition.Uri) !?repository_acquisition.Credential {
+    fn empty() CredentialContext {
+        return .{ .authorization = "", .scheme = "", .host = "", .port = 0 };
+    }
+
+    fn init(
+        allocator: std.mem.Allocator,
+        repositories: []const repository_policy.NormalizedRepository,
+        authorization: []const u8,
+    ) !CredentialContext {
+        if (repositories.len == 0) return error.InvalidCredentialScope;
+        const first = try repository_acquisition.Uri.parse(repositories[0].uri);
+        var result = try fromUri(allocator, first, authorization);
+        errdefer result.deinit(allocator);
+        for (repositories[1..]) |repository| {
+            const uri = try repository_acquisition.Uri.parse(repository.uri);
+            if (!result.matches(uri)) return error.InvalidCredentialScope;
+        }
+        return result;
+    }
+
+    fn fromUri(
+        allocator: std.mem.Allocator,
+        uri: repository_acquisition.Uri,
+        authorization: []const u8,
+    ) !CredentialContext {
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+            !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+            return error.InvalidCredentialScope;
+        const host_component = uri.host orelse return error.InvalidCredentialScope;
+        var host_buffer: [4096]u8 = undefined;
+        const host = host_component.toRaw(&host_buffer) catch return error.InvalidCredentialScope;
+        const scheme = try allocator.dupe(u8, uri.scheme);
+        errdefer allocator.free(scheme);
+        const owned_host = try allocator.dupe(u8, host);
+        return .{
+            .authorization = authorization,
+            .scheme = scheme,
+            .host = owned_host,
+            .port = effectivePort(uri),
+        };
+    }
+
+    fn deinit(self: *CredentialContext, allocator: std.mem.Allocator) void {
+        if (self.scheme.len != 0) allocator.free(self.scheme);
+        if (self.host.len != 0) allocator.free(self.host);
+        self.* = undefined;
+    }
+
+    fn matches(self: CredentialContext, uri: repository_acquisition.Uri) bool {
+        const host_component = uri.host orelse return false;
+        var host_buffer: [4096]u8 = undefined;
+        const host = host_component.toRaw(&host_buffer) catch return false;
+        return std.ascii.eqlIgnoreCase(self.scheme, uri.scheme) and
+            std.ascii.eqlIgnoreCase(self.host, host) and
+            self.port == effectivePort(uri);
+    }
+
+    fn get(context: ?*anyopaque, uri: repository_acquisition.Uri) !?repository_acquisition.Credential {
         const self: *CredentialContext = @ptrCast(@alignCast(context.?));
+        if (!self.matches(uri)) return null;
         return .{ .authorization = self.authorization };
     }
 };
 
-const ExplicitStatusReader = struct {
-    io: std.Io,
-    expected_root: []const u8,
-    path: []const u8,
-
-    fn interface(self: *ExplicitStatusReader) transaction_recovery.StatusReader {
-        return .{ .context = self, .readFn = read };
-    }
-
-    fn read(
-        context: *anyopaque,
-        allocator: std.mem.Allocator,
-        root: []const u8,
-        maximum: usize,
-    ) ![]u8 {
-        const self: *ExplicitStatusReader = @ptrCast(@alignCast(context));
-        if (!std.mem.eql(u8, root, self.expected_root)) return error.WrongInstallRoot;
-        return readFile(allocator, self.io, self.path, maximum);
-    }
-};
+fn effectivePort(uri: repository_acquisition.Uri) u16 {
+    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+}
 
 const RecoveryIntent = struct {
     operation: api.Operation,
@@ -638,7 +686,7 @@ fn writeRecoveryIntent(
     try writer.print("],\"lock_wait_ms\":{d}}}\n", .{request.options.lock_wait_ms});
     const bytes = try output.toOwnedSlice();
     defer allocator.free(bytes);
-    var dir = try std.Io.Dir.openDirAbsolute(io, state_path, .{ .follow_symlinks = false });
+    var dir = try openAbsoluteDirectory(io, state_path);
     defer dir.close(io);
     const stage = ".recovery-request.json.new";
     dir.deleteFile(io, stage) catch |err| switch (err) {
@@ -655,7 +703,21 @@ fn writeRecoveryIntent(
         try file.writeStreamingAll(io, bytes);
         try file.sync(io);
     }
+
     try dir.rename(stage, dir, "recovery-request.json", io);
+    switch (@import("builtin").os.tag) {
+        .windows, .wasi => {},
+        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
+    }
+}
+
+fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
+    var dir = try openAbsoluteDirectory(io, state_path);
+    defer dir.close(io);
+    dir.deleteFile(io, "recovery-request.json") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     switch (@import("builtin").os.tag) {
         .windows, .wasi => {},
         else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
@@ -755,6 +817,7 @@ fn queryAvailable(
             });
         }
     }
+    sortItems(items.items);
     return success(request.operation, false, "authenticated repository view queried", try items.toOwnedSlice(allocator));
 }
 
@@ -762,7 +825,9 @@ fn recordProvides(record: anytype, requested: []const []const u8) bool {
     for (requested) |name| {
         if (std.mem.eql(u8, record.control.package.text, selectorName(name))) return true;
         if (record.control.provides) |relation| {
-            if (std.mem.indexOf(u8, relation.source, selectorName(name)) != null) return true;
+            for (relation.value.groups) |group|
+                for (group.alternatives) |alternative|
+                    if (std.mem.eql(u8, alternative.package.name.text, selectorName(name))) return true;
         }
     }
     return false;
@@ -869,10 +934,15 @@ fn readFile(
     path: []const u8,
     maximum: usize,
 ) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+    const leaf = std.fs.path.basename(path);
+    var dir = try openAbsoluteDirectory(io, parent);
+    defer dir.close(io);
+    var file = try dir.openFile(io, leaf, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
+        .resolve_beneath = true,
     });
     defer file.close(io);
     var reader = file.reader(io, &.{});
@@ -893,7 +963,7 @@ fn writeLock(
 ) !void {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
     const leaf = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{ .follow_symlinks = false });
+    var dir = try openAbsoluteDirectory(io, parent);
     defer dir.close(io);
     const store = try exact_lock.Store.init(io, dir, leaf);
     try store.writeAtomic(allocator, lock);
@@ -960,7 +1030,7 @@ fn writeExecutionProvenance(
         },
     }, report);
     defer provenance.deinit();
-    var dir = try std.Io.Dir.openDirAbsolute(io, request.options.state_path, .{ .follow_symlinks = false });
+    var dir = try openAbsoluteDirectory(io, request.options.state_path);
     defer dir.close(io);
     const store = try transaction_provenance.Store.init(io, dir, "transaction-result.json");
     try store.writeAtomic(allocator, provenance.result);
@@ -997,19 +1067,80 @@ fn success(operation: api.Operation, changed: bool, summary: []const u8, items: 
     };
 }
 
+fn sortItems(items: []api.Item) void {
+    std.mem.sort(api.Item, items, {}, struct {
+        fn lessThan(_: void, left: api.Item, right: api.Item) bool {
+            const package_order = std.mem.order(u8, left.package, right.package);
+            if (package_order != .eq) return package_order == .lt;
+            const architecture_order = optionalOrder(left.architecture, right.architecture);
+            if (architecture_order != .eq) return architecture_order == .lt;
+            const version_order = optionalOrder(left.version, right.version);
+            if (version_order != .eq) return version_order == .lt;
+            return optionalOrder(left.detail, right.detail) == .lt;
+        }
+
+        fn optionalOrder(left: ?[]const u8, right: ?[]const u8) std.math.Order {
+            if (left == null) return if (right == null) .eq else .lt;
+            if (right == null) return .gt;
+            return std.mem.order(u8, left.?, right.?);
+        }
+    }.lessThan);
+}
+
+fn openAbsoluteDirectory(io: std.Io, path: []const u8) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidAbsolutePath;
+    var current = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    errdefer current.close(io);
+    if (std.mem.eql(u8, path, "/")) return current;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return error.InvalidAbsolutePath;
+        const next = try current.openDir(io, component, .{ .follow_symlinks = false });
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
+fn openOrCreateAbsoluteDirectory(io: std.Io, path: []const u8) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidAbsolutePath;
+    var current = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    errdefer current.close(io);
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return error.InvalidAbsolutePath;
+        current.createDir(io, component, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const next = try current.openDir(io, component, .{ .follow_symlinks = false });
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
 fn mapRuntimeError(operation: api.Operation, err: anyerror) api.Result {
     return switch (err) {
-        error.FileNotFound, error.InvalidRepositoryConfig, error.InvalidInstalledState,
-        error.CredentialBearingProxy, error.InvalidCredentialFile, error.InvalidAbsolutePath,
+        error.FileNotFound,
+        error.InvalidRepositoryConfig,
+        error.InvalidInstalledState,
+        error.CredentialBearingProxy,
+        error.InvalidCredentialFile,
+        error.InvalidAbsolutePath,
+        error.InvalidCredentialScope,
         => api.failure(operation, .usage, .configuration_required, @errorName(err)),
         error.CacheMiss, error.CorruptObject => api.failure(operation, .download, .offline_cache_miss, @errorName(err)),
-        error.NoValidAcceptedSignature, error.WrongSigningKey, error.InvalidSignature,
-        error.MalformedKeyring, error.NoKeyrings,
+        error.NoValidAcceptedSignature,
+        error.WrongSigningKey,
+        error.InvalidSignature,
+        error.MalformedKeyring,
+        error.NoKeyrings,
         => api.failure(operation, .authentication, .repository_authentication_failed, @errorName(err)),
-        error.PackageTooLarge, error.SizeMismatch, error.DigestMismatch =>
-        api.failure(operation, .download, .download_failed, @errorName(err)),
-        error.InvalidPackagePayload =>
-        api.failure(operation, .download, .download_failed, @errorName(err)),
+        error.PackageTooLarge, error.SizeMismatch, error.DigestMismatch => api.failure(operation, .download, .download_failed, @errorName(err)),
+        error.InvalidPackagePayload => api.failure(operation, .download, .download_failed, @errorName(err)),
         else => api.failure(operation, .internal, .internal_error, @errorName(err)),
     };
 }
@@ -1082,6 +1213,47 @@ test "production backend reports command-specific missing repository input" {
     });
     try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
     try std.testing.expectEqual(api.ErrorId.configuration_required, result.diagnostics[0].id);
+}
+
+test "production credentials are restricted to one repository origin" {
+    var context = try CredentialContext.fromUri(
+        std.testing.allocator,
+        try repository_acquisition.Uri.parse("https://repo.example:443/debian"),
+        "Bearer secret",
+    );
+    defer context.deinit(std.testing.allocator);
+    try std.testing.expect((try context.get(
+        &context,
+        try repository_acquisition.Uri.parse("https://REPO.example/other"),
+    )) != null);
+    try std.testing.expect((try context.get(
+        &context,
+        try repository_acquisition.Uri.parse("https://attacker.example/debian"),
+    )) == null);
+    try std.testing.expect((try context.get(
+        &context,
+        try repository_acquisition.Uri.parse("https://repo.example:444/debian"),
+    )) == null);
+}
+
+test "production explicit file reads reject symlinked parents" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.makePath(std.testing.io, "real");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "real/input", .data = "secret" });
+    try directory.dir.symLink(std.testing.io, "real", "linked", .{ .is_directory = true });
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/linked/input",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(
+        error.NotDir,
+        readFile(std.testing.allocator, std.testing.io, path, 1024),
+    );
 }
 
 test "production backend authenticates an explicit file repository" {
@@ -1226,6 +1398,8 @@ test "production backend mutation uses injected process runner" {
     }, backend.interface());
     try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
     try std.testing.expect(result.changed);
-    var intent = try directory.dir.openFile(std.testing.io, "state/recovery-request.json", .{});
-    intent.close(std.testing.io);
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.openFile(std.testing.io, "state/recovery-request.json", .{}),
+    );
 }

@@ -27,6 +27,22 @@ const usage =
 ;
 
 const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory };
+const SingleOption = enum {
+    install_root,
+    cache_path,
+    state_path,
+    status_path,
+    architecture,
+    default_release,
+    proxy,
+    credential_reference,
+    lock_input,
+    lock_output,
+    deadline,
+    lock_wait,
+    repository_policy,
+    conffile,
+};
 
 const Parsed = struct {
     request: api.Request,
@@ -63,9 +79,16 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
-    const parsed = parse(init.arena.allocator(), operation, &args) catch |err| {
-        try stderr.print("debz: {s}\n", .{@errorName(err)});
-        try stderr.print("Try 'debz {s} --help'.\n", .{command});
+    var requested_output: api.OutputFormat = .human;
+    const parsed = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
+        if (requested_output == .json) {
+            const invalid = api.failure(operation, .usage, .invalid_request, @errorName(err));
+            try render(init.arena.allocator(), stdout, stderr, .json, invalid);
+        } else {
+            try stderr.print("debz: {s}\n", .{@errorName(err)});
+            try stderr.print("Try 'debz {s} --help'.\n", .{command});
+        }
+        try stdout.flush();
         try stderr.flush();
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
@@ -99,12 +122,14 @@ fn parse(
     allocator: std.mem.Allocator,
     operation: api.Operation,
     args: *std.process.Args.Iterator,
+    requested_output: *api.OutputFormat,
 ) CliError!Parsed {
     var packages: std.ArrayList([]const u8) = .empty;
     var sources: std.ArrayList([]const u8) = .empty;
     var configs: std.ArrayList([]const u8) = .empty;
     var keyrings: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
+    var seen: std.EnumSet(SingleOption) = .initEmpty();
     var options: api.CommonOptions = .{
         .install_root = "",
         .cache_path = "",
@@ -119,10 +144,50 @@ fn parse(
             try packages.append(allocator, argument);
             continue;
         }
-        if (std.mem.eql(u8, argument, "--json")) options.output = .json else if (std.mem.eql(u8, argument, "--offline")) options.offline = true else if (std.mem.eql(u8, argument, "--cache-only")) {
+        if (std.mem.eql(u8, argument, "--json")) {
+            options.output = .json;
+            requested_output.* = .json;
+        } else if (std.mem.eql(u8, argument, "--offline")) options.offline = true else if (std.mem.eql(u8, argument, "--cache-only")) {
             options.cache_only = true;
             options.offline = true;
-        } else if (std.mem.eql(u8, argument, "--recommends")) options.recommends = true else if (std.mem.eql(u8, argument, "--allow-downgrade")) options.allow_downgrade = true else if (std.mem.eql(u8, argument, "--assume-yes") or std.mem.eql(u8, argument, "-y")) options.assume_yes = true else if (std.mem.eql(u8, argument, "--noninteractive")) options.noninteractive = true else if (std.mem.eql(u8, argument, "--install-root")) options.install_root = try next(args) else if (std.mem.eql(u8, argument, "--cache-path")) options.cache_path = try next(args) else if (std.mem.eql(u8, argument, "--state-path")) options.state_path = try next(args) else if (std.mem.eql(u8, argument, "--status-path")) options.status_path = try next(args) else if (std.mem.eql(u8, argument, "--architecture")) options.architecture = try next(args) else if (std.mem.eql(u8, argument, "--default-release")) options.default_release = try next(args) else if (std.mem.eql(u8, argument, "--proxy")) options.proxy = try next(args) else if (std.mem.eql(u8, argument, "--credential-reference")) options.credential_reference = try next(args) else if (std.mem.eql(u8, argument, "--lock-input")) options.lock_input_path = try next(args) else if (std.mem.eql(u8, argument, "--lock-output")) options.lock_output_path = try next(args) else if (std.mem.eql(u8, argument, "--source")) try sources.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--config")) try configs.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--keyring")) try keyrings.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--deadline-ms")) options.deadline_ms = try number(try next(args)) else if (std.mem.eql(u8, argument, "--lock-wait-ms")) options.lock_wait_ms = try number(try next(args)) else if (std.mem.eql(u8, argument, "--repository-policy")) {
+        } else if (std.mem.eql(u8, argument, "--recommends")) options.recommends = true else if (std.mem.eql(u8, argument, "--allow-downgrade")) options.allow_downgrade = true else if (std.mem.eql(u8, argument, "--assume-yes") or std.mem.eql(u8, argument, "-y")) options.assume_yes = true else if (std.mem.eql(u8, argument, "--noninteractive")) options.noninteractive = true else if (std.mem.eql(u8, argument, "--install-root")) {
+            try setOnce(&seen, .install_root);
+            options.install_root = try next(args);
+        } else if (std.mem.eql(u8, argument, "--cache-path")) {
+            try setOnce(&seen, .cache_path);
+            options.cache_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--state-path")) {
+            try setOnce(&seen, .state_path);
+            options.state_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--status-path")) {
+            try setOnce(&seen, .status_path);
+            options.status_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--architecture")) {
+            try setOnce(&seen, .architecture);
+            options.architecture = try next(args);
+        } else if (std.mem.eql(u8, argument, "--default-release")) {
+            try setOnce(&seen, .default_release);
+            options.default_release = try next(args);
+        } else if (std.mem.eql(u8, argument, "--proxy")) {
+            try setOnce(&seen, .proxy);
+            options.proxy = try next(args);
+        } else if (std.mem.eql(u8, argument, "--credential-reference")) {
+            try setOnce(&seen, .credential_reference);
+            options.credential_reference = try next(args);
+        } else if (std.mem.eql(u8, argument, "--lock-input")) {
+            try setOnce(&seen, .lock_input);
+            options.lock_input_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--lock-output")) {
+            try setOnce(&seen, .lock_output);
+            options.lock_output_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--source")) try sources.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--config")) try configs.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--keyring")) try keyrings.append(allocator, try next(args)) else if (std.mem.eql(u8, argument, "--deadline-ms")) {
+            try setOnce(&seen, .deadline);
+            options.deadline_ms = try number(try next(args));
+        } else if (std.mem.eql(u8, argument, "--lock-wait-ms")) {
+            try setOnce(&seen, .lock_wait);
+            options.lock_wait_ms = try number(try next(args));
+        } else if (std.mem.eql(u8, argument, "--repository-policy")) {
+            try setOnce(&seen, .repository_policy);
             const value = try next(args);
             options.repository_policy = if (std.mem.eql(u8, value, "strict-priority"))
                 .strict_priority
@@ -131,6 +196,7 @@ fn parse(
             else
                 return error.InvalidArguments;
         } else if (std.mem.eql(u8, argument, "--conffile")) {
+            try setOnce(&seen, .conffile);
             const value = try next(args);
             options.conffile = if (std.mem.eql(u8, value, "keep-existing"))
                 .keep_existing
@@ -144,6 +210,7 @@ fn parse(
                 return error.InvalidArguments);
         } else return error.InvalidArguments;
     }
+
     options.source_paths = try sources.toOwnedSlice(allocator);
     options.config_paths = try configs.toOwnedSlice(allocator);
     options.keyring_paths = try keyrings.toOwnedSlice(allocator);
@@ -153,6 +220,11 @@ fn parse(
         .packages = try packages.toOwnedSlice(allocator),
         .options = options,
     } };
+}
+
+fn setOnce(seen: *std.EnumSet(SingleOption), option: SingleOption) CliError!void {
+    if (seen.contains(option)) return error.InvalidArguments;
+    seen.insert(option);
 }
 
 fn next(args: *std.process.Args.Iterator) CliError![]const u8 {
