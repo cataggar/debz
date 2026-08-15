@@ -16,6 +16,7 @@ jobs:
   build-and-test:
     name: Build and test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +28,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -49,8 +52,11 @@ jobs:
   security-audit:
     name: Security and dependency policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -66,8 +72,11 @@ jobs:
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -79,12 +88,3 @@ jobs:
           sudo apt-get install --yes --no-install-recommends liblzma-dev
       - name: Run bounded fuzz campaign
         run: zig build fuzz -Dfuzz-cases=${{ github.event_name == 'schedule' && '5000' || '128' }}
-      - name: Preserve failing fuzz artifacts
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: fuzz-failure-${{ github.run_id }}
-          path: |
-            .zig-cache
-          include-hidden-files: true
-          retention-days: 14

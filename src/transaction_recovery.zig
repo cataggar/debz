@@ -120,6 +120,7 @@ pub const SystemJournalStore = struct {
     fn writeAtomic(context: *anyopaque, root: []const u8, bytes: []const u8) !void {
         const self: *SystemJournalStore = @ptrCast(@alignCast(context));
         try self.checkRoot(root);
+        if (bytes.len > maximum_journal_bytes) return error.JournalTooLarge;
         self.dir.deleteFile(self.io, stage_name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -156,7 +157,7 @@ pub const SystemJournalStore = struct {
         });
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024));
+        return reader.interface.allocRemaining(allocator, .limited(maximum_journal_bytes));
     }
 };
 

@@ -14,6 +14,10 @@
         "https://github.com/openSUSE/libsolv/security/advisories",
         "https://osv.dev/list?q=libsolv"
       ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-15",
+        "result": "no_known_unresolved_advisories"
+      },
       "reviewed_exceptions": []
     },
     {
@@ -26,6 +30,10 @@
         "https://tukaani.org/xz/",
         "https://osv.dev/list?q=xz-utils"
       ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-15",
+        "result": "no_known_unresolved_advisories"
+      },
       "reviewed_exceptions": []
     }
   ],

@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     fuzz_options.addOption(
         usize,
         "smoke_cases",
-        b.option(usize, "fuzz-cases", "Deterministic mutation cases per fuzz target") orelse 256,
+        b.option(usize, "fuzz-cases", "Deterministic mutation cases per corpus seed") orelse 256,
     );
     fuzz_tests.root_module.addOptions("fuzz_options", fuzz_options);
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_fuzz_tests.step);
 
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
-    b.step("security-audit", "Run hermeticity, dependency, license, secret, and docs gates")
+    b.step("security-audit", "Run hermeticity, dependency-policy, license, secret, and docs gates")
         .dependOn(&audit.step);
 
     const solver_tests = b.addTest(.{

@@ -16,6 +16,7 @@ const signed_corpus = &.{
 const compression_corpus = &.{
     @embedFile("corpus/compression/plain.gz"),
     @embedFile("corpus/compression/plain.xz"),
+    @embedFile("corpus/compression/plain.zst"),
 };
 const archive_corpus = &.{
     @embedFile("corpus/archive/minimal.deb"),
@@ -352,7 +353,13 @@ fn smokeCorpus(
                 const position = (case_index *% 0x9e3779b1 +% seed_index *% 17) % length;
                 storage[position] ^= @truncate((case_index *% 131) | 1);
             }
-            try exercise(storage[0..length]);
+            exercise(storage[0..length]) catch |err| {
+                std.debug.print(
+                    "bounded fuzz failure: seed={d} case={d} length={d} error={s}\n",
+                    .{ seed_index, case_index, length, @errorName(err) },
+                );
+                return err;
+            };
         }
     }
 }
