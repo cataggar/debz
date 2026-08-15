@@ -51,6 +51,13 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 
+    const solver_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"solver.test."},
+    });
+    const run_solver_tests = b.addRunArtifact(solver_tests);
+    b.step("test-solver", "Run solver adapter tests").dependOn(&run_solver_tests.step);
+
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
         .root_module = b.createModule(.{
