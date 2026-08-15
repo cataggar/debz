@@ -4,11 +4,12 @@ const cache_module = @import("metadata_cache.zig");
 const decompression = @import("metadata_decompression.zig");
 const packages_index = @import("packages_index.zig");
 const release_metadata = @import("release_metadata.zig");
+const signed_envelope = @import("signed_release_envelope.zig");
+const openpgp = @import("openpgp_verifier.zig");
 const source = @import("source.zig");
 
-const snapshot_magic = "debz-repository-snapshot-v1";
-const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v1" };
-const header_size = snapshot_magic.len + 1 + 8 * 7 + 4 * 3 + 32 * 2 + 6;
+const snapshot_magic = "debz-repository-snapshot-v2";
+const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v2" };
 
 pub const Repository = struct {
     id: source.RepositoryId,
@@ -69,23 +70,42 @@ pub const AcquisitionPolicy = struct {
     retry: acquisition.RetryPolicy = .{},
     credentials: acquisition.CredentialsProvider = .none,
     maximum_release_bytes: usize,
+    maximum_signature_bytes: usize = 1024 * 1024,
 };
 
-pub const VerifiedRelease = struct {
-    bytes: []const u8,
-    redacted_effective_uri: []const u8,
-    kind: enum { in_release, detached_release },
+pub const SignatureAcceptance = enum { any, all };
+
+pub const SignatureReporter = struct {
+    context: ?*anyopaque = null,
+    reportFn: *const fn (?*anyopaque, []const openpgp.SignatureResult) void,
 };
 
-/// Plain Release bytes have digest integrity only. A later OpenPGP layer can
-/// supply already-verified bytes without changing the refresh mechanics.
-pub const ReleaseInput = union(enum) {
-    acquire_plain,
-    verified: VerifiedRelease,
+pub const AuthenticationPolicy = struct {
+    keyrings: openpgp.Keyrings,
+    accepted_primary_fingerprints: []const [20]u8,
+    verification_time: i64,
+    acceptance: SignatureAcceptance = .any,
+    reporter: ?SignatureReporter = null,
+    envelope_limits: signed_envelope.Limits = .{},
+    verifier_limits: openpgp.Limits = .{},
+};
+
+pub const AuthenticationInput = union(enum) {
+    in_release: AuthenticationPolicy,
+    detached_release: AuthenticationPolicy,
 };
 
 pub const AuthenticationStatus = enum(u8) { unauthenticated, openpgp_verified };
+pub const AuthenticationMode = enum(u8) { plain_release, in_release, detached_release };
 pub const MetadataSource = enum(u8) { network, cache, supplied };
+
+pub const AuthenticationEvidence = struct {
+    mode: AuthenticationMode,
+    signature_digest: ?cache_module.Digest,
+    verification_time: ?i64,
+    accepted_signature_index: ?usize,
+    signatures: []const openpgp.SignatureResult,
+};
 
 pub const PolicyDecisions = struct {
     release_date_unix: i64,
@@ -108,9 +128,11 @@ pub const Provenance = struct {
     refreshed_at_unix: i64,
     source: MetadataSource,
     authentication: AuthenticationStatus,
+    authentication_evidence: AuthenticationEvidence,
     policy: PolicyDecisions,
 };
 
+/// A plain Release snapshot is intentionally untrusted at the type level.
 pub const Result = struct {
     bytes: []u8,
     packages_bytes: []u8,
@@ -120,14 +142,28 @@ pub const Result = struct {
     allocator: std.mem.Allocator,
 
     pub fn solverEligible(self: *const Result) bool {
-        return self.provenance.authentication == .openpgp_verified;
+        _ = self;
+        return false;
     }
 
     pub fn deinit(self: *Result) void {
         self.packages.deinit();
         self.release.deinit();
+        if (self.provenance.authentication_evidence.signatures.len != 0)
+            self.allocator.free(self.provenance.authentication_evidence.signatures);
         self.allocator.free(self.packages_bytes);
         self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+/// Constructed only after OpenPGP, Release policy, index verification,
+/// decompression, parsing, and atomic cache publication all succeed.
+pub const AuthenticatedResult = struct {
+    snapshot: Result,
+
+    pub fn deinit(self: *AuthenticatedResult) void {
+        self.snapshot.deinit();
         self.* = undefined;
     }
 };
@@ -137,6 +173,7 @@ pub const Dependencies = struct {
     /// Must be initialized by the caller from its explicit cache root.
     cache: *cache_module.Cache,
     clock: Clock,
+    io: std.Io,
 };
 
 pub const Error = error{
@@ -153,12 +190,57 @@ pub const Error = error{
     IndexDigestMismatch,
     PackagesParse,
     CorruptSnapshot,
+    MalformedSignedEnvelope,
+    NoValidAcceptedSignature,
+    WrongSigningKey,
+    SignerPolicyMismatch,
+    UnsupportedSignatureAlgorithm,
+    ExpiredSignature,
+    ExpiredSigningKey,
+    RevokedSigningKey,
+    InvalidSignature,
+    AuthenticationModeMismatch,
 };
 
 pub fn refresh(
     allocator: std.mem.Allocator,
     repository: Repository,
-    release_input: ReleaseInput,
+    acquisition_policy: AcquisitionPolicy,
+    refresh_policy: RefreshPolicy,
+    dependencies: Dependencies,
+) !Result {
+    return refreshInternal(
+        allocator,
+        repository,
+        null,
+        acquisition_policy,
+        refresh_policy,
+        dependencies,
+    );
+}
+
+pub fn refreshAuthenticated(
+    allocator: std.mem.Allocator,
+    repository: Repository,
+    authentication: AuthenticationInput,
+    acquisition_policy: AcquisitionPolicy,
+    refresh_policy: RefreshPolicy,
+    dependencies: Dependencies,
+) !AuthenticatedResult {
+    return .{ .snapshot = try refreshInternal(
+        allocator,
+        repository,
+        authentication,
+        acquisition_policy,
+        refresh_policy,
+        dependencies,
+    ) };
+}
+
+fn refreshInternal(
+    allocator: std.mem.Allocator,
+    repository: Repository,
+    authentication_input: ?AuthenticationInput,
     acquisition_policy: AcquisitionPolicy,
     refresh_policy: RefreshPolicy,
     dependencies: Dependencies,
@@ -176,6 +258,12 @@ pub fn refresh(
             .in_release, .detached_release => .openpgp_verified,
             .trusted_snapshot => return error.CorruptSnapshot,
         };
+        const cached_mode: AuthenticationMode = switch (record.provenance.verification) {
+            .unauthenticated_release => .plain_release,
+            .in_release => .in_release,
+            .detached_release => .detached_release,
+            .trusted_snapshot => unreachable,
+        };
         const snapshot_bytes = record.bytes;
         record.bytes = &.{};
         const result = try loadSnapshot(
@@ -185,8 +273,12 @@ pub fn refresh(
             refresh_policy,
             dependencies.clock.nowUnix(),
             .cache,
+            authentication_input,
+            dependencies.io,
         );
-        if (result.provenance.authentication != cached_authentication) {
+        if (result.provenance.authentication != cached_authentication or
+            result.provenance.authentication_evidence.mode != cached_mode)
+        {
             var invalid = result;
             invalid.deinit();
             return error.CorruptSnapshot;
@@ -198,46 +290,135 @@ pub fn refresh(
     var release_bytes: []const u8 = undefined;
     var release_owned: ?acquisition.Result = null;
     defer if (release_owned) |*value| value.deinit(allocator);
+    var signature_owned: ?acquisition.Result = null;
+    defer if (signature_owned) |*value| value.deinit(allocator);
+    var in_release_envelope: ?signed_envelope.InReleaseEnvelope = null;
+    defer if (in_release_envelope) |*value| value.deinit();
+    var detached_envelope: ?signed_envelope.DetachedEnvelope = null;
+    defer if (detached_envelope) |*value| value.deinit();
+    var verification_outcome: ?openpgp.Outcome = null;
+    defer if (verification_outcome) |*value| value.deinit(allocator);
     var release_uri: []const u8 = undefined;
-    var release_uri_owned: ?[]u8 = null;
-    defer if (release_uri_owned) |value| allocator.free(value);
     var authentication: AuthenticationStatus = .unauthenticated;
+    var authentication_mode: AuthenticationMode = .plain_release;
     var cache_verification: cache_module.VerificationKind = .unauthenticated_release;
-    var origin_source: MetadataSource = .network;
+    const origin_source: MetadataSource = .network;
+    var authentication_payload: []const u8 = &.{};
+    var signature_digest: ?cache_module.Digest = null;
+    var verification_time: ?i64 = null;
+    var accepted_signature_index: ?usize = null;
+    var signature_results: []openpgp.SignatureResult = &.{};
+    defer if (signature_results.len != 0) allocator.free(signature_results);
 
-    switch (release_input) {
-        .acquire_plain => {
-            const uri_text = try repositoryUri(allocator, repository, "Release");
-            defer allocator.free(uri_text);
-            const acquired = try acquisition.acquire(allocator, .{
-                .uri = try acquisition.Uri.parse(uri_text),
-                .proxy = acquisition_policy.proxy,
-                .deadlines = acquisition_policy.deadlines,
-                .redirect_limit = acquisition_policy.redirect_limit,
-                .retry = acquisition_policy.retry,
-                .max_response_bytes = acquisition_policy.maximum_release_bytes,
-                .credentials = acquisition_policy.credentials,
-            }, dependencies.acquisition);
-            release_bytes = acquired.bytes;
-            release_uri = acquired.provenance.effective_uri;
-            release_owned = acquired;
-        },
-        .verified => |verified| {
-            if (verified.bytes.len > acquisition_policy.maximum_release_bytes or
-                verified.redacted_effective_uri.len == 0)
-                return error.InvalidConfiguration;
-            release_bytes = verified.bytes;
-            const supplied_uri = acquisition.Uri.parse(verified.redacted_effective_uri) catch
-                return error.InvalidConfiguration;
-            release_uri_owned = try acquisition.redactUri(allocator, supplied_uri);
-            release_uri = release_uri_owned.?;
-            authentication = .openpgp_verified;
-            cache_verification = switch (verified.kind) {
-                .in_release => .in_release,
-                .detached_release => .detached_release,
-            };
-            origin_source = .supplied;
-        },
+    if (authentication_input) |auth_input| {
+        const auth_policy = switch (auth_input) {
+            .in_release => |value| value,
+            .detached_release => |value| value,
+        };
+        try validateAuthenticationPolicy(auth_policy);
+        verification_time = auth_policy.verification_time;
+        switch (auth_input) {
+            .in_release => {
+                const uri_text = try repositoryUri(allocator, repository, "InRelease");
+                defer allocator.free(uri_text);
+                const acquired = try acquireMetadata(
+                    allocator,
+                    uri_text,
+                    acquisition_policy,
+                    acquisition_policy.maximum_release_bytes,
+                    dependencies.acquisition,
+                );
+                release_uri = acquired.provenance.effective_uri;
+                authentication_payload = acquired.bytes;
+                release_owned = acquired;
+                in_release_envelope = switch (try signed_envelope.parseInRelease(
+                    allocator,
+                    authentication_payload,
+                    auth_policy.envelope_limits,
+                )) {
+                    .envelope => |value| value,
+                    .diagnostic => return error.MalformedSignedEnvelope,
+                };
+                release_bytes = in_release_envelope.?.display_cleartext;
+                const signatures = [_][]const u8{in_release_envelope.?.signature.bytes};
+                verification_outcome = try verifyAuthentication(
+                    allocator,
+                    dependencies.io,
+                    in_release_envelope.?.canonical_cleartext,
+                    &signatures,
+                    auth_policy,
+                );
+                authentication_mode = .in_release;
+                cache_verification = .in_release;
+            },
+            .detached_release => {
+                const release_uri_text = try repositoryUri(allocator, repository, "Release");
+                defer allocator.free(release_uri_text);
+                const signature_uri_text = try repositoryUri(allocator, repository, "Release.gpg");
+                defer allocator.free(signature_uri_text);
+                const acquired_release = try acquireMetadata(
+                    allocator,
+                    release_uri_text,
+                    acquisition_policy,
+                    acquisition_policy.maximum_release_bytes,
+                    dependencies.acquisition,
+                );
+                release_uri = acquired_release.provenance.effective_uri;
+                release_bytes = acquired_release.bytes;
+                release_owned = acquired_release;
+                const acquired_signature = try acquireMetadata(
+                    allocator,
+                    signature_uri_text,
+                    acquisition_policy,
+                    acquisition_policy.maximum_signature_bytes,
+                    dependencies.acquisition,
+                );
+                authentication_payload = acquired_signature.bytes;
+                signature_owned = acquired_signature;
+                detached_envelope = switch (try signed_envelope.parseDetached(
+                    allocator,
+                    release_bytes,
+                    authentication_payload,
+                    auth_policy.envelope_limits,
+                )) {
+                    .envelope => |value| value,
+                    .diagnostic => return error.MalformedSignedEnvelope,
+                };
+                var signatures: std.ArrayList([]const u8) = .empty;
+                defer signatures.deinit(allocator);
+                for (detached_envelope.?.signatures) |blob| {
+                    for (blob.packet_ranges) |packet_range|
+                        try signatures.append(allocator, packet_range.slice(blob.bytes));
+                }
+                verification_outcome = try verifyAuthentication(
+                    allocator,
+                    dependencies.io,
+                    release_bytes,
+                    signatures.items,
+                    auth_policy,
+                );
+                authentication_mode = .detached_release;
+                cache_verification = .detached_release;
+            },
+        }
+        const report = verification_outcome.?.report();
+        signature_results = try allocator.dupe(openpgp.SignatureResult, report.signatures);
+        accepted_signature_index = report.accepted_signature_index;
+        signature_digest = cache_module.Digest.of(authentication_payload);
+        authentication = .openpgp_verified;
+    } else {
+        const uri_text = try repositoryUri(allocator, repository, "Release");
+        defer allocator.free(uri_text);
+        const acquired = try acquireMetadata(
+            allocator,
+            uri_text,
+            acquisition_policy,
+            acquisition_policy.maximum_release_bytes,
+            dependencies.acquisition,
+        );
+        release_bytes = acquired.bytes;
+        release_uri = acquired.provenance.effective_uri;
+        release_owned = acquired;
     }
 
     var parsed_release = try parseRelease(
@@ -331,6 +512,12 @@ pub fn refresh(
         .release_digest = cache_module.Digest.of(release_bytes),
         .index_digest = cache_module.Digest.of(index_acquired.bytes),
         .authentication = authentication,
+        .authentication_mode = authentication_mode,
+        .authentication_payload = authentication_payload,
+        .signature_digest = signature_digest,
+        .verification_time = verification_time,
+        .accepted_signature_index = accepted_signature_index,
+        .signature_results = signature_results,
         .origin_source = origin_source,
         .compression = selected.compression,
         .future_date_accepted = release_policy.future_date_accepted,
@@ -369,6 +556,8 @@ pub fn refresh(
         refresh_policy,
         refreshed_at,
         origin_source,
+        authentication_input,
+        dependencies.io,
     );
 }
 
@@ -392,6 +581,7 @@ fn validateConfiguration(
     if (repository.suite.len == 0 or repository.component.len == 0 or
         repository.architecture.len == 0 or refresh_policy.compression_order.len == 0 or
         acquisition_policy.maximum_release_bytes == 0 or
+        acquisition_policy.maximum_signature_bytes == 0 or
         refresh_policy.maximum_compressed_bytes == 0 or
         refresh_policy.maximum_decompressed_bytes == 0 or
         refresh_policy.maximum_decoder_memory == 0)
@@ -412,6 +602,91 @@ fn validateConfiguration(
         if (seen.contains(item)) return error.InvalidConfiguration;
         seen.insert(item);
     }
+}
+
+fn validateAuthenticationPolicy(policy: AuthenticationPolicy) !void {
+    if (policy.accepted_primary_fingerprints.len == 0) return error.InvalidConfiguration;
+    if (policy.keyrings == .many and policy.keyrings.many.len == 0)
+        return error.InvalidConfiguration;
+}
+
+fn acquireMetadata(
+    allocator: std.mem.Allocator,
+    uri_text: []const u8,
+    policy: AcquisitionPolicy,
+    maximum_bytes: usize,
+    dependencies: acquisition.Dependencies,
+) !acquisition.Result {
+    return acquisition.acquire(allocator, .{
+        .uri = try acquisition.Uri.parse(uri_text),
+        .proxy = policy.proxy,
+        .deadlines = policy.deadlines,
+        .redirect_limit = policy.redirect_limit,
+        .retry = policy.retry,
+        .max_response_bytes = maximum_bytes,
+        .credentials = policy.credentials,
+    }, dependencies);
+}
+
+fn verifyAuthentication(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signed_bytes: []const u8,
+    signatures: []const []const u8,
+    policy: AuthenticationPolicy,
+) !openpgp.Outcome {
+    var outcome = try openpgp.verify(allocator, .{
+        .io = io,
+        .signed_bytes = signed_bytes,
+        .signatures = signatures,
+        .keyrings = policy.keyrings,
+        .policy = .{
+            .verification_time = policy.verification_time,
+            .accepted_primary_fingerprints = policy.accepted_primary_fingerprints,
+        },
+        .limits = policy.verifier_limits,
+    });
+    const report = outcome.report();
+    if (policy.reporter) |reporter| reporter.reportFn(reporter.context, report.signatures);
+    const accepted = outcome == .accepted and switch (policy.acceptance) {
+        .any => true,
+        .all => blk: {
+            for (report.signatures) |result| {
+                if (result.status != .valid) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+    if (!accepted) {
+        const mapped = authenticationError(report.signatures);
+        outcome.deinit(allocator);
+        return mapped;
+    }
+    return outcome;
+}
+
+fn authenticationError(results: []const openpgp.SignatureResult) Error {
+    var result: Error = error.NoValidAcceptedSignature;
+    for (results) |signature| switch (signature.status) {
+        .signer_not_accepted => result = error.SignerPolicyMismatch,
+        .no_matching_key => {
+            if (result == error.NoValidAcceptedSignature) result = error.WrongSigningKey;
+        },
+        .unsupported_public_key_algorithm,
+        .unsupported_hash_algorithm,
+        .unsupported_signature_type,
+        .unsupported_key_size,
+        .unknown_critical_subpacket,
+        => result = error.UnsupportedSignatureAlgorithm,
+        .signature_expired, .signature_not_yet_valid => result = error.ExpiredSignature,
+        .key_expired, .key_not_yet_valid => result = error.ExpiredSigningKey,
+        .key_revoked => result = error.RevokedSigningKey,
+        .bad_signature, .malformed => {
+            if (result == error.NoValidAcceptedSignature) result = error.InvalidSignature;
+        },
+        else => {},
+    };
+    return result;
 }
 
 fn parseRelease(
@@ -653,6 +928,12 @@ const SnapshotManifest = struct {
     release_digest: cache_module.Digest,
     index_digest: cache_module.Digest,
     authentication: AuthenticationStatus,
+    authentication_mode: AuthenticationMode,
+    authentication_payload: []const u8,
+    signature_digest: ?cache_module.Digest,
+    verification_time: ?i64,
+    accepted_signature_index: ?usize,
+    signature_results: []const openpgp.SignatureResult,
     origin_source: MetadataSource,
     compression: Compression,
     future_date_accepted: bool,
@@ -668,52 +949,82 @@ const SnapshotManifest = struct {
 };
 
 fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u8 {
-    var total = header_size;
+    if (manifest.signature_results.len > std.math.maxInt(u16))
+        return error.InvalidConfiguration;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, snapshot_magic ++ "\n");
+    try appendInt(&bytes, allocator, i64, manifest.refreshed_at_unix);
+    try appendInt(&bytes, allocator, i64, manifest.release_date_unix);
+    try appendInt(&bytes, allocator, i64, manifest.valid_until_unix orelse 0);
     inline for (.{
-        manifest.selected_path.len,
-        manifest.release_uri.len,
-        manifest.index_uri.len,
         manifest.release_bytes.len,
         manifest.index_bytes.len,
-    }) |length| total = std.math.add(usize, total, length) catch
-        return error.InvalidConfiguration;
-    const bytes = try allocator.alloc(u8, total);
-    errdefer allocator.free(bytes);
-    var writer: FixedWriter = .{ .bytes = bytes };
-    writer.put(snapshot_magic);
-    writer.put("\n");
-    writer.int(i64, manifest.refreshed_at_unix);
-    writer.int(i64, manifest.release_date_unix);
-    writer.int(i64, manifest.valid_until_unix orelse 0);
-    writer.int(u64, @intCast(manifest.release_bytes.len));
-    writer.int(u64, @intCast(manifest.index_bytes.len));
-    writer.int(u64, @intCast(manifest.release_uri.len));
-    writer.int(u64, @intCast(manifest.index_uri.len));
-    writer.int(u32, @intCast(manifest.selected_path.len));
-    writer.int(u32, @intFromEnum(manifest.authentication));
-    writer.int(u32, @intFromEnum(manifest.compression));
-    writer.put(&manifest.release_digest.bytes);
-    writer.put(&manifest.index_digest.bytes);
-    writer.put(&.{
+        manifest.authentication_payload.len,
+        manifest.release_uri.len,
+        manifest.index_uri.len,
+    }) |length| try appendInt(&bytes, allocator, u64, @intCast(length));
+    try appendInt(&bytes, allocator, u32, @intCast(manifest.selected_path.len));
+    try bytes.appendSlice(allocator, &.{
+        @intFromEnum(manifest.authentication),
+        @intFromEnum(manifest.authentication_mode),
         @intFromEnum(manifest.origin_source),
-        @intFromBool(manifest.valid_until_unix != null),
-        @intFromBool(manifest.future_date_accepted),
-        @intFromBool(manifest.valid_until_required),
-        @intFromBool(manifest.by_hash_advertised),
-        (@as(u8, @intFromBool(manifest.by_hash_used)) << 1) |
-            @as(u8, @intFromBool(manifest.fallback_used)),
+        @intFromEnum(manifest.compression),
+        @intFromBool(manifest.valid_until_unix != null) |
+            (@as(u8, @intFromBool(manifest.future_date_accepted)) << 1) |
+            (@as(u8, @intFromBool(manifest.valid_until_required)) << 2) |
+            (@as(u8, @intFromBool(manifest.by_hash_advertised)) << 3) |
+            (@as(u8, @intFromBool(manifest.by_hash_used)) << 4) |
+            (@as(u8, @intFromBool(manifest.fallback_used)) << 5) |
+            (@as(u8, @intFromBool(manifest.signature_digest != null)) << 6) |
+            (@as(u8, @intFromBool(manifest.verification_time != null)) << 7),
     });
-    writer.put(manifest.selected_path);
-    writer.put(manifest.release_uri);
-    writer.put(manifest.index_uri);
-    writer.put(manifest.release_bytes);
-    writer.put(manifest.index_bytes);
-    std.debug.assert(writer.offset == bytes.len);
-    return bytes;
+    try appendInt(&bytes, allocator, u16, @intCast(manifest.signature_results.len));
+    try appendInt(
+        &bytes,
+        allocator,
+        i32,
+        if (manifest.accepted_signature_index) |value| @intCast(value) else -1,
+    );
+    try appendInt(&bytes, allocator, i64, manifest.verification_time orelse 0);
+    try bytes.appendSlice(allocator, &manifest.release_digest.bytes);
+    try bytes.appendSlice(allocator, &manifest.index_digest.bytes);
+    const signature_digest_bytes: [32]u8 = if (manifest.signature_digest) |value|
+        value.bytes
+    else
+        @splat(0);
+    try bytes.appendSlice(allocator, &signature_digest_bytes);
+    for (manifest.signature_results) |result| {
+        try appendInt(&bytes, allocator, u32, @intFromEnum(result.status));
+        try bytes.appendSlice(allocator, if (result.primary_fingerprint) |*value| value else &@as([20]u8, @splat(0)));
+        try bytes.appendSlice(allocator, if (result.signing_fingerprint) |*value| value else &@as([20]u8, @splat(0)));
+        try appendInt(&bytes, allocator, i64, result.signature_creation orelse std.math.minInt(i64));
+        try appendInt(&bytes, allocator, i64, result.signature_expiration orelse std.math.minInt(i64));
+        try bytes.appendSlice(allocator, &.{ result.public_key_algorithm, result.hash_algorithm });
+    }
+    inline for (.{
+        manifest.selected_path,
+        manifest.release_uri,
+        manifest.index_uri,
+        manifest.authentication_payload,
+        manifest.release_bytes,
+        manifest.index_bytes,
+    }) |value| try bytes.appendSlice(allocator, value);
+    return bytes.toOwnedSlice(allocator);
 }
 
-fn decodeSnapshot(bytes: []const u8) !SnapshotManifest {
-    if (bytes.len < header_size) return error.CorruptSnapshot;
+fn appendInt(
+    bytes: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    value: T,
+) !void {
+    var encoded: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &encoded, value, .little);
+    try bytes.appendSlice(allocator, &encoded);
+}
+
+fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotManifest {
     var reader: FixedReader = .{ .bytes = bytes };
     if (!std.mem.eql(u8, reader.take(snapshot_magic.len), snapshot_magic) or
         !std.mem.eql(u8, reader.take(1), "\n"))
@@ -725,40 +1036,68 @@ fn decodeSnapshot(bytes: []const u8) !SnapshotManifest {
         return error.CorruptSnapshot;
     const index_len = std.math.cast(usize, reader.int(u64)) orelse
         return error.CorruptSnapshot;
+    const authentication_payload_len = std.math.cast(usize, reader.int(u64)) orelse
+        return error.CorruptSnapshot;
     const release_uri_len = std.math.cast(usize, reader.int(u64)) orelse
         return error.CorruptSnapshot;
     const index_uri_len = std.math.cast(usize, reader.int(u64)) orelse
         return error.CorruptSnapshot;
     const path_len = reader.int(u32);
-    const authentication: AuthenticationStatus = switch (reader.int(u32)) {
+    const authentication: AuthenticationStatus = switch (reader.byte()) {
         0 => .unauthenticated,
         1 => .openpgp_verified,
         else => return error.CorruptSnapshot,
     };
-    const compression_kind: Compression = switch (reader.int(u32)) {
-        0 => .xz,
-        1 => .gzip,
-        2 => .zstd,
-        3 => .uncompressed,
+    const authentication_mode: AuthenticationMode = switch (reader.byte()) {
+        0 => .plain_release,
+        1 => .in_release,
+        2 => .detached_release,
         else => return error.CorruptSnapshot,
     };
-    const release_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
-    const index_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
     const origin_source: MetadataSource = switch (reader.byte()) {
         0 => .network,
         1 => .cache,
         2 => .supplied,
         else => return error.CorruptSnapshot,
     };
-    const has_valid = try boolByte(reader.byte());
-    const future = try boolByte(reader.byte());
-    const valid_required = try boolByte(reader.byte());
-    const advertised = try boolByte(reader.byte());
+    const compression_kind: Compression = switch (reader.byte()) {
+        0 => .xz,
+        1 => .gzip,
+        2 => .zstd,
+        3 => .uncompressed,
+        else => return error.CorruptSnapshot,
+    };
     const flags = reader.byte();
-    if (flags & ~@as(u8, 3) != 0) return error.CorruptSnapshot;
+    const signature_count = reader.int(u16);
+    const accepted_raw = reader.int(i32);
+    const stored_verification_time = reader.int(i64);
+    const release_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
+    const index_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
+    const signature_digest_raw: cache_module.Digest = .{ .bytes = reader.array(32) };
+    const signature_results = try allocator.alloc(openpgp.SignatureResult, signature_count);
+    errdefer allocator.free(signature_results);
+    for (signature_results) |*result| {
+        const status_int = reader.int(u32);
+        if (status_int > @intFromEnum(openpgp.ResultStatus.signer_not_accepted))
+            return error.CorruptSnapshot;
+        const primary = reader.array(20);
+        const signing = reader.array(20);
+        const creation = reader.int(i64);
+        const expiration = reader.int(i64);
+        result.* = .{
+            .status = @enumFromInt(status_int),
+            .primary_fingerprint = if (allZero(&primary)) null else primary,
+            .signing_fingerprint = if (allZero(&signing)) null else signing,
+            .signature_creation = if (creation == std.math.minInt(i64)) null else creation,
+            .signature_expiration = if (expiration == std.math.minInt(i64)) null else expiration,
+            .public_key_algorithm = reader.byte(),
+            .hash_algorithm = reader.byte(),
+        };
+    }
     const selected_path = reader.take(path_len);
     const release_uri = reader.take(release_uri_len);
     const index_uri = reader.take(index_uri_len);
+    const authentication_payload = reader.take(authentication_payload_len);
     const release_bytes = reader.take(release_len);
     const index_bytes = reader.take(index_len);
     if (reader.failed or reader.offset != bytes.len or selected_path.len == 0 or
@@ -767,23 +1106,34 @@ fn decodeSnapshot(bytes: []const u8) !SnapshotManifest {
     return .{
         .refreshed_at_unix = refreshed,
         .release_date_unix = date,
-        .valid_until_unix = if (has_valid) valid_raw else null,
         .release_digest = release_digest,
         .index_digest = index_digest,
         .authentication = authentication,
+        .authentication_mode = authentication_mode,
+        .authentication_payload = authentication_payload,
+        .signature_digest = if (flags & 0x40 != 0) signature_digest_raw else null,
+        .verification_time = if (flags & 0x80 != 0) stored_verification_time else null,
+        .accepted_signature_index = if (accepted_raw < 0) null else @intCast(accepted_raw),
+        .signature_results = signature_results,
         .origin_source = origin_source,
         .compression = compression_kind,
-        .future_date_accepted = future,
-        .valid_until_required = valid_required,
-        .by_hash_advertised = advertised,
-        .by_hash_used = flags & 2 != 0,
-        .fallback_used = flags & 1 != 0,
+        .valid_until_unix = if (flags & 1 != 0) valid_raw else null,
+        .future_date_accepted = flags & 2 != 0,
+        .valid_until_required = flags & 4 != 0,
+        .by_hash_advertised = flags & 8 != 0,
+        .by_hash_used = flags & 16 != 0,
+        .fallback_used = flags & 32 != 0,
         .selected_path = selected_path,
         .release_uri = release_uri,
         .index_uri = index_uri,
         .release_bytes = release_bytes,
         .index_bytes = index_bytes,
     };
+}
+
+fn allZero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
 }
 
 fn loadSnapshot(
@@ -793,12 +1143,22 @@ fn loadSnapshot(
     policy: RefreshPolicy,
     now: i64,
     source_kind: MetadataSource,
+    authentication_input: ?AuthenticationInput,
+    io: std.Io,
 ) !Result {
     errdefer allocator.free(owned_bytes);
-    const manifest = try decodeSnapshot(owned_bytes);
+    const manifest = try decodeSnapshot(allocator, owned_bytes);
+    defer if (manifest.signature_results.len != 0) allocator.free(manifest.signature_results);
     if (!cache_module.Digest.of(manifest.release_bytes).eql(manifest.release_digest) or
         !cache_module.Digest.of(manifest.index_bytes).eql(manifest.index_digest))
         return error.CorruptSnapshot;
+    const current_signatures = try revalidateAuthentication(
+        allocator,
+        manifest,
+        authentication_input,
+        io,
+    );
+    errdefer if (current_signatures.len != 0) allocator.free(current_signatures);
     var release = try parseRelease(allocator, manifest.release_bytes, policy.release_limits);
     errdefer release.deinit();
     const release_policy = try validateRelease(&release, repository, policy, now);
@@ -837,6 +1197,16 @@ fn loadSnapshot(
             .refreshed_at_unix = manifest.refreshed_at_unix,
             .source = source_kind,
             .authentication = manifest.authentication,
+            .authentication_evidence = .{
+                .mode = manifest.authentication_mode,
+                .signature_digest = manifest.signature_digest,
+                .verification_time = if (authentication_input) |input| switch (input) {
+                    .in_release => |value| value.verification_time,
+                    .detached_release => |value| value.verification_time,
+                } else null,
+                .accepted_signature_index = acceptedIndex(current_signatures),
+                .signatures = current_signatures,
+            },
             .policy = .{
                 .release_date_unix = release_policy.date,
                 .valid_until_unix = release_policy.valid_until,
@@ -851,28 +1221,98 @@ fn loadSnapshot(
     };
 }
 
-fn boolByte(value: u8) !bool {
-    return switch (value) {
-        0 => false,
-        1 => true,
-        else => error.CorruptSnapshot,
-    };
+fn acceptedIndex(results: []const openpgp.SignatureResult) ?usize {
+    for (results, 0..) |result, index| {
+        if (result.status == .valid) return index;
+    }
+    return null;
 }
 
-const FixedWriter = struct {
-    bytes: []u8,
-    offset: usize = 0,
-
-    fn put(self: *FixedWriter, value: []const u8) void {
-        @memcpy(self.bytes[self.offset..][0..value.len], value);
-        self.offset += value.len;
+fn revalidateAuthentication(
+    allocator: std.mem.Allocator,
+    manifest: SnapshotManifest,
+    authentication_input: ?AuthenticationInput,
+    io: std.Io,
+) ![]openpgp.SignatureResult {
+    if (manifest.authentication == .unauthenticated) {
+        if (authentication_input != null or manifest.authentication_mode != .plain_release or
+            manifest.authentication_payload.len != 0 or manifest.signature_digest != null or
+            manifest.verification_time != null or manifest.signature_results.len != 0)
+            return error.AuthenticationModeMismatch;
+        return &.{};
     }
+    const input = authentication_input orelse return error.AuthenticationModeMismatch;
+    const policy = switch (input) {
+        .in_release => |value| value,
+        .detached_release => |value| value,
+    };
+    try validateAuthenticationPolicy(policy);
+    const expected_mode: AuthenticationMode = switch (input) {
+        .in_release => .in_release,
+        .detached_release => .detached_release,
+    };
+    if (manifest.authentication_mode != expected_mode or manifest.signature_digest == null or
+        manifest.verification_time == null or manifest.accepted_signature_index == null or
+        manifest.signature_results.len == 0 or
+        !cache_module.Digest.of(manifest.authentication_payload).eql(manifest.signature_digest.?))
+        return error.CorruptSnapshot;
+    const stored_accepted = manifest.accepted_signature_index.?;
+    if (stored_accepted >= manifest.signature_results.len or
+        manifest.signature_results[stored_accepted].status != .valid)
+        return error.CorruptSnapshot;
 
-    fn int(self: *FixedWriter, comptime T: type, value: T) void {
-        std.mem.writeInt(T, self.bytes[self.offset..][0..@sizeOf(T)], value, .little);
-        self.offset += @sizeOf(T);
+    var outcome: openpgp.Outcome = undefined;
+    switch (input) {
+        .in_release => {
+            var envelope = switch (try signed_envelope.parseInRelease(
+                allocator,
+                manifest.authentication_payload,
+                policy.envelope_limits,
+            )) {
+                .envelope => |value| value,
+                .diagnostic => return error.CorruptSnapshot,
+            };
+            defer envelope.deinit();
+            if (!std.mem.eql(u8, envelope.display_cleartext, manifest.release_bytes))
+                return error.CorruptSnapshot;
+            const signatures = [_][]const u8{envelope.signature.bytes};
+            outcome = try verifyAuthentication(
+                allocator,
+                io,
+                envelope.canonical_cleartext,
+                &signatures,
+                policy,
+            );
+        },
+        .detached_release => {
+            var envelope = switch (try signed_envelope.parseDetached(
+                allocator,
+                manifest.release_bytes,
+                manifest.authentication_payload,
+                policy.envelope_limits,
+            )) {
+                .envelope => |value| value,
+                .diagnostic => return error.CorruptSnapshot,
+            };
+            defer envelope.deinit();
+            var signatures: std.ArrayList([]const u8) = .empty;
+            defer signatures.deinit(allocator);
+            for (envelope.signatures) |blob| {
+                for (blob.packet_ranges) |packet_range|
+                    try signatures.append(allocator, packet_range.slice(blob.bytes));
+            }
+            outcome = try verifyAuthentication(
+                allocator,
+                io,
+                manifest.release_bytes,
+                signatures.items,
+                policy,
+            );
+        },
     }
-};
+    defer outcome.deinit(allocator);
+    return allocator.dupe(openpgp.SignatureResult, outcome.report().signatures);
+}
 
 const FixedReader = struct {
     bytes: []const u8,
@@ -1094,7 +1534,318 @@ fn testDependencies(
         .acquisition = fixture.dependencies(),
         .cache = cache,
         .clock = .{ .context = null, .nowUnixFn = fixedNow },
+        .io = std.testing.io,
     };
+}
+
+fn authenticatedNow(_: ?*anyopaque) i64 {
+    return @import("fixtures/openpgp.zig").created + 30;
+}
+
+fn authenticatedDependencies(
+    fixture: *TestFixture,
+    cache: *cache_module.Cache,
+) Dependencies {
+    var dependencies = testDependencies(fixture, cache);
+    dependencies.clock.nowUnixFn = authenticatedNow;
+    return dependencies;
+}
+
+fn authenticationPolicy(
+    keyring: []const u8,
+    verification_time: i64,
+) AuthenticationPolicy {
+    const fixture = @import("fixtures/openpgp.zig");
+    return .{
+        .keyrings = .{ .one = .{ .bytes = keyring } },
+        .accepted_primary_fingerprints = &.{fixture.primary_fingerprint},
+        .verification_time = verification_time,
+    };
+}
+
+test "authenticated InRelease publishes trusted snapshot and revalidates offline" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    try std.testing.expectEqualSlices(u8, test_packages, &fixture_data.repository_packages);
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{ &fixture_data.repository_in_release, test_packages },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .max_object_bytes = 128 * 1024,
+    });
+    defer cache.deinit();
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    const auth: AuthenticationInput = .{ .in_release = authenticationPolicy(
+        &fixture_data.keyring,
+        fixture_data.created + 30,
+    ) };
+    var policy = testRefreshPolicy(&.{.uncompressed});
+    var result = try refreshAuthenticated(
+        allocator,
+        repository,
+        auth,
+        testAcquisitionPolicy(),
+        policy,
+        authenticatedDependencies(&fixture, &cache),
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(AuthenticationMode.in_release, result.snapshot.provenance.authentication_evidence.mode);
+    try std.testing.expectEqual(openpgp.ResultStatus.valid, result.snapshot.provenance.authentication_evidence.signatures[0].status);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fixture_data.primary_fingerprint,
+        &result.snapshot.provenance.authentication_evidence.signatures[0].primary_fingerprint.?,
+    );
+
+    policy.mode = .cache_only;
+    var offline_fixture: TestFixture = .{ .responses = &.{} };
+    var offline = try refreshAuthenticated(
+        allocator,
+        repository,
+        auth,
+        testAcquisitionPolicy(),
+        policy,
+        authenticatedDependencies(&offline_fixture, &cache),
+    );
+    defer offline.deinit();
+    try std.testing.expectEqual(MetadataSource.cache, offline.snapshot.provenance.source);
+    try std.testing.expectEqual(@as(usize, 0), offline_fixture.next_file);
+
+    const rejected_fingerprint: [20]u8 = @splat(0xaa);
+    const rejected_auth: AuthenticationInput = .{ .in_release = .{
+        .keyrings = .{ .one = .{ .bytes = &fixture_data.keyring } },
+        .accepted_primary_fingerprints = &.{rejected_fingerprint},
+        .verification_time = fixture_data.created + 30,
+    } };
+    try std.testing.expectError(error.SignerPolicyMismatch, refreshAuthenticated(
+        allocator,
+        repository,
+        rejected_auth,
+        testAcquisitionPolicy(),
+        policy,
+        authenticatedDependencies(&offline_fixture, &cache),
+    ));
+}
+
+test "detached authentication preserves valid signer among invalid extras" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tampered = fixture_data.repository_release_signature;
+    tampered[tampered.len - 1] ^= 1;
+    const signatures = try std.mem.concat(
+        allocator,
+        u8,
+        &.{ &tampered, &fixture_data.repository_release_sha512_signature },
+    );
+    defer allocator.free(signatures);
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{ &fixture_data.repository_release, signatures, test_packages },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .max_object_bytes = 128 * 1024,
+    });
+    defer cache.deinit();
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    var result = try refreshAuthenticated(
+        allocator,
+        repository,
+        .{ .detached_release = authenticationPolicy(
+            &fixture_data.keyring,
+            fixture_data.created + 30,
+        ) },
+        testAcquisitionPolicy(),
+        testRefreshPolicy(&.{.uncompressed}),
+        authenticatedDependencies(&fixture, &cache),
+    );
+    defer result.deinit();
+    const evidence = result.snapshot.provenance.authentication_evidence;
+    try std.testing.expectEqual(@as(usize, 2), evidence.signatures.len);
+    try std.testing.expectEqual(openpgp.ResultStatus.bad_signature, evidence.signatures[0].status);
+    try std.testing.expectEqual(openpgp.ResultStatus.valid, evidence.signatures[1].status);
+    try std.testing.expectEqual(@as(?usize, 1), evidence.accepted_signature_index);
+}
+
+test "all-signatures policy rejects an invalid extra" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tampered = fixture_data.repository_release_signature;
+    tampered[tampered.len - 1] ^= 1;
+    const signatures = try std.mem.concat(
+        allocator,
+        u8,
+        &.{ &fixture_data.repository_release_sha512_signature, &tampered },
+    );
+    defer allocator.free(signatures);
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{ &fixture_data.repository_release, signatures },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{});
+    defer cache.deinit();
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    var auth_policy = authenticationPolicy(&fixture_data.keyring, fixture_data.created + 30);
+    auth_policy.acceptance = .all;
+    try std.testing.expectError(error.InvalidSignature, refreshAuthenticated(
+        allocator,
+        repository,
+        .{ .detached_release = auth_policy },
+        testAcquisitionPolicy(),
+        testRefreshPolicy(&.{.uncompressed}),
+        authenticatedDependencies(&fixture, &cache),
+    ));
+}
+
+test "authentication failures are explicit and publish no cache manifest" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    const Case = struct {
+        signature: []const u8,
+        keyring: []const u8,
+        accepted: [20]u8,
+        verification_time: i64,
+        expected: anyerror,
+    };
+    const rejected_fingerprint: [20]u8 = @splat(0xaa);
+    var bad_signature = fixture_data.repository_release_signature;
+    bad_signature[bad_signature.len - 1] ^= 1;
+    const cases = [_]Case{
+        .{
+            .signature = &fixture_data.repository_release_signature,
+            .keyring = &fixture_data.ed25519_keyring,
+            .accepted = fixture_data.primary_fingerprint,
+            .verification_time = fixture_data.created + 30,
+            .expected = error.WrongSigningKey,
+        },
+        .{
+            .signature = &fixture_data.repository_release_signature,
+            .keyring = &fixture_data.keyring,
+            .accepted = rejected_fingerprint,
+            .verification_time = fixture_data.created + 30,
+            .expected = error.SignerPolicyMismatch,
+        },
+        .{
+            .signature = &bad_signature,
+            .keyring = &fixture_data.keyring,
+            .accepted = fixture_data.primary_fingerprint,
+            .verification_time = fixture_data.created + 30,
+            .expected = error.InvalidSignature,
+        },
+        .{
+            .signature = &fixture_data.repository_release_expired_signature,
+            .keyring = &fixture_data.keyring,
+            .accepted = fixture_data.primary_fingerprint,
+            .verification_time = fixture_data.created + 61,
+            .expected = error.ExpiredSignature,
+        },
+        .{
+            .signature = &fixture_data.repository_release_signature,
+            .keyring = &fixture_data.expired_keyring,
+            .accepted = fixture_data.primary_fingerprint,
+            .verification_time = fixture_data.created + 61,
+            .expected = error.ExpiredSigningKey,
+        },
+        .{
+            .signature = &fixture_data.repository_release_signature,
+            .keyring = &fixture_data.revoked_keyring,
+            .accepted = fixture_data.primary_fingerprint,
+            .verification_time = fixture_data.created + 30,
+            .expected = error.RevokedSigningKey,
+        },
+    };
+    for (cases) |case| {
+        var fixture: TestFixture = .{
+            .responses = &.{},
+            .file_bodies = &.{ &fixture_data.repository_release, case.signature },
+        };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+            .max_object_bytes = 128 * 1024,
+        });
+        defer cache.deinit();
+        var repository = try testRepository();
+        repository.base_uri = try acquisition.Uri.parse("file:///repository");
+        try std.testing.expectError(case.expected, refreshAuthenticated(
+            allocator,
+            repository,
+            .{ .detached_release = .{
+                .keyrings = .{ .one = .{ .bytes = case.keyring } },
+                .accepted_primary_fingerprints = &.{case.accepted},
+                .verification_time = case.verification_time,
+            } },
+            testAcquisitionPolicy(),
+            testRefreshPolicy(&.{.uncompressed}),
+            authenticatedDependencies(&fixture, &cache),
+        ));
+        try std.testing.expectError(error.CacheMiss, cache.lookup(
+            allocator,
+            .{ .value = repository.id.slice() },
+            snapshot_id,
+        ));
+    }
+}
+
+test "tampered InRelease cleartext fails before Release parsing" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tampered = fixture_data.repository_in_release;
+    const offset = std.mem.indexOf(u8, &tampered, "bookworm").?;
+    tampered[offset] ^= 1;
+    var fixture: TestFixture = .{ .responses = &.{}, .file_bodies = &.{&tampered} };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{});
+    defer cache.deinit();
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    try std.testing.expectError(error.InvalidSignature, refreshAuthenticated(
+        allocator,
+        repository,
+        .{ .in_release = authenticationPolicy(
+            &fixture_data.keyring,
+            fixture_data.created + 30,
+        ) },
+        testAcquisitionPolicy(),
+        testRefreshPolicy(&.{.uncompressed}),
+        authenticatedDependencies(&fixture, &cache),
+    ));
+}
+
+test "malformed signed envelope fails explicitly" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{"not an InRelease"},
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{});
+    defer cache.deinit();
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    try std.testing.expectError(error.MalformedSignedEnvelope, refreshAuthenticated(
+        allocator,
+        repository,
+        .{ .in_release = authenticationPolicy(
+            &fixture_data.keyring,
+            fixture_data.created + 30,
+        ) },
+        testAcquisitionPolicy(),
+        testRefreshPolicy(&.{.uncompressed}),
+        authenticatedDependencies(&fixture, &cache),
+    ));
 }
 
 test "hermetic file acquisition refreshes a complete snapshot" {
@@ -1124,7 +1875,6 @@ test "hermetic file acquisition refreshes a complete snapshot" {
     var result = try refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         testRefreshPolicy(&.{.uncompressed}),
         testDependencies(&fixture, &cache),
@@ -1161,7 +1911,6 @@ test "valid compressed refresh is unauthenticated and offline revalidates cache"
     var result = try refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         policy,
         testDependencies(&fixture, &cache),
@@ -1177,7 +1926,6 @@ test "valid compressed refresh is unauthenticated and offline revalidates cache"
     var cached = try refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         policy,
         testDependencies(&offline_fixture, &cache),
@@ -1216,7 +1964,6 @@ test "Acquire-By-Hash and explicit not-found fallback policy" {
     var direct = try refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         testRefreshPolicy(&.{.uncompressed}),
         testDependencies(&direct_fixture, &direct_cache),
@@ -1240,7 +1987,6 @@ test "Acquire-By-Hash and explicit not-found fallback policy" {
     try std.testing.expectError(error.NotFound, refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         testRefreshPolicy(&.{.uncompressed}),
         testDependencies(&disabled_fixture, &disabled_cache),
@@ -1265,7 +2011,6 @@ test "Acquire-By-Hash and explicit not-found fallback policy" {
     var result = try refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         enabled_policy,
         testDependencies(&enabled_fixture, &enabled_cache),
@@ -1371,7 +2116,6 @@ test "bad digest expiry future date and decompression corruption fail closed" {
         try std.testing.expectError(case.expected, refresh(
             allocator,
             repository,
-            .acquire_plain,
             testAcquisitionPolicy(),
             testRefreshPolicy(case.order),
             testDependencies(&fixture, &cache),
@@ -1418,7 +2162,6 @@ test "interrupted publication leaves no snapshot and offline miss fails closed" 
     try std.testing.expectError(error.Interrupted, refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         policy,
         testDependencies(&fixture, &cache),
@@ -1429,7 +2172,6 @@ test "interrupted publication leaves no snapshot and offline miss fails closed" 
     try std.testing.expectError(error.CacheMiss, refresh(
         allocator,
         repository,
-        .acquire_plain,
         testAcquisitionPolicy(),
         policy,
         testDependencies(&offline_fixture, &cache),

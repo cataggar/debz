@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the checked-in, non-secret OpenPGP verification fixtures."""
 
+from base64 import b64encode
 from hashlib import sha1, sha256, sha512
 from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
@@ -66,6 +67,30 @@ R6HZAnW1Jd8UUZg229znRGB/PZiWUl7ttI8x4zY1oz5uzaSQfYGRRQ==
 
 CREATED = 1_700_000_000
 MESSAGE = b"Origin: debz fixture\nSuite: stable\n"
+PACKAGES = (
+    b"Package: hello\n"
+    b"Version: 1.0-1\n"
+    b"Architecture: amd64\n"
+    b"Maintainer: Test <test@example.invalid>\n"
+    b"Description: hello\n"
+    b"Filename: pool/main/h/hello/hello_1.0-1_amd64.deb\n"
+    b"Size: 4\n"
+    b"SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+)
+RELEASE = (
+    b"Suite: stable\n"
+    b"Codename: bookworm\n"
+    b"Date: Tue, 14 Nov 2023 22:13:20 +0000\n"
+    b"Valid-Until: Thu, 16 Nov 2023 22:13:20 +0000\n"
+    b"Architectures: amd64\n"
+    b"Components: main\n"
+    b"Acquire-By-Hash: no\n"
+    b"SHA256:\n "
+    + sha256(PACKAGES).hexdigest().encode()
+    + b" "
+    + str(len(PACKAGES)).encode()
+    + b" main/binary-amd64/Packages\n"
+)
 UID = b"debz hermetic archive fixture <fixture.invalid>"
 
 
@@ -95,6 +120,12 @@ def packet_body(encoded):
     if first == 255:
         return encoded[6:]
     raise ValueError("partial packet")
+
+
+def armor_signature(encoded):
+    body = b64encode(encoded)
+    lines = b"\n".join(body[index:index + 64] for index in range(0, len(body), 64))
+    return b"-----BEGIN PGP SIGNATURE-----\n\n" + lines + b"\n-----END PGP SIGNATURE-----\n"
 
 
 def public_body(key):
@@ -233,6 +264,20 @@ def main():
     )
     ed_keyring = ed_packet + uid_packet + ed_certification
     ed_signature = signature(ed_key, 0x00, [MESSAGE], ed_fp)
+    release_signature = signature(subkey, 0x00, [RELEASE], subkey_fp)
+    release_sha512_signature = signature(subkey, 0x00, [RELEASE], subkey_fp, hash_id=10)
+    canonical_release = RELEASE.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    release_text_signature = signature(subkey, 0x01, [canonical_release], subkey_fp)
+    release_expired_signature = signature(
+        subkey, 0x00, [RELEASE], subkey_fp,
+        extra_hashed=subpacket(3, (60).to_bytes(4, "big")),
+    )
+    in_release = (
+        b"-----BEGIN PGP SIGNED MESSAGE-----\n"
+        b"Hash: SHA256\n\n"
+        + RELEASE
+        + armor_signature(release_text_signature)
+    )
 
     values = {
         "message": MESSAGE,
@@ -250,6 +295,12 @@ def main():
         "unknown_critical_signature": unknown_critical_signature,
         "ed25519_keyring": ed_keyring,
         "ed25519_signature": ed_signature,
+        "repository_packages": PACKAGES,
+        "repository_release": RELEASE,
+        "repository_release_signature": release_signature,
+        "repository_release_sha512_signature": release_sha512_signature,
+        "repository_release_expired_signature": release_expired_signature,
+        "repository_in_release": in_release,
         "primary_fingerprint": primary_fp,
         "subkey_fingerprint": subkey_fp,
         "ed25519_fingerprint": ed_fp,
