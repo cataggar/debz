@@ -4,6 +4,7 @@ const metadata_cache = @import("metadata_cache.zig");
 const packages_index = @import("packages_index.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const exact_lock = @import("exact_lock.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -16,6 +17,7 @@ pub const SelectedPackage = struct {
     repository_priority: i32,
     record: *const packages_index.PackageRecord,
     repository_base_uri: acquisition.Uri,
+    authenticated_snapshot_sha256: ?[32]u8,
 
     /// Accepts only a package origin emitted by a solver context and a
     /// cryptographically verified repository import.
@@ -59,6 +61,7 @@ pub const SelectedPackage = struct {
             .repository_priority = repository.priority,
             .record = record,
             .repository_base_uri = repository_base_uri,
+            .authenticated_snapshot_sha256 = repository.authenticated_snapshot_sha256,
         };
     }
 };
@@ -94,6 +97,7 @@ pub const Policy = struct {
 pub const Request = struct {
     selected: SelectedPackage,
     policy: Policy,
+    exact_lock_package: ?exact_lock.Package = null,
 };
 
 pub const Provenance = struct {
@@ -141,6 +145,7 @@ pub const Error = SelectionError || error{
     CacheMiss,
     CorruptObject,
     LockBusy,
+    LockPackageMismatch,
 };
 
 pub const LockPolicy = union(enum) {
@@ -453,6 +458,17 @@ pub fn acquirePackage(
 ) !VerifiedPackage {
     const record = request.selected.record;
     const declared_size = record.transport.size.value;
+    if (request.exact_lock_package) |locked| {
+        if (!std.mem.eql(u8, locked.name, record.control.package.text) or
+            !std.mem.eql(u8, locked.version, record.control.version.value.original) or
+            !std.mem.eql(u8, locked.architecture, record.control.architecture.text) or
+            !std.mem.eql(u8, &locked.repository_id, request.selected.repository_id.slice()) or
+            request.selected.authenticated_snapshot_sha256 == null or
+            !std.mem.eql(u8, &locked.repository_snapshot_sha256, &request.selected.authenticated_snapshot_sha256.?) or
+            !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
+            locked.declared_size != declared_size)
+            return error.LockPackageMismatch;
+    }
     if (request.policy.maximum_package_bytes == 0 or
         declared_size > request.policy.maximum_package_bytes or
         declared_size > cache.limits.maximum_object_bytes)
@@ -818,6 +834,34 @@ test "authenticated solver selection rejects untrusted and conflicting provenanc
         selection.repository,
         selection.origin,
         try acquisition.Uri.parse("https://user:secret@packages.example/repository"),
+    ));
+}
+
+test "package_acquisition.test.exact lock rejects repository and artifact substitution" {
+    var selection = try testSelection(std.testing.allocator, "package payload");
+    defer selection.deinit(std.testing.allocator);
+    selection.selected.authenticated_snapshot_sha256 = @splat(1);
+    var cache_dir = std.testing.tmpDir(.{});
+    defer cache_dir.cleanup();
+    var cache = try testCache(&cache_dir);
+    defer cache.deinit();
+    var transport: TestTransport = .{};
+    const locked: exact_lock.Package = .{
+        .name = "demo",
+        .version = "1.2.3-1",
+        .architecture = "amd64",
+        .repository_id = selection.repository.repository_id.bytes,
+        .repository_snapshot_sha256 = @splat(2),
+        .sha256 = selection.index.records[0].transport.sha256.bytes,
+        .declared_size = selection.index.records[0].transport.size.value,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    try std.testing.expectError(error.LockPackageMismatch, acquirePackage(
+        std.testing.allocator,
+        &cache,
+        .{ .selected = selection.selected, .policy = testPolicy(.cache_only), .exact_lock_package = locked },
+        transport.dependencies(),
     ));
 }
 

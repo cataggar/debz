@@ -91,6 +91,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-transaction-executor", "Run dpkg transaction executor tests")
         .dependOn(&run_transaction_tests.step);
 
+    const lock_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"exact_lock.test."},
+    });
+    const run_lock_tests = b.addRunArtifact(lock_tests);
+    b.step("test-exact-lock", "Run exact solved-closure lock tests")
+        .dependOn(&run_lock_tests.step);
+
+    const provenance_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"transaction_provenance.test."},
+    });
+    const run_provenance_tests = b.addRunArtifact(provenance_tests);
+    b.step("test-transaction-provenance", "Run transaction provenance tests")
+        .dependOn(&run_provenance_tests.step);
+
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
         .root_module = b.createModule(.{

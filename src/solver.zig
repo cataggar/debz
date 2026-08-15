@@ -4,6 +4,7 @@ const packages_index = @import("packages_index.zig");
 const relation = @import("relation.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
+const exact_lock_module = @import("exact_lock.zig");
 
 const libsolv = @cImport({
     @cInclude("solv/evr.h");
@@ -112,6 +113,7 @@ pub const RepositoryInput = struct {
     priority: i32,
     eligibility: Eligibility,
     packages: *const packages_index.Index,
+    authenticated_snapshot_sha256: ?[32]u8 = null,
 
     pub fn fromRefresh(
         result: *const repository_refresh.AuthenticatedResult,
@@ -122,6 +124,7 @@ pub const RepositoryInput = struct {
             .priority = priority,
             .eligibility = .verified_refresh,
             .packages = &result.snapshot.packages,
+            .authenticated_snapshot_sha256 = repository_refresh.snapshotDigest(result),
         };
     }
 
@@ -696,6 +699,9 @@ pub const PlanInput = struct {
     request: PlanRequest,
     policy: SolvePolicy = .{},
     limits: PlanLimits = .{},
+    /// Exact final closure constraint. This is independent from dpkg selection
+    /// holds carried by `installed.policies`.
+    exact_lock: ?*const exact_lock_module.Lock = null,
 };
 
 pub const ActionKind = enum { install, remove, upgrade, downgrade, reinstall };
@@ -803,6 +809,11 @@ pub const ProblemKind = enum {
     phased_update_excluded,
     replacement_violation,
     limit_exceeded,
+    lock_repository_missing,
+    lock_repository_mismatch,
+    lock_package_missing,
+    lock_package_mismatch,
+    lock_closure_drift,
 };
 
 pub const CandidateRejectionReason = enum {
@@ -888,6 +899,12 @@ pub fn planTransaction(
     if (input.installed.hold_authority != .explicit_policy) {
         return failureOne(allocator, arena_ptr, .unsupported_feature, null, null, "planning requires explicit hold policy");
     }
+    if (input.exact_lock) |lock| {
+        if (!std.mem.eql(u8, lock.target_architecture, input.target_architecture))
+            return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "exact lock target architecture differs from planning architecture");
+        if (try validateExactLockInput(allocator, arena_ptr, input.repositories, lock)) |failure|
+            return .{ .failure = failure };
+    }
     for (input.repositories) |repository| {
         if (repository.eligibility == .untrusted) {
             return failureOne(allocator, arena_ptr, .unauthenticated_repository, null, null, "repository snapshot is not authenticated");
@@ -955,6 +972,10 @@ pub fn planTransaction(
 
     if (try preflightRequest(allocator, arena_ptr, context, input, &jobs)) |failure|
         return .{ .failure = failure };
+    if (input.exact_lock) |lock| {
+        if (try addExactLockJobs(allocator, arena_ptr, context, input, lock, &jobs)) |failure|
+            return .{ .failure = failure };
+    }
     addSafetyLocks(context, input, &jobs);
     addInstallOnlyJobs(context, input, &jobs);
     addPhasedLocks(context, input, &jobs);
@@ -1015,6 +1036,18 @@ pub fn planTransaction(
             return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "download byte total overflowed");
         size_delta += action.installed_size_delta_bytes;
         try actions.append(owned, action);
+    }
+    if (input.exact_lock) |lock| {
+        for (actions.items) |action| {
+            if (action.kind == .remove) continue;
+            const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
+                return failureOne(allocator, arena_ptr, .lock_closure_drift, action.package, null, "solver selected a package outside the exact locked closure");
+            if (action.repository == null or action.sha256 == null or action.package_size == null or
+                !std.mem.eql(u8, &action.repository.?.id, &locked.repository_id) or
+                !std.mem.eql(u8, &action.sha256.?, &hex32(locked.sha256)) or
+                action.package_size.? != locked.declared_size)
+                return failureOne(allocator, arena_ptr, .lock_package_mismatch, action.package, null, "planned package evidence differs from the exact lock");
+        }
     }
     const ordered_actions = try materializeOrdering(owned, actions.items);
     std.mem.sort(PlanAction, actions.items, {}, lessAction);
@@ -1132,6 +1165,88 @@ fn configureSolver(solver_handle: *libsolv.Solver, policy: SolvePolicy) void {
     _ = libsolv.solver_set_flag(solver_handle, libsolv.SOLVER_FLAG_ALLOW_UNINSTALL, @intFromBool(policy.allow_remove_dependencies));
     _ = libsolv.solver_set_flag(solver_handle, libsolv.SOLVER_FLAG_STRICT_REPO_PRIORITY, @intFromBool(policy.strict_repository_priority));
     _ = libsolv.solver_set_flag(solver_handle, libsolv.SOLVER_FLAG_FOCUS_BEST, 1);
+}
+
+fn validateExactLockInput(
+    backing: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    repositories: []const RepositoryInput,
+    lock: *const exact_lock_module.Lock,
+) PlanningError!?PlanFailure {
+    for (lock.repositories) |locked_repository| {
+        var matched: ?RepositoryInput = null;
+        for (repositories) |repository| {
+            if (std.mem.eql(u8, repository.repository_id.slice(), &locked_repository.id)) {
+                matched = repository;
+                break;
+            }
+        }
+        const repository = matched orelse
+            return (try failureOne(backing, arena, .lock_repository_missing, null, null, "exact lock repository is unavailable")).failure;
+        if (repository.eligibility != .verified_refresh)
+            return (try failureOne(backing, arena, .unauthenticated_repository, null, null, "exact lock reproduction requires authenticated refresh metadata")).failure;
+        const snapshot = repository.authenticated_snapshot_sha256 orelse
+            return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository has no authenticated snapshot identity")).failure;
+        if (!std.mem.eql(u8, &snapshot, &locked_repository.snapshot_sha256))
+            return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository snapshot differs from the exact lock")).failure;
+    }
+    return null;
+}
+
+fn addExactLockJobs(
+    backing: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    context: *Context,
+    input: PlanInput,
+    lock: *const exact_lock_module.Lock,
+    jobs: *libsolv.Queue,
+) PlanningError!?PlanFailure {
+    const state = internal(context);
+    for (lock.packages) |locked| {
+        var candidate: ?libsolv.Id = null;
+        var identity_seen = false;
+        for (state.origins.items) |origin| {
+            if (!std.mem.eql(u8, origin.package, locked.name) or
+                !std.mem.eql(u8, origin.version, locked.version) or
+                !std.mem.eql(u8, origin.architecture, locked.architecture))
+                continue;
+            identity_seen = true;
+            if (!std.mem.eql(u8, origin.repository_id.slice(), &locked.repository_id)) continue;
+            const repository_index = findRepositoryIndex(input.repositories, origin.repository_id) orelse continue;
+            const record = input.repositories[repository_index].packages.records[origin.record_index];
+            if (!std.mem.eql(u8, &record.transport.sha256.bytes, &locked.sha256) or
+                record.transport.size.value != locked.declared_size)
+                continue;
+            candidate = origin.solvable_id;
+            break;
+        }
+        if (candidate == null) {
+            return (try failureOne(
+                backing,
+                arena,
+                if (identity_seen) .lock_package_mismatch else .lock_package_missing,
+                locked.name,
+                null,
+                if (identity_seen)
+                    "exact lock package repository, digest, or declared size differs"
+                else
+                    "exact lock package version and architecture are unavailable",
+            )).failure;
+        }
+        libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate.?);
+    }
+
+    for (state.mappings, 0..) |mapping, installed_index| {
+        const installed = state.source_records[mapping.record_index];
+        if (!installed.status.isFullyInstalled()) continue;
+        if (lock.findIdentity(installed.name.value, installed.architecture.value) != null) continue;
+        if (isHeld(context, installed_index) and !input.policy.allow_change_held)
+            return (try failureOne(backing, arena, .held_violation, installed.name.value, null, "dpkg selection hold prevents exact lock closure reproduction")).failure;
+        if (removalViolation(context, input, installed_index)) |kind|
+            return (try failureOne(backing, arena, kind, installed.name.value, null, "safe removal policy prevents exact lock closure reproduction")).failure;
+        libsolv.queue_push2(jobs, libsolv.SOLVER_ERASE | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
+    }
+    return null;
 }
 
 fn preflightRequest(

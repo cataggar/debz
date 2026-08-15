@@ -168,6 +168,25 @@ pub const AuthenticatedResult = struct {
     }
 };
 
+/// Deterministic identity of the authenticated repository view used by locks.
+/// Refresh time, transport location, and cache/network outcome are excluded.
+pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-authenticated-repository-snapshot-v1\x00");
+    hash.update(result.snapshot.provenance.repository_id.slice());
+    hash.update(&result.snapshot.provenance.release_digest.bytes);
+    hash.update(&result.snapshot.provenance.index_digest.bytes);
+    if (result.snapshot.provenance.authentication_evidence.signature_digest) |digest|
+        hash.update(&digest.bytes);
+    for (result.snapshot.provenance.authentication_evidence.signatures) |signature| {
+        if (signature.primary_fingerprint) |fingerprint| hash.update(&fingerprint);
+        if (signature.signing_fingerprint) |fingerprint| hash.update(&fingerprint);
+        hash.update(@tagName(signature.status));
+        hash.update("\x00");
+    }
+    return hash.finalResult();
+}
+
 pub const Dependencies = struct {
     acquisition: acquisition.Dependencies,
     /// Must be initialized by the caller from its explicit cache root.
