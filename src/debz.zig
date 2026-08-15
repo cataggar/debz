@@ -2,6 +2,17 @@ const std = @import("std");
 const solver = @import("solver.zig");
 
 pub const version = "0.1.0";
+pub const product_api = @import("product_api.zig");
+pub const ApiVersion = product_api.api_version;
+pub const ProductOperation = product_api.Operation;
+pub const ProductCommonOptions = product_api.CommonOptions;
+pub const ProductRequest = product_api.Request;
+pub const ProductResult = product_api.Result;
+pub const ProductDiagnostic = product_api.Diagnostic;
+pub const ProductErrorId = product_api.ErrorId;
+pub const ProductExitStatus = product_api.ExitStatus;
+pub const ProductBackend = product_api.Backend;
+pub const executeProductRequest = product_api.execute;
 pub const DebianVersion = @import("debian_version.zig").DebianVersion;
 pub const DebianVersionParseError = @import("debian_version.zig").ParseError;
 pub const SolverContext = solver.Context;
@@ -121,23 +132,7 @@ pub const Config = struct {
     offline: bool = false,
 };
 
-pub const Operation = enum {
-    refresh,
-    install,
-    remove,
-    upgrade,
-    upgrade_all,
-    reinstall,
-    download,
-    plan,
-    list_installed,
-    list_available,
-    info,
-    provides,
-    why,
-    clean,
-    recover,
-};
+pub const Operation = product_api.Operation;
 
 pub const Request = struct {
     operation: Operation,

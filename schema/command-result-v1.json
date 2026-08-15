@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/command-result-v1.json",
+  "title": "debz command result v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "api_version", "operation", "exit_status", "changed", "summary", "items", "diagnostics"],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.command.v1" },
+    "api_version": { "const": 1 },
+    "operation": {
+      "enum": ["refresh", "install", "remove", "upgrade", "upgrade-all", "reinstall", "download", "plan", "list-installed", "list-available", "info", "provides", "why", "clean", "recover"]
+    },
+    "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
+    "changed": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["package", "version", "architecture", "detail"],
+        "properties": {
+          "package": { "type": "string" },
+          "version": { "type": ["string", "null"] },
+          "architecture": { "type": ["string", "null"] },
+          "detail": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "message"],
+        "properties": {
+          "id": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}
