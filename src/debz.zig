@@ -21,6 +21,23 @@ pub const SolverRepositoryInput = solver.RepositoryInput;
 pub const SolverImportLimits = solver.Limits;
 pub const SolverPackageOrigin = solver.PackageOrigin;
 pub const SolverAvailableImportError = solver.AvailableImportError;
+/// Pure transaction planning API. It does not download archives or execute
+/// dpkg; callers must separately review and execute returned actions.
+pub const planTransaction = solver.planTransaction;
+pub const SolverPlanInput = solver.PlanInput;
+pub const SolverPlanRequest = solver.PlanRequest;
+pub const SolverPackageSelector = solver.PackageSelector;
+pub const SolverSolvePolicy = solver.SolvePolicy;
+pub const SolverPlanLimits = solver.PlanLimits;
+pub const SolverProtectedIdentity = solver.ProtectedIdentity;
+pub const SolverPlanningResult = solver.PlanningResult;
+pub const SolverPlan = solver.Plan;
+pub const SolverPlanAction = solver.PlanAction;
+pub const SolverPlanActionKind = solver.ActionKind;
+pub const SolverPlanActionReason = solver.ActionReason;
+pub const SolverPlanFailure = solver.PlanFailure;
+pub const SolverProblemNode = solver.ProblemNode;
+pub const SolverProblemKind = solver.ProblemKind;
 pub const deb822 = @import("deb822.zig");
 pub const relation = @import("relation.zig");
 pub const deb_archive = @import("deb_archive.zig");
