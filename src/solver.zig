@@ -665,6 +665,9 @@ pub const PlanAction = struct {
     source_package: []const u8,
     prior_installed: ?PriorInstalled,
     reason: ActionReason,
+    /// Present for archive-producing actions. This is the authenticated,
+    /// solver-selected record identity consumed by package acquisition.
+    selected_origin: ?PackageOrigin,
 };
 
 pub const Plan = struct {
@@ -1350,6 +1353,15 @@ fn materializeAction(
         .source_package = try allocator.dupe(u8, source_name),
         .prior_installed = prior,
         .reason = actionReason(context, solvable_id, kind, input),
+        .selected_origin = if (origin) |available| .{
+            .repository_id = available.repository_id,
+            .repository_priority = available.repository_priority,
+            .record_index = available.record_index,
+            .package = try allocator.dupe(u8, available.package),
+            .version = try allocator.dupe(u8, available.version),
+            .architecture = try allocator.dupe(u8, available.architecture),
+            .source_location = try allocator.dupe(u8, available.source_location),
+        } else null,
     };
 }
 

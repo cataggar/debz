@@ -8,6 +8,10 @@
 
 Planning only computes actions. It does **not** download package archives, modify the filesystem, or execute dpkg.
 
+Archive-producing plan actions retain a typed `selected_origin` that can be
+matched back to the authenticated repository record by the package acquisition
+API.
+
 ## Typed metadata and archives
 
 The project exposes typed configuration and request APIs, a CLI command vocabulary, and bounded parsers for DEB822, Debian versions, binary package relations, control records, repository `Release` metadata, repository source configuration, and Debian binary package outer archives.
@@ -35,6 +39,17 @@ Repository sources can be supplied explicitly as canonical `.sources` stanzas or
 ## OpenPGP security boundary
 
 `debz.openpgp_verifier` is a separate in-process repository-signature boundary. It accepts only caller-supplied signed bytes, binary OpenPGP signature packets, and explicit keyring bytes or paths. It performs no network lookup, process spawning, or ambient keyring or home-directory access. The exact supported algorithms, parser limits, failure behavior, and backend/license decision are documented in [OpenPGP verification boundary](openpgp-verifier.md).
+
+## Verified package acquisition
+
+`debz.package_acquisition` accepts authenticated solver-selected records,
+checks declared size and SHA-256 before atomic publication to an explicit-root
+content-addressed cache, and returns owned verified handles with redacted
+provenance. Online, cache-only, transaction download, and download-only
+workflows use the same checks. Locking coordinates publication, repair, staging
+cleanup, and deterministic bounded garbage collection. It does not parse
+payloads or execute transactions. See
+[Verified package acquisition](package-acquisition.md).
 
 ## Dependency solver
 

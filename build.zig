@@ -67,6 +67,14 @@ pub fn build(b: *std.Build) void {
     const run_refresh_tests = b.addRunArtifact(refresh_tests);
     b.step("test-refresh", "Run repository refresh tests").dependOn(&run_refresh_tests.step);
 
+    const package_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"package_acquisition.test."},
+    });
+    const run_package_tests = b.addRunArtifact(package_tests);
+    b.step("test-package-acquisition", "Run verified package acquisition tests")
+        .dependOn(&run_package_tests.step);
+
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
         .root_module = b.createModule(.{
