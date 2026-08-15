@@ -33,6 +33,17 @@ OpenPGP verification of `InRelease` or `Release.gpg` is required before solver
 ingestion and remains the next security layer. A separate verified-byte input
 is reserved for that authentication layer; this pipeline never infers trust.
 
+`debz.openpgp_verifier` provides the separate, in-process repository-signature
+boundary. It accepts only caller-supplied signed bytes, binary OpenPGP signature
+packets, and explicit keyring bytes or paths. The current documented profile is
+OpenPGP v4 RSA and legacy Ed25519 with SHA-256/SHA-512, matching current Debian
+and Ubuntu archive signing. Parsing and policy are bounded, issuer hints never replace
+cryptographic verification, and accepted/rejected outcomes retain deterministic
+per-signature diagnostics. It performs no network lookup, process spawning, or
+ambient keyring/home-directory access. See
+[`docs/openpgp-verifier.md`](docs/openpgp-verifier.md) for the exact profile and
+backend/license decision.
+
 ## Dependency solver
 
 The public `SolverContext` adapter owns a Debian-configured libsolv pool while

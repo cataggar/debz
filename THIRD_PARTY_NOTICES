@@ -49,3 +49,15 @@ debz uses only liblzma's in-process streaming decoder for xz metadata. The
 dependency is selected by the build system and no xz command-line tool is
 invoked in production. See the installed XZ Utils documentation for its full
 copyright and license notices.
+
+OpenPGP verifier
+================
+
+The production OpenPGP verifier adds no third-party dependency. It uses Zig
+0.16.0 standard-library SHA-1 (fingerprints only), SHA-256, SHA-512, RSA, and
+Ed25519 verification primitives under Zig's MIT license.
+
+The checked-in OpenPGP fixture bytes were generated with Python cryptography
+45.0.4 (Apache-2.0 OR BSD-3-Clause). This package is an optional fixture
+regeneration tool only: it is not fetched, linked, imported, or executed by the
+debz build or test graph, and none of its source code is distributed here.
