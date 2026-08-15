@@ -1,12 +1,13 @@
 # debz
 
-`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It is designed around explicit inputs, bounded parsing, authenticated repository metadata, deterministic dependency solving, verified package acquisition, and transaction planning while using `dpkg` as the eventual transaction backend. It does not yet modify packages or repositories.
+`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It is designed around explicit inputs, bounded parsing, authenticated repository metadata, deterministic dependency solving, verified package acquisition, transaction planning, and install-root-aware execution through `dpkg`.
 
 ## Public entry points
 
 - `debz.planTransaction` creates an owned, deterministic transaction plan from authenticated repository snapshots and parsed dpkg state.
 - `debz.acquirePackage` downloads or loads an authenticated solver-selected package, verifies its size and SHA-256, and publishes it to an explicit package CAS.
 - `debz.repository_policy` normalizes and atomically orchestrates explicitly declared multi-repository policy.
+- `debz.executeTransaction` revalidates cached artifacts and executes an owned plan against an explicit install root with bounded locks and structured failure provenance.
 - `debz.repository_refresh.refreshAuthenticated` verifies repository signatures and metadata before publishing a solver-eligible snapshot.
 - `debz.openpgp_verifier` verifies the project's supported OpenPGP profile without network, process, or ambient keyring access.
 - `debz.deb_payload.validate` performs complete bounded `.deb` payload and authenticated identity validation before transaction handoff.

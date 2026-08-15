@@ -1,12 +1,24 @@
 # Project status and API overview
 
-`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It is intended to own repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, and diagnostics while using `dpkg` as the transaction backend. It does not yet modify packages or repositories.
+`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It owns repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, diagnostics, and an install-root-aware `dpkg` execution boundary.
 
 ## Deterministic transaction planning
 
 `debz.planTransaction` is the public typed planning API. It accepts authenticated repository snapshots, parsed dpkg state, explicit package policy, architecture, request, solver policy, and limits. The returned plan owns its data and can be serialized with `canonicalJson`; canonical schema version 2 is documented in [`schema/transaction-plan-v2.json`](../schema/transaction-plan-v2.json), while [version 1](../schema/transaction-plan-v1.json) remains published for compatibility with previously serialized plans.
 
 Planning only computes actions. It does **not** download package archives, modify the filesystem, or execute dpkg.
+
+## Transaction execution
+
+`debz.executeTransaction` consumes an owned plan plus exact cached artifact
+paths, revalidates every archive immediately before unpack, and executes only
+the plan's ordered actions. It uses explicit root/admin paths, bounded debz and
+dpkg locks, direct argv execution, a fixed environment, explicit conffile and
+typed force policy, deferred/final trigger processing, and structured
+interruption/failure provenance. See [Dpkg transaction executor](transaction-executor.md).
+
+Recovery and post-state verification remain outside this boundary and are
+tracked by #28.
 
 Archive-producing plan actions retain a typed `selected_origin` that can be
 matched back to the authenticated repository record by the package acquisition
