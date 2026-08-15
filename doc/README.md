@@ -4,5 +4,6 @@
 - [Authenticated repository refresh](authenticated-refresh.md) explains trusted refresh usage, policy, provenance, and cache behavior.
 - [Verified package acquisition](package-acquisition.md) documents authenticated solver selection, download policy, SHA-256 CAS publication, offline use, and bounded garbage collection.
 - [OpenPGP verification boundary](openpgp-verifier.md) documents the exact supported profile, security limitations, implementation decision, and verification outcomes.
-- [Transaction plan schema](../schema/transaction-plan-v1.json) is the canonical JSON Schema for version 1 plans.
+- [Solver and planning semantics](solver-planning.md) documents Debian policy, determinism, and ordered plans.
+- [Transaction plan schema v2](../schema/transaction-plan-v2.json) is the current canonical schema; [v1](../schema/transaction-plan-v1.json) remains available for compatibility.
 - [Debian payload validation](deb-payload-validation.md) documents resource limits, tar/path/link policy, identity checks, inventories, diagnostics, and fuzzing.

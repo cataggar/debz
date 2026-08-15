@@ -237,6 +237,7 @@ const Internal = struct {
     summary: ?ImportSummary = null,
     available_repositories: std.ArrayList(source.RepositoryId) = .empty,
     origins: std.ArrayList(OriginOwned) = .empty,
+    target_architecture: []u8 = &.{},
 
     fn deinit(self: *Internal) void {
         if (self.mappings.len != 0) self.allocator.free(self.mappings);
@@ -244,6 +245,7 @@ const Internal = struct {
         for (self.origins.items) |*origin| origin.deinit(self.allocator);
         self.origins.deinit(self.allocator);
         self.available_repositories.deinit(self.allocator);
+        if (self.target_architecture.len != 0) self.allocator.free(self.target_architecture);
         libsolv.solver_free(self.solver);
         libsolv.pool_free(self.pool);
         const allocator = self.allocator;
@@ -279,6 +281,7 @@ pub const Context = opaque {
         const architecture_z = try allocator.dupeZ(u8, architecture);
         defer allocator.free(architecture_z);
         libsolv.pool_setarch(internal(context).pool, architecture_z);
+        internal(context).target_architecture = try allocator.dupe(u8, architecture);
         return context;
     }
 
@@ -410,6 +413,10 @@ pub const Context = opaque {
                         0,
                     );
                     addRelations(state.pool, repo, solvable, record);
+                    setMultiArch(repo, solvable_id, record.multi_arch);
+                    addQualifiedSelfProvide(state.pool, repo, solvable, record.name.value, record.architecture.value);
+                    if (std.mem.eql(u8, record.architecture.value, "all"))
+                        addQualifiedSelfProvide(state.pool, repo, solvable, record.name.value, input.native_architecture);
                     mappings[mapping_index] = .{
                         .solvable_id = solvable_id,
                         .record_index = record_index,
@@ -492,7 +499,12 @@ pub const Context = opaque {
             state.origins.shrinkRetainingCapacity(origins_start);
         }
 
-        for (input.packages.records, 0..) |record, record_index| {
+        const record_order = try state.allocator.alloc(usize, input.packages.records.len);
+        defer state.allocator.free(record_order);
+        for (record_order, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, record_order, input.packages.records, lessAvailableRecordIndex);
+        for (record_order) |record_index| {
+            const record = input.packages.records[record_index];
             const solvable_id = libsolv.repo_add_solvable(repo);
             if (solvable_id == 0) return error.PoolAllocationFailed;
             const solvable = libsolv.pool_id2solvable(state.pool, solvable_id);
@@ -500,14 +512,15 @@ pub const Context = opaque {
             solvable.*.name = stringId(state.pool, control.package.text);
             solvable.*.evr = stringId(state.pool, control.version.value.original);
             solvable.*.arch = stringId(state.pool, control.architecture.text);
+            setMultiArch(repo, solvable_id, control.multi_arch);
 
-            addAvailableRelation(state.pool, solvable, control.pre_depends, .requires_pre);
-            addAvailableRelation(state.pool, solvable, control.depends, .requires);
-            addAvailableRelation(state.pool, solvable, control.recommends, .recommends);
-            addAvailableRelation(state.pool, solvable, control.provides, .provides);
-            addAvailableRelation(state.pool, solvable, control.conflicts, .conflicts);
-            addAvailableRelation(state.pool, solvable, control.breaks, .conflicts);
-            addAvailableRelation(state.pool, solvable, control.replaces, .obsoletes);
+            addAvailableRelation(state.pool, solvable, control.pre_depends, .requires_pre, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.depends, .requires, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.recommends, .recommends, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.provides, .provides, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.conflicts, .conflicts, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.breaks, .conflicts, state.target_architecture);
+            addAvailableRelation(state.pool, solvable, control.replaces, .obsoletes, state.target_architecture);
 
             const self_provide = libsolv.pool_rel2id(
                 state.pool,
@@ -517,6 +530,9 @@ pub const Context = opaque {
                 1,
             );
             libsolv.solvable_add_deparray(solvable, libsolv.SOLVABLE_PROVIDES, self_provide, 0);
+            addQualifiedSelfProvide(state.pool, repo, solvable, control.package.text, control.architecture.text);
+            if (std.mem.eql(u8, control.architecture.text, "all"))
+                addQualifiedSelfProvide(state.pool, repo, solvable, control.package.text, state.target_architecture);
 
             var origin = try OriginOwned.init(
                 state.allocator,
@@ -583,6 +599,34 @@ pub const Context = opaque {
     }
 };
 
+fn lessAvailableRecordIndex(
+    records: []const packages_index.PackageRecord,
+    a: usize,
+    b: usize,
+) bool {
+    const a_record = records[a];
+    const b_record = records[b];
+    const name_order = std.mem.order(u8, a_record.control.package.text, b_record.control.package.text);
+    if (name_order != .eq) return name_order == .lt;
+    const arch_order = std.mem.order(u8, a_record.control.architecture.text, b_record.control.architecture.text);
+    if (arch_order != .eq) return arch_order == .lt;
+    const version_order = std.mem.order(
+        u8,
+        a_record.control.version.value.original,
+        b_record.control.version.value.original,
+    );
+    if (version_order != .eq) return version_order == .lt;
+    return std.mem.order(u8, a_record.location.source, b_record.location.source) == .lt;
+}
+
+fn lessInstalledRecord(_: void, left: dpkg_status.Package, right: dpkg_status.Package) bool {
+    const name_order = std.mem.order(u8, left.name.value, right.name.value);
+    if (name_order != .eq) return name_order == .lt;
+    const architecture_order = std.mem.order(u8, left.architecture.value, right.architecture.value);
+    if (architecture_order != .eq) return architecture_order == .lt;
+    return std.mem.order(u8, left.version.spelling.value, right.version.spelling.value) == .lt;
+}
+
 /// Transaction planning is pure: it does not download package archives and
 /// never invokes dpkg or any other package executor.
 pub const PlanRequest = union(enum) {
@@ -590,14 +634,28 @@ pub const PlanRequest = union(enum) {
     remove: PackageSelector,
     upgrade: []const PackageSelector,
     upgrade_all,
+    reinstall: PackageSelector,
 };
 
-/// Reinstall and downgrade are represented by policy/action types for forward
-/// compatibility. Reinstall is not currently an accepted request verb.
 pub const PackageSelector = struct {
     name: []const u8,
     version: ?[]const u8 = null,
     architecture: ?[]const u8 = null,
+};
+
+pub const OperationMode = enum { plan_only, download_only };
+
+pub const PhasedUpdatePolicy = union(enum) {
+    disabled,
+    include_all,
+    deterministic_percentage: u8,
+};
+
+pub const PhasedCandidate = struct {
+    name: []const u8,
+    architecture: []const u8,
+    version: []const u8,
+    percentage: u8,
 };
 
 pub const SolvePolicy = struct {
@@ -607,7 +665,9 @@ pub const SolvePolicy = struct {
     allow_remove_essential: bool = false,
     allow_remove_protected: bool = false,
     allow_change_held: bool = false,
+    allow_replacements: bool = false,
     strict_repository_priority: bool = true,
+    phased_updates: PhasedUpdatePolicy = .disabled,
 };
 
 pub const PlanLimits = struct {
@@ -626,7 +686,13 @@ pub const PlanInput = struct {
     installed: ImportInput,
     /// Explicit policy in addition to dpkg's parsed Essential/Protected fields.
     protected: []const ProtectedIdentity = &.{},
+    /// Complete explicit set of unrequested removals a caller authorizes.
+    authorized_removals: []const ProtectedIdentity = &.{},
+    /// Identities retained side-by-side across upgrades (for example kernels).
+    install_only: []const ProtectedIdentity = &.{},
+    phased_candidates: []const PhasedCandidate = &.{},
     target_architecture: []const u8,
+    mode: OperationMode = .plan_only,
     request: PlanRequest,
     policy: SolvePolicy = .{},
     limits: PlanLimits = .{},
@@ -639,6 +705,26 @@ pub const ActionReason = enum {
     recommends,
     replacement,
     upgrade,
+};
+
+pub const OrderedActionKind = enum { remove, unpack, configure };
+
+pub const OrderedAction = struct {
+    sequence: usize,
+    kind: OrderedActionKind,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+};
+
+pub const PlanSummary = struct {
+    installs: usize = 0,
+    removals: usize = 0,
+    upgrades: usize = 0,
+    downgrades: usize = 0,
+    reinstalls: usize = 0,
+    download_bytes: u64 = 0,
+    installed_size_delta_bytes: i128 = 0,
 };
 
 pub const RepositoryIdentity = struct {
@@ -664,6 +750,7 @@ pub const PlanAction = struct {
     installed_size_delta_bytes: i128,
     source_package: []const u8,
     prior_installed: ?PriorInstalled,
+    requested: bool,
     reason: ActionReason,
     /// Present for archive-producing actions. This is the authenticated,
     /// solver-selected record identity consumed by package acquisition.
@@ -671,9 +758,12 @@ pub const PlanAction = struct {
 };
 
 pub const Plan = struct {
-    schema_version: u32 = 1,
+    schema_version: u32 = 2,
     target_architecture: []const u8,
+    mode: OperationMode,
     actions: []PlanAction,
+    ordered_actions: []OrderedAction,
+    summary: PlanSummary,
     download_bytes: u64,
     installed_size_delta_bytes: i128,
     backing_allocator: std.mem.Allocator,
@@ -707,18 +797,48 @@ pub const ProblemKind = enum {
     architecture_mismatch,
     version_mismatch,
     unsupported_feature,
+    invalid_policy,
+    reverse_dependency,
+    policy_exclusion,
+    phased_update_excluded,
+    replacement_violation,
     limit_exceeded,
 };
 
+pub const CandidateRejectionReason = enum {
+    wrong_architecture,
+    wrong_version,
+    repository_priority,
+    held,
+    protected,
+    essential,
+    downgrade_forbidden,
+    replacement_forbidden,
+    phased_update,
+    unsatisfied_relation,
+    conflict,
+};
+
+pub const CandidateRejection = struct {
+    package: []const u8,
+    version: ?[]const u8 = null,
+    architecture: ?[]const u8 = null,
+    reason: CandidateRejectionReason,
+    detail: []const u8,
+};
+
 pub const ProblemNode = struct {
+    id: usize = 0,
     kind: ProblemKind,
     package: ?[]const u8 = null,
     dependency: ?[]const u8 = null,
     detail: []const u8,
+    candidate_rejections: []const CandidateRejection = &.{},
+    related_problem_ids: []const usize = &.{},
 };
 
 pub const PlanFailure = struct {
-    schema_version: u32 = 1,
+    schema_version: u32 = 2,
     problems: []ProblemNode,
     backing_allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
@@ -762,6 +882,9 @@ pub fn planTransaction(
     if (!std.mem.eql(u8, input.target_architecture, input.installed.native_architecture)) {
         return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "target architecture differs from installed-state native architecture");
     }
+    if (validatePlanPolicy(input)) |detail| {
+        return failureOne(allocator, arena_ptr, .invalid_policy, null, null, detail);
+    }
     if (input.installed.hold_authority != .explicit_policy) {
         return failureOne(allocator, arena_ptr, .unsupported_feature, null, null, "planning requires explicit hold policy");
     }
@@ -780,7 +903,12 @@ pub fn planTransaction(
 
     const context = try Context.createForArchitecture(allocator, input.target_architecture);
     defer context.destroy();
-    const imported = try context.importInstalled(input.installed);
+    const installed_records = try allocator.dupe(dpkg_status.Package, input.installed.records);
+    defer allocator.free(installed_records);
+    std.mem.sort(dpkg_status.Package, installed_records, {}, lessInstalledRecord);
+    var installed_input = input.installed;
+    installed_input.records = installed_records;
+    const imported = try context.importInstalled(installed_input);
     switch (imported) {
         .diagnostic => |diagnostic| {
             const detail = try std.fmt.allocPrint(owned, "installed state rejected: {s}", .{@tagName(diagnostic.code)});
@@ -791,7 +919,12 @@ pub fn planTransaction(
         },
     }
 
-    for (input.repositories) |repository| {
+    const repository_order = try allocator.alloc(usize, input.repositories.len);
+    defer allocator.free(repository_order);
+    for (repository_order, 0..) |*slot, index| slot.* = index;
+    std.mem.sort(usize, repository_order, input.repositories, lessRepositoryIndex);
+    for (repository_order) |repository_index| {
+        const repository = input.repositories[repository_index];
         context.importAvailable(repository, input.limits.import) catch |err| {
             const kind: ProblemKind = switch (err) {
                 error.UntrustedRepository => .unauthenticated_repository,
@@ -823,6 +956,8 @@ pub fn planTransaction(
     if (try preflightRequest(allocator, arena_ptr, context, input, &jobs)) |failure|
         return .{ .failure = failure };
     addSafetyLocks(context, input, &jobs);
+    addInstallOnlyJobs(context, input, &jobs);
+    addPhasedLocks(context, input, &jobs);
 
     if (libsolv.solver_solve(state.solver, &jobs) != 0) {
         return .{ .failure = try materializeProblems(allocator, arena_ptr, context, input.limits.max_problems) };
@@ -833,22 +968,25 @@ pub fn planTransaction(
     defer libsolv.transaction_free(transaction);
     libsolv.transaction_order(transaction, 0);
 
-    if (!input.policy.allow_remove_dependencies) {
-        const transaction_step_count: usize = @intCast(transaction.*.steps.count);
-        if (transaction_step_count != 0) {
-            const transaction_steps = transaction.*.steps.elements[0..transaction_step_count];
-            for (transaction_steps) |solvable_id| {
-                const action_type = libsolv.transaction_type(
-                    transaction,
-                    solvable_id,
-                    libsolv.SOLVER_TRANSACTION_SHOW_ACTIVE,
-                );
-                if ((action_type == libsolv.SOLVER_TRANSACTION_ERASE or
-                    action_type == libsolv.SOLVER_TRANSACTION_OBSOLETED) and
-                    !requestedRemoval(input.request, context, solvable_id))
-                {
-                    return failureOne(allocator, arena_ptr, .protected_violation, null, null, "transaction would remove an unrequested dependent package");
-                }
+    const transaction_step_count: usize = @intCast(transaction.*.steps.count);
+    if (transaction_step_count != 0) {
+        const transaction_steps = transaction.*.steps.elements[0..transaction_step_count];
+        for (transaction_steps) |solvable_id| {
+            const action_type = libsolv.transaction_type(
+                transaction,
+                solvable_id,
+                libsolv.SOLVER_TRANSACTION_SHOW_ACTIVE,
+            );
+            if (action_type == libsolv.SOLVER_TRANSACTION_OBSOLETED and !input.policy.allow_replacements) {
+                return failureOne(allocator, arena_ptr, .replacement_violation, null, null, "transaction requires an explicitly forbidden replacement");
+            }
+            if ((action_type == libsolv.SOLVER_TRANSACTION_ERASE or
+                action_type == libsolv.SOLVER_TRANSACTION_OBSOLETED) and
+                !requestedRemoval(input.request, context, solvable_id) and
+                (!input.policy.allow_remove_dependencies or
+                    !authorizedRemoval(input, context, solvable_id)))
+            {
+                return failureOne(allocator, arena_ptr, .reverse_dependency, null, null, "unrequested removal is absent from the complete authorized removal set");
             }
         }
     }
@@ -861,6 +999,7 @@ pub fn planTransaction(
     if (step_count > input.limits.max_actions) {
         return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "transaction contains more actions than the configured limit");
     }
+
     const steps = if (step_count == 0)
         @as([]const libsolv.Id, &.{})
     else
@@ -877,17 +1016,71 @@ pub fn planTransaction(
         size_delta += action.installed_size_delta_bytes;
         try actions.append(owned, action);
     }
+    const ordered_actions = try materializeOrdering(owned, actions.items);
     std.mem.sort(PlanAction, actions.items, {}, lessAction);
     const action_slice = try actions.toOwnedSlice(owned);
+    const summary = summarizeActions(action_slice, download_bytes, size_delta);
     const target = try owned.dupe(u8, input.target_architecture);
     return .{ .plan = .{
         .target_architecture = target,
+        .mode = input.mode,
         .actions = action_slice,
+        .ordered_actions = ordered_actions,
+        .summary = summary,
         .download_bytes = download_bytes,
         .installed_size_delta_bytes = size_delta,
         .backing_allocator = allocator,
         .arena = arena_ptr,
     } };
+}
+
+fn authorizedRemoval(input: PlanInput, context: *Context, solvable_id: libsolv.Id) bool {
+    const installed_index = findInstalledBySolvable(context, solvable_id) orelse return false;
+    const state = internal(context);
+    const record = state.source_records[state.mappings[installed_index].record_index];
+    for (input.authorized_removals) |identity| {
+        if (sameIdentity(identity.name, identity.architecture, record.name.value, record.architecture.value))
+            return true;
+    }
+    return false;
+}
+
+fn lessRepositoryIndex(repositories: []const RepositoryInput, a: usize, b: usize) bool {
+    if (repositories[a].priority != repositories[b].priority)
+        return repositories[a].priority > repositories[b].priority;
+    return std.mem.order(
+        u8,
+        repositories[a].repository_id.slice(),
+        repositories[b].repository_id.slice(),
+    ) == .lt;
+}
+
+fn validatePlanPolicy(input: PlanInput) ?[]const u8 {
+    switch (input.policy.phased_updates) {
+        .deterministic_percentage => |value| if (value > 100)
+            return "deterministic phased-update value must be between 0 and 100",
+        else => {},
+    }
+    for (input.phased_candidates) |candidate| {
+        if (candidate.percentage > 100)
+            return "candidate phased-update percentage must be between 0 and 100";
+    }
+    for (input.phased_candidates, 0..) |candidate, index| {
+        for (input.phased_candidates[0..index]) |previous| {
+            if (sameIdentity(candidate.name, candidate.architecture, previous.name, previous.architecture) and
+                std.mem.eql(u8, candidate.version, previous.version))
+                return "phased-update candidate identities and versions must be unique";
+        }
+    }
+    if (input.limits.max_problems == 0)
+        return "problem limit must permit at least one diagnostic";
+    for (input.install_only, 0..) |identity, index| {
+        for (input.install_only[0..index]) |previous| {
+            if (sameIdentity(identity.name, identity.architecture, previous.name, previous.architecture))
+                return "install-only identities must be unique";
+        }
+    }
+    return null;
 }
 
 fn failureOne(
@@ -954,6 +1147,9 @@ fn preflightRequest(
                 const candidate = findAvailableCandidate(context, selector) orelse {
                     return (try selectorFailure(backing, arena, context, selector)).failure;
                 };
+                if (!candidatePolicyAllowed(context, candidate, input)) {
+                    return (try failureOne(backing, arena, .phased_update_excluded, selector.name, null, "exact candidate is excluded by deterministic phased-update policy")).failure;
+                }
                 if (downgradesInstalled(context, candidate) and !input.policy.allow_downgrade) {
                     return (try failureOne(backing, arena, .unsupported_feature, selector.name, null, "requested version is a downgrade and allow_downgrade is false")).failure;
                 }
@@ -970,6 +1166,9 @@ fn preflightRequest(
             }
         },
         .remove => |selector| {
+            if (installedSelectorAmbiguous(context, selector)) {
+                return (try failureOne(backing, arena, .invalid_policy, selector.name, null, "installed package selector is ambiguous; specify an architecture")).failure;
+            }
             const installed_index = findInstalledSelector(context, selector) orelse {
                 return (try failureOne(backing, arena, .no_candidate, selector.name, null, "requested package is not installed with the selected version and architecture")).failure;
             };
@@ -977,22 +1176,32 @@ fn preflightRequest(
             if (violation) |kind| {
                 return (try failureOne(backing, arena, kind, selector.name, null, "safe policy forbids removing the selected installed package")).failure;
             }
-            if (!input.policy.allow_remove_dependencies and
-                hasRequiredInstalledDependent(context, installed_index))
-            {
-                return (try failureOne(backing, arena, .unsatisfied_dependency, selector.name, selector.name, "an installed package requires the selected package")).failure;
-            }
             libsolv.queue_push2(
                 jobs,
                 libsolv.SOLVER_ERASE | libsolv.SOLVER_SOLVABLE,
                 internal(context).mappings[installed_index].solvable_id,
             );
+            if (hasRequiredInstalledDependent(context, installed_index)) {
+                if (!input.policy.allow_remove_dependencies) {
+                    return (try failureOne(backing, arena, .unsatisfied_dependency, selector.name, selector.name, "an installed package requires the selected package")).failure;
+                }
+                if (try addAuthorizedReverseRemovalJobs(arena.allocator(), context, input, installed_index, jobs)) |dependent| {
+                    return (try failureOne(backing, arena, .reverse_dependency, dependent, selector.name, "reverse dependency is absent from the complete authorized removal set")).failure;
+                }
+            }
         },
         .upgrade => |selectors| {
             if (selectors.len == 0) {
                 return (try failureOne(backing, arena, .unsupported_feature, null, null, "named upgrade requires at least one package")).failure;
             }
+
             for (selectors) |selector| {
+                if (installedSelectorAmbiguous(context, .{
+                    .name = selector.name,
+                    .architecture = selector.architecture,
+                })) {
+                    return (try failureOne(backing, arena, .invalid_policy, selector.name, null, "installed package selector is ambiguous; specify an architecture")).failure;
+                }
                 const installed_index = findInstalledSelector(context, .{
                     .name = selector.name,
                     .architecture = selector.architecture,
@@ -1006,12 +1215,15 @@ fn preflightRequest(
                     const candidate = findAvailableCandidate(context, selector) orelse {
                         return (try selectorFailure(backing, arena, context, selector)).failure;
                     };
+                    if (!candidatePolicyAllowed(context, candidate, input)) {
+                        return (try failureOne(backing, arena, .phased_update_excluded, selector.name, null, "exact candidate is excluded by deterministic phased-update policy")).failure;
+                    }
                     if (downgradesInstalled(context, candidate) and !input.policy.allow_downgrade) {
                         return (try failureOne(backing, arena, .unsupported_feature, selector.name, null, "requested upgrade target is a downgrade and allow_downgrade is false")).failure;
                     }
                     libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate);
                 } else {
-                    if (findBestUpgradeCandidate(context, installed_index)) |candidate|
+                    if (findBestUpgradeCandidate(context, installed_index, input)) |candidate|
                         libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate);
                 }
             }
@@ -1019,12 +1231,135 @@ fn preflightRequest(
         .upgrade_all => {
             for (internal(context).mappings, 0..) |_, installed_index| {
                 if (isHeld(context, installed_index) and !input.policy.allow_change_held) continue;
-                if (findBestUpgradeCandidate(context, installed_index)) |candidate|
+                if (findBestUpgradeCandidate(context, installed_index, input)) |candidate|
                     libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate);
             }
         },
+        .reinstall => |selector| {
+            if (installedSelectorAmbiguous(context, selector)) {
+                return (try failureOne(backing, arena, .invalid_policy, selector.name, null, "installed package selector is ambiguous; specify an architecture")).failure;
+            }
+            const installed_index = findInstalledSelector(context, selector) orelse {
+                return (try failureOne(backing, arena, .no_candidate, selector.name, null, "reinstall requires an exactly matching installed package")).failure;
+            };
+            if (isHeld(context, installed_index) and !input.policy.allow_change_held) {
+                return (try failureOne(backing, arena, .held_violation, selector.name, null, "safe policy forbids reinstalling a held package")).failure;
+            }
+            const record = internal(context).source_records[internal(context).mappings[installed_index].record_index];
+            const candidate = findAvailableCandidate(context, .{
+                .name = record.name.value,
+                .version = record.version.spelling.value,
+                .architecture = record.architecture.value,
+            }) orelse {
+                return (try failureOne(backing, arena, .no_candidate, selector.name, null, "no authenticated repository contains the installed version and architecture")).failure;
+            };
+            if (!candidatePolicyAllowed(context, candidate, input)) {
+                return (try failureOne(backing, arena, .phased_update_excluded, selector.name, null, "reinstall candidate is excluded by deterministic phased-update policy")).failure;
+            }
+            libsolv.queue_push2(
+                jobs,
+                libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE | libsolv.SOLVER_FORCEBEST,
+                candidate,
+            );
+        },
     }
     return null;
+}
+
+fn addAuthorizedReverseRemovalJobs(
+    allocator: std.mem.Allocator,
+    context: *Context,
+    input: PlanInput,
+    removed_index: usize,
+    jobs: *libsolv.Queue,
+) !?[]const u8 {
+    const state = internal(context);
+    const removed = try allocator.alloc(bool, state.mappings.len);
+    @memset(removed, false);
+    removed[removed_index] = true;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (state.mappings, 0..) |mapping, dependent_index| {
+            if (removed[dependent_index]) continue;
+            const dependent = state.source_records[mapping.record_index];
+            var must_remove = false;
+            for (dependent.relations) |dependency| {
+                if (dependency.kind != .depends and dependency.kind != .pre_depends) continue;
+                for (dependency.relation.groups) |group| {
+                    var references_removed = false;
+                    var surviving_alternative = false;
+                    for (group.alternatives) |alternative| {
+                        if (findInstalledSelector(context, .{ .name = alternative.package.name.text })) |alternative_index| {
+                            if (removed[alternative_index])
+                                references_removed = true
+                            else
+                                surviving_alternative = true;
+                        }
+                    }
+                    if (references_removed and !surviving_alternative) must_remove = true;
+                }
+            }
+            if (!must_remove) continue;
+            if (!identityAuthorized(input.authorized_removals, dependent.name.value, dependent.architecture.value))
+                return dependent.name.value;
+            removed[dependent_index] = true;
+            changed = true;
+            libsolv.queue_push2(jobs, libsolv.SOLVER_ERASE | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
+        }
+    }
+    return null;
+}
+
+fn identityAuthorized(
+    identities: []const ProtectedIdentity,
+    name: []const u8,
+    architecture: []const u8,
+) bool {
+    for (identities) |identity| {
+        if (sameIdentity(identity.name, identity.architecture, name, architecture)) return true;
+    }
+    return false;
+}
+
+fn addInstallOnlyJobs(context: *Context, input: PlanInput, jobs: *libsolv.Queue) void {
+    const state = internal(context);
+    for (input.install_only) |identity| {
+        for (state.mappings) |mapping| {
+            const record = state.source_records[mapping.record_index];
+            if (sameIdentity(identity.name, identity.architecture, record.name.value, record.architecture.value))
+                libsolv.queue_push2(jobs, libsolv.SOLVER_MULTIVERSION | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
+        }
+        for (state.origins.items) |origin| {
+            if (sameIdentity(identity.name, identity.architecture, origin.package, origin.architecture))
+                libsolv.queue_push2(jobs, libsolv.SOLVER_MULTIVERSION | libsolv.SOLVER_SOLVABLE, origin.solvable_id);
+        }
+    }
+}
+
+fn phasedCandidate(input: PlanInput, origin: OriginOwned) ?PhasedCandidate {
+    for (input.phased_candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.name, origin.package) and
+            std.mem.eql(u8, candidate.architecture, origin.architecture) and
+            std.mem.eql(u8, candidate.version, origin.version)) return candidate;
+    }
+    return null;
+}
+
+fn phasedAllowed(input: PlanInput, candidate: PhasedCandidate) bool {
+    return switch (input.policy.phased_updates) {
+        .disabled => false,
+        .include_all => true,
+        .deterministic_percentage => |phase| phase < candidate.percentage,
+    };
+}
+
+fn addPhasedLocks(context: *Context, input: PlanInput, jobs: *libsolv.Queue) void {
+    for (internal(context).origins.items) |origin| {
+        const candidate = phasedCandidate(input, origin) orelse continue;
+        if (!phasedAllowed(input, candidate))
+            libsolv.queue_push2(jobs, libsolv.SOLVER_LOCK | libsolv.SOLVER_SOLVABLE, origin.solvable_id);
+    }
 }
 
 fn selectorFailure(
@@ -1033,13 +1368,49 @@ fn selectorFailure(
     context: *Context,
     selector: PackageSelector,
 ) PlanningError!PlanningResult {
+    const owned = arena.allocator();
+    var rejections: std.ArrayList(CandidateRejection) = .empty;
+    defer rejections.deinit(owned);
+    for (internal(context).origins.items) |origin| {
+        if (!std.mem.eql(u8, origin.package, selector.name)) continue;
+        const reason: CandidateRejectionReason = if (selector.architecture) |architecture|
+            if (!std.mem.eql(u8, origin.architecture, architecture) and
+                !std.mem.eql(u8, origin.architecture, "all")) .wrong_architecture else .wrong_version
+        else
+            .wrong_version;
+        try rejections.append(owned, .{
+            .package = try owned.dupe(u8, origin.package),
+            .version = try owned.dupe(u8, origin.version),
+            .architecture = try owned.dupe(u8, origin.architecture),
+            .reason = reason,
+            .detail = if (reason == .wrong_architecture)
+                "candidate architecture does not match the exact request"
+            else
+                "candidate version does not match the exact request",
+        });
+    }
     if (!hasAvailableName(context, selector.name))
         return failureOne(backing, arena, .no_candidate, selector.name, null, "package has no available candidate");
-    if (selector.architecture) |architecture| {
-        if (!hasAvailableNameArchitecture(context, selector.name, architecture))
-            return failureOne(backing, arena, .architecture_mismatch, selector.name, null, "package exists but not for the requested architecture");
-    }
-    return failureOne(backing, arena, .version_mismatch, selector.name, null, "package exists but not at the requested exact version");
+    const problems = try owned.alloc(ProblemNode, 1);
+    problems[0] = .{
+        .kind = if (selector.architecture != null and
+            !hasAvailableNameArchitecture(context, selector.name, selector.architecture.?))
+            .architecture_mismatch
+        else
+            .version_mismatch,
+        .package = try owned.dupe(u8, selector.name),
+        .detail = if (selector.architecture != null and
+            !hasAvailableNameArchitecture(context, selector.name, selector.architecture.?))
+            "package exists but not for the requested architecture"
+        else
+            "package exists but not at the requested exact version",
+        .candidate_rejections = try rejections.toOwnedSlice(owned),
+    };
+    return .{ .failure = .{
+        .problems = problems,
+        .backing_allocator = backing,
+        .arena = arena,
+    } };
 }
 
 fn findAvailableCandidate(context: *Context, selector: PackageSelector) ?libsolv.Id {
@@ -1051,6 +1422,10 @@ fn findAvailableCandidate(context: *Context, selector: PackageSelector) ?libsolv
         if (selector.architecture) |architecture| {
             if (!std.mem.eql(u8, origin.architecture, architecture) and
                 !std.mem.eql(u8, origin.architecture, "all")) continue;
+        } else if (!std.mem.eql(u8, origin.architecture, state.target_architecture) and
+            !std.mem.eql(u8, origin.architecture, "all"))
+        {
+            continue;
         }
         if (best == null or betterCandidate(state, origin.solvable_id, best.?))
             best = origin.solvable_id;
@@ -1075,12 +1450,13 @@ fn betterCandidate(state: *Internal, a: libsolv.Id, b: libsolv.Id) bool {
     return std.mem.order(u8, a_origin.repository_id.slice(), b_origin.repository_id.slice()) == .lt;
 }
 
-fn findBestUpgradeCandidate(context: *Context, installed_index: usize) ?libsolv.Id {
+fn findBestUpgradeCandidate(context: *Context, installed_index: usize, input: PlanInput) ?libsolv.Id {
     const state = internal(context);
     const mapping = state.mappings[installed_index];
     const installed = libsolv.pool_id2solvable(state.pool, mapping.solvable_id);
     var best: ?libsolv.Id = null;
     for (state.origins.items) |origin| {
+        if (!candidatePolicyAllowed(context, origin.solvable_id, input)) continue;
         const candidate = libsolv.pool_id2solvable(state.pool, origin.solvable_id);
         if (candidate.*.name != installed.*.name) continue;
         if (candidate.*.arch != installed.*.arch and
@@ -1090,7 +1466,14 @@ fn findBestUpgradeCandidate(context: *Context, installed_index: usize) ?libsolv.
         if (best == null or betterCandidate(state, origin.solvable_id, best.?))
             best = origin.solvable_id;
     }
+
     return best;
+}
+
+fn candidatePolicyAllowed(context: *Context, solvable_id: libsolv.Id, input: PlanInput) bool {
+    const origin = findOrigin(internal(context), solvable_id) orelse return true;
+    const phased = phasedCandidate(input, origin.*) orelse return true;
+    return phasedAllowed(input, phased);
 }
 
 fn hasAvailableName(context: *Context, name: []const u8) bool {
@@ -1118,6 +1501,21 @@ fn findInstalledSelector(context: *Context, selector: PackageSelector) ?usize {
         return index;
     }
     return null;
+}
+
+fn installedSelectorAmbiguous(context: *Context, selector: PackageSelector) bool {
+    if (selector.architecture != null) return false;
+    const state = internal(context);
+    var matches: usize = 0;
+    for (state.mappings) |mapping| {
+        const record = state.source_records[mapping.record_index];
+        if (!std.mem.eql(u8, record.name.value, selector.name)) continue;
+        if (selector.version) |version|
+            if (!std.mem.eql(u8, record.version.spelling.value, version)) continue;
+        matches += 1;
+        if (matches > 1) return true;
+    }
+    return false;
 }
 
 fn findInstalledBySolvable(context: *Context, solvable_id: libsolv.Id) ?usize {
@@ -1253,11 +1651,23 @@ fn materializeProblems(
     if (problems.items.len == 0) {
         try problems.append(owned, .{ .kind = .conflict, .detail = "solver reported an unclassified contradiction" });
     }
+    std.mem.sort(ProblemNode, problems.items, {}, lessProblem);
+    for (problems.items, 0..) |*item, index| item.id = index;
     return .{
         .problems = try problems.toOwnedSlice(owned),
         .backing_allocator = backing,
         .arena = arena,
     };
+}
+
+fn lessProblem(_: void, a: ProblemNode, b: ProblemNode) bool {
+    if (@intFromEnum(a.kind) != @intFromEnum(b.kind))
+        return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+    const package_order = std.mem.order(u8, a.package orelse "", b.package orelse "");
+    if (package_order != .eq) return package_order == .lt;
+    const dependency_order = std.mem.order(u8, a.dependency orelse "", b.dependency orelse "");
+    if (dependency_order != .eq) return dependency_order == .lt;
+    return std.mem.order(u8, a.detail, b.detail) == .lt;
 }
 
 fn materializeAction(
@@ -1276,6 +1686,8 @@ fn materializeAction(
     const origin = findOrigin(state, solvable_id);
     const installed_index = if (origin == null)
         findInstalledBySolvable(context, solvable_id)
+    else if (isInstallOnly(input, origin.?.package, origin.?.architecture))
+        null
     else
         findInstalledSameNameArch(context, solvable_id);
     const prior = if (installed_index) |index| try ownedPrior(allocator, context, index) else null;
@@ -1352,7 +1764,8 @@ fn materializeAction(
         .installed_size_delta_bytes = new_bytes - prior_bytes,
         .source_package = try allocator.dupe(u8, source_name),
         .prior_installed = prior,
-        .reason = actionReason(context, solvable_id, kind, input),
+        .requested = requestedIdentity(input.request, package_name, version, architecture),
+        .reason = actionReason(context, solvable_id, kind, input, package_name, version, architecture),
         .selected_origin = if (origin) |available| .{
             .repository_id = available.repository_id,
             .repository_priority = available.repository_priority,
@@ -1363,6 +1776,13 @@ fn materializeAction(
             .source_location = try allocator.dupe(u8, available.source_location),
         } else null,
     };
+}
+
+fn isInstallOnly(input: PlanInput, name: []const u8, architecture: []const u8) bool {
+    for (input.install_only) |identity| {
+        if (sameIdentity(identity.name, identity.architecture, name, architecture)) return true;
+    }
+    return false;
 }
 
 fn ownedPrior(allocator: std.mem.Allocator, context: *Context, index: usize) !PriorInstalled {
@@ -1376,11 +1796,18 @@ fn ownedPrior(allocator: std.mem.Allocator, context: *Context, index: usize) !Pr
     };
 }
 
-fn actionReason(context: *Context, solvable_id: libsolv.Id, kind: ActionKind, input: PlanInput) ActionReason {
+fn actionReason(
+    context: *Context,
+    solvable_id: libsolv.Id,
+    kind: ActionKind,
+    input: PlanInput,
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) ActionReason {
     const state = internal(context);
-    const solvable = libsolv.pool_id2solvable(state.pool, solvable_id);
-    const name = std.mem.span(libsolv.pool_id2str(state.pool, solvable.*.name));
-    if (requestedName(input.request, name)) return if (kind == .upgrade or kind == .downgrade) .upgrade else .explicit_request;
+    if (requestedIdentity(input.request, name, version, architecture))
+        return if (kind == .upgrade or kind == .downgrade) .upgrade else .explicit_request;
     if (kind == .upgrade or kind == .downgrade) return .upgrade;
     var info: libsolv.Id = 0;
     const reason = libsolv.solver_describe_decision(state.solver, solvable_id, &info);
@@ -1389,15 +1816,90 @@ fn actionReason(context: *Context, solvable_id: libsolv.Id, kind: ActionKind, in
     return .dependency;
 }
 
-fn requestedName(request: PlanRequest, name: []const u8) bool {
+fn selectorMatches(
+    selector: PackageSelector,
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) bool {
+    if (!std.mem.eql(u8, selector.name, name)) return false;
+    if (selector.version) |selected_version|
+        if (!std.mem.eql(u8, selected_version, version)) return false;
+    if (selector.architecture) |selected_architecture|
+        if (!std.mem.eql(u8, selected_architecture, architecture) and
+            !std.mem.eql(u8, architecture, "all")) return false;
+    return true;
+}
+
+fn requestedIdentity(
+    request: PlanRequest,
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) bool {
     return switch (request) {
-        .install, .remove => |selector| std.mem.eql(u8, selector.name, name),
+        .install, .remove, .reinstall => |selector| selectorMatches(selector, name, version, architecture),
         .upgrade => |selectors| blk: {
-            for (selectors) |selector| if (std.mem.eql(u8, selector.name, name)) break :blk true;
+            for (selectors) |selector|
+                if (selectorMatches(selector, name, version, architecture)) break :blk true;
             break :blk false;
         },
         .upgrade_all => false,
     };
+}
+
+fn summarizeActions(
+    actions: []const PlanAction,
+    download_bytes: u64,
+    installed_size_delta_bytes: i128,
+) PlanSummary {
+    var summary: PlanSummary = .{
+        .download_bytes = download_bytes,
+        .installed_size_delta_bytes = installed_size_delta_bytes,
+    };
+    for (actions) |action| switch (action.kind) {
+        .install => summary.installs += 1,
+        .remove => summary.removals += 1,
+        .upgrade => summary.upgrades += 1,
+        .downgrade => summary.downgrades += 1,
+        .reinstall => summary.reinstalls += 1,
+    };
+    return summary;
+}
+
+fn materializeOrdering(
+    allocator: std.mem.Allocator,
+    actions: []const PlanAction,
+) ![]OrderedAction {
+    var ordered: std.ArrayList(OrderedAction) = .empty;
+    defer ordered.deinit(allocator);
+    for (actions) |action| {
+        if (action.kind == .remove) {
+            try ordered.append(allocator, .{
+                .sequence = ordered.items.len,
+                .kind = .remove,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            });
+        } else {
+            try ordered.append(allocator, .{
+                .sequence = ordered.items.len,
+                .kind = .unpack,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            });
+            try ordered.append(allocator, .{
+                .sequence = ordered.items.len,
+                .kind = .configure,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            });
+        }
+    }
+    return ordered.toOwnedSlice(allocator);
 }
 
 fn requestedRemoval(request: PlanRequest, context: *Context, solvable_id: libsolv.Id) bool {
@@ -1474,6 +1976,8 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
 fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
     try writer.print("{{\"schema_version\":{},\"target_architecture\":", .{plan.schema_version});
     try writeJsonString(writer, plan.target_architecture);
+    try writer.writeAll(",\"mode\":");
+    try writeJsonString(writer, @tagName(plan.mode));
     try writer.writeAll(",\"actions\":[");
     for (plan.actions, 0..) |action, index| {
         if (index != 0) try writer.writeByte(',');
@@ -1509,11 +2013,32 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
             if (prior.installed_size_kib) |size| try writer.print("{}", .{size}) else try writer.writeAll("null");
             try writer.writeByte('}');
         } else try writer.writeAll("null");
+        try writer.print(",\"requested\":{}", .{action.requested});
         try writer.writeAll(",\"reason\":");
         try writeJsonString(writer, @tagName(action.reason));
         try writer.writeByte('}');
     }
-    try writer.print("],\"download_bytes\":{},\"installed_size_delta_bytes\":{}}}", .{
+    try writer.writeAll("],\"ordered_actions\":[");
+    for (plan.ordered_actions, 0..) |action, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{{\"sequence\":{},\"kind\":", .{action.sequence});
+        try writeJsonString(writer, @tagName(action.kind));
+        try writer.writeAll(",\"package\":");
+        try writeJsonString(writer, action.package);
+        try writer.writeAll(",\"version\":");
+        try writeJsonString(writer, action.version);
+        try writer.writeAll(",\"architecture\":");
+        try writeJsonString(writer, action.architecture);
+        try writer.writeByte('}');
+    }
+    try writer.print("],\"summary\":{{\"installs\":{},\"removals\":{},\"upgrades\":{},\"downgrades\":{},\"reinstalls\":{},\"download_bytes\":{},\"installed_size_delta_bytes\":{}}},\"download_bytes\":{},\"installed_size_delta_bytes\":{}}}", .{
+        plan.summary.installs,
+        plan.summary.removals,
+        plan.summary.upgrades,
+        plan.summary.downgrades,
+        plan.summary.reinstalls,
+        plan.summary.download_bytes,
+        plan.summary.installed_size_delta_bytes,
         plan.download_bytes,
         plan.installed_size_delta_bytes,
     });
@@ -1523,7 +2048,7 @@ fn writeFailureJson(failure: PlanFailure, writer: *std.Io.Writer) !void {
     try writer.print("{{\"schema_version\":{},\"problems\":[", .{failure.schema_version});
     for (failure.problems, 0..) |problem, index| {
         if (index != 0) try writer.writeByte(',');
-        try writer.writeAll("{\"kind\":");
+        try writer.print("{{\"id\":{},\"kind\":", .{problem.id});
         try writeJsonString(writer, @tagName(problem.kind));
         try writer.writeAll(",\"package\":");
         if (problem.package) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
@@ -1531,6 +2056,27 @@ fn writeFailureJson(failure: PlanFailure, writer: *std.Io.Writer) !void {
         if (problem.dependency) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
         try writer.writeAll(",\"detail\":");
         try writeJsonString(writer, problem.detail);
+        try writer.writeAll(",\"candidate_rejections\":[");
+        for (problem.candidate_rejections, 0..) |rejection, rejection_index| {
+            if (rejection_index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"package\":");
+            try writeJsonString(writer, rejection.package);
+            try writer.writeAll(",\"version\":");
+            if (rejection.version) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+            try writer.writeAll(",\"architecture\":");
+            if (rejection.architecture) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+            try writer.writeAll(",\"reason\":");
+            try writeJsonString(writer, @tagName(rejection.reason));
+            try writer.writeAll(",\"detail\":");
+            try writeJsonString(writer, rejection.detail);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"related_problem_ids\":[");
+        for (problem.related_problem_ids, 0..) |related, related_index| {
+            if (related_index != 0) try writer.writeByte(',');
+            try writer.print("{}", .{related});
+        }
+        try writer.writeByte(']');
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -1729,10 +2275,6 @@ fn validateAvailableRecords(
                 for (relation_value.value.groups) |group| {
                     alternatives = std.math.add(usize, alternatives, group.alternatives.len) catch
                         return error.TooManyDependencyAlternatives;
-                    for (group.alternatives) |alternative| {
-                        if (alternative.package.architecture_qualifier != null)
-                            return error.UnsupportedArchitectureQualifier;
-                    }
                 }
             }
         }
@@ -1756,13 +2298,14 @@ fn validateAvailableRecords(
 
 fn addAvailableRelation(
     pool: *libsolv.Pool,
-    solvable: *libsolv.Solvable,
+    solvable: *allowzero libsolv.Solvable,
     value: ?@import("control_record.zig").RelationValue,
     target: AvailableRelationTarget,
+    target_architecture: []const u8,
 ) void {
     const relation_value = value orelse return;
     for (relation_value.value.groups) |group| {
-        const dependency = groupId(pool, group);
+        const dependency = activeGroupId(pool, group, target_architecture) orelse continue;
         const key: libsolv.Id = switch (target) {
             .requires_pre, .requires => libsolv.SOLVABLE_REQUIRES,
             .recommends => libsolv.SOLVABLE_RECOMMENDS,
@@ -1777,6 +2320,115 @@ fn addAvailableRelation(
         };
         libsolv.solvable_add_deparray(solvable, key, dependency, marker);
     }
+}
+
+fn activeGroupId(
+    pool: *libsolv.Pool,
+    group: relation.DependencyGroup,
+    target_architecture: []const u8,
+) ?libsolv.Id {
+    var result: ?libsolv.Id = null;
+    for (group.alternatives) |alternative| {
+        if (!alternativeActive(alternative, target_architecture)) continue;
+        const id = alternativeIdForArchitecture(pool, alternative, target_architecture);
+        result = if (result) |current|
+            libsolv.pool_rel2id(pool, current, id, libsolv.REL_OR, 1)
+        else
+            id;
+    }
+    return result;
+}
+
+fn alternativeActive(alternative: relation.Alternative, architecture: []const u8) bool {
+    if (alternative.restrictions.architectures) |list| {
+        var has_positive = false;
+        var positive_match = false;
+        for (list.restrictions) |restriction| {
+            const matches = architectureRestrictionMatches(restriction.name.text, architecture);
+            if (restriction.negated) {
+                if (matches) return false;
+            } else {
+                has_positive = true;
+                positive_match = positive_match or matches;
+            }
+        }
+        if (has_positive and !positive_match) return false;
+    }
+    for (alternative.restrictions.build_profiles) |list| {
+        var group_matches = false;
+        for (list.restrictions) |restriction| {
+            // Binary transactions have an explicit empty active-profile set.
+            group_matches = group_matches or restriction.negated;
+        }
+        if (!group_matches) return false;
+    }
+    return true;
+}
+
+fn architectureRestrictionMatches(restriction: []const u8, architecture: []const u8) bool {
+    if (std.mem.eql(u8, restriction, "any")) return true;
+    if (std.mem.eql(u8, restriction, architecture)) return true;
+    if (std.mem.endsWith(u8, restriction, "-any")) {
+        const prefix = restriction[0 .. restriction.len - 4];
+        if (std.mem.eql(u8, prefix, "linux"))
+            return std.mem.indexOfScalar(u8, architecture, '-') == null or
+                std.mem.startsWith(u8, architecture, "linux-");
+        return std.mem.startsWith(u8, architecture, prefix) and
+            architecture.len > prefix.len and architecture[prefix.len] == '-';
+    }
+    if (std.mem.startsWith(u8, restriction, "any-")) {
+        const suffix = restriction[4..];
+        return std.mem.endsWith(u8, architecture, suffix);
+    }
+    return false;
+}
+
+fn alternativeIdForArchitecture(
+    pool: *libsolv.Pool,
+    alternative: relation.Alternative,
+    target_architecture: []const u8,
+) libsolv.Id {
+    if (alternative.package.architecture_qualifier) |qualifier| {
+        if (std.mem.eql(u8, qualifier.text, "native")) {
+            var adjusted = alternative;
+            adjusted.package.architecture_qualifier = .{
+                .text = target_architecture,
+                .span = qualifier.span,
+            };
+            return alternativeId(pool, adjusted);
+        }
+    }
+    return alternativeId(pool, alternative);
+}
+
+fn setMultiArch(repo: *libsolv.Repo, solvable_id: libsolv.Id, value: anytype) void {
+    const multi_arch = value orelse return;
+    const text: [*:0]const u8 = switch (multi_arch) {
+        .no => "no",
+        .same => "same",
+        .foreign => "foreign",
+        .allowed => "allowed",
+    };
+    libsolv.repo_set_str(repo, solvable_id, libsolv.SOLVABLE_MULTIARCH, text);
+}
+
+fn addQualifiedSelfProvide(
+    pool: *libsolv.Pool,
+    repo: *libsolv.Repo,
+    solvable: *allowzero libsolv.Solvable,
+    name: []const u8,
+    architecture: []const u8,
+) void {
+    var buffer: [384]u8 = undefined;
+    const qualified = std.fmt.bufPrint(&buffer, "{s}:{s}", .{ name, architecture }) catch return;
+    const provide = libsolv.pool_rel2id(
+        pool,
+        stringId(pool, qualified),
+        solvable.*.evr,
+        libsolv.REL_EQ,
+        1,
+    );
+    solvable.*.provides = libsolv.repo_addid_dep(repo, solvable.*.provides, provide, 0);
 }
 
 fn parsedDatabase(input_bytes: []const u8) !dpkg_status.Database {
@@ -1998,10 +2650,18 @@ fn availableIndex(
     id: source.RepositoryId,
     text: []const u8,
 ) !packages_index.Index {
+    return availableIndexForArchitecture(id, "amd64", text);
+}
+
+fn availableIndexForArchitecture(
+    id: source.RepositoryId,
+    architecture: []const u8,
+    text: []const u8,
+) !packages_index.Index {
     const result = try packages_index.parseBorrowed(std.testing.allocator, text, .{
         .repository_id = id,
         .component = "main",
-        .architecture = "amd64",
+        .architecture = architecture,
         .source_location = "test/Packages",
     }, .{});
     return switch (result) {
@@ -2097,7 +2757,11 @@ test "available solve enforces pre-depends conflicts breaks and replaces" {
 
     try std.testing.expectError(error.Unsolvable, solveAvailable(context, "root"));
     const state = internal(context);
-    const replacement = libsolv.pool_id2solvable(state.pool, state.origins.items[2].solvable_id);
+    var replacement_id: libsolv.Id = 0;
+    for (state.origins.items) |origin| {
+        if (std.mem.eql(u8, origin.package, "new")) replacement_id = origin.solvable_id;
+    }
+    const replacement = libsolv.pool_id2solvable(state.pool, replacement_id);
     try std.testing.expect(replacement.*.obsoletes != 0);
 }
 
@@ -2119,7 +2783,11 @@ test "architecture all and recommends retain distinct solver semantics" {
     const selected = try solveAvailable(context, "root");
     defer std.testing.allocator.free(selected);
     try std.testing.expect(hasSelected(selected, "data"));
-    const root = libsolv.pool_id2solvable(internal(context).pool, internal(context).origins.items[0].solvable_id);
+    var root_id: libsolv.Id = 0;
+    for (internal(context).origins.items) |origin| {
+        if (std.mem.eql(u8, origin.package, "root")) root_id = origin.solvable_id;
+    }
+    const root = libsolv.pool_id2solvable(internal(context).pool, root_id);
     try std.testing.expect(root.*.requires != 0);
     try std.testing.expect(root.*.recommends != 0);
 }
@@ -2152,19 +2820,44 @@ test "repository priority gives stable provider ordering" {
     try std.testing.expect(!hasSelected(selected, "low"));
 }
 
-test "unsupported available relation qualifiers return typed errors" {
+test "available relations support any architecture qualifier and Multi-Arch metadata" {
     const text =
         "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: helper:any\nFilename: pool/root.deb\nSize: 1\n" ++
-        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: helper\nVersion: 1\nArchitecture: amd64\nMulti-Arch: allowed\nFilename: pool/helper.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
     const id = testRepositoryId('h');
     var index = try availableIndex(id, text);
     defer index.deinit();
     const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
     defer context.destroy();
-    try std.testing.expectError(
-        error.UnsupportedArchitectureQualifier,
-        context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{}),
-    );
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    const selected = try solveAvailable(context, "root");
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(hasSelected(selected, "helper"));
+}
+
+test "all Multi-Arch modes are preserved at the opaque libsolv boundary" {
+    const text =
+        "Package: mode-no\nVersion: 1\nArchitecture: amd64\nMulti-Arch: no\nFilename: pool/no.deb\nSize: 1\nSHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: mode-same\nVersion: 1\nArchitecture: amd64\nMulti-Arch: same\nFilename: pool/same.deb\nSize: 1\nSHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: mode-foreign\nVersion: 1\nArchitecture: amd64\nMulti-Arch: foreign\nFilename: pool/foreign.deb\nSize: 1\nSHA256: 2222222222222222222222222222222222222222222222222222222222222222\n\n" ++
+        "Package: mode-allowed\nVersion: 1\nArchitecture: amd64\nMulti-Arch: allowed\nFilename: pool/allowed.deb\nSize: 1\nSHA256: 3333333333333333333333333333333333333333333333333333333333333333\n";
+    const id = testRepositoryId('t');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    const state = internal(context);
+    for (state.origins.items) |origin| {
+        const value = std.mem.span(libsolv.solvable_lookup_str(
+            libsolv.pool_id2solvable(state.pool, origin.solvable_id),
+            libsolv.SOLVABLE_MULTIARCH,
+        ));
+        const expected = origin.package["mode-".len..];
+        try std.testing.expectEqualStrings(expected, value);
+    }
 }
 
 test "planner materializes owned install closure and stable canonical JSON" {
@@ -2191,15 +2884,28 @@ test "planner materializes owned install closure and stable canonical JSON" {
     var plan = result.plan;
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 2), plan.actions.len);
+    try std.testing.expectEqualStrings("app", plan.actions[0].package);
+    try std.testing.expectEqualStrings("lib", plan.actions[1].package);
     try std.testing.expectEqual(@as(u64, 27), plan.download_bytes);
-    try std.testing.expectEqualStrings("app-src", plan.actions[0].source_package);
+    try std.testing.expectEqualStrings("lib", plan.ordered_actions[0].package);
+    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[0].kind);
+    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[1].kind);
+    try std.testing.expectEqualStrings("app", plan.ordered_actions[2].package);
+    var saw_source = false;
+    for (plan.actions) |action| {
+        if (std.mem.eql(u8, action.package, "app")) {
+            try std.testing.expectEqualStrings("app-src", action.source_package);
+            saw_source = true;
+        }
+    }
+    try std.testing.expect(saw_source);
 
     const first = try plan.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(first);
     const second = try plan.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(std.mem.indexOf(u8, first, "\"schema_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"schema_version\":2") != null);
 }
 
 test "planner rejects untrusted duplicate and unhealthy inputs before solve" {
@@ -2516,4 +3222,334 @@ test "planner reports exact architecture version and conflict failures" {
     defer failure.deinit();
     try std.testing.expect(failure.problems[0].kind == .conflict or
         failure.problems[0].kind == .unsatisfied_dependency);
+}
+
+test "architecture restrictions and inactive build profiles are evaluated explicitly" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: missing [arm64], ignored <stage1>, helper:native [linux-any] <!stage1>, data:amd64\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
+        "Package: helper\nVersion: 1\nArchitecture: amd64\nFilename: pool/helper.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: data\nVersion: 1\nArchitecture: all\nFilename: pool/data.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('o');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    const selected = try solveAvailable(context, "root");
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(hasSelected(selected, "helper"));
+    try std.testing.expect(hasSelected(selected, "data"));
+}
+
+test "planner reinstall is exact and summaries include ordered execution" {
+    var database = try parsedDatabase(
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nInstalled-Size: 4\n",
+    );
+    defer database.deinit();
+    const policies = [_]InstalledPolicy{
+        .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+    };
+    const text =
+        "Package: app\nVersion: 1\nArchitecture: amd64\nInstalled-Size: 4\nFilename: pool/app.deb\nSize: 9\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
+    const id = testRepositoryId('p');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .mode = .download_only,
+        .request = .{ .reinstall = .{ .name = "app", .version = "1", .architecture = "amd64" } },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(OperationMode.download_only, plan.mode);
+    try std.testing.expectEqual(@as(usize, 1), plan.summary.reinstalls);
+    try std.testing.expectEqual(@as(u64, 9), plan.summary.download_bytes);
+    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[0].kind);
+    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[1].kind);
+}
+
+test "phased updates require deterministic explicit opt in" {
+    const text =
+        "Package: app\nVersion: 2\nArchitecture: amd64\nFilename: pool/app.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
+    const id = testRepositoryId('q');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const phased = [_]PhasedCandidate{.{
+        .name = "app",
+        .architecture = "amd64",
+        .version = "2",
+        .percentage = 50,
+    }};
+    var result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .phased_candidates = &phased,
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app" } },
+    });
+    var failure = result.failure;
+    failure.deinit();
+
+    result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .phased_candidates = &phased,
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app" } },
+        .policy = .{ .phased_updates = .include_all },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+}
+
+test "candidate enumeration permutations produce byte-identical plans" {
+    const first_text =
+        "Package: app\nVersion: 1\nArchitecture: amd64\nDepends: zlib | alib\nFilename: pool/app.deb\nSize: 1\nSHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: alib\nVersion: 1\nArchitecture: amd64\nFilename: pool/a.deb\nSize: 1\nSHA256: 2222222222222222222222222222222222222222222222222222222222222222\n\n" ++
+        "Package: zlib\nVersion: 1\nArchitecture: amd64\nFilename: pool/z.deb\nSize: 1\nSHA256: 3333333333333333333333333333333333333333333333333333333333333333\n";
+    const second_text =
+        "Package: zlib\nVersion: 1\nArchitecture: amd64\nFilename: pool/z.deb\nSize: 1\nSHA256: 3333333333333333333333333333333333333333333333333333333333333333\n\n" ++
+        "Package: app\nVersion: 1\nArchitecture: amd64\nDepends: zlib | alib\nFilename: pool/app.deb\nSize: 1\nSHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: alib\nVersion: 1\nArchitecture: amd64\nFilename: pool/a.deb\nSize: 1\nSHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('r');
+    var first_index = try availableIndex(id, first_text);
+    defer first_index.deinit();
+    var second_index = try availableIndex(id, second_text);
+    defer second_index.deinit();
+    const base_installed: ImportInput = .{
+        .records = &.{},
+        .native_architecture = "amd64",
+        .policies = &.{},
+        .hold_authority = .explicit_policy,
+    };
+    const first_repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &first_index)};
+    const second_repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &second_index)};
+    const first_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &first_repositories,
+        .installed = base_installed,
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app" } },
+    });
+    var first = first_result.plan;
+    defer first.deinit();
+    const second_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &second_repositories,
+        .installed = base_installed,
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app" } },
+    });
+    var second = second_result.plan;
+    defer second.deinit();
+    const first_json = try first.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(first_json);
+    const second_json = try second.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(second_json);
+    try std.testing.expectEqualStrings(first_json, second_json);
+}
+
+test "install-only policy retains installed version and installs exact new version" {
+    var database = try parsedDatabase(
+        "Package: kernel\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    const policies = [_]InstalledPolicy{
+        .{ .name = "kernel", .architecture = "amd64", .install_reason = .manual, .held = false },
+    };
+    const text =
+        "Package: kernel\nVersion: 2\nArchitecture: amd64\nFilename: pool/kernel.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
+    const id = testRepositoryId('s');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const install_only = [_]ProtectedIdentity{.{ .name = "kernel", .architecture = "amd64" }};
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .install_only = &install_only,
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "kernel", .version = "2", .architecture = "amd64" } },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.install, plan.actions[0].kind);
+    try std.testing.expect(plan.actions[0].prior_installed == null);
+}
+
+test "reverse dependency removal requires complete explicit authorization" {
+    var database = try parsedDatabase(
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nDepends: lib\n\n" ++
+            "Package: lib\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    const policies = [_]InstalledPolicy{
+        .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+        .{ .name = "lib", .architecture = "amd64", .install_reason = .automatic, .held = false },
+    };
+    const authorized = [_]ProtectedIdentity{.{ .name = "app", .architecture = "amd64" }};
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{},
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .authorized_removals = &authorized,
+        .target_architecture = "amd64",
+        .request = .{ .remove = .{ .name = "lib" } },
+        .policy = .{ .allow_remove_dependencies = true },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.summary.removals);
+}
+
+test "exact unqualified selection prefers native architecture and request identity is exact" {
+    const native_text =
+        "Package: app\nVersion: 1\nArchitecture: amd64\nDepends: app-data:arm64\nFilename: pool/app-amd64.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n\n" ++
+        "Package: app-data\nVersion: 1\nArchitecture: amd64\nMulti-Arch: foreign\nFilename: pool/data-amd64.deb\nSize: 1\n" ++
+        "SHA256: 4444444444444444444444444444444444444444444444444444444444444444\n";
+    const foreign_text =
+        "Package: app\nVersion: 1\nArchitecture: arm64\nFilename: pool/app-arm64.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: app-data\nVersion: 1\nArchitecture: arm64\nMulti-Arch: foreign\nFilename: pool/data-arm64.deb\nSize: 1\n" ++
+        "SHA256: 3333333333333333333333333333333333333333333333333333333333333333\n";
+    const native_id = testRepositoryId('t');
+    const foreign_id = testRepositoryId('u');
+    var native_index = try availableIndex(native_id, native_text);
+    defer native_index.deinit();
+    var foreign_index = try availableIndexForArchitecture(foreign_id, "arm64", foreign_text);
+    defer foreign_index.deinit();
+    const repositories = [_]RepositoryInput{
+        RepositoryInput.trustedTest(native_id, 500, &native_index),
+        RepositoryInput.trustedTest(foreign_id, 500, &foreign_index),
+    };
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .foreign_architectures = &.{"arm64"},
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app", .version = "1" } },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    var saw_native = false;
+    var saw_automatic_foreign = false;
+    for (plan.actions) |action| {
+        if (std.mem.eql(u8, action.package, "app")) {
+            try std.testing.expectEqualStrings("amd64", action.architecture);
+            try std.testing.expect(action.requested);
+            saw_native = true;
+        }
+        if (std.mem.eql(u8, action.package, "app-data")) {
+            try std.testing.expectEqualStrings("arm64", action.architecture);
+            try std.testing.expect(!action.requested);
+            saw_automatic_foreign = true;
+        }
+    }
+    try std.testing.expect(saw_native);
+    try std.testing.expect(saw_automatic_foreign);
+}
+
+test "ambiguous installed multiarch requests and contradictory limits fail explicitly" {
+    var database = try parsedDatabase(
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n\n" ++
+            "Package: app\nVersion: 1\nArchitecture: arm64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    const policies = [_]InstalledPolicy{
+        .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+        .{ .name = "app", .architecture = "arm64", .install_reason = .manual, .held = false },
+    };
+    var result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{},
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .foreign_architectures = &.{"arm64"},
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .remove = .{ .name = "app" } },
+    });
+    var failure = result.failure;
+    try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
+    failure.deinit();
+
+    result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{},
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .upgrade_all = {} },
+        .limits = .{ .max_problems = 0 },
+    });
+    failure = result.failure;
+    defer failure.deinit();
+    try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
+}
+
+test "duplicate phased candidate policy fails explicitly" {
+    const phased = [_]PhasedCandidate{
+        .{ .name = "app", .architecture = "amd64", .version = "2", .percentage = 10 },
+        .{ .name = "app", .architecture = "amd64", .version = "2", .percentage = 90 },
+    };
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{},
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .phased_candidates = &phased,
+        .target_architecture = "amd64",
+        .request = .{ .upgrade_all = {} },
+    });
+    var failure = result.failure;
+    defer failure.deinit();
+    try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
 }

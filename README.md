@@ -12,7 +12,14 @@
 - `debz.SolverContext` imports eligible package indexes into a Debian-configured libsolv pool.
 - `debz.dpkg_status`, `debz.source`, and the parser modules expose typed APIs for caller-supplied Debian metadata.
 
-See the [documentation index](doc/README.md) for current capabilities, security boundaries, authenticated refresh usage, package acquisition and cache behavior, the supported OpenPGP profile, and API/schema references.
+Plan serialization uses canonical schema version 2 in
+[`schema/transaction-plan-v2.json`](schema/transaction-plan-v2.json); version 1
+remains published for compatibility.
+
+See the [documentation index](doc/README.md) and
+[solver planning semantics](doc/solver-planning.md) for current capabilities,
+security boundaries, authenticated refresh usage, package acquisition and
+cache behavior, policy behavior, and API/schema references.
 
 ## Requirements
 

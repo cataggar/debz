@@ -4,7 +4,7 @@
 
 ## Deterministic transaction planning
 
-`debz.planTransaction` is the public typed planning API. It accepts authenticated repository snapshots, parsed dpkg state, explicit package policy, architecture, request, solver policy, and limits. The returned plan owns its data and can be serialized with `canonicalJson`; schema version 1 is documented in [`schema/transaction-plan-v1.json`](../schema/transaction-plan-v1.json).
+`debz.planTransaction` is the public typed planning API. It accepts authenticated repository snapshots, parsed dpkg state, explicit package policy, architecture, request, solver policy, and limits. The returned plan owns its data and can be serialized with `canonicalJson`; canonical schema version 2 is documented in [`schema/transaction-plan-v2.json`](../schema/transaction-plan-v2.json), while [version 1](../schema/transaction-plan-v1.json) remains published for compatibility with previously serialized plans.
 
 Planning only computes actions. It does **not** download package archives, modify the filesystem, or execute dpkg.
 
