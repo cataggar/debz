@@ -69,6 +69,8 @@ pub const DiagnosticCode = enum {
     too_many_repositories,
     source_invalid,
     unsupported_source_type,
+    unsupported_repository_uri,
+    unsupported_exact_suite,
     missing_architecture,
     invalid_policy,
     duplicate_repository,
@@ -91,6 +93,8 @@ pub const Diagnostic = struct {
             .too_many_repositories => "normalized repository limit exceeded",
             .source_invalid => "repository source input is invalid",
             .unsupported_source_type => "only binary repository entries can be refreshed",
+            .unsupported_repository_uri => "repository URI must be an explicit file, HTTP, or HTTPS URI without credentials, query, or fragment",
+            .unsupported_exact_suite => "exact-path suites are not supported by authenticated refresh",
             .missing_architecture => "repository architecture must be explicit or supplied as the native architecture",
             .invalid_policy => "repository policy is invalid",
             .duplicate_repository => "duplicate normalized repository declaration",
@@ -211,6 +215,57 @@ pub fn normalize(
                 }};
             } else repository.architectures;
 
+            for (repository.uris) |uri| {
+                if (!validRepositoryUri(uri.value)) return finishDiagnostic(
+                    allocator,
+                    arena,
+                    .{
+                        .code = .unsupported_repository_uri,
+                        .document_index = document_index,
+                    },
+                );
+            }
+            for (repository.suites) |suite| {
+                if (std.mem.endsWith(u8, suite.value, "/")) return finishDiagnostic(
+                    allocator,
+                    arena,
+                    .{
+                        .code = .unsupported_exact_suite,
+                        .document_index = document_index,
+                    },
+                );
+            }
+            const component_count = @max(repository.components.len, 1);
+            const uri_suite_count = std.math.mul(
+                usize,
+                repository.uris.len,
+                repository.suites.len,
+            ) catch return finishDiagnostic(allocator, arena, .{
+                .code = .too_many_repositories,
+                .document_index = document_index,
+            });
+            const component_architecture_count = std.math.mul(
+                usize,
+                component_count,
+                architectures.len,
+            ) catch return finishDiagnostic(allocator, arena, .{
+                .code = .too_many_repositories,
+                .document_index = document_index,
+            });
+            const expanded_count = std.math.mul(
+                usize,
+                uri_suite_count,
+                component_architecture_count,
+            ) catch return finishDiagnostic(allocator, arena, .{
+                .code = .too_many_repositories,
+                .document_index = document_index,
+            });
+            if (expanded_count > limits.max_repositories -| repositories.items.len)
+                return finishDiagnostic(allocator, arena, .{
+                    .code = .too_many_repositories,
+                    .document_index = document_index,
+                });
+
             for (repository.uris) |uri| for (repository.suites) |suite| {
                 if (repository.components.len == 0) {
                     try appendNormalized(
@@ -235,11 +290,6 @@ pub fn normalize(
                         document.policy,
                     );
                 }
-                if (repositories.items.len > limits.max_repositories)
-                    return finishDiagnostic(allocator, arena, .{
-                        .code = .too_many_repositories,
-                        .document_index = document_index,
-                    });
             };
         }
     }
@@ -342,6 +392,10 @@ fn validPolicy(policy: Policy) bool {
     if (policy.deadlines.connect_ms == 0 or policy.deadlines.read_ms == 0 or
         policy.deadlines.overall_ms == 0)
         return false;
+    if (policy.deadlines.connect_ms > std.math.maxInt(i64) or
+        policy.deadlines.read_ms > std.math.maxInt(i64) or
+        policy.deadlines.overall_ms > std.math.maxInt(i64))
+        return false;
     if (policy.default_release) |value| if (!validToken(value)) return false;
     if (policy.immutability.kind == .snapshot and
         policy.immutability.declared_identity == null)
@@ -351,6 +405,7 @@ fn validPolicy(policy: Policy) bool {
         .direct => {},
         .declared => |value| if (!validReference(value.id)) return false,
     }
+
     if (policy.credentials) |value| if (!validReference(value.id)) return false;
     for (policy.pins) |pin| {
         if (pin.suite == null and pin.component == null) return false;
@@ -358,6 +413,16 @@ fn validPolicy(policy: Policy) bool {
         if (pin.component) |value| if (!validToken(value)) return false;
     }
     return true;
+}
+
+fn validRepositoryUri(value: []const u8) bool {
+    const uri = acquisition.Uri.parse(value) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "file") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        return false;
+    return uri.user == null and uri.password == null and uri.query == null and
+        uri.fragment == null;
 }
 
 fn validToken(value: []const u8) bool {
@@ -611,6 +676,7 @@ pub const RefreshResult = struct {
         self.universe.deinit();
         for (self.snapshots) |*snapshot| snapshot.deinit();
         self.allocator.free(self.snapshots);
+        deinitStates(self.allocator, self.states);
         self.allocator.free(self.states);
         self.allocator.free(self.diagnostics);
         self.allocator.free(self.aggregate_manifest);
@@ -641,7 +707,10 @@ pub fn refreshAll(
         snapshots.deinit(allocator);
     }
     var states: std.ArrayList(PublishedRepositoryState) = .empty;
-    errdefer states.deinit(allocator);
+    errdefer {
+        deinitStates(allocator, states.items);
+        states.deinit(allocator);
+    }
     var diagnostics: std.ArrayList(RefreshDiagnostic) = .empty;
     errdefer diagnostics.deinit(allocator);
 
@@ -657,6 +726,17 @@ pub fn refreshAll(
                 return .{ .failed = failed };
             }
         }
+        if (!isEnabledRepository(request.configuration, runtime.repository_id)) {
+            try diagnostics.append(allocator, .{
+                .repository_id = runtime.repository_id,
+                .stale_attempted = false,
+                .error_name = "UnexpectedRuntime",
+            });
+        }
+    }
+    if (diagnostics.items.len != 0) {
+        const failed = try diagnostics.toOwnedSlice(allocator);
+        return .{ .failed = failed };
     }
 
     for (request.configuration.repositories) |repository| {
@@ -680,34 +760,30 @@ pub fn refreshAll(
         var refresh_policy = runtime.refresh;
         refresh_policy.mode = if (request.mode == .cache_only) .cache_only else .online;
         var stale = false;
-        var snapshot = refresh_module.refreshAuthenticated(
+        const refresh_repository: refresh_module.Repository = .{
+            .id = repository.id,
+            .base_uri = try acquisition.Uri.parse(repository.uri),
+            .suite = repository.suite,
+            .component = repository.component,
+            .architecture = repository.architecture,
+        };
+        var snapshot = refreshRepository(
             allocator,
-            .{
-                .id = repository.id,
-                .base_uri = try acquisition.Uri.parse(repository.uri),
-                .suite = repository.suite,
-                .component = repository.component,
-                .architecture = repository.architecture,
-            },
-            runtime.authentication,
-            runtime.acquisition,
+            repository,
+            refresh_repository,
+            runtime,
             refresh_policy,
             request.dependencies,
         ) catch |online_error| blk: {
             if (request.mode == .online and
-                request.failure_policy == .allow_stale_authenticated)
+                request.failure_policy == .allow_stale_authenticated and
+                repository.immutability.kind == .moving)
             {
                 refresh_policy.mode = .cache_only;
                 stale = true;
                 break :blk refresh_module.refreshAuthenticated(
                     allocator,
-                    .{
-                        .id = repository.id,
-                        .base_uri = try acquisition.Uri.parse(repository.uri),
-                        .suite = repository.suite,
-                        .component = repository.component,
-                        .architecture = repository.architecture,
-                    },
+                    refresh_repository,
                     runtime.authentication,
                     runtime.acquisition,
                     refresh_policy,
@@ -729,25 +805,58 @@ pub fn refreshAll(
             continue;
         };
         const state = stateFromSnapshot(
+            allocator,
             request.configuration.identity,
             repository,
             &snapshot,
             stale,
-        );
-        try snapshots.append(allocator, snapshot);
-        try states.append(allocator, state);
+        ) catch |err| {
+            snapshot.deinit();
+            return err;
+        };
+        snapshots.append(allocator, snapshot) catch |err| {
+            if (state.immutable_identity) |value| allocator.free(value);
+            snapshot.deinit();
+            return err;
+        };
+        states.append(allocator, state) catch |err| {
+            if (state.immutable_identity) |value| allocator.free(value);
+            return err;
+        };
     }
 
     if (diagnostics.items.len != 0) {
         for (snapshots.items) |*snapshot| snapshot.deinit();
         snapshots.deinit(allocator);
+        deinitStates(allocator, states.items);
         states.deinit(allocator);
         const failed = try diagnostics.toOwnedSlice(allocator);
         return .{ .failed = failed };
     }
 
     std.mem.sort(PublishedRepositoryState, states.items, {}, lessState);
-    for (states.items) |state| {
+    const snapshot_slice = try snapshots.toOwnedSlice(allocator);
+    errdefer {
+        for (snapshot_slice) |*snapshot| snapshot.deinit();
+        allocator.free(snapshot_slice);
+    }
+    const state_slice = try states.toOwnedSlice(allocator);
+    errdefer {
+        deinitStates(allocator, state_slice);
+        allocator.free(state_slice);
+    }
+    const diagnostic_slice = try diagnostics.toOwnedSlice(allocator);
+    errdefer allocator.free(diagnostic_slice);
+    var universe = try buildUniverse(allocator, request.configuration, snapshot_slice);
+    errdefer universe.deinit();
+    const manifest = try encodeAggregateManifest(
+        allocator,
+        request.configuration.identity,
+        state_slice,
+    );
+    errdefer allocator.free(manifest);
+
+    for (state_slice) |state| {
         const repository_manifest = try encodeRepositoryManifest(allocator, state);
         defer allocator.free(repository_manifest);
         const repository_identity: cache_module.ObjectIdentity = .{
@@ -767,12 +876,6 @@ pub fn refreshAll(
             request.aggregate_publish,
         );
     }
-    const manifest = try encodeAggregateManifest(
-        allocator,
-        request.configuration.identity,
-        states.items,
-    );
-    errdefer allocator.free(manifest);
     const identity: cache_module.ObjectIdentity = .{
         .digest = cache_module.Digest.of(manifest),
         .size = manifest.len,
@@ -792,18 +895,10 @@ pub fn refreshAll(
         return error.AggregatePublicationFailed;
     };
 
-    const snapshot_slice = try snapshots.toOwnedSlice(allocator);
-    errdefer {
-        for (snapshot_slice) |*snapshot| snapshot.deinit();
-        allocator.free(snapshot_slice);
-    }
-    const state_slice = try states.toOwnedSlice(allocator);
-    errdefer allocator.free(state_slice);
-    const universe = try buildUniverse(allocator, request.configuration, snapshot_slice);
     return .{ .published = .{
         .snapshots = snapshot_slice,
         .states = state_slice,
-        .diagnostics = try diagnostics.toOwnedSlice(allocator),
+        .diagnostics = diagnostic_slice,
         .aggregate_manifest = manifest,
         .universe = universe,
         .allocator = allocator,
@@ -815,6 +910,54 @@ fn findRuntime(runtimes: []const Runtime, id: source.RepositoryId) ?Runtime {
         if (std.mem.eql(u8, runtime.repository_id.slice(), id.slice())) return runtime;
     }
     return null;
+}
+
+fn isEnabledRepository(configuration: *const Configuration, id: source.RepositoryId) bool {
+    for (configuration.repositories) |repository| {
+        if (repository.enabled and std.mem.eql(u8, repository.id.slice(), id.slice()))
+            return true;
+    }
+    return false;
+}
+
+fn refreshRepository(
+    allocator: std.mem.Allocator,
+    repository: NormalizedRepository,
+    refresh_repository: refresh_module.Repository,
+    runtime: Runtime,
+    refresh_policy: refresh_module.RefreshPolicy,
+    dependencies: refresh_module.Dependencies,
+) !refresh_module.AuthenticatedResult {
+    if (repository.immutability.kind != .moving and refresh_policy.mode == .online) {
+        var cached_policy = refresh_policy;
+        cached_policy.mode = .cache_only;
+        return refresh_module.refreshAuthenticated(
+            allocator,
+            refresh_repository,
+            runtime.authentication,
+            runtime.acquisition,
+            cached_policy,
+            dependencies,
+        ) catch |err| switch (err) {
+            error.CacheMiss => refresh_module.refreshAuthenticated(
+                allocator,
+                refresh_repository,
+                runtime.authentication,
+                runtime.acquisition,
+                refresh_policy,
+                dependencies,
+            ),
+            else => |other| other,
+        };
+    }
+    return refresh_module.refreshAuthenticated(
+        allocator,
+        refresh_repository,
+        runtime.authentication,
+        runtime.acquisition,
+        refresh_policy,
+        dependencies,
+    );
 }
 
 fn runtimeMatches(repository: NormalizedRepository, runtime: Runtime) bool {
@@ -847,11 +990,12 @@ fn runtimeMatches(repository: NormalizedRepository, runtime: Runtime) bool {
 }
 
 fn stateFromSnapshot(
+    allocator: std.mem.Allocator,
     configuration_id: source.RepositoryId,
     repository: NormalizedRepository,
     snapshot: *const refresh_module.AuthenticatedResult,
     stale: bool,
-) PublishedRepositoryState {
+) !PublishedRepositoryState {
     const evidence = snapshot.snapshot.provenance.authentication_evidence;
     const signer = if (evidence.accepted_signature_index) |index|
         evidence.signatures[index].primary_fingerprint
@@ -868,9 +1012,18 @@ fn stateFromSnapshot(
         .selected_path = snapshot.snapshot.provenance.selected_path,
         .refreshed_at_unix = snapshot.snapshot.provenance.refreshed_at_unix,
         .immutable = repository.immutability.kind != .moving,
-        .immutable_identity = repository.immutability.declared_identity,
+        .immutable_identity = if (repository.immutability.declared_identity) |value|
+            try allocator.dupe(u8, value)
+        else
+            null,
         .stale = stale,
     };
+}
+
+fn deinitStates(allocator: std.mem.Allocator, states: []PublishedRepositoryState) void {
+    for (states) |state| {
+        if (state.immutable_identity) |value| allocator.free(value);
+    }
 }
 
 fn lessState(_: void, left: PublishedRepositoryState, right: PublishedRepositoryState) bool {
@@ -1165,6 +1318,82 @@ test "duplicates fail deterministically" {
     }
 }
 
+test "normalization rejects unsupported locations and bounds expansion before allocation" {
+    const invalid_inputs = [_]struct {
+        bytes: []const u8,
+        expected: DiagnosticCode,
+    }{
+        .{
+            .bytes = "deb [arch=amd64] ftp://example.test stable main\n",
+            .expected = .unsupported_repository_uri,
+        },
+        .{
+            .bytes = "deb [arch=amd64] https://user:secret@example.test stable main\n",
+            .expected = .unsupported_repository_uri,
+        },
+        .{
+            .bytes = "deb [arch=amd64] https://example.test path/\n",
+            .expected = .unsupported_exact_suite,
+        },
+    };
+    for (invalid_inputs) |input| {
+        const result = try normalize(std.testing.allocator, &.{.{
+            .bytes = input.bytes,
+            .format = .legacy,
+        }}, null, .{});
+        switch (result) {
+            .configuration => |value| {
+                var unexpected = value;
+                unexpected.deinit();
+                return error.ExpectedDiagnostic;
+            },
+            .diagnostic => |diagnostic| try std.testing.expectEqual(
+                input.expected,
+                diagnostic.code,
+            ),
+        }
+    }
+
+    const expanded = try normalize(std.testing.allocator, &.{.{
+        .bytes = "Types: deb\nURIs: https://a.test https://b.test\n" ++
+            "Suites: stable testing\nComponents: main contrib\n" ++
+            "Architectures: amd64 arm64\n",
+        .format = .deb822,
+    }}, null, .{ .max_repositories = 15 });
+    switch (expanded) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDiagnostic;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(
+            DiagnosticCode.too_many_repositories,
+            diagnostic.code,
+        ),
+    }
+
+    const excessive_deadline = try normalize(std.testing.allocator, &.{.{
+        .bytes = "deb [arch=amd64] https://example.test stable main\n",
+        .format = .legacy,
+        .policy = .{ .deadlines = .{
+            .connect_ms = std.math.maxInt(u64),
+            .read_ms = 1,
+            .overall_ms = 1,
+        } },
+    }}, null, .{});
+    switch (excessive_deadline) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDiagnostic;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(
+            DiagnosticCode.invalid_policy,
+            diagnostic.code,
+        ),
+    }
+}
+
 test "conflicting policy changes configuration identity" {
     const source_document =
         "deb [arch=amd64] https://example.test stable main\n";
@@ -1378,6 +1607,72 @@ test "authenticated multi repository refresh is atomic cache reusable and priori
     try std.testing.expectEqual(@as(usize, 0), offline_fixture.next);
 }
 
+test "immutable repository reuses its first authenticated generation" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const normalized = try normalize(std.testing.allocator, &.{.{
+        .bytes = "deb [arch=amd64] file:///snapshot stable main\n",
+        .format = .legacy,
+        .policy = .{ .immutability = .{
+            .kind = .snapshot,
+            .declared_identity = "20260815T000000Z",
+        } },
+    }}, null, .{});
+    var configuration = switch (normalized) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    const runtime = policyTestRuntime(configuration.repositories[0]);
+    var files = [_][]const u8{
+        &fixture.repository_in_release,
+        &fixture.repository_packages,
+    };
+    var initial_fixture: PolicyTestFixture = .{ .files = &files };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, temporary.dir, .{
+        .max_object_bytes = 512 * 1024,
+    });
+    defer cache.deinit();
+    var dependencies: refresh_module.Dependencies = .{
+        .acquisition = initial_fixture.dependencies(),
+        .cache = &cache,
+        .clock = .{ .context = null, .nowUnixFn = policyTestNow },
+        .io = std.testing.io,
+    };
+    var initial = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = &.{runtime},
+        .mode = .online,
+        .dependencies = dependencies,
+    });
+    defer initial.deinit(std.testing.allocator);
+    const initial_digest = switch (initial) {
+        .published => |*published| published.states[0].release_digest,
+        .failed => return error.UnexpectedRefreshFailure,
+    };
+
+    var no_network_fixture: PolicyTestFixture = .{ .files = &.{} };
+    dependencies.acquisition = no_network_fixture.dependencies();
+    var reused = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = &.{runtime},
+        .mode = .online,
+        .dependencies = dependencies,
+    });
+    configuration.deinit();
+    defer reused.deinit(std.testing.allocator);
+    const published = switch (reused) {
+        .published => |*value| value,
+        .failed => return error.UnexpectedRefreshFailure,
+    };
+    try std.testing.expect(initial_digest.eql(published.states[0].release_digest));
+    try std.testing.expectEqual(@as(usize, 0), no_network_fixture.next);
+    try std.testing.expectEqualStrings(
+        "20260815T000000Z",
+        published.states[0].immutable_identity.?,
+    );
+}
+
 test "ambient only proxy credentials and keyrings are rejected before acquisition" {
     const normalized = try normalize(std.testing.allocator, &.{.{
         .bytes = "deb [arch=amd64] file:///explicit stable main\n",
@@ -1412,6 +1707,30 @@ test "ambient only proxy credentials and keyrings are rejected before acquisitio
     switch (outcome) {
         .failed => |diagnostics| try std.testing.expectEqualStrings(
             "DeclaredPolicyMismatch",
+            diagnostics[0].error_name,
+        ),
+        .published => return error.ExpectedRefreshFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.next);
+
+    const declared_runtime = policyTestRuntime(configuration.repositories[0]);
+    var extra_runtime = declared_runtime;
+    extra_runtime.repository_id = .{ .bytes = @splat('a') };
+    var extra_outcome = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = &.{ declared_runtime, extra_runtime },
+        .mode = .online,
+        .dependencies = .{
+            .acquisition = fixture.dependencies(),
+            .cache = &cache,
+            .clock = .{ .context = null, .nowUnixFn = policyTestNow },
+            .io = std.testing.io,
+        },
+    });
+    defer extra_outcome.deinit(std.testing.allocator);
+    switch (extra_outcome) {
+        .failed => |diagnostics| try std.testing.expectEqualStrings(
+            "UnexpectedRuntime",
             diagnostics[0].error_name,
         ),
         .published => return error.ExpectedRefreshFailure,
@@ -1494,6 +1813,17 @@ test "repository failure does not publish a mixed aggregate and stale is explici
         },
         .published => return error.ExpectedRefreshFailure,
     }
+    var retained = try cache.lookup(
+        std.testing.allocator,
+        .{ .value = configuration.identity.slice() },
+        aggregate_snapshot,
+    );
+    defer retained.deinit();
+    const initial_manifest = switch (initial) {
+        .published => |*published| published.aggregate_manifest,
+        .failed => unreachable,
+    };
+    try std.testing.expectEqualStrings(initial_manifest, retained.bytes);
 
     var stale_files = [_][]const u8{
         &fixture.repository_in_release,
