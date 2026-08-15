@@ -70,12 +70,23 @@ pub const repository_policy = @import("repository_policy.zig");
 pub const signed_release_envelope = @import("signed_release_envelope.zig");
 pub const openpgp_verifier = @import("openpgp_verifier.zig");
 pub const transaction_executor = @import("transaction_executor.zig");
+pub const transaction_recovery = @import("transaction_recovery.zig");
 pub const executeTransaction = transaction_executor.execute;
 pub const TransactionExecutionRequest = transaction_executor.Request;
 pub const TransactionExecutionPolicy = transaction_executor.Policy;
 pub const TransactionArtifact = transaction_executor.Artifact;
 pub const TransactionExecutionReport = transaction_executor.Report;
 pub const TransactionExecutionDependencies = transaction_executor.Dependencies;
+pub const recoverTransaction = transaction_executor.recover;
+pub const TransactionRecoveryRequest = transaction_executor.RecoveryRequest;
+pub const TransactionRecoveryReport = transaction_executor.RecoveryReport;
+pub const TransactionJournalState = transaction_recovery.State;
+pub const TransactionJournalStore = transaction_recovery.Store;
+pub const TransactionStatusReader = transaction_recovery.StatusReader;
+pub const TransactionSystemJournalStore = transaction_recovery.SystemJournalStore;
+pub const TransactionSystemStatusFileReader = transaction_recovery.SystemStatusFileReader;
+pub const TransactionVerificationPolicy = transaction_recovery.VerificationPolicy;
+pub const TransactionVerification = transaction_recovery.Verification;
 
 pub const Architecture = enum {
     amd64,
@@ -174,4 +185,5 @@ test {
     _ = signed_release_envelope;
     _ = openpgp_verifier;
     _ = transaction_executor;
+    _ = transaction_recovery;
 }
