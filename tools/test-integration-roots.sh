@@ -28,7 +28,7 @@ case "$suite:$architecture:$mode" in
 esac
 
 rm -rf "$workspace"
-mkdir -p "$root/var/lib/dpkg" "$cache" "$state"
+mkdir -p "$root/var/lib/dpkg" "$root/var/lib/debz" "$cache" "$state"
 : >"$root/var/lib/dpkg/status"
 python3 tools/generate-integration-repository.py \
   --output "$repo" --suite "$suite" --architecture "$architecture"
@@ -45,7 +45,15 @@ common="--install-root $root --cache-path $cache --state-path $state --architect
 mutating="$common --assume-yes --noninteractive --conffile keep-existing"
 
 run_json() {
+  set +e
   output=$("$debz" "$@" 2>"$stderr_file")
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    cat "$stderr_file" >&2
+    printf '%s\n' "$output" >&2
+    return "$status"
+  fi
   test ! -s "$stderr_file"
   printf '%s\n' "$output"
 }
