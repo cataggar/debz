@@ -124,6 +124,10 @@ pub const Backend = struct {
         defer if (request.package != null) allocator.free(packages);
 
         const offline = request.cache_mode == .offline;
+        const foreign_architectures = try allocator.alloc([]const u8, request.foreign_architectures.len);
+        defer allocator.free(foreign_architectures);
+        for (request.foreign_architectures, 0..) |architecture, index|
+            foreign_architectures[index] = architecture.spelling();
         const response = try product.execute(allocator, .{
             .operation = operation,
             .packages = packages,
@@ -135,6 +139,7 @@ pub const Backend = struct {
                 .cache_path = request.cache,
                 .state_path = request.state,
                 .architecture = request.architecture.spelling(),
+                .foreign_architectures = foreign_architectures,
                 .repository_policy = request.repository_policy,
                 .proxy = request.proxy,
                 .credential_reference = request.credential_reference,

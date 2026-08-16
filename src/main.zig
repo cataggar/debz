@@ -15,6 +15,7 @@ const usage =
     \\
     \\Explicit input and policy options:
     \\  --source PATH --config PATH --keyring PATH --status-path PATH
+    \\  --foreign-architecture ARCH
     \\  --default-release SUITE
     \\  --repository-policy strict-priority|best-version
     \\  --proxy URI --credential-reference PATH
@@ -135,6 +136,7 @@ fn parse(
     var sources: std.ArrayList([]const u8) = .empty;
     var configs: std.ArrayList([]const u8) = .empty;
     var keyrings: std.ArrayList([]const u8) = .empty;
+    var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
     var seen: std.EnumSet(SingleOption) = .initEmpty();
     var options: api.CommonOptions = .{
@@ -172,6 +174,8 @@ fn parse(
         } else if (std.mem.eql(u8, argument, "--architecture")) {
             try setOnce(&seen, .architecture);
             options.architecture = try next(args);
+        } else if (std.mem.eql(u8, argument, "--foreign-architecture")) {
+            try foreign_architectures.append(allocator, try next(args));
         } else if (std.mem.eql(u8, argument, "--default-release")) {
             try setOnce(&seen, .default_release);
             options.default_release = try next(args);
@@ -221,6 +225,7 @@ fn parse(
     options.source_paths = try sources.toOwnedSlice(allocator);
     options.config_paths = try configs.toOwnedSlice(allocator);
     options.keyring_paths = try keyrings.toOwnedSlice(allocator);
+    options.foreign_architectures = try foreign_architectures.toOwnedSlice(allocator);
     options.force = try forces.toOwnedSlice(allocator);
     return .{ .request = .{
         .operation = operation,

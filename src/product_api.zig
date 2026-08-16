@@ -61,6 +61,7 @@ pub const CommonOptions = struct {
     state_path: []const u8,
     status_path: ?[]const u8 = null,
     architecture: []const u8,
+    foreign_architectures: []const []const u8 = &.{},
     default_release: ?[]const u8 = null,
     repository_policy: RepositoryPolicy = .strict_priority,
     proxy: ?[]const u8 = null,
@@ -202,6 +203,7 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
         (request.options.lock_input_path != null and !validAbsolutePath(request.options.lock_input_path.?)) or
         (request.options.lock_output_path != null and !validAbsolutePath(request.options.lock_output_path.?)) or
         !validArchitecture(request.options.architecture) or
+        !validForeignArchitectures(request.options.architecture, request.options.foreign_architectures) or
         request.options.deadline_ms == 0)
         return failure(request.operation, .usage, .invalid_request, "invalid explicit path, architecture, or deadline");
     if (!validPackages(request))
@@ -262,6 +264,15 @@ fn validAbsolutePath(path: []const u8) bool {
     while (components.next()) |component|
         if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
             return false;
+    return true;
+}
+
+fn validForeignArchitectures(native: []const u8, foreign: []const []const u8) bool {
+    for (foreign, 0..) |architecture, index| {
+        if (!validArchitecture(architecture) or std.mem.eql(u8, native, architecture)) return false;
+        for (foreign[0..index]) |prior|
+            if (std.mem.eql(u8, prior, architecture)) return false;
+    }
     return true;
 }
 
