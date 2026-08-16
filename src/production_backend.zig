@@ -269,7 +269,12 @@ pub const Backend = struct {
 
         var installed = try self.loadInstalled(allocator, request);
         defer installed.deinit();
-        const policies = try installedPolicies(allocator, installed.database.packages);
+        const planning_records = if (request.operation == .recover)
+            try healthyInstalledRecords(allocator, installed.database.packages)
+        else
+            installed.database.packages;
+        defer if (request.operation == .recover) allocator.free(planning_records);
+        const policies = try installedPolicies(allocator, planning_records);
         var recovery_intent: ?std.json.Parsed(RecoveryIntent) = if (request.operation == .recover)
             try readRecoveryIntent(allocator, self.io, request.options.state_path)
         else
@@ -299,7 +304,7 @@ pub const Backend = struct {
         var planning = try solver.planTransaction(allocator, .{
             .repositories = refreshed.universe.repositories,
             .installed = .{
-                .records = installed.database.packages,
+                .records = planning_records,
                 .native_architecture = request.options.architecture,
                 .policies = policies,
                 .hold_authority = .explicit_policy,
@@ -857,6 +862,17 @@ fn installedPolicies(
         });
     }
     return policies.toOwnedSlice(allocator);
+}
+
+fn healthyInstalledRecords(
+    allocator: std.mem.Allocator,
+    packages: []const dpkg_status.Package,
+) ![]dpkg_status.Package {
+    var records: std.ArrayList(dpkg_status.Package) = .empty;
+    for (packages) |package| {
+        if (package.status.isFullyInstalled()) try records.append(allocator, package);
+    }
+    return records.toOwnedSlice(allocator);
 }
 
 fn planRequest(allocator: std.mem.Allocator, request: api.Request) !solver.PlanRequest {
