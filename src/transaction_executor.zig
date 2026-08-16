@@ -1578,7 +1578,7 @@ fn artifactCode(err: anyerror) FailureCode {
 pub const SystemProcessRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    stderr_limit: usize = 64 * 1024,
+    stderr_limit: usize = maximum_diagnostic_limit,
     last_stderr: ?[]u8 = null,
 
     pub fn interface(self: *SystemProcessRunner) ProcessRunner {
