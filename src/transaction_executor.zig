@@ -1237,6 +1237,7 @@ fn buildArgv(
     try argv.append(allocator, "/usr/bin/dpkg");
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
+    try argv.append(allocator, "--quiet");
     try argv.append(allocator, "--no-pager");
     try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
@@ -1270,6 +1271,7 @@ fn buildTriggerArgv(
     try argv.append(allocator, "/usr/bin/dpkg");
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
+    try argv.append(allocator, "--quiet");
     try argv.append(allocator, "--no-pager");
     try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
@@ -1290,6 +1292,7 @@ fn buildRecoveryArgv(
     try argv.append(allocator, "/usr/bin/dpkg");
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
+    try argv.append(allocator, "--quiet");
     try argv.append(allocator, "--no-pager");
     try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
