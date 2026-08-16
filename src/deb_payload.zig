@@ -96,12 +96,12 @@ pub const Diagnostic = struct {
             .tar_metadata_limit => "tar inventory metadata exceeds the configured memory limit",
             .tar_missing_end => "tar archive lacks two zero end blocks",
             .tar_trailing_data => "tar archive has malformed trailing data",
-            .unsupported_tar_extension => "GNU/PAX tar extension metadata is not accepted by this policy",
+            .unsupported_tar_extension => "unsupported or malformed GNU/PAX tar extension metadata",
             .unsafe_path => "tar path is absolute, traversing, ambiguous, or contains an invalid component",
             .path_too_long => "tar path exceeds the configured limit",
             .duplicate_path => "tar contains duplicate or normalization-colliding paths",
             .conflicting_path => "tar paths or links conflict under archive interpretation",
-            .unsafe_link => "tar link target is absolute, traversing, ambiguous, or symlink-mediated",
+            .unsafe_link => "tar link target is traversing, ambiguous, or symlink-mediated",
             .link_too_long => "tar link target exceeds the configured limit",
             .forward_hardlink => "hard links must reference an earlier regular file",
             .unsupported_file_type => "devices, FIFOs, sockets, and other special tar entries are rejected",
@@ -148,7 +148,7 @@ pub const Script = struct {
 
 pub const Conffile = struct {
     path: []u8,
-    obsolete: bool,
+    remove_on_upgrade: bool,
 };
 
 pub const Provenance = struct {
@@ -343,6 +343,11 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
     var inventory_bytes: usize = 0;
     var offset: usize = 0;
     var zero_blocks: usize = 0;
+    var header_count: usize = 0;
+    var pending_long_name: ?[]u8 = null;
+    defer if (pending_long_name) |value| allocator.free(value);
+    var pending_long_link: ?[]u8 = null;
+    defer if (pending_long_link) |value| allocator.free(value);
 
     while (offset < bytes.len) {
         const end = std.math.add(usize, offset, 512) catch return setTarFailure(diagnostic, stage, .tar_size_overflow, member, offset, entries.items.len);
@@ -355,15 +360,33 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             continue;
         }
         if (zero_blocks != 0) return setTarFailure(diagnostic, stage, .tar_missing_end, member, offset, entries.items.len);
-        if (entries.items.len >= limits.max_entries_per_tar)
+        if (header_count >= limits.max_entries_per_tar)
             return setTarFailure(diagnostic, stage, .tar_entry_limit, member, offset, entries.items.len);
+        header_count += 1;
         if (!validChecksum(header))
             return setTarFailure(diagnostic, stage, .tar_bad_checksum, member, offset, entries.items.len);
-        if (!std.mem.eql(u8, header[257..263], "ustar\x00") or
-            !std.mem.eql(u8, header[263..265], "00"))
+        const tar_format: TarFormat = if (std.mem.eql(u8, header[257..263], "ustar\x00") and
+            std.mem.eql(u8, header[263..265], "00"))
+            .posix
+        else if (std.mem.eql(u8, header[257..265], "ustar  \x00"))
+            .gnu
+        else
             return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 257, entries.items.len);
         const size = parseOctal(header[124..136]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 124, entries.items.len);
+        const content_offset = end;
+        const size_usize: usize = std.math.cast(usize, size) orelse
+            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, offset + 124, entries.items.len);
+        const content_end = std.math.add(usize, content_offset, size_usize) catch
+            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, content_offset, entries.items.len);
+        if (content_end > bytes.len)
+            return setTarFailure(diagnostic, stage, .tar_truncated, member, content_offset, entries.items.len);
+        const padded = std.math.add(usize, content_end, (512 - (size_usize % 512)) % 512) catch
+            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, content_end, entries.items.len);
+        if (padded > bytes.len)
+            return setTarFailure(diagnostic, stage, .tar_truncated, member, content_end, entries.items.len);
+        for (bytes[content_end..padded]) |byte| if (byte != 0)
+            return setTarFailure(diagnostic, stage, .tar_trailing_data, member, content_end, entries.items.len);
         const mode_u64 = parseOctal(header[100..108]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 100, entries.items.len);
         _ = parseOctal(header[108..116]) orelse
@@ -379,8 +402,28 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         if (mode_u64 > std.math.maxInt(u32))
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 100, entries.items.len);
         const typeflag = header[156];
-        if (typeflag == 'x' or typeflag == 'g' or typeflag == 'L' or typeflag == 'K')
+        if (typeflag == 'x' or typeflag == 'g')
             return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 156, entries.items.len);
+        if (typeflag == 'L' or typeflag == 'K') {
+            if (tar_format != .gnu)
+                return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 156, entries.items.len);
+            const maximum = if (typeflag == 'L') limits.max_path_bytes else limits.max_link_bytes;
+            const content = bytes[content_offset..content_end];
+            if (content.len < 2 or content.len - 1 > maximum or content[content.len - 1] != 0 or
+                std.mem.indexOfScalar(u8, content[0 .. content.len - 1], 0) != null)
+                return setTarFailure(diagnostic, stage, if (typeflag == 'L') .unsafe_path else .unsafe_link, member, content_offset, entries.items.len);
+            const destination = if (typeflag == 'L') &pending_long_name else &pending_long_link;
+            if (destination.* != null)
+                return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 156, entries.items.len);
+            destination.* = allocator.dupe(u8, content[0 .. content.len - 1]) catch
+                return setTarFailure(diagnostic, stage, .out_of_memory, member, content_offset, entries.items.len);
+            regular_bytes = std.math.add(u64, regular_bytes, size) catch
+                return setTarFailure(diagnostic, stage, .tar_payload_limit, member, offset + 124, entries.items.len);
+            if (regular_bytes > limits.max_total_entry_bytes)
+                return setTarFailure(diagnostic, stage, .tar_payload_limit, member, offset + 124, entries.items.len);
+            offset = padded;
+            continue;
+        }
         const kind: EntryKind = switch (typeflag) {
             0, '0' => .regular,
             '5' => .directory,
@@ -390,7 +433,27 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         };
         if (kind != .regular and size != 0)
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 124, entries.items.len);
-        const path = canonicalTarPath(allocator, header, limits.max_path_bytes) catch |err| switch (err) {
+        const raw_name = if (pending_long_name) |value| value else fieldString(header[0..100]) orelse
+            return setTarFailure(diagnostic, stage, .unsafe_path, member, offset, entries.items.len);
+        if (kind == .directory and
+            (std.mem.eql(u8, raw_name, ".") or std.mem.eql(u8, raw_name, "./")))
+        {
+            const raw_link = if (pending_long_link) |value| value else fieldString(header[157..257]) orelse
+                return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+            if (raw_link.len != 0)
+                return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+            if (pending_long_name) |value| {
+                allocator.free(value);
+                pending_long_name = null;
+            }
+            if (pending_long_link) |value| {
+                allocator.free(value);
+                pending_long_link = null;
+            }
+            offset = padded;
+            continue;
+        }
+        const path = canonicalTarPath(allocator, header, tar_format, pending_long_name, limits.max_path_bytes) catch |err| switch (err) {
             error.OutOfMemory => return setTarFailure(diagnostic, stage, .out_of_memory, member, offset, entries.items.len),
             error.TooLong => return setTarFailure(diagnostic, stage, .path_too_long, member, offset, entries.items.len),
             else => return setTarFailure(diagnostic, stage, .unsafe_path, member, offset, entries.items.len),
@@ -403,7 +466,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
 
         var link_target: ?[]u8 = null;
         if (kind == .symlink or kind == .hardlink) {
-            const raw_link = fieldString(header[157..257]) orelse
+            const raw_link = if (pending_long_link) |value| value else fieldString(header[157..257]) orelse
                 return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
             if (raw_link.len > limits.max_link_bytes)
                 return setTarFailure(diagnostic, stage, .link_too_long, member, offset + 157, entries.items.len);
@@ -421,12 +484,13 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
                     allocator.free(target);
                     return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
                 }
-            } else if (hasSymlinkAtOrAbove(&paths, target)) {
+            } else if (hasSymlinkAncestor(&paths, target)) {
                 allocator.free(target);
                 return setTarFailure(diagnostic, stage, .conflicting_path, member, offset + 157, entries.items.len);
             }
             link_target = target;
-        }
+        } else if (pending_long_link != null)
+            return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 156, entries.items.len);
         errdefer if (link_target) |target| allocator.free(target);
         if (hasSymlinkAncestor(&paths, path))
             return setTarFailure(diagnostic, stage, .conflicting_path, member, offset, entries.items.len);
@@ -443,19 +507,6 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         if (inventory_bytes > limits.max_inventory_bytes_per_tar)
             return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
 
-        const content_offset = end;
-        const size_usize: usize = std.math.cast(usize, size) orelse
-            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, offset + 124, entries.items.len);
-        const content_end = std.math.add(usize, content_offset, size_usize) catch
-            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, content_offset, entries.items.len);
-        if (content_end > bytes.len)
-            return setTarFailure(diagnostic, stage, .tar_truncated, member, content_offset, entries.items.len);
-        const padded = std.math.add(usize, content_end, (512 - (size_usize % 512)) % 512) catch
-            return setTarFailure(diagnostic, stage, .tar_size_overflow, member, content_end, entries.items.len);
-        if (padded > bytes.len)
-            return setTarFailure(diagnostic, stage, .tar_truncated, member, content_end, entries.items.len);
-        for (bytes[content_end..padded]) |byte| if (byte != 0)
-            return setTarFailure(diagnostic, stage, .tar_trailing_data, member, content_end, entries.items.len);
         regular_bytes = std.math.add(u64, regular_bytes, size) catch
             return setTarFailure(diagnostic, stage, .tar_payload_limit, member, offset + 124, entries.items.len);
         if (regular_bytes > limits.max_total_entry_bytes)
@@ -471,8 +522,18 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             .header_offset = offset,
             .content_offset = content_offset,
         }) catch return setTarFailure(diagnostic, stage, .out_of_memory, member, offset, entries.items.len);
+        if (pending_long_name) |value| {
+            allocator.free(value);
+            pending_long_name = null;
+        }
+        if (pending_long_link) |value| {
+            allocator.free(value);
+            pending_long_link = null;
+        }
         offset = padded;
     }
+    if (pending_long_name != null or pending_long_link != null)
+        return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset, entries.items.len);
     if (zero_blocks < 2) return setTarFailure(diagnostic, stage, .tar_missing_end, member, offset, entries.items.len);
     while (offset < bytes.len) : (offset += 512) {
         if (bytes.len - offset < 512 or !allZero(bytes[offset .. offset + 512]))
@@ -492,8 +553,12 @@ fn setTarFailure(diagnostic: *Diagnostic, stage: Stage, code: Code, member: deb_
     return error.Invalid;
 }
 
-fn canonicalTarPath(allocator: std.mem.Allocator, header: []const u8, maximum: usize) ![]u8 {
+const TarFormat = enum { posix, gnu };
+
+fn canonicalTarPath(allocator: std.mem.Allocator, header: []const u8, format: TarFormat, long_name: ?[]const u8, maximum: usize) ![]u8 {
+    if (long_name) |name| return canonicalPath(allocator, name, maximum, false);
     const name = fieldString(header[0..100]) orelse return error.Unsafe;
+    if (format == .gnu) return canonicalPath(allocator, name, maximum, false);
     const prefix = fieldString(header[345..500]) orelse return error.Unsafe;
     if (prefix.len == 0) return canonicalPath(allocator, name, maximum, false);
     var joined: std.ArrayList(u8) = .empty;
@@ -511,8 +576,7 @@ fn fieldString(field: []const u8) ?[]const u8 {
 }
 
 fn canonicalPath(allocator: std.mem.Allocator, raw_input: []const u8, maximum: usize, allow_dotdot: bool) ![]u8 {
-    if (raw_input.len == 0 or raw_input[0] == '/' or std.mem.indexOfScalar(u8, raw_input, '\\') != null)
-        return error.Unsafe;
+    if (raw_input.len == 0 or raw_input[0] == '/') return error.Unsafe;
     var raw = raw_input;
     if (std.mem.startsWith(u8, raw, "./")) raw = raw[2..];
     while (raw.len > 1 and raw[raw.len - 1] == '/') raw = raw[0 .. raw.len - 1];
@@ -543,7 +607,8 @@ fn canonicalPath(allocator: std.mem.Allocator, raw_input: []const u8, maximum: u
 
 fn resolveLink(allocator: std.mem.Allocator, path: []const u8, raw: []const u8, hardlink: bool, maximum: usize) ![]u8 {
     if (hardlink) return canonicalPath(allocator, raw, maximum, false);
-    if (raw.len == 0 or raw[0] == '/') return error.Unsafe;
+    if (raw.len == 0) return error.Unsafe;
+    if (raw[0] == '/') return canonicalPath(allocator, raw[1..], maximum, false);
     const parent_end = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(allocator);
@@ -576,11 +641,6 @@ fn hasSymlinkAncestor(paths: *const std.StringHashMap(EntryKind), path: []const 
         cursor = slash + 1;
     }
     return false;
-}
-
-fn hasSymlinkAtOrAbove(paths: *const std.StringHashMap(EntryKind), path: []const u8) bool {
-    if (paths.get(path) == .symlink) return true;
-    return hasSymlinkAncestor(paths, path);
 }
 
 fn makesExistingLinkTargetSymlinkMediated(entries: []const Entry, path: []const u8) bool {
@@ -667,12 +727,18 @@ fn parseConffiles(allocator: std.mem.Allocator, bytes: []const u8, entries: []co
         while (lines.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
-            if (line[0] != '/')
-                return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
-            const separator = std.mem.indexOfAny(u8, line, " \t");
-            const path_text = if (separator) |index| line[0..index] else line;
-            const qualifier = if (separator) |index| std.mem.trim(u8, line[index..], " \t") else "";
-            if (qualifier.len != 0 and !std.mem.eql(u8, qualifier, "obsolete"))
+            const remove_on_upgrade = !std.mem.startsWith(u8, line, "/");
+            const path_text = if (remove_on_upgrade) blk: {
+                const separator = std.mem.indexOfAny(u8, line, " \t") orelse
+                    return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
+                if (!std.mem.eql(u8, line[0..separator], "remove-on-upgrade"))
+                    return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
+                const value = std.mem.trimStart(u8, line[separator..], " \t");
+                if (value.len == 0 or std.mem.indexOfAny(u8, value, " \t") != null)
+                    return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
+                break :blk value;
+            } else line;
+            if (path_text[0] != '/' or std.mem.indexOfAny(u8, path_text, " \t") != null)
                 return setFailure(diagnostic, .conffiles, .invalid_conffiles, member_offset + entry.content_offset);
             if (result.items.len >= limits.max_conffiles)
                 return setFailure(diagnostic, .conffiles, .conffiles_limit, member_offset + entry.content_offset);
@@ -688,7 +754,7 @@ fn parseConffiles(allocator: std.mem.Allocator, bytes: []const u8, entries: []co
                 allocator.free(path);
                 return setFailure(diagnostic, .conffiles, .out_of_memory, member_offset + entry.content_offset);
             };
-            result.append(allocator, .{ .path = path, .obsolete = qualifier.len != 0 }) catch {
+            result.append(allocator, .{ .path = path, .remove_on_upgrade = remove_on_upgrade }) catch {
                 _ = paths.remove(path);
                 allocator.free(path);
                 return setFailure(diagnostic, .conffiles, .out_of_memory, member_offset + entry.content_offset);
@@ -778,6 +844,17 @@ fn appendTarEntry(allocator: std.mem.Allocator, tar: *std.ArrayList(u8), path: [
     try tar.appendSlice(allocator, content);
     const padding = (512 - (content.len % 512)) % 512;
     try tar.appendNTimes(allocator, 0, padding);
+}
+
+fn appendGnuTarEntry(allocator: std.mem.Allocator, tar: *std.ArrayList(u8), path: []const u8, kind: u8, mode: u32, link: []const u8, content: []const u8) !void {
+    const header_offset = tar.items.len;
+    try appendTarEntry(allocator, tar, path, kind, mode, link, content);
+    const header = tar.items[header_offset .. header_offset + 512];
+    std.mem.copyForwards(u8, header[257..265], "ustar  \x00");
+    @memset(header[148..156], ' ');
+    var checksum: u64 = 0;
+    for (header) |byte| checksum += byte;
+    writeOctal(header[148..156], checksum);
 }
 
 fn finishTar(allocator: std.mem.Allocator, tar: *std.ArrayList(u8)) !void {
@@ -931,6 +1008,20 @@ test "rejects traversal identity digest limits and corrupt tar" {
 
 test "conffiles inventory rejects duplicates and entry bombs" {
     const allocator = std.testing.allocator;
+    const flagged = try testDebWithConffiles(allocator, null, "remove-on-upgrade /etc/demo.conf\n");
+    defer allocator.free(flagged);
+    const flagged_result = validate(allocator, flagged, expectedFor(flagged), .{});
+    var flagged_validation = switch (flagged_result) {
+        .validation => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer flagged_validation.deinit();
+    try std.testing.expect(flagged_validation.conffiles[0].remove_on_upgrade);
+
+    const unknown_flag = try testDebWithConffiles(allocator, null, "unknown /etc/demo.conf\n");
+    defer allocator.free(unknown_flag);
+    try std.testing.expectEqual(Code.invalid_conffiles, validate(allocator, unknown_flag, expectedFor(unknown_flag), .{}).diagnostic.code);
+
     const duplicate = try testDebWithConffiles(allocator, null, "/etc/demo.conf\n/etc/demo.conf\n");
     defer allocator.free(duplicate);
     try std.testing.expectEqual(Code.duplicate_conffile, validate(allocator, duplicate, expectedFor(duplicate), .{}).diagnostic.code);
@@ -982,7 +1073,6 @@ test "rejects duplicate paths special files unsafe links and entry bombs" {
     try appendTarEntry(allocator, &tar, "root/file", '0', 0o644, "", "");
     try finishTar(allocator, &tar);
     try std.testing.expectError(error.Conflict, parseTarTest(allocator, tar.items, member, .{}));
-
     tar.clearRetainingCapacity();
     try appendTarEntry(allocator, &tar, "a", '2', 0o777, "b", "");
     try appendTarEntry(allocator, &tar, "b", '2', 0o777, "a", "");
@@ -1005,6 +1095,43 @@ test "rejects duplicate paths special files unsafe links and entry bombs" {
     for (checksum_header) |byte| checksum += byte;
     writeOctal(checksum_header[148..156], checksum);
     try std.testing.expectError(error.Unsupported, parseTarTest(allocator, tar.items, member, .{}));
+}
+
+test "accepts GNU base headers but rejects GNU and PAX extension records" {
+    const allocator = std.testing.allocator;
+    var tar: std.ArrayList(u8) = .empty;
+    defer tar.deinit(allocator);
+    try appendGnuTarEntry(allocator, &tar, "./", '5', 0o755, "", "");
+    try appendGnuTarEntry(allocator, &tar, "usr", '5', 0o755, "", "");
+    try appendGnuTarEntry(allocator, &tar, "usr/file", '0', 0o644, "", "content");
+    try appendGnuTarEntry(allocator, &tar, "usr/link", '2', 0o777, "file", "");
+    try appendGnuTarEntry(allocator, &tar, "usr/link2", '2', 0o777, "link", "");
+    try appendGnuTarEntry(allocator, &tar, "usr/config", '2', 0o777, "/etc/config", "");
+    try appendGnuTarEntry(allocator, &tar, "usr/system-systemd\\x2dmute.slice", '0', 0o644, "", "");
+    try finishTar(allocator, &tar);
+    const member: deb_archive.Member = .{ .kind = .data, .compression = .uncompressed, .name = "data.tar", .header = .{ .start = 0, .end = 0 }, .content = .{ .start = 20, .end = 20 + tar.items.len }, .timestamp = 0, .size = tar.items.len };
+    try parseTarTest(allocator, tar.items, member, .{});
+
+    inline for (.{ 'x', 'g' }) |typeflag| {
+        tar.clearRetainingCapacity();
+        try appendGnuTarEntry(allocator, &tar, "extension", typeflag, 0, "", "");
+        try finishTar(allocator, &tar);
+        try std.testing.expectError(error.Unsupported, parseTarTest(allocator, tar.items, member, .{}));
+    }
+
+    tar.clearRetainingCapacity();
+    try appendGnuTarEntry(allocator, &tar, "././@LongLink", 'L', 0, "", "usr/share/a-very-long-directory-name-used-to-cover-safe-gnu-long-name-records/another-directory/file\x00");
+    try appendGnuTarEntry(allocator, &tar, "placeholder", '0', 0o644, "", "");
+    try appendGnuTarEntry(allocator, &tar, "././@LongLink", 'K', 0, "", "/etc/a-very-long-link-target-used-to-cover-safe-gnu-long-link-records/target\x00");
+    try appendGnuTarEntry(allocator, &tar, "long-link", '2', 0o777, "placeholder", "");
+    try finishTar(allocator, &tar);
+    try parseTarTest(allocator, tar.items, member, .{});
+
+    tar.clearRetainingCapacity();
+    try appendGnuTarEntry(allocator, &tar, "./", '5', 0o755, "", "");
+    try appendGnuTarEntry(allocator, &tar, "./", '5', 0o755, "", "");
+    try finishTar(allocator, &tar);
+    try std.testing.expectError(error.EntryLimit, parseTarTest(allocator, tar.items, member, .{ .max_entries_per_tar = 1 }));
 }
 
 fn parseTarTest(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, limits: Limits) !void {

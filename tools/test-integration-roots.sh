@@ -87,6 +87,14 @@ plan_a=$(run_json plan $common base-dep)
 plan_b=$(run_json plan $common base-dep)
 test "$plan_a" = "$plan_b"
 printf '%s' "$plan_a" | grep -q '"package":"base-dep"'
+resolved_lock="$workspace/base-dep.lock.json"
+run_json plan $common --lock-output "$resolved_lock" base-dep | grep -q '"exit_status":0'
+test -s "$resolved_lock"
+run_json plan $common --lock-input "$resolved_lock" base-dep | grep -q '"exit_status":0'
+run_json download $common --lock-input "$resolved_lock" base-dep | grep -q '"exit_status":0'
+run_json plan $common --lock-input "$resolved_lock" --lock-output "$workspace/base-dep.copy.lock.json" base-dep |
+  grep -q '"exit_status":0'
+cmp "$resolved_lock" "$workspace/base-dep.copy.lock.json"
 case "$suite" in
   debian-stable) run_json info $common trigger-pkg | grep -q '"version":"1.0-1debian1"' ;;
   ubuntu-26.04) run_json info $common trigger-pkg | grep -q '"version":"1.0-1ubuntu1"' ;;

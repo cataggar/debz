@@ -50,6 +50,18 @@ dependency is selected by the build system and no xz command-line tool is
 invoked in production. See the installed XZ Utils documentation for its full
 copyright and license notices.
 
+Zstandard libzstd
+=================
+
+Source: https://github.com/facebook/zstd
+Runtime/build dependency: system libzstd
+License: BSD-3-Clause
+
+debz uses libzstd's in-process streaming decoder for zstd repository metadata
+and Debian payload members. The dependency is selected by the build system and
+no zstd command-line tool is invoked in production. See the installed
+Zstandard documentation for its full copyright and license notices.
+
 OpenPGP verifier
 ================
 

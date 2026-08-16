@@ -15,7 +15,19 @@ randomness, wall-clock time, or APT configuration.
 Relations support `:any`, `:native`, explicit architectures, architecture
 restriction lists, and preserved build-profile groups. Binary transactions
 evaluate profiles against an explicitly empty active-profile set. `Multi-Arch`
-metadata is passed through libsolv's Debian metadata key.
+metadata is passed through libsolv's Debian metadata key. `Pre-Depends` retains
+its prerequisite marker, version relations use Debian EVR ordering, and
+`Replaces` becomes a solver obsoletion only where a matching `Conflicts`
+relation gives it replacement semantics.
+
+The solver is created only after installed and available repositories are
+fully imported, so all libsolv maps and rule ranges cover the final pool.
+Available `Essential: yes` packages are included in install closures even when
+Debian metadata omits explicit dependencies on them. A named install is
+successful only if its selected identity is already installed or appears in
+the materialized transaction. Problem diagnostics validate libsolv problem,
+learned-rule, rule-range, and solvable IDs before converting them to stable
+owned records.
 
 `install_only` identities use libsolv multiversion jobs. Reinstall requires the
 exact installed name, version, and architecture in an authenticated repository.
@@ -23,6 +35,8 @@ Reverse-dependency removal additionally requires every unrequested identity in
 the computed closure to appear in `authorized_removals`.
 
 Schema v2 adds operation mode, requested status, a complete summary, ordered
-remove/unpack/configure steps, stable problem IDs, candidate rejection records,
-and graph edges. Plan-only and download-only never execute dpkg. Schema v1
-remains published for older consumers.
+bootstrap-extract/remove/unpack/configure-pending steps, stable problem IDs,
+candidate rejection records, and graph edges. Configure barriers preserve
+Pre-Depends while leaving normal dependency-cycle ordering to dpkg. Plan-only
+and download-only never execute dpkg. Schema v1 remains published for older
+consumers.

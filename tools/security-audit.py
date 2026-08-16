@@ -77,7 +77,7 @@ def audit_dependencies() -> None:
         fail("dependency vulnerability/license review has expired")
     allowed_licenses = set(policy["allowed_production_licenses"])
     dependencies = {item["name"]: item for item in policy["production_dependencies"]}
-    if set(dependencies) != {"libsolv", "liblzma"}:
+    if set(dependencies) != {"libsolv", "liblzma", "libzstd"}:
         fail("dependency policy does not exactly enumerate production dependencies")
     for dependency in dependencies.values():
         if dependency["license"] not in allowed_licenses:
@@ -123,28 +123,29 @@ def audit_dependencies() -> None:
 
     build = (ROOT / "build.zig").read_text()
     system_libraries = set(re.findall(r'linkSystemLibrary\("([^"]+)"', build))
-    if system_libraries != {"lzma"}:
+    if system_libraries != {"lzma", "zstd"}:
         fail(f"unreviewed system libraries: {sorted(system_libraries)}")
-    version_result = subprocess.run(
-        ["pkg-config", "--modversion", "liblzma"],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if version_result.returncode != 0:
-        fail("liblzma version is unavailable through pkg-config")
-    else:
-        def version_tuple(value: str) -> tuple[int, ...]:
-            return tuple(int(part) for part in re.findall(r"\d+", value))
+    def version_tuple(value: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in re.findall(r"\d+", value))
 
+    for dependency_name in ("liblzma", "libzstd"):
+        version_result = subprocess.run(
+            ["pkg-config", "--modversion", dependency_name],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if version_result.returncode != 0:
+            fail(f"{dependency_name} version is unavailable through pkg-config")
+            continue
         installed = version_tuple(version_result.stdout.strip())
-        minimum = version_tuple(dependencies["liblzma"]["minimum_version"])
-        if installed < minimum or installed[0] >= dependencies["liblzma"]["maximum_major_exclusive"]:
-            fail(f"liblzma {version_result.stdout.strip()} is outside reviewed bounds")
+        minimum = version_tuple(dependencies[dependency_name]["minimum_version"])
+        if installed < minimum or installed[0] >= dependencies[dependency_name]["maximum_major_exclusive"]:
+            fail(f"{dependency_name} {version_result.stdout.strip()} is outside reviewed bounds")
 
     notices = (ROOT / "THIRD_PARTY_NOTICES").read_text()
-    for required in ("libsolv", "BSD-3-Clause", "XZ Utils liblzma", "0BSD"):
+    for required in ("libsolv", "BSD-3-Clause", "XZ Utils liblzma", "Zstandard libzstd", "0BSD"):
         if required not in notices:
             fail(f"THIRD_PARTY_NOTICES is missing {required!r}")
     production_notices = notices.split("OpenPGP fixture", 1)[0]

@@ -44,12 +44,17 @@ Every mutating command requires `--assume-yes`. Noninteractive transaction
 commands additionally require `--conffile keep-existing` or
 `--conffile use-package-version`. `plan` and `download` are non-executing.
 
-The standalone binary instantiates `ProductionBackend`. Missing repository,
+The standalone binary instantiates `ProductionBackend`. A non-mutating `plan`
+or `download` may use `--lock-output` without `--lock-input` to resolve an
+initial canonical lock from authenticated metadata and an empty installed
+package database. Mutating operations never gain this exception and
+package-family create/update requests require the reviewed lock as input.
+Missing repository,
 keyring, status, confirmation, conffile, or exact-lock inputs are reported as
 typed errors for the affected command; there is no global backend-unavailable
 result. Exact-lock input is enforced by planning, acquisition, and execution.
-When `--lock-output` is supplied, the validated `--lock-input` is atomically
-published there. Successful locked transactions atomically publish
+When both lock options are supplied, the validated input is atomically
+published at the output path. Successful locked transactions atomically publish
 `transaction-result.json` under the explicit state path.
 
 ## JSON and compatibility
@@ -81,3 +86,7 @@ One credential reference is restricted to the single normalized HTTP(S)
 origin shared by all configured repositories. `--status-path` is read-only;
 mutating commands always verify `INSTALL_ROOT/var/lib/dpkg/status`.
 No host APT, GnuPG, proxy, credential, or dpkg configuration is consulted.
+Moving repositories require `Valid-Until`. An explicit immutable repository
+configuration may accept a signed Release without that field because the URI
+itself is pinned; signature, Release date, identity, and all index digests
+remain mandatory.

@@ -22,8 +22,10 @@ dpkg locks, direct argv execution, a fixed environment, explicit conffile and
 typed force policy, deferred/final trigger processing, and structured
 interruption/failure provenance. See [Dpkg transaction executor](transaction-executor.md).
 
-Recovery and post-state verification remain outside this boundary and are
-tracked by #28.
+`debz.recoverTransaction` resumes journaled work under the same lock and policy
+bindings. Successful execution and recovery perform exact installed-state
+verification before atomically publishing transaction provenance; unhealthy or
+different dpkg state fails closed.
 
 Archive-producing plan actions retain a typed `selected_origin` that can be
 matched back to the authenticated repository record by the package acquisition
@@ -35,7 +37,13 @@ The project exposes typed configuration and request APIs, a CLI command vocabula
 
 The control-record model validates required identity fields and typed scalar values, preserves unknown fields and source spans, and keeps relation policy decisions separate from syntax parsing.
 
-`debz.deb_archive.parse` validates the outer `ar` structure, required members, `debian-binary` version marker, supported compression suffixes, and configured archive, member, and count limits. It returns borrowed member byte ranges and metadata without copying, decompressing, or unpacking files. Validation of compressed streams and inner tar archives is separate follow-up work; callers must not treat outer-archive validation alone as package-content validation.
+`debz.deb_archive.parse` validates the outer `ar` structure, required members,
+`debian-binary` version marker, supported compression suffixes, and configured
+archive, member, and count limits. `debz.deb_payload.validate` then verifies the
+authenticated identity, bounded compressed streams, inner control and data tar
+archives, canonical paths and links, control identity, conffiles, and payload
+inventory before an archive reaches the executor. See
+[Debian payload validation](deb-payload-validation.md).
 
 `debz.dpkg_status` parses only caller-supplied status bytes or explicit paths. It preserves source diagnostics and models package identity, exact Debian versions, installation states, package flags, dependency relations, and installed size without implicitly reading the host dpkg database.
 
@@ -47,7 +55,7 @@ Repository sources can be supplied explicitly as canonical `.sources` stanzas or
 
 `debz.repository_acquisition` fetches bounded bytes from explicit `file:`, HTTP, or HTTPS URIs. Callers provide proxy, credential, redirect, retry, deadline, clock, and size policies; production HTTPS verifies certificates and hostnames, while injectable transport and file seams support hermetic tests. Provenance contains only redacted effective URIs.
 
-`debz.metadata_decompression` provides allocator-owned, bounded decompression for gzip, xz, and zstd repository metadata. Callers must explicitly select the format or derive it from a trusted selected filename; content magic is never used as a fallback. Compressed size, decompressed size, decoder memory, and an optional expected decompressed size are checked before a result is returned. gzip and zstd use Zig's standard library. xz uses the system liblzma streaming API with a caller-bounded memory limit and full integrity checking.
+`debz.metadata_decompression` provides allocator-owned, bounded decompression for gzip, xz, and zstd repository metadata. Callers must explicitly select the format or derive it from a trusted selected filename; content magic is never used as a fallback. Compressed size, decompressed size, decoder memory, and an optional expected decompressed size are checked before a result is returned. gzip uses Zig's standard library. xz and zstd use the system liblzma and libzstd streaming APIs with caller-bounded memory and full integrity checking.
 
 `debz.metadata_cache` provides an explicit-root, versioned verified-metadata cache. Objects are addressed by SHA-256, repository and snapshot manifests are atomically published only after size and digest verification, cache-only reads reverify referenced bytes, and bounded garbage collection preserves manifest references. It does not perform network refreshes or use ambient host cache directories.
 
@@ -67,6 +75,16 @@ workflows use the same checks. Locking coordinates publication, repair, staging
 cleanup, and deterministic bounded garbage collection. It does not parse
 payloads or execute transactions. See
 [Verified package acquisition](package-acquisition.md).
+
+## Package-family image builder
+
+`debz.package_family_backend` is the stable Ubuntu/Debian image-builder
+boundary. Its non-mutating `resolve_lock` operation may create an initial exact
+lock from authenticated metadata and a deterministic plan. Create, customize,
+update, and recovery continue to require that reviewed lock as input. The
+manual native-architecture real-snapshot matrix exercises this sequence for
+Ubuntu 26.04 `ubuntu-minimal`; see
+[zvmi Debian-family backend](zvmi-package-family.md).
 
 ## Dependency solver
 

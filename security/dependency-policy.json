@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "reviewed_on": "2026-08-15",
-  "review_expires": "2026-11-13",
+  "reviewed_on": "2026-08-16",
+  "review_expires": "2026-11-14",
   "production_dependencies": [
     {
       "name": "libsolv",
@@ -15,7 +15,7 @@
         "https://osv.dev/list?q=libsolv"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-15",
+        "reviewed_on": "2026-08-16",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
@@ -31,7 +31,23 @@
         "https://osv.dev/list?q=xz-utils"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-15",
+        "reviewed_on": "2026-08-16",
+        "result": "no_known_unresolved_advisories"
+      },
+      "reviewed_exceptions": []
+    },
+    {
+      "name": "libzstd",
+      "source": "distribution-system-library",
+      "minimum_version": "1.5.5",
+      "maximum_major_exclusive": 2,
+      "license": "BSD-3-Clause",
+      "vulnerability_sources": [
+        "https://github.com/facebook/zstd/security/advisories",
+        "https://osv.dev/list?q=zstd"
+      ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-16",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []

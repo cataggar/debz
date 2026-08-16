@@ -54,9 +54,20 @@ members produce identical repository and provenance digests. The Release
 validity window is fixed from 2024 through 2037. CI retains full-lane root,
 cache, state, and provenance artifacts for seven days.
 
-Optional real Debian/Ubuntu snapshot checks are intentionally separate from PR
-CI: operators may point the public CLI at explicitly pinned HTTPS snapshots and
-explicit vendor keyrings. Such a lane must cap download size and time and must
-not replace the deterministic fixture gate. apt/dpkg may be used as a
-black-box semantic oracle when developing fixtures, but its output is never
-copied into production expectations.
+The mandatory release-acceptance command is the manual `workflow_dispatch`
+real-snapshot matrix in `.github/workflows/ci.yml`. It runs natively on
+`ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
+`https://snapshot.ubuntu.com/ubuntu/20260816T000000Z`, suite `resolute`,
+component `main`, and the explicit Ubuntu archive keyring. Inputs remain
+visible but validation rejects any value other than that reviewed snapshot.
+
+Each row uses the production CLI to authenticate metadata, resolve and review
+an exact `ubuntu-minimal` closure lock without mutating a root, download and
+validate every payload, create the dpkg root under that exact lock, reproduce
+the lock, and replay it through `upgrade-all`. It verifies dpkg health,
+provenance, native architecture, failure-before-mutation for a tampered lock,
+and the absence of apt processes in the root. Metadata, package, total
+download, disk, retry, command, and workflow limits are bounded. Evidence is
+retained even on failure while package cache and staged root payloads are
+cleaned. The lane is manual because of bandwidth, but release acceptance
+requires dispatching it successfully; it does not replace deterministic PR CI.

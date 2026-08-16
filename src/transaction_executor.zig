@@ -1,10 +1,11 @@
 const std = @import("std");
 const solver = @import("solver.zig");
 const deb_payload = @import("deb_payload.zig");
+const dpkg_status = @import("dpkg_status.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
 
-pub const Phase = enum { remove, unpack, configure, triggers, audit };
+pub const Phase = enum { bootstrap_extract, remove, unpack, configure_pending, configure, triggers, audit };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
 
 pub const ForceRisk = enum {
@@ -99,11 +100,16 @@ pub const ProcessRunner = struct {
 pub const FileSystem = struct {
     context: *anyopaque,
     validateRootFn: *const fn (*anyopaque, []const u8) anyerror!void,
+    normalizeBootstrapRootFn: *const fn (*anyopaque, []const u8) anyerror!void,
     validateArtifactPathFn: *const fn (*anyopaque, []const u8) anyerror!void,
     readArtifactFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) anyerror![]u8,
 
     pub fn validateRoot(self: FileSystem, root: []const u8) !void {
         return self.validateRootFn(self.context, root);
+    }
+
+    pub fn normalizeBootstrapRoot(self: FileSystem, root: []const u8) !void {
+        return self.normalizeBootstrapRootFn(self.context, root);
     }
 
     pub fn readArtifact(
@@ -314,6 +320,7 @@ pub fn execute(
         try rootPath(arena, request.install_root, "var/lib/dpkg/lock"),
     };
     var held: [lock_paths.len]?LockToken = @splat(null);
+    var bootstrap_normalized = !requiresRootBootstrap(request.plan.actions);
     defer for (held, 0..) |token, index| {
         if (token) |value| dependencies.locks.release(value);
         held[index] = null;
@@ -389,6 +396,18 @@ pub fn execute(
     };
 
     for (request.plan.ordered_actions, 0..) |ordered, command_index| {
+        if (!bootstrap_normalized and ordered.kind != .bootstrap_extract) {
+            dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
+                state.failure = .{
+                    .code = .invalid_root,
+                    .phase = toPhase(ordered.kind),
+                    .diagnostic = try arena.dupe(u8, @errorName(err)),
+                    .completed_commands = state.commands.items.len,
+                };
+                return finish(allocator, arena_ptr, &state, plan_sha256);
+            };
+            bootstrap_normalized = true;
+        }
         if (dependencies.cancellation.cancelled()) {
             journal.state = .interrupted;
             journal.failure = "cancelled before dpkg invocation";
@@ -402,7 +421,7 @@ pub fn execute(
             state.failure = .{
                 .code = .lock_lost,
                 .phase = toPhase(ordered.kind),
-                .package = try arena.dupe(u8, ordered.package),
+                .package = if (ordered.kind == .configure_pending) null else try arena.dupe(u8, ordered.package),
                 .diagnostic = "transaction lock ownership was lost",
                 .completed_commands = state.commands.items.len,
             };
@@ -420,7 +439,7 @@ pub fn execute(
         };
 
         const phase = toPhase(ordered.kind);
-        const artifact = if (phase == .unpack)
+        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
             null;
@@ -441,6 +460,7 @@ pub fn execute(
 
         const argv = try buildArgv(
             arena,
+            request.install_root,
             root_flag,
             admin_flag,
             phase,
@@ -476,18 +496,22 @@ pub fn execute(
             state.failure = journalFailure(arena, err, .journal_io, "cannot persist command boundary");
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
+        const configured_before = if (phase == .configure_pending)
+            configuredPackageCount(arena, dependencies.status, request.install_root) catch null
+        else
+            null;
         const result = dependencies.process.run(.{
             .argv = argv,
             .environment = &audited_environment,
             .phase = phase,
-            .package = ordered.package,
+            .package = if (phase == .configure_pending) null else ordered.package,
             .timeout_ms = request.policy.process_timeout_ms,
             .cancellation = dependencies.cancellation,
         }) catch |err| {
             state.failure = .{
                 .code = if (err == error.Timeout) .process_timeout else .process_spawn,
                 .phase = phase,
-                .package = try arena.dupe(u8, ordered.package),
+                .package = if (phase == .configure_pending) null else try arena.dupe(u8, ordered.package),
                 .diagnostic = try arena.dupe(u8, @errorName(err)),
                 .completed_commands = state.commands.items.len,
             };
@@ -498,7 +522,14 @@ pub fn execute(
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
         try state.commands.append(arena, provenance);
-        if (!successful(result.termination)) {
+        const made_configuration_progress = if (!successful(result.termination) and configured_before != null)
+            if (configuredPackageCount(arena, dependencies.status, request.install_root) catch null) |after|
+                after > configured_before.?
+            else
+                false
+        else
+            false;
+        if (!successful(result.termination) and !made_configuration_progress) {
             state.failure = try processFailure(arena, result, phase, ordered.package, request.policy.maximum_diagnostic_bytes, state.commands.items.len);
             journal.state = if (state.failure.?.code == .interrupted) .interrupted else .dpkg_failed;
             journal.failure = state.failure.?.diagnostic;
@@ -827,6 +858,12 @@ pub fn recover(
     }
     dependencies.locks.release(held[2].?);
     held[2] = null;
+    if (requiresRootBootstrap(request.plan.actions)) {
+        dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
+            state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
+    }
 
     journal.state = .in_progress;
     journal.boundary = .recovering;
@@ -1030,12 +1067,13 @@ fn buildJournalCommands(
     var commands: std.ArrayList(recovery.Command) = .empty;
     for (request.plan.ordered_actions) |ordered| {
         const phase = toPhase(ordered.kind);
-        const artifact = if (phase == .unpack)
+        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
             null;
         const argv = try buildArgv(
             allocator,
+            request.install_root,
             root_flag,
             admin_flag,
             phase,
@@ -1115,9 +1153,9 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             return error.OrderedActionMissingPlanAction;
         switch (ordered.kind) {
             .remove => if (action.kind != .remove) return error.InvalidRemoveOrdering,
-            .unpack, .configure => if (action.kind == .remove) return error.InvalidInstallOrdering,
+            .bootstrap_extract, .unpack, .configure_pending => if (action.kind == .remove) return error.InvalidInstallOrdering,
         }
-        if (ordered.kind == .unpack and
+        if ((ordered.kind == .bootstrap_extract or ordered.kind == .unpack) and
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture) == null)
             return error.MissingArtifact;
     }
@@ -1127,36 +1165,44 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 return error.DuplicatePlanAction;
         }
         var removes: usize = 0;
+        var bootstrap_extracts: usize = 0;
         var unpacks: usize = 0;
-        var configures: usize = 0;
+        var configure_pending_count: usize = 0;
         var unpack_index: ?usize = null;
-        var configure_index: ?usize = null;
         for (request.plan.ordered_actions, 0..) |ordered, ordered_index| {
             if (!sameIdentity(action.package, action.version, action.architecture, ordered.package, ordered.version, ordered.architecture))
                 continue;
             switch (ordered.kind) {
+                .bootstrap_extract => bootstrap_extracts += 1,
                 .remove => removes += 1,
                 .unpack => {
                     unpacks += 1;
                     unpack_index = ordered_index;
                 },
-                .configure => {
-                    configures += 1;
-                    configure_index = ordered_index;
-                },
+                .configure_pending => configure_pending_count += 1,
             }
         }
         if (action.kind == .remove) {
-            if (removes != 1 or unpacks != 0 or configures != 0) return error.IncompleteRemoveOrdering;
-        } else if (removes != 0 or unpacks != 1 or configures != 1) {
+            if (bootstrap_extracts != 0 or removes != 1 or unpacks != 0 or configure_pending_count != 0) return error.IncompleteRemoveOrdering;
+        } else if (removes != 0 or unpacks != 1) {
             return error.IncompleteInstallOrdering;
         } else {
-            if (unpack_index.? >= configure_index.?) return error.ConfigureBeforeUnpack;
+            const expected_bootstrap: usize = if (requiresRootBootstrap(request.plan.actions) and action.prior_installed == null) 1 else 0;
+            if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
             if (action.repository == null or action.sha256 == null or action.package_size == null)
                 return error.MissingAuthenticatedArtifactMetadata;
             _ = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
         }
     }
+    var last_unpack: ?usize = null;
+    var last_configure_pending: ?usize = null;
+    for (request.plan.ordered_actions, 0..) |ordered, index| switch (ordered.kind) {
+        .unpack => last_unpack = index,
+        .configure_pending => last_configure_pending = index,
+        else => {},
+    };
+    if (last_unpack != null and (last_configure_pending == null or last_configure_pending.? < last_unpack.?))
+        return error.IncompleteInstallOrdering;
 
     for (request.artifacts, 0..) |artifact, index| {
         try validateIdentity(artifact.package);
@@ -1225,6 +1271,7 @@ fn validateArtifact(
 
 fn buildArgv(
     allocator: std.mem.Allocator,
+    install_root: []const u8,
     root_flag: []const u8,
     admin_flag: []const u8,
     phase: Phase,
@@ -1234,11 +1281,18 @@ fn buildArgv(
     policy: Policy,
 ) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
+    if (phase == .bootstrap_extract) {
+        try argv.append(allocator, "/usr/bin/dpkg-deb");
+        try argv.append(allocator, "--extract");
+        try argv.append(allocator, artifact_path.?);
+        try argv.append(allocator, install_root);
+        return argv.toOwnedSlice(allocator);
+    }
     try argv.append(allocator, "/usr/bin/dpkg");
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
     try argv.append(allocator, "--no-pager");
-    try argv.append(allocator, "--abort-after=1");
+    if (phase != .configure_pending) try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
     for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
     try argv.append(allocator, "--no-triggers");
@@ -1251,11 +1305,15 @@ fn buildArgv(
             try argv.append(allocator, "--unpack");
             try argv.append(allocator, artifact_path.?);
         },
+        .configure_pending => {
+            try argv.append(allocator, "--configure");
+            try argv.append(allocator, "--pending");
+        },
         .configure => {
             try argv.append(allocator, "--configure");
             try argv.append(allocator, try packageSpec(allocator, package, architecture));
         },
-        .triggers, .audit => unreachable,
+        .bootstrap_extract, .triggers, .audit => unreachable,
     }
     return argv.toOwnedSlice(allocator);
 }
@@ -1339,6 +1397,27 @@ fn processFailure(
     };
 }
 
+fn configuredPackageCount(
+    allocator: std.mem.Allocator,
+    status: recovery.StatusReader,
+    root: []const u8,
+) !usize {
+    const source = try status.read(allocator, root, 64 * 1024 * 1024);
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return error.InvalidDpkgStatus,
+        .database => |value| value,
+    };
+    defer database.deinit();
+    var count: usize = 0;
+    for (database.database.packages) |package|
+        if (package.status.isFullyInstalled()) {
+            count += 1;
+        };
+    return count;
+}
+
 fn interruption(phase: ?Phase, package: ?[]const u8, completed: usize, diagnostic: []const u8) Failure {
     return .{
         .code = .interrupted,
@@ -1384,6 +1463,12 @@ fn validateIdentity(value: []const u8) !void {
     if (value.len == 0 or value.len > 4096) return error.InvalidIdentity;
     if (std.mem.findAny(u8, value, &.{ 0, '\n', '\r' }) != null) return error.InvalidIdentity;
     if (value[0] == '-') return error.OptionLikeIdentity;
+}
+
+fn requiresRootBootstrap(actions: []const solver.PlanAction) bool {
+    for (actions) |action|
+        if (action.kind != .remove and action.essential and action.prior_installed == null) return true;
+    return false;
 }
 
 fn validateForces(forces: []const ForceRisk) !void {
@@ -1433,9 +1518,10 @@ fn samePackageArchitecture(
 
 fn toPhase(kind: solver.OrderedActionKind) Phase {
     return switch (kind) {
+        .bootstrap_extract => .bootstrap_extract,
         .remove => .remove,
         .unpack => .unpack,
-        .configure => .configure,
+        .configure_pending => .configure_pending,
     };
 }
 
@@ -1623,15 +1709,17 @@ pub const SystemProcessRunner = struct {
                 return .{ .termination = .cancelled };
             },
         };
+        const diagnostics = try std.mem.concat(self.allocator, u8, &.{ result.stdout, result.stderr });
         self.allocator.free(result.stdout);
-        self.last_stderr = result.stderr;
+        self.allocator.free(result.stderr);
+        self.last_stderr = diagnostics;
         const termination: ProcessTermination = switch (result.term) {
             .exited => |code| .{ .exited = code },
             .signal => |signal| .{ .signaled = @intFromEnum(signal) },
             .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
             .unknown => |status| .{ .signaled = status },
         };
-        return .{ .termination = termination, .stderr = result.stderr };
+        return .{ .termination = termination, .stderr = diagnostics };
     }
 
     fn runChild(
@@ -1664,12 +1752,14 @@ pub const SystemProcessRunner = struct {
 /// Production filesystem adapter. Every install-root component is opened with
 /// symlink following disabled; artifact leaf symlinks are also rejected.
 pub const SystemFileSystem = struct {
+    allocator: std.mem.Allocator,
     io: std.Io,
 
     pub fn interface(self: *SystemFileSystem) FileSystem {
         return .{
             .context = self,
             .validateRootFn = validateRoot,
+            .normalizeBootstrapRootFn = normalizeBootstrapRoot,
             .validateArtifactPathFn = validateArtifactPath,
             .readArtifactFn = readArtifact,
         };
@@ -1689,6 +1779,70 @@ pub const SystemFileSystem = struct {
             const next = try current.openDir(self.io, component, .{ .follow_symlinks = false });
             current.close(self.io);
             current = next;
+        }
+    }
+
+    fn normalizeBootstrapRoot(context: *anyopaque, root: []const u8) !void {
+        const self: *SystemFileSystem = @ptrCast(@alignCast(context));
+        var directory = try std.Io.Dir.openDirAbsolute(self.io, root, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        defer directory.close(self.io);
+        for ([_][2][]const u8{
+            .{ "bin", "usr/bin" },
+            .{ "sbin", "usr/sbin" },
+            .{ "lib", "usr/lib" },
+            .{ "lib64", "usr/lib64" },
+        }) |mapping| {
+            var target_buffer: [64]u8 = undefined;
+            if (directory.readLink(self.io, mapping[0], &target_buffer)) |length| {
+                if (!std.mem.eql(u8, target_buffer[0..length], mapping[1]))
+                    return error.UnsafeMergedUsrLink;
+                continue;
+            } else |_| {}
+
+            var legacy = directory.openDir(self.io, mapping[0], .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
+                    continue;
+                },
+                else => return err,
+            };
+            var merged = try directory.openDir(self.io, mapping[1], .{
+                .iterate = true,
+                .follow_symlinks = false,
+            });
+            mergeBootstrapDirectory(self.io, legacy, merged) catch |err| {
+                merged.close(self.io);
+                legacy.close(self.io);
+                return err;
+            };
+            merged.close(self.io);
+            legacy.close(self.io);
+            try directory.deleteDir(self.io, mapping[0]);
+            try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
+        }
+        inline for (.{
+            .{ "usr/share/base-passwd/passwd.master", "etc/passwd" },
+            .{ "usr/share/base-passwd/group.master", "etc/group" },
+        }) |mapping| {
+            const bytes: ?[]u8 = directory.readFileAlloc(
+                self.io,
+                mapping[0],
+                self.allocator,
+                .limited(64 * 1024),
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (bytes) |contents| {
+                defer self.allocator.free(contents);
+                try directory.writeFile(self.io, .{ .sub_path = mapping[1], .data = contents });
+            }
         }
     }
 
@@ -1731,6 +1885,51 @@ pub const SystemFileSystem = struct {
         file.close(self.io);
     }
 };
+
+fn mergeBootstrapDirectory(io: std.Io, source: std.Io.Dir, target: std.Io.Dir) !void {
+    while (true) {
+        var iterator = source.iterate();
+        const entry = try iterator.next(io) orelse break;
+        switch (entry.kind) {
+            .directory => {
+                var source_child = try source.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                var target_child = target.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                }) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        source_child.close(io);
+                        try source.rename(entry.name, target, entry.name, io);
+                        continue;
+                    },
+                    else => {
+                        source_child.close(io);
+                        return err;
+                    },
+                };
+                mergeBootstrapDirectory(io, source_child, target_child) catch |err| {
+                    target_child.close(io);
+                    source_child.close(io);
+                    return err;
+                };
+                target_child.close(io);
+                source_child.close(io);
+                try source.deleteDir(io, entry.name);
+            },
+            .file, .sym_link => {
+                if (target.statFile(io, entry.name, .{})) |_| return error.BootstrapPathCollision else |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                }
+                try source.rename(entry.name, target, entry.name, io);
+            },
+            else => return error.UnsafeBootstrapEntry,
+        }
+    }
+}
 
 /// Production bounded advisory lock adapter. A token owns the locked file
 /// descriptor until release.
@@ -1864,6 +2063,7 @@ const TestHarness = struct {
     journal_writes: usize = 0,
     journal_archived: bool = false,
     status_source: ?[]const u8 = null,
+    status_source_after_first_read: ?[]const u8 = null,
     status_reads: usize = 0,
     crash_point: ?recovery.CrashPoint = null,
     crash_index: usize = 0,
@@ -1873,6 +2073,7 @@ const TestHarness = struct {
             .filesystem = .{
                 .context = self,
                 .validateRootFn = validateRoot,
+                .normalizeBootstrapRootFn = normalizeBootstrapRoot,
                 .validateArtifactPathFn = validateArtifactPath,
                 .readArtifactFn = readArtifact,
             },
@@ -1901,6 +2102,8 @@ const TestHarness = struct {
         self.root_validate_count += 1;
         if (!self.root_valid or self.root_fail_after == current) return error.SymlinkRoot;
     }
+
+    fn normalizeBootstrapRoot(_: *anyopaque, _: []const u8) !void {}
 
     fn readArtifact(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
         const self: *TestHarness = @ptrCast(@alignCast(context));
@@ -1971,12 +2174,23 @@ const TestHarness = struct {
     fn readStatus(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
         const self: *TestHarness = @ptrCast(@alignCast(context));
         self.status_reads += 1;
+        if (self.status_source_after_first_read) |source|
+            if (self.status_reads > 1) return allocator.dupe(u8, source);
         if (self.status_source) |source| return allocator.dupe(u8, source);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
-        for (self.invocations[0..self.invocation_count]) |invocation| {
-            if (invocation.phase != .configure or invocation.package == null) continue;
+        for (self.invocations[0..self.invocation_count], 0..) |invocation, index| {
+            if (invocation.phase == .unpack and invocation.package != null) {
+                var configured = false;
+                for (self.invocations[index + 1 .. self.invocation_count], index + 1..) |later, later_index|
+                    if (later.phase == .configure_pending) {
+                        if (self.fail_at == later_index) continue;
+                        configured = true;
+                        break;
+                    };
+                if (!configured) continue;
+            } else if (invocation.phase != .configure or invocation.package == null) continue;
             try writer.print(
                 "Package: {s}\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n",
                 .{invocation.package.?},
@@ -2078,9 +2292,11 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    actions[0].essential = true;
     var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 0, .kind = .bootstrap_extract, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes };
@@ -2093,12 +2309,15 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     defer report.deinit();
 
     try std.testing.expect(report.succeeded());
-    try std.testing.expectEqual(@as(usize, 3), harness.invocation_count);
-    try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[0].argv[0]);
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--root=/target"));
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--force-confold"));
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--no-triggers"));
+    try std.testing.expectEqual(@as(usize, 4), harness.invocation_count);
+    try std.testing.expectEqualStrings("/usr/bin/dpkg-deb", harness.invocations[0].argv[0]);
+    try std.testing.expect(containsArg(harness.invocations[0].argv, "--extract"));
+    try std.testing.expect(containsArg(harness.invocations[0].argv, "/target"));
+    try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[1].argv[0]);
+    try std.testing.expect(containsArg(harness.invocations[1].argv, "--root=/target"));
+    try std.testing.expect(containsArg(harness.invocations[1].argv, "--force-confold"));
     try std.testing.expect(containsArg(harness.invocations[1].argv, "--no-triggers"));
+    try std.testing.expect(containsArg(harness.invocations[2].argv, "--no-triggers"));
     try std.testing.expect(!containsArg(harness.invocations[0].argv, "sh"));
     try std.testing.expectEqual(@as(usize, audited_environment.len), harness.invocations[0].environment.len);
     try std.testing.expectEqualStrings("DEBIAN_FRONTEND", harness.invocations[0].environment[0].key);
@@ -2189,7 +2408,7 @@ test "transaction_executor.test.digest mismatch is rechecked after locks before 
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
     var ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes, .corrupt_read = true };
@@ -2232,6 +2451,37 @@ test "transaction_executor.test.dpkg failure has package phase exit and never su
     try std.testing.expectEqualStrings("demo postrm maintainer script returned error", report.failure.?.diagnostic);
     try std.testing.expectEqual(@as(usize, 1), report.failure.?.completed_commands);
     try std.testing.expectEqual(@as(usize, 1), report.commands.len);
+}
+
+test "transaction_executor.test.configure pending accepts only measured dpkg progress" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    const installed =
+        "Package: demo\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n";
+    var harness: TestHarness = .{
+        .bytes = bytes,
+        .fail_at = 1,
+        .fail_termination = .{ .exited = 1 },
+        .stderr = "one pending package remains dependency-blocked",
+        .status_source = "",
+        .status_source_after_first_read = installed,
+    };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expect(report.succeeded());
+    try std.testing.expectEqual(@as(usize, 3), harness.invocation_count);
+    try std.testing.expect(!containsArg(harness.invocations[1].argv, "--abort-after=1"));
 }
 
 test "transaction_executor.test.process timeout is bounded and structured" {
@@ -2499,7 +2749,7 @@ test "transaction_executor.test.unfinished journal blocks normal retry and binds
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
     var ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes, .cancelled_value = true };
@@ -2640,7 +2890,7 @@ test "transaction_executor.test.completed recovery retains unhealthy-state evide
 }
 
 test "transaction_executor.test.production adapters expose injectable interfaces" {
-    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     var locks: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     var process: SystemProcessRunner = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer process.deinit();
@@ -2661,7 +2911,7 @@ test "transaction_executor.test.production filesystem accepts an exact-size arti
         .{path_buffer[0..root_length]},
     );
     defer std.testing.allocator.free(path);
-    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     const bytes = try filesystem.interface().readArtifact(std.testing.allocator, path, 5);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("exact", bytes);
@@ -2669,6 +2919,46 @@ test "transaction_executor.test.production filesystem accepts an exact-size arti
         error.StreamTooLong,
         filesystem.interface().readArtifact(std.testing.allocator, path, 4),
     );
+}
+
+test "transaction_executor.test.bootstrap normalization restores empty merged-usr directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/bin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/sbin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/lib");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/lib64");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/share/base-passwd");
+    try tmp.dir.createDirPath(std.testing.io, "root/etc");
+    try tmp.dir.createDirPath(std.testing.io, "root/lib");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/lib/bootstrap-file", .data = "safe" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/passwd.master",
+        .data = "root:x:0:0:root:/root:/bin/sh\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/group.master",
+        .data = "root:x:0:\nmail:x:8:\n",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{path_buffer[0..root_length]});
+    defer std.testing.allocator.free(root);
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    try filesystem.interface().normalizeBootstrapRoot(root);
+    var target: [64]u8 = undefined;
+    const length = try tmp.dir.readLink(std.testing.io, "root/lib", &target);
+    try std.testing.expectEqualStrings("usr/lib", target[0..length]);
+    var moved = try tmp.dir.openFile(std.testing.io, "root/usr/lib/bootstrap-file", .{});
+    moved.close(std.testing.io);
+    const group = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "root/etc/group",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(group);
+    try std.testing.expectEqualStrings("root:x:0:\nmail:x:8:\n", group);
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {

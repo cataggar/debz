@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @cImport({
     @cInclude("lzma.h");
+    @cInclude("zstd.h");
 });
 
 pub const Compression = enum {
@@ -125,47 +126,49 @@ fn decompressZstd(
         !std.mem.eql(u8, compressed[0..4], &.{ 0x28, 0xb5, 0x2f, 0xfd }))
         return error.CompressionMismatch;
 
-    const window_len: u32 = @intCast(@min(
-        options.maximum_decoder_memory,
-        std.math.maxInt(u32),
-    ));
-    var input = std.Io.Reader.fixed(compressed);
-    var decoder: std.compress.zstd.Decompress = .init(&input, &.{}, .{
-        .window_len = window_len,
-    });
+    if (options.maximum_decoder_memory < 1024) return error.MemoryLimitExceeded;
+    if (c.ZSTD_getDictID_fromFrame(compressed.ptr, compressed.len) != 0)
+        return error.Unsupported;
+    const decoder = c.ZSTD_createDStream() orelse return error.OutOfMemory;
+    defer _ = c.ZSTD_freeDStream(decoder);
+    const window_log: c_int = @intCast(std.math.log2_int(u64, options.maximum_decoder_memory));
+    if (c.ZSTD_isError(c.ZSTD_DCtx_setParameter(decoder, c.ZSTD_d_windowLogMax, window_log)) != 0)
+        return error.MemoryLimitExceeded;
+    if (c.ZSTD_isError(c.ZSTD_initDStream(decoder)) != 0) return error.Corrupt;
+
+    var input = c.ZSTD_inBuffer{
+        .src = compressed.ptr,
+        .size = compressed.len,
+        .pos = 0,
+    };
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    var scratch: [std.compress.zstd.block_size_max]u8 = undefined;
+    var scratch: [128 * 1024]u8 = undefined;
     while (true) {
-        var writer = std.Io.Writer.fixed(&scratch);
-        const produced = decoder.reader.stream(
-            &writer,
-            .limited(scratch.len),
-        ) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => return mapZstdError(decoder.err, input.seek),
-            error.WriteFailed => return error.OutputLimitExceeded,
+        const previous_input = input.pos;
+        var chunk = c.ZSTD_outBuffer{
+            .dst = &scratch,
+            .size = scratch.len,
+            .pos = 0,
         };
+        const remaining = c.ZSTD_decompressStream(decoder, &chunk, &input);
+        if (c.ZSTD_isError(remaining) != 0) return error.Corrupt;
+        const produced: usize = @intCast(chunk.pos);
         const new_len = std.math.add(usize, output.items.len, produced) catch
             return error.OutputLimitExceeded;
         if (new_len > options.maximum_decompressed_bytes)
             return error.OutputLimitExceeded;
         output.appendSlice(allocator, scratch[0..produced]) catch
             return error.OutOfMemory;
+        if (remaining == 0) {
+            if (input.pos != compressed.len) return error.TrailingData;
+            break;
+        }
+        if (input.pos == previous_input and produced == 0)
+            return if (input.pos == compressed.len) error.Truncated else error.Corrupt;
     }
 
-    if (input.seek != compressed.len) return error.TrailingData;
     return output.toOwnedSlice(allocator) catch error.OutOfMemory;
-}
-
-fn mapZstdError(err: ?std.compress.zstd.Decompress.Error, consumed: usize) Error {
-    return switch (err orelse return error.Corrupt) {
-        error.EndOfStream, error.InputBufferUndersize => error.Truncated,
-        error.BadMagic => if (consumed > 4) error.TrailingData else error.CompressionMismatch,
-        error.WindowOversize, error.OutputBufferUndersize => error.MemoryLimitExceeded,
-        error.DictionaryIdFlagUnsupported => error.Unsupported,
-        else => error.Corrupt,
-    };
 }
 
 fn decompressXz(
