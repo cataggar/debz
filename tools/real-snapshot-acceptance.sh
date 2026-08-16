@@ -58,6 +58,11 @@ source_file=$workspace/ubuntu.sources
 config_file=$workspace/ubuntu.json
 lock=$evidence/ubuntu-minimal.lock.json
 mkdir -p "$root/var/lib/debz" "$root/var/lib/dpkg/"{info,updates,triggers} "$cache" "$state" "$evidence"
+mkdir -p "$root/usr/"{bin,sbin,lib,lib64}
+ln -s usr/bin "$root/bin"
+ln -s usr/sbin "$root/sbin"
+ln -s usr/lib "$root/lib"
+ln -s usr/lib64 "$root/lib64"
 : >"$root/var/lib/dpkg/status"
 : >"$root/var/lib/dpkg/available"
 cat >"$source_file" <<EOF
