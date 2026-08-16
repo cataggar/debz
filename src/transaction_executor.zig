@@ -1778,11 +1778,16 @@ pub const SystemFileSystem = struct {
                 },
                 else => return err,
             };
-            var iterator = legacy.iterate();
-            if (try iterator.next(self.io) != null) {
+            var merged = try directory.openDir(self.io, mapping[1], .{
+                .iterate = true,
+                .follow_symlinks = false,
+            });
+            mergeBootstrapDirectory(self.io, legacy, merged) catch |err| {
+                merged.close(self.io);
                 legacy.close(self.io);
-                return error.NonEmptyLegacyUsrDirectory;
-            }
+                return err;
+            };
+            merged.close(self.io);
             legacy.close(self.io);
             try directory.deleteDir(self.io, mapping[0]);
             try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
@@ -1828,6 +1833,51 @@ pub const SystemFileSystem = struct {
         file.close(self.io);
     }
 };
+
+fn mergeBootstrapDirectory(io: std.Io, source: std.Io.Dir, target: std.Io.Dir) !void {
+    while (true) {
+        var iterator = source.iterate();
+        const entry = try iterator.next(io) orelse break;
+        switch (entry.kind) {
+            .directory => {
+                var source_child = try source.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                var target_child = target.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                }) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        source_child.close(io);
+                        try source.rename(entry.name, target, entry.name, io);
+                        continue;
+                    },
+                    else => {
+                        source_child.close(io);
+                        return err;
+                    },
+                };
+                mergeBootstrapDirectory(io, source_child, target_child) catch |err| {
+                    target_child.close(io);
+                    source_child.close(io);
+                    return err;
+                };
+                target_child.close(io);
+                source_child.close(io);
+                try source.deleteDir(io, entry.name);
+            },
+            .file, .sym_link => {
+                if (target.statFile(io, entry.name, .{})) |_| return error.BootstrapPathCollision else |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                }
+                try source.rename(entry.name, target, entry.name, io);
+            },
+            else => return error.UnsafeBootstrapEntry,
+        }
+    }
+}
 
 /// Production bounded advisory lock adapter. A token owns the locked file
 /// descriptor until release.
@@ -2792,6 +2842,7 @@ test "transaction_executor.test.bootstrap normalization restores empty merged-us
     try tmp.dir.createDirPath(std.testing.io, "root/usr/lib");
     try tmp.dir.createDirPath(std.testing.io, "root/usr/lib64");
     try tmp.dir.createDirPath(std.testing.io, "root/lib");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/lib/bootstrap-file", .data = "safe" });
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
     const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{path_buffer[0..root_length]});
@@ -2801,6 +2852,8 @@ test "transaction_executor.test.bootstrap normalization restores empty merged-us
     var target: [64]u8 = undefined;
     const length = try tmp.dir.readLink(std.testing.io, "root/lib", &target);
     try std.testing.expectEqualStrings("usr/lib", target[0..length]);
+    var moved = try tmp.dir.openFile(std.testing.io, "root/usr/lib/bootstrap-file", .{});
+    moved.close(std.testing.io);
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
