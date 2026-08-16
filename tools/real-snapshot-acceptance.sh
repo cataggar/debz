@@ -90,7 +90,7 @@ run() {
   grep -q '"exit_status":0' "$evidence/$name.json"
 }
 
-run refresh refresh "${common[@]}"
+run refresh refresh "${common[@]}" --assume-yes
 metadata_bytes=$(du -sb "$cache" | cut -f1)
 (( metadata_bytes <= max_cache_bytes ))
 
