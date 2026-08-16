@@ -1578,7 +1578,7 @@ fn artifactCode(err: anyerror) FailureCode {
 pub const SystemProcessRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    stderr_limit: usize = maximum_diagnostic_limit,
+    stderr_limit: usize = 64 * 1024,
     last_stderr: ?[]u8 = null,
 
     pub fn interface(self: *SystemProcessRunner) ProcessRunner {
@@ -1594,61 +1594,64 @@ pub const SystemProcessRunner = struct {
         const self: *SystemProcessRunner = @ptrCast(@alignCast(context));
         if (self.last_stderr) |stderr| self.allocator.free(stderr);
         self.last_stderr = null;
-        if (invocation.cancellation.cancelled())
-            return .{ .termination = .cancelled };
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
         for (invocation.environment) |entry| try environment.put(entry.key, entry.value);
 
-        var child = try std.process.spawn(self.io, .{
-            .argv = invocation.argv,
-            .environ_map = &environment,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        });
-        defer child.kill(self.io);
         const Outcome = union(enum) {
-            term: std.process.Child.WaitError!std.process.Child.Term,
-            timeout,
+            result: std.process.RunError!std.process.RunResult,
             cancelled,
         };
-        var outcomes: [3]Outcome = undefined;
+        var outcomes: [2]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.term, std.process.Child.wait, .{ &child, self.io });
-        select.async(.timeout, sleepFor, .{ self.io, invocation.timeout_ms });
+        select.async(.result, runChild, .{ self, invocation, &environment });
         select.async(.cancelled, waitCancellation, .{ self.io, invocation.cancellation });
         errdefer select.cancelDiscard();
-        const term = switch (try select.await()) {
-            .term => |term| term: {
+        const result = switch (try select.await()) {
+            .result => |result| result: {
                 select.cancelDiscard();
-                break :term try term;
-            },
-            .timeout => {
-                select.cancelDiscard();
-                child.kill(self.io);
-                return error.Timeout;
+                break :result try result;
             },
             .cancelled => {
-                select.cancelDiscard();
-                child.kill(self.io);
+                while (select.cancel()) |outcome| switch (outcome) {
+                    .result => |result| if (result) |completed| {
+                        self.allocator.free(completed.stdout);
+                        self.allocator.free(completed.stderr);
+                    } else |_| {},
+                    .cancelled => {},
+                };
                 return .{ .termination = .cancelled };
             },
         };
-        const termination: ProcessTermination = switch (term) {
+        self.allocator.free(result.stdout);
+        self.last_stderr = result.stderr;
+        const termination: ProcessTermination = switch (result.term) {
             .exited => |code| .{ .exited = code },
             .signal => |signal| .{ .signaled = @intFromEnum(signal) },
             .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
             .unknown => |status| .{ .signaled = status },
         };
-        return .{ .termination = termination, .stderr = &.{} };
+        return .{ .termination = termination, .stderr = result.stderr };
     }
 
-    fn sleepFor(io: std.Io, timeout_ms: u64) void {
-        io.sleep(.fromMilliseconds(@intCast(@min(
-            timeout_ms,
-            @as(u64, std.math.maxInt(i64)),
-        ))), .awake) catch {};
+    fn runChild(
+        self: *SystemProcessRunner,
+        invocation: Invocation,
+        environment: *const std.process.Environ.Map,
+    ) std.process.RunError!std.process.RunResult {
+        return std.process.run(self.allocator, self.io, .{
+            .argv = invocation.argv,
+            .environ_map = environment,
+            .stdout_limit = .limited(self.stderr_limit),
+            .stderr_limit = .limited(self.stderr_limit),
+            .timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@min(
+                    invocation.timeout_ms,
+                    @as(u64, std.math.maxInt(i64)),
+                ))),
+                .clock = .awake,
+            } },
+        });
     }
 
     fn waitCancellation(io: std.Io, cancellation: Cancellation) void {
@@ -1656,7 +1659,6 @@ pub const SystemProcessRunner = struct {
             io.sleep(.fromMilliseconds(10), .awake) catch return;
         }
     }
-
 };
 
 /// Production filesystem adapter. Every install-root component is opened with
@@ -1707,7 +1709,13 @@ pub const SystemFileSystem = struct {
         defer file.close(self.io);
         var reader_buffer: [8192]u8 = undefined;
         var reader = file.reader(self.io, &reader_buffer);
-        return reader.interface.allocRemaining(allocator, .limited(maximum));
+        const probe_limit = std.math.add(usize, maximum, 1) catch maximum;
+        const bytes = try reader.interface.allocRemaining(allocator, .limited(probe_limit));
+        if (bytes.len > maximum) {
+            allocator.free(bytes);
+            return error.StreamTooLong;
+        }
+        return bytes;
     }
 
     fn validateArtifactPath(context: *anyopaque, path: []const u8) !void {
@@ -2639,6 +2647,28 @@ test "transaction_executor.test.production adapters expose injectable interfaces
     _ = filesystem.interface();
     _ = locks.interface();
     _ = process.interface();
+}
+
+test "transaction_executor.test.production filesystem accepts an exact-size artifact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "artifact.deb", .data = "exact" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/artifact.deb",
+        .{path_buffer[0..root_length]},
+    );
+    defer std.testing.allocator.free(path);
+    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    const bytes = try filesystem.interface().readArtifact(std.testing.allocator, path, 5);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("exact", bytes);
+    try std.testing.expectError(
+        error.StreamTooLong,
+        filesystem.interface().readArtifact(std.testing.allocator, path, 4),
+    );
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
