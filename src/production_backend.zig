@@ -344,7 +344,12 @@ pub const Backend = struct {
                 generated_lock = lockFromPlan(allocator, effective_request, refreshed, plan.*) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return api.failure(request.operation, .planning, .planning_failed, "authenticated plan could not produce a complete exact lock"),
+                        else => return api.failure(
+                            request.operation,
+                            .planning,
+                            .planning_failed,
+                            try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
+                        ),
                     };
                 try writeLock(allocator, self.io, path, generated_lock.?.lock);
             }
