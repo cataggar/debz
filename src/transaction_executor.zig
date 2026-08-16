@@ -1594,35 +1594,13 @@ pub const SystemProcessRunner = struct {
         const self: *SystemProcessRunner = @ptrCast(@alignCast(context));
         if (self.last_stderr) |stderr| self.allocator.free(stderr);
         self.last_stderr = null;
+        if (invocation.cancellation.cancelled())
+            return .{ .termination = .cancelled };
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
         for (invocation.environment) |entry| try environment.put(entry.key, entry.value);
 
-        const Outcome = union(enum) {
-            result: std.process.RunError!std.process.RunResult,
-            cancelled,
-        };
-        var outcomes: [2]Outcome = undefined;
-        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.result, runChild, .{ self, invocation, &environment });
-        select.async(.cancelled, waitCancellation, .{ self.io, invocation.cancellation });
-        errdefer select.cancelDiscard();
-        const result = switch (try select.await()) {
-            .result => |result| result: {
-                select.cancelDiscard();
-                break :result try result;
-            },
-            .cancelled => {
-                while (select.cancel()) |outcome| switch (outcome) {
-                    .result => |result| if (result) |completed| {
-                        self.allocator.free(completed.stdout);
-                        self.allocator.free(completed.stderr);
-                    } else |_| {},
-                    .cancelled => {},
-                };
-                return .{ .termination = .cancelled };
-            },
-        };
+        const result = try self.runChild(invocation, &environment);
         self.allocator.free(result.stdout);
         self.last_stderr = result.stderr;
         const termination: ProcessTermination = switch (result.term) {
@@ -1654,11 +1632,6 @@ pub const SystemProcessRunner = struct {
         });
     }
 
-    fn waitCancellation(io: std.Io, cancellation: Cancellation) void {
-        while (!cancellation.cancelled()) {
-            io.sleep(.fromMilliseconds(10), .awake) catch return;
-        }
-    }
 };
 
 /// Production filesystem adapter. Every install-root component is opened with
