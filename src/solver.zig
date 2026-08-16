@@ -1247,6 +1247,14 @@ fn addExactLockJobs(
                     "exact lock package version and architecture are unavailable",
             )).failure;
         }
+        if (findInstalledSelector(context, .{
+            .name = locked.name,
+            .version = locked.version,
+            .architecture = locked.architecture,
+        })) |installed_index| {
+            const mapping = state.mappings[installed_index];
+            if (state.source_records[mapping.record_index].status.isFullyInstalled()) continue;
+        }
         libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate.?);
     }
 
