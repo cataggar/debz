@@ -259,7 +259,7 @@ jobs:
           sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
           sudo du -sh "$work" >"$work/evidence/disk-usage-final.txt" 2>/dev/null || true
           sudo rm -rf "$work/root" "$work/cache"
-          sudo chown -R "$USER:$USER" "$work"
+          sudo chown -R "$USER:$USER" .real-snapshot
       - name: Upload real acceptance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

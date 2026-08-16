@@ -44,9 +44,10 @@ uri=$2
 suite=$3
 architecture=$4
 workspace=$(realpath -m "$5")
+repository_root=$(pwd -P)
 validate "$uri" "$suite" "$architecture"
 [[ -x "$debz" ]]
-case "$workspace" in "$PWD"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
+case "$workspace" in "$repository_root"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
 [[ ! -L "$workspace" ]]
 
 root=$workspace/root
