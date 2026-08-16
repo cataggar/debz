@@ -35,7 +35,6 @@ pub const Policy = struct {
 };
 
 const maximum_diagnostic_limit = 1024 * 1024;
-const maximum_process_capture_bytes = 64 * 1024 * 1024;
 
 /// A cached archive bound to one archive-producing action in an owned plan.
 /// The executor rereads and fully validates `path` immediately before dpkg.
@@ -1579,7 +1578,7 @@ fn artifactCode(err: anyerror) FailureCode {
 pub const SystemProcessRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    stderr_limit: usize = maximum_process_capture_bytes,
+    stderr_limit: usize = maximum_diagnostic_limit,
     last_stderr: ?[]u8 = null,
 
     pub fn interface(self: *SystemProcessRunner) ProcessRunner {
@@ -1621,8 +1620,8 @@ pub const SystemProcessRunner = struct {
         return std.process.run(self.allocator, self.io, .{
             .argv = invocation.argv,
             .environ_map = environment,
-            .stdout_limit = .limited(self.stderr_limit),
-            .stderr_limit = .limited(self.stderr_limit),
+            .stdout_limit = .unlimited,
+            .stderr_limit = .unlimited,
             .timeout = .{ .duration = .{
                 .raw = .fromMilliseconds(@intCast(@min(
                     invocation.timeout_ms,
