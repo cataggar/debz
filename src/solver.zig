@@ -721,7 +721,7 @@ pub const ActionReason = enum {
     upgrade,
 };
 
-pub const OrderedActionKind = enum { bootstrap_extract, remove, unpack, configure };
+pub const OrderedActionKind = enum { bootstrap_extract, remove, unpack, configure_pending };
 
 pub const OrderedAction = struct {
     sequence: usize,
@@ -767,6 +767,7 @@ pub const PlanAction = struct {
     requested: bool,
     reason: ActionReason,
     essential: bool = false,
+    has_pre_depends: bool = false,
     /// Present for archive-producing actions. This is the authenticated,
     /// solver-selected record identity consumed by package acquisition.
     selected_origin: ?PackageOrigin,
@@ -2039,6 +2040,7 @@ fn materializeAction(
     var version: []const u8 = undefined;
     var architecture: []const u8 = undefined;
     var essential = false;
+    var has_pre_depends = false;
     if (origin) |available| {
         const record = input.repositories[findRepositoryIndex(input.repositories, available.repository_id).?]
             .packages.records[available.record_index];
@@ -2046,6 +2048,7 @@ fn materializeAction(
         version = record.control.version.value.original;
         architecture = record.control.architecture.text;
         essential = record.control.essential == true;
+        has_pre_depends = record.control.pre_depends != null;
         package_size = record.transport.size.value;
         sha256 = hex32(record.transport.sha256.bytes);
         installed_size = record.control.installed_size orelse 0;
@@ -2079,6 +2082,7 @@ fn materializeAction(
         .requested = requestedIdentity(input.request, package_name, version, architecture),
         .reason = actionReason(context, solvable_id, kind, input, package_name, version, architecture),
         .essential = essential,
+        .has_pre_depends = has_pre_depends,
         .selected_origin = if (origin) |available| .{
             .repository_id = available.repository_id,
             .repository_priority = available.repository_priority,
@@ -2203,6 +2207,8 @@ fn materializeOrdering(
             .architecture = action.architecture,
         });
     }
+    var pending_unpacks: usize = 0;
+    var last_install: ?PlanAction = null;
     for (actions) |action| {
         if (action.kind == .remove) {
             try ordered.append(allocator, .{
@@ -2213,6 +2219,16 @@ fn materializeOrdering(
                 .architecture = action.architecture,
             });
         } else {
+            if (action.has_pre_depends and pending_unpacks != 0) {
+                try ordered.append(allocator, .{
+                    .sequence = ordered.items.len,
+                    .kind = .configure_pending,
+                    .package = action.package,
+                    .version = action.version,
+                    .architecture = action.architecture,
+                });
+                pending_unpacks = 0;
+            }
             try ordered.append(allocator, .{
                 .sequence = ordered.items.len,
                 .kind = .unpack,
@@ -2220,14 +2236,19 @@ fn materializeOrdering(
                 .version = action.version,
                 .architecture = action.architecture,
             });
-            try ordered.append(allocator, .{
-                .sequence = ordered.items.len,
-                .kind = .configure,
-                .package = action.package,
-                .version = action.version,
-                .architecture = action.architecture,
-            });
+            pending_unpacks += 1;
+            last_install = action;
         }
+    }
+    if (pending_unpacks != 0) {
+        const action = last_install.?;
+        try ordered.append(allocator, .{
+            .sequence = ordered.items.len,
+            .kind = .configure_pending,
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        });
     }
     return ordered.toOwnedSlice(allocator);
 }
@@ -2347,6 +2368,7 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
         try writer.writeAll(",\"reason\":");
         try writeJsonString(writer, @tagName(action.reason));
         try writer.print(",\"essential\":{}", .{action.essential});
+        try writer.print(",\"has_pre_depends\":{}", .{action.has_pre_depends});
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"ordered_actions\":[");
@@ -3363,8 +3385,9 @@ test "planner materializes owned install closure and stable canonical JSON" {
     try std.testing.expectEqualStrings("app", plan.ordered_actions[1].package);
     try std.testing.expectEqual(OrderedActionKind.bootstrap_extract, plan.ordered_actions[1].kind);
     try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[2].kind);
-    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[3].kind);
-    try std.testing.expectEqualStrings("app", plan.ordered_actions[4].package);
+    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[3].kind);
+    try std.testing.expectEqualStrings("app", plan.ordered_actions[3].package);
+    try std.testing.expectEqual(OrderedActionKind.configure_pending, plan.ordered_actions[4].kind);
     var saw_source = false;
     for (plan.actions) |action| {
         if (std.mem.eql(u8, action.package, "app")) {
@@ -3432,6 +3455,18 @@ test "real metadata facts produce ubuntu-minimal closures on native architecture
         try std.testing.expect(plan.actions.len != 0);
         try std.testing.expect(hasAction(plan.actions, "ubuntu-minimal"));
         try std.testing.expect(hasAction(plan.actions, "base-files"));
+        try std.testing.expectEqual(OrderedActionKind.configure_pending, plan.ordered_actions[plan.ordered_actions.len - 1].kind);
+        var saw_bootstrap = false;
+        var saw_pre_depends_barrier = false;
+        for (plan.ordered_actions, 0..) |ordered, ordered_index| {
+            if (ordered.kind == .bootstrap_extract) saw_bootstrap = true;
+            if (ordered.kind == .unpack and std.mem.eql(u8, ordered.package, "base-files")) {
+                try std.testing.expect(ordered_index != 0);
+                saw_pre_depends_barrier = plan.ordered_actions[ordered_index - 1].kind == .configure_pending;
+            }
+        }
+        try std.testing.expect(saw_bootstrap);
+        try std.testing.expect(saw_pre_depends_barrier);
     }
 }
 
@@ -3836,7 +3871,7 @@ test "planner reinstall is exact and summaries include ordered execution" {
     try std.testing.expectEqual(@as(usize, 1), plan.summary.reinstalls);
     try std.testing.expectEqual(@as(u64, 9), plan.summary.download_bytes);
     try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[0].kind);
-    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[1].kind);
+    try std.testing.expectEqual(OrderedActionKind.configure_pending, plan.ordered_actions[1].kind);
 }
 
 test "phased updates require deterministic explicit opt in" {

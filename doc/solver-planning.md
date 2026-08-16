@@ -35,6 +35,8 @@ Reverse-dependency removal additionally requires every unrequested identity in
 the computed closure to appear in `authorized_removals`.
 
 Schema v2 adds operation mode, requested status, a complete summary, ordered
-remove/unpack/configure steps, stable problem IDs, candidate rejection records,
-and graph edges. Plan-only and download-only never execute dpkg. Schema v1
-remains published for older consumers.
+bootstrap-extract/remove/unpack/configure-pending steps, stable problem IDs,
+candidate rejection records, and graph edges. Configure barriers preserve
+Pre-Depends while leaving normal dependency-cycle ordering to dpkg. Plan-only
+and download-only never execute dpkg. Schema v1 remains published for older
+consumers.

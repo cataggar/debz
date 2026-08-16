@@ -4,7 +4,7 @@ const deb_payload = @import("deb_payload.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
 
-pub const Phase = enum { bootstrap_extract, remove, unpack, configure, triggers, audit };
+pub const Phase = enum { bootstrap_extract, remove, unpack, configure_pending, configure, triggers, audit };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
 
 pub const ForceRisk = enum {
@@ -402,7 +402,7 @@ pub fn execute(
             state.failure = .{
                 .code = .lock_lost,
                 .phase = toPhase(ordered.kind),
-                .package = try arena.dupe(u8, ordered.package),
+                .package = if (ordered.kind == .configure_pending) null else try arena.dupe(u8, ordered.package),
                 .diagnostic = "transaction lock ownership was lost",
                 .completed_commands = state.commands.items.len,
             };
@@ -481,14 +481,14 @@ pub fn execute(
             .argv = argv,
             .environment = &audited_environment,
             .phase = phase,
-            .package = ordered.package,
+            .package = if (phase == .configure_pending) null else ordered.package,
             .timeout_ms = request.policy.process_timeout_ms,
             .cancellation = dependencies.cancellation,
         }) catch |err| {
             state.failure = .{
                 .code = if (err == error.Timeout) .process_timeout else .process_spawn,
                 .phase = phase,
-                .package = try arena.dupe(u8, ordered.package),
+                .package = if (phase == .configure_pending) null else try arena.dupe(u8, ordered.package),
                 .diagnostic = try arena.dupe(u8, @errorName(err)),
                 .completed_commands = state.commands.items.len,
             };
@@ -1117,7 +1117,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             return error.OrderedActionMissingPlanAction;
         switch (ordered.kind) {
             .remove => if (action.kind != .remove) return error.InvalidRemoveOrdering,
-            .bootstrap_extract, .unpack, .configure => if (action.kind == .remove) return error.InvalidInstallOrdering,
+            .bootstrap_extract, .unpack, .configure_pending => if (action.kind == .remove) return error.InvalidInstallOrdering,
         }
         if ((ordered.kind == .bootstrap_extract or ordered.kind == .unpack) and
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture) == null)
@@ -1131,9 +1131,8 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         var removes: usize = 0;
         var bootstrap_extracts: usize = 0;
         var unpacks: usize = 0;
-        var configures: usize = 0;
+        var configure_pending_count: usize = 0;
         var unpack_index: ?usize = null;
-        var configure_index: ?usize = null;
         for (request.plan.ordered_actions, 0..) |ordered, ordered_index| {
             if (!sameIdentity(action.package, action.version, action.architecture, ordered.package, ordered.version, ordered.architecture))
                 continue;
@@ -1144,25 +1143,30 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                     unpacks += 1;
                     unpack_index = ordered_index;
                 },
-                .configure => {
-                    configures += 1;
-                    configure_index = ordered_index;
-                },
+                .configure_pending => configure_pending_count += 1,
             }
         }
         if (action.kind == .remove) {
-            if (bootstrap_extracts != 0 or removes != 1 or unpacks != 0 or configures != 0) return error.IncompleteRemoveOrdering;
-        } else if (removes != 0 or unpacks != 1 or configures != 1) {
+            if (bootstrap_extracts != 0 or removes != 1 or unpacks != 0 or configure_pending_count != 0) return error.IncompleteRemoveOrdering;
+        } else if (removes != 0 or unpacks != 1) {
             return error.IncompleteInstallOrdering;
         } else {
             const expected_bootstrap: usize = if (requiresRootBootstrap(request.plan.actions) and action.prior_installed == null) 1 else 0;
             if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
-            if (unpack_index.? >= configure_index.?) return error.ConfigureBeforeUnpack;
             if (action.repository == null or action.sha256 == null or action.package_size == null)
                 return error.MissingAuthenticatedArtifactMetadata;
             _ = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
         }
     }
+    var last_unpack: ?usize = null;
+    var last_configure_pending: ?usize = null;
+    for (request.plan.ordered_actions, 0..) |ordered, index| switch (ordered.kind) {
+        .unpack => last_unpack = index,
+        .configure_pending => last_configure_pending = index,
+        else => {},
+    };
+    if (last_unpack != null and (last_configure_pending == null or last_configure_pending.? < last_unpack.?))
+        return error.IncompleteInstallOrdering;
 
     for (request.artifacts, 0..) |artifact, index| {
         try validateIdentity(artifact.package);
@@ -1264,6 +1268,10 @@ fn buildArgv(
         .unpack => {
             try argv.append(allocator, "--unpack");
             try argv.append(allocator, artifact_path.?);
+        },
+        .configure_pending => {
+            try argv.append(allocator, "--configure");
+            try argv.append(allocator, "--pending");
         },
         .configure => {
             try argv.append(allocator, "--configure");
@@ -1456,7 +1464,7 @@ fn toPhase(kind: solver.OrderedActionKind) Phase {
         .bootstrap_extract => .bootstrap_extract,
         .remove => .remove,
         .unpack => .unpack,
-        .configure => .configure,
+        .configure_pending => .configure_pending,
     };
 }
 
@@ -1996,8 +2004,16 @@ const TestHarness = struct {
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
-        for (self.invocations[0..self.invocation_count]) |invocation| {
-            if (invocation.phase != .configure or invocation.package == null) continue;
+        for (self.invocations[0..self.invocation_count], 0..) |invocation, index| {
+            if (invocation.phase == .unpack and invocation.package != null) {
+                var configured = false;
+                for (self.invocations[index + 1 .. self.invocation_count]) |later|
+                    if (later.phase == .configure_pending) {
+                        configured = true;
+                        break;
+                    };
+                if (!configured) continue;
+            } else if (invocation.phase != .configure or invocation.package == null) continue;
             try writer.print(
                 "Package: {s}\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n",
                 .{invocation.package.?},
@@ -2103,7 +2119,7 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     var ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .bootstrap_extract, .package = "demo", .version = "1.0", .architecture = "amd64" },
         .{ .sequence = 1, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 2, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes };
@@ -2215,7 +2231,7 @@ test "transaction_executor.test.digest mismatch is rechecked after locks before 
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
     var ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes, .corrupt_read = true };
@@ -2525,7 +2541,7 @@ test "transaction_executor.test.unfinished journal blocks normal retry and binds
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
     var ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes, .cancelled_value = true };

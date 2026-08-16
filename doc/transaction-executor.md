@@ -45,8 +45,11 @@ No general dpkg force option is enabled by default. Supported exceptions are a
 typed `ForceRisk` list and therefore appear in command provenance.
 
 The executor follows `ordered_actions` exactly, including planner-linearized
-cycles and Essential bootstrap extraction. Remove, unpack, and configure commands defer triggers with
-`--no-triggers`; one final
+cycles and Essential bootstrap extraction. It unpacks in libsolv's
+Pre-Depends-aware order and inserts `dpkg --configure --pending` barriers before
+packages with Pre-Depends and after the final unpack, allowing dpkg to configure
+normal dependency cycles in its native order. Remove, unpack, and configure
+commands defer triggers with `--no-triggers`; one final
 `--triggers-only --pending` command processes them deterministically without
 configuring unrelated pending packages.
 
