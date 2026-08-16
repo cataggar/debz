@@ -234,7 +234,7 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
         extra_hashed=fixture.subpacket(27, b"\x02") + fixture.subpacket(32, fixture.packet_body(primary_binding)),
     )
     keyring = primary_packet + uid_packet + certification + subkey_packet + binding
-    canonical_release = release.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    canonical_release = release.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").removesuffix(b"\r\n")
     release_signature = fixture.signature(subkey, 0x01, [canonical_release], subkey_fingerprint)
     in_release = (
         b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"

@@ -141,7 +141,8 @@ pub const SignatureBlob = struct {
 /// Owns transformed cleartext and signature storage; `source` remains borrowed.
 /// `display_cleartext` reverses only OpenPGP dash escaping and retains the
 /// source line endings. `canonical_cleartext` contains the exact CRLF text
-/// bytes to pass to an OpenPGP text-signature verifier.
+/// bytes to pass to an OpenPGP text-signature verifier, excluding the line
+/// ending that separates cleartext from the signature armor delimiter.
 pub const InReleaseEnvelope = struct {
     source: []const u8,
     envelope_range: ByteRange,
@@ -330,6 +331,7 @@ pub fn parseInRelease(
     }
     if (!found_signature)
         return .{ .diagnostic = diag(.missing_signature_begin, .in_release, source.len, source.len) };
+    if (canonical.items.len >= 2) canonical.items.len -= 2;
 
     const parsed_armor = try parseArmorBlock(allocator, source, offset, limits, .in_release);
     var signature = switch (parsed_armor) {
@@ -770,7 +772,7 @@ test "RFC-style cleartext fixture reverses dash escaping and canonicalizes LF" {
     };
     defer envelope.deinit();
     try std.testing.expectEqualStrings("Suite: stable \t\n-dash\nFrom escaped\n", envelope.display_cleartext);
-    try std.testing.expectEqualStrings("Suite: stable\r\n-dash\r\nFrom escaped\r\n", envelope.canonical_cleartext);
+    try std.testing.expectEqualStrings("Suite: stable\r\n-dash\r\nFrom escaped", envelope.canonical_cleartext);
     try std.testing.expectEqualStrings("SHA256", envelope.declared_hashes[0].value.slice(fixture));
     try std.testing.expectEqualSlices(u8, &.{ 0xc2, 3, 1, 2, 3 }, envelope.signature.bytes);
 }
@@ -790,7 +792,7 @@ test "RFC-style CRLF fixture preserves display text without newline ambiguity" {
     };
     defer envelope.deinit();
     try std.testing.expectEqualStrings("Origin: Debian\r\n", envelope.display_cleartext);
-    try std.testing.expectEqualStrings("Origin: Debian\r\n", envelope.canonical_cleartext);
+    try std.testing.expectEqualStrings("Origin: Debian", envelope.canonical_cleartext);
 }
 
 test "detached Release bytes remain exact including missing final newline" {

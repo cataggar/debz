@@ -55,6 +55,7 @@ cache=$workspace/cache
 state=$workspace/state
 evidence=$workspace/evidence
 source_file=$workspace/ubuntu.sources
+config_file=$workspace/ubuntu.json
 lock=$evidence/ubuntu-minimal.lock.json
 mkdir -p "$root/var/lib/dpkg/"{info,updates,triggers} "$cache" "$state" "$evidence"
 : >"$root/var/lib/dpkg/status"
@@ -67,13 +68,15 @@ Components: main
 Architectures: $architecture
 Signed-By: $keyring
 EOF
+printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true}\n' \
+  "$source_file" "$suite" >"$config_file"
 
 common=(
   --install-root "$root"
   --cache-path "$cache"
   --state-path "$state"
   --architecture "$architecture"
-  --source "$source_file"
+  --config "$config_file"
   --keyring "$keyring"
   --deadline-ms 300000
   --lock-wait-ms 30000

@@ -818,7 +818,10 @@ fn makeRuntimes(
                 .compression_order = &.{ .xz, .gzip, .zstd, .uncompressed },
                 .by_hash_fallback = .not_found_only,
                 .maximum_future_seconds = 300,
-                .expiry_policy = .require_valid_until,
+                .expiry_policy = if (repository.immutability.kind == .moving)
+                    .require_valid_until
+                else
+                    .allow_missing_valid_until,
                 .maximum_compressed_bytes = 64 * 1024 * 1024,
                 .maximum_decompressed_bytes = 256 * 1024 * 1024,
                 .maximum_decoder_memory = 256 * 1024 * 1024,

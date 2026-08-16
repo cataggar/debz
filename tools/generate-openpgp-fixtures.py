@@ -266,7 +266,7 @@ def main():
     ed_signature = signature(ed_key, 0x00, [MESSAGE], ed_fp)
     release_signature = signature(subkey, 0x00, [RELEASE], subkey_fp)
     release_sha512_signature = signature(subkey, 0x00, [RELEASE], subkey_fp, hash_id=10)
-    canonical_release = RELEASE.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    canonical_release = RELEASE.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").removesuffix(b"\r\n")
     release_text_signature = signature(subkey, 0x01, [canonical_release], subkey_fp)
     release_expired_signature = signature(
         subkey, 0x00, [RELEASE], subkey_fp,

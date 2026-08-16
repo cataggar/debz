@@ -86,3 +86,7 @@ One credential reference is restricted to the single normalized HTTP(S)
 origin shared by all configured repositories. `--status-path` is read-only;
 mutating commands always verify `INSTALL_ROOT/var/lib/dpkg/status`.
 No host APT, GnuPG, proxy, credential, or dpkg configuration is consulted.
+Moving repositories require `Valid-Until`. An explicit immutable repository
+configuration may accept a signed Release without that field because the URI
+itself is pinned; signature, Release date, identity, and all index digests
+remain mandatory.
