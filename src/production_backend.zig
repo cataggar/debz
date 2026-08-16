@@ -712,10 +712,7 @@ fn writeRecoveryIntent(
     }
 
     try dir.rename(stage, dir, "recovery-request.json", io);
-    switch (@import("builtin").os.tag) {
-        .windows, .wasi => {},
-        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
-    }
+    try syncDirectory(dir);
 }
 
 fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
@@ -725,9 +722,14 @@ fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     };
+    try syncDirectory(dir);
+}
+
+fn syncDirectory(dir: std.Io.Dir) !void {
     switch (@import("builtin").os.tag) {
-        .windows, .wasi => {},
-        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
+        .linux => if (std.posix.errno(std.os.linux.fsync(dir.handle)) != .SUCCESS)
+            return error.Unexpected,
+        else => {},
     }
 }
 
