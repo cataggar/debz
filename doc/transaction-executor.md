@@ -19,12 +19,12 @@ Each cached archive is reread immediately before its bootstrap-extract or unpack
 SHA-256, outer archive, payload paths, control identity, requested identity,
 scripts, and conffiles are revalidated with `deb_payload.validate`.
 
-For a new root, authenticated Essential packages receive a deterministic
-`/usr/bin/dpkg-deb --extract` bootstrap phase before normal dpkg processing.
-This runs no maintainer scripts and makes the complete Essential runtime
-available for the first pre-installation and configuration scripts; every
-archive is subsequently unpacked by dpkg so ownership and database state remain
-authoritative.
+For a new root, the authenticated closure containing absent Essential packages
+receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before
+normal dpkg processing. This runs no maintainer scripts and makes Essential
+packages plus their omitted or explicit runtime prerequisites available for the
+first pre-installation and configuration scripts; every archive is subsequently
+unpacked by dpkg so ownership and database state remain authoritative.
 
 Processes are invoked directly as `/usr/bin/dpkg-deb` or `/usr/bin/dpkg`; no
 shell or command string is used. Every invocation replaces the environment with the fixed audited set

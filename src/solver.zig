@@ -2186,8 +2186,15 @@ fn materializeOrdering(
 ) ![]OrderedAction {
     var ordered: std.ArrayList(OrderedAction) = .empty;
     defer ordered.deinit(allocator);
+    var bootstrap_root = false;
     for (actions) |action| {
-        if (action.kind == .remove or !action.essential or action.prior_installed != null) continue;
+        if (action.kind != .remove and action.essential and action.prior_installed == null) {
+            bootstrap_root = true;
+            break;
+        }
+    }
+    for (actions) |action| {
+        if (!bootstrap_root or action.kind == .remove or action.prior_installed != null) continue;
         try ordered.append(allocator, .{
             .sequence = ordered.items.len,
             .kind = .bootstrap_extract,
@@ -3353,9 +3360,11 @@ test "planner materializes owned install closure and stable canonical JSON" {
     try std.testing.expectEqual(@as(u64, 27), plan.download_bytes);
     try std.testing.expectEqualStrings("lib", plan.ordered_actions[0].package);
     try std.testing.expectEqual(OrderedActionKind.bootstrap_extract, plan.ordered_actions[0].kind);
-    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[1].kind);
-    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[2].kind);
-    try std.testing.expectEqualStrings("app", plan.ordered_actions[3].package);
+    try std.testing.expectEqualStrings("app", plan.ordered_actions[1].package);
+    try std.testing.expectEqual(OrderedActionKind.bootstrap_extract, plan.ordered_actions[1].kind);
+    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[2].kind);
+    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[3].kind);
+    try std.testing.expectEqualStrings("app", plan.ordered_actions[4].package);
     var saw_source = false;
     for (plan.actions) |action| {
         if (std.mem.eql(u8, action.package, "app")) {

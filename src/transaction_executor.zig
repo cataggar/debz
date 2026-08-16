@@ -1155,7 +1155,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         } else if (removes != 0 or unpacks != 1 or configures != 1) {
             return error.IncompleteInstallOrdering;
         } else {
-            const expected_bootstrap: usize = if (action.essential and action.prior_installed == null) 1 else 0;
+            const expected_bootstrap: usize = if (requiresRootBootstrap(request.plan.actions) and action.prior_installed == null) 1 else 0;
             if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
             if (unpack_index.? >= configure_index.?) return error.ConfigureBeforeUnpack;
             if (action.repository == null or action.sha256 == null or action.package_size == null)
@@ -1398,6 +1398,12 @@ fn validateIdentity(value: []const u8) !void {
     if (value.len == 0 or value.len > 4096) return error.InvalidIdentity;
     if (std.mem.findAny(u8, value, &.{ 0, '\n', '\r' }) != null) return error.InvalidIdentity;
     if (value[0] == '-') return error.OptionLikeIdentity;
+}
+
+fn requiresRootBootstrap(actions: []const solver.PlanAction) bool {
+    for (actions) |action|
+        if (action.kind != .remove and action.essential and action.prior_installed == null) return true;
+    return false;
 }
 
 fn validateForces(forces: []const ForceRisk) !void {
