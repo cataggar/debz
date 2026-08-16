@@ -1797,14 +1797,19 @@ pub const SystemFileSystem = struct {
             .{ "usr/share/base-passwd/passwd.master", "etc/passwd" },
             .{ "usr/share/base-passwd/group.master", "etc/group" },
         }) |mapping| {
-            const bytes = try directory.readFileAlloc(
+            const bytes: ?[]u8 = directory.readFileAlloc(
                 self.io,
                 mapping[0],
                 self.allocator,
                 .limited(64 * 1024),
-            );
-            defer self.allocator.free(bytes);
-            try directory.writeFile(self.io, .{ .sub_path = mapping[1], .data = bytes });
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (bytes) |contents| {
+                defer self.allocator.free(contents);
+                try directory.writeFile(self.io, .{ .sub_path = mapping[1], .data = contents });
+            }
         }
     }
 
