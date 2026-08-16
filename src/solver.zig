@@ -2739,13 +2739,16 @@ fn alternativeActive(alternative: relation.Alternative, architecture: []const u8
         }
         if (has_positive and !positive_match) return false;
     }
-    for (alternative.restrictions.build_profiles) |list| {
-        var group_matches = false;
-        for (list.restrictions) |restriction| {
-            // Binary transactions have an explicit empty active-profile set.
-            group_matches = group_matches or restriction.negated;
+    if (alternative.restrictions.build_profiles.len != 0) {
+        for (alternative.restrictions.build_profiles) |list| {
+            var list_matches = true;
+            for (list.restrictions) |restriction| {
+                // Binary transactions have an explicit empty active-profile set.
+                list_matches = list_matches and restriction.negated;
+            }
+            if (list_matches) return true;
         }
-        if (!group_matches) return false;
+        return false;
     }
     return true;
 }
@@ -3824,7 +3827,7 @@ test "planner reports exact architecture version and conflict failures" {
 
 test "architecture restrictions and inactive build profiles are evaluated explicitly" {
     const text =
-        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: missing [arm64], ignored <stage1>, helper:native [linux-any] <!stage1>, data:amd64\nFilename: pool/root.deb\nSize: 1\n" ++
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: missing [arm64], ignored <stage1>, also-ignored <stage1 !cross>, helper:native [linux-any] <!stage1>, data:amd64 <stage1> <!cross>\nFilename: pool/root.deb\nSize: 1\n" ++
         "SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n\n" ++
         "Package: helper\nVersion: 1\nArchitecture: amd64\nFilename: pool/helper.deb\nSize: 1\n" ++
         "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
