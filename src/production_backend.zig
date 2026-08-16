@@ -998,7 +998,7 @@ fn deadlines(overall: u64) repository_acquisition.Deadlines {
 }
 
 fn productionRetryPolicy() repository_acquisition.RetryPolicy {
-    return .{ .max_attempts = 4, .backoff_ms = productionRetryBackoff };
+    return .{ .max_attempts = 6, .backoff_ms = productionRetryBackoff };
 }
 
 fn productionRetryBackoff(attempt: u16) u64 {
