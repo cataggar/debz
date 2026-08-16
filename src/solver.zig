@@ -721,7 +721,7 @@ pub const ActionReason = enum {
     upgrade,
 };
 
-pub const OrderedActionKind = enum { remove, unpack, configure };
+pub const OrderedActionKind = enum { bootstrap_extract, remove, unpack, configure };
 
 pub const OrderedAction = struct {
     sequence: usize,
@@ -766,6 +766,7 @@ pub const PlanAction = struct {
     prior_installed: ?PriorInstalled,
     requested: bool,
     reason: ActionReason,
+    essential: bool = false,
     /// Present for archive-producing actions. This is the authenticated,
     /// solver-selected record identity consumed by package acquisition.
     selected_origin: ?PackageOrigin,
@@ -2037,12 +2038,14 @@ fn materializeAction(
     var package_name: []const u8 = undefined;
     var version: []const u8 = undefined;
     var architecture: []const u8 = undefined;
+    var essential = false;
     if (origin) |available| {
         const record = input.repositories[findRepositoryIndex(input.repositories, available.repository_id).?]
             .packages.records[available.record_index];
         package_name = record.control.package.text;
         version = record.control.version.value.original;
         architecture = record.control.architecture.text;
+        essential = record.control.essential == true;
         package_size = record.transport.size.value;
         sha256 = hex32(record.transport.sha256.bytes);
         installed_size = record.control.installed_size orelse 0;
@@ -2057,6 +2060,7 @@ fn materializeAction(
         package_name = record.name.value;
         version = record.version.spelling.value;
         architecture = record.architecture.value;
+        essential = record.essential == true;
         source_name = package_name;
     }
     const prior_bytes: i128 = if (prior) |value| @as(i128, @intCast(value.installed_size_kib orelse 0)) * 1024 else 0;
@@ -2074,6 +2078,7 @@ fn materializeAction(
         .prior_installed = prior,
         .requested = requestedIdentity(input.request, package_name, version, architecture),
         .reason = actionReason(context, solvable_id, kind, input, package_name, version, architecture),
+        .essential = essential,
         .selected_origin = if (origin) |available| .{
             .repository_id = available.repository_id,
             .repository_priority = available.repository_priority,
@@ -2181,6 +2186,16 @@ fn materializeOrdering(
 ) ![]OrderedAction {
     var ordered: std.ArrayList(OrderedAction) = .empty;
     defer ordered.deinit(allocator);
+    for (actions) |action| {
+        if (action.kind == .remove or !action.essential or action.prior_installed != null) continue;
+        try ordered.append(allocator, .{
+            .sequence = ordered.items.len,
+            .kind = .bootstrap_extract,
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        });
+    }
     for (actions) |action| {
         if (action.kind == .remove) {
             try ordered.append(allocator, .{
@@ -2324,6 +2339,7 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
         try writer.print(",\"requested\":{}", .{action.requested});
         try writer.writeAll(",\"reason\":");
         try writeJsonString(writer, @tagName(action.reason));
+        try writer.print(",\"essential\":{}", .{action.essential});
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"ordered_actions\":[");
@@ -3312,7 +3328,7 @@ test "planner materializes owned install closure and stable canonical JSON" {
     const text =
         "Package: app\nVersion: 2\nArchitecture: amd64\nProvides: app-virtual (= 2)\nDepends: lib\nInstalled-Size: 10\nSource: app-src (2)\nFilename: pool/app.deb\nSize: 20\n" ++
         "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
-        "Package: lib\nVersion: 1\nArchitecture: amd64\nInstalled-Size: 3\nFilename: pool/lib.deb\nSize: 7\n" ++
+        "Package: lib\nVersion: 1\nArchitecture: amd64\nEssential: yes\nInstalled-Size: 3\nFilename: pool/lib.deb\nSize: 7\n" ++
         "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
     const id = testRepositoryId('i');
     var index = try availableIndex(id, text);
@@ -3336,9 +3352,10 @@ test "planner materializes owned install closure and stable canonical JSON" {
     try std.testing.expectEqualStrings("lib", plan.actions[1].package);
     try std.testing.expectEqual(@as(u64, 27), plan.download_bytes);
     try std.testing.expectEqualStrings("lib", plan.ordered_actions[0].package);
-    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[0].kind);
-    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[1].kind);
-    try std.testing.expectEqualStrings("app", plan.ordered_actions[2].package);
+    try std.testing.expectEqual(OrderedActionKind.bootstrap_extract, plan.ordered_actions[0].kind);
+    try std.testing.expectEqual(OrderedActionKind.unpack, plan.ordered_actions[1].kind);
+    try std.testing.expectEqual(OrderedActionKind.configure, plan.ordered_actions[2].kind);
+    try std.testing.expectEqualStrings("app", plan.ordered_actions[3].package);
     var saw_source = false;
     for (plan.actions) |action| {
         if (std.mem.eql(u8, action.package, "app")) {

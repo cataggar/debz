@@ -4,7 +4,7 @@ const deb_payload = @import("deb_payload.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
 
-pub const Phase = enum { remove, unpack, configure, triggers, audit };
+pub const Phase = enum { bootstrap_extract, remove, unpack, configure, triggers, audit };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
 
 pub const ForceRisk = enum {
@@ -420,7 +420,7 @@ pub fn execute(
         };
 
         const phase = toPhase(ordered.kind);
-        const artifact = if (phase == .unpack)
+        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
             null;
@@ -441,6 +441,7 @@ pub fn execute(
 
         const argv = try buildArgv(
             arena,
+            request.install_root,
             root_flag,
             admin_flag,
             phase,
@@ -1030,12 +1031,13 @@ fn buildJournalCommands(
     var commands: std.ArrayList(recovery.Command) = .empty;
     for (request.plan.ordered_actions) |ordered| {
         const phase = toPhase(ordered.kind);
-        const artifact = if (phase == .unpack)
+        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
             null;
         const argv = try buildArgv(
             allocator,
+            request.install_root,
             root_flag,
             admin_flag,
             phase,
@@ -1115,9 +1117,9 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             return error.OrderedActionMissingPlanAction;
         switch (ordered.kind) {
             .remove => if (action.kind != .remove) return error.InvalidRemoveOrdering,
-            .unpack, .configure => if (action.kind == .remove) return error.InvalidInstallOrdering,
+            .bootstrap_extract, .unpack, .configure => if (action.kind == .remove) return error.InvalidInstallOrdering,
         }
-        if (ordered.kind == .unpack and
+        if ((ordered.kind == .bootstrap_extract or ordered.kind == .unpack) and
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture) == null)
             return error.MissingArtifact;
     }
@@ -1127,6 +1129,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 return error.DuplicatePlanAction;
         }
         var removes: usize = 0;
+        var bootstrap_extracts: usize = 0;
         var unpacks: usize = 0;
         var configures: usize = 0;
         var unpack_index: ?usize = null;
@@ -1135,6 +1138,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             if (!sameIdentity(action.package, action.version, action.architecture, ordered.package, ordered.version, ordered.architecture))
                 continue;
             switch (ordered.kind) {
+                .bootstrap_extract => bootstrap_extracts += 1,
                 .remove => removes += 1,
                 .unpack => {
                     unpacks += 1;
@@ -1147,10 +1151,12 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             }
         }
         if (action.kind == .remove) {
-            if (removes != 1 or unpacks != 0 or configures != 0) return error.IncompleteRemoveOrdering;
+            if (bootstrap_extracts != 0 or removes != 1 or unpacks != 0 or configures != 0) return error.IncompleteRemoveOrdering;
         } else if (removes != 0 or unpacks != 1 or configures != 1) {
             return error.IncompleteInstallOrdering;
         } else {
+            const expected_bootstrap: usize = if (action.essential and action.prior_installed == null) 1 else 0;
+            if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
             if (unpack_index.? >= configure_index.?) return error.ConfigureBeforeUnpack;
             if (action.repository == null or action.sha256 == null or action.package_size == null)
                 return error.MissingAuthenticatedArtifactMetadata;
@@ -1225,6 +1231,7 @@ fn validateArtifact(
 
 fn buildArgv(
     allocator: std.mem.Allocator,
+    install_root: []const u8,
     root_flag: []const u8,
     admin_flag: []const u8,
     phase: Phase,
@@ -1234,6 +1241,13 @@ fn buildArgv(
     policy: Policy,
 ) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
+    if (phase == .bootstrap_extract) {
+        try argv.append(allocator, "/usr/bin/dpkg-deb");
+        try argv.append(allocator, "--extract");
+        try argv.append(allocator, artifact_path.?);
+        try argv.append(allocator, install_root);
+        return argv.toOwnedSlice(allocator);
+    }
     try argv.append(allocator, "/usr/bin/dpkg");
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
@@ -1255,7 +1269,7 @@ fn buildArgv(
             try argv.append(allocator, "--configure");
             try argv.append(allocator, try packageSpec(allocator, package, architecture));
         },
-        .triggers, .audit => unreachable,
+        .bootstrap_extract, .triggers, .audit => unreachable,
     }
     return argv.toOwnedSlice(allocator);
 }
@@ -1433,6 +1447,7 @@ fn samePackageArchitecture(
 
 fn toPhase(kind: solver.OrderedActionKind) Phase {
     return switch (kind) {
+        .bootstrap_extract => .bootstrap_extract,
         .remove => .remove,
         .unpack => .unpack,
         .configure => .configure,
@@ -2078,9 +2093,11 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    actions[0].essential = true;
     var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 0, .kind = .bootstrap_extract, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .configure, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = bytes };
@@ -2093,12 +2110,15 @@ test "transaction_executor.test.argv environment conffile policy and no shell" {
     defer report.deinit();
 
     try std.testing.expect(report.succeeded());
-    try std.testing.expectEqual(@as(usize, 3), harness.invocation_count);
-    try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[0].argv[0]);
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--root=/target"));
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--force-confold"));
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--no-triggers"));
+    try std.testing.expectEqual(@as(usize, 4), harness.invocation_count);
+    try std.testing.expectEqualStrings("/usr/bin/dpkg-deb", harness.invocations[0].argv[0]);
+    try std.testing.expect(containsArg(harness.invocations[0].argv, "--extract"));
+    try std.testing.expect(containsArg(harness.invocations[0].argv, "/target"));
+    try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[1].argv[0]);
+    try std.testing.expect(containsArg(harness.invocations[1].argv, "--root=/target"));
+    try std.testing.expect(containsArg(harness.invocations[1].argv, "--force-confold"));
     try std.testing.expect(containsArg(harness.invocations[1].argv, "--no-triggers"));
+    try std.testing.expect(containsArg(harness.invocations[2].argv, "--no-triggers"));
     try std.testing.expect(!containsArg(harness.invocations[0].argv, "sh"));
     try std.testing.expectEqual(@as(usize, audited_environment.len), harness.invocations[0].environment.len);
     try std.testing.expectEqualStrings("DEBIAN_FRONTEND", harness.invocations[0].environment[0].key);

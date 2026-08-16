@@ -15,12 +15,19 @@ database lock is released after this bounded probe so dpkg can own it; debz
 retains its transaction lock and the frontend lock, with
 `DPKG_FRONTEND_LOCKED=true`, across the transaction.
 
-Each cached archive is reread immediately before its unpack command. Size,
+Each cached archive is reread immediately before its bootstrap-extract or unpack command. Size,
 SHA-256, outer archive, payload paths, control identity, requested identity,
 scripts, and conffiles are revalidated with `deb_payload.validate`.
 
-Processes are invoked directly as `/usr/bin/dpkg`; no shell or command string
-is used. Every invocation replaces the environment with the fixed audited set
+For a new root, authenticated Essential packages receive a deterministic
+`/usr/bin/dpkg-deb --extract` bootstrap phase before normal dpkg processing.
+This runs no maintainer scripts and makes the complete Essential runtime
+available for the first pre-installation and configuration scripts; every
+archive is subsequently unpacked by dpkg so ownership and database state remain
+authoritative.
+
+Processes are invoked directly as `/usr/bin/dpkg-deb` or `/usr/bin/dpkg`; no
+shell or command string is used. Every invocation replaces the environment with the fixed audited set
 `DEBIAN_FRONTEND`, `DPKG_COLORS`, `DPKG_FRONTEND_LOCKED`, `HOME`, `LC_ALL`,
 and `PATH`. The fixed locale is `C`. Dpkg receives both `--root` and
 `--admindir`. Output capture is bounded and concurrent, and every child has a
@@ -38,7 +45,7 @@ No general dpkg force option is enabled by default. Supported exceptions are a
 typed `ForceRisk` list and therefore appear in command provenance.
 
 The executor follows `ordered_actions` exactly, including planner-linearized
-cycles. Remove, unpack, and configure commands defer triggers with
+cycles and Essential bootstrap extraction. Remove, unpack, and configure commands defer triggers with
 `--no-triggers`; one final
 `--triggers-only --pending` command processes them deterministically without
 configuring unrelated pending packages.

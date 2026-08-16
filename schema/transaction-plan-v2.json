@@ -77,7 +77,8 @@
           ]
         },
         "requested": { "type": "boolean" },
-        "reason": { "enum": ["explicit_request", "dependency", "recommends", "replacement", "upgrade"] }
+        "reason": { "enum": ["explicit_request", "dependency", "recommends", "replacement", "upgrade"] },
+        "essential": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -86,7 +87,7 @@
       "required": ["sequence", "kind", "package", "version", "architecture"],
       "properties": {
         "sequence": { "type": "integer", "minimum": 0 },
-        "kind": { "enum": ["remove", "unpack", "configure"] },
+        "kind": { "enum": ["bootstrap_extract", "remove", "unpack", "configure"] },
         "package": { "type": "string" },
         "version": { "type": "string" },
         "architecture": { "type": "string" }
