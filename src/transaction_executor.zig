@@ -1652,15 +1652,17 @@ pub const SystemProcessRunner = struct {
                 return .{ .termination = .cancelled };
             },
         };
+        const diagnostics = try std.mem.concat(self.allocator, u8, &.{ result.stdout, result.stderr });
         self.allocator.free(result.stdout);
-        self.last_stderr = result.stderr;
+        self.allocator.free(result.stderr);
+        self.last_stderr = diagnostics;
         const termination: ProcessTermination = switch (result.term) {
             .exited => |code| .{ .exited = code },
             .signal => |signal| .{ .signaled = @intFromEnum(signal) },
             .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
             .unknown => |status| .{ .signaled = status },
         };
-        return .{ .termination = termination, .stderr = result.stderr };
+        return .{ .termination = termination, .stderr = diagnostics };
     }
 
     fn runChild(

@@ -65,6 +65,17 @@ ln -s usr/lib "$root/lib"
 ln -s usr/lib64 "$root/lib64"
 : >"$root/var/lib/dpkg/status"
 : >"$root/var/lib/dpkg/available"
+capture_root_layout() {
+  {
+    for path in bin sbin lib lib64 bin/sh usr/bin/sh usr/bin/dpkg-divert; do
+      target=$(readlink "$root/$path" 2>/dev/null || true)
+      printf '%s target=%s exists=%s executable=%s\n' "$path" "${target:-none}" \
+        "$([[ -e "$root/$path" ]] && echo true || echo false)" \
+        "$([[ -x "$root/$path" ]] && echo true || echo false)"
+    done
+  } >"$evidence/root-layout.txt"
+}
+trap capture_root_layout EXIT
 cat >"$source_file" <<EOF
 Types: deb
 URIs: $uri

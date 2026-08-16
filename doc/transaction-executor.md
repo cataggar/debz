@@ -30,7 +30,8 @@ Processes are invoked directly as `/usr/bin/dpkg-deb` or `/usr/bin/dpkg`; no
 shell or command string is used. Every invocation replaces the environment with the fixed audited set
 `DEBIAN_FRONTEND`, `DPKG_COLORS`, `DPKG_FRONTEND_LOCKED`, `HOME`, `LC_ALL`,
 and `PATH`. The fixed locale is `C`. Dpkg receives both `--root` and
-`--admindir`. Output capture is bounded and concurrent, and every child has a
+`--admindir`. Standard output and error diagnostics are captured concurrently,
+combined in fixed stdout-then-stderr order under independent bounds, and every child has a
 configurable nonzero deadline (five minutes by default); expiry terminates and
 reaps the child and produces a structured `process_timeout` failure. Production
 cancellation is observed while a command is running and likewise terminates and
