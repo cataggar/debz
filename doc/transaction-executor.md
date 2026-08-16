@@ -27,8 +27,10 @@ first pre-installation and configuration scripts; every archive is subsequently
 unpacked by dpkg so ownership and database state remain authoritative.
 Before dpkg runs, legacy top-level directories created by safe archive
 extraction are merged into their `usr` targets without overwriting any existing
-entry, then restored to exact merged-usr links. Wrong links, path collisions,
-and unsupported entries fail closed.
+entry, then restored to exact merged-usr links. Authenticated `base-passwd`
+master files, when present, seed the new root's initial passwd and group
+databases before maintainer scripts run. Wrong links, path collisions, and
+unsupported entries fail closed.
 
 Processes are invoked directly as `/usr/bin/dpkg-deb` or `/usr/bin/dpkg`; no
 shell or command string is used. Every invocation replaces the environment with the fixed audited set
@@ -53,7 +55,11 @@ The executor follows `ordered_actions` exactly, including planner-linearized
 cycles and Essential bootstrap extraction. It unpacks in libsolv's
 Pre-Depends-aware order and inserts `dpkg --configure --pending` barriers before
 packages with Pre-Depends and after the final unpack, allowing dpkg to configure
-normal dependency cycles in its native order. Remove, unpack, and configure
+normal dependency cycles in its native order. A barrier omits dpkg's
+single-error abort limit: when dependency cycles leave a nonzero result, the
+executor proceeds only if a bounded status reread proves a strict increase in
+fully configured packages. No-progress and maintainer-script failures remain
+structured transaction failures. Remove, unpack, and configure
 commands defer triggers with `--no-triggers`; one final
 `--triggers-only --pending` command processes them deterministically without
 configuring unrelated pending packages.
@@ -61,8 +67,9 @@ configuring unrelated pending packages.
 Failures include phase, exact package identity, exit status or signal, bounded dpkg
 diagnostics, completed-command count, plan digest, and command/artifact
 digests. Root safety and lock ownership are rechecked at command boundaries. A report is
-successful only after every ordered command and final trigger command exits
-zero. Recovery and post-state verification are intentionally deferred to #28.
+successful only after every ordered command makes its required state transition,
+the final trigger command exits zero, and exact post-state verification passes.
+Recovery and post-state verification are intentionally deferred to #28.
 
 `FileSystem`, `LockManager`, `ProcessRunner`, and `Cancellation` are injectable
 for hermetic tests. `SystemFileSystem`, `SystemLockManager`, and

@@ -1,6 +1,7 @@
 const std = @import("std");
 const solver = @import("solver.zig");
 const deb_payload = @import("deb_payload.zig");
+const dpkg_status = @import("dpkg_status.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
 
@@ -495,6 +496,10 @@ pub fn execute(
             state.failure = journalFailure(arena, err, .journal_io, "cannot persist command boundary");
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
+        const configured_before = if (phase == .configure_pending)
+            configuredPackageCount(arena, dependencies.status, request.install_root) catch null
+        else
+            null;
         const result = dependencies.process.run(.{
             .argv = argv,
             .environment = &audited_environment,
@@ -517,7 +522,14 @@ pub fn execute(
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
         try state.commands.append(arena, provenance);
-        if (!successful(result.termination)) {
+        const made_configuration_progress = if (!successful(result.termination) and configured_before != null)
+            if (configuredPackageCount(arena, dependencies.status, request.install_root) catch null) |after|
+                after > configured_before.?
+            else
+                false
+        else
+            false;
+        if (!successful(result.termination) and !made_configuration_progress) {
             state.failure = try processFailure(arena, result, phase, ordered.package, request.policy.maximum_diagnostic_bytes, state.commands.items.len);
             journal.state = if (state.failure.?.code == .interrupted) .interrupted else .dpkg_failed;
             journal.failure = state.failure.?.diagnostic;
@@ -1280,7 +1292,7 @@ fn buildArgv(
     try argv.append(allocator, root_flag);
     try argv.append(allocator, admin_flag);
     try argv.append(allocator, "--no-pager");
-    try argv.append(allocator, "--abort-after=1");
+    if (phase != .configure_pending) try argv.append(allocator, "--abort-after=1");
     try argv.append(allocator, conffileArg(policy.conffile));
     for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
     try argv.append(allocator, "--no-triggers");
@@ -1383,6 +1395,27 @@ fn processFailure(
         },
         .cancelled => interruption(phase, owned_package, completed, diagnostic),
     };
+}
+
+fn configuredPackageCount(
+    allocator: std.mem.Allocator,
+    status: recovery.StatusReader,
+    root: []const u8,
+) !usize {
+    const source = try status.read(allocator, root, 64 * 1024 * 1024);
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return error.InvalidDpkgStatus,
+        .database => |value| value,
+    };
+    defer database.deinit();
+    var count: usize = 0;
+    for (database.database.packages) |package|
+        if (package.status.isFullyInstalled()) {
+            count += 1;
+        };
+    return count;
 }
 
 fn interruption(phase: ?Phase, package: ?[]const u8, completed: usize, diagnostic: []const u8) Failure {
@@ -2030,6 +2063,7 @@ const TestHarness = struct {
     journal_writes: usize = 0,
     journal_archived: bool = false,
     status_source: ?[]const u8 = null,
+    status_source_after_first_read: ?[]const u8 = null,
     status_reads: usize = 0,
     crash_point: ?recovery.CrashPoint = null,
     crash_index: usize = 0,
@@ -2140,6 +2174,8 @@ const TestHarness = struct {
     fn readStatus(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
         const self: *TestHarness = @ptrCast(@alignCast(context));
         self.status_reads += 1;
+        if (self.status_source_after_first_read) |source|
+            if (self.status_reads > 1) return allocator.dupe(u8, source);
         if (self.status_source) |source| return allocator.dupe(u8, source);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
@@ -2147,8 +2183,9 @@ const TestHarness = struct {
         for (self.invocations[0..self.invocation_count], 0..) |invocation, index| {
             if (invocation.phase == .unpack and invocation.package != null) {
                 var configured = false;
-                for (self.invocations[index + 1 .. self.invocation_count]) |later|
+                for (self.invocations[index + 1 .. self.invocation_count], index + 1..) |later, later_index|
                     if (later.phase == .configure_pending) {
+                        if (self.fail_at == later_index) continue;
                         configured = true;
                         break;
                     };
@@ -2414,6 +2451,37 @@ test "transaction_executor.test.dpkg failure has package phase exit and never su
     try std.testing.expectEqualStrings("demo postrm maintainer script returned error", report.failure.?.diagnostic);
     try std.testing.expectEqual(@as(usize, 1), report.failure.?.completed_commands);
     try std.testing.expectEqual(@as(usize, 1), report.commands.len);
+}
+
+test "transaction_executor.test.configure pending accepts only measured dpkg progress" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    const installed =
+        "Package: demo\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n";
+    var harness: TestHarness = .{
+        .bytes = bytes,
+        .fail_at = 1,
+        .fail_termination = .{ .exited = 1 },
+        .stderr = "one pending package remains dependency-blocked",
+        .status_source = "",
+        .status_source_after_first_read = installed,
+    };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expect(report.succeeded());
+    try std.testing.expectEqual(@as(usize, 3), harness.invocation_count);
+    try std.testing.expect(!containsArg(harness.invocations[1].argv, "--abort-after=1"));
 }
 
 test "transaction_executor.test.process timeout is bounded and structured" {
