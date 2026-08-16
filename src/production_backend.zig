@@ -464,7 +464,7 @@ pub const Backend = struct {
         const executor_policy = try executionPolicy(allocator, effective_request);
         var system_process = transaction_executor.SystemProcessRunner{ .allocator = allocator, .io = self.io };
         defer system_process.deinit();
-        var system_files = transaction_executor.SystemFileSystem{ .io = self.io };
+        var system_files = transaction_executor.SystemFileSystem{ .allocator = allocator, .io = self.io };
         var system_locks = transaction_executor.SystemLockManager{ .allocator = allocator, .io = self.io };
         var journal = try transaction_recovery.SystemJournalStore.init(
             self.io,

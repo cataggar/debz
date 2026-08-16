@@ -64,8 +64,6 @@ ln -s usr/bin "$root/bin"
 ln -s usr/sbin "$root/sbin"
 ln -s usr/lib "$root/lib"
 ln -s usr/lib64 "$root/lib64"
-printf 'root:x:0:0:root:/root:/bin/sh\n' >"$root/etc/passwd"
-printf 'root:x:0:\n' >"$root/etc/group"
 : >"$root/var/lib/dpkg/status"
 : >"$root/var/lib/dpkg/available"
 capture_root_layout() {

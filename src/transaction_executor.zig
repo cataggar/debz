@@ -1719,6 +1719,7 @@ pub const SystemProcessRunner = struct {
 /// Production filesystem adapter. Every install-root component is opened with
 /// symlink following disabled; artifact leaf symlinks are also rejected.
 pub const SystemFileSystem = struct {
+    allocator: std.mem.Allocator,
     io: std.Io,
 
     pub fn interface(self: *SystemFileSystem) FileSystem {
@@ -1791,6 +1792,19 @@ pub const SystemFileSystem = struct {
             legacy.close(self.io);
             try directory.deleteDir(self.io, mapping[0]);
             try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
+        }
+        inline for (.{
+            .{ "usr/share/base-passwd/passwd.master", "etc/passwd" },
+            .{ "usr/share/base-passwd/group.master", "etc/group" },
+        }) |mapping| {
+            const bytes = try directory.readFileAlloc(
+                self.io,
+                mapping[0],
+                self.allocator,
+                .limited(64 * 1024),
+            );
+            defer self.allocator.free(bytes);
+            try directory.writeFile(self.io, .{ .sub_path = mapping[1], .data = bytes });
         }
     }
 
@@ -2803,7 +2817,7 @@ test "transaction_executor.test.completed recovery retains unhealthy-state evide
 }
 
 test "transaction_executor.test.production adapters expose injectable interfaces" {
-    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     var locks: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     var process: SystemProcessRunner = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer process.deinit();
@@ -2824,7 +2838,7 @@ test "transaction_executor.test.production filesystem accepts an exact-size arti
         .{path_buffer[0..root_length]},
     );
     defer std.testing.allocator.free(path);
-    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     const bytes = try filesystem.interface().readArtifact(std.testing.allocator, path, 5);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("exact", bytes);
@@ -2841,19 +2855,37 @@ test "transaction_executor.test.bootstrap normalization restores empty merged-us
     try tmp.dir.createDirPath(std.testing.io, "root/usr/sbin");
     try tmp.dir.createDirPath(std.testing.io, "root/usr/lib");
     try tmp.dir.createDirPath(std.testing.io, "root/usr/lib64");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/share/base-passwd");
+    try tmp.dir.createDirPath(std.testing.io, "root/etc");
     try tmp.dir.createDirPath(std.testing.io, "root/lib");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/lib/bootstrap-file", .data = "safe" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/passwd.master",
+        .data = "root:x:0:0:root:/root:/bin/sh\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/group.master",
+        .data = "root:x:0:\nmail:x:8:\n",
+    });
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
     const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{path_buffer[0..root_length]});
     defer std.testing.allocator.free(root);
-    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     try filesystem.interface().normalizeBootstrapRoot(root);
     var target: [64]u8 = undefined;
     const length = try tmp.dir.readLink(std.testing.io, "root/lib", &target);
     try std.testing.expectEqualStrings("usr/lib", target[0..length]);
     var moved = try tmp.dir.openFile(std.testing.io, "root/usr/lib/bootstrap-file", .{});
     moved.close(std.testing.io);
+    const group = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "root/etc/group",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(group);
+    try std.testing.expectEqualStrings("root:x:0:\nmail:x:8:\n", group);
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
