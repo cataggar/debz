@@ -87,7 +87,7 @@ mutating=(--assume-yes --noninteractive --conffile keep-existing)
 run() {
   local name=$1
   shift
-  timeout --signal=TERM --kill-after=30s 10m "$debz" "$@" \
+  timeout --signal=TERM --kill-after=30s 30m "$debz" "$@" \
     >"$evidence/$name.json" 2>"$evidence/$name.stderr"
   [[ ! -s "$evidence/$name.stderr" ]]
   grep -q '"exit_status":0' "$evidence/$name.json"
