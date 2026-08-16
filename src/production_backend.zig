@@ -377,7 +377,7 @@ pub const Backend = struct {
                 origin,
                 try repository_acquisition.Uri.parse(normalized_repository.uri),
             );
-            var package = try package_acquisition.acquirePackage(
+            var package = package_acquisition.acquirePackage(
                 allocator,
                 &package_cache,
                 .{
@@ -397,6 +397,15 @@ pub const Backend = struct {
                         null,
                 },
                 acquisition.dependencies(),
+            ) catch |err| return api.failure(
+                request.operation,
+                .download,
+                .download_failed,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "package acquisition failed for {s}={s}:{s}: {s}",
+                    .{ action.package, action.version, action.architecture, @errorName(err) },
+                ),
             );
             var validation_result = deb_payload.validate(allocator, package.bytes, .{
                 .repository = origin.repository_id.slice(),
@@ -412,12 +421,25 @@ pub const Backend = struct {
             }, .{});
             switch (validation_result) {
                 .diagnostic => |diagnostic| {
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "payload validation failed for {s}={s}:{s}: stage={s} code={s} decompression={s}: {s}",
+                        .{
+                            action.package,
+                            action.version,
+                            action.architecture,
+                            @tagName(diagnostic.stage),
+                            @tagName(diagnostic.code),
+                            if (diagnostic.decompression_error) |err| @errorName(err) else "none",
+                            diagnostic.message(),
+                        },
+                    );
                     package.deinit();
                     return api.failure(
                         request.operation,
                         .download,
                         .download_failed,
-                        diagnostic.message(),
+                        message,
                     );
                 },
                 .validation => |*validation| validation.deinit(),
