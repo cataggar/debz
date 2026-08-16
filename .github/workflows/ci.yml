@@ -127,7 +127,11 @@ jobs:
           DEBZ_INTEGRATION_SUITE: ${{ matrix.suite }}
           DEBZ_INTEGRATION_ARCH: ${{ matrix.architecture }}
           DEBZ_INTEGRATION_MODE: full
+          DEBZ_INTEGRATION_SUDO: "1"
         run: zig build test-integration
+      - name: Normalize diagnostic ownership
+        if: always()
+        run: sudo chown -R "$USER:$USER" ".zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}" || true
       - name: Upload root diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -170,7 +174,11 @@ jobs:
           DEBZ_INTEGRATION_SUITE: ${{ matrix.suite }}
           DEBZ_INTEGRATION_ARCH: ${{ matrix.architecture }}
           DEBZ_INTEGRATION_MODE: full
+          DEBZ_INTEGRATION_SUDO: "1"
         run: zig build test-integration
+      - name: Normalize diagnostic ownership
+        if: always()
+        run: sudo chown -R "$USER:$USER" ".zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}" || true
       - name: Upload root diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

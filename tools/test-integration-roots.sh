@@ -6,6 +6,7 @@ debz=$1
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
 architecture=${DEBZ_INTEGRATION_ARCH:-amd64}
 mode=${DEBZ_INTEGRATION_MODE:-smoke}
+use_sudo=${DEBZ_INTEGRATION_SUDO:-0}
 workspace="$PWD/.zig-cache/integration-$suite-$architecture"
 repo="$workspace/repository"
 root="$workspace/root"
@@ -56,6 +57,24 @@ run_json() {
   fi
   test ! -s "$stderr_file"
   printf '%s\n' "$output"
+}
+
+run_mutating_json() {
+  if [ "$use_sudo" = 1 ]; then
+    set +e
+    output=$(sudo -- "$debz" "$@" 2>"$stderr_file")
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+      cat "$stderr_file" >&2
+      printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+    test ! -s "$stderr_file"
+    printf '%s\n' "$output"
+  else
+    run_json "$@"
+  fi
 }
 
 refresh_a=$(run_json refresh $common --assume-yes)
@@ -135,18 +154,26 @@ EOF
   printf 'CAPABILITY dpkg-root-transactions: %s\n' "$(dpkg --version | head -n 1)"
   mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
   dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
-  run_json install $mutating base-dep | grep -q '"exit_status":0'
-  run_json reinstall $mutating base-dep | grep -q '"exit_status":0'
-  run_json remove $mutating base-dep | grep -q '"exit_status":0'
-  run_json clean $mutating | grep -q '"exit_status":0'
+  run_mutating_json install $mutating base-dep | grep -q '"exit_status":0'
+  run_mutating_json reinstall $mutating base-dep | grep -q '"exit_status":0'
+  run_mutating_json remove $mutating base-dep | grep -q '"exit_status":0'
+  run_mutating_json clean $mutating | grep -q '"exit_status":0'
   set +e
-  failed_script=$("$debz" install $mutating fail-script 2>"$stderr_file")
+  if [ "$use_sudo" = 1 ]; then
+    failed_script=$(sudo -- "$debz" install $mutating fail-script 2>"$stderr_file")
+  else
+    failed_script=$("$debz" install $mutating fail-script 2>"$stderr_file")
+  fi
   failed_script_status=$?
   set -e
   test "$failed_script_status" -eq 7
   printf '%s' "$failed_script" | grep -q '"id":"transaction_failed"'
   set +e
-  recovery=$("$debz" recover $mutating 2>"$stderr_file")
+  if [ "$use_sudo" = 1 ]; then
+    recovery=$(sudo -- "$debz" recover $mutating 2>"$stderr_file")
+  else
+    recovery=$("$debz" recover $mutating 2>"$stderr_file")
+  fi
   recovery_status=$?
   set -e
   test "$recovery_status" -ne 0
