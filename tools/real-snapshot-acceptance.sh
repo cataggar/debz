@@ -57,7 +57,7 @@ evidence=$workspace/evidence
 source_file=$workspace/ubuntu.sources
 config_file=$workspace/ubuntu.json
 lock=$evidence/ubuntu-minimal.lock.json
-mkdir -p "$root/var/lib/dpkg/"{info,updates,triggers} "$cache" "$state" "$evidence"
+mkdir -p "$root/var/lib/debz" "$root/var/lib/dpkg/"{info,updates,triggers} "$cache" "$state" "$evidence"
 : >"$root/var/lib/dpkg/status"
 : >"$root/var/lib/dpkg/available"
 cat >"$source_file" <<EOF
