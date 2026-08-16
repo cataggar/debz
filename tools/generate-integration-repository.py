@@ -42,7 +42,21 @@ def tar_member(name: str, data: bytes, mode: int = 0o644) -> tarfile.TarInfo:
 def tar_gz(entries: list[tuple[str, bytes, int]]) -> bytes:
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        directories: set[str] = set()
         for name, data, mode in entries:
+            parent = pathlib.PurePosixPath(name).parent
+            parents: list[pathlib.PurePosixPath] = []
+            while str(parent) not in (".", ""):
+                parents.append(parent)
+                parent = parent.parent
+            for directory in reversed(parents):
+                directory_name = str(directory)
+                if directory_name in directories:
+                    continue
+                member = tar_member(directory_name, b"", 0o755)
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member)
+                directories.add(directory_name)
             archive.addfile(tar_member(name, data, mode), io.BytesIO(data))
     output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode="wb", mtime=EPOCH, filename="") as stream:
