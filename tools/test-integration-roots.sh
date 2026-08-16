@@ -155,9 +155,13 @@ EOF
   mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
   dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
   run_mutating_json install $mutating base-dep | grep -q '"exit_status":0'
+  echo "ASSERT dpkg-install: passed"
   run_mutating_json reinstall $mutating base-dep | grep -q '"exit_status":0'
+  echo "ASSERT dpkg-reinstall: passed"
   run_mutating_json remove $mutating base-dep | grep -q '"exit_status":0'
+  echo "ASSERT dpkg-remove: passed"
   run_mutating_json clean $mutating | grep -q '"exit_status":0'
+  echo "ASSERT cache-clean: passed"
   set +e
   if [ "$use_sudo" = 1 ]; then
     failed_script=$(sudo -- "$debz" install $mutating fail-script 2>"$stderr_file")
@@ -168,6 +172,7 @@ EOF
   set -e
   test "$failed_script_status" -eq 7
   printf '%s' "$failed_script" | grep -q '"id":"transaction_failed"'
+  echo "ASSERT maintainer-script-failure: passed"
   set +e
   if [ "$use_sudo" = 1 ]; then
     recovery=$(sudo -- "$debz" recover $mutating 2>"$stderr_file")
@@ -176,6 +181,7 @@ EOF
   fi
   recovery_status=$?
   set -e
+  printf 'RECOVERY status=%s output=%s\n' "$recovery_status" "$recovery"
   test "$recovery_status" -ne 0
   printf '%s' "$recovery" | grep -q '"exit_status":7\|"exit_status":8'
 fi
