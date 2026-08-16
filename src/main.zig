@@ -8,6 +8,7 @@ const usage =
     \\Commands:
     \\  refresh install remove upgrade upgrade-all reinstall download plan
     \\  list-installed list-available info provides why clean recover
+    \\  package-family-capabilities
     \\
     \\Required common options:
     \\  --install-root PATH --cache-path PATH --state-path PATH --architecture ARCH
@@ -71,6 +72,12 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "--version")) {
         try stdout.print("debz {s} (API v{d})\n", .{ debz.version, api.api_version });
+        return;
+    }
+    if (std.mem.eql(u8, command, "package-family-capabilities")) {
+        const json = try debz.packageFamilyCapabilities().canonicalJson(init.arena.allocator());
+        try stdout.writeAll(json);
+        try stdout.writeByte('\n');
         return;
     }
     const operation = debz.parseOperation(command) orelse {

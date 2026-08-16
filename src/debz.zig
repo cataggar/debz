@@ -15,6 +15,12 @@ pub const ProductBackend = product_api.Backend;
 pub const executeProductRequest = product_api.execute;
 pub const production_backend = @import("production_backend.zig");
 pub const ProductionBackend = production_backend.Backend;
+pub const package_family_backend = @import("package_family_backend.zig");
+pub const PackageFamilyBackend = package_family_backend.Backend;
+pub const PackageFamilyRequest = package_family_backend.Request;
+pub const PackageFamilyResult = package_family_backend.Result;
+pub const PackageFamilyCapabilities = package_family_backend.Capabilities;
+pub const packageFamilyCapabilities = package_family_backend.capabilities;
 pub const DebianVersion = @import("debian_version.zig").DebianVersion;
 pub const DebianVersionParseError = @import("debian_version.zig").ParseError;
 pub const SolverContext = solver.Context;
@@ -201,4 +207,5 @@ test {
     _ = transaction_recovery;
     _ = exact_lock;
     _ = transaction_provenance;
+    _ = package_family_backend;
 }

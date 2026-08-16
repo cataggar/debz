@@ -14,5 +14,6 @@
 - [Exact closure locks and transaction provenance](exact-locks-and-provenance.md) documents canonical schemas, reproduction constraints, redaction, persistence, recovery evidence, and final verification.
 - [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
 - [Hermetic integration roots](integration-roots.md) documents deterministic signed fixtures, disposable native/foreign roots, CI lanes, and local prerequisites.
+- [zvmi Debian-family backend](zvmi-package-family.md) defines the versioned Ubuntu/Debian image-builder boundary, explicit inputs, locks, provenance, cache policy, and failure contract.
 - [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.
 - [Safety CI, fuzzing and audits](safety-ci.md) documents fuzz targets, bounded CI/local campaigns, safety modes, and static policy gates.
