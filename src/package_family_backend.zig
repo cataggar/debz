@@ -190,7 +190,7 @@ fn validRequest(request: Request) bool {
     for (request.foreign_architectures) |architecture|
         if (architecture == request.architecture) return false;
     if ((request.operation == .create or request.operation == .customize) and request.package == null) return false;
-    if (request.operation == .recover and request.lock_input == null) return false;
+    if (request.operation != .inspect and request.lock_input == null) return false;
     if (request.lock_output != null and request.lock_input == null) return false;
     if (request.lock_input) |path| if (!absolute(path)) return false;
     if (request.lock_output) |path| if (!absolute(path)) return false;
@@ -278,6 +278,23 @@ test "mutations fail closed without required explicit inputs" {
         .cache = "/build/cache",
         .state = "/build/state",
         .package = "ubuntu-minimal",
+    });
+    try std.testing.expect(!result.succeeded);
+    try std.testing.expectEqual(ErrorId.invalid_request, result.diagnostic.?.id);
+    try std.testing.expect(!fake.seen);
+}
+
+test "mutations require an exact lock before backend execution" {
+    var fake: Fake = .{};
+    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const result = try backend.execute(std.testing.allocator, .{
+        .operation = .update,
+        .root = "/build/root",
+        .architecture = .amd64,
+        .sources = &.{"/build/sources"},
+        .keyrings = &.{"/build/keyring.gpg"},
+        .cache = "/build/cache",
+        .state = "/build/state",
     });
     try std.testing.expect(!result.succeeded);
     try std.testing.expectEqual(ErrorId.invalid_request, result.diagnostic.?.id);

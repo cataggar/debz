@@ -13,6 +13,10 @@ Schema version 1 supports create, customize, update, inspect, and recovery for
 architecture. Requests must provide absolute root, source/config, keyring,
 cache, state, credential-reference, and lock paths. No host APT configuration,
 keyring, proxy, cache, or credentials are inherited.
+Every create, customize, update, or recovery request must provide a previously
+reviewed exact-lock input; the backend never performs an unlocked image
+mutation. An optional lock output is an atomic canonical copy for the caller's
+artifact layout.
 
 Repository metadata is accepted only through debz's authenticated refresh
 pipeline. Package archives are digest-checked and payload-validated before the
