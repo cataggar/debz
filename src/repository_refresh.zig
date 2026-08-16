@@ -624,7 +624,6 @@ fn validateConfiguration(
 }
 
 fn validateAuthenticationPolicy(policy: AuthenticationPolicy) !void {
-    if (policy.accepted_primary_fingerprints.len == 0) return error.InvalidConfiguration;
     if (policy.keyrings == .many and policy.keyrings.many.len == 0)
         return error.InvalidConfiguration;
 }

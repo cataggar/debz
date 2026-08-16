@@ -238,9 +238,11 @@ fn openDirectoryPathFromOwned(io: std.Io, initial: std.Io.Dir, path: []const u8)
 }
 
 fn syncDirectory(io: std.Io, dir: std.Io.Dir) !void {
+    _ = io;
     switch (@import("builtin").os.tag) {
-        .windows, .wasi => return,
-        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
+        .linux => if (std.posix.errno(std.os.linux.fsync(dir.handle)) != .SUCCESS)
+            return error.Unexpected,
+        else => {},
     }
 }
 

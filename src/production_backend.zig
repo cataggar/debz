@@ -269,7 +269,12 @@ pub const Backend = struct {
 
         var installed = try self.loadInstalled(allocator, request);
         defer installed.deinit();
-        const policies = try installedPolicies(allocator, installed.database.packages);
+        const planning_records = if (request.operation == .recover)
+            try healthyInstalledRecords(allocator, installed.database.packages)
+        else
+            installed.database.packages;
+        defer if (request.operation == .recover) allocator.free(planning_records);
+        const policies = try installedPolicies(allocator, planning_records);
         var recovery_intent: ?std.json.Parsed(RecoveryIntent) = if (request.operation == .recover)
             try readRecoveryIntent(allocator, self.io, request.options.state_path)
         else
@@ -289,7 +294,8 @@ pub const Backend = struct {
         if (request.options.lock_output_path != null and request.options.lock_input_path == null)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output requires --lock-input for an exact authenticated closure");
         var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
-            try readLock(allocator, self.io, path)
+            readLock(allocator, self.io, path) catch
+                return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
         else
             null;
         defer if (lock) |*value| value.deinit();
@@ -298,7 +304,7 @@ pub const Backend = struct {
         var planning = try solver.planTransaction(allocator, .{
             .repositories = refreshed.universe.repositories,
             .installed = .{
-                .records = installed.database.packages,
+                .records = planning_records,
                 .native_architecture = request.options.architecture,
                 .policies = policies,
                 .hold_authority = .explicit_policy,
@@ -345,15 +351,16 @@ pub const Backend = struct {
                 return error.MissingRepository;
             const normalized_repository = findNormalized(configuration.repositories, origin.repository_id) orelse
                 return error.MissingRepository;
+            const selected = try package_acquisition.SelectedPackage.fromSolverSelection(
+                repository_input,
+                origin,
+                try repository_acquisition.Uri.parse(normalized_repository.uri),
+            );
             var package = try package_acquisition.acquirePackage(
                 allocator,
                 &package_cache,
                 .{
-                    .selected = try package_acquisition.SelectedPackage.fromSolverSelection(
-                        repository_input,
-                        origin,
-                        try repository_acquisition.Uri.parse(normalized_repository.uri),
-                    ),
+                    .selected = selected,
                     .policy = .{
                         .mode = if (request.options.offline or request.options.cache_only) .cache_only else .online,
                         .workflow = if (request.operation == .download) .download_only else .transaction,
@@ -378,14 +385,19 @@ pub const Backend = struct {
                 .requested_package = action.package,
                 .requested_version = action.version,
                 .requested_architecture = action.architecture,
-                .filename = origin.source_location,
+                .filename = selected.record.transport.filename.value,
                 .size = package.provenance.declared_size,
                 .sha256 = package.provenance.expected_sha256.bytes,
             }, .{});
             switch (validation_result) {
-                .diagnostic => {
+                .diagnostic => |diagnostic| {
                     package.deinit();
-                    return error.InvalidPackagePayload;
+                    return api.failure(
+                        request.operation,
+                        .download,
+                        .download_failed,
+                        diagnostic.message(),
+                    );
                 },
                 .validation => |*validation| validation.deinit(),
             }
@@ -705,10 +717,7 @@ fn writeRecoveryIntent(
     }
 
     try dir.rename(stage, dir, "recovery-request.json", io);
-    switch (@import("builtin").os.tag) {
-        .windows, .wasi => {},
-        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
-    }
+    try syncDirectory(dir);
 }
 
 fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
@@ -718,9 +727,14 @@ fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     };
+    try syncDirectory(dir);
+}
+
+fn syncDirectory(dir: std.Io.Dir) !void {
     switch (@import("builtin").os.tag) {
-        .windows, .wasi => {},
-        else => try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io),
+        .linux => if (std.posix.errno(std.os.linux.fsync(dir.handle)) != .SUCCESS)
+            return error.Unexpected,
+        else => {},
     }
 }
 
@@ -848,6 +862,17 @@ fn installedPolicies(
         });
     }
     return policies.toOwnedSlice(allocator);
+}
+
+fn healthyInstalledRecords(
+    allocator: std.mem.Allocator,
+    packages: []const dpkg_status.Package,
+) ![]dpkg_status.Package {
+    var records: std.ArrayList(dpkg_status.Package) = .empty;
+    for (packages) |package| {
+        if (package.status.isFullyInstalled()) try records.append(allocator, package);
+    }
+    return records.toOwnedSlice(allocator);
 }
 
 fn planRequest(allocator: std.mem.Allocator, request: api.Request) !solver.PlanRequest {

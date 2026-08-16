@@ -1709,7 +1709,13 @@ pub const SystemFileSystem = struct {
         defer file.close(self.io);
         var reader_buffer: [8192]u8 = undefined;
         var reader = file.reader(self.io, &reader_buffer);
-        return reader.interface.allocRemaining(allocator, .limited(maximum));
+        const probe_limit = std.math.add(usize, maximum, 1) catch maximum;
+        const bytes = try reader.interface.allocRemaining(allocator, .limited(probe_limit));
+        if (bytes.len > maximum) {
+            allocator.free(bytes);
+            return error.StreamTooLong;
+        }
+        return bytes;
     }
 
     fn validateArtifactPath(context: *anyopaque, path: []const u8) !void {
@@ -2641,6 +2647,28 @@ test "transaction_executor.test.production adapters expose injectable interfaces
     _ = filesystem.interface();
     _ = locks.interface();
     _ = process.interface();
+}
+
+test "transaction_executor.test.production filesystem accepts an exact-size artifact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "artifact.deb", .data = "exact" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/artifact.deb",
+        .{path_buffer[0..root_length]},
+    );
+    defer std.testing.allocator.free(path);
+    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    const bytes = try filesystem.interface().readArtifact(std.testing.allocator, path, 5);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("exact", bytes);
+    try std.testing.expectError(
+        error.StreamTooLong,
+        filesystem.interface().readArtifact(std.testing.allocator, path, 4),
+    );
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {

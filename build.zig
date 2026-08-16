@@ -58,6 +58,11 @@ pub fn build(b: *std.Build) void {
     cli_tests.addArtifactArg(cli);
     test_step.dependOn(&cli_tests.step);
 
+    const integration_tests = b.addSystemCommand(&.{ "sh", "tools/test-integration-roots.sh" });
+    integration_tests.addArtifactArg(cli);
+    b.step("test-integration", "Run hermetic signed-repository integration roots")
+        .dependOn(&integration_tests.step);
+
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("fuzz/fuzz_targets.zig"),
