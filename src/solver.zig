@@ -7,9 +7,11 @@ const source = @import("source.zig");
 const exact_lock_module = @import("exact_lock.zig");
 
 const libsolv = @cImport({
+    @cDefine("LIBSOLV_INTERNAL", "1");
     @cInclude("solv/evr.h");
     @cInclude("solv/pool.h");
     @cInclude("solv/poolarch.h");
+    @cInclude("solv/problems.h");
     @cInclude("solv/queue.h");
     @cInclude("solv/repo.h");
     @cInclude("solv/rules.h");
@@ -415,7 +417,7 @@ pub const Context = opaque {
                         libsolv.pool_rel2id(state.pool, solvable.*.name, solvable.*.evr, libsolv.REL_EQ, 1),
                         0,
                     );
-                    addRelations(state.pool, repo, solvable, record);
+                    addRelations(state.pool, repo, solvable, record, input.native_architecture);
                     setMultiArch(repo, solvable_id, record.multi_arch);
                     addQualifiedSelfProvide(state.pool, repo, solvable, record.name.value, record.architecture.value);
                     if (std.mem.eql(u8, record.architecture.value, "all"))
@@ -523,7 +525,13 @@ pub const Context = opaque {
             addAvailableRelation(state.pool, solvable, control.provides, .provides, state.target_architecture);
             addAvailableRelation(state.pool, solvable, control.conflicts, .conflicts, state.target_architecture);
             addAvailableRelation(state.pool, solvable, control.breaks, .conflicts, state.target_architecture);
-            addAvailableRelation(state.pool, solvable, control.replaces, .obsoletes, state.target_architecture);
+            addDebianObsoletes(
+                state.pool,
+                solvable,
+                if (control.replaces) |value| value.value else null,
+                if (control.conflicts) |value| value.value else null,
+                state.target_architecture,
+            );
 
             const self_provide = libsolv.pool_rel2id(
                 state.pool,
@@ -814,6 +822,7 @@ pub const ProblemKind = enum {
     lock_package_missing,
     lock_package_mismatch,
     lock_closure_drift,
+    invalid_solver_state,
 };
 
 pub const CandidateRejectionReason = enum {
@@ -965,6 +974,7 @@ pub fn planTransaction(
     }
 
     const state = internal(context);
+    try recreateSolver(state);
     configureSolver(state.solver, input.policy);
     var jobs: libsolv.Queue = undefined;
     libsolv.queue_init(&jobs);
@@ -976,6 +986,7 @@ pub fn planTransaction(
         if (try addExactLockJobs(allocator, arena_ptr, context, input, lock, &jobs)) |failure|
             return .{ .failure = failure };
     }
+    addEssentialJobs(context, input, &jobs);
     addSafetyLocks(context, input, &jobs);
     addInstallOnlyJobs(context, input, &jobs);
     addPhasedLocks(context, input, &jobs);
@@ -983,7 +994,6 @@ pub fn planTransaction(
     if (libsolv.solver_solve(state.solver, &jobs) != 0) {
         return .{ .failure = try materializeProblems(allocator, arena_ptr, context, input.limits.max_problems) };
     }
-
     const transaction = libsolv.solver_create_transaction(state.solver) orelse
         return error.PoolAllocationFailed;
     defer libsolv.transaction_free(transaction);
@@ -1037,6 +1047,8 @@ pub fn planTransaction(
         size_delta += action.installed_size_delta_bytes;
         try actions.append(owned, action);
     }
+    if (try validateNamedInstallAction(allocator, arena_ptr, context, input, actions.items)) |failure|
+        return .{ .failure = failure };
     if (input.exact_lock) |lock| {
         for (actions.items) |action| {
             if (action.kind == .remove) continue;
@@ -1270,14 +1282,13 @@ fn preflightRequest(
                 }
                 libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate);
             } else {
-                if (!hasAvailableName(context, selector.name)) {
+                const candidate = findAvailableCandidate(context, selector) orelse {
                     return (try failureOne(backing, arena, .no_candidate, selector.name, null, "no available package or provider matches the requested name")).failure;
+                };
+                if (!candidatePolicyAllowed(context, candidate, input)) {
+                    return (try failureOne(backing, arena, .phased_update_excluded, selector.name, null, "selected candidate is excluded by deterministic phased-update policy")).failure;
                 }
-                libsolv.queue_push2(
-                    jobs,
-                    libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE_NAME | libsolv.SOLVER_FORCEBEST,
-                    stringId(internal(context).pool, selector.name),
-                );
+                libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE | libsolv.SOLVER_FORCEBEST, candidate);
             }
         },
         .remove => |selector| {
@@ -1706,6 +1717,57 @@ fn hasRequiredInstalledDependent(context: *Context, removed_index: usize) bool {
     return false;
 }
 
+fn addEssentialJobs(context: *Context, input: PlanInput, jobs: *libsolv.Queue) void {
+    switch (input.request) {
+        .remove => return,
+        else => {},
+    }
+    const state = internal(context);
+    for (state.origins.items) |origin| {
+        const repository_index = findRepositoryIndex(input.repositories, origin.repository_id) orelse continue;
+        const record = input.repositories[repository_index].packages.records[origin.record_index];
+        if (record.control.essential != true) continue;
+        const candidate = findAvailableCandidate(context, .{ .name = origin.package }) orelse continue;
+        if (candidate != origin.solvable_id or !candidatePolicyAllowed(context, candidate, input)) continue;
+        if (hasInstalledOrigin(context, origin) or hasInstallJob(jobs, candidate))
+            continue;
+        libsolv.queue_push2(
+            jobs,
+            libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE | libsolv.SOLVER_ESSENTIAL,
+            candidate,
+        );
+    }
+}
+
+fn hasInstalledOrigin(context: *Context, origin: OriginOwned) bool {
+    const state = internal(context);
+    for (state.mappings) |mapping| {
+        const installed = state.source_records[mapping.record_index];
+        if (sameIdentity(
+            origin.package,
+            origin.architecture,
+            installed.name.value,
+            installed.architecture.value,
+        )) return true;
+    }
+    return false;
+}
+
+fn hasInstallJob(jobs: *const libsolv.Queue, candidate: libsolv.Id) bool {
+    if (jobs.*.count < 0) return false;
+    const count: usize = @intCast(jobs.*.count);
+    var index: usize = 0;
+    while (index + 1 < count) : (index += 2) {
+        const how = jobs.*.elements[index];
+        const what = jobs.*.elements[index + 1];
+        if ((how & libsolv.SOLVER_JOBMASK) == libsolv.SOLVER_INSTALL and
+            (how & libsolv.SOLVER_SELECTMASK) == libsolv.SOLVER_SOLVABLE and
+            what == candidate)
+            return true;
+    }
+    return false;
+}
+
 fn addSafetyLocks(context: *Context, input: PlanInput, jobs: *libsolv.Queue) void {
     const state = internal(context);
     for (state.mappings, 0..) |mapping, index| {
@@ -1713,6 +1775,41 @@ fn addSafetyLocks(context: *Context, input: PlanInput, jobs: *libsolv.Queue) voi
             libsolv.queue_push2(jobs, libsolv.SOLVER_LOCK | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
         }
     }
+}
+
+fn validateNamedInstallAction(
+    backing: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    context: *Context,
+    input: PlanInput,
+    actions: []const PlanAction,
+) PlanningError!?PlanFailure {
+    const selector = switch (input.request) {
+        .install => |value| value,
+        else => return null,
+    };
+    const candidate_id = findAvailableCandidate(context, selector) orelse return null;
+    const origin = findOrigin(internal(context), candidate_id).?;
+    if (findInstalledSelector(context, .{
+        .name = origin.package,
+        .version = origin.version,
+        .architecture = origin.architecture,
+    }) != null) return null;
+    for (actions) |action| {
+        if (action.kind != .remove and
+            std.mem.eql(u8, action.package, origin.package) and
+            std.mem.eql(u8, action.version, origin.version) and
+            std.mem.eql(u8, action.architecture, origin.architecture))
+            return null;
+    }
+    return (try failureOne(
+        backing,
+        arena,
+        .unsatisfied_dependency,
+        selector.name,
+        null,
+        "solver did not materialize the selected named package",
+    )).failure;
 }
 
 fn materializeProblems(
@@ -1729,11 +1826,25 @@ fn materializeProblems(
     while (true) {
         problem = libsolv.solver_next_problem(state.solver, problem);
         if (problem == 0 or problems.items.len == max_problems) break;
-        const rule = libsolv.solver_findproblemrule(state.solver, problem);
+        const rule = validatedProblemRule(state, problem) orelse {
+            try problems.append(owned, .{
+                .kind = .invalid_solver_state,
+                .detail = "solver problem trace failed validated rule and range checks",
+            });
+            break;
+        };
         var source_id: libsolv.Id = 0;
         var target_id: libsolv.Id = 0;
         var dependency_id: libsolv.Id = 0;
         const info = libsolv.solver_ruleinfo(state.solver, rule, &source_id, &target_id, &dependency_id);
+        const solvable_count: libsolv.Id = @intCast(state.pool.*.nsolvables);
+        if (source_id < 0 or source_id >= solvable_count or target_id < 0 or target_id >= solvable_count) {
+            try problems.append(owned, .{
+                .kind = .invalid_solver_state,
+                .detail = "solver rule produced an out-of-range solvable identifier",
+            });
+            break;
+        }
         const kind: ProblemKind = switch (info) {
             libsolv.SOLVER_RULE_PKG_NOTHING_PROVIDES_DEP,
             libsolv.SOLVER_RULE_PKG_REQUIRES,
@@ -1755,7 +1866,13 @@ fn materializeProblems(
             try owned.dupe(u8, std.mem.span(libsolv.pool_dep2str(state.pool, dependency_id)))
         else
             null;
-        const detail = try owned.dupe(u8, std.mem.span(libsolv.solver_problem2str(state.solver, problem)));
+        const detail = try owned.dupe(u8, std.mem.span(libsolv.solver_problemruleinfo2str(
+            state.solver,
+            info,
+            source_id,
+            target_id,
+            dependency_id,
+        )));
         try problems.append(owned, .{
             .kind = kind,
             .package = package,
@@ -1773,6 +1890,82 @@ fn materializeProblems(
         .backing_allocator = backing,
         .arena = arena,
     };
+}
+
+fn validatedProblemRule(state: *Internal, problem: libsolv.Id) ?libsolv.Id {
+    const solver_handle = state.solver;
+    if (problem <= 0) return null;
+    const problem_count: usize = @intCast(libsolv.solver_problem_count(solver_handle));
+    const problem_index: usize = @intCast(problem);
+    if (problem_index > problem_count or solver_handle.*.problems.count < 0 or
+        @as(usize, @intCast(solver_handle.*.problems.count)) != problem_count * 2)
+        return null;
+    if (!solverRuleRangesValid(solver_handle)) return null;
+    const trace_slot = (problem_index - 1) * 2;
+    const trace_index = solver_handle.*.problems.elements[trace_slot];
+    var budget: usize = @intCast(solver_handle.*.learnt_pool.count);
+    if (!validatedLearntTrace(solver_handle, trace_index, 0, &budget)) return null;
+    const rule = libsolv.solver_findproblemrule(solver_handle, problem);
+    if (rule <= 0 or rule >= solver_handle.*.nrules) return null;
+    return rule;
+}
+
+fn solverRuleRangesValid(solver_handle: *libsolv.Solver) bool {
+    const end = solver_handle.*.nrules;
+    if (end <= 0) return false;
+    const ranges = [_]libsolv.Id{
+        solver_handle.*.pkgrules_end,
+        solver_handle.*.featurerules,
+        solver_handle.*.featurerules_end,
+        solver_handle.*.updaterules,
+        solver_handle.*.updaterules_end,
+        solver_handle.*.jobrules,
+        solver_handle.*.jobrules_end,
+        solver_handle.*.infarchrules,
+        solver_handle.*.infarchrules_end,
+        solver_handle.*.duprules,
+        solver_handle.*.duprules_end,
+        solver_handle.*.bestrules,
+        solver_handle.*.bestrules_up,
+        solver_handle.*.bestrules_end,
+        solver_handle.*.yumobsrules,
+        solver_handle.*.yumobsrules_end,
+        solver_handle.*.blackrules,
+        solver_handle.*.blackrules_end,
+        solver_handle.*.strictrepopriorules,
+        solver_handle.*.strictrepopriorules_end,
+        solver_handle.*.learntrules,
+    };
+    for (ranges) |value| if (value < 0 or value > end) return false;
+    return true;
+}
+
+fn validatedLearntTrace(
+    solver_handle: *libsolv.Solver,
+    start: libsolv.Id,
+    depth: usize,
+    budget: *usize,
+) bool {
+    if (depth > 64 or start < 0 or solver_handle.*.learnt_pool.count < 0) return false;
+    const count: usize = @intCast(solver_handle.*.learnt_pool.count);
+    var index: usize = @intCast(start);
+    if (index >= count) return false;
+    while (index < count) : (index += 1) {
+        if (budget.* == 0) return false;
+        budget.* -= 1;
+        const rule = solver_handle.*.learnt_pool.elements[index];
+        if (rule == 0) return true;
+        if (rule <= 0 or rule >= solver_handle.*.nrules) return false;
+        if (rule >= solver_handle.*.learntrules) {
+            const learnt_index: usize = @intCast(rule - solver_handle.*.learntrules);
+            if (solver_handle.*.learnt_why.count < 0 or
+                learnt_index >= @as(usize, @intCast(solver_handle.*.learnt_why.count)))
+                return false;
+            const nested = solver_handle.*.learnt_why.elements[learnt_index];
+            if (!validatedLearntTrace(solver_handle, nested, depth + 1, budget)) return false;
+        }
+    }
+    return false;
 }
 
 fn lessProblem(_: void, a: ProblemNode, b: ProblemNode) bool {
@@ -2272,6 +2465,13 @@ fn internalConst(context: *const Context) *const Internal {
     return @ptrCast(@alignCast(context));
 }
 
+fn recreateSolver(state: *Internal) error{PoolAllocationFailed}!void {
+    const replacement = libsolv.solver_create(state.pool) orelse
+        return error.PoolAllocationFailed;
+    libsolv.solver_free(state.solver);
+    state.solver = replacement;
+}
+
 fn stringId(pool: *libsolv.Pool, value: []const u8) libsolv.Id {
     return libsolv.pool_strn2id(pool, value.ptr, @intCast(value.len), 1);
 }
@@ -2281,11 +2481,25 @@ fn addRelations(
     repo: *libsolv.Repo,
     solvable: *allowzero libsolv.Solvable,
     record: dpkg_status.Package,
+    target_architecture: []const u8,
 ) void {
     for (record.relations) |dependency| {
         switch (dependency.kind) {
-            .pre_depends, .depends => for (dependency.relation.groups) |group| {
-                solvable.*.requires = libsolv.repo_addid_dep(repo, solvable.*.requires, groupId(pool, group), 0);
+            .pre_depends => for (dependency.relation.groups) |group| {
+                solvable.*.requires = libsolv.repo_addid_dep(
+                    repo,
+                    solvable.*.requires,
+                    groupId(pool, group),
+                    libsolv.SOLVABLE_PREREQMARKER,
+                );
+            },
+            .depends => for (dependency.relation.groups) |group| {
+                solvable.*.requires = libsolv.repo_addid_dep(
+                    repo,
+                    solvable.*.requires,
+                    groupId(pool, group),
+                    -libsolv.SOLVABLE_PREREQMARKER,
+                );
             },
             .recommends => for (dependency.relation.groups) |group| {
                 solvable.*.recommends = libsolv.repo_addid_dep(repo, solvable.*.recommends, groupId(pool, group), 0);
@@ -2301,11 +2515,7 @@ fn addRelations(
                     solvable.*.conflicts = libsolv.repo_addid_dep(repo, solvable.*.conflicts, alternativeId(pool, alternative), 0);
                 }
             },
-            .replaces => for (dependency.relation.groups) |group| {
-                for (group.alternatives) |alternative| {
-                    solvable.*.obsoletes = libsolv.repo_addid_dep(repo, solvable.*.obsoletes, alternativeId(pool, alternative), 0);
-                }
-            },
+            .replaces => {},
             .provides => for (dependency.relation.groups) |group| {
                 for (group.alternatives) |alternative| {
                     solvable.*.provides = libsolv.repo_addid_dep(repo, solvable.*.provides, alternativeId(pool, alternative), 0);
@@ -2313,6 +2523,13 @@ fn addRelations(
             },
         }
     }
+    addDebianObsoletes(
+        pool,
+        solvable,
+        if (record.relation(.replaces)) |value| value.relation else null,
+        if (record.relation(.conflicts)) |value| value.relation else null,
+        target_architecture,
+    );
 }
 
 fn groupId(pool: *libsolv.Pool, group: relation.DependencyGroup) libsolv.Id {
@@ -2516,6 +2733,57 @@ fn alternativeIdForArchitecture(
     return alternativeId(pool, alternative);
 }
 
+fn addDebianObsoletes(
+    pool: *libsolv.Pool,
+    solvable: *allowzero libsolv.Solvable,
+    replaces: ?relation.Relation,
+    conflicts: ?relation.Relation,
+    target_architecture: []const u8,
+) void {
+    const replace_relation = replaces orelse return;
+    const conflict_relation = conflicts orelse return;
+    for (replace_relation.groups) |replace_group| {
+        for (replace_group.alternatives) |replace| {
+            if (!alternativeActive(replace, target_architecture)) continue;
+            for (conflict_relation.groups) |conflict_group| {
+                for (conflict_group.alternatives) |conflict| {
+                    if (!alternativeActive(conflict, target_architecture) or
+                        !samePackageReference(replace.package, conflict.package, target_architecture))
+                        continue;
+                    const replace_id = alternativeIdForArchitecture(pool, replace, target_architecture);
+                    const conflict_id = alternativeIdForArchitecture(pool, conflict, target_architecture);
+                    const obsolete = if (replace_id == conflict_id)
+                        replace_id
+                    else
+                        libsolv.pool_rel2id(pool, replace_id, conflict_id, libsolv.REL_AND, 1);
+                    libsolv.solvable_add_deparray(solvable, libsolv.SOLVABLE_OBSOLETES, obsolete, 0);
+                }
+            }
+        }
+    }
+}
+
+fn samePackageReference(
+    left: relation.PackageReference,
+    right: relation.PackageReference,
+    target_architecture: []const u8,
+) bool {
+    if (!std.mem.eql(u8, left.name.text, right.name.text)) return false;
+    const left_architecture = normalizedQualifier(left.architecture_qualifier, target_architecture);
+    const right_architecture = normalizedQualifier(right.architecture_qualifier, target_architecture);
+    if (left_architecture == null or right_architecture == null)
+        return left_architecture == null and right_architecture == null;
+    return std.mem.eql(u8, left_architecture.?, right_architecture.?);
+}
+
+fn normalizedQualifier(
+    qualifier: ?relation.Token,
+    target_architecture: []const u8,
+) ?[]const u8 {
+    const value = qualifier orelse return null;
+    return if (std.mem.eql(u8, value.text, "native")) target_architecture else value.text;
+}
+
 fn setMultiArch(repo: *libsolv.Repo, solvable_id: libsolv.Id, value: anytype) void {
     const multi_arch = value orelse return;
     const text: [*:0]const u8 = switch (multi_arch) {
@@ -2566,7 +2834,7 @@ test "context pool uses Debian version semantics" {
 test "installed records preserve dependencies, provides, conflicts, and source mapping" {
     var database = try parsedDatabase(
         "Package: provider\nVersion: 2\nArchitecture: amd64\nStatus: install ok installed\nProvides: virtual-api (= 2)\n\n" ++
-            "Package: consumer\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nDepends: virtual-api (>= 2) | fallback\nConflicts: obsolete-api\n",
+            "Package: consumer\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nPre-Depends: bootstrap\nDepends: virtual-api (>= 2) | fallback\nConflicts: obsolete-api\n",
     );
     defer database.deinit();
     const policies = [_]InstalledPolicy{
@@ -2587,6 +2855,13 @@ test "installed records preserve dependencies, provides, conflicts, and source m
     const consumer = &state.pool.*.solvables[@intCast(state.mappings[1].solvable_id)];
     try std.testing.expect(consumer.*.requires != 0);
     try std.testing.expect(consumer.*.conflicts != 0);
+    var dependency_offset = consumer.*.requires;
+    var saw_prerequisite_marker = false;
+    while (state.installed_repo.?.*.idarraydata[dependency_offset] != 0) : (dependency_offset += 1) {
+        if (state.installed_repo.?.*.idarraydata[dependency_offset] == libsolv.SOLVABLE_PREREQMARKER)
+            saw_prerequisite_marker = true;
+    }
+    try std.testing.expect(saw_prerequisite_marker);
     const provider = &state.pool.*.solvables[@intCast(state.mappings[0].solvable_id)];
     try std.testing.expect(provider.*.provides != 0);
     const virtual_requirement = libsolv.pool_rel2id(
@@ -2787,6 +3062,7 @@ fn availableIndexForArchitecture(
 
 fn solveAvailable(context: *Context, name: []const u8) ![]PackageOrigin {
     const state = internal(context);
+    try recreateSolver(state);
     var job: libsolv.Queue = undefined;
     libsolv.queue_init(&job);
     defer libsolv.queue_free(&job);
@@ -2811,6 +3087,44 @@ fn hasSelected(selected: []const PackageOrigin, name: []const u8) bool {
         if (std.mem.eql(u8, origin.package, name)) return true;
     }
     return false;
+}
+
+fn hasAction(actions: []const PlanAction, name: []const u8) bool {
+    for (actions) |action| {
+        if (std.mem.eql(u8, action.package, name) and action.kind != .remove) return true;
+    }
+    return false;
+}
+
+fn minimizedUbuntuMetadata(allocator: std.mem.Allocator, architecture: []const u8) ![]u8 {
+    const hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    return std.fmt.allocPrint(
+        allocator,
+        "Package: ubuntu-minimal\nVersion: 1.570\nArchitecture: {s}\nDepends: apt, python3:any, sudo, sudo-rs\nFilename: pool/ubuntu-minimal.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: apt\nVersion: 3.2.0\nArchitecture: {s}\nProvides: apt-transport-https (= 3.2.0)\nDepends: base-passwd, gpgv, libapt-pkg7.0 (>= 3.2.0), libc6 (>= 2.38)\nReplaces: apt-transport-https (<< 1.5~)\nFilename: pool/apt.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: base-files\nVersion: 14ubuntu1\nArchitecture: {s}\nEssential: yes\nPre-Depends: libc6 (>= 2.38)\nFilename: pool/base-files.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: base-passwd\nVersion: 3.6.8\nArchitecture: {s}\nEssential: yes\nPre-Depends: libc6 (>= 2.38)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: gpgv\nVersion: 2.4.8\nArchitecture: {s}\nMulti-Arch: foreign\nDepends: libc6 (>= 2.38)\nFilename: pool/gpgv.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: libapt-pkg7.0\nVersion: 3.2.0\nArchitecture: {s}\nMulti-Arch: same\nProvides: libapt-pkg (= 3.2.0)\nDepends: libc6 (>= 2.38)\nFilename: pool/libapt-pkg.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: libc6\nVersion: 2.43\nArchitecture: {s}\nEssential: yes\nMulti-Arch: same\nFilename: pool/libc6.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: python3\nVersion: 3.14\nArchitecture: {s}\nMulti-Arch: allowed\nDepends: libc6 (>= 2.38)\nFilename: pool/python3.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: sudo\nVersion: 1.9.17\nArchitecture: {s}\nPre-Depends: sudo-common\nDepends: libc6 (>= 2.38)\nRecommends: sudo-rs\nConflicts: sudo-ldap\nReplaces: sudo-ldap\nFilename: pool/sudo.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: sudo-common\nVersion: 1.2ubuntu\nArchitecture: all\nBreaks: sudo (<< 1.9.16)\nReplaces: sudo (<< 1.9.16)\nFilename: pool/sudo-common.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: sudo-rs\nVersion: 0.2.13\nArchitecture: {s}\nDepends: python3:any, sudo-common, libc6 (>= 2.38)\nFilename: pool/sudo-rs.deb\nSize: 1\nSHA256: {s}\n",
+        .{
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            hash,         architecture,
+            hash,
+        },
+    );
 }
 
 test "available import requires explicit trust and owns identities" {
@@ -2878,6 +3192,25 @@ test "available solve enforces pre-depends conflicts breaks and replaces" {
     }
     const replacement = libsolv.pool_id2solvable(state.pool, replacement_id);
     try std.testing.expect(replacement.*.obsoletes != 0);
+}
+
+test "Debian Replaces without Conflicts does not obsolete packages" {
+    const text =
+        "Package: common\nVersion: 2\nArchitecture: all\nBreaks: app (<< 2)\nReplaces: app (<< 2)\nFilename: pool/common.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: app\nVersion: 2\nArchitecture: amd64\nFilename: pool/app.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('r');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    for (internal(context).origins.items) |origin| {
+        if (!std.mem.eql(u8, origin.package, "common")) continue;
+        const package = libsolv.pool_id2solvable(internal(context).pool, origin.solvable_id);
+        try std.testing.expectEqual(@as(libsolv.Offset, 0), package.*.obsoletes);
+    }
 }
 
 test "architecture all and recommends retain distinct solver semantics" {
@@ -2977,7 +3310,7 @@ test "all Multi-Arch modes are preserved at the opaque libsolv boundary" {
 
 test "planner materializes owned install closure and stable canonical JSON" {
     const text =
-        "Package: app\nVersion: 2\nArchitecture: amd64\nDepends: lib\nInstalled-Size: 10\nSource: app-src (2)\nFilename: pool/app.deb\nSize: 20\n" ++
+        "Package: app\nVersion: 2\nArchitecture: amd64\nProvides: app-virtual (= 2)\nDepends: lib\nInstalled-Size: 10\nSource: app-src (2)\nFilename: pool/app.deb\nSize: 20\n" ++
         "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
         "Package: lib\nVersion: 1\nArchitecture: amd64\nInstalled-Size: 3\nFilename: pool/lib.deb\nSize: 7\n" ++
         "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
@@ -3021,6 +3354,87 @@ test "planner materializes owned install closure and stable canonical JSON" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"schema_version\":2") != null);
+}
+
+test "planner installs a named package with Debian replacement metadata" {
+    const text =
+        "Package: apt\nVersion: 3.2.0\nArchitecture: amd64\nProvides: apt-transport-https (= 3.2.0)\nDepends: dep\nConflicts: old (<< 2)\nBreaks: older (<< 2)\nReplaces: apt-transport-https (<< 1.5~)\nFilename: pool/apt.deb\nSize: 2\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: dep\nVersion: 1\nArchitecture: amd64\nFilename: pool/dep.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('x');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "apt" } },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.actions.len);
+}
+
+test "real metadata facts produce ubuntu-minimal closures on native architectures" {
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        const text = try minimizedUbuntuMetadata(std.testing.allocator, architecture);
+        defer std.testing.allocator.free(text);
+        const id = testRepositoryId(if (std.mem.eql(u8, architecture, "amd64")) 'm' else 'n');
+        var index = try availableIndexForArchitecture(id, architecture, text);
+        defer index.deinit();
+        const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+        const result = try planTransaction(std.testing.allocator, .{
+            .repositories = &repositories,
+            .installed = .{
+                .records = &.{},
+                .native_architecture = architecture,
+                .policies = &.{},
+                .hold_authority = .explicit_policy,
+            },
+            .target_architecture = architecture,
+            .request = .{ .install = .{ .name = "ubuntu-minimal" } },
+        });
+        var plan = result.plan;
+        defer plan.deinit();
+        try std.testing.expect(plan.actions.len != 0);
+        try std.testing.expect(hasAction(plan.actions, "ubuntu-minimal"));
+        try std.testing.expect(hasAction(plan.actions, "base-files"));
+    }
+}
+
+test "problem traces are range checked before libsolv materialization" {
+    const text =
+        "Package: root\nVersion: 1\nArchitecture: amd64\nDepends: absent\nFilename: pool/root.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
+    const id = testRepositoryId('q');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
+    const state = internal(context);
+    try recreateSolver(state);
+    var jobs: libsolv.Queue = undefined;
+    libsolv.queue_init(&jobs);
+    defer libsolv.queue_free(&jobs);
+    libsolv.queue_push2(
+        &jobs,
+        libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE,
+        state.origins.items[0].solvable_id,
+    );
+    try std.testing.expect(libsolv.solver_solve(state.solver, &jobs) != 0);
+    try std.testing.expect(validatedProblemRule(state, 1) != null);
+    const original = state.solver.*.problems.elements[0];
+    state.solver.*.problems.elements[0] = state.solver.*.learnt_pool.count + 1;
+    defer state.solver.*.problems.elements[0] = original;
+    try std.testing.expectEqual(@as(?libsolv.Id, null), validatedProblemRule(state, 1));
 }
 
 test "planner rejects untrusted duplicate and unhealthy inputs before solve" {
@@ -3361,15 +3775,19 @@ test "architecture restrictions and inactive build profiles are evaluated explic
 
 test "planner reinstall is exact and summaries include ordered execution" {
     var database = try parsedDatabase(
-        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nInstalled-Size: 4\n",
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nInstalled-Size: 4\n\n" ++
+            "Package: essential-core\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nEssential: yes\n",
     );
     defer database.deinit();
     const policies = [_]InstalledPolicy{
         .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+        .{ .name = "essential-core", .architecture = "amd64", .install_reason = .automatic, .held = false },
     };
     const text =
         "Package: app\nVersion: 1\nArchitecture: amd64\nInstalled-Size: 4\nFilename: pool/app.deb\nSize: 9\n" ++
-        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n";
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: essential-core\nVersion: 1\nArchitecture: amd64\nEssential: yes\nFilename: pool/essential.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
     const id = testRepositoryId('p');
     var index = try availableIndex(id, text);
     defer index.deinit();

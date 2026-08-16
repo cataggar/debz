@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    debz.addIncludePath(libsolv_dependency.path("src"));
     debz.linkLibrary(libsolv);
     debz.link_libc = true;
     debz.linkSystemLibrary("lzma", .{});
