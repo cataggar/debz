@@ -1600,36 +1600,61 @@ pub const SystemProcessRunner = struct {
         defer environment.deinit();
         for (invocation.environment) |entry| try environment.put(entry.key, entry.value);
 
-        const result = try self.runChild(invocation, &environment);
-        self.allocator.free(result.stdout);
-        self.last_stderr = result.stderr;
-        const termination: ProcessTermination = switch (result.term) {
+        var child = try std.process.spawn(self.io, .{
+            .argv = invocation.argv,
+            .environ_map = &environment,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        defer child.kill(self.io);
+        const Outcome = union(enum) {
+            term: std.process.Child.WaitError!std.process.Child.Term,
+            timeout,
+            cancelled,
+        };
+        var outcomes: [3]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        select.async(.term, std.process.Child.wait, .{ &child, self.io });
+        select.async(.timeout, sleepFor, .{ self.io, invocation.timeout_ms });
+        select.async(.cancelled, waitCancellation, .{ self.io, invocation.cancellation });
+        errdefer select.cancelDiscard();
+        const term = switch (try select.await()) {
+            .term => |term| term: {
+                select.cancelDiscard();
+                break :term try term;
+            },
+            .timeout => {
+                select.cancelDiscard();
+                child.kill(self.io);
+                return error.Timeout;
+            },
+            .cancelled => {
+                select.cancelDiscard();
+                child.kill(self.io);
+                return .{ .termination = .cancelled };
+            },
+        };
+        const termination: ProcessTermination = switch (term) {
             .exited => |code| .{ .exited = code },
             .signal => |signal| .{ .signaled = @intFromEnum(signal) },
             .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
             .unknown => |status| .{ .signaled = status },
         };
-        return .{ .termination = termination, .stderr = result.stderr };
+        return .{ .termination = termination, .stderr = &.{} };
     }
 
-    fn runChild(
-        self: *SystemProcessRunner,
-        invocation: Invocation,
-        environment: *const std.process.Environ.Map,
-    ) std.process.RunError!std.process.RunResult {
-        return std.process.run(self.allocator, self.io, .{
-            .argv = invocation.argv,
-            .environ_map = environment,
-            .stdout_limit = .unlimited,
-            .stderr_limit = .unlimited,
-            .timeout = .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(@min(
-                    invocation.timeout_ms,
-                    @as(u64, std.math.maxInt(i64)),
-                ))),
-                .clock = .awake,
-            } },
-        });
+    fn sleepFor(io: std.Io, timeout_ms: u64) void {
+        io.sleep(.fromMilliseconds(@intCast(@min(
+            timeout_ms,
+            @as(u64, std.math.maxInt(i64)),
+        ))), .awake) catch {};
+    }
+
+    fn waitCancellation(io: std.Io, cancellation: Cancellation) void {
+        while (!cancellation.cancelled()) {
+            io.sleep(.fromMilliseconds(10), .awake) catch return;
+        }
     }
 
 };

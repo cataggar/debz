@@ -62,7 +62,7 @@ def audit_production_sources() -> None:
                     continue
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative}:{line}: forbidden {reason}")
-        for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
+        for match in re.finditer(r"\bstd\.process\.(?:run|spawn)\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
     if len(process_calls) != 1 or not process_calls[0].startswith("src/transaction_executor.zig:"):
         fail(f"production process boundary changed: {process_calls!r}")
