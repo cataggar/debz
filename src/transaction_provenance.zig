@@ -342,8 +342,9 @@ pub const Store = struct {
         }
         try self.dir.rename(stage, self.dir, self.name, self.io);
         switch (@import("builtin").os.tag) {
-            .windows, .wasi => {},
-            else => try (std.Io.File{ .handle = self.dir.handle, .flags = .{ .nonblocking = false } }).sync(self.io),
+            .linux => if (std.posix.errno(std.os.linux.fsync(self.dir.handle)) != .SUCCESS)
+                return error.Unexpected,
+            else => {},
         }
     }
 };
