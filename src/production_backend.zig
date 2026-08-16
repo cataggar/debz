@@ -388,6 +388,7 @@ pub const Backend = struct {
                         .maximum_package_bytes = 1024 * 1024 * 1024,
                         .deadlines = deadlines(request.options.deadline_ms),
                         .redirect_limit = 8,
+                        .retry = productionRetryPolicy(),
                         .proxy = try proxyPolicy(request.options.proxy),
                         .credentials = credentials,
                     },
@@ -837,6 +838,7 @@ fn makeRuntimes(
                 .proxy = try proxyPolicy(request.options.proxy),
                 .deadlines = deadlines(request.options.deadline_ms),
                 .redirect_limit = 8,
+                .retry = productionRetryPolicy(),
                 .credentials = credentials,
                 .maximum_release_bytes = 16 * 1024 * 1024,
             },
@@ -993,6 +995,14 @@ fn deadlines(overall: u64) repository_acquisition.Deadlines {
         .read_ms = @min(overall, 30_000),
         .overall_ms = overall,
     };
+}
+
+fn productionRetryPolicy() repository_acquisition.RetryPolicy {
+    return .{ .max_attempts = 4, .backoff_ms = productionRetryBackoff };
+}
+
+fn productionRetryBackoff(attempt: u16) u64 {
+    return @as(u64, attempt) * 2_000;
 }
 
 fn sourceFormat(path: []const u8) source.Format {
