@@ -7,19 +7,16 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      run_real_ubuntu_snapshot:
-        description: "Run optional authenticated Ubuntu snapshot smoke lane"
-        required: false
-        type: boolean
-        default: false
       ubuntu_snapshot_uri:
-        description: "Immutable Ubuntu snapshot URI"
-        required: false
+        description: "Pinned immutable Ubuntu snapshot URI"
+        required: true
         type: string
+        default: "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z"
       ubuntu_snapshot_suite:
-        description: "Snapshot suite/codename"
-        required: false
+        description: "Pinned snapshot suite/codename"
+        required: true
         type: string
+        default: "resolute"
   schedule:
     - cron: "23 3 * * 1"
 
@@ -80,6 +77,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends liblzma-dev pkg-config
+      - name: Test real acceptance input validation
+        run: |
+          tools/real-snapshot-acceptance.sh --validate-values \
+            https://snapshot.ubuntu.com/ubuntu/20260816T000000Z resolute amd64
+          ! tools/real-snapshot-acceptance.sh --validate-values \
+            https://example.invalid resolute amd64
       - name: Run static security audit
         run: zig build security-audit
 
@@ -203,50 +206,65 @@ jobs:
           retention-days: 7
 
   ubuntu-real-snapshot:
-    if: github.event_name == 'workflow_dispatch' && inputs.run_real_ubuntu_snapshot
-    name: Optional real Ubuntu snapshot
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch'
+    name: Real Ubuntu snapshot (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Validate opt-in inputs
+      - name: Validate pinned native acceptance inputs
         env:
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
           SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}
         run: |
-          test -n "$SNAPSHOT_URI"
-          test -n "$SNAPSHOT_SUITE"
-          test -f /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          tools/real-snapshot-acceptance.sh --validate \
+            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "${{ matrix.architecture }}"
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
-      - name: Install audited system dependency
+      - name: Install test runner prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends liblzma-dev
-      - name: Authenticated refresh and deterministic plan
+          sudo apt-get install --yes --no-install-recommends dpkg jq liblzma-dev
+      - name: Build production CLI
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Create and replay exact Ubuntu root
         env:
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
           SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}
         run: |
-          set -euo pipefail
-          mkdir -p .real-snapshot/{cache,state,root}
-          cp /usr/share/keyrings/ubuntu-archive-keyring.gpg .real-snapshot/ubuntu-archive.gpg
-          keyring="$PWD/.real-snapshot/ubuntu-archive.gpg"
-          cat > .real-snapshot/ubuntu.sources <<EOF
-          Types: deb
-          URIs: $SNAPSHOT_URI
-          Suites: $SNAPSHOT_SUITE
-          Components: main
-          Architectures: amd64
-          Signed-By: $keyring
-          EOF
-          zig build
-          debz="$PWD/zig-out/bin/debz"
-          common="--install-root $PWD/.real-snapshot/root --cache-path $PWD/.real-snapshot/cache --state-path $PWD/.real-snapshot/state --architecture amd64 --source $PWD/.real-snapshot/ubuntu.sources --keyring $keyring --json"
-          "$debz" refresh $common
-          "$debz" plan $common ubuntu-minimal
+          sudo --preserve-env=SNAPSHOT_URI,SNAPSHOT_SUITE \
+            tools/real-snapshot-acceptance.sh "$PWD/zig-out/bin/debz" \
+            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "${{ matrix.architecture }}" \
+            "$PWD/.real-snapshot/${{ matrix.architecture }}"
+      - name: Collect diagnostics and clean staged payloads
+        if: always()
+        run: |
+          work=".real-snapshot/${{ matrix.architecture }}"
+          sudo mkdir -p "$work/evidence"
+          sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
+          sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
+          sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
+          sudo du -sh "$work" >"$work/evidence/disk-usage-final.txt" 2>/dev/null || true
+          sudo rm -rf "$work/root" "$work/cache"
+          sudo chown -R "$USER:$USER" "$work"
+      - name: Upload real acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ubuntu-real-snapshot-${{ matrix.architecture }}
+          path: .real-snapshot/${{ matrix.architecture }}/evidence/
+          if-no-files-found: error
+          retention-days: 14

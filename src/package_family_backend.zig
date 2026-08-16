@@ -17,6 +17,7 @@ pub const Architecture = enum {
 };
 
 pub const Operation = enum {
+    resolve_lock,
     create,
     customize,
     update,
@@ -32,7 +33,7 @@ pub const Capabilities = struct {
     version: u32 = schema_version,
     family: []const u8 = "debian",
     implementations: []const []const u8 = &.{ "ubuntu-26.04", "debian" },
-    operations: []const []const u8 = &.{ "create", "customize", "update", "recover", "inspect" },
+    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "update", "recover", "inspect" },
     architectures: []const []const u8 = &.{ "amd64", "arm64" },
     request_schema: []const u8 = request_schema,
     result_schema: []const u8 = result_schema,
@@ -112,6 +113,7 @@ pub const Backend = struct {
             return failure(request.operation, .usage, .invalid_request, "invalid explicit package-family request", false);
 
         const operation: product.Operation = switch (request.operation) {
+            .resolve_lock => .plan,
             .create, .customize => .install,
             .update => if (request.package == null) .upgrade_all else .upgrade,
             .recover => .recover,
@@ -189,9 +191,11 @@ fn validRequest(request: Request) bool {
     for (request.keyrings) |path| if (!absolute(path)) return false;
     for (request.foreign_architectures) |architecture|
         if (architecture == request.architecture) return false;
-    if ((request.operation == .create or request.operation == .customize) and request.package == null) return false;
-    if (request.operation != .inspect and request.lock_input == null) return false;
-    if (request.lock_output != null and request.lock_input == null) return false;
+    if ((request.operation == .resolve_lock or request.operation == .create or request.operation == .customize) and request.package == null) return false;
+    if (request.operation == .resolve_lock) {
+        if (request.lock_input != null or request.lock_output == null) return false;
+    } else if (request.operation != .inspect and request.lock_input == null) return false;
+    if (request.lock_output != null and request.lock_input == null and request.operation != .resolve_lock) return false;
     if (request.lock_input) |path| if (!absolute(path)) return false;
     if (request.lock_output) |path| if (!absolute(path)) return false;
     if (request.credential_reference) |path| if (!absolute(path)) return false;
@@ -264,6 +268,27 @@ test "Ubuntu create maps explicit policy to product API" {
     defer if (result.provenance_path) |path| std.testing.allocator.free(path);
     try std.testing.expect(result.succeeded);
     try std.testing.expectEqual(product.Operation.install, fake.operation.?);
+}
+
+test "initial lock resolution is non-mutating and requires a new lock path" {
+    var fake: Fake = .{};
+    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const result = try backend.execute(std.testing.allocator, .{
+        .operation = .resolve_lock,
+        .root = "/build/root",
+        .architecture = .arm64,
+        .sources = &.{"/build/sources"},
+        .keyrings = &.{"/build/keyring.gpg"},
+        .cache = "/build/cache",
+        .state = "/build/state",
+        .package = "ubuntu-minimal",
+        .lock_output = "/build/core.lock.json",
+        .cache_mode = .offline,
+    });
+    try std.testing.expect(result.succeeded);
+    try std.testing.expectEqual(product.Operation.plan, fake.operation.?);
+    try std.testing.expectEqualStrings("/build/core.lock.json", result.lock_path.?);
+    try std.testing.expect(!result.changed);
 }
 
 test "mutations fail closed without required explicit inputs" {

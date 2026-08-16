@@ -19,6 +19,9 @@ normal production inputs should be built from
 rejects unknown schema versions, digest tampering, non-canonical JSON,
 duplicates, missing repositories, unsafe paths, symlinks, and oversized
 documents. `ExactClosureLockStore` publishes with write/fsync/rename/fsync.
+The production CLI permits initial lock resolution only on non-mutating
+`plan` and `download` operations. The package-family API exposes that path as
+`resolve_lock`; all image mutations continue to require the reviewed lock.
 
 `debz.transaction_provenance` defines transaction-result schema version 1. It
 binds request and policy digests, architecture, source configuration IDs,

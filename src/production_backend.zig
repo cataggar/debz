@@ -291,16 +291,18 @@ pub const Backend = struct {
             effective_request.options.force = intent.value.force;
             effective_request.options.lock_wait_ms = intent.value.lock_wait_ms;
         }
-        if (request.options.lock_output_path != null and request.options.lock_input_path == null)
-            return api.failure(request.operation, .usage, .configuration_required, "--lock-output requires --lock-input for an exact authenticated closure");
+        if (request.options.lock_output_path != null and request.options.lock_input_path == null and
+            request.operation != .plan and request.operation != .download)
+            return api.failure(request.operation, .usage, .configuration_required, "--lock-output without --lock-input is restricted to non-mutating plan or download lock resolution");
+        if (request.options.lock_output_path != null and request.options.lock_input_path == null and
+            planning_records.len != 0)
+            return api.failure(request.operation, .planning, .planning_failed, "initial exact-lock resolution requires an empty installed package database");
         var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
             readLock(allocator, self.io, path) catch
                 return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
         else
             null;
         defer if (lock) |*value| value.deinit();
-        if (request.options.lock_output_path) |path|
-            try writeLock(allocator, self.io, path, lock.?.lock);
         var planning = try solver.planTransaction(allocator, .{
             .repositories = refreshed.universe.repositories,
             .installed = .{
@@ -333,6 +335,20 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
+        var generated_lock: ?exact_lock.OwnedLock = null;
+        defer if (generated_lock) |*value| value.deinit();
+        if (request.options.lock_output_path) |path| {
+            if (lock) |*value| {
+                try writeLock(allocator, self.io, path, value.lock);
+            } else {
+                generated_lock = lockFromPlan(allocator, effective_request, refreshed, plan.*) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return api.failure(request.operation, .planning, .planning_failed, "authenticated plan could not produce a complete exact lock"),
+                    };
+                try writeLock(allocator, self.io, path, generated_lock.?.lock);
+            }
+        }
         if (request.operation == .plan) return planResult(allocator, request.operation, plan.*);
 
         var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
@@ -992,6 +1008,108 @@ fn writeLock(
     defer dir.close(io);
     const store = try exact_lock.Store.init(io, dir, leaf);
     try store.writeAtomic(allocator, lock);
+}
+
+fn lockFromPlan(
+    allocator: std.mem.Allocator,
+    request: api.Request,
+    refreshed: *repository_policy.RefreshResult,
+    plan: solver.Plan,
+) !exact_lock.OwnedLock {
+    var packages: std.ArrayList(exact_lock.Package) = .empty;
+    defer packages.deinit(allocator);
+    var repository_ids: std.ArrayList([64]u8) = .empty;
+    defer repository_ids.deinit(allocator);
+
+    for (plan.actions) |action| {
+        const origin = action.selected_origin orelse continue;
+        const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
+            return error.MissingRepository;
+        const record = repository.packages.records[origin.record_index];
+        var repository_id: [64]u8 = undefined;
+        @memcpy(&repository_id, origin.repository_id.slice());
+        var seen = false;
+        for (repository_ids.items) |existing| {
+            if (std.mem.eql(u8, &existing, &repository_id)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try repository_ids.append(allocator, repository_id);
+        try packages.append(allocator, .{
+            .name = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+            .repository_id = repository_id,
+            .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
+                return error.MissingRepository,
+            .sha256 = record.transport.sha256.bytes,
+            .declared_size = record.transport.size.value,
+            .retention = if (action.requested) .requested else .dependency,
+            .dpkg_selection_hold = false,
+        });
+    }
+
+    var repositories: std.ArrayList(exact_lock.Repository) = .empty;
+    defer repositories.deinit(allocator);
+    var signer_storage: std.ArrayList([][20]u8) = .empty;
+    defer {
+        for (signer_storage.items) |signers| allocator.free(signers);
+        signer_storage.deinit(allocator);
+    }
+    for (repository_ids.items) |repository_id| {
+        const snapshot = findSnapshot(refreshed.snapshots, repository_id) orelse
+            return error.MissingRepository;
+        const evidence = snapshot.snapshot.provenance.authentication_evidence;
+        var signers = try allocator.alloc([20]u8, evidence.signatures.len);
+        var signer_count: usize = 0;
+        for (evidence.signatures) |signature| if (signature.primary_fingerprint) |fingerprint| {
+            signers[signer_count] = fingerprint;
+            signer_count += 1;
+        };
+        if (signer_count == 0) {
+            allocator.free(signers);
+            return error.MissingRepository;
+        }
+        try signer_storage.append(allocator, signers);
+        try repositories.append(allocator, .{
+            .id = repository_id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+            .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+            .index_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+            .signer_fingerprints = signers[0..signer_count],
+        });
+    }
+
+    const plan_json = try plan.canonicalJson(allocator);
+    defer allocator.free(plan_json);
+    var request_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plan_json, &request_digest, .{});
+    var policy_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    policy_hash.update("debz-solver-policy-v1\x00");
+    policy_hash.update(if (request.options.recommends) "recommends\x00" else "no-recommends\x00");
+    policy_hash.update(if (request.options.allow_downgrade) "allow-downgrade\x00" else "no-downgrade\x00");
+    policy_hash.update(@tagName(request.options.repository_policy));
+
+    return exact_lock.create(allocator, .{
+        .target_architecture = request.options.architecture,
+        .request_sha256 = request_digest,
+        .policy_sha256 = policy_hash.finalResult(),
+        .repositories = repositories.items,
+        .packages = packages.items,
+        .authenticated_metadata = true,
+    });
+}
+
+fn findSnapshot(
+    snapshots: []const repository_refresh.AuthenticatedResult,
+    repository_id: [64]u8,
+) ?*const repository_refresh.AuthenticatedResult {
+    for (snapshots) |*snapshot| {
+        if (std.mem.eql(u8, snapshot.snapshot.provenance.repository_id.slice(), &repository_id))
+            return snapshot;
+    }
+    return null;
 }
 
 fn writeExecutionProvenance(
