@@ -25,6 +25,9 @@ normal dpkg processing. This runs no maintainer scripts and makes Essential
 packages plus their omitted or explicit runtime prerequisites available for the
 first pre-installation and configuration scripts; every archive is subsequently
 unpacked by dpkg so ownership and database state remain authoritative.
+Before dpkg runs, empty legacy top-level directories created by safe archive
+extraction are restored to exact merged-usr links; wrong links or non-empty
+legacy directories fail closed.
 
 Processes are invoked directly as `/usr/bin/dpkg-deb` or `/usr/bin/dpkg`; no
 shell or command string is used. Every invocation replaces the environment with the fixed audited set

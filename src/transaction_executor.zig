@@ -99,11 +99,16 @@ pub const ProcessRunner = struct {
 pub const FileSystem = struct {
     context: *anyopaque,
     validateRootFn: *const fn (*anyopaque, []const u8) anyerror!void,
+    normalizeBootstrapRootFn: *const fn (*anyopaque, []const u8) anyerror!void,
     validateArtifactPathFn: *const fn (*anyopaque, []const u8) anyerror!void,
     readArtifactFn: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) anyerror![]u8,
 
     pub fn validateRoot(self: FileSystem, root: []const u8) !void {
         return self.validateRootFn(self.context, root);
+    }
+
+    pub fn normalizeBootstrapRoot(self: FileSystem, root: []const u8) !void {
+        return self.normalizeBootstrapRootFn(self.context, root);
     }
 
     pub fn readArtifact(
@@ -314,6 +319,7 @@ pub fn execute(
         try rootPath(arena, request.install_root, "var/lib/dpkg/lock"),
     };
     var held: [lock_paths.len]?LockToken = @splat(null);
+    var bootstrap_normalized = !requiresRootBootstrap(request.plan.actions);
     defer for (held, 0..) |token, index| {
         if (token) |value| dependencies.locks.release(value);
         held[index] = null;
@@ -389,6 +395,18 @@ pub fn execute(
     };
 
     for (request.plan.ordered_actions, 0..) |ordered, command_index| {
+        if (!bootstrap_normalized and ordered.kind != .bootstrap_extract) {
+            dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
+                state.failure = .{
+                    .code = .invalid_root,
+                    .phase = toPhase(ordered.kind),
+                    .diagnostic = try arena.dupe(u8, @errorName(err)),
+                    .completed_commands = state.commands.items.len,
+                };
+                return finish(allocator, arena_ptr, &state, plan_sha256);
+            };
+            bootstrap_normalized = true;
+        }
         if (dependencies.cancellation.cancelled()) {
             journal.state = .interrupted;
             journal.failure = "cancelled before dpkg invocation";
@@ -828,6 +846,12 @@ pub fn recover(
     }
     dependencies.locks.release(held[2].?);
     held[2] = null;
+    if (requiresRootBootstrap(request.plan.actions)) {
+        dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
+            state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
+    }
 
     journal.state = .in_progress;
     journal.boundary = .recovering;
@@ -1701,6 +1725,7 @@ pub const SystemFileSystem = struct {
         return .{
             .context = self,
             .validateRootFn = validateRoot,
+            .normalizeBootstrapRootFn = normalizeBootstrapRoot,
             .validateArtifactPathFn = validateArtifactPath,
             .readArtifactFn = readArtifact,
         };
@@ -1720,6 +1745,47 @@ pub const SystemFileSystem = struct {
             const next = try current.openDir(self.io, component, .{ .follow_symlinks = false });
             current.close(self.io);
             current = next;
+        }
+    }
+
+    fn normalizeBootstrapRoot(context: *anyopaque, root: []const u8) !void {
+        const self: *SystemFileSystem = @ptrCast(@alignCast(context));
+        var directory = try std.Io.Dir.openDirAbsolute(self.io, root, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        defer directory.close(self.io);
+        for ([_][2][]const u8{
+            .{ "bin", "usr/bin" },
+            .{ "sbin", "usr/sbin" },
+            .{ "lib", "usr/lib" },
+            .{ "lib64", "usr/lib64" },
+        }) |mapping| {
+            var target_buffer: [64]u8 = undefined;
+            if (directory.readLink(self.io, mapping[0], &target_buffer)) |length| {
+                if (!std.mem.eql(u8, target_buffer[0..length], mapping[1]))
+                    return error.UnsafeMergedUsrLink;
+                continue;
+            } else |_| {}
+
+            var legacy = directory.openDir(self.io, mapping[0], .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
+                    continue;
+                },
+                else => return err,
+            };
+            var iterator = legacy.iterate();
+            if (try iterator.next(self.io) != null) {
+                legacy.close(self.io);
+                return error.NonEmptyLegacyUsrDirectory;
+            }
+            legacy.close(self.io);
+            try directory.deleteDir(self.io, mapping[0]);
+            try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
         }
     }
 
@@ -1904,6 +1970,7 @@ const TestHarness = struct {
             .filesystem = .{
                 .context = self,
                 .validateRootFn = validateRoot,
+                .normalizeBootstrapRootFn = normalizeBootstrapRoot,
                 .validateArtifactPathFn = validateArtifactPath,
                 .readArtifactFn = readArtifact,
             },
@@ -1932,6 +1999,8 @@ const TestHarness = struct {
         self.root_validate_count += 1;
         if (!self.root_valid or self.root_fail_after == current) return error.SymlinkRoot;
     }
+
+    fn normalizeBootstrapRoot(_: *anyopaque, _: []const u8) !void {}
 
     fn readArtifact(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) ![]u8 {
         const self: *TestHarness = @ptrCast(@alignCast(context));
@@ -2713,6 +2782,25 @@ test "transaction_executor.test.production filesystem accepts an exact-size arti
         error.StreamTooLong,
         filesystem.interface().readArtifact(std.testing.allocator, path, 4),
     );
+}
+
+test "transaction_executor.test.bootstrap normalization restores empty merged-usr directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/bin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/sbin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/lib");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/lib64");
+    try tmp.dir.createDirPath(std.testing.io, "root/lib");
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{path_buffer[0..root_length]});
+    defer std.testing.allocator.free(root);
+    var filesystem: SystemFileSystem = .{ .io = std.testing.io };
+    try filesystem.interface().normalizeBootstrapRoot(root);
+    var target: [64]u8 = undefined;
+    const length = try tmp.dir.readLink(std.testing.io, "root/lib", &target);
+    try std.testing.expectEqualStrings("usr/lib", target[0..length]);
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
