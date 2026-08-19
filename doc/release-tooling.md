@@ -11,8 +11,9 @@ undeclared ELF dependencies.
 The install prefix must contain:
 
 * `bin/debz`
-* `share/licenses/debz/LICENSE`
-* `share/licenses/debz/THIRD_PARTY_NOTICES`
+* `share/doc/debz/LICENSE`
+* `share/doc/debz/THIRD_PARTY_NOTICES`
+* `share/debz/runtime-dependencies.json`
 
 Typical CI usage:
 

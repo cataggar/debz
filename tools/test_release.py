@@ -50,9 +50,21 @@ class ReleaseTests(unittest.TestCase):
         elf[:6] = b"\x7fELF\x02\x01"
         elf[18:20] = machine.to_bytes(2, "little")
         (prefix / "bin/debz").write_bytes(elf)
-        (prefix / "share/licenses/debz").mkdir(parents=True)
-        (prefix / "share/licenses/debz/LICENSE").write_text("Apache-2.0\n")
-        (prefix / "share/licenses/debz/THIRD_PARTY_NOTICES").write_text("libsolv BSD-3-Clause\n")
+        (prefix / "share/doc/debz").mkdir(parents=True)
+        (prefix / "share/doc/debz/LICENSE").write_text("Apache-2.0\n")
+        (prefix / "share/doc/debz/THIRD_PARTY_NOTICES").write_text("libsolv BSD-3-Clause\n")
+        (prefix / "share/debz").mkdir(parents=True)
+        (prefix / "share/debz/runtime-dependencies.json").write_text(
+            json.dumps(
+                {
+                    "linux_release_runtime": {
+                        "libc": {"implementation": "glibc"},
+                        "system_libraries": [{"name": "liblzma"}, {"name": "libzstd"}],
+                        "included_libraries": [{"name": "libsolv"}],
+                    }
+                }
+            )
+        )
         return prefix
 
     def test_strict_tags_and_consistency(self) -> None:
@@ -68,6 +80,8 @@ class ReleaseTests(unittest.TestCase):
         prefix = self.prefix()
         entries, binary = release.binary_entries(prefix, "debz-0.1.0-linux-x64")
         dependencies = release.policy_dependencies(self.policy)
+        runtime = next(data for name, data, _ in entries if name.endswith("runtime-dependencies.json"))
+        release.validate_runtime_manifest(runtime, dependencies)
         release.validate_elf_platform(binary, "linux-x64")
         with self.assertRaises(release.ReleaseError):
             release.validate_elf_platform(binary, "linux-arm64")
@@ -124,7 +138,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_missing_licenses_are_rejected(self) -> None:
         prefix = self.prefix()
-        (prefix / "share/licenses/debz/LICENSE").unlink()
+        (prefix / "share/doc/debz/LICENSE").unlink()
         with self.assertRaises(release.ReleaseError):
             release.binary_entries(prefix, "debz-0.1.0-linux-x64")
         policy = json.loads(self.policy.read_text())

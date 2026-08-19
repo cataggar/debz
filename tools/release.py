@@ -227,6 +227,23 @@ def policy_dependencies(policy_path: pathlib.Path) -> list[dict[str, object]]:
     return sorted(result, key=lambda item: str(item["name"]))
 
 
+def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]) -> None:
+    try:
+        runtime = json.loads(data)
+        linux = runtime["linux_release_runtime"]
+        names = {linux["libc"]["implementation"]}
+        names.update(item["name"] for item in linux["system_libraries"])
+        names.update(item["name"] for item in linux["included_libraries"])
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"invalid installed runtime dependency manifest: {error}") from error
+    policy_names = {str(item["name"]) for item in dependencies}
+    if names != policy_names | {"glibc"}:
+        raise ReleaseError(
+            "installed runtime dependency manifest differs from reviewed policy: "
+            + ", ".join(sorted(names))
+        )
+
+
 def elf_needed(data: bytes) -> set[str]:
     if not data.startswith(b"\x7fELF"):
         return set()
@@ -450,8 +467,9 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
             binary = data
     required = {
         pathlib.PurePosixPath("bin/debz"),
-        pathlib.PurePosixPath("share/licenses/debz/LICENSE"),
-        pathlib.PurePosixPath("share/licenses/debz/THIRD_PARTY_NOTICES"),
+        pathlib.PurePosixPath("share/doc/debz/LICENSE"),
+        pathlib.PurePosixPath("share/doc/debz/THIRD_PARTY_NOTICES"),
+        pathlib.PurePosixPath("share/debz/runtime-dependencies.json"),
     }
     present = {pathlib.PurePosixPath(name).relative_to(root_name) for name, _, _ in entries}
     missing = required - present
@@ -542,8 +560,9 @@ def audit_archive(path: pathlib.Path, kind: str, version: str, platform: str | N
     if kind == "binary":
         required = {
             f"{root}/bin/debz",
-            f"{root}/share/licenses/debz/LICENSE",
-            f"{root}/share/licenses/debz/THIRD_PARTY_NOTICES",
+            f"{root}/share/doc/debz/LICENSE",
+            f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
+            f"{root}/share/debz/runtime-dependencies.json",
         }
     else:
         required = {f"{root}/LICENSE", f"{root}/THIRD_PARTY_NOTICES", f"{root}/build.zig.zon"}
@@ -605,6 +624,8 @@ def command_binary(args: argparse.Namespace) -> None:
     root_name = f"debz-{version}-{args.platform}"
     entries, binary = binary_entries(args.prefix, root_name)
     validate_elf_platform(binary, args.platform)
+    runtime_data = next(data for name, data, _ in entries if name.endswith("/share/debz/runtime-dependencies.json"))
+    validate_runtime_manifest(runtime_data, dependencies)
     validate_dynamic_dependencies(binary, dependencies)
     for path in create_release_files(args.output, root_name, version, entries, args.epoch, dependencies):
         print(path)
