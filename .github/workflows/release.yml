@@ -28,10 +28,23 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag
+      - name: Validate tag, version, and main ancestry
         id: release
-        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
+          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+          core=${version%%+*}
+          prerelease=false
+          case "$core" in
+            *-*) prerelease=true ;;
+          esac
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          printf 'version=%s\nzon_version=%s\nprerelease=%s\nepoch=%s\n' \
+            "$version" "$zon_version" "$prerelease" "$epoch" >>"$GITHUB_OUTPUT"
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -39,60 +52,84 @@ jobs:
           use-cache: false
       - name: Install audited build and runtime prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends binutils liblzma-dev liblzma5 libzstd-dev libzstd1 pkg-config
-          pkg-config --modversion liblzma
-          pkg-config --modversion libzstd
-      - name: Build ReleaseSafe install layout
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends \
+              binutils liblzma-dev liblzma5 libzstd-dev libzstd1 pkg-config
+          fi
+      - name: Build complete ReleaseSafe install prefix
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: zig build -Doptimize=ReleaseSafe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
-      - name: Audit and package binary
+      - name: Validate built version and package binary
         env:
-          VERSION: ${{ steps.release.outputs.version }}
+          EPOCH: ${{ steps.release.outputs.epoch }}
+          PLATFORM: ${{ matrix.platform }}
+          TAG: ${{ github.ref_name }}
+          ZON_VERSION: ${{ steps.release.outputs.zon_version }}
         run: |
-          tools/release.py audit-runtime release-root/bin/debz
-          test "$(release-root/bin/debz --version)" = "$VERSION"
-          tools/release.py package-binary "$VERSION" "${{ matrix.platform }}" release-root release-assets
-          tools/release.py verify-assets "$VERSION" release-assets
+          python3 tools/release.py version "$TAG" --expect "zon=$ZON_VERSION" \
+            --expect "binary=$(release-root/bin/debz --version)"
+          python3 tools/release.py binary --tag "$TAG" --platform "$PLATFORM" \
+            --prefix release-root --epoch "$EPOCH" --output release-assets
+          for format in tar.gz tar.xz; do
+            python3 tools/release.py audit --tag "$TAG" --kind binary --platform "$PLATFORM" \
+              --archive "release-assets/debz-${TAG#v}-$PLATFORM.$format" --smoke
+          done
       - name: Upload binary release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-binary-${{ matrix.platform }}
+          name: release-assets-${{ matrix.platform }}
           path: release-assets/
           if-no-files-found: error
           retention-days: 7
 
   source:
-    name: Package deterministic source
+    name: Package deterministic source and manifest
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag
+      - name: Validate tag, version, and main ancestry
         id: release
-        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
-      - name: Build source archive twice
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
+          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+      - name: Build and audit deterministic source assets
         env:
+          TAG: ${{ github.ref_name }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
-          mkdir -p .zig-cache
-          tools/release.py package-source "$VERSION" release-assets
-          tools/release.py package-source "$VERSION" .zig-cache/source-repeat
-          cmp "release-assets/debz-$VERSION-source.tar.gz" ".zig-cache/source-repeat/debz-$VERSION-source.tar.gz"
-          tools/release.py verify-assets "$VERSION" release-assets
-      - name: Upload source release assets
+          python3 tools/release.py source --tag "$TAG" --commit "$GITHUB_SHA" --output release-assets
+          python3 tools/release.py source --tag "$TAG" --commit "$GITHUB_SHA" --output source-repeat
+          diff --recursive --brief release-assets source-repeat
+          python3 tools/release.py manifest --tag "$TAG" --output release-assets
+          for format in tar.gz tar.xz; do
+            python3 tools/release.py audit --tag "$TAG" --kind source \
+              --archive "release-assets/debz-$VERSION-source.$format"
+          done
+      - name: Upload source and manifest release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-source
+          name: release-assets-source
           path: release-assets/
           if-no-files-found: error
           retention-days: 7
 
   release:
-    name: Attest and publish
+    name: Verify, attest, and publish
     needs: [binaries, source]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -103,29 +140,47 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag
+      - name: Validate tag, version, and main ancestry
         id: release
-        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
-      - name: Download merged release assets
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
+          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+          core=${version%%+*}
+          prerelease=false
+          case "$core" in
+            *-*) prerelease=true ;;
+          esac
+          printf 'version=%s\nprerelease=%s\n' "$version" "$prerelease" >>"$GITHUB_OUTPUT"
+      - name: Download release assets without collisions
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: release-*
+          pattern: release-assets-*
           path: release-assets
           merge-multiple: true
-      - name: Verify complete release asset manifest
+      - name: Verify exact complete 26-asset release
         env:
           VERSION: ${{ steps.release.outputs.version }}
-        run: tools/release.py verify-assets "$VERSION" release-assets --complete
-      - name: Attest binary and source archives
+        run: |
+          python3 tools/release.py verify \
+            --manifest "release-assets/debz-$VERSION-release-manifest.json" \
+            --assets release-assets --smoke
+      - name: Attest gzip archives
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: release-assets/*.tar.gz
+      - name: Attest xz archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-assets/*.tar.xz
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.release.outputs.version }}
           PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
           cat >release-body.md <<EOF
           Install:
@@ -134,15 +189,16 @@ jobs:
 
           Supported platforms: Linux x64 and Linux arm64.
 
-          Runtime requirements: glibc, liblzma.so.5, and libzstd.so.1. The archives use a normal \`bin/debz\` install layout.
+          Runtime requirements: glibc, liblzma.so.5, and libzstd.so.1. Binary archives use the complete \`bin/\`, \`share/doc/\`, and \`share/debz/\` install layout.
 
-          Artifacts and SHA-256 checksum sidecars are currently unsigned. GitHub artifact attestations provide provenance for every binary and source archive, and SPDX 2.3 SBOM sidecars describe debz and its audited runtime dependencies.
+          All gzip and xz archives have SHA-256 sidecars, SPDX 2.3 SBOM sidecars with their own checksums, and GitHub provenance attestations. Artifacts and checksum files are currently unsigned. The canonical release manifest declares exactly 26 assets.
           EOF
           options=()
           if [ "$PRERELEASE" = true ]; then
             options+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" release-assets/* --title "debz $VERSION" --notes-file release-body.md "${options[@]}"
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "debz $VERSION" --notes-file release-body.md "${options[@]}"
 
   smoke:
     name: Post-release smoke (${{ matrix.platform }})
@@ -164,25 +220,44 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag
+      - name: Validate tag and main ancestry
         id: release
-        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
+          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
       - name: Install audited runtime prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends binutils liblzma5 libzstd1 python3-pip python3-venv
-      - name: Install exact release with ghr
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils liblzma5 libzstd1 python3-pip python3-venv
+      - name: Audit published archive and install exact release with ghr
         env:
+          GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
+          mkdir -p .zig-cache/released
+          gh release download "$GITHUB_REF_NAME" --dir .zig-cache/released \
+            --pattern "debz-$VERSION-$PLATFORM.tar.gz*"
+          python3 tools/release.py audit --tag "$GITHUB_REF_NAME" --kind binary \
+            --platform "$PLATFORM" \
+            --archive ".zig-cache/released/debz-$VERSION-$PLATFORM.tar.gz" --smoke
           python3 -m venv .zig-cache/ghr
           .zig-cache/ghr/bin/pip install ghr-bin==0.7.0
           .zig-cache/ghr/bin/ghr install cataggar/debz@v$VERSION
           bin_dir=$(.zig-cache/ghr/bin/ghr path bin)
           test -x "$bin_dir/debz"
-          tools/release.py audit-runtime "$bin_dir/debz"
           test "$("$bin_dir/debz" --version)" = "$VERSION"
           "$bin_dir/debz" --help
           mkdir -p .zig-cache/smoke/root .zig-cache/smoke/cache .zig-cache/smoke/state
