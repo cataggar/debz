@@ -1,6 +1,7 @@
 # Documentation
 
 - [Stable product API and CLI contract](product-api.md)
+- [Release installation and runtime requirements](release-installation.md) describes version injection, the installed tree, and Linux dynamic dependencies.
 
 - [Project status and API overview](project-status.md) describes implemented modules, public boundaries, limitations, and transaction-plan schema.
 - [Authenticated repository refresh](authenticated-refresh.md) explains trusted refresh usage, policy, provenance, and cache behavior.

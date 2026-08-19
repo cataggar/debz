@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "package": "debz",
+  "linux_release_runtime": {
+    "binary_kind": "dynamically_linked",
+    "libc": {
+      "implementation": "glibc",
+      "linkage": "dynamic",
+      "expectation": "The target glibc ABI must be provided by the destination Linux system."
+    },
+    "system_libraries": [
+      {
+        "name": "liblzma",
+        "linkage": "dynamic",
+        "reviewed_version_range": ">=5.2.6 <6"
+      },
+      {
+        "name": "libzstd",
+        "linkage": "dynamic",
+        "reviewed_version_range": ">=1.5.5 <2"
+      }
+    ],
+    "included_libraries": [
+      {
+        "name": "libsolv",
+        "version": "0.7.39",
+        "linkage": "static_archive_in_debz",
+        "license": "BSD-3-Clause"
+      }
+    ],
+    "fully_static": false
+  }
+}

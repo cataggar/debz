@@ -1,7 +1,8 @@
 const std = @import("std");
 const solver = @import("solver.zig");
+const build_options = @import("debz_build_options");
 
-pub const version = "0.1.0";
+pub const version = build_options.version;
 pub const product_api = @import("product_api.zig");
 pub const ApiVersion = product_api.api_version;
 pub const ProductOperation = product_api.Operation;

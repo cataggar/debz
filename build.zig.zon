@@ -15,6 +15,7 @@
         "src",
         "fuzz",
         "doc",
+        "schema",
         "security",
         "tools",
         "SECURITY.md",

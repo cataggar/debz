@@ -3,6 +3,7 @@ set -eu
 trap 'rm -rf .zig-cache/cli-production-test; rm -f cli-test-stderr' EXIT
 
 debz=$1
+expected_version=$2
 root="$PWD/.zig-cache/cli-production-test/root"
 cache="$PWD/.zig-cache/cli-production-test/cache"
 state="$PWD/.zig-cache/cli-production-test/state"
@@ -13,7 +14,7 @@ read_common="$common --status-path $status"
 mkdir -p "$root/var/lib/dpkg" "$state"
 
 "$debz" --help >/dev/null
-"$debz" --version | grep -q 'API v1'
+test "$("$debz" --version)" = "$expected_version"
 
 output=$("$debz" list-installed $read_common 2>cli-test-stderr)
 test ! -s cli-test-stderr
