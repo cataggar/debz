@@ -32,9 +32,14 @@ python3 tools/release.py verify \
 ```
 
 Run the tooling tests with `python3 -m unittest tools/test_release.py` or
-`zig build test-release`. Both gzip and xz archives normalize names, ordering,
-timestamps, ownership and modes. Each archive and SPDX 2.3 JSON SBOM has a
-portable SHA-256 sidecar in the exact form `<hex><two spaces><file name><LF>`.
+`zig build test-release`. Packaging the same inputs twice in one controlled
+build environment produces byte-identical gzip and xz assets. Portable audit
+does not assume that different zlib, liblzma, or Python versions emit identical
+compressed bytes: it validates container integrity and canonical stable headers,
+then compares the decompressed tar payload with the canonical tar encoding.
+Names, ordering, timestamps, ownership and modes remain strictly enforced. Each
+archive and SPDX 2.3 JSON SBOM has a portable SHA-256 sidecar in the exact form
+`<hex><two spaces><file name><LF>`.
 Complete verification requires the assets directory to contain exactly the
 manifest-declared regular files. Binary audit re-reads `bin/debz` and the
 installed runtime manifest from each archive, then checks ELF architecture and
