@@ -48,8 +48,11 @@ jobs:
           use-cache: false
       - name: Install metadata decompression dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd; then
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+          fi
       - name: Build and test
         run: |
           zig build
