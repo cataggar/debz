@@ -191,6 +191,7 @@ fn installReleaseFiles(b: *std.Build, install_cli: *std.Build.Step.InstallArtifa
         "project-status.md",
         "release-installation.md",
         "release-tooling.md",
+        "releasing.md",
         "safety-ci.md",
         "solver-planning.md",
         "threat-model.md",

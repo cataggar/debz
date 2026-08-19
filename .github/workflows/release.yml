@@ -52,7 +52,7 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           tools/release.py audit-runtime release-root/bin/debz
-          test "$(release-root/bin/debz --version)" = "debz $VERSION (API v1)"
+          test "$(release-root/bin/debz --version)" = "$VERSION"
           tools/release.py package-binary "$VERSION" "${{ matrix.platform }}" release-root release-assets
           tools/release.py verify-assets "$VERSION" release-assets
       - name: Upload binary release assets
@@ -183,7 +183,7 @@ jobs:
           bin_dir=$(.zig-cache/ghr/bin/ghr path bin)
           test -x "$bin_dir/debz"
           tools/release.py audit-runtime "$bin_dir/debz"
-          test "$("$bin_dir/debz" --version)" = "debz $VERSION (API v1)"
+          test "$("$bin_dir/debz" --version)" = "$VERSION"
           "$bin_dir/debz" --help
           mkdir -p .zig-cache/smoke/root .zig-cache/smoke/cache .zig-cache/smoke/state
           "$bin_dir/debz" list-installed \
