@@ -48,12 +48,21 @@ jobs:
           use-cache: false
       - name: Install metadata decompression dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+          fi
       - name: Build and test
         run: |
           zig build
           zig build test
+          zig build test-release
           zig build fuzz
           zig build -Doptimize=ReleaseSafe
           zig build -Doptimize=ReleaseSafe test
@@ -75,8 +84,17 @@ jobs:
           use-cache: false
       - name: Install audited system dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev pkg-config
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends \
+              liblzma-dev libzstd-dev pkg-config
+          fi
       - name: Test real acceptance input validation
         run: |
           tools/real-snapshot-acceptance.sh --validate-values \
@@ -101,7 +119,12 @@ jobs:
           use-cache: false
       - name: Install metadata decompression dependency
         run: |
-          sudo apt-get update
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 update
           sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
       - name: Run bounded fuzz campaign
         run: zig build fuzz -Dfuzz-cases=${{ github.event_name == 'schedule' && '5000' || '128' }}
@@ -137,7 +160,12 @@ jobs:
           use-cache: false
       - name: Install bounded fixture prerequisites
         run: |
-          sudo apt-get update
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 update
           sudo apt-get install --yes --no-install-recommends dpkg liblzma-dev libzstd-dev python3-cryptography
       - name: Run required integration root
         env:
