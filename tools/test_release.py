@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import gzip
 import io
 import json
+import lzma
 import os
 import pathlib
 import subprocess
@@ -188,6 +190,65 @@ class ReleaseTests(unittest.TestCase):
                 archive.addfile(info, io.BytesIO(data))
         with self.assertRaisesRegex(release.ReleaseError, "not sorted"):
             release.archive_entries(path)
+
+    def test_archive_audit_accepts_portable_compression_variants(self) -> None:
+        entries = [
+            ("debz-0.1.0-source/LICENSE", b"license", 0o644),
+            ("debz-0.1.0-source/THIRD_PARTY_NOTICES", b"notices", 0o644),
+            ("debz-0.1.0-source/build.zig.zon", b"zon", 0o644),
+        ]
+        tar_data = release.build_tar(entries, 123)
+        gzip_bytes = []
+        for level in (1, 9):
+            output = io.BytesIO()
+            with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0, compresslevel=level) as stream:
+                stream.write(tar_data)
+            gzip_bytes.append(output.getvalue())
+        self.assertNotEqual(gzip_bytes[0], gzip_bytes[1])
+        for index, data in enumerate(gzip_bytes):
+            path = self.root / f"portable-{index}.tar.gz"
+            path.write_bytes(data)
+            release.audit_archive(path, "source", "0.1.0", None)
+
+        xz_bytes = [lzma.compress(tar_data, format=lzma.FORMAT_XZ, preset=preset) for preset in (0, 9)]
+        self.assertNotEqual(xz_bytes[0], xz_bytes[1])
+        for index, data in enumerate(xz_bytes):
+            path = self.root / f"portable-{index}.tar.xz"
+            path.write_bytes(data)
+            release.audit_archive(path, "source", "0.1.0", None)
+
+    def test_archive_container_corruption_trailing_and_payload_mismatch_are_rejected(self) -> None:
+        entries = [
+            ("debz-0.1.0-source/LICENSE", b"license", 0o644),
+            ("debz-0.1.0-source/THIRD_PARTY_NOTICES", b"notices", 0o644),
+            ("debz-0.1.0-source/build.zig.zon", b"zon", 0o644),
+        ]
+        tar_data = release.build_tar(entries, 123)
+        for archive_format in ("tar.gz", "tar.xz"):
+            valid = release.compress_tar(tar_data, archive_format)
+            cases = {
+                "corrupt": valid[:-1] + bytes([valid[-1] ^ 1]),
+                "trailing": valid + b"junk",
+                "payload": release.compress_tar(tar_data + b"\0" * 512, archive_format),
+            }
+            for case, data in cases.items():
+                path = self.root / f"{case}.{archive_format}"
+                path.write_bytes(data)
+                with self.subTest(format=archive_format, case=case), self.assertRaises(release.ReleaseError):
+                    release.audit_archive(path, "source", "0.1.0", None)
+
+        wrong_format = self.root / "wrong.tar.xz"
+        wrong_format.write_bytes(release.compress_tar(tar_data, "tar.gz"))
+        with self.assertRaisesRegex(release.ReleaseError, "not xz"):
+            release.audit_archive(wrong_format, "source", "0.1.0", None)
+
+        noncanonical = self.root / "timestamp.tar.gz"
+        output = io.BytesIO()
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=123, compresslevel=9) as stream:
+            stream.write(tar_data)
+        noncanonical.write_bytes(output.getvalue())
+        with self.assertRaisesRegex(release.ReleaseError, "timestamp is not canonical"):
+            release.audit_archive(noncanonical, "source", "0.1.0", None)
 
     def test_manifest_and_sbom_are_stable_and_complete(self) -> None:
         first = release.canonical_json(release.manifest_document("v0.1.0"))

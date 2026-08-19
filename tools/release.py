@@ -20,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import uuid
+import zlib
 
 PLATFORMS = ("linux-x64", "linux-arm64")
 FORMATS = ("tar.gz", "tar.xz")
@@ -165,6 +166,39 @@ def compress_tar(tar_data: bytes, archive_format: str) -> bytes:
     if archive_format == "tar.xz":
         return lzma.compress(tar_data, format=lzma.FORMAT_XZ, preset=9)
     raise ReleaseError(f"unsupported archive format: {archive_format}")
+
+
+def decompressed_tar(archive_path: pathlib.Path) -> bytes:
+    try:
+        data = archive_path.read_bytes()
+        if archive_path.name.endswith(".tar.gz"):
+            if len(data) < 18 or data[:3] != b"\x1f\x8b\x08":
+                raise ReleaseError(f"archive is not gzip: {archive_path.name}")
+            flags = data[3]
+            if flags & 0xE0 or flags != 0:
+                raise ReleaseError(f"gzip header is not canonical: {archive_path.name}")
+            if data[4:8] != b"\0\0\0\0":
+                raise ReleaseError(f"gzip timestamp is not canonical: {archive_path.name}")
+            stream = zlib.decompressobj(wbits=31)
+            payload = stream.decompress(data) + stream.flush()
+            if not stream.eof:
+                raise ReleaseError(f"gzip stream is incomplete: {archive_path.name}")
+            if stream.unused_data or stream.unconsumed_tail:
+                raise ReleaseError(f"gzip stream has trailing data: {archive_path.name}")
+            return payload
+        if archive_path.name.endswith(".tar.xz"):
+            if not data.startswith(b"\xfd7zXZ\x00"):
+                raise ReleaseError(f"archive is not xz: {archive_path.name}")
+            stream = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+            payload = stream.decompress(data)
+            if not stream.eof:
+                raise ReleaseError(f"xz stream is incomplete: {archive_path.name}")
+            if stream.unused_data:
+                raise ReleaseError(f"xz stream has trailing data: {archive_path.name}")
+            return payload
+    except (OSError, EOFError, lzma.LZMAError, zlib.error) as error:
+        raise ReleaseError(f"invalid compressed archive {archive_path.name}: {error}") from error
+    raise ReleaseError(f"unsupported archive format: {archive_path.name}")
 
 
 def archive_entries(archive_path: pathlib.Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
@@ -612,9 +646,8 @@ def audit_archive(
                 raise ReleaseError(f"unexpected executable in binary archive: {name}")
     files = [(member.name, data, member.mode) for member, data in entries if member.isfile() and data is not None]
     epoch = int(entries[0][0].mtime)
-    archive_format = "tar.gz" if path.name.endswith(".tar.gz") else "tar.xz" if path.name.endswith(".tar.xz") else ""
-    if not archive_format or compress_tar(build_tar(files, epoch), archive_format) != path.read_bytes():
-        raise ReleaseError(f"archive encoding or metadata is not deterministic: {path.name}")
+    if decompressed_tar(path) != build_tar(files, epoch):
+        raise ReleaseError(f"decompressed tar payload is not canonical: {path.name}")
     return entries
 
 
