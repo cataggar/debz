@@ -70,6 +70,7 @@ def audit_production_sources() -> None:
 
 def audit_dependencies() -> None:
     policy = json.loads((ROOT / "security/dependency-policy.json").read_text())
+    runtime = json.loads((ROOT / "security/runtime-dependencies.json").read_text())
     reviewed_on = date.fromisoformat(policy["reviewed_on"])
     if reviewed_on > date.today():
         fail("dependency review date is in the future")
@@ -122,9 +123,41 @@ def audit_dependencies() -> None:
             fail(f"{name}: dependency URL is not pinned to an exact commit")
 
     build = (ROOT / "build.zig").read_text()
+    zon_version = re.search(r'\.version\s*=\s*"([^"]+)"', zon)
+    build_version = re.search(r'const package_version\s*=\s*"([^"]+)"', build)
+    if zon_version is None or build_version is None or zon_version.group(1) != build_version.group(1):
+        fail("default build version differs from build.zig.zon")
     system_libraries = set(re.findall(r'linkSystemLibrary\("([^"]+)"', build))
     if system_libraries != {"lzma", "zstd"}:
         fail(f"unreviewed system libraries: {sorted(system_libraries)}")
+    linux_runtime = runtime.get("linux_release_runtime", {})
+    if (
+        runtime.get("schema_version") != 1
+        or runtime.get("package") != "debz"
+        or linux_runtime.get("binary_kind") != "dynamically_linked"
+        or linux_runtime.get("fully_static") is not False
+        or linux_runtime.get("libc", {}).get("implementation") != "glibc"
+        or linux_runtime.get("libc", {}).get("linkage") != "dynamic"
+    ):
+        fail("Linux runtime metadata does not identify dynamic glibc requirements")
+    runtime_system = {
+        (item.get("name"), item.get("linkage"))
+        for item in linux_runtime.get("system_libraries", [])
+    }
+    if runtime_system != {("liblzma", "dynamic"), ("libzstd", "dynamic")}:
+        fail("Linux runtime metadata differs from linked system libraries")
+    included = linux_runtime.get("included_libraries", [])
+    if included != [
+        {
+            "name": "libsolv",
+            "version": dependencies["libsolv"]["version"],
+            "linkage": "static_archive_in_debz",
+            "license": "BSD-3-Clause",
+        }
+    ]:
+        fail("Linux runtime metadata does not identify statically included libsolv")
+    if ".shared = false" not in build or "debz.link_libc = true" not in build:
+        fail("build linkage differs from documented runtime dependency model")
     def version_tuple(value: str) -> tuple[int, ...]:
         return tuple(int(part) for part in re.findall(r"\d+", value))
 

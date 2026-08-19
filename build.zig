@@ -1,8 +1,17 @@
 const std = @import("std");
 
+const package_version = "0.1.0";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Release version (SemVer)") orelse package_version;
+    _ = std.SemanticVersion.parse(version) catch {
+        std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.1.0 or 1.2.3-rc.1)", .{version});
+    };
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
 
     const libsolv_dependency = b.dependency("libsolv", .{
         .target = target,
@@ -27,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    debz.addOptions("debz_build_options", build_options);
     debz.addIncludePath(libsolv_dependency.path("src"));
     debz.linkLibrary(libsolv);
     debz.link_libc = true;
@@ -44,7 +54,11 @@ pub fn build(b: *std.Build) void {
         .name = "debz",
         .root_module = cli_module,
     });
-    b.installArtifact(cli);
+    const install_cli = b.addInstallArtifact(cli, .{});
+    b.getInstallStep().dependOn(&install_cli.step);
+    installReleaseFiles(b, install_cli);
+    b.step("release-install", "Install the complete release tree for packaging")
+        .dependOn(b.getInstallStep());
 
     const run_cli = b.addRunArtifact(cli);
     run_cli.step.dependOn(b.getInstallStep());
@@ -58,6 +72,7 @@ pub fn build(b: *std.Build) void {
 
     const cli_tests = b.addSystemCommand(&.{ "sh", "tools/test-cli.sh" });
     cli_tests.addArtifactArg(cli);
+    cli_tests.addArg(version);
     test_step.dependOn(&cli_tests.step);
 
     const integration_tests = b.addSystemCommand(&.{ "sh", "tools/test-integration-roots.sh" });
@@ -156,4 +171,70 @@ pub fn build(b: *std.Build) void {
     dpkg_oracle.addArtifactArg(version_oracle);
     b.step("test-dpkg", "Compare version ordering with dpkg when available")
         .dependOn(&dpkg_oracle.step);
+}
+
+fn installReleaseFiles(b: *std.Build, install_cli: *std.Build.Step.InstallArtifact) void {
+    const docs = [_][]const u8{
+        "README.md",
+        "authenticated-refresh.md",
+        "deb-payload-validation.md",
+        "exact-locks-and-provenance.md",
+        "integration-roots.md",
+        "multi-repository-policy.md",
+        "openpgp-verifier.md",
+        "package-acquisition.md",
+        "product-api.md",
+        "project-status.md",
+        "release-installation.md",
+        "safety-ci.md",
+        "solver-planning.md",
+        "threat-model.md",
+        "transaction-executor.md",
+        "transaction-recovery.md",
+        "zvmi-package-family.md",
+    };
+    const schemas = [_][]const u8{
+        "command-result-v1.json",
+        "exact-closure-lock-v1.json",
+        "transaction-plan-v1.json",
+        "transaction-plan-v2.json",
+        "transaction-result-v1.json",
+    };
+    const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
+        .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
+        .{ .source = "LICENSE", .destination = "share/doc/debz/LICENSE" },
+        .{ .source = "THIRD_PARTY_NOTICES", .destination = "share/doc/debz/THIRD_PARTY_NOTICES" },
+        .{ .source = "security/runtime-dependencies.json", .destination = "share/debz/runtime-dependencies.json" },
+    };
+
+    const regular_modes = b.addSystemCommand(&.{ "chmod", "0644" });
+    for (regular_files) |file| {
+        const install = b.addInstallFile(b.path(file.source), file.destination);
+        b.getInstallStep().dependOn(&install.step);
+        regular_modes.step.dependOn(&install.step);
+        regular_modes.addArg(b.getInstallPath(.prefix, file.destination));
+    }
+    for (docs) |name| {
+        const destination = b.fmt("share/doc/debz/doc/{s}", .{name});
+        const install = b.addInstallFile(b.path(b.fmt("doc/{s}", .{name})), destination);
+        b.getInstallStep().dependOn(&install.step);
+        regular_modes.step.dependOn(&install.step);
+        regular_modes.addArg(b.getInstallPath(.prefix, destination));
+    }
+    for (schemas) |name| {
+        const source = b.path(b.fmt("schema/{s}", .{name}));
+        for ([_][]const u8{ "share/debz/schema", "share/doc/debz/schema" }) |directory| {
+            const destination = b.fmt("{s}/{s}", .{ directory, name });
+            const install = b.addInstallFile(source, destination);
+            b.getInstallStep().dependOn(&install.step);
+            regular_modes.step.dependOn(&install.step);
+            regular_modes.addArg(b.getInstallPath(.prefix, destination));
+        }
+    }
+    b.getInstallStep().dependOn(&regular_modes.step);
+
+    const executable_mode = b.addSystemCommand(&.{ "chmod", "0755" });
+    executable_mode.step.dependOn(&install_cli.step);
+    executable_mode.addArg(b.getInstallPath(.bin, "debz"));
+    b.getInstallStep().dependOn(&executable_mode.step);
 }

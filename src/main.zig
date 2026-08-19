@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, command, "--version")) {
-        try stdout.print("debz {s} (API v{d})\n", .{ debz.version, api.api_version });
+        try stdout.print("{s}\n", .{debz.version});
         return;
     }
     if (std.mem.eql(u8, command, "package-family-capabilities")) {
