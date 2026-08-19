@@ -19,3 +19,4 @@
 - [zvmi Debian-family backend](zvmi-package-family.md) defines the versioned Ubuntu/Debian image-builder boundary, explicit inputs, locks, provenance, cache policy, and failure contract.
 - [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.
 - [Safety CI, fuzzing and audits](safety-ci.md) documents fuzz targets, bounded CI/local campaigns, safety modes, and static policy gates.
+- [Release operations](releasing.md) defines immutable tag policy, pre-tag gates, publication checks, and failure handling.

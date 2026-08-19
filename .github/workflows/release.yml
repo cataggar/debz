@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  binaries:
+    name: Package binary (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        id: release
+        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Install audited build and runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends binutils liblzma-dev liblzma5 libzstd-dev libzstd1 pkg-config
+          pkg-config --modversion liblzma
+          pkg-config --modversion libzstd
+      - name: Build ReleaseSafe install layout
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: zig build -Doptimize=ReleaseSafe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
+      - name: Audit and package binary
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          tools/release.py audit-runtime release-root/bin/debz
+          test "$(release-root/bin/debz --version)" = "debz $VERSION (API v1)"
+          tools/release.py package-binary "$VERSION" "${{ matrix.platform }}" release-root release-assets
+          tools/release.py verify-assets "$VERSION" release-assets
+      - name: Upload binary release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-binary-${{ matrix.platform }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Package deterministic source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        id: release
+        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+      - name: Build source archive twice
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p .zig-cache
+          tools/release.py package-source "$VERSION" release-assets
+          tools/release.py package-source "$VERSION" .zig-cache/source-repeat
+          cmp "release-assets/debz-$VERSION-source.tar.gz" ".zig-cache/source-repeat/debz-$VERSION-source.tar.gz"
+          tools/release.py verify-assets "$VERSION" release-assets
+      - name: Upload source release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-source
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Attest and publish
+    needs: [binaries, source]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        id: release
+        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+      - name: Download merged release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify complete release asset manifest
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: tools/release.py verify-assets "$VERSION" release-assets --complete
+      - name: Attest binary and source archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release-assets/*.tar.gz
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        run: |
+          cat >release-body.md <<EOF
+          Install:
+
+          \`ghr install cataggar/debz@v$VERSION\`
+
+          Supported platforms: Linux x64 and Linux arm64.
+
+          Runtime requirements: glibc, liblzma.so.5, and libzstd.so.1. The archives use a normal \`bin/debz\` install layout.
+
+          Artifacts and SHA-256 checksum sidecars are currently unsigned. GitHub artifact attestations provide provenance for every binary and source archive, and SPDX 2.3 SBOM sidecars describe debz and its audited runtime dependencies.
+          EOF
+          options=()
+          if [ "$PRERELEASE" = true ]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* --title "debz $VERSION" --notes-file release-body.md "${options[@]}"
+
+  smoke:
+    name: Post-release smoke (${{ matrix.platform }})
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            architecture: arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        id: release
+        run: tools/release.py validate-tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+      - name: Install audited runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends binutils liblzma5 libzstd1 python3-pip python3-venv
+      - name: Install exact release with ghr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python3 -m venv .zig-cache/ghr
+          .zig-cache/ghr/bin/pip install ghr-bin==0.7.0
+          .zig-cache/ghr/bin/ghr install cataggar/debz@v$VERSION
+          bin_dir=$(.zig-cache/ghr/bin/ghr path bin)
+          test -x "$bin_dir/debz"
+          tools/release.py audit-runtime "$bin_dir/debz"
+          test "$("$bin_dir/debz" --version)" = "debz $VERSION (API v1)"
+          "$bin_dir/debz" --help
+          mkdir -p .zig-cache/smoke/root .zig-cache/smoke/cache .zig-cache/smoke/state
+          "$bin_dir/debz" list-installed \
+            --install-root "$PWD/.zig-cache/smoke/root" \
+            --cache-path "$PWD/.zig-cache/smoke/cache" \
+            --state-path "$PWD/.zig-cache/smoke/state" \
+            --status-path "$PWD/src/fixtures/dpkg-status/installed.status" \
+            --architecture "${{ matrix.architecture }}" --json >.zig-cache/smoke/output.json
+          python3 -c 'import json; value=json.load(open(".zig-cache/smoke/output.json")); assert value["exit_status"] == 0'
