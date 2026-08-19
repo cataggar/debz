@@ -27,10 +27,15 @@ python3 tools/release.py manifest --tag v0.1.0 --output dist
 python3 tools/release.py audit --tag v0.1.0 --kind binary \
   --platform linux-x64 --archive dist/debz-0.1.0-linux-x64.tar.xz --smoke
 python3 tools/release.py verify \
-  --manifest dist/debz-0.1.0-release-manifest.json --assets dist --smoke
+  --manifest dist/debz-0.1.0-release-manifest.json --assets dist \
+  --policy security/dependency-policy.json --smoke
 ```
 
 Run the tooling tests with `python3 -m unittest tools/test_release.py` or
 `zig build test-release`. Both gzip and xz archives normalize names, ordering,
 timestamps, ownership and modes. Each archive and SPDX 2.3 JSON SBOM has a
 portable SHA-256 sidecar in the exact form `<hex><two spaces><file name><LF>`.
+Complete verification requires the assets directory to contain exactly the
+manifest-declared regular files. Binary audit re-reads `bin/debz` and the
+installed runtime manifest from each archive, then checks ELF architecture and
+dynamic dependencies against the reviewed dependency policy.

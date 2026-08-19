@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -206,6 +207,68 @@ class ReleaseTests(unittest.TestCase):
         path = self.root / "test.spdx.json"
         path.write_bytes(release.canonical_json(sbom))
         release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+        sha1_values = sorted(
+            checksum["checksumValue"]
+            for file_entry in sbom["files"]
+            for checksum in file_entry["checksums"]
+            if checksum["algorithm"] == "SHA1"
+        )
+        expected = hashlib.sha1("".join(sha1_values).encode("ascii")).hexdigest()
+        self.assertEqual(
+            sbom["packages"][0]["packageVerificationCode"]["packageVerificationCodeValue"],
+            expected,
+        )
+        missing_license = json.loads(release.canonical_json(sbom))
+        del missing_license["files"][0]["licenseInfoInFiles"]
+        path.write_bytes(release.canonical_json(missing_license))
+        with self.assertRaisesRegex(release.ReleaseError, "licenseInfoInFiles"):
+            release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+        bad_verification = json.loads(release.canonical_json(sbom))
+        bad_verification["packages"][0]["packageVerificationCode"]["packageVerificationCodeValue"] = "0" * 40
+        path.write_bytes(release.canonical_json(bad_verification))
+        with self.assertRaisesRegex(release.ReleaseError, "packageVerificationCode"):
+            release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+
+    def test_archived_binary_linkage_is_revalidated(self) -> None:
+        dependencies = release.policy_dependencies(self.policy)
+        base = "debz-0.1.0-linux-arm64"
+        entries, _ = release.binary_entries(self.prefix("wrong-arch", 62), base)
+        archive = self.root / f"{base}.tar.gz"
+        archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
+        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-arm64")
+        with self.assertRaisesRegex(release.ReleaseError, "does not match"):
+            release.validate_archived_binary(audited, "0.1.0", "linux-arm64", dependencies)
+
+        prefix = self.prefix("bad-runtime", 62)
+        (prefix / "share/debz/runtime-dependencies.json").write_text(
+            json.dumps(
+                {
+                    "linux_release_runtime": {
+                        "libc": {"implementation": "glibc"},
+                        "system_libraries": [{"name": "libevil"}],
+                        "included_libraries": [{"name": "libsolv"}],
+                    }
+                }
+            )
+        )
+        base = "debz-0.1.0-linux-x64"
+        entries, _ = release.binary_entries(prefix, base)
+        archive = self.root / f"{base}.tar.gz"
+        archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
+        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-x64")
+        with self.assertRaisesRegex(release.ReleaseError, "differs from reviewed policy"):
+            release.validate_archived_binary(audited, "0.1.0", "linux-x64", dependencies)
+
+        entries, _ = release.binary_entries(self.prefix("bad-needed", 62), base)
+        archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
+        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-x64")
+        original = release.elf_needed
+        release.elf_needed = lambda _: {"libevil.so.1"}
+        try:
+            with self.assertRaisesRegex(release.ReleaseError, "unexpected dynamic dependencies"):
+                release.validate_archived_binary(audited, "0.1.0", "linux-x64", dependencies)
+        finally:
+            release.elf_needed = original
 
     def test_complete_release_verification(self) -> None:
         output = self.root / "dist"
@@ -225,8 +288,21 @@ class ReleaseTests(unittest.TestCase):
         )
         manifest = release.write_manifest("v0.1.0", output)
         release.command_verify(
-            type("Args", (), {"manifest": manifest, "assets": output, "smoke": False})()
+            type(
+                "Args",
+                (),
+                {"manifest": manifest, "assets": output, "smoke": False, "policy": self.policy},
+            )()
         )
+        (output / "undeclared.txt").write_text("extra")
+        with self.assertRaisesRegex(release.ReleaseError, "undeclared"):
+            release.command_verify(
+                type(
+                    "Args",
+                    (),
+                    {"manifest": manifest, "assets": output, "smoke": False, "policy": self.policy},
+                )()
+            )
 
     @staticmethod
     def info(
