@@ -103,6 +103,10 @@ pub fn build(b: *std.Build) void {
     b.step("security-audit", "Run hermeticity, dependency-policy, license, secret, and docs gates")
         .dependOn(&audit.step);
 
+    const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
+    b.step("test-release", "Run deterministic release packaging and audit tests")
+        .dependOn(&release_tests.step);
+
     const solver_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"solver.test."},
