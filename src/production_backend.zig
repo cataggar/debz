@@ -4,7 +4,6 @@ const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const package_acquisition = @import("package_acquisition.zig");
-const packages_index = @import("packages_index.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
@@ -39,7 +38,6 @@ pub const Executor = struct {
 };
 
 var system_executor_context: u8 = 0;
-const production_maximum_packages_bytes = 256 * 1024 * 1024;
 
 fn systemExecute(
     _: *anyopaque,
@@ -853,18 +851,13 @@ fn makeRuntimes(
                     .require_valid_until
                 else
                     .allow_missing_valid_until,
-                .packages_options = productionPackagesOptions(),
                 .maximum_compressed_bytes = 64 * 1024 * 1024,
-                .maximum_decompressed_bytes = production_maximum_packages_bytes,
+                .maximum_decompressed_bytes = 256 * 1024 * 1024,
                 .maximum_decoder_memory = 256 * 1024 * 1024,
             },
         };
     }
     return runtimes;
-}
-
-fn productionPackagesOptions() packages_index.Options {
-    return .{ .limits = .{ .max_total_bytes = production_maximum_packages_bytes } };
 }
 
 fn queryAvailable(
@@ -1403,15 +1396,6 @@ test "production backend reports command-specific missing repository input" {
     });
     try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
     try std.testing.expectEqual(api.ErrorId.configuration_required, result.diagnostics[0].id);
-}
-
-test "production package parser accepts large distribution indexes" {
-    const options = productionPackagesOptions();
-    try std.testing.expectEqual(
-        production_maximum_packages_bytes,
-        options.limits.max_total_bytes,
-    );
-    try std.testing.expect(options.limits.max_total_bytes > 76_792_699);
 }
 
 test "production credentials are restricted to one repository origin" {
