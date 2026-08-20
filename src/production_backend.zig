@@ -226,6 +226,7 @@ pub const Backend = struct {
             .none;
         var now = self.now_unix orelse realNow(self.io);
         const runtimes = try makeRuntimes(allocator, request, &configuration, now, credentials);
+        defer freeRuntimes(allocator, runtimes);
         var refresh_outcome = try repository_policy.refreshAll(allocator, .{
             .configuration = &configuration,
             .runtimes = runtimes,
@@ -820,7 +821,13 @@ fn makeRuntimes(
     credentials: repository_acquisition.CredentialsProvider,
 ) ![]repository_policy.Runtime {
     var runtimes = try allocator.alloc(repository_policy.Runtime, configuration.repositories.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRuntimeKeyrings(allocator, runtimes[0..initialized]);
+        allocator.free(runtimes);
+    }
     for (configuration.repositories, 0..) |repository, index| {
+        const proxy = try proxyPolicy(request.options.proxy);
         var keyrings = try allocator.alloc(openpgp.Keyring, repository.signed_by.len);
         for (repository.signed_by, 0..) |path, key_index| keyrings[key_index] = .{ .path = path };
         const auth: repository_refresh.AuthenticationInput = .{ .in_release = .{
@@ -835,7 +842,7 @@ fn makeRuntimes(
             .declared_keyrings = repository.signed_by,
             .authentication = auth,
             .acquisition = .{
-                .proxy = try proxyPolicy(request.options.proxy),
+                .proxy = proxy,
                 .deadlines = deadlines(request.options.deadline_ms),
                 .redirect_limit = 8,
                 .retry = productionRetryPolicy(),
@@ -856,8 +863,24 @@ fn makeRuntimes(
                 .maximum_decoder_memory = 256 * 1024 * 1024,
             },
         };
+        initialized += 1;
     }
     return runtimes;
+}
+
+fn freeRuntimes(allocator: std.mem.Allocator, runtimes: []repository_policy.Runtime) void {
+    freeRuntimeKeyrings(allocator, runtimes);
+    allocator.free(runtimes);
+}
+
+fn freeRuntimeKeyrings(allocator: std.mem.Allocator, runtimes: []repository_policy.Runtime) void {
+    for (runtimes) |runtime| switch (runtime.authentication) {
+        .in_release => |authentication| switch (authentication.keyrings) {
+            .many => |keyrings| allocator.free(keyrings),
+            else => {},
+        },
+        else => {},
+    };
 }
 
 fn queryAvailable(

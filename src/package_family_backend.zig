@@ -158,6 +158,7 @@ pub const Backend = struct {
                 .conffile = request.conffile,
             },
         }, self.product_backend);
+        defer freePackageFamilyProductItems(allocator, response.items);
         if (response.exit_status != .success) {
             return failure(
                 request.operation,
@@ -181,6 +182,15 @@ pub const Backend = struct {
         };
     }
 };
+
+fn freePackageFamilyProductItems(allocator: std.mem.Allocator, items: []const product.Item) void {
+    for (items) |item| {
+        allocator.free(item.package);
+        if (item.version) |value| allocator.free(value);
+        if (item.architecture) |value| allocator.free(value);
+    }
+    allocator.free(items);
+}
 
 fn validRequest(request: Request) bool {
     if (!std.mem.eql(u8, request.schema, request_schema) or request.version != schema_version) return false;
@@ -225,19 +235,31 @@ fn failure(
 const Fake = struct {
     seen: bool = false,
     operation: ?product.Operation = null,
+    return_item: bool = false,
 
-    fn execute(context: *anyopaque, _: std.mem.Allocator, request: product.Request) !product.Result {
+    fn execute(context: *anyopaque, allocator: std.mem.Allocator, request: product.Request) !product.Result {
         const self: *Fake = @ptrCast(@alignCast(context));
         self.seen = true;
         self.operation = request.operation;
         try std.testing.expectEqualStrings("arm64", request.options.architecture);
         try std.testing.expect(request.options.cache_only);
         try std.testing.expectEqualStrings("ubuntu-minimal", request.packages[0]);
+        const items = if (self.return_item) blk: {
+            const result = try allocator.alloc(product.Item, 1);
+            result[0] = .{
+                .package = try allocator.dupe(u8, "ubuntu-minimal"),
+                .version = try allocator.dupe(u8, "1"),
+                .architecture = try allocator.dupe(u8, "arm64"),
+                .detail = "install",
+            };
+            break :blk result;
+        } else &.{};
         return .{
             .operation = request.operation,
             .exit_status = .success,
             .changed = request.operation.mutates(),
             .summary = "ok",
+            .items = items,
         };
     }
 };
@@ -251,7 +273,7 @@ test "capabilities are versioned and apt-free" {
 }
 
 test "Ubuntu create maps explicit policy to product API" {
-    var fake: Fake = .{};
+    var fake: Fake = .{ .return_item = true };
     const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
     const result = try backend.execute(std.testing.allocator, .{
         .operation = .create,
