@@ -17,7 +17,7 @@ target fails. Documentation, notices, metadata, and schemas are installed with
 mode `0644`; the built CLI is installed with mode `0755`.
 
 The release version defaults to the `build.zig.zon` package version. Override
-it with a valid SemVer value such as `-Dversion=0.1.0-rc.1`. The same value is
+it with a valid SemVer value such as `-Dversion=0.2.0`. The same value is
 available as `debz.version` to Zig consumers and is printed verbatim by
 `debz --version`.
 
