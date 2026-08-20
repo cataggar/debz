@@ -103,6 +103,63 @@ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
+musl libc
+=========
+
+Source: https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl
+Upstream baseline: musl 1.2.5
+Bundled snapshot: 1.2.5+zig.0.16.0.24fdd5b7a4c1
+Zig toolchain commit: 24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8
+Official Zig source archive:
+https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz
+SHA-256:
+43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf
+License: MIT
+
+The release binaries statically link the musl implementation supplied by Zig
+0.16.0. The version above is an exact Zig toolchain snapshot identifier, not a
+claim that the modified bundled tree is an unmodified upstream musl release.
+
+musl as a whole is licensed under the following standard MIT license:
+
+----------------------------------------------------------------------
+Copyright © 2005-2020 Rich Felker, et al.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+----------------------------------------------------------------------
+
+Portions of musl are derived from third-party works under permissive licenses.
+The TRE regular expression implementation is Copyright © 2001-2008 Ville
+Laurikari under a two-clause BSD license. Math and complex code includes work
+Copyright © 1993,2004 Sun Microsystems, Copyright © 2003-2011 David Schultz,
+Copyright © 2003-2009 Steven G. Kargl, Copyright © 2003-2009 Bruce D. Evans,
+Copyright © 2008 Stephen L. Moshier, and Copyright © 2017-2018 Arm Limited.
+The ARM memcpy code is Copyright © 2008 The Android Open Source Project under
+a two-clause BSD license. AArch64 memcpy and memset code is Copyright ©
+1999-2019 Arm Limited. DES crypt code is Copyright © 1994 David Burren under a
+BSD license. Blowfish crypt was written by Solar Designer and placed in the
+public domain with a permissive fallback license. The smoothsort implementation
+is Copyright © 2011 Valentin Ochs under an MIT-style license. Architecture
+ports and other files remain covered by the permissive terms documented in the
+bundled musl COPYRIGHT file.
+
 OpenPGP verifier
 ================
 

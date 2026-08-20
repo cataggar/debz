@@ -10,6 +10,7 @@
       "zig_hash": "libsolv-0.7.39-PoNzeg2EIACYnSAYc3_WneVukScmmV-vyo_5guzBzqdO",
       "version": "0.7.39",
       "license": "BSD-3-Clause",
+      "runtime_linkage": "static_archive_in_debz",
       "vulnerability_sources": [
         "https://github.com/openSUSE/libsolv/security/advisories",
         "https://osv.dev/list?q=libsolv"
@@ -28,6 +29,7 @@
       "zig_hash": "N-V-__8AAPy-ZQDvb3F10PKDTFyFXk7kwDjstLisczD0n9Fs",
       "version": "5.8.3",
       "license": "0BSD",
+      "runtime_linkage": "static_archive_in_debz",
       "vulnerability_sources": [
         "https://tukaani.org/xz/",
         "https://osv.dev/list?q=xz-utils"
@@ -47,6 +49,7 @@
       "zig_hash": "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
       "version": "1.6.0",
       "license": "BSD-3-Clause",
+      "runtime_linkage": "static_archive_in_debz",
       "vulnerability_sources": [
         "https://github.com/facebook/zstd/security/advisories",
         "https://osv.dev/list?q=zstd"
@@ -56,6 +59,49 @@
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
+    },
+    {
+      "name": "musl",
+      "source": "https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl",
+      "upstream": "https://musl.libc.org/",
+      "upstream_version": "1.2.5",
+      "zig_musl_baseline_commit": "0098e650fbceae74c8c468716c0810476f72ec47",
+      "toolchain_version": "0.16.0",
+      "toolchain_commit": "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
+      "toolchain_source_archive": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
+      "toolchain_source_sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+      "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+      "license": "MIT",
+      "runtime_linkage": "static_libc_in_debz",
+      "vulnerability_sources": [
+        "https://musl.libc.org/releases.html",
+        "https://nvd.nist.gov/vuln/detail/CVE-2025-26519",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-40200",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-6042",
+        "https://codeberg.org/ziglang/zig/commit/8a3aebaee0a68d037a6f311bc5c1b426e8e1884c",
+        "https://osv.dev/list?q=musl"
+      ],
+      "vulnerability_review": {
+        "reviewed_on": "2026-08-20",
+        "result": "reviewed_exceptions"
+      },
+      "reviewed_exceptions": [
+        {
+          "id": "CVE-2025-26519",
+          "disposition": "patched_in_toolchain",
+          "rationale": "Zig commit 8a3aebaee0a68d037a6f311bc5c1b426e8e1884c applies Rich Felker's mitigation to the bundled iconv implementation and is an ancestor of the Zig 0.16.0 toolchain commit."
+        },
+        {
+          "id": "CVE-2026-40200",
+          "disposition": "not_affected",
+          "rationale": "Zig 0.16.0 removes musl src/stdlib/qsort.c and supplies qsort from lib/c/stdlib.zig using std.mem.sortUnstableContext, so the vulnerable musl smoothsort implementation is not present."
+        },
+        {
+          "id": "CVE-2026-6042",
+          "disposition": "not_linked",
+          "rationale": "The affected iconv GB18030 decoder remains in the toolchain source snapshot, but debz and its pinned static libraries do not use iconv; static linking therefore excludes that object from the release executable."
+        }
+      ]
     }
   ],
   "allowed_production_licenses": [

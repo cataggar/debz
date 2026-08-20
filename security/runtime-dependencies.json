@@ -2,20 +2,14 @@
   "schema_version": 1,
   "package": "debz",
   "linux_release_runtime": {
-    "binary_kind": "dynamically_linked",
+    "binary_kind": "fully_static",
     "libc": {
-      "implementation": "glibc",
-      "linkage": "dynamic",
-      "expectation": "The target glibc ABI must be provided by the destination Linux system."
+      "implementation": "musl",
+      "linkage": "static",
+      "expectation": "musl and all required libraries are statically linked; no target-system shared libraries are required."
     },
     "system_libraries": [],
     "included_libraries": [
-      {
-        "name": "libsolv",
-        "version": "0.7.39",
-        "linkage": "static_archive_in_debz",
-        "license": "BSD-3-Clause"
-      },
       {
         "name": "liblzma",
         "version": "5.8.3",
@@ -23,12 +17,24 @@
         "license": "0BSD"
       },
       {
+        "name": "libsolv",
+        "version": "0.7.39",
+        "linkage": "static_archive_in_debz",
+        "license": "BSD-3-Clause"
+      },
+      {
         "name": "libzstd",
         "version": "1.6.0",
         "linkage": "static_archive_in_debz",
         "license": "BSD-3-Clause"
+      },
+      {
+        "name": "musl",
+        "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "linkage": "static_libc_in_debz",
+        "license": "MIT"
       }
     ],
-    "fully_static": false
+    "fully_static": true
   }
 }

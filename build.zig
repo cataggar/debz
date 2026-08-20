@@ -74,9 +74,9 @@ pub fn build(b: *std.Build) void {
     });
     const install_cli = b.addInstallArtifact(cli, .{});
     b.getInstallStep().dependOn(&install_cli.step);
-    installReleaseFiles(b, install_cli);
-    b.step("release-install", "Install the complete release tree for packaging")
-        .dependOn(b.getInstallStep());
+    const release_install = b.step("release-install", "Install the complete release tree for packaging");
+    release_install.dependOn(b.getInstallStep());
+    installReleaseFiles(b, install_cli, release_install, target);
 
     const run_cli = b.addRunArtifact(cli);
     run_cli.step.dependOn(b.getInstallStep());
@@ -137,9 +137,13 @@ pub fn build(b: *std.Build) void {
     );
     audit_step.dependOn(&audit_tests.step);
 
+    const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
-    b.step("test-release", "Run deterministic release packaging and audit tests")
-        .dependOn(&release_tests.step);
+    release_test_step.dependOn(&release_tests.step);
+    const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
+    install_layout_tests.addArg(b.graph.zig_exe);
+    install_layout_tests.addArg(version);
+    release_test_step.dependOn(&install_layout_tests.step);
 
     const solver_tests = b.addTest(.{
         .root_module = debz,
@@ -211,7 +215,12 @@ pub fn build(b: *std.Build) void {
         .dependOn(&dpkg_oracle.step);
 }
 
-fn installReleaseFiles(b: *std.Build, install_cli: *std.Build.Step.InstallArtifact) void {
+fn installReleaseFiles(
+    b: *std.Build,
+    install_cli: *std.Build.Step.InstallArtifact,
+    release_install: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+) void {
     const docs = [_][]const u8{
         "README.md",
         "authenticated-refresh.md",
@@ -244,7 +253,6 @@ fn installReleaseFiles(b: *std.Build, install_cli: *std.Build.Step.InstallArtifa
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
         .{ .source = "LICENSE", .destination = "share/doc/debz/LICENSE" },
         .{ .source = "THIRD_PARTY_NOTICES", .destination = "share/doc/debz/THIRD_PARTY_NOTICES" },
-        .{ .source = "security/runtime-dependencies.json", .destination = "share/debz/runtime-dependencies.json" },
     };
 
     const regular_modes = b.addSystemCommand(&.{ "chmod", "0644" });
@@ -277,4 +285,19 @@ fn installReleaseFiles(b: *std.Build, install_cli: *std.Build.Step.InstallArtifa
     executable_mode.step.dependOn(&install_cli.step);
     executable_mode.addArg(b.getInstallPath(.bin, "debz"));
     b.getInstallStep().dependOn(&executable_mode.step);
+
+    const runtime_metadata = b.addInstallFile(
+        b.path("security/runtime-dependencies.json"),
+        "share/debz/runtime-dependencies.json",
+    );
+    if (target.result.os.tag != .linux or target.result.abi != .musl) {
+        const unsupported_target = b.addFail(
+            "release-install requires a Linux musl target; use ordinary install for other targets",
+        );
+        runtime_metadata.step.dependOn(&unsupported_target.step);
+    }
+    const runtime_metadata_mode = b.addSystemCommand(&.{ "chmod", "0644" });
+    runtime_metadata_mode.step.dependOn(&runtime_metadata.step);
+    runtime_metadata_mode.addArg(b.getInstallPath(.prefix, "share/debz/runtime-dependencies.json"));
+    release_install.dependOn(&runtime_metadata_mode.step);
 }

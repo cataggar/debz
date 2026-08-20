@@ -6,7 +6,7 @@ Copyright 2026 debz contributors. SPDX-License-Identifier: Apache-2.0.
 and validator. It uses Python's standard library plus `git` for reading an exact
 source commit. Release inputs are rejected when they contain links, generated
 artifacts, cache paths, common secret formats, missing notices, unsafe names, or
-undeclared ELF dependencies.
+ELF binaries that are not fully static for the declared architecture.
 
 The install prefix must contain:
 
@@ -43,4 +43,8 @@ archive and SPDX 2.3 JSON SBOM has a portable SHA-256 sidecar in the exact form
 Complete verification requires the assets directory to contain exactly the
 manifest-declared regular files. Binary audit re-reads `bin/debz` and the
 installed runtime manifest from each archive, then checks ELF architecture and
-dynamic dependencies against the reviewed dependency policy.
+parses ELF program headers to reject `PT_INTERP`, every `DT_NEEDED` entry, and
+malformed layouts even when section headers are absent. `PT_DYNAMIC` file and
+virtual ranges must resolve uniquely and consistently through the same
+file-backed `PT_LOAD`, preventing a decoy file offset from hiding the dynamic
+table actually visible to the loader.

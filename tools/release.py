@@ -45,22 +45,6 @@ SECRET_PATTERNS = (
     re.compile(rb"AKIA[0-9A-Z]{16}"),
     re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}"),
 )
-BASE_RUNTIME = {
-    "libc.so.6",
-    "libm.so.6",
-    "libpthread.so.0",
-    "libdl.so.2",
-    "librt.so.1",
-    "ld-linux-x86-64.so.2",
-    "ld-linux-aarch64.so.1",
-}
-DEPENDENCY_SONAMES = {
-    "liblzma": set(),
-    "libzstd": set(),
-    "libsolv": set(),
-}
-
-
 class ReleaseError(Exception):
     """A release input or artifact failed validation."""
 
@@ -257,6 +241,8 @@ def policy_dependencies(policy_path: pathlib.Path) -> list[dict[str, object]]:
             raise ReleaseError(f"{dependency['name']}: license is not allowed")
         if not (dependency.get("version") or dependency.get("minimum_version")):
             raise ReleaseError(f"{dependency['name']}: version is missing")
+        if not dependency.get("runtime_linkage"):
+            raise ReleaseError(f"{dependency['name']}: runtime linkage is missing")
         result.append(dependency)
     return sorted(result, key=lambda item: str(item["name"]))
 
@@ -270,11 +256,14 @@ def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]
             "schema_version": 1,
             "package": "debz",
             "linux_release_runtime": {
-                "binary_kind": "dynamically_linked",
+                "binary_kind": "fully_static",
                 "libc": {
-                    "implementation": "glibc",
-                    "linkage": "dynamic",
-                    "expectation": "The target glibc ABI must be provided by the destination Linux system.",
+                    "implementation": "musl",
+                    "linkage": "static",
+                    "expectation": (
+                        "musl and all required libraries are statically linked; "
+                        "no target-system shared libraries are required."
+                    ),
                 },
                 "system_libraries": [],
                 "included_libraries": sorted(
@@ -282,14 +271,14 @@ def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]
                         {
                             "name": str(item["name"]),
                             "version": str(item["version"]),
-                            "linkage": "static_archive_in_debz",
+                            "linkage": str(item["runtime_linkage"]),
                             "license": str(item["license"]),
                         }
                         for item in dependencies
                     ),
                     key=lambda item: item["name"],
                 ),
-                "fully_static": False,
+                "fully_static": True,
             },
         }
         normalized = {
@@ -307,74 +296,187 @@ def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]
         )
 
 
-def elf_needed(data: bytes) -> set[str]:
-    if not data.startswith(b"\x7fELF"):
-        return set()
-    elf_class, encoding = data[4], data[5]
-    if elf_class not in (1, 2) or encoding not in (1, 2):
-        raise ReleaseError("unsupported ELF encoding")
-    endian = "<" if encoding == 1 else ">"
-    if elf_class == 2:
-        header = struct.unpack_from(endian + "HHIQQQIHHHHHH", data, 16)
-        section_offset, section_size, section_count, names_index = header[5], header[10], header[11], header[12]
-        section_format = endian + "IIQQQQIIQQ"
-    else:
-        header = struct.unpack_from(endian + "HHIIIIIHHHHHH", data, 16)
-        section_offset, section_size, section_count, names_index = header[5], header[10], header[11], header[12]
-        section_format = endian + "IIIIIIIIII"
-    if not section_offset or not section_count or names_index >= section_count:
-        return set()
-    sections = [
-        struct.unpack_from(section_format, data, section_offset + index * section_size)
-        for index in range(section_count)
-    ]
-    names_section = sections[names_index]
-    names = data[names_section[4] : names_section[4] + names_section[5]]
-
-    def section_name(section: tuple[int, ...]) -> str:
-        start = section[0]
-        end = names.find(b"\0", start)
-        return names[start:end].decode("ascii", "strict")
-
-    by_name = {section_name(section): section for section in sections}
-    dynamic = by_name.get(".dynamic")
-    strings = by_name.get(".dynstr")
-    if not dynamic or not strings:
-        return set()
-    string_data = data[strings[4] : strings[4] + strings[5]]
-    pair = endian + ("QQ" if elf_class == 2 else "II")
-    pair_size = struct.calcsize(pair)
-    needed: set[str] = set()
-    for offset in range(dynamic[4], dynamic[4] + dynamic[5], pair_size):
-        tag, value = struct.unpack_from(pair, data, offset)
-        if tag == 0:
-            break
-        if tag == 1:
-            end = string_data.find(b"\0", value)
-            needed.add(string_data[value:end].decode("ascii", "strict"))
-    return needed
+def checked_elf_region(data: bytes, offset: int, size: int, description: str) -> memoryview:
+    if offset < 0 or size < 0 or offset > len(data) or size > len(data) - offset:
+        raise ReleaseError(f"malformed ELF {description} offset or size")
+    return memoryview(data)[offset : offset + size]
 
 
-def validate_dynamic_dependencies(binary: bytes, dependencies: list[dict[str, object]]) -> set[str]:
-    needed = elf_needed(binary)
-    declared = {str(item["name"]) for item in dependencies}
-    allowed = set(BASE_RUNTIME)
-    for name in declared:
-        allowed.update(DEPENDENCY_SONAMES.get(name, set()))
-    unexpected = needed - allowed
-    if unexpected:
-        raise ReleaseError(f"unexpected dynamic dependencies: {', '.join(sorted(unexpected))}")
-    return needed
+def checked_elf_address_end(address: int, size: int, description: str) -> int:
+    if address < 0 or size < 0 or address > (1 << 64) - 1 - size:
+        raise ReleaseError(f"malformed ELF {description} address or size")
+    return address + size
 
 
-def validate_elf_platform(binary: bytes, platform: str) -> None:
-    if len(binary) < 20 or not binary.startswith(b"\x7fELF") or binary[4] != 2 or binary[5] not in (1, 2):
-        raise ReleaseError("bin/debz is not a supported 64-bit ELF executable")
-    endian = "<" if binary[5] == 1 else ">"
-    machine = struct.unpack_from(endian + "H", binary, 18)[0]
-    expected = {"linux-x64": 62, "linux-arm64": 183}[platform]
-    if machine != expected:
+def validate_static_elf(binary: bytes, platform: str) -> None:
+    if len(binary) < 64 or not binary.startswith(b"\x7fELF"):
+        raise ReleaseError("bin/debz is not an ELF64 executable")
+    if binary[4] != 2:
+        raise ReleaseError("bin/debz is not an ELF64 executable")
+    if binary[5] != 1 or binary[6] != 1:
+        raise ReleaseError("bin/debz has an unsupported ELF encoding or version")
+
+    header = struct.unpack_from("<HHIQQQIHHHHHH", binary, 16)
+    (
+        elf_type,
+        machine,
+        elf_version,
+        _entry,
+        program_offset,
+        section_offset,
+        _flags,
+        header_size,
+        program_entry_size,
+        program_count,
+        section_entry_size,
+        section_count,
+        section_names_index,
+    ) = header
+    expected_machine = {"linux-x64": 62, "linux-arm64": 183}[platform]
+    if elf_type not in (2, 3) or elf_version != 1 or header_size != 64:
+        raise ReleaseError("bin/debz has a malformed ELF64 header")
+    if machine != expected_machine:
         raise ReleaseError(f"ELF architecture {machine} does not match {platform}")
+    if program_count in (0, 0xFFFF) or program_entry_size != 56:
+        raise ReleaseError("bin/debz has a malformed ELF64 program header table")
+    if program_offset < header_size or program_offset % 8:
+        raise ReleaseError("bin/debz has a malformed ELF64 program header offset")
+    program_headers = checked_elf_region(
+        binary,
+        program_offset,
+        program_count * program_entry_size,
+        "program header table",
+    )
+
+    if section_offset == 0:
+        if section_count != 0 or section_names_index != 0 or section_entry_size not in (0, 64):
+            raise ReleaseError("bin/debz has malformed section-header-less ELF metadata")
+    else:
+        if (
+            section_count == 0
+            or section_names_index == 0xFFFF
+            or section_names_index >= section_count
+            or section_entry_size != 64
+            or section_offset < header_size
+            or section_offset % 8
+        ):
+            raise ReleaseError("bin/debz has a malformed ELF64 section header table")
+        sections = checked_elf_region(
+            binary,
+            section_offset,
+            section_count * section_entry_size,
+            "section header table",
+        )
+        for index in range(section_count):
+            section = struct.unpack_from("<IIQQQQIIQQ", sections, index * section_entry_size)
+            section_type, section_file_offset, section_size, alignment = (
+                section[1],
+                section[4],
+                section[5],
+                section[8],
+            )
+            if alignment not in (0, 1) and alignment & (alignment - 1):
+                raise ReleaseError("bin/debz has a malformed ELF64 section alignment")
+            if section_type != 8 and section_size:
+                checked_elf_region(binary, section_file_offset, section_size, "section")
+
+    load_regions: list[tuple[int, int, int, int, int]] = []
+    dynamic_regions: list[tuple[int, int, int, int]] = []
+    for index in range(program_count):
+        program = struct.unpack_from("<IIQQQQQQ", program_headers, index * program_entry_size)
+        program_type, file_offset, virtual_address, file_size, memory_size, alignment = (
+            program[0],
+            program[2],
+            program[3],
+            program[5],
+            program[6],
+            program[7],
+        )
+        if file_size > memory_size:
+            raise ReleaseError("bin/debz has an ELF segment larger on disk than in memory")
+        if alignment not in (0, 1) and alignment & (alignment - 1):
+            raise ReleaseError("bin/debz has a malformed ELF segment alignment")
+        if program_type == 1 and alignment > 1 and file_offset % alignment != virtual_address % alignment:
+            raise ReleaseError("bin/debz has a misaligned ELF load segment")
+        if file_size:
+            checked_elf_region(binary, file_offset, file_size, "segment")
+        if program_type == 1:
+            load_regions.append(
+                (
+                    file_offset,
+                    file_offset + file_size,
+                    virtual_address,
+                    checked_elf_address_end(
+                        virtual_address, file_size, "load segment file mapping"
+                    ),
+                    checked_elf_address_end(
+                        virtual_address, memory_size, "load segment memory mapping"
+                    ),
+                )
+            )
+        elif program_type == 2:
+            dynamic_regions.append(
+                (file_offset, virtual_address, file_size, memory_size)
+            )
+        elif program_type == 3:
+            raise ReleaseError("bin/debz contains a PT_INTERP dynamic loader")
+
+    if not load_regions:
+        raise ReleaseError("bin/debz has no ELF load segment")
+    if len(dynamic_regions) > 1:
+        raise ReleaseError("bin/debz has multiple PT_DYNAMIC segments")
+    for dynamic_offset, dynamic_address, dynamic_size, dynamic_memory_size in dynamic_regions:
+        if (
+            dynamic_offset % 8
+            or dynamic_address % 8
+            or dynamic_size == 0
+            or dynamic_size % 16
+            or dynamic_memory_size != dynamic_size
+        ):
+            raise ReleaseError("bin/debz has a malformed PT_DYNAMIC segment")
+        dynamic_file_end = dynamic_offset + dynamic_size
+        dynamic_address_end = checked_elf_address_end(
+            dynamic_address, dynamic_size, "PT_DYNAMIC mapping"
+        )
+        file_mappings = [
+            index
+            for index, (file_start, file_end, _, _, _) in enumerate(load_regions)
+            if dynamic_offset >= file_start and dynamic_file_end <= file_end
+        ]
+        virtual_mappings = [
+            index
+            for index, (_, _, virtual_start, virtual_file_end, virtual_memory_end) in enumerate(
+                load_regions
+            )
+            if dynamic_address >= virtual_start
+            and dynamic_address_end <= virtual_file_end
+            and dynamic_address_end <= virtual_memory_end
+        ]
+        if len(file_mappings) != 1 or len(virtual_mappings) != 1:
+            raise ReleaseError(
+                "bin/debz has an ambiguous or unmapped PT_DYNAMIC file/virtual range"
+            )
+        if file_mappings[0] != virtual_mappings[0]:
+            raise ReleaseError(
+                "bin/debz has mismatched PT_DYNAMIC file and virtual mappings"
+            )
+        load = load_regions[file_mappings[0]]
+        if dynamic_offset - load[0] != dynamic_address - load[2]:
+            raise ReleaseError(
+                "bin/debz has inconsistent PT_DYNAMIC file and virtual offsets"
+            )
+        dynamic = checked_elf_region(binary, dynamic_offset, dynamic_size, "PT_DYNAMIC segment")
+        terminated = False
+        for offset in range(0, dynamic_size, 16):
+            tag, _value = struct.unpack_from("<qQ", dynamic, offset)
+            if tag == 1:
+                raise ReleaseError("bin/debz contains a DT_NEEDED shared-library dependency")
+            if terminated and tag != 0:
+                raise ReleaseError("bin/debz has data after the PT_DYNAMIC terminator")
+            if tag == 0:
+                terminated = True
+        if not terminated:
+            raise ReleaseError("bin/debz has an unterminated PT_DYNAMIC segment")
 
 
 def spdx_document(
@@ -467,7 +569,11 @@ def spdx_document(
     }
 
 
-def verify_sbom(path: pathlib.Path, archive_name: str) -> None:
+def verify_sbom(
+    path: pathlib.Path,
+    archive_name: str,
+    dependencies: list[dict[str, object]],
+) -> None:
     try:
         document = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
@@ -480,9 +586,32 @@ def verify_sbom(path: pathlib.Path, archive_name: str) -> None:
     packages = document["packages"]
     if not packages or packages[0].get("packageFileName") != archive_name:
         raise ReleaseError(f"SBOM does not describe {archive_name}")
-    names = {item.get("name") for item in packages}
-    if not {"debz", "libsolv", "liblzma", "libzstd"}.issubset(names):
+    dependency_packages = {
+        item.get("name"): item
+        for item in packages[1:]
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    expected_dependencies = {
+        str(item["name"]): {
+            "downloadLocation": str(item.get("source", "NOASSERTION")),
+            "filesAnalyzed": False,
+            "licenseConcluded": str(item["license"]),
+            "licenseDeclared": str(item["license"]),
+            "versionInfo": str(item.get("version", item.get("minimum_version"))),
+        }
+        for item in dependencies
+    }
+    if (
+        len(packages) != len(expected_dependencies) + 1
+        or set(dependency_packages) != set(expected_dependencies)
+    ):
         raise ReleaseError(f"SBOM dependency coverage is incomplete: {path.name}")
+    for name, expected in expected_dependencies.items():
+        package = dependency_packages[name]
+        if any(package.get(field) != value for field, value in expected.items()):
+            raise ReleaseError(
+                f"SBOM dependency metadata differs from reviewed policy for {name}: {path.name}"
+            )
     file_sha1_values = []
     for file_entry in document["files"]:
         license_info = file_entry.get("licenseInfoInFiles")
@@ -694,9 +823,8 @@ def validate_archived_binary(
     }
     binary = files[f"{root}/bin/debz"]
     runtime = files[f"{root}/share/debz/runtime-dependencies.json"]
-    validate_elf_platform(binary, platform)
+    validate_static_elf(binary, platform)
     validate_runtime_manifest(runtime, dependencies)
-    validate_dynamic_dependencies(binary, dependencies)
 
 
 def native_platform() -> str | None:
@@ -738,10 +866,9 @@ def command_binary(args: argparse.Namespace) -> None:
     dependencies = policy_dependencies(args.policy)
     root_name = f"debz-{version}-{args.platform}"
     entries, binary = binary_entries(args.prefix, root_name)
-    validate_elf_platform(binary, args.platform)
+    validate_static_elf(binary, args.platform)
     runtime_data = next(data for name, data, _ in entries if name.endswith("/share/debz/runtime-dependencies.json"))
     validate_runtime_manifest(runtime_data, dependencies)
-    validate_dynamic_dependencies(binary, dependencies)
     for path in create_release_files(args.output, root_name, version, entries, args.epoch, dependencies):
         print(path)
 
@@ -764,12 +891,13 @@ def command_manifest(args: argparse.Namespace) -> None:
 def command_audit(args: argparse.Namespace) -> None:
     version = parse_tag(args.tag)
     entries = audit_archive(args.archive, args.kind, version, args.platform)
+    dependencies = policy_dependencies(args.policy)
     if args.kind == "binary":
-        validate_archived_binary(entries, version, args.platform, policy_dependencies(args.policy))
+        validate_archived_binary(entries, version, args.platform, dependencies)
     validate_checksum(args.archive.with_name(args.archive.name + ".sha256"), args.archive)
     sbom = args.archive.with_name(args.archive.name + ".spdx.json")
     validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-    verify_sbom(sbom, args.archive.name)
+    verify_sbom(sbom, args.archive.name, dependencies)
     if args.smoke and args.kind == "binary" and args.platform == native_platform():
         smoke_binary(args.archive, version)
     print(f"verified {args.archive}")
@@ -809,14 +937,14 @@ def command_verify(args: argparse.Namespace) -> None:
             validate_checksum(archive.with_name(archive.name + ".sha256"), archive)
             sbom = archive.with_name(archive.name + ".spdx.json")
             validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-            verify_sbom(sbom, archive.name)
+            verify_sbom(sbom, archive.name, dependencies)
     for archive_format in FORMATS:
         archive = args.assets / f"debz-{version}-source.{archive_format}"
         audit_archive(archive, "source", version, None)
         validate_checksum(archive.with_name(archive.name + ".sha256"), archive)
         sbom = archive.with_name(archive.name + ".spdx.json")
         validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-        verify_sbom(sbom, archive.name)
+        verify_sbom(sbom, archive.name, dependencies)
     if args.smoke:
         platform = native_platform()
         if platform:

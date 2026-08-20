@@ -61,6 +61,75 @@ def dependency_option_failures(build: str, dependency: str, expected: dict[str, 
     ]
 
 
+def expected_runtime_metadata(
+    dependencies: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "package": "debz",
+        "linux_release_runtime": {
+            "binary_kind": "fully_static",
+            "libc": {
+                "implementation": "musl",
+                "linkage": "static",
+                "expectation": (
+                    "musl and all required libraries are statically linked; "
+                    "no target-system shared libraries are required."
+                ),
+            },
+            "system_libraries": [],
+            "included_libraries": sorted(
+                (
+                    {
+                        "name": name,
+                        "version": dependency["version"],
+                        "linkage": dependency["runtime_linkage"],
+                        "license": dependency["license"],
+                    }
+                    for name, dependency in dependencies.items()
+                ),
+                key=lambda item: item["name"],
+            ),
+            "fully_static": True,
+        },
+    }
+
+
+def runtime_metadata_failures(
+    runtime: dict[str, object],
+    dependencies: dict[str, dict[str, object]],
+) -> list[str]:
+    if runtime == expected_runtime_metadata(dependencies):
+        return []
+    return ["Linux runtime metadata does not exactly identify fully static musl release binaries"]
+
+
+def release_install_metadata_failures(build: str) -> list[str]:
+    failures = []
+    source = '"security/runtime-dependencies.json"'
+    if build.count(source) != 1:
+        failures.append("runtime metadata install source is missing or ambiguous")
+    regular_start = build.find("const regular_files =")
+    regular_end = build.find("\n    };", regular_start)
+    if (
+        regular_start < 0
+        or regular_end < 0
+        or source in build[regular_start:regular_end]
+    ):
+        failures.append("ordinary install graph contains static-musl runtime metadata")
+    required = (
+        "const runtime_metadata = b.addInstallFile(",
+        'b.path("security/runtime-dependencies.json")',
+        '"share/debz/runtime-dependencies.json"',
+        "target.result.abi != .musl",
+        "release-install requires a Linux musl target",
+        "release_install.dependOn(&runtime_metadata_mode.step);",
+    )
+    if any(item not in build for item in required):
+        failures.append("release-install graph does not install static-musl runtime metadata")
+    return failures
+
+
 def audit_production_sources() -> None:
     forbidden = {
         r"\b(?:getEnvVarOwned|getEnvMap)\b": "ambient environment access",
@@ -111,11 +180,13 @@ def audit_dependencies() -> None:
         fail("dependency vulnerability/license review has expired")
     allowed_licenses = set(policy["allowed_production_licenses"])
     dependencies = {item["name"]: item for item in policy["production_dependencies"]}
-    if set(dependencies) != {"libsolv", "liblzma", "libzstd"}:
+    if set(dependencies) != {"libsolv", "liblzma", "libzstd", "musl"}:
         fail("dependency policy does not exactly enumerate production dependencies")
     for dependency in dependencies.values():
         if dependency["license"] not in allowed_licenses:
             fail(f"{dependency['name']}: license is outside the production allowlist")
+        if not dependency.get("runtime_linkage"):
+            fail(f"{dependency['name']}: runtime linkage is missing")
         if not dependency["vulnerability_sources"] or not all(
             source.startswith("https://") for source in dependency["vulnerability_sources"]
         ):
@@ -127,6 +198,48 @@ def audit_dependencies() -> None:
             fail(f"{dependency['name']}: vulnerability review result is missing")
         if review.get("result") == "reviewed_exceptions" and not dependency["reviewed_exceptions"]:
             fail(f"{dependency['name']}: vulnerability exceptions are not enumerated")
+
+    musl = dependencies["musl"]
+    if {
+        "source": musl.get("source"),
+        "upstream_version": musl.get("upstream_version"),
+        "zig_musl_baseline_commit": musl.get("zig_musl_baseline_commit"),
+        "toolchain_version": musl.get("toolchain_version"),
+        "toolchain_commit": musl.get("toolchain_commit"),
+        "toolchain_source_archive": musl.get("toolchain_source_archive"),
+        "toolchain_source_sha256": musl.get("toolchain_source_sha256"),
+        "version": musl.get("version"),
+        "license": musl.get("license"),
+        "runtime_linkage": musl.get("runtime_linkage"),
+    } != {
+        "source": "https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl",
+        "upstream_version": "1.2.5",
+        "zig_musl_baseline_commit": "0098e650fbceae74c8c468716c0810476f72ec47",
+        "toolchain_version": "0.16.0",
+        "toolchain_commit": "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
+        "toolchain_source_archive": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
+        "toolchain_source_sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+        "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "license": "MIT",
+        "runtime_linkage": "static_libc_in_debz",
+    }:
+        fail("musl provenance differs from the reviewed Zig 0.16.0 toolchain snapshot")
+    musl_exceptions = {
+        item.get("id"): item.get("disposition")
+        for item in musl.get("reviewed_exceptions", [])
+        if isinstance(item, dict)
+    }
+    if musl_exceptions != {
+        "CVE-2025-26519": "patched_in_toolchain",
+        "CVE-2026-40200": "not_affected",
+        "CVE-2026-6042": "not_linked",
+    }:
+        fail("musl vulnerability review exceptions are incomplete")
+    if any(
+        not isinstance(item, dict) or not item.get("rationale")
+        for item in musl.get("reviewed_exceptions", [])
+    ):
+        fail("musl vulnerability review exceptions lack rationale")
 
     zon = (ROOT / "build.zig.zon").read_text()
     dependency_blocks = re.findall(
@@ -184,44 +297,12 @@ def audit_dependencies() -> None:
     system_libraries = set(re.findall(r'linkSystemLibrary\("([^"]+)"', build))
     if system_libraries:
         fail(f"unreviewed system libraries: {sorted(system_libraries)}")
-    linux_runtime = runtime.get("linux_release_runtime", {})
-    if (
-        runtime.get("schema_version") != 1
-        or runtime.get("package") != "debz"
-        or linux_runtime.get("binary_kind") != "dynamically_linked"
-        or linux_runtime.get("fully_static") is not False
-        or linux_runtime.get("libc", {}).get("implementation") != "glibc"
-        or linux_runtime.get("libc", {}).get("linkage") != "dynamic"
-    ):
-        fail("Linux runtime metadata does not identify dynamic glibc requirements")
-    runtime_system = {
-        (item.get("name"), item.get("linkage"))
-        for item in linux_runtime.get("system_libraries", [])
-    }
-    if runtime_system:
-        fail("Linux runtime metadata differs from linked system libraries")
-    included = linux_runtime.get("included_libraries", [])
-    if included != [
-        {
-            "name": "libsolv",
-            "version": dependencies["libsolv"]["version"],
-            "linkage": "static_archive_in_debz",
-            "license": "BSD-3-Clause",
-        },
-        {
-            "name": "liblzma",
-            "version": dependencies["liblzma"]["version"],
-            "linkage": "static_archive_in_debz",
-            "license": "0BSD",
-        },
-        {
-            "name": "libzstd",
-            "version": dependencies["libzstd"]["version"],
-            "linkage": "static_archive_in_debz",
-            "license": "BSD-3-Clause",
-        },
-    ]:
-        fail("Linux runtime metadata does not identify statically included libraries")
+    for message in runtime_metadata_failures(runtime, dependencies):
+        fail(message)
+    for message in release_install_metadata_failures(build):
+        fail(message)
+    if "const target = b.standardTargetOptions(.{});" not in build:
+        fail("ordinary builds must preserve standard target option propagation")
     for message in dependency_option_failures(build, "libsolv", {"shared": "false"}):
         fail(message)
     for message in dependency_option_failures(
@@ -254,12 +335,46 @@ def audit_dependencies() -> None:
         fail("repository-local liblzma build is not the reviewed single-threaded decoder configuration")
 
     notices = (ROOT / "THIRD_PARTY_NOTICES").read_text()
-    for required in ("libsolv", "BSD-3-Clause", "XZ Utils liblzma", "Zstandard libzstd", "0BSD"):
+    for required in (
+        "libsolv",
+        "BSD-3-Clause",
+        "XZ Utils liblzma",
+        "Zstandard libzstd",
+        "0BSD",
+        "musl libc",
+        "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+        "MIT",
+    ):
         if required not in notices:
             fail(f"THIRD_PARTY_NOTICES is missing {required!r}")
     production_notices = notices.split("OpenPGP fixture", 1)[0]
     if re.search(r"\b(?:GPL|LGPL|AGPL)(?:-|\b)", production_notices):
         fail("GPL/LGPL/AGPL production dependency is not permitted")
+
+
+def audit_release_targets() -> None:
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    expected = ("x86_64-linux-musl", "aarch64-linux-musl")
+    jobs = (
+        ("release.yml binaries", re.search(r"(?ms)^  binaries:\n(.*?)(?=^  \S|\Z)", release)),
+        (
+            "ci.yml release-dry-run",
+            re.search(r"(?ms)^  release-dry-run:\n(.*?)(?=^  \S|\Z)", ci),
+        ),
+    )
+    for workflow, match in jobs:
+        if match is None:
+            fail(f"{workflow}: release job is missing")
+            continue
+        text = match.group(1)
+        for target in expected:
+            if text.count(f"target: {target}") != 1:
+                fail(f"{workflow}: release matrix must contain exactly one {target} target")
+        for target in ("x86_64-linux-gnu", "aarch64-linux-gnu"):
+            if f"target: {target}" in text:
+                fail(f"{workflow}: release matrix retains dynamic GNU target {target}")
 
 
 def audit_ci_pins() -> None:
@@ -348,6 +463,7 @@ def main() -> int:
     files = tracked_files()
     audit_production_sources()
     audit_dependencies()
+    audit_release_targets()
     audit_ci_pins()
     audit_docs()
     audit_secrets_and_artifacts(files)
