@@ -25,7 +25,7 @@ pub const DuplicatePolicy = enum {
 };
 
 pub const Limits = struct {
-    max_total_bytes: usize = 64 * 1024 * 1024,
+    max_total_bytes: usize = 256 * 1024 * 1024,
     max_records: usize = 250_000,
     max_fields_per_record: usize = 1_000,
     max_field_bytes: usize = 1024 * 1024,
@@ -33,6 +33,10 @@ pub const Limits = struct {
     max_filename_bytes: usize = 4096,
     relation: @import("relation.zig").Limits = .{},
 };
+
+test "default input bound is 256 MiB" {
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), (Limits{}).max_total_bytes);
+}
 
 pub const Options = struct {
     limits: Limits = .{},
