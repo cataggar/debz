@@ -114,10 +114,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux-x64
-            target: x86_64-linux-gnu
+            target: x86_64-linux-musl
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
-            target: aarch64-linux-gnu
+            target: aarch64-linux-musl
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -127,20 +127,6 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-      - name: Install audited build and runtime prerequisites
-        run: |
-          if ! command -v readelf >/dev/null ||
-             ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd; then
-            if [ -f /etc/apt/apt-mirrors.txt ]; then
-              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-                /etc/apt/apt-mirrors.txt
-            fi
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-              -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends \
-              binutils liblzma-dev liblzma5 libzstd-dev libzstd1 pkg-config
-          fi
       - name: Build, package, and audit v0.1.0 binary assets
         env:
           PLATFORM: ${{ matrix.platform }}

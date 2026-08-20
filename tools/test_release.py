@@ -13,6 +13,7 @@ import json
 import lzma
 import os
 import pathlib
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -33,11 +34,41 @@ class ReleaseTests(unittest.TestCase):
         self.policy.write_text(
             json.dumps(
                 {
-                    "allowed_production_licenses": ["Apache-2.0", "BSD-3-Clause", "0BSD"],
+                    "allowed_production_licenses": [
+                        "Apache-2.0",
+                        "BSD-3-Clause",
+                        "0BSD",
+                        "MIT",
+                    ],
                     "production_dependencies": [
-                        {"name": "libsolv", "version": "0.7.39", "license": "BSD-3-Clause", "source": "example"},
-                        {"name": "liblzma", "version": "5.8.3", "license": "0BSD", "source": "example"},
-                        {"name": "libzstd", "version": "1.6.0", "license": "BSD-3-Clause", "source": "example"},
+                        {
+                            "name": "libsolv",
+                            "version": "0.7.39",
+                            "license": "BSD-3-Clause",
+                            "runtime_linkage": "static_archive_in_debz",
+                            "source": "example",
+                        },
+                        {
+                            "name": "liblzma",
+                            "version": "5.8.3",
+                            "license": "0BSD",
+                            "runtime_linkage": "static_archive_in_debz",
+                            "source": "example",
+                        },
+                        {
+                            "name": "libzstd",
+                            "version": "1.6.0",
+                            "license": "BSD-3-Clause",
+                            "runtime_linkage": "static_archive_in_debz",
+                            "source": "example",
+                        },
+                        {
+                            "name": "musl",
+                            "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+                            "license": "MIT",
+                            "runtime_linkage": "static_libc_in_debz",
+                            "source": "example",
+                        },
                     ],
                 }
             )
@@ -52,33 +83,155 @@ class ReleaseTests(unittest.TestCase):
             "schema_version": 1,
             "package": "debz",
             "linux_release_runtime": {
-                "binary_kind": "dynamically_linked",
+                "binary_kind": "fully_static",
                 "libc": {
-                    "implementation": "glibc",
-                    "linkage": "dynamic",
-                    "expectation": "The target glibc ABI must be provided by the destination Linux system.",
+                    "implementation": "musl",
+                    "linkage": "static",
+                    "expectation": (
+                        "musl and all required libraries are statically linked; "
+                        "no target-system shared libraries are required."
+                    ),
                 },
                 "system_libraries": [],
                 "included_libraries": [
                     {
                         "name": dependency["name"],
                         "version": dependency["version"],
-                        "linkage": "static_archive_in_debz",
+                        "linkage": dependency["runtime_linkage"],
                         "license": dependency["license"],
                     }
                     for dependency in dependencies
                 ],
-                "fully_static": False,
+                "fully_static": True,
             },
         }
 
-    def prefix(self, name: str = "prefix", machine: int = 62) -> pathlib.Path:
+    @staticmethod
+    def elf(
+        machine: int = 62,
+        *,
+        interp: bool = False,
+        needed: bool = False,
+        needed_mapping_bypass: bool = False,
+    ) -> bytes:
+        has_dynamic = needed or needed_mapping_bypass
+        program_count = 1 + int(interp) + int(has_dynamic)
+        cursor = 64 + 56 * program_count
+        cursor = (cursor + 7) & ~7
+        interpreter = b"/lib/ld-musl-test.so.1\0" if interp else b""
+        interpreter_offset = cursor
+        cursor += len(interpreter)
+        cursor = (cursor + 7) & ~7
+        dynamic = (
+            struct.pack("<qQqQ", 1, 0, 0, 0)
+            if needed
+            else struct.pack("<qQqQ", 0, 0, 0, 0)
+            if needed_mapping_bypass
+            else b""
+        )
+        dynamic_offset = cursor
+        cursor += len(dynamic)
+        cursor = (cursor + 7) & ~7
+        mapped_dynamic = (
+            struct.pack("<qQqQ", 1, 0, 0, 0)
+            if needed_mapping_bypass
+            else b""
+        )
+        mapped_dynamic_offset = cursor
+        cursor += len(mapped_dynamic)
+        binary = bytearray(cursor)
+        binary[:16] = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+        struct.pack_into(
+            "<HHIQQQIHHHHHH",
+            binary,
+            16,
+            2,
+            machine,
+            1,
+            0x400000,
+            64,
+            0,
+            0,
+            64,
+            56,
+            program_count,
+            0,
+            0,
+            0,
+        )
+        struct.pack_into(
+            "<IIQQQQQQ",
+            binary,
+            64,
+            1,
+            5,
+            0,
+            0x400000,
+            0x400000,
+            len(binary),
+            len(binary),
+            0x1000,
+        )
+        header_offset = 120
+        if interp:
+            struct.pack_into(
+                "<IIQQQQQQ",
+                binary,
+                header_offset,
+                3,
+                4,
+                interpreter_offset,
+                0x400000 + interpreter_offset,
+                0x400000 + interpreter_offset,
+                len(interpreter),
+                len(interpreter),
+                1,
+            )
+            binary[interpreter_offset : interpreter_offset + len(interpreter)] = interpreter
+            header_offset += 56
+        if has_dynamic:
+            struct.pack_into(
+                "<IIQQQQQQ",
+                binary,
+                header_offset,
+                2,
+                6,
+                dynamic_offset,
+                0x400000
+                + (
+                    mapped_dynamic_offset
+                    if needed_mapping_bypass
+                    else dynamic_offset
+                ),
+                0x400000
+                + (
+                    mapped_dynamic_offset
+                    if needed_mapping_bypass
+                    else dynamic_offset
+                ),
+                len(dynamic),
+                len(dynamic),
+                8,
+            )
+            binary[dynamic_offset : dynamic_offset + len(dynamic)] = dynamic
+            binary[
+                mapped_dynamic_offset : mapped_dynamic_offset + len(mapped_dynamic)
+            ] = mapped_dynamic
+        return bytes(binary)
+
+    def prefix(
+        self,
+        name: str = "prefix",
+        machine: int = 62,
+        *,
+        interp: bool = False,
+        needed: bool = False,
+    ) -> pathlib.Path:
         prefix = self.root / name
         (prefix / "bin").mkdir(parents=True)
-        elf = bytearray(64)
-        elf[:6] = b"\x7fELF\x02\x01"
-        elf[18:20] = machine.to_bytes(2, "little")
-        (prefix / "bin/debz").write_bytes(elf)
+        (prefix / "bin/debz").write_bytes(
+            self.elf(machine, interp=interp, needed=needed)
+        )
         (prefix / "share/doc/debz").mkdir(parents=True)
         (prefix / "share/doc/debz/LICENSE").write_text("Apache-2.0\n")
         (prefix / "share/doc/debz/THIRD_PARTY_NOTICES").write_text("libsolv BSD-3-Clause\n")
@@ -103,10 +256,9 @@ class ReleaseTests(unittest.TestCase):
         dependencies = release.policy_dependencies(self.policy)
         runtime = next(data for name, data, _ in entries if name.endswith("runtime-dependencies.json"))
         release.validate_runtime_manifest(runtime, dependencies)
-        release.validate_elf_platform(binary, "linux-x64")
+        release.validate_static_elf(binary, "linux-x64")
         with self.assertRaises(release.ReleaseError):
-            release.validate_elf_platform(binary, "linux-arm64")
-        self.assertEqual(release.validate_dynamic_dependencies(binary, dependencies), set())
+            release.validate_static_elf(binary, "linux-arm64")
         first = self.root / "first"
         second = self.root / "second"
         release.create_release_files(first, "debz-0.1.0-linux-x64", "0.1.0", entries, 123, dependencies)
@@ -168,40 +320,63 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.policy_dependencies(self.policy)
 
-    def test_unexpected_dynamic_dependency_is_rejected(self) -> None:
-        original = release.elf_needed
-        try:
-            for soname in ("libevil.so.1", "liblzma.so.5", "libzstd.so.1"):
-                release.elf_needed = lambda _, soname=soname: {soname}
-                with self.subTest(soname=soname), self.assertRaisesRegex(release.ReleaseError, soname):
-                    release.validate_dynamic_dependencies(b"ELF", release.policy_dependencies(self.policy))
-        finally:
-            release.elf_needed = original
+    def test_static_x64_and_arm64_elfs_are_accepted(self) -> None:
+        release.validate_static_elf(self.elf(62), "linux-x64")
+        release.validate_static_elf(self.elf(183), "linux-arm64")
+
+    def test_pt_interp_is_rejected(self) -> None:
+        with self.assertRaisesRegex(release.ReleaseError, "PT_INTERP"):
+            release.validate_static_elf(self.elf(62, interp=True), "linux-x64")
+
+    def test_dt_needed_without_section_headers_is_rejected(self) -> None:
+        binary = self.elf(62, needed=True)
+        self.assertEqual(struct.unpack_from("<Q", binary, 40)[0], 0)
+        with self.assertRaisesRegex(release.ReleaseError, "DT_NEEDED"):
+            release.validate_static_elf(binary, "linux-x64")
+
+    def test_pt_dynamic_offset_virtual_mapping_bypass_is_rejected(self) -> None:
+        binary = self.elf(62, needed_mapping_bypass=True)
+        self.assertEqual(struct.unpack_from("<Q", binary, 40)[0], 0)
+        dynamic_offset = struct.unpack_from("<Q", binary, 128)[0]
+        dynamic_address = struct.unpack_from("<Q", binary, 136)[0]
+        self.assertEqual(struct.unpack_from("<q", binary, dynamic_offset)[0], 0)
+        self.assertEqual(
+            struct.unpack_from("<q", binary, dynamic_address - 0x400000)[0],
+            1,
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "PT_DYNAMIC"):
+            release.validate_static_elf(binary, "linux-x64")
+
+    def test_malformed_elf_is_rejected(self) -> None:
+        invalid_encoding = bytearray(self.elf())
+        invalid_encoding[5] = 0
+        invalid_program_offset = bytearray(self.elf())
+        struct.pack_into(
+            "<Q", invalid_program_offset, 32, len(invalid_program_offset) + 8
+        )
+        invalid_dynamic_size = bytearray(self.elf(needed=True))
+        struct.pack_into("<Q", invalid_dynamic_size, 152, 17)
+        struct.pack_into("<Q", invalid_dynamic_size, 160, 17)
+        for name, binary in (
+            ("truncated", self.elf()[:63]),
+            ("encoding", bytes(invalid_encoding)),
+            ("program-offset", bytes(invalid_program_offset)),
+            ("dynamic-size", bytes(invalid_dynamic_size)),
+        ):
+            with self.subTest(name=name), self.assertRaises(release.ReleaseError):
+                release.validate_static_elf(binary, "linux-x64")
 
     def test_previous_dynamic_runtime_manifest_is_rejected(self) -> None:
         previous = self.runtime_manifest()
         linux = previous["linux_release_runtime"]
         assert isinstance(linux, dict)
-        linux["system_libraries"] = [
-            {
-                "name": "liblzma",
-                "linkage": "dynamic",
-                "reviewed_version_range": ">=5.2.6 <6",
-            },
-            {
-                "name": "libzstd",
-                "linkage": "dynamic",
-                "reviewed_version_range": ">=1.5.5 <2",
-            },
-        ]
-        linux["included_libraries"] = [
-            {
-                "name": "libsolv",
-                "version": "0.7.39",
-                "linkage": "static_archive_in_debz",
-                "license": "BSD-3-Clause",
-            }
-        ]
+        linux["binary_kind"] = "dynamically_linked"
+        linux["libc"] = {
+            "implementation": "glibc",
+            "linkage": "dynamic",
+            "expectation": "The target glibc ABI must be provided by the destination Linux system.",
+        }
+        linux["fully_static"] = False
         with self.assertRaisesRegex(release.ReleaseError, "static linkage model"):
             release.validate_runtime_manifest(
                 release.canonical_json(previous),
@@ -316,7 +491,18 @@ class ReleaseTests(unittest.TestCase):
         )
         path = self.root / "test.spdx.json"
         path.write_bytes(release.canonical_json(sbom))
-        release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+        dependencies = release.policy_dependencies(self.policy)
+        release.verify_sbom(
+            path,
+            "debz-0.1.0-linux-x64.tar.gz",
+            dependencies,
+        )
+        packages = {item["name"]: item for item in sbom["packages"]}
+        self.assertEqual(
+            packages["musl"]["versionInfo"],
+            "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        )
+        self.assertEqual(packages["musl"]["licenseDeclared"], "MIT")
         sha1_values = sorted(
             checksum["checksumValue"]
             for file_entry in sbom["files"]
@@ -332,12 +518,33 @@ class ReleaseTests(unittest.TestCase):
         del missing_license["files"][0]["licenseInfoInFiles"]
         path.write_bytes(release.canonical_json(missing_license))
         with self.assertRaisesRegex(release.ReleaseError, "licenseInfoInFiles"):
-            release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+            release.verify_sbom(
+                path,
+                "debz-0.1.0-linux-x64.tar.gz",
+                dependencies,
+            )
         bad_verification = json.loads(release.canonical_json(sbom))
         bad_verification["packages"][0]["packageVerificationCode"]["packageVerificationCodeValue"] = "0" * 40
         path.write_bytes(release.canonical_json(bad_verification))
         with self.assertRaisesRegex(release.ReleaseError, "packageVerificationCode"):
-            release.verify_sbom(path, "debz-0.1.0-linux-x64.tar.gz")
+            release.verify_sbom(
+                path,
+                "debz-0.1.0-linux-x64.tar.gz",
+                dependencies,
+            )
+        wrong_musl = json.loads(release.canonical_json(sbom))
+        next(
+            package
+            for package in wrong_musl["packages"]
+            if package["name"] == "musl"
+        )["versionInfo"] = "1.2.5"
+        path.write_bytes(release.canonical_json(wrong_musl))
+        with self.assertRaisesRegex(release.ReleaseError, "reviewed policy for musl"):
+            release.verify_sbom(
+                path,
+                "debz-0.1.0-linux-x64.tar.gz",
+                dependencies,
+            )
 
     def test_archived_binary_linkage_is_revalidated(self) -> None:
         dependencies = release.policy_dependencies(self.policy)
@@ -369,16 +576,15 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "differs from reviewed policy"):
             release.validate_archived_binary(audited, "0.1.0", "linux-x64", dependencies)
 
-        entries, _ = release.binary_entries(self.prefix("bad-needed", 62), base)
+        entries, _ = release.binary_entries(
+            self.prefix("bad-needed", 62, needed=True), base
+        )
         archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
         audited = release.audit_archive(archive, "binary", "0.1.0", "linux-x64")
-        original = release.elf_needed
-        release.elf_needed = lambda _: {"libevil.so.1"}
-        try:
-            with self.assertRaisesRegex(release.ReleaseError, "unexpected dynamic dependencies"):
-                release.validate_archived_binary(audited, "0.1.0", "linux-x64", dependencies)
-        finally:
-            release.elf_needed = original
+        with self.assertRaisesRegex(release.ReleaseError, "DT_NEEDED"):
+            release.validate_archived_binary(
+                audited, "0.1.0", "linux-x64", dependencies
+            )
 
     def test_complete_release_verification(self) -> None:
         output = self.root / "dist"
@@ -386,7 +592,7 @@ class ReleaseTests(unittest.TestCase):
         for platform, machine in (("linux-x64", 62), ("linux-arm64", 183)):
             base = f"debz-0.1.0-{platform}"
             entries, binary = release.binary_entries(self.prefix(platform, machine), base)
-            release.validate_elf_platform(binary, platform)
+            release.validate_static_elf(binary, platform)
             release.create_release_files(output, base, "0.1.0", entries, 123, dependencies)
         source_entries = [
             ("debz-0.1.0-source/LICENSE", b"license", 0o644),

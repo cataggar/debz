@@ -83,6 +83,28 @@ def main() -> None:
     ):
         if token not in ci:
             FAILURES.append(f"CI release dry-run is missing policy token: {token}")
+    release_jobs = (
+        ("release.yml binaries", re.search(r"(?ms)^  binaries:\n(.*?)(?=^  \S|\Z)", release)),
+        (
+            "ci.yml release-dry-run",
+            re.search(r"(?ms)^  release-dry-run:\n(.*?)(?=^  \S|\Z)", ci),
+        ),
+    )
+    for workflow_name, match in release_jobs:
+        if match is None:
+            FAILURES.append(f"{workflow_name}: release job is missing")
+            continue
+        text = match.group(1)
+        for target in ("x86_64-linux-musl", "aarch64-linux-musl"):
+            if text.count(f"target: {target}") != 1:
+                FAILURES.append(
+                    f"{workflow_name}: release matrix must contain exactly one {target} target"
+                )
+        for target in ("x86_64-linux-gnu", "aarch64-linux-gnu"):
+            if f"target: {target}" in text:
+                FAILURES.append(
+                    f"{workflow_name}: release matrix retains dynamic GNU target {target}"
+                )
     if release.count("actions/attest-build-provenance@") != 2:
         FAILURES.append("release workflow must separately attest gzip and xz archives")
     if "${{ secrets." in release:
