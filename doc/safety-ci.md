@@ -30,18 +30,18 @@ Harnesses call production bounded APIs directly and never shell out.
 - ambient APT/GnuPG/proxy/environment access and shell construction;
 - unpinned GitHub Actions or dependencies outside the reviewed allowlist;
 - missing dependency notices or GPL/LGPL/AGPL production dependencies;
-- expired recorded vulnerability/license reviews or an out-of-policy system
-  liblzma;
+- expired recorded vulnerability/license reviews or source pins that differ
+  from the reviewed libsolv, liblzma, and libzstd inputs;
 - stale local documentation paths;
 - credential markers in tracked files, except the exact documented synthetic
   fixture-key generator;
 - tracked build, coverage or generated binary artifacts.
 
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
-The repository does not claim a C sanitizer gate: libsolv is built by its
-separately pinned package and liblzma is supplied by the runner, so toggling a
-root Zig flag would not instrument either dependency. This is documented
-rather than presenting a non-instrumented build as sanitizer coverage.
+The repository does not claim a C sanitizer gate: libsolv and libzstd are
+built by separately pinned packages and liblzma by the repository-local Zig
+build module, but toggling a root Zig flag is not presented as sanitizer
+coverage for those C dependencies.
 
 The network-free dependency gate validates exact pins, licenses, notices,
 review evidence and expiry. It does not claim to discover advisories published

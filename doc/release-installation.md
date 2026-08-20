@@ -18,6 +18,6 @@ available as `debz.version` to Zig consumers and is printed verbatim by
 `debz --version`.
 
 Linux release binaries are not fully static. They dynamically require the
-target glibc ABI, liblzma, and libzstd. BSD-licensed libsolv is included as a
-static archive. Machine-readable details and reviewed version bounds are in
-`share/debz/runtime-dependencies.json`.
+target glibc ABI. BSD-licensed libsolv and libzstd and 0BSD-licensed liblzma
+are included as source-built static archives. Machine-readable details and
+reviewed exact versions are in `share/debz/runtime-dependencies.json`.

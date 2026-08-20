@@ -1,4 +1,5 @@
 const std = @import("std");
+const liblzma_build = @import("build/liblzma.zig");
 
 const package_version = "0.1.0";
 
@@ -12,6 +13,20 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+
+    const zstd_dependency = b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+        .shared = false,
+        .tools = false,
+        .multithread = false,
+    });
+    const zstd = zstd_dependency.artifact("zstd");
+
+    // Zig 0.16 exposes paths from dependencies without build.zig files, so
+    // the repository-local module can compile the exact upstream XZ sources.
+    const xz_dependency = b.dependency("xz", .{});
+    const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);
 
     const libsolv_dependency = b.dependency("libsolv", .{
         .target = target,
@@ -38,10 +53,13 @@ pub fn build(b: *std.Build) void {
     });
     debz.addOptions("debz_build_options", build_options);
     debz.addIncludePath(libsolv_dependency.path("src"));
+    debz.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    debz.addIncludePath(zstd_dependency.path("lib"));
+    debz.addCMacro("LZMA_API_STATIC", "1");
     debz.linkLibrary(libsolv);
+    debz.linkLibrary(liblzma);
+    debz.linkLibrary(zstd);
     debz.link_libc = true;
-    debz.linkSystemLibrary("lzma", .{});
-    debz.linkSystemLibrary("zstd", .{});
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -75,6 +93,15 @@ pub fn build(b: *std.Build) void {
     cli_tests.addArg(version);
     test_step.dependOn(&cli_tests.step);
 
+    const consumer_tests = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "--cache-dir",
+        "../../.zig-cache/public-consumer",
+    });
+    consumer_tests.setCwd(b.path("test/consumer"));
+    test_step.dependOn(&consumer_tests.step);
+
     const integration_tests = b.addSystemCommand(&.{ "sh", "tools/test-integration-roots.sh" });
     integration_tests.addArtifactArg(cli);
     b.step("test-integration", "Run hermetic signed-repository integration roots")
@@ -99,9 +126,16 @@ pub fn build(b: *std.Build) void {
     b.step("fuzz", "Run parser fuzz targets (use --fuzz=<cases> for mutation fuzzing)")
         .dependOn(&run_fuzz_tests.step);
 
+    const audit_step = b.step(
+        "security-audit",
+        "Run hermeticity, dependency-policy, license, secret, and docs gates",
+    );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
-    b.step("security-audit", "Run hermeticity, dependency-policy, license, secret, and docs gates")
-        .dependOn(&audit.step);
+    audit_step.dependOn(&audit.step);
+    const audit_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_security_audit.py" },
+    );
+    audit_step.dependOn(&audit_tests.step);
 
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
     b.step("test-release", "Run deterministic release packaging and audit tests")

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "reviewed_on": "2026-08-16",
-  "review_expires": "2026-11-14",
+  "reviewed_on": "2026-08-20",
+  "review_expires": "2026-11-18",
   "production_dependencies": [
     {
       "name": "libsolv",
@@ -15,39 +15,44 @@
         "https://osv.dev/list?q=libsolv"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-16",
+        "reviewed_on": "2026-08-20",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
     },
     {
       "name": "liblzma",
-      "source": "distribution-system-library",
-      "minimum_version": "5.2.6",
-      "maximum_major_exclusive": 6,
+      "source": "https://github.com/tukaani-project/xz",
+      "archive": "https://github.com/tukaani-project/xz/archive/4b73f2ec19a99ef465282fbce633e8deb33691b3.tar.gz",
+      "commit": "4b73f2ec19a99ef465282fbce633e8deb33691b3",
+      "zig_hash": "N-V-__8AAPy-ZQDvb3F10PKDTFyFXk7kwDjstLisczD0n9Fs",
+      "version": "5.8.3",
       "license": "0BSD",
       "vulnerability_sources": [
         "https://tukaani.org/xz/",
         "https://osv.dev/list?q=xz-utils"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-16",
+        "reviewed_on": "2026-08-20",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
     },
     {
       "name": "libzstd",
-      "source": "distribution-system-library",
-      "minimum_version": "1.5.5",
-      "maximum_major_exclusive": 2,
+      "source": "https://github.com/cataggar/zstd",
+      "upstream": "https://github.com/facebook/zstd",
+      "archive": "https://github.com/cataggar/zstd/archive/45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
+      "commit": "45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+      "zig_hash": "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+      "version": "1.6.0",
       "license": "BSD-3-Clause",
       "vulnerability_sources": [
         "https://github.com/facebook/zstd/security/advisories",
         "https://osv.dev/list?q=zstd"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-16",
+        "reviewed_on": "2026-08-20",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []

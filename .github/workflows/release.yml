@@ -23,8 +23,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux-x64
+            target: x86_64-linux-gnu
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
+            target: aarch64-linux-gnu
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -65,8 +67,9 @@ jobs:
           fi
       - name: Build complete ReleaseSafe install prefix
         env:
+          TARGET: ${{ matrix.target }}
           VERSION: ${{ steps.release.outputs.version }}
-        run: zig build -Doptimize=ReleaseSafe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
+        run: zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
       - name: Validate built version and package binary
         env:
           EPOCH: ${{ steps.release.outputs.epoch }}
@@ -189,7 +192,7 @@ jobs:
 
           Supported platforms: Linux x64 and Linux arm64.
 
-          Runtime requirements: glibc, liblzma.so.5, and libzstd.so.1. Binary archives use the complete \`bin/\`, \`share/doc/\`, and \`share/debz/\` install layout.
+          Runtime requirement: glibc. liblzma and libzstd are included as source-built static libraries. Binary archives use the complete \`bin/\`, \`share/doc/\`, and \`share/debz/\` install layout.
 
           All gzip and xz archives have SHA-256 sidecars, SPDX 2.3 SBOM sidecars with their own checksums, and GitHub provenance attestations. Artifacts and checksum files are currently unsigned. The canonical release manifest declares exactly 26 assets.
           EOF

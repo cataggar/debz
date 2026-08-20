@@ -28,6 +28,39 @@ def tracked_files() -> list[pathlib.Path]:
     return [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
 
 
+def dependency_options(build: str, dependency: str) -> dict[str, str] | None:
+    blocks = re.findall(
+        rf'\bb\.dependency\(\s*"{re.escape(dependency)}"\s*,\s*\.\{{(.*?)\}}\s*\)',
+        build,
+        re.DOTALL,
+    )
+    if len(blocks) != 1:
+        return None
+    options: dict[str, str] = {}
+    for match in re.finditer(
+        r'(?m)^\s*\.(?P<name>[A-Za-z][A-Za-z0-9_-]*|@"[^"]+")\s*=\s*(?P<value>[^,\n]+)\s*,?\s*$',
+        blocks[0],
+    ):
+        name = match.group("name")
+        if name.startswith('@"'):
+            name = name[2:-1]
+        if name in options:
+            return None
+        options[name] = match.group("value").strip()
+    return options
+
+
+def dependency_option_failures(build: str, dependency: str, expected: dict[str, str]) -> list[str]:
+    options = dependency_options(build, dependency)
+    if options is None:
+        return [f"{dependency}: build dependency options are missing or ambiguous"]
+    return [
+        f"{dependency}: build option .{name} must be {value}"
+        for name, value in expected.items()
+        if options.get(name) != value
+    ]
+
+
 def audit_production_sources() -> None:
     forbidden = {
         r"\b(?:getEnvVarOwned|getEnvMap)\b": "ambient environment access",
@@ -107,20 +140,41 @@ def audit_dependencies() -> None:
             "git+https://github.com/cataggar/libsolv.git#"
             "e190ef1433e5df60a2238b01438927eb76c285f5",
             "libsolv-0.7.39-PoNzeg2EIACYnSAYc3_WneVukScmmV-vyo_5guzBzqdO",
-        )
+            "libsolv",
+            "e190ef1433e5df60a2238b01438927eb76c285f5",
+        ),
+        "xz": (
+            "https://github.com/tukaani-project/xz/archive/"
+            "4b73f2ec19a99ef465282fbce633e8deb33691b3.tar.gz",
+            "N-V-__8AAPy-ZQDvb3F10PKDTFyFXk7kwDjstLisczD0n9Fs",
+            "liblzma",
+            "4b73f2ec19a99ef465282fbce633e8deb33691b3",
+        ),
+        "zstd": (
+            "https://github.com/cataggar/zstd/archive/"
+            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
+            "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+            "libzstd",
+            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+        ),
     }
     found = {name: (url, digest) for name, url, digest in dependency_blocks}
-    if found != expected:
+    expected_pins = {name: values[:2] for name, values in expected.items()}
+    if found != expected_pins:
         fail(f"build.zig.zon dependencies differ from reviewed exact pins: {found!r}")
-    libsolv_policy = dependencies["libsolv"]
-    if (
-        libsolv_policy["commit"] not in expected["libsolv"][0]
-        or libsolv_policy["zig_hash"] != expected["libsolv"][1]
-    ):
-        fail("libsolv manifest pin differs from dependency policy")
-    for name, (url, _) in found.items():
-        if not re.search(r"#[0-9a-f]{40}$", url):
-            fail(f"{name}: dependency URL is not pinned to an exact commit")
+    for manifest_name, (url, digest, policy_name, commit) in expected.items():
+        dependency = dependencies[policy_name]
+        if (
+            dependency.get("commit") != commit
+            or dependency.get("zig_hash") != digest
+            or commit not in url
+        ):
+            fail(f"{policy_name}: manifest pin differs from dependency policy")
+        if not (
+            re.search(r"#[0-9a-f]{40}$", url)
+            or re.search(r"/[0-9a-f]{40}\.tar\.gz$", url)
+        ):
+            fail(f"{manifest_name}: dependency URL is not pinned to an exact commit")
 
     build = (ROOT / "build.zig").read_text()
     zon_version = re.search(r'\.version\s*=\s*"([^"]+)"', zon)
@@ -128,7 +182,7 @@ def audit_dependencies() -> None:
     if zon_version is None or build_version is None or zon_version.group(1) != build_version.group(1):
         fail("default build version differs from build.zig.zon")
     system_libraries = set(re.findall(r'linkSystemLibrary\("([^"]+)"', build))
-    if system_libraries != {"lzma", "zstd"}:
+    if system_libraries:
         fail(f"unreviewed system libraries: {sorted(system_libraries)}")
     linux_runtime = runtime.get("linux_release_runtime", {})
     if (
@@ -144,7 +198,7 @@ def audit_dependencies() -> None:
         (item.get("name"), item.get("linkage"))
         for item in linux_runtime.get("system_libraries", [])
     }
-    if runtime_system != {("liblzma", "dynamic"), ("libzstd", "dynamic")}:
+    if runtime_system:
         fail("Linux runtime metadata differs from linked system libraries")
     included = linux_runtime.get("included_libraries", [])
     if included != [
@@ -153,29 +207,51 @@ def audit_dependencies() -> None:
             "version": dependencies["libsolv"]["version"],
             "linkage": "static_archive_in_debz",
             "license": "BSD-3-Clause",
-        }
+        },
+        {
+            "name": "liblzma",
+            "version": dependencies["liblzma"]["version"],
+            "linkage": "static_archive_in_debz",
+            "license": "0BSD",
+        },
+        {
+            "name": "libzstd",
+            "version": dependencies["libzstd"]["version"],
+            "linkage": "static_archive_in_debz",
+            "license": "BSD-3-Clause",
+        },
     ]:
-        fail("Linux runtime metadata does not identify statically included libsolv")
-    if ".shared = false" not in build or "debz.link_libc = true" not in build:
+        fail("Linux runtime metadata does not identify statically included libraries")
+    for message in dependency_option_failures(build, "libsolv", {"shared": "false"}):
+        fail(message)
+    for message in dependency_option_failures(
+        build,
+        "zstd",
+        {
+            "target": "target",
+            "optimize": "optimize",
+            "shared": "false",
+            "tools": "false",
+            "multithread": "false",
+        },
+    ):
+        fail(message)
+    if (
+        "debz.link_libc = true" not in build
+        or 'b.dependency("xz"' not in build
+        or "liblzma_build.addStaticLibrary" not in build
+        or "debz.linkLibrary(liblzma)" not in build
+        or "debz.linkLibrary(zstd)" not in build
+    ):
         fail("build linkage differs from documented runtime dependency model")
-    def version_tuple(value: str) -> tuple[int, ...]:
-        return tuple(int(part) for part in re.findall(r"\d+", value))
-
-    for dependency_name in ("liblzma", "libzstd"):
-        version_result = subprocess.run(
-            ["pkg-config", "--modversion", dependency_name],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if version_result.returncode != 0:
-            fail(f"{dependency_name} version is unavailable through pkg-config")
-            continue
-        installed = version_tuple(version_result.stdout.strip())
-        minimum = version_tuple(dependencies[dependency_name]["minimum_version"])
-        if installed < minimum or installed[0] >= dependencies[dependency_name]["maximum_major_exclusive"]:
-            fail(f"{dependency_name} {version_result.stdout.strip()} is outside reviewed bounds")
+    liblzma_build = (ROOT / "build/liblzma.zig").read_text()
+    if (
+        "stream_decoder_mt.c" in liblzma_build
+        or "encoder.c" in liblzma_build
+        or '"HAVE_DECODERS"' not in liblzma_build
+        or '"HAVE_CHECK_SHA256"' not in liblzma_build
+    ):
+        fail("repository-local liblzma build is not the reviewed single-threaded decoder configuration")
 
     notices = (ROOT / "THIRD_PARTY_NOTICES").read_text()
     for required in ("libsolv", "BSD-3-Clause", "XZ Utils liblzma", "Zstandard libzstd", "0BSD"):
@@ -223,6 +299,9 @@ def audit_docs() -> None:
         fail("stale docs/ directory exists; documentation belongs under doc/")
     link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
     for path in sorted(ROOT.rglob("*.md")):
+        relative = path.relative_to(ROOT)
+        if any(part in {".git", ".zig-cache", "zig-out", "zig-pkg"} for part in relative.parts):
+            continue
         for target in link_pattern.findall(path.read_text(errors="strict")):
             target = target.split("#", 1)[0]
             if not target or "://" in target or target.startswith("mailto:"):
@@ -235,7 +314,7 @@ def audit_docs() -> None:
 
 
 def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
-    generated_roots = {"zig-out", ".zig-cache"}
+    generated_roots = {"zig-out", ".zig-cache", "zig-pkg"}
     generated_suffixes = {".o", ".a", ".so", ".dll", ".dylib", ".exe", ".profraw"}
     secret_patterns = {
         re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"): "private key",
@@ -248,7 +327,7 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
     synthetic_key_count = 0
     for path in files:
         relative = path.relative_to(ROOT)
-        if relative.parts and relative.parts[0] in generated_roots:
+        if any(part in generated_roots for part in relative.parts):
             fail(f"tracked generated artifact: {relative}")
         if path.suffix.lower() in generated_suffixes:
             fail(f"tracked generated binary artifact: {relative}")

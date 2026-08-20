@@ -55,8 +55,8 @@ BASE_RUNTIME = {
     "ld-linux-aarch64.so.1",
 }
 DEPENDENCY_SONAMES = {
-    "liblzma": {"liblzma.so.5"},
-    "libzstd": {"libzstd.so.1"},
+    "liblzma": set(),
+    "libzstd": set(),
     "libsolv": set(),
 }
 
@@ -265,16 +265,45 @@ def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]
     try:
         runtime = json.loads(data)
         linux = runtime["linux_release_runtime"]
-        names = {linux["libc"]["implementation"]}
-        names.update(item["name"] for item in linux["system_libraries"])
-        names.update(item["name"] for item in linux["included_libraries"])
+        included = linux["included_libraries"]
+        expected = {
+            "schema_version": 1,
+            "package": "debz",
+            "linux_release_runtime": {
+                "binary_kind": "dynamically_linked",
+                "libc": {
+                    "implementation": "glibc",
+                    "linkage": "dynamic",
+                    "expectation": "The target glibc ABI must be provided by the destination Linux system.",
+                },
+                "system_libraries": [],
+                "included_libraries": sorted(
+                    (
+                        {
+                            "name": str(item["name"]),
+                            "version": str(item["version"]),
+                            "linkage": "static_archive_in_debz",
+                            "license": str(item["license"]),
+                        }
+                        for item in dependencies
+                    ),
+                    key=lambda item: item["name"],
+                ),
+                "fully_static": False,
+            },
+        }
+        normalized = {
+            **runtime,
+            "linux_release_runtime": {
+                **linux,
+                "included_libraries": sorted(included, key=lambda item: str(item["name"])),
+            },
+        }
     except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:
         raise ReleaseError(f"invalid installed runtime dependency manifest: {error}") from error
-    policy_names = {str(item["name"]) for item in dependencies}
-    if names != policy_names | {"glibc"}:
+    if normalized != expected:
         raise ReleaseError(
-            "installed runtime dependency manifest differs from reviewed policy: "
-            + ", ".join(sorted(names))
+            "installed runtime dependency manifest differs from reviewed policy and static linkage model"
         )
 
 
