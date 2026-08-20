@@ -18,16 +18,16 @@ The install prefix must contain:
 Typical CI usage:
 
 ```sh
-python3 tools/release.py version v0.1.0 --expect zon=0.1.0 --expect binary=0.1.0
-python3 tools/release.py dry-run --tag v0.1.0
-python3 tools/release.py binary --tag v0.1.0 --platform linux-x64 \
+python3 tools/release.py version v0.2.0 --expect zon=0.2.0 --expect binary=0.2.0
+python3 tools/release.py dry-run --tag v0.2.0
+python3 tools/release.py binary --tag v0.2.0 --platform linux-x64 \
   --prefix zig-out --epoch "$SOURCE_DATE_EPOCH" --output dist
-python3 tools/release.py source --tag v0.1.0 --commit "$GITHUB_SHA" --output dist
-python3 tools/release.py manifest --tag v0.1.0 --output dist
-python3 tools/release.py audit --tag v0.1.0 --kind binary \
-  --platform linux-x64 --archive dist/debz-0.1.0-linux-x64.tar.xz --smoke
+python3 tools/release.py source --tag v0.2.0 --commit "$GITHUB_SHA" --output dist
+python3 tools/release.py manifest --tag v0.2.0 --output dist
+python3 tools/release.py audit --tag v0.2.0 --kind binary \
+  --platform linux-x64 --archive dist/debz-0.2.0-linux-x64.tar.xz --smoke
 python3 tools/release.py verify \
-  --manifest dist/debz-0.1.0-release-manifest.json --assets dist \
+  --manifest dist/debz-0.2.0-release-manifest.json --assets dist \
   --policy security/dependency-policy.json --smoke
 ```
 

@@ -1,14 +1,14 @@
 const std = @import("std");
 const liblzma_build = @import("build/liblzma.zig");
 
-const package_version = "0.1.0";
+const package_version = "0.2.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Release version (SemVer)") orelse package_version;
     _ = std.SemanticVersion.parse(version) catch {
-        std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.1.0 or 1.2.3-rc.1)", .{version});
+        std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.2.0 or 1.2.3-rc.1)", .{version});
     };
 
     const build_options = b.addOptions();
