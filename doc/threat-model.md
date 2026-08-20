@@ -36,8 +36,9 @@ responsible for selecting values appropriate to their resource budget.
 ## Residual risks
 
 The OpenPGP implementation intentionally supports a documented subset.
-Unsupported algorithms and packets fail closed. libsolv is linked as a
-reviewed, exact-pinned BSD dependency; liblzma is the distribution's 0BSD
-in-process decoder. Neither dependency enables repository/network loaders.
+Unsupported algorithms and packets fail closed. libsolv and libzstd are
+linked as reviewed, exact-pinned BSD dependencies; liblzma is an exact-pinned
+0BSD, single-threaded in-process decoder. None enables repository/network
+loaders.
 See [Safety CI and fuzzing](safety-ci.md) and
 [dependency notices](../THIRD_PARTY_NOTICES).

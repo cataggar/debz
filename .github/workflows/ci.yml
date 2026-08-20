@@ -114,8 +114,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux-x64
+            target: x86_64-linux-gnu
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
+            target: aarch64-linux-gnu
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -142,10 +144,11 @@ jobs:
       - name: Build, package, and audit v0.1.0 binary assets
         env:
           PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
         run: |
           zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
           version=$(python3 tools/release.py version v0.1.0 --expect "zon=$zon_version")
-          zig build -Doptimize=ReleaseSafe -Dversion="$version" release-install \
+          zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$version" release-install \
             --prefix "$PWD/.zig-cache/release-install"
           python3 tools/release.py version v0.1.0 --expect "zon=$zon_version" \
             --expect "binary=$(.zig-cache/release-install/bin/debz --version)"

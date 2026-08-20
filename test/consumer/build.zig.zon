@@ -1,0 +1,16 @@
+.{
+    .name = .debz_consumer_test,
+    .version = "0.0.0",
+    .fingerprint = 0x79fbd8922e9d60c3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .debz = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

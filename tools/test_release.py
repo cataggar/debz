@@ -36,8 +36,8 @@ class ReleaseTests(unittest.TestCase):
                     "allowed_production_licenses": ["Apache-2.0", "BSD-3-Clause", "0BSD"],
                     "production_dependencies": [
                         {"name": "libsolv", "version": "0.7.39", "license": "BSD-3-Clause", "source": "example"},
-                        {"name": "liblzma", "minimum_version": "5.2.6", "license": "0BSD", "source": "example"},
-                        {"name": "libzstd", "minimum_version": "1.5.5", "license": "BSD-3-Clause", "source": "example"},
+                        {"name": "liblzma", "version": "5.8.3", "license": "0BSD", "source": "example"},
+                        {"name": "libzstd", "version": "1.6.0", "license": "BSD-3-Clause", "source": "example"},
                     ],
                 }
             )
@@ -45,6 +45,32 @@ class ReleaseTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def runtime_manifest(self) -> dict[str, object]:
+        dependencies = release.policy_dependencies(self.policy)
+        return {
+            "schema_version": 1,
+            "package": "debz",
+            "linux_release_runtime": {
+                "binary_kind": "dynamically_linked",
+                "libc": {
+                    "implementation": "glibc",
+                    "linkage": "dynamic",
+                    "expectation": "The target glibc ABI must be provided by the destination Linux system.",
+                },
+                "system_libraries": [],
+                "included_libraries": [
+                    {
+                        "name": dependency["name"],
+                        "version": dependency["version"],
+                        "linkage": "static_archive_in_debz",
+                        "license": dependency["license"],
+                    }
+                    for dependency in dependencies
+                ],
+                "fully_static": False,
+            },
+        }
 
     def prefix(self, name: str = "prefix", machine: int = 62) -> pathlib.Path:
         prefix = self.root / name
@@ -58,15 +84,7 @@ class ReleaseTests(unittest.TestCase):
         (prefix / "share/doc/debz/THIRD_PARTY_NOTICES").write_text("libsolv BSD-3-Clause\n")
         (prefix / "share/debz").mkdir(parents=True)
         (prefix / "share/debz/runtime-dependencies.json").write_text(
-            json.dumps(
-                {
-                    "linux_release_runtime": {
-                        "libc": {"implementation": "glibc"},
-                        "system_libraries": [{"name": "liblzma"}, {"name": "libzstd"}],
-                        "included_libraries": [{"name": "libsolv"}],
-                    }
-                }
-            )
+            json.dumps(self.runtime_manifest())
         )
         return prefix
 
@@ -152,12 +170,43 @@ class ReleaseTests(unittest.TestCase):
 
     def test_unexpected_dynamic_dependency_is_rejected(self) -> None:
         original = release.elf_needed
-        release.elf_needed = lambda _: {"libevil.so.1"}
         try:
-            with self.assertRaisesRegex(release.ReleaseError, "libevil"):
-                release.validate_dynamic_dependencies(b"ELF", release.policy_dependencies(self.policy))
+            for soname in ("libevil.so.1", "liblzma.so.5", "libzstd.so.1"):
+                release.elf_needed = lambda _, soname=soname: {soname}
+                with self.subTest(soname=soname), self.assertRaisesRegex(release.ReleaseError, soname):
+                    release.validate_dynamic_dependencies(b"ELF", release.policy_dependencies(self.policy))
         finally:
             release.elf_needed = original
+
+    def test_previous_dynamic_runtime_manifest_is_rejected(self) -> None:
+        previous = self.runtime_manifest()
+        linux = previous["linux_release_runtime"]
+        assert isinstance(linux, dict)
+        linux["system_libraries"] = [
+            {
+                "name": "liblzma",
+                "linkage": "dynamic",
+                "reviewed_version_range": ">=5.2.6 <6",
+            },
+            {
+                "name": "libzstd",
+                "linkage": "dynamic",
+                "reviewed_version_range": ">=1.5.5 <2",
+            },
+        ]
+        linux["included_libraries"] = [
+            {
+                "name": "libsolv",
+                "version": "0.7.39",
+                "linkage": "static_archive_in_debz",
+                "license": "BSD-3-Clause",
+            }
+        ]
+        with self.assertRaisesRegex(release.ReleaseError, "static linkage model"):
+            release.validate_runtime_manifest(
+                release.canonical_json(previous),
+                release.policy_dependencies(self.policy),
+            )
 
     def test_unsafe_duplicate_link_and_modes_are_rejected(self) -> None:
         cases = (
