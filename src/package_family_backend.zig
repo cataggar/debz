@@ -185,7 +185,8 @@ pub const Backend = struct {
 fn validRequest(request: Request) bool {
     if (!std.mem.eql(u8, request.schema, request_schema) or request.version != schema_version) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
-    if (request.sources.len == 0 or request.keyrings.len == 0 or request.deadline_ms == 0) return false;
+    if ((request.sources.len == 0 and request.configs.len == 0) or
+        request.keyrings.len == 0 or request.deadline_ms == 0) return false;
     for (request.sources) |path| if (!absolute(path)) return false;
     for (request.configs) |path| if (!absolute(path)) return false;
     for (request.keyrings) |path| if (!absolute(path)) return false;
@@ -289,6 +290,26 @@ test "initial lock resolution is non-mutating and requires a new lock path" {
     try std.testing.expectEqual(product.Operation.plan, fake.operation.?);
     try std.testing.expectEqualStrings("/build/core.lock.json", result.lock_path.?);
     try std.testing.expect(!result.changed);
+}
+
+test "immutable config can provide the repository source" {
+    var fake: Fake = .{};
+    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const result = try backend.execute(std.testing.allocator, .{
+        .operation = .resolve_lock,
+        .root = "/build/root",
+        .architecture = .arm64,
+        .sources = &.{},
+        .configs = &.{"/build/immutable-source.json"},
+        .keyrings = &.{"/build/keyring.gpg"},
+        .cache = "/build/cache",
+        .state = "/build/state",
+        .package = "ubuntu-minimal",
+        .lock_output = "/build/core.lock.json",
+        .cache_mode = .offline,
+    });
+    try std.testing.expect(result.succeeded);
+    try std.testing.expectEqual(product.Operation.plan, fake.operation.?);
 }
 
 test "mutations fail closed without required explicit inputs" {
