@@ -295,9 +295,6 @@ pub const Backend = struct {
         if (request.options.lock_output_path != null and request.options.lock_input_path == null and
             request.operation != .plan and request.operation != .download)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output without --lock-input is restricted to non-mutating plan or download lock resolution");
-        if (request.options.lock_output_path != null and request.options.lock_input_path == null and
-            planning_records.len != 0)
-            return api.failure(request.operation, .planning, .planning_failed, "initial exact-lock resolution requires an empty installed package database");
         var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
             readLock(allocator, self.io, path) catch
                 return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
@@ -342,7 +339,13 @@ pub const Backend = struct {
             if (lock) |*value| {
                 try writeLock(allocator, self.io, path, value.lock);
             } else {
-                generated_lock = lockFromPlan(allocator, effective_request, refreshed, plan.*) catch |err|
+                generated_lock = lockFromPlan(
+                    allocator,
+                    effective_request,
+                    refreshed,
+                    planning_records,
+                    plan.*,
+                ) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return api.failure(
@@ -528,10 +531,12 @@ pub const Backend = struct {
     }
 
     fn loadInstalled(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !dpkg_status.OwnedDatabase {
-        const path = if (request.options.status_path) |value|
-            value
+        const allocated_path = if (request.options.status_path == null)
+            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/status", .{request.options.install_root})
         else
-            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/status", .{request.options.install_root});
+            null;
+        defer if (allocated_path) |path| allocator.free(path);
+        const path = request.options.status_path orelse allocated_path.?;
         const parsed = try dpkg_status.parseFile(allocator, self.io, path, .{});
         return switch (parsed) {
             .diagnostic => |diagnostic| {
@@ -1077,6 +1082,7 @@ fn lockFromPlan(
     allocator: std.mem.Allocator,
     request: api.Request,
     refreshed: *repository_policy.RefreshResult,
+    installed: []const dpkg_status.Package,
     plan: solver.Plan,
 ) !exact_lock.OwnedLock {
     var packages: std.ArrayList(exact_lock.Package) = .empty;
@@ -1112,6 +1118,42 @@ fn lockFromPlan(
             .dpkg_selection_hold = false,
         });
     }
+    for (installed) |package| {
+        if (!package.status.isFullyInstalled() or
+            planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
+            continue;
+        const origin = findRetainedOrigin(
+            refreshed.universe.repositories,
+            package.name.value,
+            package.version.spelling.value,
+            package.architecture.value,
+        ) orelse return error.RetainedPackageUnavailable;
+        const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
+            return error.MissingRepository;
+        const record = repository.packages.records[origin.record_index];
+        var repository_id: [64]u8 = undefined;
+        @memcpy(&repository_id, origin.repository_id.slice());
+        var seen = false;
+        for (repository_ids.items) |existing| {
+            if (std.mem.eql(u8, &existing, &repository_id)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try repository_ids.append(allocator, repository_id);
+        try packages.append(allocator, .{
+            .name = package.name.value,
+            .version = package.version.spelling.value,
+            .architecture = package.architecture.value,
+            .repository_id = repository_id,
+            .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
+                return error.MissingRepository,
+            .sha256 = record.transport.sha256.bytes,
+            .declared_size = record.transport.size.value,
+            .retention = .retained,
+            .dpkg_selection_hold = package.status.want == .hold,
+        });
+    }
 
     var repositories: std.ArrayList(exact_lock.Repository) = .empty;
     defer repositories.deinit(allocator);
@@ -1120,6 +1162,7 @@ fn lockFromPlan(
         for (signer_storage.items) |signers| allocator.free(signers);
         signer_storage.deinit(allocator);
     }
+
     for (repository_ids.items) |repository_id| {
         const snapshot = findSnapshot(refreshed.snapshots, repository_id) orelse
             return error.MissingRepository;
@@ -1162,6 +1205,57 @@ fn lockFromPlan(
         .packages = packages.items,
         .authenticated_metadata = true,
     });
+}
+
+fn planChangesIdentity(
+    actions: []const solver.PlanAction,
+    name: []const u8,
+    architecture: []const u8,
+) bool {
+    for (actions) |action| {
+        if (std.mem.eql(u8, action.package, name) and
+            std.mem.eql(u8, action.architecture, architecture))
+            return true;
+    }
+    return false;
+}
+
+fn findRetainedOrigin(
+    repositories: []const solver.RepositoryInput,
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) ?solver.PackageOrigin {
+    var best: ?solver.PackageOrigin = null;
+    for (repositories) |repository| {
+        for (repository.packages.records, 0..) |record, index| {
+            if (!std.mem.eql(u8, record.control.package.text, name) or
+                !std.mem.eql(u8, record.control.version.value.original, version) or
+                !std.mem.eql(u8, record.control.architecture.text, architecture))
+                continue;
+            const candidate: solver.PackageOrigin = .{
+                .repository_id = repository.repository_id,
+                .repository_priority = repository.priority,
+                .record_index = index,
+                .package = record.control.package.text,
+                .version = record.control.version.value.original,
+                .architecture = record.control.architecture.text,
+                .source_location = record.location.source,
+            };
+            if (best == null or betterRetainedOrigin(candidate, best.?)) best = candidate;
+        }
+    }
+    return best;
+}
+
+fn betterRetainedOrigin(candidate: solver.PackageOrigin, current: solver.PackageOrigin) bool {
+    if (candidate.repository_priority != current.repository_priority)
+        return candidate.repository_priority > current.repository_priority;
+    return std.mem.order(
+        u8,
+        candidate.repository_id.slice(),
+        current.repository_id.slice(),
+    ) == .lt;
 }
 
 fn findSnapshot(
@@ -1529,6 +1623,146 @@ test "production backend authenticates an explicit file repository" {
     }, backend.interface());
     try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
     try std.testing.expect(result.items.len != 0);
+}
+
+test "production exact lock imports and validates the installed baseline" {
+    const fixture = @import("fixtures/openpgp.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.makePath(std.testing.io, "state");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/InRelease",
+        .data = &fixture.repository_in_release,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/main/binary-amd64/Packages",
+        .data = &fixture.repository_packages,
+    });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.gpg", .data = &fixture.keyring });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data =
+        \\Package: hello
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1.0-1
+        \\
+        ,
+    });
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root = real_buffer[0..real_length];
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sources.list", .{root});
+    defer std.testing.allocator.free(source_path);
+    const keyring_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/keyring.gpg", .{root});
+    defer std.testing.allocator.free(keyring_path);
+    const repository_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/repo", .{root});
+    defer std.testing.allocator.free(repository_path);
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s} stable main\n",
+        .{ keyring_path, repository_path },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "sources.list", .data = source_bytes });
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{root});
+    defer std.testing.allocator.free(install_root);
+    const cache_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cache", .{root});
+    defer std.testing.allocator.free(cache_path);
+    const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state", .{root});
+    defer std.testing.allocator.free(state_path);
+    const lock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/exact-lock.json", .{root});
+    defer std.testing.allocator.free(lock_path);
+
+    var backend: Backend = .{ .io = std.testing.io, .now_unix = fixture.created + 30 };
+    const resolved = try api.execute(std.testing.allocator, .{
+        .operation = .plan,
+        .packages = &.{"hello"},
+        .options = .{
+            .install_root = install_root,
+            .source_paths = &.{source_path},
+            .keyring_paths = &.{keyring_path},
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .architecture = "amd64",
+            .lock_output_path = lock_path,
+        },
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, resolved.exit_status);
+    const lock_bytes = try readFile(
+        std.testing.allocator,
+        std.testing.io,
+        lock_path,
+        exact_lock.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(lock_bytes);
+    var lock = try exact_lock.decode(
+        std.testing.allocator,
+        lock_bytes,
+        exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lock.lock.packages.len);
+    try std.testing.expectEqual(exact_lock.Retention.retained, lock.lock.packages[0].retention);
+    try std.testing.expectEqualStrings("hello", lock.lock.packages[0].name);
+    try std.testing.expectEqualStrings("1.0-1", lock.lock.packages[0].version);
+    try std.testing.expectEqualStrings("amd64", lock.lock.packages[0].architecture);
+
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data =
+        \\Package: hello
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1.0-2
+        \\
+        ,
+    });
+    const drift = try api.execute(std.testing.allocator, .{
+        .operation = .plan,
+        .packages = &.{"hello"},
+        .options = .{
+            .install_root = install_root,
+            .source_paths = &.{source_path},
+            .keyring_paths = &.{keyring_path},
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .architecture = "amd64",
+            .lock_output_path = lock_path,
+        },
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.planning, drift.exit_status);
+
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data =
+        \\Package: baseline-only
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+        ,
+    });
+    const missing = try api.execute(std.testing.allocator, .{
+        .operation = .plan,
+        .packages = &.{"hello"},
+        .options = .{
+            .install_root = install_root,
+            .source_paths = &.{source_path},
+            .keyring_paths = &.{keyring_path},
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .architecture = "amd64",
+            .lock_output_path = lock_path,
+        },
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.planning, missing.exit_status);
 }
 
 test "production backend mutation uses injected process runner" {
