@@ -276,6 +276,7 @@ pub const Backend = struct {
             installed.database.packages;
         defer if (request.operation == .recover) allocator.free(planning_records);
         const policies = try installedPolicies(allocator, planning_records);
+        defer allocator.free(policies);
         var recovery_intent: ?std.json.Parsed(RecoveryIntent) = if (request.operation == .recover)
             try readRecoveryIntent(allocator, self.io, request.options.state_path)
         else
@@ -301,6 +302,9 @@ pub const Backend = struct {
         else
             null;
         defer if (lock) |*value| value.deinit();
+        const selectors = try allocator.alloc(solver.PackageSelector, effective_request.packages.len);
+        defer allocator.free(selectors);
+        for (effective_request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
         var planning = try solver.planTransaction(allocator, .{
             .repositories = refreshed.universe.repositories,
             .installed = .{
@@ -311,7 +315,7 @@ pub const Backend = struct {
             },
             .target_architecture = request.options.architecture,
             .mode = if (effective_request.operation == .download) .download_only else .plan_only,
-            .request = try planRequest(allocator, effective_request),
+            .request = try planRequestFromSelectors(effective_request.operation, selectors),
             .policy = .{
                 .recommends = effective_request.options.recommends,
                 .allow_downgrade = effective_request.options.allow_downgrade,
@@ -365,6 +369,10 @@ pub const Backend = struct {
         });
         defer package_cache.deinit();
         var artifacts: std.ArrayList(transaction_executor.Artifact) = .empty;
+        defer {
+            for (artifacts.items) |artifact| allocator.free(artifact.path);
+            artifacts.deinit(allocator);
+        }
         var verified: std.ArrayList(package_acquisition.VerifiedPackage) = .empty;
         defer {
             for (verified.items) |*package| package.deinit();
@@ -497,7 +505,7 @@ pub const Backend = struct {
             defer report.deinit();
             if (!report.succeeded())
                 return api.failure(request.operation, .recovery, .recovery_failed, if (report.failure) |failure|
-                    try allocator.dupe(u8, failure.diagnostic)
+                    try describeExecutorFailure(allocator, "recovery", failure)
                 else
                     "recovery failed");
             try deleteRecoveryIntent(self.io, request.options.state_path);
@@ -514,7 +522,7 @@ pub const Backend = struct {
         defer report.deinit();
         if (!report.succeeded())
             return api.failure(request.operation, .transaction, .transaction_failed, if (report.failure) |failure|
-                try allocator.dupe(u8, failure.diagnostic)
+                try describeExecutorFailure(allocator, "transaction", failure)
             else
                 "transaction failed");
         try deleteRecoveryIntent(self.io, request.options.state_path);
@@ -923,6 +931,34 @@ fn recordProvides(record: anytype, requested: []const []const u8) bool {
     return false;
 }
 
+/// Builds a credential-free, structured diagnostic for a failed executor
+/// report. The bare `failure.diagnostic` (for example "FileNotFound") is not
+/// actionable in production, so this names the failing stage, machine failure
+/// code, dpkg phase, package, and lock path alongside the raw diagnostic. None
+/// of these fields carry credentials (lock paths and package names are public),
+/// and the embedding host additionally redacts the whole message before it is
+/// surfaced, so backend errors point at the missing stage/artifact without ever
+/// exposing secrets.
+fn describeExecutorFailure(
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    failure: transaction_executor.Failure,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} failed: code={s} phase={s} package={s} lock_path={s} completed_commands={d}: {s}",
+        .{
+            stage,
+            @tagName(failure.code),
+            if (failure.phase) |phase| @tagName(phase) else "none",
+            failure.package orelse "none",
+            failure.lock_path orelse "none",
+            failure.completed_commands,
+            if (failure.diagnostic.len == 0) "no diagnostic detail" else failure.diagnostic,
+        },
+    );
+}
+
 fn installedPolicies(
     allocator: std.mem.Allocator,
     packages: []const dpkg_status.Package,
@@ -951,10 +987,8 @@ fn healthyInstalledRecords(
     return records.toOwnedSlice(allocator);
 }
 
-fn planRequest(allocator: std.mem.Allocator, request: api.Request) !solver.PlanRequest {
-    const selectors = try allocator.alloc(solver.PackageSelector, request.packages.len);
-    for (request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
-    return switch (request.operation) {
+fn planRequestFromSelectors(operation: api.Operation, selectors: []solver.PackageSelector) !solver.PlanRequest {
+    return switch (operation) {
         .install, .plan, .download => if (selectors.len == 0) .upgrade_all else .{ .install = selectors[0] },
         .remove => .{ .remove = selectors[0] },
         .upgrade => .{ .upgrade = selectors },

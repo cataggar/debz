@@ -124,6 +124,14 @@ pub const TransactionSystemStatusFileReader = transaction_recovery.SystemStatusF
 pub const TransactionVerificationPolicy = transaction_recovery.VerificationPolicy;
 pub const TransactionVerification = transaction_recovery.Verification;
 
+/// OpenPGP repository fixtures (signed InRelease/Packages plus keyrings) shared
+/// with out-of-tree regression tests such as production_backend_customize_test.zig,
+/// which exercises the product backend exclusively through this public package.
+/// Analyzed lazily, so builds that never reference it incur no cost.
+pub const test_fixtures = struct {
+    pub const openpgp = @import("fixtures/openpgp.zig");
+};
+
 pub const Architecture = enum {
     amd64,
     arm64,

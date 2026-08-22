@@ -199,6 +199,21 @@ pub fn build(b: *std.Build) void {
     b.step("test-transaction-provenance", "Run transaction provenance tests")
         .dependOn(&run_provenance_tests.step);
 
+    const production_customize_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/production_backend_customize_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    production_customize_tests.root_module.addImport("debz", debz);
+    const run_production_customize_tests = b.addRunArtifact(production_customize_tests);
+    b.step(
+        "test-production-customize",
+        "Run production customize lock-root and diagnostics regression tests",
+    ).dependOn(&run_production_customize_tests.step);
+    test_step.dependOn(&run_production_customize_tests.step);
+
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
         .root_module = b.createModule(.{
