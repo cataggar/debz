@@ -46,11 +46,15 @@ const Fixture = struct {
         self.directory.cleanup();
     }
 
-    fn options(self: Fixture) api.CommonOptions {
+    fn options(
+        self: Fixture,
+        source_paths: []const []const u8,
+        keyring_paths: []const []const u8,
+    ) api.CommonOptions {
         return .{
             .install_root = self.install_root,
-            .source_paths = &.{self.source_path},
-            .keyring_paths = &.{self.keyring_path},
+            .source_paths = source_paths,
+            .keyring_paths = keyring_paths,
             .cache_path = self.cache_path,
             .state_path = self.state_path,
             .architecture = "amd64",
@@ -157,13 +161,15 @@ test "production customize provisions a missing var/lib/debz lock root" {
         .now_unix = fixture.created + 30,
         .process_runner = process.interface(),
     };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
     // The staged root intentionally lacks var/lib/debz. Before the lock adapter
     // provisioned its own state directory, acquiring the transaction lock here
     // failed with FileNotFound (exit 7) — the exact aarch64 customize regression.
     const result = try api.execute(arena.allocator(), .{
         .operation = .remove,
         .packages = &.{"removable"},
-        .options = staged.options(),
+        .options = staged.options(&source_paths, &keyring_paths),
     }, backend.interface());
     try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
     try std.testing.expect(result.changed);
@@ -185,10 +191,12 @@ test "production customize failure reports structured diagnostics without leakin
         .now_unix = fixture.created + 30,
         .process_runner = process.interface(),
     };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
     const result = try api.execute(std.testing.allocator, .{
         .operation = .remove,
         .packages = &.{"removable"},
-        .options = staged.options(),
+        .options = staged.options(&source_paths, &keyring_paths),
     }, backend.interface());
     // The failure path allocates planning policies, plan-request selectors, and
     // the returned message; std.testing.allocator fails if any working buffer
