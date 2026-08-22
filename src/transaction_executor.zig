@@ -2002,7 +2002,24 @@ pub const SystemLockManager = struct {
         var components = std.mem.splitScalar(u8, parent[1..], '/');
         while (components.next()) |component| {
             if (component.len == 0) continue;
-            const next = try current.openDir(self.io, component, .{ .follow_symlinks = false });
+            const next = current.openDir(self.io, component, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                // debz owns its transaction bookkeeping directory
+                // (var/lib/debz) and must provision it rather than trusting the
+                // caller's root to already carry it. An authenticated Ubuntu
+                // root only ships var/lib/dpkg, so customizing into a staged
+                // copy walked into a missing var/lib/debz and surfaced a bare
+                // FileNotFound. Create the missing component in place without
+                // following symlinks; losing the race to a concurrent creator
+                // is fine because the directory is all we need.
+                error.FileNotFound => blk: {
+                    current.createDir(self.io, component, .default_dir) catch |create_err| switch (create_err) {
+                        error.PathAlreadyExists => {},
+                        else => return create_err,
+                    };
+                    break :blk try current.openDir(self.io, component, .{ .follow_symlinks = false });
+                },
+                else => return err,
+            };
             current.close(self.io);
             current = next;
         }
@@ -3030,4 +3047,34 @@ test "transaction_executor.test.production process adapter enforces timeout and 
         .timeout_ms = 10,
         .cancellation = Cancellation.never(),
     }));
+}
+
+test "transaction_executor.test.system lock manager provisions missing debz state directory" {
+    // Reproduces the aarch64 customize regression: an authenticated Ubuntu root
+    // carries var/lib/dpkg but never a var/lib/debz directory, so acquiring the
+    // debz transaction lock walked into a missing parent and surfaced a bare
+    // FileNotFound with exit status 7. The production adapter must provision its
+    // own bookkeeping directory before locking instead of trusting the caller.
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root = real_buffer[0..real_length];
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root/var/lib/debz/transaction.lock",
+        .{root},
+    );
+    defer std.testing.allocator.free(lock_path);
+
+    var manager: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    const locks = manager.interface();
+    const token = try locks.acquire(lock_path, 1_000);
+    try std.testing.expect(locks.held(token));
+    locks.release(token);
+
+    var provisioned = try directory.dir.openDir(std.testing.io, "root/var/lib/debz", .{ .follow_symlinks = false });
+    provisioned.close(std.testing.io);
 }
