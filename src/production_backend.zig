@@ -1359,8 +1359,13 @@ fn writeExecutionProvenance(
     status: transaction_recovery.StatusReader,
     verify: *transaction_provenance.VerifyDiagnostic,
 ) !void {
-    var repositories = try allocator.alloc(transaction_provenance.RepositoryEvidence, refreshed.snapshots.len);
-    for (refreshed.snapshots, 0..) |snapshot, index| {
+    // The lock records only repositories that actually supplied a package, so the
+    // evidence has to be drawn from the lock rather than from every refreshed
+    // snapshot; provenance keeps a one-to-one binding with the lock.
+    const repositories = try allocator.alloc(transaction_provenance.RepositoryEvidence, lock.repositories.len);
+    for (lock.repositories, 0..) |locked, index| {
+        const snapshot = findSnapshot(refreshed.snapshots, locked.id) orelse
+            return error.MissingRepository;
         const evidence = snapshot.snapshot.provenance.authentication_evidence;
         const signers = try allocator.alloc([20]u8, evidence.signatures.len);
         var signer_count: usize = 0;
@@ -1368,11 +1373,9 @@ fn writeExecutionProvenance(
             signers[signer_count] = fingerprint;
             signer_count += 1;
         };
-        var source_id: [64]u8 = undefined;
-        @memcpy(&source_id, snapshot.snapshot.provenance.repository_id.slice());
         repositories[index] = .{
-            .source_config_id = source_id,
-            .snapshot_sha256 = repository_refresh.snapshotDigest(&snapshot),
+            .source_config_id = locked.id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
             .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
             .signature_sha256 = if (evidence.signature_digest) |digest| digest.bytes else null,
             .metadata_sha256 = snapshot.snapshot.provenance.index_digest.bytes,

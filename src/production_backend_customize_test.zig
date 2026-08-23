@@ -8,6 +8,11 @@
 //! drive the public product backend end to end so the lock provisioning, the
 //! structured diagnostics, and the leak-free failure path all stay fixed.
 //!
+//! The same build later failed after dpkg had already succeeded, because
+//! execution provenance described every refreshed repository while the exact
+//! lock only records the ones a package came from. That binding is covered here
+//! too, since it only breaks when the sources out-number the closure.
+//!
 //! This file is the root of its own test binary (see build.zig's
 //! `test-production-customize` step, mirroring the fuzz target wiring) and
 //! reaches the backend exclusively through the public `debz` package. That
@@ -26,6 +31,17 @@ const removable_status =
     \\Priority: optional
     \\Architecture: amd64
     \\Version: 1
+    \\
+;
+
+// The baseline for the provenance test: every installed package has to have a
+// repository origin before an exact lock can be resolved at all.
+const repository_status =
+    \\Package: hello
+    \\Status: install ok installed
+    \\Priority: optional
+    \\Architecture: amd64
+    \\Version: 1.0-1
     \\
 ;
 
@@ -239,6 +255,111 @@ test "a root that does not exist is still an error, not an empty one" {
     try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
     try std.testing.expect(std.mem.indexOf(u8, result.summary, "FileNotFound") != null);
+}
+
+// Stages a second authenticated repository that resolves and refreshes exactly
+// like the first one but never wins a package, and replaces the staged status
+// with a baseline the repositories can actually account for. Ubuntu's real
+// sources fan out into a repository per component and pocket, so a build
+// routinely refreshes many more repositories than its closure draws from.
+fn addSpareRepository(staged: Fixture) !void {
+    const root = std.fs.path.dirname(staged.keyring_path).?;
+    try staged.directory.dir.createDirPath(std.testing.io, "spare/dists/stable/main/binary-amd64");
+    try staged.directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "spare/dists/stable/InRelease",
+        .data = &fixture.repository_in_release,
+    });
+    try staged.directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "spare/dists/stable/main/binary-amd64/Packages",
+        .data = &fixture.repository_packages,
+    });
+    try staged.directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = repository_status,
+    });
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s}/repo stable main\n" ++
+            "deb [arch=amd64 signed-by={s}] file://{s}/spare stable main\n",
+        .{ staged.keyring_path, root, staged.keyring_path, root },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try staged.directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = source_bytes,
+    });
+}
+
+test "provenance repositories follow the lock, not every refreshed repository" {
+    var staged = try stageRoot();
+    defer staged.deinit();
+    try addSpareRepository(staged);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const root = std.fs.path.dirname(staged.keyring_path).?;
+    const lock_path = try std.fmt.allocPrint(arena.allocator(), "{s}/exact-lock.json", .{root});
+    var process = SuccessfulProcess{ .io = std.testing.io, .dir = staged.directory.dir };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
+
+    // Resolve the lock the way vmiz does, as a separate non-mutating pass.
+    var resolve_options = staged.options(&source_paths, &keyring_paths);
+    resolve_options.lock_output_path = lock_path;
+    const resolved = try api.execute(arena.allocator(), .{
+        .operation = .plan,
+        .packages = &.{},
+        .options = resolve_options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, resolved.exit_status);
+
+    // Replay that lock through a mutating pass, which is the only path that
+    // writes execution provenance. The exact lock refuses to record a
+    // repository no package came from, so a build whose sources out-number its
+    // closure produced more repository evidence than the lock held, and
+    // provenance rejected its own transaction with RepositoryEvidenceMismatch
+    // after dpkg had already succeeded.
+    var replay_options = staged.options(&source_paths, &keyring_paths);
+    replay_options.lock_input_path = lock_path;
+    const replayed = try api.execute(arena.allocator(), .{
+        .operation = .upgrade_all,
+        .packages = &.{},
+        .options = replay_options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, replayed.exit_status);
+
+    const provenance_bytes = try staged.directory.dir.readFileAlloc(
+        std.testing.io,
+        "state/transaction-result.json",
+        std.testing.allocator,
+        .limited(debz.transaction_provenance.maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(provenance_bytes);
+    var validated = try debz.transaction_provenance.validateDocument(
+        std.testing.allocator,
+        provenance_bytes,
+        debz.transaction_provenance.maximum_document_bytes,
+    );
+    defer validated.deinit();
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        provenance_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    // Both repositories authenticated and refreshed; only the one the closure
+    // drew from is evidence, so the record stays bound one-to-one to the lock.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        parsed.value.object.get("repositories").?.array.items.len,
+    );
 }
 
 test "production customize failure reports structured diagnostics without leaking" {
