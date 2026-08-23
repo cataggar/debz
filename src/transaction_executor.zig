@@ -1782,6 +1782,15 @@ pub const SystemFileSystem = struct {
         }
     }
 
+    /// Whether `name` names an existing directory under `directory`, used to
+    /// tell a merged-usr target that is really there from one this
+    /// architecture simply does not have.
+    fn directoryExists(io: std.Io, directory: std.Io.Dir, name: []const u8) bool {
+        var opened = directory.openDir(io, name, .{ .follow_symlinks = false }) catch return false;
+        opened.close(io);
+        return true;
+    }
+
     fn normalizeBootstrapRoot(context: *anyopaque, root: []const u8) !void {
         const self: *SystemFileSystem = @ptrCast(@alignCast(context));
         var directory = try std.Io.Dir.openDirAbsolute(self.io, root, .{
@@ -1807,7 +1816,15 @@ pub const SystemFileSystem = struct {
                 .follow_symlinks = false,
             }) catch |err| switch (err) {
                 error.FileNotFound => {
-                    try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
+                    // A merged-usr link is only meaningful when the directory
+                    // it merges into exists. /lib64 is architecture-specific --
+                    // amd64 and s390x carry usr/lib64, arm64 has none -- so
+                    // linking unconditionally left arm64 roots with a dangling
+                    // /lib64, and base-files' preinst refuses to unpack against
+                    // one ("cannot proceed with the upgrade"), which failed the
+                    // bootstrap of every arm64 root at the first package.
+                    if (directoryExists(self.io, directory, mapping[1]))
+                        try directory.symLink(self.io, mapping[1], mapping[0], .{ .is_directory = true });
                     continue;
                 },
                 else => return err,
@@ -2976,6 +2993,44 @@ test "transaction_executor.test.bootstrap normalization restores empty merged-us
     );
     defer std.testing.allocator.free(group);
     try std.testing.expectEqualStrings("root:x:0:\nmail:x:8:\n", group);
+}
+
+test "transaction_executor.test.bootstrap normalization leaves no dangling link for an absent merged-usr target" {
+    // An arm64 root has usr/lib but no usr/lib64. Linking lib64 anyway left a
+    // dangling /lib64, and base-files' preinst refuses to unpack against one,
+    // which failed the bootstrap of every arm64 root at its first package.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/bin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/sbin");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/lib");
+    try tmp.dir.createDirPath(std.testing.io, "root/usr/share/base-passwd");
+    try tmp.dir.createDirPath(std.testing.io, "root/etc");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/passwd.master",
+        .data = "root:x:0:0:root:/root:/bin/sh\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/base-passwd/group.master",
+        .data = "root:x:0:\n",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{path_buffer[0..root_length]});
+    defer std.testing.allocator.free(root);
+    var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    try filesystem.interface().normalizeBootstrapRoot(root);
+
+    // The architecture that has the target still gets its link.
+    var target: [64]u8 = undefined;
+    const length = try tmp.dir.readLink(std.testing.io, "root/lib", &target);
+    try std.testing.expectEqualStrings("usr/lib", target[0..length]);
+
+    // The one that does not is left alone rather than pointed at nothing.
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.readLink(std.testing.io, "root/lib64", &target),
+    );
 }
 
 test "transaction_executor.test.production lock adapter refuses parent and leaf symlinks" {
