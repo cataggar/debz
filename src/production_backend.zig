@@ -564,7 +564,25 @@ pub const Backend = struct {
             null;
         defer if (allocated_path) |path| allocator.free(path);
         const path = request.options.status_path orelse allocated_path.?;
-        const parsed = try dpkg_status.parseFile(allocator, self.io, path, .{});
+        const parsed = blk: {
+            break :blk dpkg_status.parseFile(allocator, self.io, path, .{}) catch |err| {
+                if (err != error.FileNotFound) return err;
+                // A root with no dpkg database has nothing installed. That is
+                // precisely what a root looks like before its first
+                // transaction, and debootstrap writes the same statement as an
+                // empty status file, so the two roots describe one installed
+                // set and must resolve alike. Refusing the absent one made
+                // bootstrapping a fresh root impossible to plan: the caller had
+                // to materialize an empty file to say what its absence already
+                // said.
+                //
+                // The root itself must still exist. A missing database inside a
+                // real root is a fresh root; a missing root is a misconfigured
+                // one, and only the first is a fact about packages.
+                if (!self.installRootExists(request.options.install_root)) return err;
+                break :blk try dpkg_status.parseOwned(allocator, "", .{});
+            };
+        };
         return switch (parsed) {
             .diagnostic => |diagnostic| {
                 _ = diagnostic;
@@ -572,6 +590,15 @@ pub const Backend = struct {
             },
             .database => |database| database,
         };
+    }
+
+    /// Whether the install root exists as a directory, which separates a root
+    /// that has not been bootstrapped yet from one that was never there.
+    fn installRootExists(self: *Backend, install_root: []const u8) bool {
+        if (install_root.len == 0) return false;
+        var dir = std.Io.Dir.cwd().openDir(self.io, install_root, .{}) catch return false;
+        dir.close(self.io);
+        return true;
     }
 
     fn loadRepositoryDocuments(

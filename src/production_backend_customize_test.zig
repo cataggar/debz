@@ -181,6 +181,66 @@ test "production customize provisions a missing var/lib/debz lock root" {
     provisioned.close(std.testing.io);
 }
 
+test "a root with no dpkg database has nothing installed" {
+    var staged = try stageRoot();
+    defer staged.deinit();
+
+    // A root being bootstrapped has no dpkg database yet. Reproduce that by
+    // removing the staged one: this is the state vmiz's fresh-root build leaves
+    // behind after it wipes the exported cloud root, and resolving against it
+    // failed with a bare FileNotFound that named nothing.
+    try staged.directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/status");
+
+    var process = FailingProcess{};
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
+    const result = try api.execute(std.testing.allocator, .{
+        .operation = .list_installed,
+        .packages = &.{},
+        .options = staged.options(&source_paths, &keyring_paths),
+    }, backend.interface());
+    defer std.testing.allocator.free(result.items);
+    try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
+    // Nothing installed, rather than an error about the absence.
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "a root that does not exist is still an error, not an empty one" {
+    var staged = try stageRoot();
+    defer staged.deinit();
+
+    // The absent database is only a fact about packages when the root it would
+    // live in is really there. Deleting the root entirely is a misconfigured
+    // path, and reporting that as "nothing installed" would let a typo plan a
+    // full install into somewhere that does not exist.
+    try staged.directory.dir.deleteTree(std.testing.io, "root");
+
+    var process = FailingProcess{};
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
+    const result = try api.execute(std.testing.allocator, .{
+        .operation = .list_installed,
+        .packages = &.{},
+        .options = staged.options(&source_paths, &keyring_paths),
+    }, backend.interface());
+    // Refused as a configuration problem rather than answered as an empty root.
+    // This summary is the static error name, not an allocated diagnostic, so
+    // unlike the transaction-failure path below there is nothing to free.
+    try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary, "FileNotFound") != null);
+}
+
 test "production customize failure reports structured diagnostics without leaking" {
     var staged = try stageRoot();
     defer staged.deinit();
