@@ -526,15 +526,34 @@ pub const Backend = struct {
             else
                 "transaction failed");
         try deleteRecoveryIntent(self.io, request.options.state_path);
-        if (lock) |*value| try writeExecutionProvenance(
-            allocator,
-            self.io,
-            request,
-            refreshed,
-            value.lock,
-            report,
-            dependencies.status,
-        );
+        if (lock) |*value| {
+            var verify: transaction_provenance.VerifyDiagnostic = .{};
+            writeExecutionProvenance(
+                allocator,
+                self.io,
+                request,
+                refreshed,
+                value.lock,
+                report,
+                dependencies.status,
+                &verify,
+            ) catch |err| switch (err) {
+                error.RepositoryEvidenceMismatch,
+                error.MissingPackageEvidence,
+                error.PackageDigestMismatch,
+                => return api.failure(
+                    request.operation,
+                    .internal,
+                    .lock_verification_failed,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "exact-lock evidence rejected during {s}: {s}",
+                        .{ @tagName(request.operation), verify.message() },
+                    ),
+                ),
+                else => return err,
+            };
+        }
         return planResultChanged(allocator, request.operation, plan.*, true, "transaction completed");
     }
 
@@ -1311,6 +1330,7 @@ fn writeExecutionProvenance(
     lock: exact_lock.Lock,
     report: transaction_executor.Report,
     status: transaction_recovery.StatusReader,
+    verify: *transaction_provenance.VerifyDiagnostic,
 ) !void {
     var repositories = try allocator.alloc(transaction_provenance.RepositoryEvidence, refreshed.snapshots.len);
     for (refreshed.snapshots, 0..) |snapshot, index| {
@@ -1344,6 +1364,7 @@ fn writeExecutionProvenance(
         .cas_sha256 = package.sha256,
         .declared_size = package.declared_size,
     };
+    try transaction_provenance.verifyLockEvidence(lock, repositories, packages, verify);
     const status_bytes = try status.read(allocator, request.options.install_root, 64 * 1024 * 1024);
     defer allocator.free(status_bytes);
     var status_digest: [32]u8 = undefined;

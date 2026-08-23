@@ -112,6 +112,7 @@ pub const ErrorId = enum {
     download_failed,
     transaction_failed,
     recovery_failed,
+    lock_verification_failed,
     internal_error,
 };
 

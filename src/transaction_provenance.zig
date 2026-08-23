@@ -156,7 +156,7 @@ pub fn createFromExecution(
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
     if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
         return error.LockDigestMismatch;
-    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages);
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const arena = temporary.allocator();
@@ -207,7 +207,7 @@ pub fn createFromRecovery(
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
     if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
         return error.LockDigestMismatch;
-    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages);
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const arena = temporary.allocator();
@@ -471,23 +471,91 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
     return .{ .result = result, .arena = arena, .backing_allocator = allocator };
 }
 
+/// Credential-free sink for a lock-evidence verification failure. The message
+/// names the offending repository (by id prefix) or package and the field that
+/// changed, so a mismatch no longer surfaces as only a bare error name. Repo id
+/// prefixes, content digests, and package names/versions are all non-secret, so
+/// nothing here can leak an authentication token or signing key.
+pub const VerifyDiagnostic = struct {
+    buffer: [220]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const VerifyDiagnostic) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn note(self: *VerifyDiagnostic, comptime fmt: []const u8, args: anytype) void {
+        const rendered = std.fmt.bufPrint(&self.buffer, fmt, args) catch {
+            self.len = 0;
+            return;
+        };
+        self.len = rendered.len;
+    }
+};
+
+fn shortId(id: *const [64]u8) []const u8 {
+    return id[0..12];
+}
+
+/// Verifies that every repository and package recorded in the exact lock is
+/// present and unchanged in the runtime provenance evidence.
+///
+/// The runtime refresh authenticates every configured repository -- for the
+/// Ubuntu release that is every suite x component (e.g. 12 repositories) --
+/// while the exact lock records only the repositories that actually contributed
+/// a package. The locked repositories are therefore verified as a SUBSET of the
+/// runtime evidence. Requiring an exact count match falsely rejected the
+/// production customize with `RepositoryEvidenceMismatch` whenever a configured
+/// component such as `multiverse` shipped no selected package (2 locked vs 12
+/// refreshed). Every locked repository must still be present with matching
+/// snapshot/release/index digests, signer fingerprints, and a verified
+/// signature, so no authenticated artifact can silently change between resolve
+/// and customize.
+///
+/// On mismatch the optional `diagnostic` is filled with a credential-free
+/// message naming the offending repository or package and the changed field.
 pub fn verifyLockEvidence(
     lock: exact_lock.Lock,
     repositories: []const RepositoryEvidence,
     packages: []const PackageEvidence,
+    diagnostic: ?*VerifyDiagnostic,
 ) Error!void {
-    if (lock.repositories.len != repositories.len) return error.RepositoryEvidenceMismatch;
     for (lock.repositories) |locked| {
-        const repository = findRepositoryEvidence(repositories, locked.id) orelse
+        const repository = findRepositoryEvidence(repositories, locked.id) orelse {
+            if (diagnostic) |sink| sink.note(
+                "locked repository {s} absent from runtime evidence (runtime authenticated {d} repositories)",
+                .{ shortId(&locked.id), repositories.len },
+            );
             return error.RepositoryEvidenceMismatch;
-        if (!std.mem.eql(u8, &locked.snapshot_sha256, &repository.snapshot_sha256) or
-            !std.mem.eql(u8, &locked.release_sha256, &repository.release_sha256) or
-            !std.mem.eql(u8, &locked.index_sha256, &repository.metadata_sha256) or
-            !sameFingerprints(locked.signer_fingerprints, repository.signer_fingerprints) or
-            !repository.signature_verified)
+        };
+        const changed: ?[]const u8 =
+            if (!std.mem.eql(u8, &locked.snapshot_sha256, &repository.snapshot_sha256))
+                "snapshot digest"
+            else if (!std.mem.eql(u8, &locked.release_sha256, &repository.release_sha256))
+                "release digest"
+            else if (!std.mem.eql(u8, &locked.index_sha256, &repository.metadata_sha256))
+                "index digest"
+            else if (!sameFingerprints(locked.signer_fingerprints, repository.signer_fingerprints))
+                "signer fingerprints"
+            else if (!repository.signature_verified)
+                "signature verification"
+            else
+                null;
+        if (changed) |field| {
+            if (diagnostic) |sink| sink.note(
+                "locked repository {s} {s} changed between resolve and customize",
+                .{ shortId(&locked.id), field },
+            );
             return error.RepositoryEvidenceMismatch;
+        }
     }
-    if (lock.packages.len != packages.len) return error.MissingPackageEvidence;
+    if (lock.packages.len != packages.len) {
+        if (diagnostic) |sink| sink.note(
+            "locked package count {d} does not match runtime evidence {d}",
+            .{ lock.packages.len, packages.len },
+        );
+        return error.MissingPackageEvidence;
+    }
     for (lock.packages) |locked| {
         var found = false;
         for (packages) |package| {
@@ -500,9 +568,21 @@ pub fn verifyLockEvidence(
                 !std.mem.eql(u8, &locked.repository_snapshot_sha256, &package.repository_snapshot_sha256) or
                 !std.mem.eql(u8, &locked.sha256, &package.package_sha256) or
                 locked.declared_size != package.declared_size)
+            {
+                if (diagnostic) |sink| sink.note(
+                    "locked package {s} {s} artifact evidence changed between resolve and customize",
+                    .{ locked.name, locked.architecture },
+                );
                 return error.PackageDigestMismatch;
+            }
         }
-        if (!found) return error.MissingPackageEvidence;
+        if (!found) {
+            if (diagnostic) |sink| sink.note(
+                "locked package {s} {s} missing from runtime evidence",
+                .{ locked.name, locked.architecture },
+            );
+            return error.MissingPackageEvidence;
+        }
     }
 }
 
@@ -924,11 +1004,154 @@ test "transaction_provenance.test.deterministic provenance recovery and redactio
         .packages = &lock_packages,
         .digest_sha256 = @splat(12),
     };
-    try verifyLockEvidence(lock, &repositories, &packages);
+    try verifyLockEvidence(lock, &repositories, &packages, null);
     var wrong_repository = repositories;
     wrong_repository[0].metadata_sha256 = @splat(15);
     try std.testing.expectError(
         error.RepositoryEvidenceMismatch,
-        verifyLockEvidence(lock, &wrong_repository, &packages),
+        verifyLockEvidence(lock, &wrong_repository, &packages, null),
     );
+}
+
+test "transaction_provenance.verifyLockEvidence accepts locked repositories as a subset of runtime evidence" {
+    // Regression for issue #455: the aarch64/x86 release customize refreshes
+    // every configured suite x component (12 repositories) while the exact lock
+    // records only the repositories that contributed a package (2). Requiring an
+    // exact count match surfaced a bare `backend_failed: RepositoryEvidenceMismatch`
+    // (exit 70) the first time customize verified evidence after a resolve. The
+    // locked repositories must instead verify as a subset of the runtime evidence.
+    const fingerprints = [_][20]u8{@splat(0xAB)};
+    var evidence: [12]RepositoryEvidence = undefined;
+    for (&evidence, 0..) |*item, index| {
+        const tag: u8 = @intCast(index + 1);
+        item.* = .{
+            .source_config_id = @splat(tag),
+            .snapshot_sha256 = @splat(tag),
+            .release_sha256 = @splat(tag +% 0x20),
+            .signature_sha256 = null,
+            .metadata_sha256 = @splat(tag +% 0x40),
+            .signer_fingerprints = &fingerprints,
+            .signature_verified = true,
+        };
+    }
+    const contributing = [_]usize{ 3, 8 };
+    const names = [_][]const u8{ "alpha", "beta" };
+    var lock_repositories: [2]exact_lock.Repository = undefined;
+    var lock_packages: [2]exact_lock.Package = undefined;
+    var package_evidence: [2]PackageEvidence = undefined;
+    for (&lock_repositories, &lock_packages, &package_evidence, contributing, names) |*repo, *pkg, *ev, source, name| {
+        repo.* = .{
+            .id = evidence[source].source_config_id,
+            .snapshot_sha256 = evidence[source].snapshot_sha256,
+            .release_sha256 = evidence[source].release_sha256,
+            .index_sha256 = evidence[source].metadata_sha256,
+            .signer_fingerprints = &fingerprints,
+        };
+        pkg.* = .{
+            .name = name,
+            .version = "1.0",
+            .architecture = "amd64",
+            .repository_id = evidence[source].source_config_id,
+            .repository_snapshot_sha256 = evidence[source].snapshot_sha256,
+            .sha256 = @splat(0xC0),
+            .declared_size = 100,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        };
+        ev.* = .{
+            .name = name,
+            .version = "1.0",
+            .architecture = "amd64",
+            .repository_id = evidence[source].source_config_id,
+            .repository_snapshot_sha256 = evidence[source].snapshot_sha256,
+            .package_sha256 = @splat(0xC0),
+            .cas_sha256 = @splat(0xC0),
+            .declared_size = 100,
+        };
+    }
+    const lock: exact_lock.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &lock_repositories,
+        .packages = &lock_packages,
+        .digest_sha256 = @splat(3),
+    };
+    // Before the fix this returned error.RepositoryEvidenceMismatch purely
+    // because 2 != 12.
+    try verifyLockEvidence(lock, &evidence, &package_evidence, null);
+}
+
+test "transaction_provenance.verifyLockEvidence names a missing repository without leaking credentials" {
+    const fingerprints = [_][20]u8{@splat(0xAB)};
+    const evidence = [_]RepositoryEvidence{.{
+        .source_config_id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = null,
+        .metadata_sha256 = @splat(3),
+        .signer_fingerprints = &fingerprints,
+        .signature_verified = true,
+    }};
+    const lock_repositories = [_]exact_lock.Repository{.{
+        .id = @splat('z'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &fingerprints,
+    }};
+    const lock: exact_lock.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &lock_repositories,
+        .packages = &.{},
+        .digest_sha256 = @splat(3),
+    };
+    var diagnostic: VerifyDiagnostic = .{};
+    try std.testing.expectError(
+        error.RepositoryEvidenceMismatch,
+        verifyLockEvidence(lock, &evidence, &.{}, &diagnostic),
+    );
+    const message = diagnostic.message();
+    try std.testing.expect(std.mem.indexOf(u8, message, "absent from runtime evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "zzzzzzzzzzzz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "password") == null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "signed-by") == null);
+}
+
+test "transaction_provenance.verifyLockEvidence names a changed repository digest" {
+    const fingerprints = [_][20]u8{@splat(0xAB)};
+    const evidence = [_]RepositoryEvidence{.{
+        .source_config_id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = null,
+        .metadata_sha256 = @splat(9),
+        .signer_fingerprints = &fingerprints,
+        .signature_verified = true,
+    }};
+    const lock_repositories = [_]exact_lock.Repository{.{
+        .id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &fingerprints,
+    }};
+    const lock: exact_lock.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &lock_repositories,
+        .packages = &.{},
+        .digest_sha256 = @splat(3),
+    };
+    var diagnostic: VerifyDiagnostic = .{};
+    try std.testing.expectError(
+        error.RepositoryEvidenceMismatch,
+        verifyLockEvidence(lock, &evidence, &.{}, &diagnostic),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "index digest changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "aaaaaaaaaaaa") != null);
 }
