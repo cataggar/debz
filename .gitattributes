@@ -1,0 +1,21 @@
+# Line endings are content in this project, not formatting. debz parses OpenPGP
+# cleartext signatures, deb822 documents, and dpkg status databases, where CR
+# and LF are significant bytes -- one fixture is named "inrelease-lf" precisely
+# because it exists to prove LF input is handled. A checkout with
+# core.autocrlf=true rewrites LF to CRLF and silently changes what those tests
+# assert on, so the working tree is pinned here rather than left to whatever
+# each developer's global git configuration happens to be.
+* text=auto eol=lf
+
+# Fixtures and fuzz corpora are exact bytes, not text to be tidied. Never
+# translate them in either direction: a fixture that arrives with different
+# bytes than it was recorded with is no longer testing what it claims to.
+src/fixtures/** -text
+fuzz/corpus/** -text
+
+# Binary artifacts, wherever they appear.
+*.deb binary
+*.tar binary
+*.gz  binary
+*.xz  binary
+*.zst binary
