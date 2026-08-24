@@ -73,7 +73,7 @@ pub const CommonOptions = struct {
     cache_only: bool = false,
     recommends: bool = false,
     allow_downgrade: bool = false,
-    deadline_ms: u64 = 60_000,
+    deadline_ms: ?u64 = null,
     lock_wait_ms: u64 = 30_000,
     assume_yes: bool = false,
     noninteractive: bool = false,
@@ -205,7 +205,7 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
         (request.options.lock_output_path != null and !validAbsolutePath(request.options.lock_output_path.?)) or
         !validArchitecture(request.options.architecture) or
         !validForeignArchitectures(request.options.architecture, request.options.foreign_architectures) or
-        request.options.deadline_ms == 0)
+        (request.options.deadline_ms != null and request.options.deadline_ms.? == 0))
         return failure(request.operation, .usage, .invalid_request, "invalid explicit path, architecture, or deadline");
     if (!validPackages(request))
         return failure(request.operation, .usage, .invalid_request, "invalid package argument count or spelling");
