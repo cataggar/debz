@@ -1097,12 +1097,40 @@ fn proxyPolicy(value: ?[]const u8) !repository_acquisition.ProxyPolicy {
     return .{ .http = endpoint, .https = endpoint };
 }
 
-fn deadlines(overall: u64) repository_acquisition.Deadlines {
-    return .{
-        .connect_ms = @min(overall, 10_000),
-        .read_ms = @min(overall, 30_000),
-        .overall_ms = overall,
+fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
+    const bounded = overall orelse {
+        const unbounded: u64 = @intCast(std.math.maxInt(i64));
+        return .{
+            .connect_ms = unbounded,
+            .read_ms = unbounded,
+            .overall_ms = unbounded,
+        };
     };
+    return .{
+        .connect_ms = @min(bounded, 10_000),
+        .read_ms = @min(bounded, 30_000),
+        .overall_ms = bounded,
+    };
+}
+
+test "production acquisition is unbounded unless a deadline is explicit" {
+    const unbounded: u64 = @intCast(std.math.maxInt(i64));
+    try std.testing.expectEqual(
+        repository_acquisition.Deadlines{
+            .connect_ms = unbounded,
+            .read_ms = unbounded,
+            .overall_ms = unbounded,
+        },
+        deadlines(null),
+    );
+    try std.testing.expectEqual(
+        repository_acquisition.Deadlines{
+            .connect_ms = 10_000,
+            .read_ms = 30_000,
+            .overall_ms = 60_000,
+        },
+        deadlines(60_000),
+    );
 }
 
 fn productionRetryPolicy() repository_acquisition.RetryPolicy {

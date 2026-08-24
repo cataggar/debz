@@ -75,7 +75,7 @@ pub const Request = struct {
     conffile: product.ConffilePolicy = .keep_existing,
     credential_reference: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
-    deadline_ms: u64 = 300_000,
+    deadline_ms: ?u64 = null,
     lock_wait_ms: u64 = 30_000,
 };
 
@@ -196,7 +196,8 @@ fn validRequest(request: Request) bool {
     if (!std.mem.eql(u8, request.schema, request_schema) or request.version != schema_version) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
     if ((request.sources.len == 0 and request.configs.len == 0) or
-        request.keyrings.len == 0 or request.deadline_ms == 0) return false;
+        request.keyrings.len == 0 or
+        (request.deadline_ms != null and request.deadline_ms.? == 0)) return false;
     for (request.sources) |path| if (!absolute(path)) return false;
     for (request.configs) |path| if (!absolute(path)) return false;
     for (request.keyrings) |path| if (!absolute(path)) return false;
@@ -244,6 +245,7 @@ const Fake = struct {
         try std.testing.expectEqualStrings("arm64", request.options.architecture);
         try std.testing.expect(request.options.cache_only);
         try std.testing.expectEqualStrings("ubuntu-minimal", request.packages[0]);
+        try std.testing.expectEqual(@as(?u64, null), request.options.deadline_ms);
         const items = if (self.return_item) blk: {
             const result = try allocator.alloc(product.Item, 1);
             result[0] = .{
