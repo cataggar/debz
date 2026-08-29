@@ -26,6 +26,13 @@ Commands are `refresh`, `install`, `remove`, `upgrade`, `upgrade-all`,
 `reinstall`, `download`, `plan`, `list-installed`, `list-available`, `info`,
 `provides`, `why`, `clean`, and `recover`.
 
+`debz -h` and `debz --help` print root help. Every command accepts `-h` and
+`--help` after the command name and prints command-specific help without
+performing validation, filesystem access, repository access, or other backend
+work. Help flags take precedence over other command arguments wherever they
+appear. The `package-family-capabilities` metadata command follows the same
+help contract. Positional `help` is not a command or alias.
+
 Inputs are explicit: `--source`, `--config`, `--keyring`, `--status-path`,
 `--default-release`,
 `--repository-policy`, `--lock-input`, `--lock-output`, `--offline`,
