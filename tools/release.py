@@ -842,7 +842,11 @@ def smoke_binary(archive_path: pathlib.Path, version: str) -> None:
                     raise ReleaseError(f"unsafe extraction path: {member.name}")
             archive.extractall(root, filter="data")
         binary = next(root.glob("*/bin/debz"))
-        for argument, expected in (("--version", version), ("--help", "Usage: debz")):
+        for argument, expected in (
+            ("--version", version),
+            ("-h", "debz <command> [options] [packages...]"),
+            ("--help", "debz <command> [options] [packages...]"),
+        ):
             result = subprocess.run(
                 [binary, argument], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
             )

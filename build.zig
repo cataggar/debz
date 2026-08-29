@@ -93,6 +93,49 @@ pub fn build(b: *std.Build) void {
     cli_tests.addArg(version);
     test_step.dependOn(&cli_tests.step);
 
+    const help_cases = [_]struct {
+        args: []const []const u8,
+        usage: []const u8,
+    }{
+        .{ .args = &.{}, .usage = "debz <command> [options] [packages...]" },
+        .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
+        .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
+        .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
+        .{ .args = &.{"upgrade"}, .usage = "debz upgrade [options] [package...]" },
+        .{ .args = &.{"upgrade-all"}, .usage = "debz upgrade-all [options]" },
+        .{ .args = &.{"reinstall"}, .usage = "debz reinstall [options] <package>" },
+        .{ .args = &.{"download"}, .usage = "debz download [options] <package>" },
+        .{ .args = &.{"plan"}, .usage = "debz plan [options] [package]" },
+        .{ .args = &.{"list-installed"}, .usage = "debz list-installed [options]" },
+        .{ .args = &.{"list-available"}, .usage = "debz list-available [options]" },
+        .{ .args = &.{"info"}, .usage = "debz info [options] <package>..." },
+        .{ .args = &.{"provides"}, .usage = "debz provides [options] <capability>..." },
+        .{ .args = &.{"why"}, .usage = "debz why [options] <package>..." },
+        .{ .args = &.{"clean"}, .usage = "debz clean [options]" },
+        .{ .args = &.{"recover"}, .usage = "debz recover [options]" },
+        .{ .args = &.{"package-family-capabilities"}, .usage = "debz package-family-capabilities" },
+        // Help wins after positional or malformed arguments so parsing and IO never begin.
+        .{ .args = &.{ "install", "example" }, .usage = "debz install [options] <package>" },
+        .{ .args = &.{ "install", "--deadline-ms" }, .usage = "debz install [options] <package>" },
+        .{ .args = &.{ "install", "--unknown" }, .usage = "debz install [options] <package>" },
+    };
+    for (help_cases) |case| {
+        addHelpFlagTests(b, test_step, cli, case.args, case.usage);
+    }
+
+    const no_args_help = b.addRunArtifact(cli);
+    no_args_help.expectExitCode(0);
+    no_args_help.expectStdOutMatch("debz <command> [options] [packages...]");
+    no_args_help.expectStdErrEqual("");
+    test_step.dependOn(&no_args_help.step);
+
+    const positional_help = b.addRunArtifact(cli);
+    positional_help.addArg("help");
+    positional_help.expectExitCode(2);
+    positional_help.expectStdOutEqual("");
+    positional_help.expectStdErrMatch("debz: unknown command 'help'");
+    test_step.dependOn(&positional_help.step);
+
     const consumer_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
@@ -228,6 +271,24 @@ pub fn build(b: *std.Build) void {
     dpkg_oracle.addArtifactArg(version_oracle);
     b.step("test-dpkg", "Compare version ordering with dpkg when available")
         .dependOn(&dpkg_oracle.step);
+}
+
+fn addHelpFlagTests(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    cli: *std.Build.Step.Compile,
+    args: []const []const u8,
+    usage: []const u8,
+) void {
+    for ([_][]const u8{ "-h", "--help" }) |flag| {
+        const help = b.addRunArtifact(cli);
+        help.addArgs(args);
+        help.addArg(flag);
+        help.expectExitCode(0);
+        help.expectStdOutMatch(usage);
+        help.expectStdErrEqual("");
+        test_step.dependOn(&help.step);
+    }
 }
 
 fn installReleaseFiles(

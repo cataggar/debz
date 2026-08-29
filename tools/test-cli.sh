@@ -13,7 +13,11 @@ read_common="$common --status-path $status"
 
 mkdir -p "$root/var/lib/dpkg" "$state"
 
-"$debz" --help >/dev/null
+for help in -h --help; do
+    output=$("$debz" "$help" 2>cli-test-stderr)
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q 'debz <command> \[options\] \[packages\.\.\.\]'
+done
 test "$("$debz" --version)" = "$expected_version"
 
 output=$("$debz" list-installed $read_common 2>cli-test-stderr)
