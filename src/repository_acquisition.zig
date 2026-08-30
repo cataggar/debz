@@ -449,23 +449,7 @@ pub fn redactUri(allocator: std.mem.Allocator, uri: Uri) ![]u8 {
         .fragment = false,
         .port = true,
     });
-    if (uri.query) |query_component| {
-        const query = switch (query_component) {
-            .raw, .percent_encoded => |value| value,
-        };
-        try output.writer.writeByte('?');
-        var parameters = std.mem.splitScalar(u8, query, '&');
-        var first = true;
-        while (parameters.next()) |parameter| {
-            if (!first) try output.writer.writeByte('&');
-            first = false;
-            if (std.mem.indexOfScalar(u8, parameter, '=')) |equals| {
-                try output.writer.print("{s}=REDACTED", .{parameter[0..equals]});
-            } else {
-                try output.writer.writeAll(parameter);
-            }
-        }
-    }
+    if (uri.query != null) try output.writer.writeAll("?REDACTED");
     return output.toOwnedSlice();
 }
 
@@ -808,12 +792,25 @@ pub const Production = struct {
     }
 };
 
-test "redaction removes userinfo and fragment" {
+test "redaction removes userinfo fragment and query data" {
     const allocator = std.testing.allocator;
     const uri = try Uri.parse("https://alice:secret@example.test/path?q=ok#token");
     const redacted = try redactUri(allocator, uri);
     defer allocator.free(redacted);
-    try std.testing.expectEqualStrings("https://example.test/path?q=REDACTED", redacted);
+    try std.testing.expectEqualStrings("https://example.test/path?REDACTED", redacted);
+}
+
+test "redaction removes bare query components and secret-looking names" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "https://example.test/path?bare-secret",
+        "https://example.test/path?secret-looking-name=value&other",
+    };
+    for (cases) |text| {
+        const redacted = try redactUri(allocator, try Uri.parse(text));
+        defer allocator.free(redacted);
+        try std.testing.expectEqualStrings("https://example.test/path?REDACTED", redacted);
+    }
 }
 
 test "file acquisition rejects remote authority and ambiguous traversal" {
