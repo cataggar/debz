@@ -173,8 +173,8 @@ pub const Diagnostic = struct {
             .maintainer_script_limit => "maintainer scripts exceed configured count or byte limits",
             .descriptor_control_entry => "repository descriptor contains an unsupported control archive entry",
             .descriptor_payload_path => "repository descriptor payload is outside approved repository configuration locations",
-            .descriptor_unsafe_mode => "repository descriptor contains a setuid, setgid, or writable trust-bearing entry",
-            .descriptor_unsafe_owner => "repository descriptor contains trust-bearing content not unambiguously owned by root",
+            .descriptor_unsafe_mode => "repository descriptor contains a setuid, setgid, or group/world-writable entry or extraction root",
+            .descriptor_unsafe_owner => "repository descriptor content or extraction root is not unambiguously owned by root",
             .descriptor_link => "repository descriptor payload must not contain symbolic or hard links",
             .descriptor_relationship => "repository descriptor declares a disallowed package relationship or system importance flag",
             .descriptor_limit => "repository descriptor exceeds configured entry or byte limits",
@@ -202,10 +202,20 @@ pub const Entry = struct {
     content_offset: usize,
 };
 
+pub const RootEntry = struct {
+    mode: u32,
+    uid: u64,
+    gid: u64,
+    owner_name: ?[]const u8,
+    group_name: ?[]const u8,
+    header_offset: usize,
+};
+
 pub const TarInventory = struct {
     compression: deb_archive.Compression,
     compressed_bytes: usize,
     decompressed_bytes: usize,
+    root: ?RootEntry,
     entries: []Entry,
     entry_headers: usize,
     inventory_bytes: usize,
@@ -560,8 +570,8 @@ fn validateInternal(
             if (validateDescriptorProfile(
                 record,
                 package,
-                control_tar.entries,
-                data_tar.entries,
+                control_tar,
+                data_tar,
                 scripts,
                 conffiles,
                 outer.control,
@@ -610,14 +620,16 @@ fn duplicateOptional(
 fn validateDescriptorProfile(
     record: *const control_record.Record,
     package: []const u8,
-    control_entries: []const Entry,
-    data_entries: []const Entry,
+    control: TarInventory,
+    data: TarInventory,
     scripts: []const Script,
     conffiles: []const Conffile,
     control_member: deb_archive.Member,
     data_member: deb_archive.Member,
     limits: Limits,
 ) ?Diagnostic {
+    const control_entries = control.entries;
+    const data_entries = data.entries;
     if (record.essential == true or
         record.protected == true or
         record.important == true or
@@ -651,9 +663,14 @@ fn validateDescriptorProfile(
             return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
         }
     }
+    if (validateDescriptorRoot(control.root, control_member)) |diagnostic| return diagnostic;
+    if (validateDescriptorRoot(data.root, data_member)) |diagnostic| return diagnostic;
     for (control_entries, 0..) |entry, index| {
-        if (entry.mode & 0o6000 != 0) {
+        if (entry.mode & 0o6022 != 0) {
             return profileFailure(.descriptor_unsafe_mode, control_member, entry, index);
+        }
+        if (!hasUnambiguousRootOwnership(entry)) {
+            return profileFailure(.descriptor_unsafe_owner, control_member, entry, index);
         }
         if (!descriptorControlEntryAllowed(entry)) {
             return profileFailure(.descriptor_control_entry, control_member, entry, index);
@@ -725,6 +742,17 @@ fn descriptorControlEntryAllowed(entry: Entry) bool {
     return false;
 }
 
+fn validateDescriptorRoot(root: ?RootEntry, member: deb_archive.Member) ?Diagnostic {
+    const entry = root orelse return null;
+    if (entry.mode & 0o6022 != 0) {
+        return profileRootFailure(.descriptor_unsafe_mode, member, entry);
+    }
+    if (!hasUnambiguousRootOwnership(entry)) {
+        return profileRootFailure(.descriptor_unsafe_owner, member, entry);
+    }
+    return null;
+}
+
 const DescriptorPathClassification = struct {
     allowed: bool = false,
     source: bool = false,
@@ -783,7 +811,7 @@ fn trustFileSuffix(path: []const u8) bool {
     return false;
 }
 
-fn hasUnambiguousRootOwnership(entry: Entry) bool {
+fn hasUnambiguousRootOwnership(entry: anytype) bool {
     if (entry.uid != 0 or entry.gid != 0) return false;
     if (entry.owner_name) |name| {
         if (!std.mem.eql(u8, name, "root")) return false;
@@ -837,6 +865,19 @@ fn profileFailure(
         .offset = member.content.start + entry.header_offset,
         .inner_offset = entry.header_offset,
         .entry_index = index,
+    };
+}
+
+fn profileRootFailure(
+    code: Code,
+    member: deb_archive.Member,
+    entry: RootEntry,
+) Diagnostic {
+    return .{
+        .stage = .descriptor_profile,
+        .code = code,
+        .offset = member.content.start + entry.header_offset,
+        .inner_offset = entry.header_offset,
     };
 }
 
@@ -909,6 +950,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
     defer paths.deinit();
     var regular_bytes: u64 = 0;
     var inventory_bytes: usize = 0;
+    var root: ?RootEntry = null;
     var offset: usize = 0;
     var zero_blocks: usize = 0;
     var header_count: usize = 0;
@@ -1009,13 +1051,31 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 124, entries.items.len);
         const raw_name = if (pending_long_name) |value| value else fieldString(header[0..100]) orelse
             return setTarFailure(diagnostic, stage, .unsafe_path, member, offset, entries.items.len);
+        const root_prefix_empty = tar_format == .gnu or
+            (fieldString(header[345..500]) orelse
+                return setTarFailure(diagnostic, stage, .unsafe_path, member, offset + 345, entries.items.len)).len == 0;
         if (kind == .directory and
+            root_prefix_empty and
             (std.mem.eql(u8, raw_name, ".") or std.mem.eql(u8, raw_name, "./")))
         {
             const raw_link = if (pending_long_link) |value| value else fieldString(header[157..257]) orelse
                 return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
             if (raw_link.len != 0)
                 return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+            if (root != null)
+                return setTarFailure(diagnostic, stage, .duplicate_path, member, offset, entries.items.len);
+            inventory_bytes = std.math.add(usize, inventory_bytes, @sizeOf(RootEntry)) catch
+                return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
+            if (inventory_bytes > limits.max_inventory_bytes_per_tar)
+                return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
+            root = .{
+                .mode = @intCast(mode_u64),
+                .uid = uid,
+                .gid = gid,
+                .owner_name = owner_name,
+                .group_name = group_name,
+                .header_offset = offset,
+            };
             if (pending_long_name) |value| {
                 allocator.free(value);
                 pending_long_name = null;
@@ -1121,6 +1181,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         .compression = member.compression,
         .compressed_bytes = member.size,
         .decompressed_bytes = bytes.len,
+        .root = root,
         .entries = entries.toOwnedSlice(allocator) catch return setTarFailure(diagnostic, stage, .out_of_memory, member, 0, null),
         .entry_headers = header_count,
         .inventory_bytes = inventory_bytes,
@@ -1523,6 +1584,9 @@ fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
 const DescriptorTestOptions = struct {
     extra_control_fields: []const u8 = "",
     extra_data_path: ?[]const u8 = null,
+    control_root_mode: u32 = 0o755,
+    data_root_mode: u32 = 0o755,
+    script_mode: u32 = 0o755,
     source_mode: u32 = 0o644,
     source_kind: u8 = '0',
     keyring_mode: u32 = 0o644,
@@ -1533,6 +1597,9 @@ const DescriptorTestOptions = struct {
     keyring_ownership: TestTarOwnership = .{},
     source_parent_ownership: TestTarOwnership = .{},
     keyring_parent_ownership: TestTarOwnership = .{},
+    control_root_ownership: TestTarOwnership = .{},
+    data_root_ownership: TestTarOwnership = .{},
+    script_ownership: TestTarOwnership = .{},
 };
 
 fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOptions) ![]u8 {
@@ -1544,6 +1611,7 @@ fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOption
         .{options.extra_control_fields},
     );
     defer allocator.free(metadata);
+    try appendOwnedTarEntry(allocator, &control, "./", '5', options.control_root_mode, "", "", options.control_root_ownership);
     try appendTarEntry(allocator, &control, "./control", '0', 0o644, "", metadata);
     try appendTarEntry(allocator, &control, "./md5sums", '0', 0o644, "", "");
     try appendTarEntry(
@@ -1557,13 +1625,15 @@ fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOption
             "/usr/share/keyrings/vendor.gpg\n" ++
             "/etc/debsig/policies/ABC/vendor.pol\n",
     );
-    try appendTarEntry(allocator, &control, "./preinst", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
-    try appendTarEntry(allocator, &control, "./postinst", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
-    try appendTarEntry(allocator, &control, "./prerm", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
+    try appendOwnedTarEntry(allocator, &control, "./preinst", '0', options.script_mode, "", "#!/bin/sh\nexit 0\n", options.script_ownership);
+    try appendOwnedTarEntry(allocator, &control, "./postinst", '0', options.script_mode, "", "#!/bin/sh\nexit 0\n", options.script_ownership);
+    try appendOwnedTarEntry(allocator, &control, "./prerm", '0', options.script_mode, "", "#!/bin/sh\nexit 0\n", options.script_ownership);
+    try appendOwnedTarEntry(allocator, &control, "./postrm", '0', options.script_mode, "", "#!/bin/sh\nexit 0\n", options.script_ownership);
     try finishTar(allocator, &control);
 
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
+    try appendOwnedTarEntry(allocator, &data, "./", '5', options.data_root_mode, "", "", options.data_root_ownership);
     try appendTarEntry(allocator, &data, "./etc", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./etc/" ++ "apt", '5', 0o755, "", "");
     try appendOwnedTarEntry(allocator, &data, "./etc/" ++ "apt/sources.list.d", '5', options.source_parent_mode, "", "", options.source_parent_ownership);
@@ -1676,7 +1746,7 @@ test "local inspection derives identity and copies selected static repository fi
     try std.testing.expectEqualStrings("all", validation.architecture);
     try std.testing.expectEqual(ProvenanceKind.local_artifact, validation.provenance.kind);
     try std.testing.expectEqualStrings("ca-certificates", validation.relationships.depends.?);
-    try std.testing.expectEqual(@as(usize, 3), validation.scripts.len);
+    try std.testing.expectEqual(@as(usize, 4), validation.scripts.len);
 
     const source_bytes = try validation.regularPayloadBytes(
         "etc/apt/sources.list.d/vendor.list",
@@ -1869,6 +1939,91 @@ test "repository descriptor rejects ambiguous USTAR owner name metadata" {
     try std.testing.expectEqual(Code.tar_invalid_owner, result.diagnostic.code);
 }
 
+test "repository descriptor preserves valid control extraction root ownership" {
+    const allocator = std.testing.allocator;
+    const bytes = try descriptorTestDeb(allocator, .{
+        .control_root_ownership = .{
+            .owner_name = "root",
+            .group_name = "root",
+        },
+        .script_ownership = .{
+            .owner_name = "root",
+            .group_name = "root",
+        },
+    });
+    defer allocator.free(bytes);
+    var result = inspectLocal(allocator, bytes, .{
+        .profile = .repository_descriptor,
+    }, .{});
+    switch (result) {
+        .diagnostic => |diagnostic| {
+            std.debug.print("{s} at {d}\n", .{ diagnostic.message(), diagnostic.offset });
+            return error.UnexpectedDiagnostic;
+        },
+        .validation => |*validation| {
+            defer validation.deinit();
+            const root = validation.control.root orelse return error.MissingControlRoot;
+            try std.testing.expectEqual(@as(u32, 0o755), root.mode);
+            try std.testing.expectEqual(@as(u64, 0), root.uid);
+            try std.testing.expectEqual(@as(u64, 0), root.gid);
+            try std.testing.expectEqualStrings("root", root.owner_name.?);
+            try std.testing.expectEqualStrings("root", root.group_name.?);
+            for (validation.control.entries) |entry| {
+                if (!std.mem.eql(u8, entry.path, "preinst")) continue;
+                try std.testing.expectEqualStrings("root", entry.owner_name.?);
+                try std.testing.expectEqualStrings("root", entry.group_name.?);
+                break;
+            } else return error.MissingPreinst;
+        },
+    }
+}
+
+test "repository descriptor rejects unsafe maintainer script ownership and modes" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        options: DescriptorTestOptions,
+        code: Code,
+    }{
+        .{ .options = .{ .script_mode = 0o775 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .script_mode = 0o4755 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .script_ownership = .{ .uid = 1000 } }, .code = .descriptor_unsafe_owner },
+        .{ .options = .{ .script_ownership = .{ .gid = 1000 } }, .code = .descriptor_unsafe_owner },
+        .{ .options = .{ .script_ownership = .{ .owner_name = "builder" } }, .code = .descriptor_unsafe_owner },
+        .{ .options = .{ .script_ownership = .{ .group_name = "users" } }, .code = .descriptor_unsafe_owner },
+    };
+    for (cases) |case| {
+        const bytes = try descriptorTestDeb(allocator, case.options);
+        defer allocator.free(bytes);
+        const result = inspectLocal(allocator, bytes, .{
+            .profile = .repository_descriptor,
+        }, .{});
+        try std.testing.expectEqual(Stage.descriptor_profile, result.diagnostic.stage);
+        try std.testing.expectEqual(case.code, result.diagnostic.code);
+    }
+}
+
+test "repository descriptor rejects unsafe control and data extraction roots" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        options: DescriptorTestOptions,
+        code: Code,
+    }{
+        .{ .options = .{ .control_root_mode = 0o775 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .data_root_mode = 0o2755 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .control_root_ownership = .{ .uid = 1000 } }, .code = .descriptor_unsafe_owner },
+        .{ .options = .{ .data_root_ownership = .{ .group_name = "users" } }, .code = .descriptor_unsafe_owner },
+    };
+    for (cases) |case| {
+        const bytes = try descriptorTestDeb(allocator, case.options);
+        defer allocator.free(bytes);
+        const result = inspectLocal(allocator, bytes, .{
+            .profile = .repository_descriptor,
+        }, .{});
+        try std.testing.expectEqual(Stage.descriptor_profile, result.diagnostic.stage);
+        try std.testing.expectEqual(case.code, result.diagnostic.code);
+    }
+}
+
 test "repository descriptor bounds apply before data decompression and inventory materialization" {
     const allocator = std.testing.allocator;
     const bytes = try descriptorTestDeb(allocator, .{});
@@ -1886,7 +2041,7 @@ test "repository descriptor bounds apply before data decompression and inventory
     const inventory_result = inspectLocal(allocator, bytes, .{
         .profile = .repository_descriptor,
     }, .{
-        .max_descriptor_entries = 6,
+        .max_descriptor_entries = 9,
     });
     try std.testing.expectEqual(Stage.data_tar, inventory_result.diagnostic.stage);
     try std.testing.expectEqual(Code.tar_entry_limit, inventory_result.diagnostic.code);
@@ -2088,6 +2243,16 @@ test "accepts GNU base headers but rejects GNU and PAX extension records" {
     try appendGnuTarEntry(allocator, &tar, "./", '5', 0o755, "", "");
     try finishTar(allocator, &tar);
     try std.testing.expectError(error.EntryLimit, parseTarTest(allocator, tar.items, member, .{ .max_entries_per_tar = 1 }));
+
+    tar.clearRetainingCapacity();
+    try appendTarEntry(allocator, &tar, ".", '5', 0o755, "", "");
+    std.mem.copyForwards(u8, tar.items[345..500], "parent");
+    @memset(tar.items[148..156], ' ');
+    var checksum: u64 = 0;
+    for (tar.items[0..512]) |byte| checksum += byte;
+    writeOctal(tar.items[148..156], checksum);
+    try finishTar(allocator, &tar);
+    try std.testing.expectError(error.UnsafePath, parseTarTest(allocator, tar.items, member, .{}));
 }
 
 fn parseTarTest(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, limits: Limits) !void {
@@ -2095,6 +2260,7 @@ fn parseTarTest(allocator: std.mem.Allocator, bytes: []const u8, member: deb_arc
     var inventory = parseTar(allocator, bytes, member, .data_tar, limits, &diagnostic) catch switch (diagnostic.code) {
         .duplicate_path => return error.DuplicatePath,
         .unsupported_file_type, .unsupported_tar_extension => return error.Unsupported,
+        .unsafe_path => return error.UnsafePath,
         .unsafe_link => return error.UnsafeLink,
         .tar_entry_limit => return error.EntryLimit,
         .tar_metadata_limit => return error.MetadataLimit,
