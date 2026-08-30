@@ -52,6 +52,14 @@ can enforce a narrow repository-descriptor profile. See
 
 Repository sources can be supplied explicitly as canonical `.sources` stanzas or legacy `deb` and `deb-src` lines; parsing never consults host APT configuration. Parsed sources preserve spans, enforce caller-configurable bounds, and receive deterministic IDs from normalized declared values.
 
+`debz.target_apt_config` provides an explicit, injectable target-root import
+boundary for APT sources, binary OpenPGP keyrings, and dpkg-native architecture
+state. Its production filesystem adapter is traversal-safe and no-follow;
+logical `Signed-By` values remain root-independent while verifier inputs use
+the imported bytes. Imports produce the canonical, digest-bound
+[`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) manifest. See
+[Target-root APT configuration snapshots](target-apt-config.md).
+
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 
 ## Repository metadata

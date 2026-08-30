@@ -93,6 +93,7 @@ pub const packages_index = @import("packages_index.zig");
 pub const metadata_decompression = @import("metadata_decompression.zig");
 pub const repository_refresh = @import("repository_refresh.zig");
 pub const repository_policy = @import("repository_policy.zig");
+pub const target_apt_config = @import("target_apt_config.zig");
 pub const signed_release_envelope = @import("signed_release_envelope.zig");
 pub const openpgp_verifier = @import("openpgp_verifier.zig");
 pub const transaction_executor = @import("transaction_executor.zig");
@@ -217,6 +218,7 @@ test {
     _ = metadata_decompression;
     _ = repository_refresh;
     _ = repository_policy;
+    _ = target_apt_config;
     _ = signed_release_envelope;
     _ = openpgp_verifier;
     _ = transaction_executor;

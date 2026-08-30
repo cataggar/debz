@@ -107,6 +107,33 @@ pub const VerifyError = error{
     UnsupportedKeyringArmor,
 } || std.Io.Dir.ReadFileAllocError;
 
+pub const KeyringInspection = struct {
+    primary_fingerprints: [][20]u8,
+
+    pub fn deinit(self: *KeyringInspection, allocator: std.mem.Allocator) void {
+        allocator.free(self.primary_fingerprints);
+        self.* = undefined;
+    }
+};
+
+pub const KeyringInspectionTotals = struct {
+    bytes: usize = 0,
+    packets: usize = 0,
+    keys: usize = 0,
+};
+
+pub const InspectKeyringError = error{
+    KeyringTooLarge,
+    PacketTooLarge,
+    TooManyPackets,
+    TooManyKeys,
+    MalformedKeyring,
+    UnsupportedKeyringArmor,
+    UnsupportedKeyMaterial,
+    UnsupportedKeySize,
+    NoSupportedPrimaryKeys,
+} || std.mem.Allocator.Error;
+
 const Packet = struct {
     tag: u6,
     body: []const u8,
@@ -214,6 +241,7 @@ const KeyringState = struct {
     keys: std.ArrayList(Key) = .empty,
     owned_keyrings: std.ArrayList([]u8) = .empty,
     packet_count: usize = 0,
+    key_count: usize = 0,
 
     fn deinit(self: *KeyringState) void {
         self.keys.deinit(self.allocator);
@@ -258,6 +286,74 @@ pub fn verify(allocator: std.mem.Allocator, request: Request) VerifyError!Outcom
     return if (accepted != null) .{ .accepted = report } else .{ .rejected = report };
 }
 
+/// Parses a binary keyring without performing signature verification and
+/// returns every supported v4 primary-key fingerprint. Unlike `verify`, this
+/// preflight is strict: unsupported public or secret key material is rejected
+/// rather than ignored.
+pub fn inspectKeyring(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    limits: Limits,
+) InspectKeyringError!KeyringInspection {
+    var totals: KeyringInspectionTotals = .{};
+    return inspectKeyringWithTotals(allocator, bytes, limits, &totals);
+}
+
+/// Strictly inspects one keyring while applying byte, packet, and key limits
+/// cumulatively with prior successful inspections using the same totals.
+pub fn inspectKeyringWithTotals(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    limits: Limits,
+    totals: *KeyringInspectionTotals,
+) InspectKeyringError!KeyringInspection {
+    const total_bytes = std.math.add(usize, totals.bytes, bytes.len) catch
+        return error.KeyringTooLarge;
+    if (total_bytes > limits.max_keyring_bytes) return error.KeyringTooLarge;
+    if (std.mem.startsWith(
+        u8,
+        std.mem.trimStart(u8, bytes, " \t\r\n"),
+        "-----BEGIN PGP",
+    ))
+        return error.UnsupportedKeyringArmor;
+
+    var state = KeyringState{
+        .allocator = allocator,
+        .packet_count = totals.packets,
+        .key_count = totals.keys,
+    };
+    defer state.deinit();
+    try parseKeyringMode(&state, bytes, limits, true);
+
+    var fingerprints: std.ArrayList([20]u8) = .empty;
+    defer fingerprints.deinit(allocator);
+    for (state.keys.items) |key| {
+        if (key.is_primary) try fingerprints.append(allocator, key.fingerprint);
+    }
+    if (fingerprints.items.len == 0) return error.NoSupportedPrimaryKeys;
+    std.mem.sort([20]u8, fingerprints.items, {}, struct {
+        fn less(_: void, left: [20]u8, right: [20]u8) bool {
+            return std.mem.order(u8, &left, &right) == .lt;
+        }
+    }.less);
+    var write_index: usize = 0;
+    for (fingerprints.items) |fingerprint| {
+        if (write_index != 0 and
+            std.mem.eql(u8, &fingerprint, &fingerprints.items[write_index - 1]))
+            continue;
+        fingerprints.items[write_index] = fingerprint;
+        write_index += 1;
+    }
+    fingerprints.items.len = write_index;
+    const owned_fingerprints = try fingerprints.toOwnedSlice(allocator);
+    totals.* = .{
+        .bytes = total_bytes,
+        .packets = state.packet_count,
+        .keys = state.key_count,
+    };
+    return .{ .primary_fingerprints = owned_fingerprints };
+}
+
 fn addKeyring(
     state: *KeyringState,
     source: Keyring,
@@ -285,10 +381,19 @@ fn addKeyring(
         return error.KeyringTooLarge;
     if (total_keyring_bytes.* > request.limits.max_keyring_bytes) return error.KeyringTooLarge;
     if (std.mem.startsWith(u8, bytes, "-----BEGIN PGP")) return error.UnsupportedKeyringArmor;
-    try parseKeyring(state, bytes, request.limits);
+    parseKeyringMode(state, bytes, request.limits, false) catch |err| switch (err) {
+        error.UnsupportedKeyMaterial => unreachable,
+        error.UnsupportedKeySize => unreachable,
+        else => |other| return other,
+    };
 }
 
-fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
+fn parseKeyringMode(
+    state: *KeyringState,
+    bytes: []const u8,
+    limits: Limits,
+    reject_unsupported: bool,
+) !void {
     var parser = Parser{ .bytes = bytes, .count = state.packet_count, .limits = limits };
     defer state.packet_count = parser.count;
     var primary_index: ?usize = null;
@@ -298,9 +403,10 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
     while (try parser.next()) |packet| {
         switch (packet.tag) {
             6 => {
-                if (state.keys.items.len >= limits.max_keys) return error.TooManyKeys;
+                if (state.key_count >= limits.max_keys) return error.TooManyKeys;
                 const key = parseKey(packet.body, null, true) catch |err| switch (err) {
                     error.UnsupportedAlgorithm => {
+                        if (reject_unsupported) return error.UnsupportedKeyMaterial;
                         primary_index = null;
                         subject_index = null;
                         user_id = null;
@@ -308,27 +414,33 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
                     },
                     else => return error.MalformedKeyring,
                 };
+                if (reject_unsupported) try validateInspectableKey(key);
                 try state.keys.append(state.allocator, key);
+                state.key_count += 1;
                 primary_index = state.keys.items.len - 1;
                 subject_index = primary_index;
                 user_id = null;
             },
             14 => {
                 const pi = primary_index orelse {
+                    if (reject_unsupported) return error.MalformedKeyring;
                     subject_index = null;
                     user_id = null;
                     continue;
                 };
-                if (state.keys.items.len >= limits.max_keys) return error.TooManyKeys;
+                if (state.key_count >= limits.max_keys) return error.TooManyKeys;
                 const key = parseKey(packet.body, state.keys.items[pi].fingerprint, false) catch |err| switch (err) {
                     error.UnsupportedAlgorithm => {
+                        if (reject_unsupported) return error.UnsupportedKeyMaterial;
                         subject_index = null;
                         user_id = null;
                         continue;
                     },
                     else => return error.MalformedKeyring,
                 };
+                if (reject_unsupported) try validateInspectableKey(key);
                 try state.keys.append(state.allocator, key);
+                state.key_count += 1;
                 subject_index = state.keys.items.len - 1;
                 user_id = null;
             },
@@ -344,9 +456,25 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
                 applyKeySignature(state.keys.items, pi, si, user_id, packet.body, limits) catch
                     return error.MalformedKeyring;
             },
+            5, 7 => if (reject_unsupported) return error.UnsupportedKeyMaterial,
             else => {},
         }
     }
+}
+
+fn validateInspectableKey(key: Key) !void {
+    if (key.algorithm != 1 and key.algorithm != 3) return;
+    const modulus_bits = key.modulus.len * 8 - @as(usize, @clz(key.modulus[0]));
+    if (modulus_bits != 2048 and modulus_bits != 3072 and modulus_bits != 4096)
+        return error.UnsupportedKeySize;
+    if ((key.modulus[key.modulus.len - 1] & 1) == 0 or
+        (key.exponent[key.exponent.len - 1] & 1) == 0 or
+        (key.exponent.len == 1 and key.exponent[0] < 3))
+        return error.MalformedKeyring;
+    _ = std.crypto.Certificate.rsa.PublicKey.fromBytes(
+        key.exponent,
+        key.modulus,
+    ) catch return error.MalformedKeyring;
 }
 
 fn parseKey(body: []const u8, primary: ?[20]u8, is_primary: bool) !Key {
@@ -1142,4 +1270,150 @@ test "strict keyring and count bounds reject before verification" {
     request = fixtureRequest(&fixture.keyring, &.{&fixture.signature}, fixture.created + 30);
     request.limits.max_signed_bytes = fixture.message.len - 1;
     try std.testing.expectError(error.SignedDataTooLarge, verify(std.testing.allocator, request));
+}
+
+test "keyring inspection returns primary fingerprints and rejects unsupported material" {
+    var inspected = try inspectKeyring(std.testing.allocator, &fixture.keyring, .{});
+    defer inspected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), inspected.primary_fingerprints.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fixture.primary_fingerprint,
+        &inspected.primary_fingerprints[0],
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedKeyringArmor,
+        inspectKeyring(std.testing.allocator, "-----BEGIN PGP PUBLIC KEY BLOCK-----\n", .{}),
+    );
+
+    var unsupported_key = fixture.ed25519_keyring;
+    var packet_parser = Parser{ .bytes = &unsupported_key, .limits = .{} };
+    const packet = (try packet_parser.next()).?;
+    const body_offset = @intFromPtr(packet.body.ptr) - @intFromPtr(unsupported_key[0..].ptr);
+    unsupported_key[body_offset + 5] = 19;
+    try std.testing.expectError(
+        error.UnsupportedKeyMaterial,
+        inspectKeyring(std.testing.allocator, &unsupported_key, .{}),
+    );
+}
+
+fn wrongSizeRsaPacket(tag: u6) [272]u8 {
+    var wrong_size_rsa: [272]u8 = undefined;
+    wrong_size_rsa[0] = 0xc0 | @as(u8, tag);
+    wrong_size_rsa[1] = 0xc0;
+    wrong_size_rsa[2] = 0x4d;
+    wrong_size_rsa[3] = 4;
+    @memset(wrong_size_rsa[4..8], 0);
+    wrong_size_rsa[8] = 1;
+    wrong_size_rsa[9] = 0x07;
+    wrong_size_rsa[10] = 0xff;
+    wrong_size_rsa[11] = 0x7f;
+    @memset(wrong_size_rsa[12..267], 0xff);
+    wrong_size_rsa[267] = 0x00;
+    wrong_size_rsa[268] = 0x11;
+    wrong_size_rsa[269] = 0x01;
+    wrong_size_rsa[270] = 0x00;
+    wrong_size_rsa[271] = 0x01;
+    return wrong_size_rsa;
+}
+
+test "keyring inspection rejects unsupported RSA sizes and unusable parameters" {
+    const wrong_size_rsa = wrongSizeRsaPacket(6);
+    try std.testing.expectError(
+        error.UnsupportedKeySize,
+        inspectKeyring(std.testing.allocator, &wrong_size_rsa, .{}),
+    );
+
+    var unusable = fixture.keyring;
+    var parser = Parser{ .bytes = &unusable, .limits = .{} };
+    const packet = (try parser.next()).?;
+    var offset: usize = 6;
+    _ = try readMpi(packet.body, &offset);
+    const exponent = try readMpi(packet.body, &offset);
+    const exponent_offset = @intFromPtr(exponent.ptr) - @intFromPtr(unusable[0..].ptr);
+    unusable[exponent_offset + exponent.len - 1] = 0;
+    try std.testing.expectError(
+        error.MalformedKeyring,
+        inspectKeyring(std.testing.allocator, &unusable, .{}),
+    );
+}
+
+test "strict keyring inspection rejects orphan public subkeys" {
+    const malformed_orphan = [_]u8{ 0xce, 1, 0 };
+    const malformed_then_primary = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{ &malformed_orphan, &fixture.keyring },
+    );
+    defer std.testing.allocator.free(malformed_then_primary);
+    try std.testing.expectError(
+        error.MalformedKeyring,
+        inspectKeyring(std.testing.allocator, malformed_then_primary, .{}),
+    );
+
+    const wrong_size_orphan = wrongSizeRsaPacket(14);
+    const wrong_size_then_primary = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{ &wrong_size_orphan, &fixture.keyring },
+    );
+    defer std.testing.allocator.free(wrong_size_then_primary);
+    try std.testing.expectError(
+        error.MalformedKeyring,
+        inspectKeyring(std.testing.allocator, wrong_size_then_primary, .{}),
+    );
+}
+
+test "keyring inspection totals enforce aggregate verifier limits" {
+    var single_totals: KeyringInspectionTotals = .{};
+    var single = try inspectKeyringWithTotals(
+        std.testing.allocator,
+        &fixture.keyring,
+        .{},
+        &single_totals,
+    );
+    single.deinit(std.testing.allocator);
+
+    var totals: KeyringInspectionTotals = .{};
+    const packet_limits: Limits = .{
+        .max_packets = single_totals.packets * 2 - 1,
+    };
+    var first_packets = try inspectKeyringWithTotals(
+        std.testing.allocator,
+        &fixture.keyring,
+        packet_limits,
+        &totals,
+    );
+    first_packets.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.TooManyPackets,
+        inspectKeyringWithTotals(
+            std.testing.allocator,
+            &fixture.keyring,
+            packet_limits,
+            &totals,
+        ),
+    );
+
+    totals = .{};
+    const key_limits: Limits = .{
+        .max_keys = single_totals.keys * 2 - 1,
+    };
+    var first_keys = try inspectKeyringWithTotals(
+        std.testing.allocator,
+        &fixture.keyring,
+        key_limits,
+        &totals,
+    );
+    first_keys.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.TooManyKeys,
+        inspectKeyringWithTotals(
+            std.testing.allocator,
+            &fixture.keyring,
+            key_limits,
+            &totals,
+        ),
+    );
 }

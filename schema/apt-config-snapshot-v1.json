@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-config-snapshot-v1",
+  "title": "debz target APT configuration snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "native_architecture",
+    "foreign_architectures",
+    "sources",
+    "configuration_id",
+    "repository_ids",
+    "keyrings",
+    "global_trust_compatibility",
+    "exclusions",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-config-snapshot-v1" },
+    "version": { "const": 1 },
+    "native_architecture": { "$ref": "#/$defs/architecture" },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/architecture" }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "sha256", "format"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "format": { "enum": ["deb822", "legacy"] }
+        }
+      }
+    },
+    "configuration_id": { "$ref": "#/$defs/sha256" },
+    "repository_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sha256" }
+    },
+    "keyrings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "sha256", "primary_fingerprints", "use"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "primary_fingerprints": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/fingerprint" }
+          },
+          "use": { "enum": ["declared", "global", "declared_and_global"] }
+        }
+      }
+    },
+    "global_trust_compatibility": { "type": "boolean" },
+    "exclusions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "reason"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "reason": { "enum": ["unsupported_name", "directory", "symlink", "special"] }
+        }
+      }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9-]+$"
+    },
+    "logical_path": {
+      "type": "string",
+      "minLength": 2,
+      "allOf": [
+        {
+          "pattern": "^/[^/\\\\\\u0000-\\u001f\\u007f]+(?:/[^/\\\\\\u0000-\\u001f\\u007f]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)\\.\\.?($|/)"
+          }
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  }
+}

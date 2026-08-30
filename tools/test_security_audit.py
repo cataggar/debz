@@ -113,6 +113,16 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertEqual(included["musl"]["linkage"], "static_libc_in_debz")
         self.assertEqual(included["musl"]["license"], "MIT")
 
+    def test_target_apt_import_is_the_only_additional_process_and_apt_boundary(self) -> None:
+        source = (ROOT / "src/target_apt_config.zig").read_text()
+        self.assertEqual(source.count("std.process.run("), 1)
+        self.assertIn(".environ_map = &environ", source)
+        self.assertIn('const sources_list_path = "/etc/apt/sources.list";', source)
+        self.assertIn(
+            'const global_keyring_directory_path = "/etc/apt/trusted.gpg.d";',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

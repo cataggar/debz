@@ -39,6 +39,9 @@ fi
 
 test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
+test -f "$release_prefix/share/debz/schema/apt-config-snapshot-v1.json"
+test -f "$release_prefix/share/doc/debz/schema/apt-config-snapshot-v1.json"
+test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
 python3 - "$release_prefix/share/debz/runtime-dependencies.json" <<'PY'
 import json
 import pathlib

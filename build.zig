@@ -226,6 +226,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-repository-policy", "Run multi-repository policy tests")
         .dependOn(&run_policy_tests.step);
 
+    const target_apt_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"target_apt_config.test."},
+    });
+    const run_target_apt_tests = b.addRunArtifact(target_apt_tests);
+    b.step("test-target-apt-config", "Run target-root APT configuration import tests")
+        .dependOn(&run_target_apt_tests.step);
+
     const transaction_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"transaction_executor.test."},
@@ -324,9 +332,11 @@ fn installReleaseFiles(
         "threat-model.md",
         "transaction-executor.md",
         "transaction-recovery.md",
+        "target-apt-config.md",
         "zvmi-package-family.md",
     };
     const schemas = [_][]const u8{
+        "apt-config-snapshot-v1.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "transaction-plan-v1.json",
