@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import importlib.util
-import hashlib
 import gzip
 import io
 import json
@@ -14,7 +13,6 @@ import lzma
 import os
 import pathlib
 import struct
-import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -261,53 +259,21 @@ class ReleaseTests(unittest.TestCase):
             release.validate_static_elf(binary, "linux-arm64")
         first = self.root / "first"
         second = self.root / "second"
-        release.create_release_files(first, "debz-0.1.0-linux-x64", "0.1.0", entries, 123, dependencies)
+        release.create_release_files(first, "debz-0.1.0-linux-x64", entries, 123)
         os.utime(prefix / "bin/debz", (9999, 9999))
-        release.create_release_files(second, "debz-0.1.0-linux-x64", "0.1.0", entries, 123, dependencies)
-        for name in sorted(path.name for path in first.iterdir()):
-            self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
-        release.audit_archive(first / "debz-0.1.0-linux-x64.tar.gz", "binary", "0.1.0", "linux-x64")
-
-    def test_source_is_from_commit_not_worktree(self) -> None:
-        repo = self.root / "repo"
-        repo.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-        for name, data in (
-            ("LICENSE", "license"),
-            ("THIRD_PARTY_NOTICES", "notices"),
-            ("build.zig.zon", "zon"),
-            ("source.txt", "committed"),
-        ):
-            (repo / name).write_text(data)
-        subprocess.run(["git", "add", "."], cwd=repo, check=True)
-        subprocess.run(
-            ["git", "commit", "-qm", "fixture"], cwd=repo, check=True, env={**os.environ, "GIT_AUTHOR_DATE": "2001-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2001-01-01T00:00:00Z"}
+        release.create_release_files(second, "debz-0.1.0-linux-x64", entries, 123)
+        self.assertEqual(
+            {path.name for path in first.iterdir()},
+            {
+                "debz-0.1.0-linux-x64.tar.gz",
+                "debz-0.1.0-linux-x64.tar.xz",
+            },
         )
-        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-        (repo / "source.txt").write_text("dirty")
-        (repo / "untracked-secret").write_text("not archived")
-        entries = release.source_entries(repo, commit, "debz-0.1.0-source")
-        values = {name: data for name, data, _ in entries}
-        self.assertEqual(values["debz-0.1.0-source/source.txt"], b"committed")
-        self.assertNotIn("debz-0.1.0-source/untracked-secret", values)
-        dependencies = release.policy_dependencies(self.policy)
-        first = self.root / "source-first"
-        second = self.root / "source-second"
-        release.create_release_files(first, "debz-0.1.0-source", "0.1.0", entries, 978307200, dependencies)
-        release.create_release_files(second, "debz-0.1.0-source", "0.1.0", entries, 978307200, dependencies)
         for name in sorted(path.name for path in first.iterdir()):
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
-
-    def test_checksum_tampering_is_rejected(self) -> None:
-        asset = self.root / "asset"
-        asset.write_bytes(b"good")
-        sidecar = release.write_checksum(asset)
-        release.validate_checksum(sidecar, asset)
-        asset.write_bytes(b"bad")
-        with self.assertRaises(release.ReleaseError):
-            release.validate_checksum(sidecar, asset)
+        release.audit_archive(
+            first / "debz-0.1.0-linux-x64.tar.gz", "0.1.0", "linux-x64"
+        )
 
     def test_missing_licenses_are_rejected(self) -> None:
         prefix = self.prefix()
@@ -404,7 +370,7 @@ class ReleaseTests(unittest.TestCase):
         path = self.root / "unexpected.tar.gz"
         path.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
         with self.assertRaisesRegex(release.ReleaseError, "unexpected install path"):
-            release.audit_archive(path, "binary", "0.1.0", "linux-x64")
+            release.audit_archive(path, "0.1.0", "linux-x64")
 
     def test_nondeterministic_metadata_and_order_are_rejected(self) -> None:
         path = self.root / "bad-order.tar"
@@ -416,11 +382,9 @@ class ReleaseTests(unittest.TestCase):
             release.archive_entries(path)
 
     def test_archive_audit_accepts_portable_compression_variants(self) -> None:
-        entries = [
-            ("debz-0.1.0-source/LICENSE", b"license", 0o644),
-            ("debz-0.1.0-source/THIRD_PARTY_NOTICES", b"notices", 0o644),
-            ("debz-0.1.0-source/build.zig.zon", b"zon", 0o644),
-        ]
+        entries, _ = release.binary_entries(
+            self.prefix(), "debz-0.1.0-linux-x64"
+        )
         tar_data = release.build_tar(entries, 123)
         gzip_bytes = []
         for level in (1, 9):
@@ -432,21 +396,19 @@ class ReleaseTests(unittest.TestCase):
         for index, data in enumerate(gzip_bytes):
             path = self.root / f"portable-{index}.tar.gz"
             path.write_bytes(data)
-            release.audit_archive(path, "source", "0.1.0", None)
+            release.audit_archive(path, "0.1.0", "linux-x64")
 
         xz_bytes = [lzma.compress(tar_data, format=lzma.FORMAT_XZ, preset=preset) for preset in (0, 9)]
         self.assertNotEqual(xz_bytes[0], xz_bytes[1])
         for index, data in enumerate(xz_bytes):
             path = self.root / f"portable-{index}.tar.xz"
             path.write_bytes(data)
-            release.audit_archive(path, "source", "0.1.0", None)
+            release.audit_archive(path, "0.1.0", "linux-x64")
 
     def test_archive_container_corruption_trailing_and_payload_mismatch_are_rejected(self) -> None:
-        entries = [
-            ("debz-0.1.0-source/LICENSE", b"license", 0o644),
-            ("debz-0.1.0-source/THIRD_PARTY_NOTICES", b"notices", 0o644),
-            ("debz-0.1.0-source/build.zig.zon", b"zon", 0o644),
-        ]
+        entries, _ = release.binary_entries(
+            self.prefix(), "debz-0.1.0-linux-x64"
+        )
         tar_data = release.build_tar(entries, 123)
         for archive_format in ("tar.gz", "tar.xz"):
             valid = release.compress_tar(tar_data, archive_format)
@@ -459,12 +421,12 @@ class ReleaseTests(unittest.TestCase):
                 path = self.root / f"{case}.{archive_format}"
                 path.write_bytes(data)
                 with self.subTest(format=archive_format, case=case), self.assertRaises(release.ReleaseError):
-                    release.audit_archive(path, "source", "0.1.0", None)
+                    release.audit_archive(path, "0.1.0", "linux-x64")
 
         wrong_format = self.root / "wrong.tar.xz"
         wrong_format.write_bytes(release.compress_tar(tar_data, "tar.gz"))
         with self.assertRaisesRegex(release.ReleaseError, "not xz"):
-            release.audit_archive(wrong_format, "source", "0.1.0", None)
+            release.audit_archive(wrong_format, "0.1.0", "linux-x64")
 
         noncanonical = self.root / "timestamp.tar.gz"
         output = io.BytesIO()
@@ -472,79 +434,7 @@ class ReleaseTests(unittest.TestCase):
             stream.write(tar_data)
         noncanonical.write_bytes(output.getvalue())
         with self.assertRaisesRegex(release.ReleaseError, "timestamp is not canonical"):
-            release.audit_archive(noncanonical, "source", "0.1.0", None)
-
-    def test_manifest_and_sbom_are_stable_and_complete(self) -> None:
-        first = release.canonical_json(release.manifest_document("v0.1.0"))
-        second = release.canonical_json(release.manifest_document("v0.1.0"))
-        self.assertEqual(first, second)
-        manifest = json.loads(first)
-        self.assertEqual(len(manifest["assets"]), 26)
-        entries, _ = release.binary_entries(self.prefix(), "debz-0.1.0-linux-x64")
-        sbom = release.spdx_document(
-            "debz-0.1.0-linux-x64",
-            "0.1.0",
-            "debz-0.1.0-linux-x64.tar.gz",
-            entries,
-            release.policy_dependencies(self.policy),
-            "0" * 64,
-        )
-        path = self.root / "test.spdx.json"
-        path.write_bytes(release.canonical_json(sbom))
-        dependencies = release.policy_dependencies(self.policy)
-        release.verify_sbom(
-            path,
-            "debz-0.1.0-linux-x64.tar.gz",
-            dependencies,
-        )
-        packages = {item["name"]: item for item in sbom["packages"]}
-        self.assertEqual(
-            packages["musl"]["versionInfo"],
-            "1.2.5+zig.0.16.0.24fdd5b7a4c1",
-        )
-        self.assertEqual(packages["musl"]["licenseDeclared"], "MIT")
-        sha1_values = sorted(
-            checksum["checksumValue"]
-            for file_entry in sbom["files"]
-            for checksum in file_entry["checksums"]
-            if checksum["algorithm"] == "SHA1"
-        )
-        expected = hashlib.sha1("".join(sha1_values).encode("ascii")).hexdigest()
-        self.assertEqual(
-            sbom["packages"][0]["packageVerificationCode"]["packageVerificationCodeValue"],
-            expected,
-        )
-        missing_license = json.loads(release.canonical_json(sbom))
-        del missing_license["files"][0]["licenseInfoInFiles"]
-        path.write_bytes(release.canonical_json(missing_license))
-        with self.assertRaisesRegex(release.ReleaseError, "licenseInfoInFiles"):
-            release.verify_sbom(
-                path,
-                "debz-0.1.0-linux-x64.tar.gz",
-                dependencies,
-            )
-        bad_verification = json.loads(release.canonical_json(sbom))
-        bad_verification["packages"][0]["packageVerificationCode"]["packageVerificationCodeValue"] = "0" * 40
-        path.write_bytes(release.canonical_json(bad_verification))
-        with self.assertRaisesRegex(release.ReleaseError, "packageVerificationCode"):
-            release.verify_sbom(
-                path,
-                "debz-0.1.0-linux-x64.tar.gz",
-                dependencies,
-            )
-        wrong_musl = json.loads(release.canonical_json(sbom))
-        next(
-            package
-            for package in wrong_musl["packages"]
-            if package["name"] == "musl"
-        )["versionInfo"] = "1.2.5"
-        path.write_bytes(release.canonical_json(wrong_musl))
-        with self.assertRaisesRegex(release.ReleaseError, "reviewed policy for musl"):
-            release.verify_sbom(
-                path,
-                "debz-0.1.0-linux-x64.tar.gz",
-                dependencies,
-            )
+            release.audit_archive(noncanonical, "0.1.0", "linux-x64")
 
     def test_archived_binary_linkage_is_revalidated(self) -> None:
         dependencies = release.policy_dependencies(self.policy)
@@ -552,7 +442,7 @@ class ReleaseTests(unittest.TestCase):
         entries, _ = release.binary_entries(self.prefix("wrong-arch", 62), base)
         archive = self.root / f"{base}.tar.gz"
         archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
-        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-arm64")
+        audited = release.audit_archive(archive, "0.1.0", "linux-arm64")
         with self.assertRaisesRegex(release.ReleaseError, "does not match"):
             release.validate_archived_binary(audited, "0.1.0", "linux-arm64", dependencies)
 
@@ -572,7 +462,7 @@ class ReleaseTests(unittest.TestCase):
         entries, _ = release.binary_entries(prefix, base)
         archive = self.root / f"{base}.tar.gz"
         archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
-        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-x64")
+        audited = release.audit_archive(archive, "0.1.0", "linux-x64")
         with self.assertRaisesRegex(release.ReleaseError, "differs from reviewed policy"):
             release.validate_archived_binary(audited, "0.1.0", "linux-x64", dependencies)
 
@@ -580,7 +470,7 @@ class ReleaseTests(unittest.TestCase):
             self.prefix("bad-needed", 62, needed=True), base
         )
         archive.write_bytes(release.compress_tar(release.build_tar(entries, 123), "tar.gz"))
-        audited = release.audit_archive(archive, "binary", "0.1.0", "linux-x64")
+        audited = release.audit_archive(archive, "0.1.0", "linux-x64")
         with self.assertRaisesRegex(release.ReleaseError, "DT_NEEDED"):
             release.validate_archived_binary(
                 audited, "0.1.0", "linux-x64", dependencies
@@ -593,32 +483,41 @@ class ReleaseTests(unittest.TestCase):
             base = f"debz-0.1.0-{platform}"
             entries, binary = release.binary_entries(self.prefix(platform, machine), base)
             release.validate_static_elf(binary, platform)
-            release.create_release_files(output, base, "0.1.0", entries, 123, dependencies)
-        source_entries = [
-            ("debz-0.1.0-source/LICENSE", b"license", 0o644),
-            ("debz-0.1.0-source/THIRD_PARTY_NOTICES", b"notices", 0o644),
-            ("debz-0.1.0-source/build.zig.zon", b"zon", 0o644),
-        ]
-        release.create_release_files(
-            output, "debz-0.1.0-source", "0.1.0", source_entries, 123, dependencies
+            release.create_release_files(output, base, entries, 123)
+        self.assertEqual(
+            sorted(path.name for path in output.iterdir()),
+            release.expected_asset_names("0.1.0"),
         )
-        manifest = release.write_manifest("v0.1.0", output)
         release.command_verify(
             type(
                 "Args",
                 (),
-                {"manifest": manifest, "assets": output, "smoke": False, "policy": self.policy},
+                {"tag": "v0.1.0", "assets": output, "smoke": False, "policy": self.policy},
             )()
         )
-        (output / "undeclared.txt").write_text("extra")
-        with self.assertRaisesRegex(release.ReleaseError, "undeclared"):
-            release.command_verify(
-                type(
-                    "Args",
-                    (),
-                    {"manifest": manifest, "assets": output, "smoke": False, "policy": self.policy},
-                )()
-            )
+        for forbidden in (
+            "debz-0.1.0-linux-x64.tar.gz.sha256",
+            "debz-0.1.0-linux-x64.tar.gz.spdx.json",
+            "debz-0.1.0-release-manifest.json",
+            "debz-0.1.0-source.tar.gz",
+        ):
+            with self.subTest(forbidden=forbidden):
+                path = output / forbidden
+                path.write_text("forbidden")
+                with self.assertRaisesRegex(release.ReleaseError, "forbidden"):
+                    release.command_verify(
+                        type(
+                            "Args",
+                            (),
+                            {
+                                "tag": "v0.1.0",
+                                "assets": output,
+                                "smoke": False,
+                                "policy": self.policy,
+                            },
+                        )()
+                    )
+                path.unlink()
 
     @staticmethod
     def info(

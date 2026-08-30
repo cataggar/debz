@@ -25,10 +25,10 @@ const root_help =
     \\  clean                        Clean cached package artifacts
     \\  recover                      Recover an interrupted transaction
     \\  package-family-capabilities  Print package-family capabilities as JSON
+    \\  version                      Print the version and exit
     \\
     \\Options:
     \\  -h, --help                   Show this help
-    \\  --version                    Print the version and exit
     \\
     \\Run 'debz <command> --help' for command-specific help.
     \\No host APT configuration, keyrings, proxy, or credentials are inherited.
@@ -113,6 +113,7 @@ const HelpTopic = union(enum) {
     root,
     operation: api.Operation,
     package_family_capabilities,
+    version,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -142,7 +143,12 @@ pub fn main(init: std.process.Init) !void {
         try stdout.writeAll(root_help);
         return;
     };
-    if (std.mem.eql(u8, command, "--version")) {
+    if (std.mem.eql(u8, command, "version")) {
+        if (args.next()) |argument| {
+            try stderr.print("debz: unexpected argument '{s}' for 'debz version'\n", .{argument});
+            try stderr.flush();
+            std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        }
         try stdout.print("{s}\n", .{debz.version});
         return;
     }
@@ -203,6 +209,7 @@ fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpT
     if (debz.parseOperation(command)) |operation| return .{ .operation = operation };
     if (std.mem.eql(u8, command, "package-family-capabilities"))
         return .package_family_capabilities;
+    if (std.mem.eql(u8, command, "version")) return .version;
     return null;
 }
 
@@ -219,6 +226,16 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\
             \\Usage:
             \\  debz package-family-capabilities
+            \\
+            \\Options:
+            \\  -h, --help  Show this help
+            \\
+        ),
+        .version => try stdout.writeAll(
+            \\debz version - print the debz version
+            \\
+            \\Usage:
+            \\  debz version
             \\
             \\Options:
             \\  -h, --help  Show this help

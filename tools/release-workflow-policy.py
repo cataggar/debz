@@ -53,30 +53,33 @@ def main() -> None:
         "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main",
         'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main',
         'python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version"',
-        '--expect "binary=$(release-root/bin/debz --version)"',
+        '--expect "binary=$(release-root/bin/debz version)"',
         "-Doptimize=ReleaseSafe",
         '-Dversion="$VERSION"',
         "python3 tools/release.py binary",
-        "python3 tools/release.py source",
-        "python3 tools/release.py manifest",
         "python3 tools/release.py audit",
         "python3 tools/release.py verify",
         "--assets release-assets --smoke",
         "subject-path: release-assets/*.tar.gz",
         "subject-path: release-assets/*.tar.xz",
         "release-assets-${{ matrix.platform }}",
-        "name: release-assets-source",
         "merge-multiple: true",
         "ghr-bin==0.7.0",
         "ghr install cataggar/debz@v$VERSION",
+        "'```sh'",
+        "--generate-notes",
+        "--fail-on-no-commits",
+        "--verify-tag",
+        "release-assets/debz-$VERSION-linux-x64.tar.gz",
+        "release-assets/debz-$VERSION-linux-x64.tar.xz",
+        "release-assets/debz-$VERSION-linux-arm64.tar.gz",
+        "release-assets/debz-$VERSION-linux-arm64.tar.xz",
     )
     for token in required_release_tokens:
         if token not in release:
             FAILURES.append(f"release workflow is missing policy token: {token}")
     for token in (
         "python3 tools/release.py binary",
-        "python3 tools/release.py source",
-        "python3 tools/release.py manifest",
         "python3 tools/release.py audit",
         "python3 tools/release.py verify",
         "Required release dry-run exact verification",
@@ -111,6 +114,17 @@ def main() -> None:
         FAILURES.append("release workflow must not reference repository secrets")
     if "timeout-minutes:" not in release or "concurrency:" not in release:
         FAILURES.append("release workflow requires timeouts and concurrency")
+    for forbidden in (
+        ".sha256",
+        ".spdx",
+        "-release-manifest.json",
+        "-source.tar",
+        "tools/release.py source",
+        "tools/release.py manifest",
+        "release-assets-source",
+    ):
+        if forbidden in release or forbidden in ci:
+            FAILURES.append(f"forbidden release asset or command remains: {forbidden}")
     for obsolete in ("validate-tag", "package-binary", "package-source", "verify-assets", "audit-runtime"):
         if obsolete in release or obsolete in ci:
             FAILURES.append(f"obsolete release tool command remains: {obsolete}")
@@ -127,13 +141,14 @@ def main() -> None:
         ).stdout
     )
     assets = plan.get("assets")
-    if not isinstance(assets, list) or len(assets) != 26 or len(set(assets)) != 26:
-        FAILURES.append("merged release manifest must declare exactly 26 unique assets")
-    elif not all(
-        any(name.endswith(suffix) for name in assets)
-        for suffix in (".tar.gz", ".tar.xz", ".spdx.json", ".sha256", "-release-manifest.json")
-    ):
-        FAILURES.append("merged release manifest lacks required archive, SBOM, checksum, or manifest assets")
+    expected_assets = {
+        "debz-0.1.0-linux-x64.tar.gz",
+        "debz-0.1.0-linux-x64.tar.xz",
+        "debz-0.1.0-linux-arm64.tar.gz",
+        "debz-0.1.0-linux-arm64.tar.xz",
+    }
+    if not isinstance(assets, list) or set(assets) != expected_assets or len(assets) != 4:
+        FAILURES.append("release plan must declare exactly four binary archives")
 
     if FAILURES:
         raise SystemExit("\n".join(f"release policy: {failure}" for failure in FAILURES))
