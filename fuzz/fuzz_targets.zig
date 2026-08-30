@@ -20,6 +20,7 @@ const compression_corpus = &.{
 };
 const archive_corpus = &.{
     @embedFile("corpus/archive/minimal.deb"),
+    @embedFile("corpus/archive/signed.deb"),
     @embedFile("corpus/archive/traversal.tar"),
 };
 const state_corpus = &.{
@@ -300,6 +301,36 @@ fn exerciseArchive(bytes: []const u8) !void {
         .max_total_entry_bytes = 64 * 1024,
     });
     switch (result) {
+        .validation => |value| {
+            var validation = value;
+            validation.deinit();
+        },
+        .diagnostic => {},
+    }
+    const local_result = debz.deb_payload.inspectLocal(std.testing.allocator, bytes, .{}, .{
+        .outer = .{
+            .max_archive_bytes = max_input,
+            .max_member_bytes = max_input,
+            .max_signature_bytes = 8192,
+            .max_members = 8,
+        },
+        .max_control_compressed_bytes = max_input,
+        .max_control_decompressed_bytes = 64 * 1024,
+        .max_data_compressed_bytes = max_input,
+        .max_data_decompressed_bytes = 64 * 1024,
+        .max_decoder_memory = 4 * 1024 * 1024,
+        .max_entries_per_tar = 128,
+        .max_path_bytes = 1024,
+        .max_link_bytes = 1024,
+        .max_inventory_bytes_per_tar = 64 * 1024,
+        .max_control_file_bytes = 8192,
+        .max_conffiles_bytes = 8192,
+        .max_conffiles = 64,
+        .max_maintainer_script_bytes = 8192,
+        .max_total_maintainer_script_bytes = 16 * 1024,
+        .max_total_entry_bytes = 64 * 1024,
+    });
+    switch (local_result) {
         .validation => |value| {
             var validation = value;
             validation.deinit();

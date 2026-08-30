@@ -61,3 +61,14 @@ results. `cleanupStaging` provides bounded crash recovery.
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and query values; cache keys and provenance contain only the
 authenticated repository identity and expected SHA-256.
+
+## Local artifacts
+
+`debz.local_artifact.acquire` is a separate initial-trust boundary for
+standalone artifacts such as repository-configuration packages. Unpinned
+requests require HTTPS. An explicit SHA-256 pin permits HTTPS, HTTP, or a local
+`file:` URI; an optional size is also enforced. Successful bytes are hashed as
+one complete artifact, published through the same package CAS, and returned
+with redacted acquisition provenance and an explicit HTTPS-or-SHA-256 trust
+mode. This layer does not treat the artifact as authenticated repository
+metadata and does not verify embedded debsigs signatures.

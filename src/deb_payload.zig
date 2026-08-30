@@ -17,6 +17,17 @@ pub const Limits = struct {
     max_control_file_bytes: usize = 4 * 1024 * 1024,
     max_conffiles_bytes: usize = 4 * 1024 * 1024,
     max_conffiles: usize = 100_000,
+    max_maintainer_scripts: usize = 5,
+    max_maintainer_script_bytes: usize = 64 * 1024 * 1024,
+    max_total_maintainer_script_bytes: usize = 64 * 1024 * 1024,
+    max_descriptor_entries: usize = 4096,
+    max_descriptor_file_bytes: usize = 16 * 1024 * 1024,
+    max_descriptor_source_bytes: usize = 1024 * 1024,
+    max_descriptor_keyring_bytes: usize = 16 * 1024 * 1024,
+    max_descriptor_scripts: usize = 4,
+    max_descriptor_script_bytes: usize = 1024 * 1024,
+    max_descriptor_total_script_bytes: u64 = 4 * 1024 * 1024,
+    max_descriptor_total_bytes: u64 = 64 * 1024 * 1024,
     max_total_entry_bytes: u64 = 4 * 1024 * 1024 * 1024,
 };
 
@@ -34,7 +45,38 @@ pub const Expected = struct {
     require_conventional_filename: bool = true,
 };
 
-pub const Stage = enum { outer, digest, control_decompression, data_decompression, control_tar, data_tar, control_metadata, identity, conffiles };
+pub const Identity = struct {
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+};
+
+pub const LocalProfile = enum {
+    general,
+    repository_descriptor,
+};
+
+pub const LocalExpected = struct {
+    source: []const u8 = "local-artifact",
+    filename: []const u8 = "",
+    size: ?u64 = null,
+    sha256: ?[32]u8 = null,
+    identity: ?Identity = null,
+    profile: LocalProfile = .general,
+};
+
+pub const Stage = enum {
+    outer,
+    digest,
+    control_decompression,
+    data_decompression,
+    control_tar,
+    data_tar,
+    control_metadata,
+    identity,
+    conffiles,
+    descriptor_profile,
+};
 
 pub const Code = enum {
     outer_archive,
@@ -69,6 +111,16 @@ pub const Code = enum {
     invalid_conffiles,
     conffiles_limit,
     duplicate_conffile,
+    maintainer_script_limit,
+    descriptor_control_entry,
+    descriptor_payload_path,
+    descriptor_unsafe_mode,
+    descriptor_link,
+    descriptor_relationship,
+    descriptor_limit,
+    descriptor_missing_source,
+    descriptor_missing_keyring,
+    descriptor_conffile_mismatch,
     out_of_memory,
 };
 
@@ -84,8 +136,8 @@ pub const Diagnostic = struct {
     pub fn message(self: Diagnostic) []const u8 {
         return switch (self.code) {
             .outer_archive => "invalid outer Debian archive",
-            .size_mismatch => "archive byte count does not match authenticated repository metadata",
-            .digest_mismatch => "archive SHA-256 does not match authenticated repository metadata",
+            .size_mismatch => "archive byte count does not match the supplied expectation",
+            .digest_mismatch => "archive SHA-256 does not match the supplied expectation",
             .decompression_failed => "compressed tar member is corrupt, unsupported, trailing, or exceeds a resource limit",
             .tar_truncated => "tar header, entry content, or padding is truncated",
             .tar_bad_checksum => "tar header checksum is invalid",
@@ -115,6 +167,16 @@ pub const Diagnostic = struct {
             .invalid_conffiles => "conffiles contains an unsafe or malformed path",
             .conffiles_limit => "conffiles exceeds the configured entry limit",
             .duplicate_conffile => "conffiles contains a duplicate normalized path",
+            .maintainer_script_limit => "maintainer scripts exceed configured count or byte limits",
+            .descriptor_control_entry => "repository descriptor contains an unsupported control archive entry",
+            .descriptor_payload_path => "repository descriptor payload is outside approved repository configuration locations",
+            .descriptor_unsafe_mode => "repository descriptor contains a setuid or setgid entry",
+            .descriptor_link => "repository descriptor payload must not contain symbolic or hard links",
+            .descriptor_relationship => "repository descriptor declares a disallowed package relationship or system importance flag",
+            .descriptor_limit => "repository descriptor exceeds configured entry or byte limits",
+            .descriptor_missing_source => "repository descriptor contains no static .list or .sources file",
+            .descriptor_missing_keyring => "repository descriptor contains no static repository keyring",
+            .descriptor_conffile_mismatch => "repository descriptor conffiles entry does not name a regular payload file",
             .out_of_memory => "validation allocation failed",
         };
     }
@@ -151,11 +213,57 @@ pub const Conffile = struct {
     remove_on_upgrade: bool,
 };
 
+pub const ProvenanceKind = enum {
+    authenticated_repository,
+    local_artifact,
+};
+
 pub const Provenance = struct {
+    kind: ProvenanceKind,
     repository: []u8,
     filename: []u8,
     size: u64,
     sha256: [32]u8,
+};
+
+pub const Relationships = struct {
+    depends: ?[]u8,
+    pre_depends: ?[]u8,
+};
+
+pub const PayloadFile = struct {
+    path: []u8,
+    bytes: []u8,
+};
+
+pub const PayloadFiles = struct {
+    allocator: std.mem.Allocator,
+    files: []PayloadFile,
+
+    pub fn deinit(self: *PayloadFiles) void {
+        for (self.files) |file| {
+            self.allocator.free(file.path);
+            self.allocator.free(file.bytes);
+        }
+        self.allocator.free(self.files);
+        self.* = undefined;
+    }
+};
+
+pub const PayloadCopyLimits = struct {
+    max_files: usize = 16,
+    max_file_bytes: usize = 4 * 1024 * 1024,
+    max_total_bytes: usize = 16 * 1024 * 1024,
+};
+
+pub const PayloadAccessError = error{
+    InvalidPath,
+    MissingPath,
+    NotRegularFile,
+    FileTooLarge,
+    TooManyFiles,
+    TotalTooLarge,
+    DuplicateRequest,
 };
 
 /// Owns all returned strings, inventories, and decompressed tar bytes. Entry
@@ -166,6 +274,7 @@ pub const Validation = struct {
     version: []u8,
     architecture: []u8,
     provenance: Provenance,
+    relationships: Relationships,
     control: TarInventory,
     data: TarInventory,
     scripts: []Script,
@@ -184,9 +293,68 @@ pub const Validation = struct {
         self.allocator.free(self.architecture);
         self.allocator.free(self.provenance.repository);
         self.allocator.free(self.provenance.filename);
+        if (self.relationships.depends) |value| self.allocator.free(value);
+        if (self.relationships.pre_depends) |value| self.allocator.free(value);
         self.allocator.free(self.control_bytes);
         self.allocator.free(self.data_bytes);
         self.* = undefined;
+    }
+
+    /// Returns a bounded borrowed view of one validated regular data.tar file.
+    /// `path` must be canonical and archive-root-relative (for example,
+    /// `etc/apt/sources.list.d/vendor.list`).
+    pub fn regularPayloadBytes(
+        self: *const Validation,
+        path: []const u8,
+        maximum_bytes: usize,
+    ) PayloadAccessError![]const u8 {
+        if (!canonicalLookupPath(path)) return error.InvalidPath;
+        for (self.data.entries) |entry| {
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            if (entry.kind != .regular) return error.NotRegularFile;
+            if (entry.size > maximum_bytes) return error.FileTooLarge;
+            return entryContent(self.data_bytes, entry) orelse error.MissingPath;
+        }
+        return error.MissingPath;
+    }
+
+    /// Copies a bounded, caller-selected set of validated regular data.tar
+    /// files without unpacking the package or touching the filesystem.
+    pub fn copyRegularPayloadFiles(
+        self: *const Validation,
+        allocator: std.mem.Allocator,
+        paths: []const []const u8,
+        limits: PayloadCopyLimits,
+    ) (PayloadAccessError || std.mem.Allocator.Error)!PayloadFiles {
+        if (paths.len > limits.max_files) return error.TooManyFiles;
+        var files: std.ArrayList(PayloadFile) = .empty;
+        errdefer {
+            for (files.items) |file| {
+                allocator.free(file.path);
+                allocator.free(file.bytes);
+            }
+            files.deinit(allocator);
+        }
+        var total: usize = 0;
+        for (paths, 0..) |path, index| {
+            for (paths[0..index]) |previous| {
+                if (std.mem.eql(u8, previous, path)) return error.DuplicateRequest;
+            }
+            const bytes = try self.regularPayloadBytes(path, limits.max_file_bytes);
+            total = std.math.add(usize, total, bytes.len) catch return error.TotalTooLarge;
+            if (total > limits.max_total_bytes) return error.TotalTooLarge;
+            const owned_path = try allocator.dupe(u8, path);
+            const owned_bytes = allocator.dupe(u8, bytes) catch |err| {
+                allocator.free(owned_path);
+                return err;
+            };
+            files.append(allocator, .{ .path = owned_path, .bytes = owned_bytes }) catch |err| {
+                allocator.free(owned_path);
+                allocator.free(owned_bytes);
+                return err;
+            };
+        }
+        return .{ .allocator = allocator, .files = try files.toOwnedSlice(allocator) };
     }
 };
 
@@ -196,11 +364,52 @@ pub const Result = union(enum) {
 };
 
 pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expected, limits: Limits) Result {
+    return validateInternal(allocator, bytes, .{ .repository = expected }, limits);
+}
+
+/// Validates a standalone `.deb` without pretending it was selected from
+/// authenticated repository metadata. Identity is derived from the validated
+/// control record. Optional size, digest, and identity expectations still fail
+/// closed when supplied.
+pub fn inspectLocal(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected: LocalExpected,
+    limits: Limits,
+) Result {
+    return validateInternal(allocator, bytes, .{ .local = expected }, limits);
+}
+
+const ValidationRequest = union(enum) {
+    repository: Expected,
+    local: LocalExpected,
+};
+
+fn validateInternal(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    request: ValidationRequest,
+    limits: Limits,
+) Result {
     var ownership_transferred = false;
-    if (bytes.len != expected.size) return fail(.digest, .size_mismatch, 0, null, null);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    if (!std.mem.eql(u8, &digest, &expected.sha256)) return fail(.digest, .digest_mismatch, 0, null, null);
+    switch (request) {
+        .repository => |expected| {
+            if (bytes.len != expected.size) return fail(.digest, .size_mismatch, 0, null, null);
+            if (!std.mem.eql(u8, &digest, &expected.sha256))
+                return fail(.digest, .digest_mismatch, 0, null, null);
+        },
+        .local => |expected| {
+            if (expected.size) |size| {
+                if (bytes.len != size) return fail(.digest, .size_mismatch, 0, null, null);
+            }
+            if (expected.sha256) |sha256| {
+                if (!std.mem.eql(u8, &digest, &sha256))
+                    return fail(.digest, .digest_mismatch, 0, null, null);
+            }
+        },
+    }
 
     const outer = switch (deb_archive.parse(bytes, limits.outer)) {
         .archive => |archive| archive,
@@ -250,16 +459,28 @@ pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expec
     if (document.records.len != 1)
         return fail(.control_metadata, .missing_identity, outer.control.content.start + control_entry.content_offset, control_entry.content_offset, null);
     const record = &document.records[0];
-    if (!std.mem.eql(u8, record.package.text, expected.package) or
-        !std.mem.eql(u8, record.version.value.original, expected.version) or
-        !std.mem.eql(u8, record.architecture.text, expected.architecture))
-        return fail(.identity, .identity_mismatch, outer.control.content.start + control_entry.content_offset, control_entry.content_offset, null);
-    if (!std.mem.eql(u8, expected.requested_package, expected.package) or
-        (expected.requested_version != null and !std.mem.eql(u8, expected.requested_version.?, expected.version)) or
-        (expected.requested_architecture != null and !std.mem.eql(u8, expected.requested_architecture.?, expected.architecture)))
-        return fail(.identity, .request_mismatch, 0, null, null);
-    if (expected.require_conventional_filename and !validFilename(expected))
-        return fail(.identity, .filename_mismatch, 0, null, null);
+    switch (request) {
+        .repository => |expected| {
+            if (!std.mem.eql(u8, record.package.text, expected.package) or
+                !std.mem.eql(u8, record.version.value.original, expected.version) or
+                !std.mem.eql(u8, record.architecture.text, expected.architecture))
+                return fail(.identity, .identity_mismatch, outer.control.content.start + control_entry.content_offset, control_entry.content_offset, null);
+            if (!std.mem.eql(u8, expected.requested_package, expected.package) or
+                (expected.requested_version != null and !std.mem.eql(u8, expected.requested_version.?, expected.version)) or
+                (expected.requested_architecture != null and !std.mem.eql(u8, expected.requested_architecture.?, expected.architecture)))
+                return fail(.identity, .request_mismatch, 0, null, null);
+            if (expected.require_conventional_filename and !validFilename(expected))
+                return fail(.identity, .filename_mismatch, 0, null, null);
+        },
+        .local => |expected| {
+            if (expected.identity) |identity| {
+                if (!std.mem.eql(u8, record.package.text, identity.package) or
+                    !std.mem.eql(u8, record.version.value.original, identity.version) or
+                    !std.mem.eql(u8, record.architecture.text, identity.architecture))
+                    return fail(.identity, .identity_mismatch, outer.control.content.start + control_entry.content_offset, control_entry.content_offset, null);
+            }
+        },
+    }
 
     const package = allocator.dupe(u8, record.package.text) catch return oom();
     defer if (!ownership_transferred) allocator.free(package);
@@ -267,16 +488,37 @@ pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expec
     defer if (!ownership_transferred) allocator.free(version);
     const architecture = allocator.dupe(u8, record.architecture.text) catch return oom();
     defer if (!ownership_transferred) allocator.free(architecture);
-    const repository = allocator.dupe(u8, expected.repository) catch return oom();
+    const repository = allocator.dupe(u8, switch (request) {
+        .repository => |expected| expected.repository,
+        .local => |expected| expected.source,
+    }) catch return oom();
     defer if (!ownership_transferred) allocator.free(repository);
-    const filename = allocator.dupe(u8, expected.filename) catch return oom();
+    const filename = allocator.dupe(u8, switch (request) {
+        .repository => |expected| expected.filename,
+        .local => |expected| expected.filename,
+    }) catch return oom();
     defer if (!ownership_transferred) allocator.free(filename);
+    const depends = duplicateOptional(allocator, if (record.depends) |value| value.source else null) catch return oom();
+    defer if (!ownership_transferred) if (depends) |value| allocator.free(value);
+    const pre_depends = duplicateOptional(allocator, if (record.pre_depends) |value| value.source else null) catch return oom();
+    defer if (!ownership_transferred) if (pre_depends) |value| allocator.free(value);
 
     var script_list: std.ArrayList(Script) = .empty;
     defer script_list.deinit(allocator);
+    var total_script_bytes: usize = 0;
     for (control_tar.entries) |entry| {
-        if (entry.kind == .regular and isScript(entry.path))
+        if (entry.kind == .regular and isScript(entry.path)) {
+            if (script_list.items.len >= limits.max_maintainer_scripts or
+                entry.size > limits.max_maintainer_script_bytes)
+                return fail(.control_metadata, .maintainer_script_limit, outer.control.content.start + entry.header_offset, entry.header_offset, null);
+            const script_size = std.math.cast(usize, entry.size) orelse
+                return fail(.control_metadata, .maintainer_script_limit, outer.control.content.start + entry.header_offset, entry.header_offset, null);
+            total_script_bytes = std.math.add(usize, total_script_bytes, script_size) catch
+                return fail(.control_metadata, .maintainer_script_limit, outer.control.content.start + entry.header_offset, entry.header_offset, null);
+            if (total_script_bytes > limits.max_total_maintainer_script_bytes)
+                return fail(.control_metadata, .maintainer_script_limit, outer.control.content.start + entry.header_offset, entry.header_offset, null);
             script_list.append(allocator, .{ .name = scriptName(entry.path).?, .mode = entry.mode, .size = entry.size }) catch return oom();
+        }
     }
     const scripts = script_list.toOwnedSlice(allocator) catch return oom();
     defer if (!ownership_transferred) allocator.free(scripts);
@@ -287,6 +529,22 @@ pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expec
         for (conffiles) |conffile| allocator.free(conffile.path);
         allocator.free(conffiles);
     };
+    switch (request) {
+        .repository => {},
+        .local => |expected| if (expected.profile == .repository_descriptor) {
+            if (validateDescriptorProfile(
+                record,
+                package,
+                control_tar.entries,
+                data_tar.entries,
+                scripts,
+                conffiles,
+                outer.control,
+                outer.data,
+                limits,
+            )) |diagnostic| return .{ .diagnostic = diagnostic };
+        },
+    }
 
     ownership_transferred = true;
     return .{ .validation = .{
@@ -294,7 +552,20 @@ pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expec
         .package = package,
         .version = version,
         .architecture = architecture,
-        .provenance = .{ .repository = repository, .filename = filename, .size = expected.size, .sha256 = expected.sha256 },
+        .provenance = .{
+            .kind = switch (request) {
+                .repository => .authenticated_repository,
+                .local => .local_artifact,
+            },
+            .repository = repository,
+            .filename = filename,
+            .size = bytes.len,
+            .sha256 = digest,
+        },
+        .relationships = .{
+            .depends = depends,
+            .pre_depends = pre_depends,
+        },
         .control = control_tar,
         .data = data_tar,
         .scripts = scripts,
@@ -302,6 +573,219 @@ pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expec
         .control_bytes = control_bytes,
         .data_bytes = data_bytes,
     } };
+}
+
+fn duplicateOptional(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
+}
+
+fn validateDescriptorProfile(
+    record: *const control_record.Record,
+    package: []const u8,
+    control_entries: []const Entry,
+    data_entries: []const Entry,
+    scripts: []const Script,
+    conffiles: []const Conffile,
+    control_member: deb_archive.Member,
+    data_member: deb_archive.Member,
+    limits: Limits,
+) ?Diagnostic {
+    if (record.essential == true or
+        record.protected == true or
+        record.important == true or
+        record.built_using != null or
+        record.pre_depends != null or
+        record.recommends != null or
+        record.suggests != null or
+        record.enhances != null or
+        record.provides != null or
+        record.conflicts != null or
+        record.breaks != null or
+        record.replaces != null)
+    {
+        return fail(.descriptor_profile, .descriptor_relationship, control_member.content.start, null, null).diagnostic;
+    }
+
+    if (control_entries.len +| data_entries.len > limits.max_descriptor_entries) {
+        return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
+    }
+    if (scripts.len > limits.max_descriptor_scripts) {
+        return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
+    }
+    var total_script_bytes: u64 = 0;
+    for (scripts) |script| {
+        if (script.size > limits.max_descriptor_script_bytes) {
+            return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
+        }
+        total_script_bytes = std.math.add(u64, total_script_bytes, script.size) catch
+            return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
+        if (total_script_bytes > limits.max_descriptor_total_script_bytes) {
+            return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
+        }
+    }
+    for (control_entries, 0..) |entry, index| {
+        if (entry.mode & 0o6000 != 0) {
+            return profileFailure(.descriptor_unsafe_mode, control_member, entry, index);
+        }
+        if (!descriptorControlEntryAllowed(entry)) {
+            return profileFailure(.descriptor_control_entry, control_member, entry, index);
+        }
+    }
+
+    var source_count: usize = 0;
+    var keyring_count: usize = 0;
+    var total_bytes: u64 = 0;
+    for (data_entries, 0..) |entry, index| {
+        if (entry.mode & 0o6000 != 0) {
+            return profileFailure(.descriptor_unsafe_mode, data_member, entry, index);
+        }
+        if (entry.kind == .symlink or entry.kind == .hardlink) {
+            return profileFailure(.descriptor_link, data_member, entry, index);
+        }
+        const classification = classifyDescriptorPath(entry.path, entry.kind, package);
+        if (!classification.allowed) {
+            return profileFailure(.descriptor_payload_path, data_member, entry, index);
+        }
+        if (entry.kind == .regular) {
+            if (entry.size > limits.max_descriptor_file_bytes or
+                (classification.source and entry.size > limits.max_descriptor_source_bytes) or
+                (classification.keyring and entry.size > limits.max_descriptor_keyring_bytes))
+            {
+                return profileFailure(.descriptor_limit, data_member, entry, index);
+            }
+            total_bytes = std.math.add(u64, total_bytes, entry.size) catch
+                return profileFailure(.descriptor_limit, data_member, entry, index);
+            if (total_bytes > limits.max_descriptor_total_bytes)
+                return profileFailure(.descriptor_limit, data_member, entry, index);
+            if (classification.source) source_count += 1;
+            if (classification.keyring) keyring_count += 1;
+        }
+    }
+    if (source_count == 0) {
+        return fail(.descriptor_profile, .descriptor_missing_source, data_member.content.start, null, null).diagnostic;
+    }
+    if (keyring_count == 0) {
+        return fail(.descriptor_profile, .descriptor_missing_keyring, data_member.content.start, null, null).diagnostic;
+    }
+
+    for (conffiles) |conffile| {
+        var matched = false;
+        for (data_entries) |entry| {
+            if (entry.kind == .regular and std.mem.eql(u8, entry.path, conffile.path)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return fail(.descriptor_profile, .descriptor_conffile_mismatch, data_member.content.start, null, null).diagnostic;
+        }
+    }
+    return null;
+}
+
+fn descriptorControlEntryAllowed(entry: Entry) bool {
+    if (entry.kind != .regular) return false;
+    inline for (.{ "control", "md5sums", "conffiles", "preinst", "postinst", "prerm", "postrm" }) |allowed| {
+        if (std.mem.eql(u8, entry.path, allowed)) return true;
+    }
+    return false;
+}
+
+const DescriptorPathClassification = struct {
+    allowed: bool = false,
+    source: bool = false,
+    keyring: bool = false,
+};
+
+fn classifyDescriptorPath(path: []const u8, kind: EntryKind, package: []const u8) DescriptorPathClassification {
+    const source_roots = [_][]const u8{"etc/apt/sources.list.d"};
+    const keyring_roots = [_][]const u8{
+        "etc/apt/keyrings",
+        "etc/apt/trusted.gpg.d",
+        "usr/share/keyrings",
+    };
+    const tree_roots = [_][]const u8{
+        "etc/debsig/policies",
+        "usr/share/debsig/keyrings",
+    };
+
+    if (kind == .directory) {
+        for (source_roots ++ keyring_roots ++ tree_roots) |root| {
+            if (isPathAncestorOrEqual(path, root) or isPathWithin(path, root))
+                return .{ .allowed = true };
+        }
+        if (isPackageDocPath(path, package, true) or isLintianPath(path, package, true))
+            return .{ .allowed = true };
+        return .{};
+    }
+
+    for (source_roots) |root| {
+        if (isDirectChild(path, root) and
+            (std.mem.endsWith(u8, path, ".list") or std.mem.endsWith(u8, path, ".sources")))
+            return .{ .allowed = true, .source = true };
+    }
+    for (keyring_roots) |root| {
+        if (isDirectChild(path, root) and
+            (std.mem.endsWith(u8, path, ".gpg") or
+                std.mem.endsWith(u8, path, ".pgp") or
+                std.mem.endsWith(u8, path, ".asc")))
+            return .{ .allowed = true, .keyring = true };
+    }
+    for (tree_roots) |root| {
+        if (isPathWithin(path, root)) return .{ .allowed = true };
+    }
+    if (isPackageDocPath(path, package, false) or isLintianPath(path, package, false))
+        return .{ .allowed = true };
+    return .{};
+}
+
+fn isPathAncestorOrEqual(path: []const u8, root: []const u8) bool {
+    return std.mem.eql(u8, path, root) or
+        (path.len < root.len and std.mem.startsWith(u8, root, path) and root[path.len] == '/');
+}
+
+fn isPathWithin(path: []const u8, root: []const u8) bool {
+    return path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/';
+}
+
+fn isDirectChild(path: []const u8, root: []const u8) bool {
+    if (!isPathWithin(path, root)) return false;
+    return std.mem.indexOfScalar(u8, path[root.len + 1 ..], '/') == null;
+}
+
+fn isPackageDocPath(path: []const u8, package: []const u8, directory: bool) bool {
+    const prefix = "usr/share/doc/";
+    if (isPathAncestorOrEqual(path, "usr/share/doc")) return directory;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    const remainder = path[prefix.len..];
+    if (remainder.len < package.len or !std.mem.startsWith(u8, remainder, package)) return false;
+    if (remainder.len == package.len) return directory;
+    return remainder[package.len] == '/';
+}
+
+fn isLintianPath(path: []const u8, package: []const u8, directory: bool) bool {
+    const root = "usr/share/lintian/overrides";
+    if (isPathAncestorOrEqual(path, root)) return directory;
+    if (!isDirectChild(path, root)) return false;
+    return std.mem.eql(u8, path[root.len + 1 ..], package);
+}
+
+fn profileFailure(
+    code: Code,
+    member: deb_archive.Member,
+    entry: Entry,
+    index: usize,
+) Diagnostic {
+    return .{
+        .stage = .descriptor_profile,
+        .code = code,
+        .offset = member.content.start + entry.header_offset,
+        .inner_offset = entry.header_offset,
+        .entry_index = index,
+    };
 }
 
 fn decompressMember(allocator: std.mem.Allocator, archive: deb_archive.Archive, member: deb_archive.Member, is_control: bool, limits: Limits) metadata_decompression.Error![]u8 {
@@ -605,6 +1089,21 @@ fn canonicalPath(allocator: std.mem.Allocator, raw_input: []const u8, maximum: u
     return output.toOwnedSlice(allocator);
 }
 
+fn canonicalLookupPath(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return false;
+        for (component) |byte| {
+            if (byte < 0x20 or byte == 0x7f) return false;
+        }
+    }
+    return true;
+}
+
 fn resolveLink(allocator: std.mem.Allocator, path: []const u8, raw: []const u8, hardlink: bool, maximum: usize) ![]u8 {
     if (hardlink) return canonicalPath(allocator, raw, maximum, false);
     if (raw.len == 0) return error.Unsafe;
@@ -901,9 +1400,71 @@ fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
     return testDebWithConffiles(allocator, bad_data_path, "/etc/demo.conf\n");
 }
 
+fn descriptorTestDeb(
+    allocator: std.mem.Allocator,
+    extra_control_fields: []const u8,
+    extra_data_path: ?[]const u8,
+    source_mode: u32,
+    source_kind: u8,
+) ![]u8 {
+    var control: std.ArrayList(u8) = .empty;
+    defer control.deinit(allocator);
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        "Package: repo-config\nVersion: 2.0\nArchitecture: all\nDepends: ca-certificates\n{s}",
+        .{extra_control_fields},
+    );
+    defer allocator.free(metadata);
+    try appendTarEntry(allocator, &control, "./control", '0', 0o644, "", metadata);
+    try appendTarEntry(allocator, &control, "./md5sums", '0', 0o644, "", "");
+    try appendTarEntry(
+        allocator,
+        &control,
+        "./conffiles",
+        '0',
+        0o644,
+        "",
+        "/etc/" ++ "apt/sources.list.d/vendor.list\n" ++
+            "/usr/share/keyrings/vendor.gpg\n" ++
+            "/etc/debsig/policies/ABC/vendor.pol\n",
+    );
+    try appendTarEntry(allocator, &control, "./preinst", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
+    try appendTarEntry(allocator, &control, "./postinst", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
+    try appendTarEntry(allocator, &control, "./prerm", '0', 0o755, "", "#!/bin/sh\nexit 0\n");
+    try finishTar(allocator, &control);
+
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    try appendTarEntry(
+        allocator,
+        &data,
+        "./etc/" ++ "apt/sources.list.d/vendor.list",
+        source_kind,
+        source_mode,
+        if (source_kind == '2') "other.list" else "",
+        if (source_kind == '0') "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://example.test stable main\n" else "",
+    );
+    try appendTarEntry(allocator, &data, "./usr/share/keyrings/vendor.gpg", '0', 0o644, "", "keyring");
+    try appendTarEntry(allocator, &data, "./etc/debsig/policies/ABC/vendor.pol", '0', 0o644, "", "policy");
+    try appendTarEntry(allocator, &data, "./usr/share/debsig/keyrings/ABC/vendor.gpg", '0', 0o644, "", "debsig-key");
+    try appendTarEntry(allocator, &data, "./usr/share/doc/repo-config/copyright", '0', 0o644, "", "copyright");
+    try appendTarEntry(allocator, &data, "./usr/share/lintian/overrides/repo-config", '0', 0o644, "", "override");
+    if (extra_data_path) |path|
+        try appendTarEntry(allocator, &data, path, '0', 0o644, "", "unexpected");
+    try finishTar(allocator, &data);
+
+    var ar: std.ArrayList(u8) = .empty;
+    errdefer ar.deinit(allocator);
+    try ar.appendSlice(allocator, "!<arch>\n");
+    try appendAr(allocator, &ar, "debian-binary/", "2.0\n");
+    try appendAr(allocator, &ar, "control.tar/", control.items);
+    try appendAr(allocator, &ar, "data.tar/", data.items);
+    try appendAr(allocator, &ar, "_gpgorigin/", "structural signature only");
+    return ar.toOwnedSlice(allocator);
+}
+
 fn expectedFor(bytes: []const u8) Expected {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const digest = metadataDigest(bytes);
     return .{
         .repository = "stable",
         .package = "demo",
@@ -914,6 +1475,12 @@ fn expectedFor(bytes: []const u8) Expected {
         .size = bytes.len,
         .sha256 = digest,
     };
+}
+
+fn metadataDigest(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
 }
 
 test "full validation inventories scripts conffiles and payload without unpacking" {
@@ -934,6 +1501,136 @@ test "full validation inventories scripts conffiles and payload without unpackin
     try std.testing.expectEqualStrings("postinst", validation.scripts[0].name);
     try std.testing.expectEqualStrings("etc/demo.conf", validation.conffiles[0].path);
     try std.testing.expectEqual(@as(usize, 1), validation.data.entries.len);
+}
+
+test "local inspection derives identity and copies selected static repository files" {
+    const allocator = std.testing.allocator;
+    const bytes = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    defer allocator.free(bytes);
+    const digest = metadataDigest(bytes);
+    const result = inspectLocal(allocator, bytes, .{
+        .source = "https://example.test/repo-config.deb",
+        .filename = "repo-config.deb",
+        .size = bytes.len,
+        .sha256 = digest,
+        .profile = .repository_descriptor,
+    }, .{});
+    var validation = switch (result) {
+        .validation => |value| value,
+        .diagnostic => |diagnostic| {
+            std.debug.print("{s} at {d}\n", .{ diagnostic.message(), diagnostic.offset });
+            return error.UnexpectedDiagnostic;
+        },
+    };
+    defer validation.deinit();
+
+    try std.testing.expectEqualStrings("repo-config", validation.package);
+    try std.testing.expectEqualStrings("2.0", validation.version);
+    try std.testing.expectEqualStrings("all", validation.architecture);
+    try std.testing.expectEqual(ProvenanceKind.local_artifact, validation.provenance.kind);
+    try std.testing.expectEqualStrings("ca-certificates", validation.relationships.depends.?);
+    try std.testing.expectEqual(@as(usize, 3), validation.scripts.len);
+
+    const source_bytes = try validation.regularPayloadBytes(
+        "etc/apt/sources.list.d/vendor.list",
+        1024,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, source_bytes, "deb "));
+    try std.testing.expectError(
+        error.FileTooLarge,
+        validation.regularPayloadBytes("usr/share/keyrings/vendor.gpg", 3),
+    );
+    try std.testing.expectError(
+        error.InvalidPath,
+        validation.regularPayloadBytes("../vendor.gpg", 1024),
+    );
+
+    var selected = try validation.copyRegularPayloadFiles(allocator, &.{
+        "etc/apt/sources.list.d/vendor.list",
+        "usr/share/keyrings/vendor.gpg",
+    }, .{ .max_files = 2, .max_file_bytes = 1024, .max_total_bytes = 2048 });
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 2), selected.files.len);
+    try std.testing.expectEqualStrings("keyring", selected.files[1].bytes);
+    try std.testing.expectError(
+        error.DuplicateRequest,
+        validation.copyRegularPayloadFiles(allocator, &.{
+            "usr/share/keyrings/vendor.gpg",
+            "usr/share/keyrings/vendor.gpg",
+        }, .{}),
+    );
+    try std.testing.expectError(
+        error.TooManyFiles,
+        validation.copyRegularPayloadFiles(allocator, &.{
+            "etc/apt/sources.list.d/vendor.list",
+            "usr/share/keyrings/vendor.gpg",
+        }, .{ .max_files = 1 }),
+    );
+    try std.testing.expectError(
+        error.TotalTooLarge,
+        validation.copyRegularPayloadFiles(allocator, &.{
+            "etc/apt/sources.list.d/vendor.list",
+            "usr/share/keyrings/vendor.gpg",
+        }, .{ .max_total_bytes = 8 }),
+    );
+    try std.testing.expectError(
+        error.MissingPath,
+        validation.regularPayloadBytes("usr/share/keyrings/missing.gpg", 1024),
+    );
+}
+
+test "local inspection enforces optional digest size and identity expectations" {
+    const allocator = std.testing.allocator;
+    const bytes = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    defer allocator.free(bytes);
+    var bad_digest = metadataDigest(bytes);
+    bad_digest[0] ^= 1;
+    try std.testing.expectEqual(Code.digest_mismatch, inspectLocal(allocator, bytes, .{
+        .sha256 = bad_digest,
+    }, .{}).diagnostic.code);
+    try std.testing.expectEqual(Code.size_mismatch, inspectLocal(allocator, bytes, .{
+        .size = bytes.len + 1,
+    }, .{}).diagnostic.code);
+    try std.testing.expectEqual(Code.identity_mismatch, inspectLocal(allocator, bytes, .{
+        .identity = .{ .package = "other", .version = "2.0", .architecture = "all" },
+    }, .{}).diagnostic.code);
+}
+
+test "repository descriptor profile rejects unsafe payloads relationships and script excess" {
+    const allocator = std.testing.allocator;
+
+    const outside = try descriptorTestDeb(allocator, "", "./usr/bin/tool", 0o644, '0');
+    defer allocator.free(outside);
+    try std.testing.expectEqual(Code.descriptor_payload_path, inspectLocal(allocator, outside, .{
+        .profile = .repository_descriptor,
+    }, .{}).diagnostic.code);
+
+    const setuid = try descriptorTestDeb(allocator, "", null, 0o4644, '0');
+    defer allocator.free(setuid);
+    try std.testing.expectEqual(Code.descriptor_unsafe_mode, inspectLocal(allocator, setuid, .{
+        .profile = .repository_descriptor,
+    }, .{}).diagnostic.code);
+
+    const linked = try descriptorTestDeb(allocator, "", null, 0o777, '2');
+    defer allocator.free(linked);
+    try std.testing.expectEqual(Code.descriptor_link, inspectLocal(allocator, linked, .{
+        .profile = .repository_descriptor,
+    }, .{}).diagnostic.code);
+
+    const conflicting = try descriptorTestDeb(allocator, "Conflicts: apt\n", null, 0o644, '0');
+    defer allocator.free(conflicting);
+    try std.testing.expectEqual(Code.descriptor_relationship, inspectLocal(allocator, conflicting, .{
+        .profile = .repository_descriptor,
+    }, .{}).diagnostic.code);
+
+    const scripts = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    defer allocator.free(scripts);
+    try std.testing.expectEqual(Code.maintainer_script_limit, inspectLocal(allocator, scripts, .{
+        .profile = .repository_descriptor,
+    }, .{ .max_maintainer_scripts = 2 }).diagnostic.code);
+    try std.testing.expectEqual(Code.descriptor_limit, inspectLocal(allocator, scripts, .{
+        .profile = .repository_descriptor,
+    }, .{ .max_descriptor_source_bytes = 8 }).diagnostic.code);
 }
 
 test "validates plain gzip xz and zstd payload members" {

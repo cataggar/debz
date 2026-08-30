@@ -20,6 +20,7 @@ pub const MemberKind = enum {
     debian_binary,
     control,
     data,
+    signature,
 };
 
 pub const Member = struct {
@@ -32,16 +33,52 @@ pub const Member = struct {
     size: usize,
 };
 
+pub const SignatureKind = enum {
+    origin,
+    maintainer,
+    archive,
+
+    pub fn memberName(self: SignatureKind) []const u8 {
+        return switch (self) {
+            .origin => "_gpgorigin",
+            .maintainer => "_gpgmaint",
+            .archive => "_gpgarchive",
+        };
+    }
+};
+
+pub const Signature = struct {
+    kind: SignatureKind,
+    member: Member,
+};
+
+pub const max_signatures = std.meta.fields(SignatureKind).len;
+
 /// Borrows member names and byte ranges from the input passed to `parse`.
+/// Signature entries are structurally recognized only; callers must supply an
+/// independent trusted key before claiming cryptographic verification.
 pub const Archive = struct {
     source: []const u8,
     debian_binary: Member,
     control: Member,
     data: Member,
+    signatures: [max_signatures]Signature,
+    signature_count: usize,
     member_count: usize,
 
     pub fn memberBytes(self: Archive, member: Member) []const u8 {
         return member.content.slice(self.source);
+    }
+
+    pub fn signatureMembers(self: *const Archive) []const Signature {
+        return self.signatures[0..self.signature_count];
+    }
+
+    pub fn signature(self: *const Archive, kind: SignatureKind) ?Signature {
+        for (self.signatureMembers()) |candidate| {
+            if (candidate.kind == kind) return candidate;
+        }
+        return null;
     }
 };
 
@@ -57,6 +94,7 @@ pub const DebianBinaryNewlinePolicy = enum {
 pub const Limits = struct {
     max_archive_bytes: usize = 1024 * 1024 * 1024,
     max_member_bytes: usize = 512 * 1024 * 1024,
+    max_signature_bytes: usize = 1024 * 1024,
     max_members: usize = 16,
     debian_binary_newline: DebianBinaryNewlinePolicy = .lf_only,
 };
@@ -78,9 +116,11 @@ pub const DiagnosticCode = enum {
     invalid_padding,
     trailing_data,
     unexpected_member,
+    invalid_member_order,
     duplicate_debian_binary,
     duplicate_control,
     duplicate_data,
+    duplicate_signature,
     missing_debian_binary,
     missing_control,
     missing_data,
@@ -109,10 +149,12 @@ pub const Diagnostic = struct {
             .truncated_member_content => "ar member content extends beyond the archive",
             .invalid_padding => "odd-sized ar member must be followed by a newline padding byte",
             .trailing_data => "unexpected trailing bytes follow the required archive members",
-            .unexpected_member => "archive contains a member other than debian-binary, control.tar, or data.tar",
+            .unexpected_member => "archive contains an unrecognized Debian package member",
+            .invalid_member_order => "Debian package members must be debian-binary, control.tar, data.tar, then signatures",
             .duplicate_debian_binary => "archive contains more than one debian-binary member",
             .duplicate_control => "archive contains more than one supported control.tar member",
             .duplicate_data => "archive contains more than one supported data.tar member",
+            .duplicate_signature => "archive contains more than one signature of the same recognized type",
             .missing_debian_binary => "archive is missing debian-binary",
             .missing_control => "archive is missing a supported control.tar member",
             .missing_data => "archive is missing a supported data.tar member",
@@ -146,6 +188,8 @@ pub fn parse(source: []const u8, limits: Limits) ParseResult {
     var debian_binary: ?Member = null;
     var control: ?Member = null;
     var data: ?Member = null;
+    var signatures: [max_signatures]Signature = undefined;
+    var signature_count: usize = 0;
 
     while (offset < source.len) {
         if (member_count >= limits.max_members) {
@@ -177,6 +221,9 @@ pub fn parse(source: []const u8, limits: Limits) ParseResult {
             return failure(.member_too_large, offset + 48, member_count);
         }
         const size: usize = @intCast(size_u64);
+        if (classifiedSignature(parsed_name.name) != null and size > limits.max_signature_bytes) {
+            return failure(.member_too_large, offset + 48, member_count);
+        }
         const content_end = std.math.add(usize, header_end, size) catch
             return failure(.truncated_member_content, header_end, member_count);
         if (content_end > source.len) {
@@ -200,6 +247,7 @@ pub fn parse(source: []const u8, limits: Limits) ParseResult {
                 if (debian_binary != null) {
                     return failure(.duplicate_debian_binary, offset, member_count);
                 }
+                if (member_count != 0) return failure(.invalid_member_order, offset, member_count);
                 if (!validDebianBinary(source[header_end..content_end], limits.debian_binary_newline)) {
                     return failure(.invalid_debian_binary, header_end, member_count);
                 }
@@ -207,11 +255,26 @@ pub fn parse(source: []const u8, limits: Limits) ParseResult {
             },
             .control => {
                 if (control != null) return failure(.duplicate_control, offset, member_count);
+                if (debian_binary == null or data != null or signature_count != 0)
+                    return failure(.invalid_member_order, offset, member_count);
                 control = member;
             },
             .data => {
                 if (data != null) return failure(.duplicate_data, offset, member_count);
+                if (debian_binary == null or control == null or signature_count != 0)
+                    return failure(.invalid_member_order, offset, member_count);
                 data = member;
+            },
+            .signature => {
+                if (debian_binary == null or control == null or data == null)
+                    return failure(.invalid_member_order, offset, member_count);
+                const signature_kind = classified.signature_kind.?;
+                for (signatures[0..signature_count]) |signature| {
+                    if (signature.kind == signature_kind)
+                        return failure(.duplicate_signature, offset, member_count);
+                }
+                signatures[signature_count] = .{ .kind = signature_kind, .member = member };
+                signature_count += 1;
             },
         }
 
@@ -238,6 +301,8 @@ pub fn parse(source: []const u8, limits: Limits) ParseResult {
         .debian_binary = debian_binary.?,
         .control = control.?,
         .data = data.?,
+        .signatures = signatures,
+        .signature_count = signature_count,
         .member_count = member_count,
     } };
 }
@@ -301,6 +366,7 @@ fn parseDecimal(field: []const u8) ?u64 {
 const Classification = struct {
     kind: MemberKind,
     compression: Compression,
+    signature_kind: ?SignatureKind = null,
 };
 
 fn classify(name: []const u8) ?Classification {
@@ -320,6 +386,21 @@ fn classify(name: []const u8) ?Classification {
         if (std.mem.eql(u8, name, entry[0])) {
             return .{ .kind = entry[1], .compression = entry[2] };
         }
+    }
+    if (classifiedSignature(name)) |kind| {
+        return .{
+            .kind = .signature,
+            .compression = .uncompressed,
+            .signature_kind = kind,
+        };
+    }
+    return null;
+}
+
+fn classifiedSignature(name: []const u8) ?SignatureKind {
+    inline for (std.meta.fields(SignatureKind)) |field| {
+        const kind: SignatureKind = @enumFromInt(field.value);
+        if (std.mem.eql(u8, name, kind.memberName())) return kind;
     }
     return null;
 }
@@ -401,11 +482,79 @@ test "parses supported members as borrowed typed ranges" {
         },
     };
     try std.testing.expectEqual(@as(usize, 3), archive.member_count);
+    try std.testing.expectEqual(@as(usize, 0), archive.signature_count);
     try std.testing.expectEqual(Compression.xz, archive.control.compression);
     try std.testing.expectEqual(Compression.zstd, archive.data.compression);
     try std.testing.expectEqualStrings("2.0\n", archive.memberBytes(archive.debian_binary));
     try std.testing.expectEqualStrings("control.tar.xz", archive.control.name);
     try std.testing.expectEqualStrings("ctrl", archive.memberBytes(archive.control));
+}
+
+test "accepts bounded recognized signatures after data and preserves their spans" {
+    const allocator = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "control.tar.gz/", "ctrl");
+    try appendTestMember(allocator, &bytes, "data.tar.gz/", "data");
+    try appendTestMember(allocator, &bytes, "_gpgorigin/", "origin signature");
+    try appendTestMember(allocator, &bytes, "_gpgmaint/", "maintainer signature");
+    try appendTestMember(allocator, &bytes, "_gpgarchive/", "archive signature");
+
+    const archive = parse(bytes.items, .{}).archive;
+    try std.testing.expectEqual(@as(usize, 6), archive.member_count);
+    try std.testing.expectEqual(@as(usize, 3), archive.signature_count);
+    try std.testing.expectEqual(SignatureKind.origin, archive.signatureMembers()[0].kind);
+    try std.testing.expectEqualStrings(
+        "origin signature",
+        archive.memberBytes(archive.signature(.origin).?.member),
+    );
+}
+
+test "rejects duplicate arbitrary misplaced and oversized signature members" {
+    const allocator = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
+    try appendTestMember(allocator, &bytes, "data.tar/", "");
+    try appendTestMember(allocator, &bytes, "_gpgorigin/", "one");
+    try appendTestMember(allocator, &bytes, "_gpgorigin/", "two");
+    _ = try expectDiagnostic(.duplicate_signature, parse(bytes.items, .{}));
+
+    bytes.clearRetainingCapacity();
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
+    try appendTestMember(allocator, &bytes, "data.tar/", "");
+    try appendTestMember(allocator, &bytes, "_gpgvendor/", "");
+    _ = try expectDiagnostic(.unexpected_member, parse(bytes.items, .{}));
+
+    bytes.clearRetainingCapacity();
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "_gpgorigin/", "");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
+    try appendTestMember(allocator, &bytes, "data.tar/", "");
+    _ = try expectDiagnostic(.invalid_member_order, parse(bytes.items, .{}));
+
+    bytes.clearRetainingCapacity();
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "data.tar/", "");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
+    _ = try expectDiagnostic(.invalid_member_order, parse(bytes.items, .{}));
+
+    bytes.clearRetainingCapacity();
+    try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
+    try appendTestMember(allocator, &bytes, "data.tar/", "");
+    try appendTestMember(allocator, &bytes, "_gpgorigin/", "too large");
+    _ = try expectDiagnostic(.member_too_large, parse(bytes.items, .{ .max_signature_bytes = 3 }));
 }
 
 test "recognizes every supported control and data compression suffix" {
@@ -520,12 +669,15 @@ test "rejects duplicate, missing, and unexpected members" {
 
     bytes.clearRetainingCapacity();
     try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
     try appendTestMember(allocator, &bytes, "control.tar.gz/", "");
     try appendTestMember(allocator, &bytes, "control.tar.xz/", "");
     _ = try expectDiagnostic(.duplicate_control, parse(bytes.items, .{}));
 
     bytes.clearRetainingCapacity();
     try bytes.appendSlice(allocator, global_magic);
+    try appendTestMember(allocator, &bytes, "debian-binary/", "2.0\n");
+    try appendTestMember(allocator, &bytes, "control.tar/", "");
     try appendTestMember(allocator, &bytes, "data.tar/", "");
     try appendTestMember(allocator, &bytes, "data.tar.zst/", "");
     _ = try expectDiagnostic(.duplicate_data, parse(bytes.items, .{}));
