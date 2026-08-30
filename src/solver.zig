@@ -162,7 +162,9 @@ pub const RepositoryInput = struct {
     }
 };
 
-pub const AuthenticatedRepositoryPackageOrigin = struct {
+/// Repository-only origin retained for source compatibility with the v1
+/// solver and package-acquisition APIs.
+pub const PackageOrigin = struct {
     repository_id: source.RepositoryId,
     repository_priority: i32,
     record_index: usize,
@@ -172,6 +174,8 @@ pub const AuthenticatedRepositoryPackageOrigin = struct {
     source_location: []const u8,
 };
 
+pub const AuthenticatedRepositoryPackageOrigin = PackageOrigin;
+
 pub const LocalArtifactPackageOrigin = struct {
     evidence: package_origin.LocalArtifactEvidence,
     solver_priority: i32,
@@ -179,10 +183,11 @@ pub const LocalArtifactPackageOrigin = struct {
     source_location: []const u8,
 };
 
-pub const PackageOrigin = union(enum) {
+pub const TaggedPackageOrigin = union(enum) {
     authenticated_repository: AuthenticatedRepositoryPackageOrigin,
     local_artifact: LocalArtifactPackageOrigin,
 };
+pub const PackageOriginV2 = TaggedPackageOrigin;
 
 pub const AvailableImportError = std.mem.Allocator.Error || error{
     PoolAllocationFailed,
@@ -266,7 +271,20 @@ const OriginOwned = struct {
         self.* = undefined;
     }
 
-    fn public(self: *const OriginOwned) PackageOrigin {
+    fn publicRepository(self: *const OriginOwned) ?PackageOrigin {
+        if (self.local_artifact != null) return null;
+        return .{
+            .repository_id = self.repository_id,
+            .repository_priority = self.repository_priority,
+            .record_index = self.record_index,
+            .package = self.package,
+            .version = self.version,
+            .architecture = self.architecture,
+            .source_location = self.source_location,
+        };
+    }
+
+    fn publicTagged(self: *const OriginOwned) TaggedPackageOrigin {
         if (self.local_artifact) |artifact| return .{ .local_artifact = .{
             .evidence = artifact,
             .solver_priority = self.repository_priority,
@@ -645,10 +663,18 @@ pub const Context = opaque {
         return internalConst(self).origins.items.len;
     }
 
+    /// Returns repository-only origins as before. Local-artifact entries are
+    /// available through `originAtTagged`.
     pub fn originAt(self: *const Context, index: usize) ?PackageOrigin {
         const origins = internalConst(self).origins.items;
         if (index >= origins.len) return null;
-        return origins[index].public();
+        return origins[index].publicRepository();
+    }
+
+    pub fn originAtTagged(self: *const Context, index: usize) ?TaggedPackageOrigin {
+        const origins = internalConst(self).origins.items;
+        if (index >= origins.len) return null;
+        return origins[index].publicTagged();
     }
 
     pub fn installedCount(self: *const Context) usize {
@@ -862,6 +888,8 @@ pub const PlanAction = struct {
     /// consumed by package acquisition; local selections retain their
     /// separately verified artifact evidence.
     selected_origin: ?PackageOrigin,
+    /// Versioned tagged selection including verified local artifacts.
+    selected_origin_v2: ?TaggedPackageOrigin = null,
     /// Tagged production identity. Schema v2 continues serializing
     /// `repository`; schema v3 serializes this field as `origin`.
     origin: ?PlanOrigin = null,
@@ -985,6 +1013,34 @@ pub const PlanningError = std.mem.Allocator.Error || error{PoolAllocationFailed}
 /// Builds an owned deterministic transaction plan. All returned strings and
 /// records are detached from libsolv and from the caller's parsed inputs.
 pub fn planTransaction(
+    allocator: std.mem.Allocator,
+    input: PlanInput,
+) PlanningError!PlanningResult {
+    var result = try planTransactionInternal(allocator, input);
+    switch (result) {
+        .plan => {},
+        .failure => |*failure| failure.schema_version = planInputSchemaVersion(input),
+    }
+    return result;
+}
+
+fn planInputSchemaVersion(input: PlanInput) u32 {
+    for (input.repositories) |repository| {
+        if (repository.eligibility == .verified_local_artifact or
+            repository.local_artifact != null)
+            return 3;
+    }
+    if (input.exact_lock_v2) |lock| {
+        if (lock.local_artifacts.len != 0) return 3;
+        for (lock.packages) |package| switch (package.origin) {
+            .authenticated_repository => {},
+            .local_artifact => return 3,
+        };
+    }
+    return 2;
+}
+
+fn planTransactionInternal(
     allocator: std.mem.Allocator,
     input: PlanInput,
 ) PlanningError!PlanningResult {
@@ -1481,9 +1537,22 @@ fn addExactLockV2Jobs(
             .architecture = locked.architecture,
         })) |installed_index| {
             const mapping = state.mappings[installed_index];
-            if (state.source_records[mapping.record_index].status.isFullyInstalled()) continue;
+            if (state.source_records[mapping.record_index].status.isFullyInstalled()) {
+                switch (locked.origin) {
+                    .authenticated_repository => continue,
+                    .local_artifact => {},
+                }
+            }
         }
-        libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate.?);
+        const force = switch (locked.origin) {
+            .authenticated_repository => 0,
+            .local_artifact => libsolv.SOLVER_FORCEBEST,
+        };
+        libsolv.queue_push2(
+            jobs,
+            libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE | force,
+            candidate.?,
+        );
     }
 
     for (state.mappings, 0..) |mapping, installed_index| {
@@ -2332,6 +2401,14 @@ fn materializeAction(
     }
     const prior_bytes: i128 = if (prior) |value| @as(i128, @intCast(value.installed_size_kib orelse 0)) * 1024 else 0;
     const new_bytes: i128 = if (kind == .remove) 0 else @as(i128, @intCast(installed_size)) * 1024;
+    const selected_origin_v2 = if (origin) |available|
+        try ownedTaggedPackageOrigin(allocator, available)
+    else
+        null;
+    const selected_origin = if (selected_origin_v2) |selected| switch (selected) {
+        .authenticated_repository => |repository_origin| repository_origin,
+        .local_artifact => null,
+    } else null;
     return .{
         .kind = kind,
         .package = try allocator.dupe(u8, package_name),
@@ -2347,18 +2424,16 @@ fn materializeAction(
         .reason = actionReason(context, solvable_id, kind, input, package_name, version, architecture),
         .essential = essential,
         .has_pre_depends = has_pre_depends,
-        .selected_origin = if (origin) |available|
-            try ownedPackageOrigin(allocator, available)
-        else
-            null,
+        .selected_origin = selected_origin,
+        .selected_origin_v2 = selected_origin_v2,
         .origin = plan_origin,
     };
 }
 
-fn ownedPackageOrigin(
+fn ownedTaggedPackageOrigin(
     allocator: std.mem.Allocator,
     available: *const OriginOwned,
-) !PackageOrigin {
+) !TaggedPackageOrigin {
     if (available.local_artifact) |artifact| {
         var owned_artifact = artifact;
         owned_artifact.package = try allocator.dupe(u8, artifact.package);
@@ -3452,7 +3527,7 @@ fn availableIndexForArchitecture(
     };
 }
 
-fn solveAvailable(context: *Context, name: []const u8) ![]PackageOrigin {
+fn solveAvailable(context: *Context, name: []const u8) ![]TaggedPackageOrigin {
     const state = internal(context);
     try recreateSolver(state);
     var job: libsolv.Queue = undefined;
@@ -3465,16 +3540,16 @@ fn solveAvailable(context: *Context, name: []const u8) ![]PackageOrigin {
     );
     if (libsolv.solver_solve(state.solver, &job) != 0) return error.Unsolvable;
 
-    var selected: std.ArrayList(PackageOrigin) = .empty;
+    var selected: std.ArrayList(TaggedPackageOrigin) = .empty;
     defer selected.deinit(std.testing.allocator);
     for (state.origins.items) |*origin| {
         if (libsolv.solver_get_decisionlevel(state.solver, origin.solvable_id) > 0)
-            try selected.append(std.testing.allocator, origin.public());
+            try selected.append(std.testing.allocator, origin.publicTagged());
     }
     return selected.toOwnedSlice(std.testing.allocator);
 }
 
-fn hasSelected(selected: []const PackageOrigin, name: []const u8) bool {
+fn hasSelected(selected: []const TaggedPackageOrigin, name: []const u8) bool {
     for (selected) |origin| {
         const package = switch (origin) {
             .authenticated_repository => |repository| repository.package,
@@ -3537,7 +3612,7 @@ test "available import requires explicit trust and owns identities" {
     input.eligibility = .untrusted;
     try std.testing.expectError(error.UntrustedRepository, context.importAvailable(input, .{}));
     try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
-    const origin = switch (context.originAt(0).?) {
+    const origin = switch (context.originAtTagged(0).?) {
         .authenticated_repository => |value| value,
         .local_artifact => unreachable,
     };
@@ -4015,6 +4090,157 @@ test "solver.test.v1 exact lock replay remains repository-only schema v2" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"repository\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"origin\":") == null);
+}
+
+test "solver.test.local planning failures use v3 while repository failures remain v2" {
+    const digest: [32]u8 = @splat(0x44);
+    const artifact_id: source.RepositoryId = .{
+        .bytes = package_origin.artifactIdFromSha256(digest),
+    };
+    var index = try availableIndex(
+        artifact_id,
+        "Package: demo\nVersion: 1\nArchitecture: amd64\nFilename: demo.deb\nSize: 4\n" ++
+            "SHA256: 4444444444444444444444444444444444444444444444444444444444444444\n",
+    );
+    defer index.deinit();
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = artifact_id.bytes,
+        .sha256 = digest,
+        .size = 5,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    const local_repositories = [_]RepositoryInput{
+        RepositoryInput.fromLocalArtifact(&index, 500, artifact),
+    };
+    const local_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &local_repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "demo" } },
+    });
+    var local_failure = local_result.failure;
+    defer local_failure.deinit();
+    try std.testing.expectEqual(@as(u32, 3), local_failure.schema_version);
+    try std.testing.expectEqual(
+        ProblemKind.invalid_local_artifact,
+        local_failure.problems[0].kind,
+    );
+    const local_json = try local_failure.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(local_json);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        local_json,
+        "{\"schema_version\":3,",
+    ));
+
+    var repository = RepositoryInput.trustedTest(artifact_id, 500, &index);
+    repository.eligibility = .untrusted;
+    const repository_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{repository},
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "demo" } },
+    });
+    var repository_failure = repository_result.failure;
+    defer repository_failure.deinit();
+    try std.testing.expectEqual(@as(u32, 2), repository_failure.schema_version);
+    try std.testing.expectEqual(
+        ProblemKind.unauthenticated_repository,
+        repository_failure.problems[0].kind,
+    );
+}
+
+test "solver.test.exact lock v2 reinstalls matching local dpkg identity" {
+    const digest: [32]u8 = @splat(0x55);
+    const artifact_id: source.RepositoryId = .{
+        .bytes = package_origin.artifactIdFromSha256(digest),
+    };
+    var index = try availableIndex(
+        artifact_id,
+        "Package: demo\nVersion: 1\nArchitecture: amd64\nFilename: demo.deb\nSize: 5\n" ++
+            "SHA256: 5555555555555555555555555555555555555555555555555555555555555555\n",
+    );
+    defer index.deinit();
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = artifact_id.bytes,
+        .sha256 = digest,
+        .size = 5,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    const locked_package: exact_lock_v2.Package = .{
+        .name = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .origin = .{ .local_artifact = artifact },
+        .sha256 = artifact.sha256,
+        .declared_size = artifact.size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{artifact},
+        .packages = &.{locked_package},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var installed = try parsedDatabase(
+        "Package: demo\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer installed.deinit();
+    const policies = [_]InstalledPolicy{.{
+        .name = "demo",
+        .architecture = "amd64",
+        .install_reason = .manual,
+        .held = false,
+    }};
+    const repositories = [_]RepositoryInput{
+        RepositoryInput.fromLocalArtifact(&index, 500, artifact),
+    };
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = installed.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "demo" } },
+        .exact_lock_v2 = &lock.lock,
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u32, 3), plan.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.reinstall, plan.actions[0].kind);
+    try std.testing.expect(plan.actions[0].selected_origin == null);
+    try std.testing.expect(plan.actions[0].selected_origin_v2 != null);
+    switch (plan.actions[0].selected_origin_v2.?) {
+        .authenticated_repository => return error.TestExpectedLocalArtifact,
+        .local_artifact => {},
+    }
 }
 
 test "planner installs a named package with Debian replacement metadata" {

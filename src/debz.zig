@@ -41,6 +41,8 @@ pub const SolverRepositoryInput = solver.RepositoryInput;
 pub const SolverImportLimits = solver.Limits;
 pub const SolverPackageOrigin = solver.PackageOrigin;
 pub const SolverAuthenticatedRepositoryPackageOrigin = solver.AuthenticatedRepositoryPackageOrigin;
+pub const SolverTaggedPackageOrigin = solver.TaggedPackageOrigin;
+pub const SolverPackageOriginV2 = solver.PackageOriginV2;
 pub const SolverLocalArtifactPackageOrigin = solver.LocalArtifactPackageOrigin;
 pub const SolverAvailableImportError = solver.AvailableImportError;
 /// Pure transaction planning API. It does not download archives or execute

@@ -4,6 +4,11 @@ const package_origin = @import("package_origin.zig");
 pub const schema_id = "https://debz.dev/schema/exact-closure-lock-v2";
 pub const schema_version: u32 = 2;
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
+pub const maximum_repositories: usize = 16_384;
+pub const maximum_local_artifacts: usize = 65_536;
+pub const maximum_packages: usize = 100_000;
+pub const maximum_signer_fingerprints: usize = 65_536;
+pub const maximum_validation_items: usize = 200_000;
 
 pub const Retention = enum {
     requested,
@@ -72,20 +77,47 @@ pub const Lock = struct {
         version: []const u8,
         architecture: []const u8,
     ) ?Package {
-        for (self.packages) |package| {
-            if (std.mem.eql(u8, package.name, name) and
-                std.mem.eql(u8, package.version, version) and
-                std.mem.eql(u8, package.architecture, architecture))
-                return package;
+        const index = self.findPackageIndex(name, version, architecture) orelse
+            return null;
+        return self.packages[index];
+    }
+
+    pub fn findPackageIndex(
+        self: Lock,
+        name: []const u8,
+        version: []const u8,
+        architecture: []const u8,
+    ) ?usize {
+        var low: usize = 0;
+        var high = self.packages.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const package = self.packages[middle];
+            switch (comparePackageKey(package, name, architecture, version)) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => return middle,
+            }
         }
         return null;
     }
 
     pub fn findIdentity(self: Lock, name: []const u8, architecture: []const u8) ?Package {
-        for (self.packages) |package| {
-            if (std.mem.eql(u8, package.name, name) and
-                std.mem.eql(u8, package.architecture, architecture))
-                return package;
+        var low: usize = 0;
+        var high = self.packages.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const package = self.packages[middle];
+            const name_order = std.mem.order(u8, package.name, name);
+            const order = if (name_order == .eq)
+                std.mem.order(u8, package.architecture, architecture)
+            else
+                name_order;
+            switch (order) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => return package,
+            }
         }
         return null;
     }
@@ -124,6 +156,11 @@ pub const ValidationError = error{
     DigestMismatch,
     DocumentTooLarge,
     InvalidDigest,
+    TooManyRepositories,
+    TooManyArtifacts,
+    TooManyPackages,
+    TooManySigners,
+    ValidationWorkLimitExceeded,
 };
 
 pub fn create(
@@ -133,6 +170,27 @@ pub fn create(
     if (!input.verified_origins) return error.UnverifiedOrigin;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     if (input.packages.len == 0) return error.EmptyClosure;
+    if (input.repositories.len > maximum_repositories) return error.TooManyRepositories;
+    if (input.local_artifacts.len > maximum_local_artifacts) return error.TooManyArtifacts;
+    if (input.packages.len > maximum_packages) return error.TooManyPackages;
+    var signer_count: usize = 0;
+    for (input.repositories) |repository| {
+        signer_count = std.math.add(usize, signer_count, repository.signer_fingerprints.len) catch
+            return error.ValidationWorkLimitExceeded;
+        if (signer_count > maximum_signer_fingerprints) return error.TooManySigners;
+    }
+    const evidence_count = std.math.add(
+        usize,
+        input.repositories.len,
+        input.local_artifacts.len,
+    ) catch return error.ValidationWorkLimitExceeded;
+    const validation_items = std.math.add(
+        usize,
+        evidence_count,
+        input.packages.len,
+    ) catch return error.ValidationWorkLimitExceeded;
+    if (validation_items > maximum_validation_items)
+        return error.ValidationWorkLimitExceeded;
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -181,6 +239,10 @@ pub fn create(
             &local_artifacts[index - 1].artifact_id,
         )) return error.DuplicateArtifact;
     }
+    const referenced_repositories = try owned.alloc(bool, repositories.len);
+    @memset(referenced_repositories, false);
+    const referenced_artifacts = try owned.alloc(bool, local_artifacts.len);
+    @memset(referenced_artifacts, false);
 
     const packages = try owned.alloc(Package, input.packages.len);
     for (input.packages, 0..) |package, index| {
@@ -194,18 +256,27 @@ pub fn create(
         packages[index].architecture = try owned.dupe(u8, package.architecture);
         switch (package.origin) {
             .authenticated_repository => |origin| {
-                const repository = findRepository(repositories, origin.repository_id) orelse
+                const repository_index = findRepositoryIndex(
+                    repositories,
+                    origin.repository_id,
+                ) orelse
                     return error.MissingRepository;
+                const repository = repositories[repository_index];
                 if (!std.mem.eql(
                     u8,
                     &repository.snapshot_sha256,
                     &origin.repository_snapshot_sha256,
                 )) return error.RepositorySnapshotMismatch;
+                referenced_repositories[repository_index] = true;
             },
             .local_artifact => |origin| {
                 try package_origin.validateLocalArtifact(origin);
-                const artifact = findLocalArtifact(local_artifacts, origin.artifact_id) orelse
+                const artifact_index = findLocalArtifactIndex(
+                    local_artifacts,
+                    origin.artifact_id,
+                ) orelse
                     return error.MissingArtifact;
+                const artifact = local_artifacts[artifact_index];
                 if (!package_origin.eqlLocalArtifact(artifact, origin) or
                     !std.mem.eql(u8, package.name, origin.package) or
                     !std.mem.eql(u8, package.version, origin.version) or
@@ -216,6 +287,7 @@ pub fn create(
                 packages[index].origin = .{
                     .local_artifact = try dupeLocalArtifact(owned, origin),
                 };
+                referenced_artifacts[artifact_index] = true;
             },
         }
     }
@@ -225,28 +297,10 @@ pub fn create(
             return error.DuplicatePackage;
     }
 
-    for (repositories) |repository| {
-        var referenced = false;
-        for (packages) |package| switch (package.origin) {
-            .authenticated_repository => |origin| {
-                if (std.mem.eql(u8, &repository.id, &origin.repository_id))
-                    referenced = true;
-            },
-            .local_artifact => {},
-        };
+    for (referenced_repositories) |referenced|
         if (!referenced) return error.UnusedRepository;
-    }
-    for (local_artifacts) |artifact| {
-        var referenced = false;
-        for (packages) |package| switch (package.origin) {
-            .authenticated_repository => {},
-            .local_artifact => |origin| {
-                if (std.mem.eql(u8, &artifact.artifact_id, &origin.artifact_id))
-                    referenced = true;
-            },
-        };
+    for (referenced_artifacts) |referenced|
         if (!referenced) return error.UnusedArtifact;
-    }
 
     var lock: Lock = .{
         .target_architecture = try owned.dupe(u8, input.target_architecture),
@@ -707,19 +761,48 @@ fn validIdentity(value: []const u8) bool {
     return true;
 }
 
-fn findRepository(repositories: []const Repository, id: [64]u8) ?Repository {
-    for (repositories) |repository|
-        if (std.mem.eql(u8, &repository.id, &id)) return repository;
+fn findRepositoryIndex(repositories: []const Repository, id: [64]u8) ?usize {
+    var low: usize = 0;
+    var high = repositories.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        switch (std.mem.order(u8, &repositories[middle].id, &id)) {
+            .lt => low = middle + 1,
+            .gt => high = middle,
+            .eq => return middle,
+        }
+    }
     return null;
 }
 
-fn findLocalArtifact(
+fn findLocalArtifactIndex(
     artifacts: []const package_origin.LocalArtifactEvidence,
     id: [64]u8,
-) ?package_origin.LocalArtifactEvidence {
-    for (artifacts) |artifact|
-        if (std.mem.eql(u8, &artifact.artifact_id, &id)) return artifact;
+) ?usize {
+    var low: usize = 0;
+    var high = artifacts.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        switch (std.mem.order(u8, &artifacts[middle].artifact_id, &id)) {
+            .lt => low = middle + 1,
+            .gt => high = middle,
+            .eq => return middle,
+        }
+    }
     return null;
+}
+
+fn comparePackageKey(
+    package: Package,
+    name: []const u8,
+    architecture: []const u8,
+    version: []const u8,
+) std.math.Order {
+    const name_order = std.mem.order(u8, package.name, name);
+    if (name_order != .eq) return name_order;
+    const architecture_order = std.mem.order(u8, package.architecture, architecture);
+    if (architecture_order != .eq) return architecture_order;
+    return std.mem.order(u8, package.version, version);
 }
 
 fn lessRepository(_: void, left: Repository, right: Repository) bool {
@@ -972,6 +1055,79 @@ test "exact_lock_v2.test.rejects origin substitution mismatch and unused evidenc
                 .repositories = &.{},
                 .local_artifacts = &.{artifact},
                 .packages = &.{changed_package},
+                .verified_origins = true,
+            },
+        ));
+    }
+
+    {
+        const count = 4096;
+        var input_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer input_arena.deinit();
+        const allocator = input_arena.allocator();
+        const artifacts = try allocator.alloc(package_origin.LocalArtifactEvidence, count);
+        const packages = try allocator.alloc(Package, count);
+        for (0..count) |offset| {
+            const value: u64 = @intCast(count - offset);
+            var package_digest: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, package_digest[0..8], value, .big);
+            const name = try std.fmt.allocPrint(allocator, "package-{d:0>5}", .{value});
+            const url = try std.fmt.allocPrint(allocator, "file:///{s}.deb", .{name});
+            const large_artifact: package_origin.LocalArtifactEvidence = .{
+                .artifact_id = package_origin.artifactIdFromSha256(package_digest),
+                .sha256 = package_digest,
+                .size = value + 1,
+                .package = name,
+                .version = "1",
+                .architecture = "amd64",
+                .acquisition_url = url,
+                .trust_mode = .pinned_sha256,
+            };
+            artifacts[offset] = large_artifact;
+            packages[offset] = .{
+                .name = large_artifact.package,
+                .version = large_artifact.version,
+                .architecture = large_artifact.architecture,
+                .origin = .{ .local_artifact = large_artifact },
+                .sha256 = large_artifact.sha256,
+                .declared_size = large_artifact.size,
+                .retention = .dependency,
+                .dpkg_selection_hold = false,
+            };
+        }
+        var lock = try create(std.testing.allocator, .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(1),
+            .policy_sha256 = @splat(2),
+            .repositories = &.{},
+            .local_artifacts = artifacts,
+            .packages = packages,
+            .verified_origins = true,
+        });
+        defer lock.deinit();
+        try std.testing.expectEqual(count, lock.lock.packages.len);
+        try std.testing.expect(lock.lock.findPackage("package-02048", "1", "amd64") != null);
+        const canonical = try lock.lock.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(canonical);
+        try std.testing.expect(canonical.len < maximum_document_bytes);
+        var decoded = try decode(std.testing.allocator, canonical, maximum_document_bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqual(count, decoded.lock.local_artifacts.len);
+
+        const too_many = try std.testing.allocator.alloc(
+            Repository,
+            maximum_repositories + 1,
+        );
+        defer std.testing.allocator.free(too_many);
+        try std.testing.expectError(error.TooManyRepositories, create(
+            std.testing.allocator,
+            .{
+                .target_architecture = "amd64",
+                .request_sha256 = @splat(1),
+                .policy_sha256 = @splat(2),
+                .repositories = too_many,
+                .local_artifacts = artifacts[0..1],
+                .packages = packages[0..1],
                 .verified_origins = true,
             },
         ));

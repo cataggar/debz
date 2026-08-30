@@ -379,14 +379,14 @@ pub const Backend = struct {
             verified.deinit(allocator);
         }
         for (plan.actions) |action| {
-            const origin = try authenticatedPackageOrigin(action.selected_origin orelse continue);
+            const origin = try authenticatedPackageOrigin(action.selected_origin_v2 orelse continue);
             const repository_input = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
                 return error.MissingRepository;
             const normalized_repository = findNormalized(configuration.repositories, origin.repository_id) orelse
                 return error.MissingRepository;
             const selected = try package_acquisition.SelectedPackage.fromSolverSelection(
                 repository_input,
-                .{ .authenticated_repository = origin },
+                origin,
                 try repository_acquisition.Uri.parse(normalized_repository.uri),
             );
             var package = package_acquisition.acquirePackage(
@@ -1199,7 +1199,7 @@ fn lockFromPlan(
     defer repository_ids.deinit(allocator);
 
     for (plan.actions) |action| {
-        const origin = try authenticatedPackageOrigin(action.selected_origin orelse continue);
+        const origin = try authenticatedPackageOrigin(action.selected_origin_v2 orelse continue);
         const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
             return error.MissingRepository;
         const record = repository.packages.records[origin.record_index];
@@ -1581,7 +1581,7 @@ fn findRepositoryInput(
 }
 
 fn authenticatedPackageOrigin(
-    origin: solver.PackageOrigin,
+    origin: solver.TaggedPackageOrigin,
 ) !solver.AuthenticatedRepositoryPackageOrigin {
     return switch (origin) {
         .authenticated_repository => |repository| repository,

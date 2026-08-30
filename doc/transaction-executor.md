@@ -22,6 +22,11 @@ repository packages or `deb_payload.inspectLocal` for tagged local artifacts.
 Every install-like action requires an exact SHA-256 and size. Origin checks
 branch explicitly between authenticated repository identity and local artifact
 ID, acquisition URL, trust mode, digest, size, and control identity.
+An exact-lock-v2 local package is always replayed from its locked artifact when
+dpkg status alone is the only installed-state evidence. Final execution and
+recovery verification require a completed unpack journal entry with that
+artifact digest and an exact plan-origin/size match; matching dpkg identity
+alone is insufficient.
 
 For a new root, the authenticated closure containing absent Essential packages
 receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before

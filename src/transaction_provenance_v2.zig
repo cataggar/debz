@@ -66,6 +66,131 @@ pub const Result = struct {
         try writeDocument(self, &output.writer);
         return output.toOwnedSlice();
     }
+
+    fn testExecutionMetadataBoundToExactLock() !void {
+        const digest: [32]u8 = @splat(0x31);
+        const artifact: package_origin.LocalArtifactEvidence = .{
+            .artifact_id = package_origin.artifactIdFromSha256(digest),
+            .sha256 = digest,
+            .size = 31,
+            .package = "demo",
+            .version = "1",
+            .architecture = "amd64",
+            .acquisition_url = "file:///demo.deb",
+            .trust_mode = .pinned_sha256,
+        };
+        const locked_package: exact_lock_v2.Package = .{
+            .name = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .origin = .{ .local_artifact = artifact },
+            .sha256 = artifact.sha256,
+            .declared_size = artifact.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        };
+        var lock = try exact_lock_v2.create(std.testing.allocator, .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(1),
+            .policy_sha256 = @splat(2),
+            .repositories = &.{},
+            .local_artifacts = &.{artifact},
+            .packages = &.{locked_package},
+            .verified_origins = true,
+        });
+        defer lock.deinit();
+        const package: PackageEvidence = .{
+            .name = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .origin = .{ .local_artifact = artifact },
+            .package_sha256 = artifact.sha256,
+            .cas_sha256 = artifact.sha256,
+            .declared_size = artifact.size,
+        };
+        const verification: FinalVerification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(3),
+            .package_origins_sha256 = lock.lock.digest_sha256,
+            .detail = "verified",
+        };
+        const input: ExecutionInput = .{
+            .exact_lock = &lock.lock,
+            .target_architecture = lock.lock.target_architecture,
+            .request_sha256 = lock.lock.request_sha256,
+            .solver_policy_sha256 = lock.lock.policy_sha256,
+            .repositories = &.{},
+            .packages = &.{package},
+            .journal_steps = &.{},
+            .final_verification = verification,
+        };
+        const report: transaction_executor.Report = .{
+            .allocator = std.testing.allocator,
+            .arena = undefined,
+            .commands = &.{},
+            .plan_sha256 = @splat(4),
+            .transaction_state = .complete,
+            .root_identity = @splat(5),
+            .policy_sha256 = @splat(6),
+            .lock_sha256 = lock.lock.digest_sha256,
+            .failure = null,
+        };
+        const recovery_report: transaction_executor.RecoveryReport = .{
+            .allocator = std.testing.allocator,
+            .arena = undefined,
+            .state = .complete,
+            .commands = &.{},
+            .plan_sha256 = report.plan_sha256,
+            .root_identity = report.root_identity,
+            .policy_sha256 = report.policy_sha256,
+            .lock_sha256 = report.lock_sha256,
+            .failure = null,
+        };
+        var execution = try createFromExecution(std.testing.allocator, input, report);
+        defer execution.deinit();
+        var recovered = try createFromRecovery(
+            std.testing.allocator,
+            input,
+            recovery_report,
+        );
+        defer recovered.deinit();
+        try std.testing.expectEqualStrings(
+            lock.lock.target_architecture,
+            execution.result.target_architecture,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            &lock.lock.request_sha256,
+            &recovered.result.request_sha256,
+        );
+
+        const Mismatch = enum { architecture, request, policy };
+        inline for ([_]Mismatch{ .architecture, .request, .policy }) |kind| {
+            var mismatch = input;
+            const expected: anyerror = switch (kind) {
+                .architecture => blk: {
+                    mismatch.target_architecture = "arm64";
+                    break :blk error.LockArchitectureMismatch;
+                },
+                .request => blk: {
+                    mismatch.request_sha256 = @splat(0xaa);
+                    break :blk error.LockRequestMismatch;
+                },
+                .policy => blk: {
+                    mismatch.solver_policy_sha256 = @splat(0xbb);
+                    break :blk error.LockPolicyMismatch;
+                },
+            };
+            try std.testing.expectError(
+                expected,
+                createFromExecution(std.testing.allocator, mismatch, report),
+            );
+            try std.testing.expectError(
+                expected,
+                createFromRecovery(std.testing.allocator, mismatch, recovery_report),
+            );
+        }
+    }
 };
 
 pub const OwnedResult = struct {
@@ -84,6 +209,9 @@ pub const Error = v1.Error || package_origin.ValidationError || error{
     UnusedRepository,
     InvalidPackageOrigin,
     PackageOriginMismatch,
+    LockArchitectureMismatch,
+    LockRequestMismatch,
+    LockPolicyMismatch,
 };
 
 pub const ExecutionInput = struct {
@@ -106,15 +234,16 @@ pub fn createFromExecution(
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
     if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
         return error.LockDigestMismatch;
+    try validateExecutionLockMetadata(input);
     try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const arena = temporary.allocator();
     const commands = try commandsFromReport(arena, report.commands);
     return create(allocator, .{
-        .target_architecture = input.target_architecture,
-        .request_sha256 = input.request_sha256,
-        .solver_policy_sha256 = input.solver_policy_sha256,
+        .target_architecture = input.exact_lock.target_architecture,
+        .request_sha256 = input.exact_lock.request_sha256,
+        .solver_policy_sha256 = input.exact_lock.policy_sha256,
         .executor_policy_sha256 = report.policy_sha256,
         .plan_sha256 = report.plan_sha256,
         .lock_sha256 = lock_sha256,
@@ -141,14 +270,15 @@ pub fn createFromRecovery(
     const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
     if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
         return error.LockDigestMismatch;
+    try validateExecutionLockMetadata(input);
     try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
     var temporary = std.heap.ArenaAllocator.init(allocator);
     defer temporary.deinit();
     const commands = try commandsFromReport(temporary.allocator(), report.commands);
     return create(allocator, .{
-        .target_architecture = input.target_architecture,
-        .request_sha256 = input.request_sha256,
-        .solver_policy_sha256 = input.solver_policy_sha256,
+        .target_architecture = input.exact_lock.target_architecture,
+        .request_sha256 = input.exact_lock.request_sha256,
+        .solver_policy_sha256 = input.exact_lock.policy_sha256,
         .executor_policy_sha256 = report.policy_sha256,
         .plan_sha256 = report.plan_sha256,
         .lock_sha256 = lock_sha256,
@@ -164,6 +294,24 @@ pub fn createFromRecovery(
             .recovery_required,
         .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
     });
+}
+
+fn validateExecutionLockMetadata(input: ExecutionInput) Error!void {
+    if (!std.mem.eql(
+        u8,
+        input.target_architecture,
+        input.exact_lock.target_architecture,
+    )) return error.LockArchitectureMismatch;
+    if (!std.mem.eql(
+        u8,
+        &input.request_sha256,
+        &input.exact_lock.request_sha256,
+    )) return error.LockRequestMismatch;
+    if (!std.mem.eql(
+        u8,
+        &input.solver_policy_sha256,
+        &input.exact_lock.policy_sha256,
+    )) return error.LockPolicyMismatch;
 }
 
 pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
@@ -944,4 +1092,8 @@ test "transaction_provenance_v2.test.local artifact evidence has no repository s
             verifyLockEvidence(lock.lock, &.{}, &.{mismatch}, null),
         );
     }
+}
+
+test "transaction_provenance_v2.test.execution metadata is bound to exact lock" {
+    try Result.testExecutionMetadataBoundToExactLock();
 }

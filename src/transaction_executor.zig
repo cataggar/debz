@@ -720,7 +720,7 @@ pub fn execute(
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist verification boundary");
         return finish(allocator, arena_ptr, &state, plan_sha256);
     };
-    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, request.install_root, dependencies.status) catch |err| {
+    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status) catch |err| {
         journal.state = .verification_failed;
         journal.failure = @errorName(err);
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -853,7 +853,7 @@ pub fn recover(
             state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
-        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, request.install_root, dependencies.status);
+        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
         if (!verification.succeeded()) {
             journal.state = .verification_failed;
             journal.failure = @tagName(verification.failure.?);
@@ -994,7 +994,7 @@ pub fn recover(
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
 
-    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, request.install_root, dependencies.status);
+    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
     if (!verification.succeeded()) {
         journal.state = .verification_failed;
         journal.failure = @tagName(verification.failure.?);
@@ -1066,13 +1066,22 @@ fn verifyFinal(
     plan: solver.Plan,
     lock: ?*const exact_lock.Lock,
     lock_v2: ?*const exact_lock_v2.Lock,
+    journal: recovery.Journal,
     root: []const u8,
     status: recovery.StatusReader,
 ) !recovery.Verification {
     if (lock) |closure|
         return recovery.verifyExactLock(allocator, closure.*, root, status, 64 * 1024 * 1024);
     if (lock_v2) |closure|
-        return recovery.verifyExactLockV2(allocator, closure.*, root, status, 64 * 1024 * 1024);
+        return recovery.verifyExactLockV2WithEvidence(
+            allocator,
+            closure.*,
+            plan,
+            journal,
+            root,
+            status,
+            64 * 1024 * 1024,
+        );
     return recovery.verify(allocator, plan, root, status, .{});
 }
 

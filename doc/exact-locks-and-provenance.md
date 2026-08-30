@@ -13,7 +13,11 @@ identity, redacted acquisition URL, and `pinned_sha256` or `verified_https`
 trust mode. Local artifacts never receive fabricated Release, index, signer,
 or repository snapshot evidence. V2 creation and replay reject unused or
 duplicate evidence and every origin, digest, size, identity, URL, or trust-mode
-substitution. V1 decoding and replay remain unchanged.
+substitution. Local packages are reinstalled during replay even when dpkg
+already reports the locked name, version, and architecture, because dpkg status
+does not authoritatively retain archive origin. Final verification additionally
+requires the completed journal's local archive digest and the plan's exact
+origin, digest, and size evidence. V1 decoding and replay remain unchanged.
 
 `dpkg_selection_hold` records dpkg selection intent. It is not an exact-lock
 constraint. `SolverPlanInput.exact_lock` separately constrains the complete
@@ -27,7 +31,10 @@ normal production inputs should be built from
 `repository_refresh.AuthenticatedResult` and its `snapshotDigest`. Decoding
 rejects unknown schema versions, digest tampering, non-canonical JSON,
 duplicates, missing repositories, unsafe paths, symlinks, and oversized
-documents. `ExactClosureLockStore` publishes with write/fsync/rename/fsync.
+documents. V2 validation has explicit repository, artifact, package, signer,
+and total-work limits; sorted indexed matching and reference accounting avoid
+quadratic artifact/package validation. `ExactClosureLockStore` publishes with
+write/fsync/rename/fsync.
 The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
@@ -46,7 +53,9 @@ into the result.
 `debz.transaction_provenance_v2` carries the same tagged package origins and
 verifies them against an exact-closure-lock v2. Repository evidence is emitted
 only for authenticated repository packages; local artifacts carry only their
-artifact and acquisition evidence.
+artifact and acquisition evidence. Execution and recovery provenance reject
+target-architecture, request-digest, or solver-policy-digest values that differ
+from the exact lock, then serialize those fields from the lock.
 
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted

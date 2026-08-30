@@ -50,3 +50,11 @@ consumers.
 Repository-only plans retain canonical schema-v2 output. A plan containing a
 local artifact uses schema v3, where every archive-producing action serializes
 a tagged `origin` rather than reinterpreting the v2 `repository` field.
+Failures from a planning input containing local-origin evidence also use schema
+v3, including failures raised while validating that evidence. Repository-only
+failures remain schema v2.
+
+The repository-only `SolverPackageOrigin` and package-acquisition entry points
+remain source compatible. `SolverPackageOriginV2` (also exported as
+`SolverTaggedPackageOrigin`) and the corresponding tagged acquisition entry
+points are the explicit API for repository-or-local solver selections.
