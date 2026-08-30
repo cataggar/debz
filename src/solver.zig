@@ -792,6 +792,8 @@ pub const PlanLimits = struct {
     max_problems: usize = 1_000,
 };
 
+const maximum_exact_lock_v2_origins: usize = 500_000;
+
 pub const ProtectedIdentity = struct {
     name: []const u8,
     architecture: []const u8,
@@ -1032,10 +1034,6 @@ fn planInputSchemaVersion(input: PlanInput) u32 {
     }
     if (input.exact_lock_v2) |lock| {
         if (lock.local_artifacts.len != 0) return 3;
-        for (lock.packages) |package| switch (package.origin) {
-            .authenticated_repository => {},
-            .local_artifact => return 3,
-        };
     }
     return 2;
 }
@@ -1064,6 +1062,48 @@ fn planTransactionInternal(
     if (input.exact_lock != null and input.exact_lock_v2 != null) {
         return failureOne(allocator, arena_ptr, .invalid_policy, null, null, "only one exact lock version may be supplied");
     }
+    if (input.repositories.len > input.limits.import.max_repositories or
+        (input.exact_lock_v2 != null and
+            input.repositories.len > exact_lock_v2.maximum_repositories))
+    {
+        return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "repository input exceeds the configured limit");
+    }
+    const repository_order = try allocator.alloc(usize, input.repositories.len);
+    defer allocator.free(repository_order);
+    const repository_lookup_order = try allocator.alloc(usize, input.repositories.len);
+    defer allocator.free(repository_lookup_order);
+    for (repository_order, 0..) |*slot, index| slot.* = index;
+    @memcpy(repository_lookup_order, repository_order);
+    std.mem.sort(usize, repository_order, input.repositories, lessRepositoryIndex);
+    std.mem.sort(
+        usize,
+        repository_lookup_order,
+        input.repositories,
+        lessRepositoryLookupIndex,
+    );
+    for (repository_lookup_order, 0..) |repository_index, order_index| {
+        if (order_index == 0) continue;
+        const previous_index = repository_lookup_order[order_index - 1];
+        if (std.mem.eql(
+            u8,
+            input.repositories[repository_index].repository_id.slice(),
+            input.repositories[previous_index].repository_id.slice(),
+        )) {
+            return failureOne(allocator, arena_ptr, .duplicate_repository, null, null, "repository identity is repeated");
+        }
+    }
+    if (input.exact_lock_v2 != null) {
+        var available_origin_count: usize = 0;
+        for (input.repositories) |repository| {
+            available_origin_count = std.math.add(
+                usize,
+                available_origin_count,
+                repository.packages.records.len,
+            ) catch return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "exact-lock v2 available-origin count overflowed");
+            if (available_origin_count > maximum_exact_lock_v2_origins)
+                return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "exact-lock v2 available-origin count exceeds its work limit");
+        }
+    }
     if (input.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, input.target_architecture))
             return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "exact lock target architecture differs from planning architecture");
@@ -1073,7 +1113,13 @@ fn planTransactionInternal(
     if (input.exact_lock_v2) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, input.target_architecture))
             return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "exact lock target architecture differs from planning architecture");
-        if (try validateExactLockV2Input(allocator, arena_ptr, input.repositories, lock)) |failure|
+        if (try validateExactLockV2Input(
+            allocator,
+            arena_ptr,
+            input.repositories,
+            repository_lookup_order,
+            lock,
+        )) |failure|
             return .{ .failure = failure };
     }
     for (input.repositories) |repository| {
@@ -1081,14 +1127,6 @@ fn planTransactionInternal(
             return failureOne(allocator, arena_ptr, .unauthenticated_repository, null, null, "repository snapshot is not authenticated");
         }
     }
-    for (input.repositories, 0..) |repository, index| {
-        for (input.repositories[0..index]) |previous| {
-            if (std.mem.eql(u8, repository.repository_id.slice(), previous.repository_id.slice())) {
-                return failureOne(allocator, arena_ptr, .duplicate_repository, null, null, "repository identity is repeated");
-            }
-        }
-    }
-
     const context = try Context.createForArchitecture(allocator, input.target_architecture);
     defer context.destroy();
     const installed_records = try allocator.dupe(dpkg_status.Package, input.installed.records);
@@ -1107,10 +1145,6 @@ fn planTransactionInternal(
         },
     }
 
-    const repository_order = try allocator.alloc(usize, input.repositories.len);
-    defer allocator.free(repository_order);
-    for (repository_order, 0..) |*slot, index| slot.* = index;
-    std.mem.sort(usize, repository_order, input.repositories, lessRepositoryIndex);
     for (repository_order) |repository_index| {
         const repository = input.repositories[repository_index];
         context.importAvailable(repository, input.limits.import) catch |err| {
@@ -1150,10 +1184,25 @@ fn planTransactionInternal(
             return .{ .failure = failure };
     }
     if (input.exact_lock_v2) |lock| {
-        if (try addExactLockV2Jobs(allocator, arena_ptr, context, input, lock, &jobs)) |failure|
+        if (state.origins.items.len > maximum_exact_lock_v2_origins)
+            return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "exact-lock v2 origin lookup exceeds its work limit");
+        const origin_order = try allocator.alloc(usize, state.origins.items.len);
+        defer allocator.free(origin_order);
+        for (origin_order, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, origin_order, state, lessOriginIndex);
+        if (try addExactLockV2Jobs(
+            allocator,
+            arena_ptr,
+            context,
+            input,
+            repository_lookup_order,
+            origin_order,
+            lock,
+            &jobs,
+        )) |failure|
             return .{ .failure = failure };
     }
-    addEssentialJobs(context, input, &jobs);
+    addEssentialJobs(context, input, repository_lookup_order, &jobs);
     addSafetyLocks(context, input, &jobs);
     addInstallOnlyJobs(context, input, &jobs);
     addPhasedLocks(context, input, &jobs);
@@ -1208,7 +1257,14 @@ fn planTransactionInternal(
             solvable_id,
             libsolv.SOLVER_TRANSACTION_SHOW_ACTIVE,
         ) == libsolv.SOLVER_TRANSACTION_IGNORE) continue;
-        const action = try materializeAction(owned, context, transaction, solvable_id, input);
+        const action = try materializeAction(
+            owned,
+            context,
+            transaction,
+            solvable_id,
+            input,
+            repository_lookup_order,
+        );
         download_bytes = std.math.add(u64, download_bytes, action.package_size orelse 0) catch
             return failureOne(allocator, arena_ptr, .limit_exceeded, null, null, "download byte total overflowed");
         size_delta += action.installed_size_delta_bytes;
@@ -1273,6 +1329,18 @@ fn authorizedRemoval(input: PlanInput, context: *Context, solvable_id: libsolv.I
 fn lessRepositoryIndex(repositories: []const RepositoryInput, a: usize, b: usize) bool {
     if (repositories[a].priority != repositories[b].priority)
         return repositories[a].priority > repositories[b].priority;
+    return std.mem.order(
+        u8,
+        repositories[a].repository_id.slice(),
+        repositories[b].repository_id.slice(),
+    ) == .lt;
+}
+
+fn lessRepositoryLookupIndex(
+    repositories: []const RepositoryInput,
+    a: usize,
+    b: usize,
+) bool {
     return std.mem.order(
         u8,
         repositories[a].repository_id.slice(),
@@ -1389,18 +1457,33 @@ fn validateExactLockV2Input(
     backing: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     repositories: []const RepositoryInput,
+    repository_order: []const usize,
     lock: *const exact_lock_v2.Lock,
 ) PlanningError!?PlanFailure {
+    if (lock.repositories.len > exact_lock_v2.maximum_repositories or
+        lock.local_artifacts.len > exact_lock_v2.maximum_local_artifacts or
+        lock.packages.len > exact_lock_v2.maximum_packages)
+        return (try failureOne(backing, arena, .limit_exceeded, null, null, "exact-lock v2 evidence exceeds count limits")).failure;
+    const evidence_count = std.math.add(
+        usize,
+        lock.repositories.len,
+        lock.local_artifacts.len,
+    ) catch return (try failureOne(backing, arena, .limit_exceeded, null, null, "exact-lock v2 evidence count overflowed")).failure;
+    const validation_items = std.math.add(
+        usize,
+        evidence_count,
+        lock.packages.len,
+    ) catch return (try failureOne(backing, arena, .limit_exceeded, null, null, "exact-lock v2 validation work overflowed")).failure;
+    if (validation_items > exact_lock_v2.maximum_validation_items)
+        return (try failureOne(backing, arena, .limit_exceeded, null, null, "exact-lock v2 validation work exceeds its limit")).failure;
     for (lock.repositories) |locked_repository| {
-        var matched: ?RepositoryInput = null;
-        for (repositories) |repository| {
-            if (std.mem.eql(u8, repository.repository_id.slice(), &locked_repository.id)) {
-                matched = repository;
-                break;
-            }
-        }
-        const repository = matched orelse
+        const repository_index = findRepositoryIndexSorted(
+            repositories,
+            repository_order,
+            .{ .bytes = locked_repository.id },
+        ) orelse
             return (try failureOne(backing, arena, .lock_repository_missing, null, null, "exact lock repository is unavailable")).failure;
+        const repository = repositories[repository_index];
         if (repository.eligibility != .verified_refresh)
             return (try failureOne(backing, arena, .unauthenticated_repository, null, null, "repository lock reproduction requires authenticated refresh metadata")).failure;
         const snapshot = repository.authenticated_snapshot_sha256 orelse
@@ -1409,18 +1492,17 @@ fn validateExactLockV2Input(
             return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository snapshot differs from the exact lock")).failure;
     }
     for (lock.local_artifacts) |locked_artifact| {
-        var matched = false;
-        for (repositories) |repository| {
-            if (repository.eligibility != .verified_local_artifact) continue;
-            const artifact = repository.local_artifact orelse continue;
-            if (std.mem.eql(u8, &artifact.artifact_id, &locked_artifact.artifact_id) and
-                package_origin.eqlLocalArtifact(artifact, locked_artifact))
-            {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched)
+        const repository_index = findRepositoryIndexSorted(
+            repositories,
+            repository_order,
+            .{ .bytes = locked_artifact.artifact_id },
+        ) orelse
+            return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "locked local artifact is unavailable")).failure;
+        const repository = repositories[repository_index];
+        const artifact = repository.local_artifact orelse
+            return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "verified local artifact evidence is unavailable")).failure;
+        if (repository.eligibility != .verified_local_artifact or
+            !package_origin.eqlLocalArtifact(artifact, locked_artifact))
             return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "verified local artifact evidence differs from the exact lock")).failure;
     }
     return null;
@@ -1495,6 +1577,8 @@ fn addExactLockV2Jobs(
     arena: *std.heap.ArenaAllocator,
     context: *Context,
     input: PlanInput,
+    repository_order: []const usize,
+    origin_order: []const usize,
     lock: *const exact_lock_v2.Lock,
     jobs: *libsolv.Queue,
 ) PlanningError!?PlanFailure {
@@ -1502,13 +1586,27 @@ fn addExactLockV2Jobs(
     for (lock.packages) |locked| {
         var candidate: ?libsolv.Id = null;
         var identity_seen = false;
-        for (state.origins.items) |origin| {
-            if (!std.mem.eql(u8, origin.package, locked.name) or
-                !std.mem.eql(u8, origin.version, locked.version) or
-                !std.mem.eql(u8, origin.architecture, locked.architecture))
-                continue;
+        var origin_position = lowerBoundOrigin(
+            state,
+            origin_order,
+            locked.name,
+            locked.architecture,
+            locked.version,
+        );
+        while (origin_position < origin_order.len) : (origin_position += 1) {
+            const origin = state.origins.items[origin_order[origin_position]];
+            if (compareOriginIdentity(
+                origin,
+                locked.name,
+                locked.architecture,
+                locked.version,
+            ) != .eq) break;
             identity_seen = true;
-            const repository_index = findRepositoryIndex(input.repositories, origin.repository_id) orelse
+            const repository_index = findRepositoryIndexSorted(
+                input.repositories,
+                repository_order,
+                origin.repository_id,
+            ) orelse
                 continue;
             const record = input.repositories[repository_index].packages.records[origin.record_index];
             if (!std.mem.eql(u8, &record.transport.sha256.bytes, &locked.sha256) or
@@ -2038,14 +2136,23 @@ fn hasRequiredInstalledDependent(context: *Context, removed_index: usize) bool {
     return false;
 }
 
-fn addEssentialJobs(context: *Context, input: PlanInput, jobs: *libsolv.Queue) void {
+fn addEssentialJobs(
+    context: *Context,
+    input: PlanInput,
+    repository_order: []const usize,
+    jobs: *libsolv.Queue,
+) void {
     switch (input.request) {
         .remove => return,
         else => {},
     }
     const state = internal(context);
     for (state.origins.items) |origin| {
-        const repository_index = findRepositoryIndex(input.repositories, origin.repository_id) orelse continue;
+        const repository_index = findRepositoryIndexSorted(
+            input.repositories,
+            repository_order,
+            origin.repository_id,
+        ) orelse continue;
         const record = input.repositories[repository_index].packages.records[origin.record_index];
         if (record.control.essential != true) continue;
         const candidate = findAvailableCandidate(context, .{ .name = origin.package }) orelse continue;
@@ -2305,6 +2412,7 @@ fn materializeAction(
     transaction: *libsolv.Transaction,
     solvable_id: libsolv.Id,
     input: PlanInput,
+    repository_order: []const usize,
 ) !PlanAction {
     const state = internal(context);
     const action_type = libsolv.transaction_type(
@@ -2362,7 +2470,13 @@ fn materializeAction(
     var essential = false;
     var has_pre_depends = false;
     if (origin) |available| {
-        const record = input.repositories[findRepositoryIndex(input.repositories, available.repository_id).?]
+        const record = input.repositories[
+            findRepositoryIndexSorted(
+                input.repositories,
+                repository_order,
+                available.repository_id,
+            ).?
+        ]
             .packages.records[available.record_index];
         package_name = record.control.package.text;
         version = record.control.version.value.original;
@@ -2633,7 +2747,19 @@ fn requestedRemoval(request: PlanRequest, context: *Context, solvable_id: libsol
 }
 
 fn findOrigin(state: *Internal, solvable_id: libsolv.Id) ?*const OriginOwned {
-    for (state.origins.items) |*origin| if (origin.solvable_id == solvable_id) return origin;
+    var low: usize = 0;
+    var high = state.origins.items.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const origin = &state.origins.items[middle];
+        if (origin.solvable_id < solvable_id) {
+            low = middle + 1;
+        } else if (origin.solvable_id > solvable_id) {
+            high = middle;
+        } else {
+            return origin;
+        }
+    }
     return null;
 }
 
@@ -2641,6 +2767,85 @@ fn findRepositoryIndex(repositories: []const RepositoryInput, id: source.Reposit
     for (repositories, 0..) |repository, index|
         if (std.mem.eql(u8, repository.repository_id.slice(), id.slice())) return index;
     return null;
+}
+
+fn findRepositoryIndexSorted(
+    repositories: []const RepositoryInput,
+    order: []const usize,
+    id: source.RepositoryId,
+) ?usize {
+    var low: usize = 0;
+    var high = order.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const repository_index = order[middle];
+        switch (std.mem.order(
+            u8,
+            repositories[repository_index].repository_id.slice(),
+            id.slice(),
+        )) {
+            .lt => low = middle + 1,
+            .gt => high = middle,
+            .eq => return repository_index,
+        }
+    }
+    return null;
+}
+
+fn lessOriginIndex(state: *Internal, left_index: usize, right_index: usize) bool {
+    const left = state.origins.items[left_index];
+    const right = state.origins.items[right_index];
+    const identity_order = compareOriginIdentity(
+        left,
+        right.package,
+        right.architecture,
+        right.version,
+    );
+    if (identity_order != .eq) return identity_order == .lt;
+    const repository_order = std.mem.order(
+        u8,
+        left.repository_id.slice(),
+        right.repository_id.slice(),
+    );
+    if (repository_order != .eq) return repository_order == .lt;
+    return left.record_index < right.record_index;
+}
+
+fn lowerBoundOrigin(
+    state: *const Internal,
+    order: []const usize,
+    package: []const u8,
+    architecture: []const u8,
+    version: []const u8,
+) usize {
+    var low: usize = 0;
+    var high = order.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const origin = state.origins.items[order[middle]];
+        if (compareOriginIdentity(origin, package, architecture, version) == .lt)
+            low = middle + 1
+        else
+            high = middle;
+    }
+    return low;
+}
+
+fn compareOriginIdentity(
+    origin: OriginOwned,
+    package: []const u8,
+    architecture: []const u8,
+    version: []const u8,
+) std.math.Order {
+    const package_order = std.mem.order(u8, origin.package, package);
+    if (package_order != .eq) return package_order;
+    const architecture_order = std.mem.order(
+        u8,
+        origin.architecture,
+        architecture,
+    );
+    if (architecture_order != .eq) return architecture_order;
+    return std.mem.order(u8, origin.version, version);
 }
 
 fn hex32(bytes: [32]u8) [64]u8 {
@@ -4984,4 +5189,92 @@ test "duplicate phased candidate policy fails explicitly" {
     var failure = result.failure;
     defer failure.deinit();
     try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
+}
+
+test "solver.test.large reversed local lock replay uses bounded indexes" {
+    const count = 512;
+    var input_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer input_arena.deinit();
+    const allocator = input_arena.allocator();
+    const indexes = try std.testing.allocator.alloc(packages_index.Index, count);
+    defer std.testing.allocator.free(indexes);
+    var indexes_initialized: usize = 0;
+    defer for (indexes[0..indexes_initialized]) |*index| index.deinit();
+    const repositories = try allocator.alloc(RepositoryInput, count);
+    const artifacts = try allocator.alloc(package_origin.LocalArtifactEvidence, count);
+    const locked_packages = try allocator.alloc(exact_lock_v2.Package, count);
+
+    for (0..count) |offset| {
+        const value: u64 = @intCast(count - offset);
+        var digest: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], value, .big);
+        const digest_hex = hex32(digest);
+        const name = try std.fmt.allocPrint(allocator, "package-{d:0>5}", .{value});
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "Package: {s}\nVersion: 1\nArchitecture: amd64\nFilename: {s}.deb\nSize: {}\nSHA256: {s}\n",
+            .{ name, name, value + 1, &digest_hex },
+        );
+        const repository_id: source.RepositoryId = .{
+            .bytes = package_origin.artifactIdFromSha256(digest),
+        };
+        indexes[offset] = try availableIndex(repository_id, text);
+        indexes_initialized += 1;
+        const artifact: package_origin.LocalArtifactEvidence = .{
+            .artifact_id = repository_id.bytes,
+            .sha256 = digest,
+            .size = value + 1,
+            .package = name,
+            .version = "1",
+            .architecture = "amd64",
+            .acquisition_url = try std.fmt.allocPrint(
+                allocator,
+                "file:///{s}.deb",
+                .{name},
+            ),
+            .trust_mode = .pinned_sha256,
+        };
+        artifacts[offset] = artifact;
+        repositories[offset] = RepositoryInput.fromLocalArtifact(
+            &indexes[offset],
+            @intCast(value),
+            artifact,
+        );
+        locked_packages[offset] = .{
+            .name = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .origin = .{ .local_artifact = artifact },
+            .sha256 = artifact.sha256,
+            .declared_size = artifact.size,
+            .retention = if (value == 1) .requested else .dependency,
+            .dpkg_selection_hold = false,
+        };
+    }
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = artifacts,
+        .packages = locked_packages,
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "package-00001" } },
+        .exact_lock_v2 = &lock.lock,
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u32, 3), plan.schema_version);
+    try std.testing.expectEqual(count, plan.actions.len);
 }

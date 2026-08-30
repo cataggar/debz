@@ -28,6 +28,10 @@ recovery verification require a completed unpack journal entry with that
 artifact digest and an exact plan-origin/size match; matching dpkg identity
 alone is insufficient.
 
+The recovery journal's plan digest binds the complete tagged origin of every
+archive-producing action, including the union tag, artifact ID, SHA-256, size,
+package identity, acquisition URL, trust mode, and solver priority.
+
 For a new root, the authenticated closure containing absent Essential packages
 receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before
 normal dpkg processing. This runs no maintainer scripts and makes Essential

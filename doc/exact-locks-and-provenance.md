@@ -55,7 +55,11 @@ verifies them against an exact-closure-lock v2. Repository evidence is emitted
 only for authenticated repository packages; local artifacts carry only their
 artifact and acquisition evidence. Execution and recovery provenance reject
 target-architecture, request-digest, or solver-policy-digest values that differ
-from the exact lock, then serialize those fields from the lock.
+from the exact lock, then serialize those fields from the lock. A successful
+result additionally requires non-null installed-state evidence and a
+package-origin digest exactly equal to the bound lock digest. Package,
+repository, and signer verification is count-bounded and uses sorted/indexed
+matching rather than nested scans.
 
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted

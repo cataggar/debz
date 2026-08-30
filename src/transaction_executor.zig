@@ -1695,6 +1695,7 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
         if (action.repository) |repository| hash.update(&repository.id);
         hash.update("\x00");
+        hashPlanOrigin(&hash, action.origin);
         if (action.sha256) |digest| hash.update(&digest);
         hash.update("\x00");
         std.mem.writeInt(u64, &number, action.package_size orelse 0, .little);
@@ -1714,6 +1715,48 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
     }
     return hash.finalResult();
+}
+
+fn hashPlanOrigin(
+    hash: *std.crypto.hash.sha2.Sha256,
+    origin: ?solver.PlanOrigin,
+) void {
+    const value = origin orelse {
+        hash.update(&.{0});
+        return;
+    };
+    var number: [8]u8 = undefined;
+    var priority: [4]u8 = undefined;
+    switch (value) {
+        .authenticated_repository => |repository| {
+            hash.update(&.{1});
+            hash.update(&repository.id);
+            std.mem.writeInt(i32, &priority, repository.priority, .little);
+            hash.update(&priority);
+        },
+        .local_artifact => |local| {
+            const evidence = local.evidence;
+            hash.update(&.{2});
+            hash.update(&evidence.artifact_id);
+            hash.update(&evidence.sha256);
+            std.mem.writeInt(u64, &number, evidence.size, .little);
+            hash.update(&number);
+            hashPlanString(hash, evidence.package);
+            hashPlanString(hash, evidence.version);
+            hashPlanString(hash, evidence.architecture);
+            hashPlanString(hash, evidence.acquisition_url);
+            hashPlanString(hash, @tagName(evidence.trust_mode));
+            std.mem.writeInt(i32, &priority, local.solver_priority, .little);
+            hash.update(&priority);
+        },
+    }
+}
+
+fn hashPlanString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(value.len), .little);
+    hash.update(&length);
+    hash.update(value);
 }
 
 fn hashInvocation(argv: []const []const u8, environment: []const EnvironmentEntry) [32]u8 {
@@ -3353,4 +3396,104 @@ test "transaction_executor.test.system lock manager provisions missing debz stat
 
     var provisioned = try directory.dir.openDir(std.testing.io, "root/var/lib/debz", .{ .follow_symlinks = false });
     provisioned.close(std.testing.io);
+}
+
+test "transaction_executor.test.plan hash binds every tagged local origin field" {
+    const digest: [32]u8 = @splat(0x11);
+    const evidence: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = 17,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    var actions = [_]solver.PlanAction{.{
+        .kind = .install,
+        .package = evidence.package,
+        .version = evidence.version,
+        .architecture = evidence.architecture,
+        .repository = null,
+        .sha256 = @splat('1'),
+        .package_size = evidence.size,
+        .installed_size_delta_bytes = 0,
+        .source_package = evidence.package,
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+        .origin = .{ .local_artifact = .{
+            .evidence = evidence,
+            .solver_priority = 500,
+        } },
+    }};
+    const plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &.{},
+        .summary = .{ .installs = 1, .download_bytes = evidence.size },
+        .download_bytes = evidence.size,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    const expected = hashPlan(plan);
+    const Mutation = enum {
+        union_tag,
+        artifact_id,
+        sha256,
+        size,
+        package,
+        version,
+        architecture,
+        acquisition_url,
+        trust_mode,
+        solver_priority,
+    };
+    inline for ([_]Mutation{
+        .union_tag,
+        .artifact_id,
+        .sha256,
+        .size,
+        .package,
+        .version,
+        .architecture,
+        .acquisition_url,
+        .trust_mode,
+        .solver_priority,
+    }) |mutation| {
+        var changed_actions = actions;
+        if (mutation == .union_tag) {
+            changed_actions[0].origin = .{ .authenticated_repository = .{
+                .id = @splat('a'),
+                .priority = 500,
+            } };
+        } else {
+            var local = changed_actions[0].origin.?.local_artifact;
+            switch (mutation) {
+                .union_tag => unreachable,
+                .artifact_id => local.evidence.artifact_id = @splat('b'),
+                .sha256 => local.evidence.sha256 = @splat(0x22),
+                .size => local.evidence.size += 1,
+                .package => local.evidence.package = "other",
+                .version => local.evidence.version = "2",
+                .architecture => local.evidence.architecture = "arm64",
+                .acquisition_url => local.evidence.acquisition_url = "file:///other.deb",
+                .trust_mode => local.evidence.trust_mode = .verified_https,
+                .solver_priority => local.solver_priority += 1,
+            }
+            changed_actions[0].origin = .{ .local_artifact = local };
+        }
+        var changed_plan = plan;
+        changed_plan.actions = &changed_actions;
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &expected,
+            &hashPlan(changed_plan),
+        ));
+    }
 }

@@ -54,6 +54,11 @@ Failures from a planning input containing local-origin evidence also use schema
 v3, including failures raised while validating that evidence. Repository-only
 failures remain schema v2.
 
+Exact-lock-v2 replay applies hard evidence and available-origin work limits.
+Repository and local-artifact evidence use sorted ID indexes, while locked
+packages use a sorted package-origin index, avoiding closure-by-universe nested
+scans.
+
 The repository-only `SolverPackageOrigin` and package-acquisition entry points
 remain source compatible. `SolverPackageOriginV2` (also exported as
 `SolverTaggedPackageOrigin`) and the corresponding tagged acquisition entry
