@@ -23,20 +23,28 @@ malformed sources fail explicitly. The production adapter opens the selected
 root, every parent, and every file without following symlinks and resolves file
 reads beneath their opened parent.
 
+Valid `deb-src`-only declarations, including disabled legacy declarations, stay
+covered by the source-file path and digest evidence but are excluded from the
+binary refresh configuration. Source material is bounded both per file and in
+aggregate before retained copies are made.
+
 Paths remain logical in normalized repositories and in the manifest. For
 example, `/usr/share/keyrings/vendor.gpg` is read from
 `ROOT/usr/share/keyrings/vendor.gpg`, but the declared path is never rewritten
 to include `ROOT`. Repository identities therefore remain stable when
-identical roots live at different physical paths.
+identical roots live at different physical paths. Logical paths use one
+schema/runtime grammar: valid UTF-8 absolute paths other than `/`, with no
+empty, `.` or `..` component, trailing slash, backslash, control byte, or DEL.
 
 ## Trust material
 
 Every imported binary keyring is boundedly parsed before use. The snapshot
 records its SHA-256 and sorted supported v4 primary-key fingerprints.
-Malformed keyrings and unsupported public/secret key material fail before a
-snapshot is returned. ASCII-armored keyrings are eligible APT inputs but are
-currently rejected explicitly because the verifier intentionally supports
-binary OpenPGP keyrings only.
+Per-keyring and aggregate retained bytes are bounded. Malformed keyrings,
+unusable RSA public parameters, unsupported RSA modulus sizes, and unsupported
+public/secret key material fail before a snapshot is returned. ASCII-armored
+keyrings are eligible APT inputs but are currently rejected explicitly because
+the verifier intentionally supports binary OpenPGP keyrings only.
 
 `Snapshot.runtimeTrust` constructs `openpgp_verifier.Keyring.bytes` values from
 the imported bytes. It separately returns the repository's logical

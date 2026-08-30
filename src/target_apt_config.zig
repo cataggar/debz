@@ -22,7 +22,9 @@ pub const Limits = struct {
     keyring: openpgp.Limits = .{},
     max_directory_entries: usize = 4096,
     max_sources: usize = 1024,
+    max_source_material_bytes: usize = 16 * 1024 * 1024,
     max_keyrings: usize = 1024,
+    max_keyring_material_bytes: usize = 64 * 1024 * 1024,
     max_exclusions: usize = 8192,
     max_status_bytes: usize = 32 * 1024 * 1024,
     max_architecture_state_bytes: usize = 64 * 1024,
@@ -190,12 +192,34 @@ pub const Manifest = struct {
     digest_sha256: [32]u8,
 
     pub fn canonicalJson(self: Manifest, allocator: std.mem.Allocator) ![]u8 {
+        try validateSerializableManifest(self);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try writeDocument(self, &output.writer);
         return output.toOwnedSlice();
     }
 };
+
+fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
+    if (!validArchitecture(manifest.native_architecture))
+        return error.InvalidArchitecture;
+    for (manifest.foreign_architectures) |architecture| {
+        if (!validArchitecture(architecture)) return error.InvalidArchitecture;
+    }
+    for (manifest.sources) |record| {
+        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+    }
+    if (!validLowerHex(&manifest.configuration_id)) return error.InvalidIdentity;
+    for (manifest.repository_ids) |id| {
+        if (!validLowerHex(&id)) return error.InvalidIdentity;
+    }
+    for (manifest.keyrings) |record| {
+        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+    }
+    for (manifest.exclusions) |exclusion| {
+        if (!validLogicalPath(exclusion.logical_path)) return error.InvalidPath;
+    }
+}
 
 pub const OwnedManifest = struct {
     manifest: Manifest,
@@ -330,7 +354,9 @@ pub const ValidationError = error{
 pub const ImportError = error{
     InvalidRootPath,
     TooManySources,
+    SourceMaterialTooLarge,
     TooManyKeyrings,
+    KeyringMaterialTooLarge,
     TooManyExclusions,
     UnsafeDirectoryEntry,
     SymlinkedSource,
@@ -344,6 +370,7 @@ pub const ImportError = error{
     MalformedKeyring,
     UnsupportedKeyringArmor,
     UnsupportedKeyMaterial,
+    UnsupportedKeySize,
     NoSupportedPrimaryKeys,
     MalformedArchitectureState,
     NativeArchitectureUnavailable,
@@ -388,7 +415,7 @@ pub fn snapshot(
     };
     var repository_limits = request.limits.repository;
     repository_limits.source = request.limits.source;
-    const normalized = try repository_policy.normalize(
+    const normalized = try repository_policy.normalizeBinaryRefresh(
         allocator,
         documents,
         architecture.native,
@@ -432,6 +459,7 @@ pub fn snapshot(
 
     var keyring_materials: std.ArrayList(KeyringMaterial) = .empty;
     defer keyring_materials.deinit(allocator);
+    var total_keyring_bytes: usize = 0;
     for (candidates.items) |candidate| {
         const bytes = request.dependencies.filesystem.readFile(
             allocator,
@@ -448,6 +476,13 @@ pub fn snapshot(
             else => return err,
         };
         defer allocator.free(bytes);
+        total_keyring_bytes = std.math.add(
+            usize,
+            total_keyring_bytes,
+            bytes.len,
+        ) catch return error.KeyringMaterialTooLarge;
+        if (total_keyring_bytes > request.limits.max_keyring_material_bytes)
+            return error.KeyringMaterialTooLarge;
         var inspected = openpgp.inspectKeyring(
             allocator,
             bytes,
@@ -455,6 +490,7 @@ pub fn snapshot(
         ) catch |err| switch (err) {
             error.UnsupportedKeyringArmor => return error.UnsupportedKeyringArmor,
             error.UnsupportedKeyMaterial => return error.UnsupportedKeyMaterial,
+            error.UnsupportedKeySize => return error.UnsupportedKeySize,
             error.NoSupportedPrimaryKeys => return error.NoSupportedPrimaryKeys,
             error.MalformedKeyring => return error.MalformedKeyring,
             else => return err,
@@ -528,8 +564,17 @@ fn discoverSources(
 ) ![]SourceMaterial {
     var materials: std.ArrayList(SourceMaterial) = .empty;
     defer materials.deinit(allocator);
+    var total_bytes: usize = 0;
 
-    try appendSourceIfPresent(owned, allocator, request, &materials, sources_list_path, .legacy);
+    try appendSourceIfPresent(
+        owned,
+        allocator,
+        request,
+        &materials,
+        &total_bytes,
+        sources_list_path,
+        .legacy,
+    );
     var listing = request.dependencies.filesystem.listDirectory(
         allocator,
         sources_directory_path,
@@ -559,7 +604,15 @@ fn discoverSources(
         }
         const path = try joinLogical(allocator, sources_directory_path, entry.name);
         defer allocator.free(path);
-        try appendSourceIfPresent(owned, allocator, request, &materials, path, format.?);
+        try appendSourceIfPresent(
+            owned,
+            allocator,
+            request,
+            &materials,
+            &total_bytes,
+            path,
+            format.?,
+        );
     }
     if (materials.items.len > request.limits.max_sources) return error.TooManySources;
     std.mem.sort(SourceMaterial, materials.items, {}, lessSourceMaterial);
@@ -571,6 +624,7 @@ fn appendSourceIfPresent(
     allocator: std.mem.Allocator,
     request: Request,
     materials: *std.ArrayList(SourceMaterial),
+    total_bytes: *usize,
     logical_path: []const u8,
     format: source.Format,
 ) !void {
@@ -587,6 +641,10 @@ fn appendSourceIfPresent(
         else => return err,
     };
     defer allocator.free(bytes);
+    total_bytes.* = std.math.add(usize, total_bytes.*, bytes.len) catch
+        return error.SourceMaterialTooLarge;
+    if (total_bytes.* > request.limits.max_source_material_bytes)
+        return error.SourceMaterialTooLarge;
     const parsed = try source.parse(allocator, bytes, format, request.limits.source);
     switch (parsed) {
         .diagnostic => return error.MalformedSource,
@@ -1255,7 +1313,7 @@ pub const ProductionFileSystem = struct {
         self: *ProductionFileSystem,
         logical_path: []const u8,
     ) !std.Io.Dir {
-        if (!validLogicalPath(logical_path)) return error.UnsafePath;
+        if (!validLogicalDirectoryPath(logical_path)) return error.UnsafePath;
         var current = try self.root.openDir(self.io, ".", .{
             .iterate = true,
             .follow_symlinks = false,
@@ -1480,8 +1538,21 @@ fn validLowerHex(value: []const u8) bool {
 }
 
 fn validRootPath(path: []const u8) bool {
-    if (!std.fs.path.isAbsolute(path)) return false;
-    if (std.mem.eql(u8, path, "/")) return true;
+    return validAbsolutePath(path, true);
+}
+
+fn validLogicalPath(path: []const u8) bool {
+    return validAbsolutePath(path, false);
+}
+
+fn validLogicalDirectoryPath(path: []const u8) bool {
+    return validAbsolutePath(path, true);
+}
+
+fn validAbsolutePath(path: []const u8, allow_root: bool) bool {
+    if (!std.unicode.utf8ValidateSlice(path) or !std.fs.path.isAbsolute(path))
+        return false;
+    if (std.mem.eql(u8, path, "/")) return allow_root;
     if (path[path.len - 1] == '/') return false;
     var components = std.mem.splitScalar(u8, path[1..], '/');
     while (components.next()) |component| {
@@ -1490,19 +1561,18 @@ fn validRootPath(path: []const u8) bool {
     return true;
 }
 
-fn validLogicalPath(path: []const u8) bool {
-    if (!validRootPath(path) or std.mem.indexOfScalar(u8, path, '\\') != null)
-        return false;
-    for (path) |byte| if (byte < 0x20 or byte == 0x7f) return false;
-    return true;
-}
-
 fn safeLeaf(name: []const u8) bool {
-    return name.len != 0 and
-        !std.mem.eql(u8, name, ".") and
-        !std.mem.eql(u8, name, "..") and
-        std.mem.indexOfScalar(u8, name, '/') == null and
-        std.mem.indexOfScalar(u8, name, '\\') == null;
+    if (!std.unicode.utf8ValidateSlice(name) or
+        name.len == 0 or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, "..") or
+        std.mem.indexOfScalar(u8, name, '/') != null or
+        std.mem.indexOfScalar(u8, name, '\\') != null)
+        return false;
+    for (name) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
 }
 
 fn validArchitecture(value: []const u8) bool {
@@ -1745,6 +1815,127 @@ test "target_apt_config deterministic alternate-root import preserves logical id
     });
     defer verified.deinit(std.testing.allocator);
     try std.testing.expect(verified == .accepted);
+}
+
+test "target_apt_config retains source-only evidence but excludes it from binary refresh" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.createDirPath(std.testing.io, "root/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = "deb-src [signed-by=/missing-active.gpg] https://source.invalid stable main\n" ++
+            "# deb-src [signed-by=/missing-disabled.gpg] https://disabled.invalid stable main\n" ++
+            "deb [signed-by=/keyrings/binary.gpg] https://binary.invalid stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/source-only.sources",
+        .data = "Types: deb-src\n" ++
+            "URIs: https://deb822-source.invalid\n" ++
+            "Suites: stable\n" ++
+            "Components: main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/keyrings/binary.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), imported.source_materials.len);
+    try std.testing.expectEqual(@as(usize, 2), imported.manifest.manifest.sources.len);
+    try std.testing.expectEqual(@as(usize, 1), imported.configuration.repositories.len);
+    try std.testing.expectEqualStrings(
+        "https://binary.invalid",
+        imported.configuration.repositories[0].uri,
+    );
+    try std.testing.expectEqual(@as(usize, 1), imported.keyring_materials.len);
+    try std.testing.expectEqualStrings(
+        "/keyrings/binary.gpg",
+        imported.keyring_materials[0].logical_path,
+    );
+}
+
+test "target_apt_config enforces aggregate source material bounds" {
+    const primary = "deb-src https://one.invalid stable main\n";
+    const secondary = "deb-src https://two.invalid stable main\n";
+    const total = primary.len + secondary.len;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = primary,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/secondary.list",
+        .data = secondary,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{ .max_source_material_bytes = total },
+    });
+    imported.deinit();
+    try std.testing.expectError(error.SourceMaterialTooLarge, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{ .max_source_material_bytes = total - 1 },
+    }));
+}
+
+test "target_apt_config enforces aggregate keyring material bounds" {
+    const total = test_fixture.keyring.len * 2;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt");
+    try directory.dir.createDirPath(std.testing.io, "root/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = "deb [signed-by=/keyrings/a.gpg] https://a.invalid stable main\n" ++
+            "deb [signed-by=/keyrings/b.gpg] https://b.invalid stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/keyrings/a.gpg",
+        .data = &test_fixture.keyring,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/keyrings/b.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{ .max_keyring_material_bytes = total },
+    });
+    imported.deinit();
+    try std.testing.expectError(error.KeyringMaterialTooLarge, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{ .max_keyring_material_bytes = total - 1 },
+    }));
 }
 
 test "target_apt_config production adapter rejects eligible source and keyring symlinks" {
@@ -2160,4 +2351,79 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
         &created.manifest.digest_sha256,
         &stored.manifest.digest_sha256,
     );
+}
+
+test "target_apt_config logical path grammar is UTF-8 and traversal safe" {
+    const valid_sources = [_]SourceRecord{.{
+        .logical_path = "/etc/apt/sources.list.d/référence.sources",
+        .sha256 = @splat(1),
+        .format = .deb822,
+    }};
+    var valid = try createManifest(std.testing.allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &valid_sources,
+        .configuration_id = @splat('a'),
+        .repository_ids = &.{},
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    });
+    defer valid.deinit();
+    const canonical = try valid.manifest.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    var decoded = try decodeManifest(
+        std.testing.allocator,
+        canonical,
+        maximum_document_bytes,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(
+        valid_sources[0].logical_path,
+        decoded.manifest.sources[0].logical_path,
+    );
+
+    const invalid_paths = [_][]const u8{
+        "/",
+        "/etc//apt",
+        "/etc/./apt",
+        "/etc/../apt",
+        "/etc/apt/",
+        "/etc\\apt",
+        "/etc/\x1fapt",
+        "/etc/\x7fapt",
+        "/etc/\xffapt",
+    };
+    for (invalid_paths) |path| {
+        const sources = [_]SourceRecord{.{
+            .logical_path = path,
+            .sha256 = @splat(1),
+            .format = .legacy,
+        }};
+        try std.testing.expectError(error.InvalidPath, createManifest(std.testing.allocator, .{
+            .native_architecture = "amd64",
+            .foreign_architectures = &.{},
+            .sources = &sources,
+            .configuration_id = @splat('a'),
+            .repository_ids = &.{},
+            .keyrings = &.{},
+            .global_trust_compatibility = false,
+            .exclusions = &.{},
+        }));
+        const direct: Manifest = .{
+            .native_architecture = "amd64",
+            .foreign_architectures = &.{},
+            .sources = &sources,
+            .configuration_id = @splat('a'),
+            .repository_ids = &.{},
+            .keyrings = &.{},
+            .global_trust_compatibility = false,
+            .exclusions = &.{},
+            .digest_sha256 = @splat(0),
+        };
+        try std.testing.expectError(
+            error.InvalidPath,
+            direct.canonicalJson(std.testing.allocator),
+        );
+    }
 }

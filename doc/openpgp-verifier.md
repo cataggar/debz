@@ -73,8 +73,9 @@ deterministically ordered per-signature results. There is no fallback success.
 `inspectKeyring` applies the same bounded binary parser without verifying a
 document and returns sorted supported v4 primary-key fingerprints. This
 preflight is intentionally stricter than verification of a mixed keyring:
-unsupported public or secret key material, malformed packets, an empty
-supported-key set, and ASCII armor all fail explicitly.
+unsupported public or secret key material, unsupported RSA modulus sizes,
+unusable RSA public parameters, malformed packets, an empty supported-key set,
+and ASCII armor all fail explicitly.
 
 The checked-in fixtures are generated from non-secret RSA and Ed25519 test keys by
 `tools/generate-openpgp-fixtures.py`; normal builds and tests use only the

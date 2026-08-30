@@ -165,6 +165,30 @@ pub fn normalize(
     native_architecture: ?[]const u8,
     limits: Limits,
 ) std.mem.Allocator.Error!NormalizeResult {
+    return normalizeInternal(allocator, documents, native_architecture, limits, .reject);
+}
+
+/// Normalizes only binary repository declarations. Valid `deb-src`-only
+/// declarations are ignored after parsing so callers can retain their source
+/// document evidence without making source-package metadata refreshable.
+pub fn normalizeBinaryRefresh(
+    allocator: std.mem.Allocator,
+    documents: []const SourceDocument,
+    native_architecture: ?[]const u8,
+    limits: Limits,
+) std.mem.Allocator.Error!NormalizeResult {
+    return normalizeInternal(allocator, documents, native_architecture, limits, .exclude);
+}
+
+const SourceOnlyPolicy = enum { reject, exclude };
+
+fn normalizeInternal(
+    allocator: std.mem.Allocator,
+    documents: []const SourceDocument,
+    native_architecture: ?[]const u8,
+    limits: Limits,
+    source_only: SourceOnlyPolicy,
+) std.mem.Allocator.Error!NormalizeResult {
     if (documents.len > limits.max_documents)
         return .{ .diagnostic = .{ .code = .too_many_documents } };
 
@@ -199,10 +223,13 @@ pub fn normalize(
             for (repository.types) |kind| if (kind == .binary) {
                 has_binary = true;
             };
-            if (!has_binary) return finishDiagnostic(allocator, arena, .{
-                .code = .unsupported_source_type,
-                .document_index = document_index,
-            });
+            if (!has_binary) {
+                if (source_only == .exclude) continue;
+                return finishDiagnostic(allocator, arena, .{
+                    .code = .unsupported_source_type,
+                    .document_index = document_index,
+                });
+            }
             const architectures = if (repository.architectures.len == 0) blk: {
                 const native = native_architecture orelse return finishDiagnostic(
                     allocator,
@@ -1261,6 +1288,37 @@ test "normalization is order independent canonical and credential redacted" {
     };
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.repositories.len);
+}
+
+test "binary refresh normalization excludes source-only declarations" {
+    const document: SourceDocument = .{
+        .bytes = "deb-src [arch=amd64] https://source.example stable main\n" ++
+            "# deb-src [arch=amd64] https://disabled-source.example stable main\n" ++
+            "deb [arch=amd64] https://binary.example stable main\n",
+        .format = .legacy,
+    };
+    const strict = try normalize(std.testing.allocator, &.{document}, null, .{});
+    try std.testing.expectEqual(
+        DiagnosticCode.unsupported_source_type,
+        strict.diagnostic.code,
+    );
+
+    const imported = try normalizeBinaryRefresh(
+        std.testing.allocator,
+        &.{document},
+        null,
+        .{},
+    );
+    var configuration = switch (imported) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    try std.testing.expectEqual(@as(usize, 1), configuration.repositories.len);
+    try std.testing.expectEqualStrings(
+        "https://binary.example",
+        configuration.repositories[0].uri,
+    );
 }
 
 test "priority pins and default release have deterministic precedence" {

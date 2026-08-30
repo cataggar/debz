@@ -124,6 +124,7 @@ pub const InspectKeyringError = error{
     MalformedKeyring,
     UnsupportedKeyringArmor,
     UnsupportedKeyMaterial,
+    UnsupportedKeySize,
     NoSupportedPrimaryKeys,
 } || std.mem.Allocator.Error;
 
@@ -351,6 +352,7 @@ fn addKeyring(
     if (std.mem.startsWith(u8, bytes, "-----BEGIN PGP")) return error.UnsupportedKeyringArmor;
     parseKeyringMode(state, bytes, request.limits, false) catch |err| switch (err) {
         error.UnsupportedKeyMaterial => unreachable,
+        error.UnsupportedKeySize => unreachable,
         else => |other| return other,
     };
 }
@@ -381,6 +383,7 @@ fn parseKeyringMode(
                     },
                     else => return error.MalformedKeyring,
                 };
+                if (reject_unsupported) try validateInspectableKey(key);
                 try state.keys.append(state.allocator, key);
                 primary_index = state.keys.items.len - 1;
                 subject_index = primary_index;
@@ -402,6 +405,7 @@ fn parseKeyringMode(
                     },
                     else => return error.MalformedKeyring,
                 };
+                if (reject_unsupported) try validateInspectableKey(key);
                 try state.keys.append(state.allocator, key);
                 subject_index = state.keys.items.len - 1;
                 user_id = null;
@@ -422,6 +426,21 @@ fn parseKeyringMode(
             else => {},
         }
     }
+}
+
+fn validateInspectableKey(key: Key) !void {
+    if (key.algorithm != 1 and key.algorithm != 3) return;
+    const modulus_bits = key.modulus.len * 8 - @as(usize, @clz(key.modulus[0]));
+    if (modulus_bits != 2048 and modulus_bits != 3072 and modulus_bits != 4096)
+        return error.UnsupportedKeySize;
+    if ((key.modulus[key.modulus.len - 1] & 1) == 0 or
+        (key.exponent[key.exponent.len - 1] & 1) == 0 or
+        (key.exponent.len == 1 and key.exponent[0] < 3))
+        return error.MalformedKeyring;
+    _ = std.crypto.Certificate.rsa.PublicKey.fromBytes(
+        key.exponent,
+        key.modulus,
+    ) catch return error.MalformedKeyring;
 }
 
 fn parseKey(body: []const u8, primary: ?[20]u8, is_primary: bool) !Key {
@@ -1242,5 +1261,41 @@ test "keyring inspection returns primary fingerprints and rejects unsupported ma
     try std.testing.expectError(
         error.UnsupportedKeyMaterial,
         inspectKeyring(std.testing.allocator, &unsupported_key, .{}),
+    );
+}
+
+test "keyring inspection rejects unsupported RSA sizes and unusable parameters" {
+    var wrong_size_rsa: [272]u8 = undefined;
+    wrong_size_rsa[0] = 0xc6;
+    wrong_size_rsa[1] = 0xc0;
+    wrong_size_rsa[2] = 0x4d;
+    wrong_size_rsa[3] = 4;
+    @memset(wrong_size_rsa[4..8], 0);
+    wrong_size_rsa[8] = 1;
+    wrong_size_rsa[9] = 0x07;
+    wrong_size_rsa[10] = 0xff;
+    wrong_size_rsa[11] = 0x7f;
+    @memset(wrong_size_rsa[12..267], 0xff);
+    wrong_size_rsa[267] = 0x00;
+    wrong_size_rsa[268] = 0x11;
+    wrong_size_rsa[269] = 0x01;
+    wrong_size_rsa[270] = 0x00;
+    wrong_size_rsa[271] = 0x01;
+    try std.testing.expectError(
+        error.UnsupportedKeySize,
+        inspectKeyring(std.testing.allocator, &wrong_size_rsa, .{}),
+    );
+
+    var unusable = fixture.keyring;
+    var parser = Parser{ .bytes = &unusable, .limits = .{} };
+    const packet = (try parser.next()).?;
+    var offset: usize = 6;
+    _ = try readMpi(packet.body, &offset);
+    const exponent = try readMpi(packet.body, &offset);
+    const exponent_offset = @intFromPtr(exponent.ptr) - @intFromPtr(unusable[0..].ptr);
+    unusable[exponent_offset + exponent.len - 1] = 0;
+    try std.testing.expectError(
+        error.MalformedKeyring,
+        inspectKeyring(std.testing.allocator, &unusable, .{}),
     );
 }
