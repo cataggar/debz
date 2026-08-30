@@ -253,6 +253,7 @@ pub const Snapshot = struct {
     manifest: OwnedManifest,
     source_materials: []const SourceMaterial,
     keyring_materials: []const KeyringMaterial,
+    verifier_limits: openpgp.Limits,
     arena: *std.heap.ArenaAllocator,
     backing_allocator: std.mem.Allocator,
 
@@ -289,6 +290,7 @@ pub const Snapshot = struct {
         return .{
             .keyrings = try keyrings.toOwnedSlice(allocator),
             .declared_keyrings = repository.signed_by,
+            .verifier_limits = self.verifier_limits,
             .allocator = allocator,
         };
     }
@@ -304,6 +306,7 @@ pub const Snapshot = struct {
 pub const RuntimeTrust = struct {
     keyrings: []openpgp.Keyring,
     declared_keyrings: []const []const u8,
+    verifier_limits: openpgp.Limits,
     allocator: std.mem.Allocator,
 
     pub fn authentication(
@@ -314,6 +317,7 @@ pub const RuntimeTrust = struct {
             .keyrings = .{ .many = self.keyrings },
             .accepted_primary_fingerprints = &.{},
             .verification_time = verification_time,
+            .verifier_limits = self.verifier_limits,
         } };
     }
 
@@ -357,6 +361,8 @@ pub const ImportError = error{
     SourceMaterialTooLarge,
     TooManyKeyrings,
     KeyringMaterialTooLarge,
+    TooManyKeyringPackets,
+    TooManyKeyringKeys,
     TooManyExclusions,
     UnsafeDirectoryEntry,
     SymlinkedSource,
@@ -439,20 +445,43 @@ pub fn snapshot(
         for (candidates.items) |candidate| allocator.free(candidate.logical_path);
         candidates.deinit(allocator);
     }
+    var candidate_indices = std.StringHashMap(usize).init(allocator);
+    defer candidate_indices.deinit();
     var global_trust = false;
     for (configuration.repositories) |repository| {
         if (repository.signed_by.len == 0) {
             global_trust = true;
         } else for (repository.signed_by) |logical_path| {
             if (!validLogicalPath(logical_path)) return error.UnsafeKeyringPath;
-            try addKeyCandidate(allocator, &candidates, logical_path, .declared, false);
+            try addKeyCandidate(
+                allocator,
+                &candidates,
+                &candidate_indices,
+                request.limits.max_keyrings,
+                logical_path,
+                .declared,
+                false,
+            );
         }
     }
     if (global_trust) {
-        try addKeyCandidate(allocator, &candidates, global_keyring_path, .global, true);
-        try discoverGlobalKeyringCandidates(allocator, request, &candidates, &exclusions);
+        try addKeyCandidate(
+            allocator,
+            &candidates,
+            &candidate_indices,
+            request.limits.max_keyrings,
+            global_keyring_path,
+            .global,
+            true,
+        );
+        try discoverGlobalKeyringCandidates(
+            allocator,
+            request,
+            &candidates,
+            &candidate_indices,
+            &exclusions,
+        );
     }
-    if (candidates.items.len > request.limits.max_keyrings) return error.TooManyKeyrings;
     if (exclusions.items.len > request.limits.max_exclusions) return error.TooManyExclusions;
     std.mem.sort(KeyCandidate, candidates.items, {}, lessKeyCandidate);
     std.mem.sort(Exclusion, exclusions.items, {}, lessExclusion);
@@ -460,6 +489,7 @@ pub fn snapshot(
     var keyring_materials: std.ArrayList(KeyringMaterial) = .empty;
     defer keyring_materials.deinit(allocator);
     var total_keyring_bytes: usize = 0;
+    var inspection_totals: openpgp.KeyringInspectionTotals = .{};
     for (candidates.items) |candidate| {
         const bytes = request.dependencies.filesystem.readFile(
             allocator,
@@ -483,11 +513,15 @@ pub fn snapshot(
         ) catch return error.KeyringMaterialTooLarge;
         if (total_keyring_bytes > request.limits.max_keyring_material_bytes)
             return error.KeyringMaterialTooLarge;
-        var inspected = openpgp.inspectKeyring(
+        var inspected = openpgp.inspectKeyringWithTotals(
             allocator,
             bytes,
             request.limits.keyring,
+            &inspection_totals,
         ) catch |err| switch (err) {
+            error.KeyringTooLarge => return error.KeyringMaterialTooLarge,
+            error.TooManyPackets => return error.TooManyKeyringPackets,
+            error.TooManyKeys => return error.TooManyKeyringKeys,
             error.UnsupportedKeyringArmor => return error.UnsupportedKeyringArmor,
             error.UnsupportedKeyMaterial => return error.UnsupportedKeyMaterial,
             error.UnsupportedKeySize => return error.UnsupportedKeySize,
@@ -552,6 +586,7 @@ pub fn snapshot(
         .manifest = manifest,
         .source_materials = source_materials,
         .keyring_materials = try owned.dupe(KeyringMaterial, keyring_materials.items),
+        .verifier_limits = request.limits.keyring,
         .arena = arena,
         .backing_allocator = allocator,
     };
@@ -590,6 +625,7 @@ fn discoverSources(
     std.mem.sort(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
     for (listing.entries) |entry| {
         if (!safeLeaf(entry.name)) return error.UnsafeDirectoryEntry;
+        if (!validAptFragmentFilename(entry.name)) continue;
         const format: ?source.Format = if (std.mem.endsWith(u8, entry.name, ".sources"))
             .deb822
         else if (std.mem.endsWith(u8, entry.name, ".list"))
@@ -708,9 +744,11 @@ fn appendDirectoryExclusions(
     std.mem.sort(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
     for (listing.entries) |entry| {
         if (!safeLeaf(entry.name)) return error.UnsafeDirectoryEntry;
+        const apt_filename = purpose != .source or validAptFragmentFilename(entry.name);
         const eligible = switch (purpose) {
-            .source => std.mem.endsWith(u8, entry.name, ".list") or
-                std.mem.endsWith(u8, entry.name, ".sources"),
+            .source => apt_filename and
+                (std.mem.endsWith(u8, entry.name, ".list") or
+                    std.mem.endsWith(u8, entry.name, ".sources")),
             .keyring => std.mem.endsWith(u8, entry.name, ".gpg") or
                 std.mem.endsWith(u8, entry.name, ".asc"),
         };
@@ -731,7 +769,9 @@ fn appendDirectoryExclusions(
             return error.TooManyExclusions;
         try exclusions.append(allocator, .{
             .logical_path = try joinLogical(allocator, logical_directory, entry.name),
-            .reason = switch (entry.kind) {
+            .reason = if (!apt_filename)
+                .unsupported_name
+            else switch (entry.kind) {
                 .regular => .unsupported_name,
                 .directory => .directory,
                 .symlink => .symlink,
@@ -745,6 +785,7 @@ fn discoverGlobalKeyringCandidates(
     allocator: std.mem.Allocator,
     request: Request,
     candidates: *std.ArrayList(KeyCandidate),
+    candidate_indices: *std.StringHashMap(usize),
     exclusions: *std.ArrayList(Exclusion),
 ) !void {
     var listing = request.dependencies.filesystem.listDirectory(
@@ -776,7 +817,15 @@ fn discoverGlobalKeyringCandidates(
                 entry.name,
             );
             defer allocator.free(path);
-            try addKeyCandidate(allocator, candidates, path, .global, false);
+            try addKeyCandidate(
+                allocator,
+                candidates,
+                candidate_indices,
+                request.limits.max_keyrings,
+                path,
+                .global,
+                false,
+            );
         } else {
             if (exclusions.items.len >= request.limits.max_exclusions)
                 return error.TooManyExclusions;
@@ -800,21 +849,28 @@ fn discoverGlobalKeyringCandidates(
 fn addKeyCandidate(
     allocator: std.mem.Allocator,
     candidates: *std.ArrayList(KeyCandidate),
+    candidate_indices: *std.StringHashMap(usize),
+    maximum: usize,
     path: []const u8,
     usage: KeyringUse,
     optional: bool,
 ) !void {
-    for (candidates.items) |*candidate| {
-        if (!std.mem.eql(u8, candidate.logical_path, path)) continue;
+    if (candidate_indices.get(path)) |index| {
+        const candidate = &candidates.items[index];
         candidate.use = mergeUse(candidate.use, usage);
         candidate.optional = candidate.optional and optional;
         return;
     }
+    if (candidates.items.len >= maximum) return error.TooManyKeyrings;
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
     try candidates.append(allocator, .{
-        .logical_path = try allocator.dupe(u8, path),
+        .logical_path = owned_path,
         .use = usage,
         .optional = optional,
     });
+    errdefer _ = candidates.pop();
+    try candidate_indices.put(owned_path, candidates.items.len - 1);
 }
 
 fn mergeUse(left: KeyringUse, right: KeyringUse) KeyringUse {
@@ -1575,6 +1631,18 @@ fn safeLeaf(name: []const u8) bool {
     return true;
 }
 
+fn validAptFragmentFilename(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or
+            byte == '_' or
+            byte == '-' or
+            byte == '.'))
+            return false;
+    }
+    return true;
+}
+
 fn validArchitecture(value: []const u8) bool {
     if (value.len == 0 or value.len > 64) return false;
     for (value) |byte| {
@@ -1901,14 +1969,25 @@ test "target_apt_config enforces aggregate source material bounds" {
 
 test "target_apt_config enforces aggregate keyring material bounds" {
     const total = test_fixture.keyring.len * 2;
+    var single_totals: openpgp.KeyringInspectionTotals = .{};
+    var single = try openpgp.inspectKeyringWithTotals(
+        std.testing.allocator,
+        &test_fixture.keyring,
+        .{},
+        &single_totals,
+    );
+    single.deinit(std.testing.allocator);
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    try directory.dir.createDirPath(std.testing.io, "root/etc/apt");
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
     try directory.dir.createDirPath(std.testing.io, "root/keyrings");
     try directory.dir.writeFile(std.testing.io, .{
-        .sub_path = "root/etc/apt/sources.list",
-        .data = "deb [signed-by=/keyrings/a.gpg] https://a.invalid stable main\n" ++
-            "deb [signed-by=/keyrings/b.gpg] https://b.invalid stable main\n",
+        .sub_path = "root/etc/apt/sources.list.d/multiple.sources",
+        .data = "Types: deb\n" ++
+            "URIs: https://a.invalid\n" ++
+            "Suites: stable\n" ++
+            "Components: main\n" ++
+            "Signed-By: /keyrings/a.gpg /keyrings/b.gpg\n",
     });
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "root/keyrings/a.gpg",
@@ -1927,8 +2006,44 @@ test "target_apt_config enforces aggregate keyring material bounds" {
         .root_path = root_path,
         .architecture_override = "amd64",
         .dependencies = .{ .filesystem = files.interface() },
-        .limits = .{ .max_keyring_material_bytes = total },
+        .limits = .{
+            .max_keyring_material_bytes = total,
+            .keyring = .{
+                .max_keyring_bytes = total,
+                .max_packets = single_totals.packets * 2,
+                .max_keys = single_totals.keys * 2,
+            },
+        },
     });
+    var trust = try imported.runtimeTrust(
+        std.testing.allocator,
+        imported.configuration.repositories[0],
+    );
+    defer trust.deinit();
+    const authentication = trust.authentication(test_fixture.created + 30);
+    try std.testing.expectEqual(@as(usize, 2), authentication.in_release.keyrings.many.len);
+    try std.testing.expectEqual(
+        total,
+        authentication.in_release.verifier_limits.max_keyring_bytes,
+    );
+    try std.testing.expectEqual(
+        single_totals.packets * 2,
+        authentication.in_release.verifier_limits.max_packets,
+    );
+    try std.testing.expectEqual(
+        single_totals.keys * 2,
+        authentication.in_release.verifier_limits.max_keys,
+    );
+    var verified = try openpgp.verify(std.testing.allocator, .{
+        .io = std.testing.io,
+        .signed_bytes = &test_fixture.message,
+        .signatures = &.{&test_fixture.signature},
+        .keyrings = authentication.in_release.keyrings,
+        .policy = .{ .verification_time = authentication.in_release.verification_time },
+        .limits = authentication.in_release.verifier_limits,
+    });
+    defer verified.deinit(std.testing.allocator);
+    try std.testing.expect(verified == .accepted);
     imported.deinit();
     try std.testing.expectError(error.KeyringMaterialTooLarge, snapshot(std.testing.allocator, .{
         .root_path = root_path,
@@ -1936,6 +2051,158 @@ test "target_apt_config enforces aggregate keyring material bounds" {
         .dependencies = .{ .filesystem = files.interface() },
         .limits = .{ .max_keyring_material_bytes = total - 1 },
     }));
+    try std.testing.expectError(error.KeyringMaterialTooLarge, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{
+            .max_keyring_material_bytes = total,
+            .keyring = .{ .max_keyring_bytes = total - 1 },
+        },
+    }));
+    try std.testing.expectError(error.TooManyKeyringPackets, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{
+            .max_keyring_material_bytes = total,
+            .keyring = .{ .max_packets = single_totals.packets * 2 - 1 },
+        },
+    }));
+    try std.testing.expectError(error.TooManyKeyringKeys, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{
+            .max_keyring_material_bytes = total,
+            .keyring = .{ .max_keys = single_totals.keys * 2 - 1 },
+        },
+    }));
+}
+
+test "target_apt_config bounds unique keyring candidates while deduplicating repeats" {
+    var repeated_root = std.testing.tmpDir(.{});
+    defer repeated_root.cleanup();
+    try repeated_root.dir.createDirPath(std.testing.io, "root/etc/apt");
+    try repeated_root.dir.createDirPath(std.testing.io, "root/keyrings");
+    var repeated_source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer repeated_source.deinit();
+    for (0..128) |index| {
+        try repeated_source.writer.print(
+            "deb [signed-by=/keyrings/shared.gpg] https://repeat{}.invalid stable main\n",
+            .{index},
+        );
+    }
+    const repeated_bytes = try repeated_source.toOwnedSlice();
+    defer std.testing.allocator.free(repeated_bytes);
+    try repeated_root.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = repeated_bytes,
+    });
+    try repeated_root.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/keyrings/shared.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const repeated_path = try testRootPath(std.testing.allocator, repeated_root.dir);
+    defer std.testing.allocator.free(repeated_path);
+    var repeated_files = try ProductionFileSystem.init(std.testing.io, repeated_path);
+    defer repeated_files.deinit();
+    var repeated = try snapshot(std.testing.allocator, .{
+        .root_path = repeated_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = repeated_files.interface() },
+        .limits = .{ .max_keyrings = 1 },
+    });
+    defer repeated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), repeated.keyring_materials.len);
+
+    var unique_root = std.testing.tmpDir(.{});
+    defer unique_root.cleanup();
+    try unique_root.dir.createDirPath(std.testing.io, "root/etc/apt");
+    var unique_source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unique_source.deinit();
+    for (0..128) |index| {
+        try unique_source.writer.print(
+            "deb [signed-by=/keyrings/key{}.gpg] https://unique{}.invalid stable main\n",
+            .{ index, index },
+        );
+    }
+    const unique_bytes = try unique_source.toOwnedSlice();
+    defer std.testing.allocator.free(unique_bytes);
+    try unique_root.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = unique_bytes,
+    });
+    const unique_path = try testRootPath(std.testing.allocator, unique_root.dir);
+    defer std.testing.allocator.free(unique_path);
+    var unique_files = try ProductionFileSystem.init(std.testing.io, unique_path);
+    defer unique_files.deinit();
+    try std.testing.expectError(error.TooManyKeyrings, snapshot(std.testing.allocator, .{
+        .root_path = unique_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = unique_files.interface() },
+        .limits = .{ .max_keyrings = 64 },
+    }));
+}
+
+test "target_apt_config applies APT source fragment filename grammar" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    const valid_source = "deb-src https://source.invalid stable main\n";
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/valid-name_1.list",
+        .data = valid_source,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/valid.sources",
+        .data = "Types: deb-src\nURIs: https://deb822.invalid\nSuites: stable\nComponents: main\n",
+    });
+    const invalid_names = [_][]const u8{
+        "bad name.list",
+        "bad@name.sources",
+        "unicodé.list",
+    };
+    for (invalid_names) |name| {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "root/etc/apt/sources.list.d/{s}",
+            .{name},
+        );
+        defer std.testing.allocator.free(path);
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = path,
+            .data = "not a valid source",
+        });
+    }
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), imported.source_materials.len);
+    try std.testing.expectEqual(@as(usize, 3), imported.manifest.manifest.exclusions.len);
+    for (imported.manifest.manifest.exclusions) |exclusion| {
+        try std.testing.expectEqual(ExclusionReason.unsupported_name, exclusion.reason);
+    }
+    try std.testing.expectEqualStrings(
+        "/etc/apt/sources.list.d/bad name.list",
+        imported.manifest.manifest.exclusions[0].logical_path,
+    );
+    try std.testing.expectEqualStrings(
+        "/etc/apt/sources.list.d/bad@name.sources",
+        imported.manifest.manifest.exclusions[1].logical_path,
+    );
+    try std.testing.expectEqualStrings(
+        "/etc/apt/sources.list.d/unicodé.list",
+        imported.manifest.manifest.exclusions[2].logical_path,
+    );
 }
 
 test "target_apt_config production adapter rejects eligible source and keyring symlinks" {

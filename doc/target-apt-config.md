@@ -23,6 +23,11 @@ malformed sources fail explicitly. The production adapter opens the selected
 root, every parent, and every file without following symlinks and resolves file
 reads beneath their opened parent.
 
+Source fragments follow APT's basename grammar before extension matching:
+ASCII letters, digits, underscore, hyphen, and period only. Names containing
+spaces, `@`, Unicode, or other characters are ignored as inputs and recorded
+as `unsupported_name` exclusions.
+
 Valid `deb-src`-only declarations, including disabled legacy declarations, stay
 covered by the source-file path and digest evidence but are excluded from the
 binary refresh configuration. Source material is bounded both per file and in
@@ -45,6 +50,12 @@ unusable RSA public parameters, unsupported RSA modulus sizes, and unsupported
 public/secret key material fail before a snapshot is returned. ASCII-armored
 keyrings are eligible APT inputs but are currently rejected explicitly because
 the verifier intentionally supports binary OpenPGP keyrings only.
+
+Candidate keyring paths are deduplicated through a bounded hash index, with the
+unique-keyring limit enforced before insertion. Strict inspection applies the
+same byte, packet, and key limits cumulatively across all imported keyrings.
+Those exact verifier limits are carried into runtime authentication, so every
+accepted snapshot remains usable by the runtime verifier.
 
 `Snapshot.runtimeTrust` constructs `openpgp_verifier.Keyring.bytes` values from
 the imported bytes. It separately returns the repository's logical

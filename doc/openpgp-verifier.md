@@ -75,7 +75,10 @@ document and returns sorted supported v4 primary-key fingerprints. This
 preflight is intentionally stricter than verification of a mixed keyring:
 unsupported public or secret key material, unsupported RSA modulus sizes,
 unusable RSA public parameters, malformed packets, an empty supported-key set,
-and ASCII armor all fail explicitly.
+orphan public subkeys, and ASCII armor all fail explicitly.
+`inspectKeyringWithTotals` carries byte, packet, and key counts across multiple
+strict inspections so callers can enforce the verifier's aggregate limits
+before retaining a multi-keyring configuration.
 
 The checked-in fixtures are generated from non-secret RSA and Ed25519 test keys by
 `tools/generate-openpgp-fixtures.py`; normal builds and tests use only the
