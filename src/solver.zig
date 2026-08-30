@@ -5,6 +5,8 @@ const relation = @import("relation.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
 const exact_lock_module = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
+const package_origin = @import("package_origin.zig");
 
 const libsolv = @cImport({
     @cDefine("LIBSOLV_INTERNAL", "1");
@@ -100,6 +102,7 @@ pub const ImportResult = union(enum) {
 pub const Eligibility = enum {
     untrusted,
     verified_refresh,
+    verified_local_artifact,
     trusted_test,
 };
 
@@ -116,6 +119,7 @@ pub const RepositoryInput = struct {
     eligibility: Eligibility,
     packages: *const packages_index.Index,
     authenticated_snapshot_sha256: ?[32]u8 = null,
+    local_artifact: ?package_origin.LocalArtifactEvidence = null,
 
     pub fn fromRefresh(
         result: *const repository_refresh.AuthenticatedResult,
@@ -142,9 +146,23 @@ pub const RepositoryInput = struct {
             .packages = packages,
         };
     }
+
+    pub fn fromLocalArtifact(
+        packages: *const packages_index.Index,
+        priority: i32,
+        evidence: package_origin.LocalArtifactEvidence,
+    ) RepositoryInput {
+        return .{
+            .repository_id = packages.context.repository_id,
+            .priority = priority,
+            .eligibility = .verified_local_artifact,
+            .packages = packages,
+            .local_artifact = evidence,
+        };
+    }
 };
 
-pub const PackageOrigin = struct {
+pub const AuthenticatedRepositoryPackageOrigin = struct {
     repository_id: source.RepositoryId,
     repository_priority: i32,
     record_index: usize,
@@ -154,10 +172,23 @@ pub const PackageOrigin = struct {
     source_location: []const u8,
 };
 
+pub const LocalArtifactPackageOrigin = struct {
+    evidence: package_origin.LocalArtifactEvidence,
+    solver_priority: i32,
+    record_index: usize,
+    source_location: []const u8,
+};
+
+pub const PackageOrigin = union(enum) {
+    authenticated_repository: AuthenticatedRepositoryPackageOrigin,
+    local_artifact: LocalArtifactPackageOrigin,
+};
+
 pub const AvailableImportError = std.mem.Allocator.Error || error{
     PoolAllocationFailed,
     UntrustedRepository,
     RepositoryIdentityMismatch,
+    InvalidLocalArtifact,
     DuplicateRepository,
     TooManyRepositories,
     TooManyPackages,
@@ -182,6 +213,7 @@ const OriginOwned = struct {
     version: []u8,
     architecture: []u8,
     source_location: []u8,
+    local_artifact: ?package_origin.LocalArtifactEvidence,
     solvable_id: libsolv.Id,
 
     fn init(
@@ -197,7 +229,21 @@ const OriginOwned = struct {
         errdefer allocator.free(version);
         const architecture = try allocator.dupe(u8, record.control.architecture.text);
         errdefer allocator.free(architecture);
-        const source_location = try allocator.dupe(u8, record.location.source);
+        const source_location = try allocator.dupe(
+            u8,
+            if (input.local_artifact) |artifact|
+                artifact.acquisition_url
+            else
+                record.location.source,
+        );
+        errdefer allocator.free(source_location);
+        var local_artifact = input.local_artifact;
+        if (local_artifact) |*artifact| {
+            artifact.package = package_name;
+            artifact.version = version;
+            artifact.architecture = architecture;
+            artifact.acquisition_url = try allocator.dupe(u8, artifact.acquisition_url);
+        }
         return .{
             .repository_id = input.repository_id,
             .repository_priority = input.priority,
@@ -206,6 +252,7 @@ const OriginOwned = struct {
             .version = version,
             .architecture = architecture,
             .source_location = source_location,
+            .local_artifact = local_artifact,
             .solvable_id = solvable_id,
         };
     }
@@ -215,11 +262,18 @@ const OriginOwned = struct {
         allocator.free(self.version);
         allocator.free(self.architecture);
         allocator.free(self.source_location);
+        if (self.local_artifact) |artifact| allocator.free(artifact.acquisition_url);
         self.* = undefined;
     }
 
     fn public(self: *const OriginOwned) PackageOrigin {
-        return .{
+        if (self.local_artifact) |artifact| return .{ .local_artifact = .{
+            .evidence = artifact,
+            .solver_priority = self.repository_priority,
+            .record_index = self.record_index,
+            .source_location = self.source_location,
+        } };
+        return .{ .authenticated_repository = .{
             .repository_id = self.repository_id,
             .repository_priority = self.repository_priority,
             .record_index = self.record_index,
@@ -227,7 +281,7 @@ const OriginOwned = struct {
             .version = self.version,
             .architecture = self.architecture,
             .source_location = self.source_location,
-        };
+        } };
     }
 };
 
@@ -478,6 +532,31 @@ pub const Context = opaque {
             input.repository_id.slice(),
             input.packages.context.repository_id.slice(),
         )) return error.RepositoryIdentityMismatch;
+        switch (input.eligibility) {
+            .verified_refresh => {
+                if (input.authenticated_snapshot_sha256 == null or input.local_artifact != null)
+                    return error.RepositoryIdentityMismatch;
+            },
+            .verified_local_artifact => {
+                const artifact = input.local_artifact orelse return error.InvalidLocalArtifact;
+                package_origin.validateLocalArtifact(artifact) catch
+                    return error.InvalidLocalArtifact;
+                if (!std.mem.eql(u8, input.repository_id.slice(), &artifact.artifact_id) or
+                    input.authenticated_snapshot_sha256 != null or
+                    input.packages.records.len != 1)
+                    return error.InvalidLocalArtifact;
+                const record = input.packages.records[0];
+                if (!std.mem.eql(u8, record.control.package.text, artifact.package) or
+                    !std.mem.eql(u8, record.control.version.value.original, artifact.version) or
+                    !std.mem.eql(u8, record.control.architecture.text, artifact.architecture) or
+                    !std.mem.eql(u8, &record.transport.sha256.bytes, &artifact.sha256) or
+                    record.transport.size.value != artifact.size)
+                    return error.InvalidLocalArtifact;
+            },
+            .trusted_test => if (input.local_artifact != null)
+                return error.InvalidLocalArtifact,
+            .untrusted => unreachable,
+        }
         if (state.available_repositories.items.len >= limits.max_repositories)
             return error.TooManyRepositories;
         if (input.packages.records.len > limits.max_packages_per_repository)
@@ -710,6 +789,7 @@ pub const PlanInput = struct {
     /// Exact final closure constraint. This is independent from dpkg selection
     /// holds carried by `installed.policies`.
     exact_lock: ?*const exact_lock_module.Lock = null,
+    exact_lock_v2: ?*const exact_lock_v2.Lock = null,
 };
 
 pub const ActionKind = enum { install, remove, upgrade, downgrade, reinstall };
@@ -746,6 +826,16 @@ pub const RepositoryIdentity = struct {
     priority: i32,
 };
 
+pub const PlanLocalArtifactOrigin = struct {
+    evidence: package_origin.LocalArtifactEvidence,
+    solver_priority: i32,
+};
+
+pub const PlanOrigin = union(enum) {
+    authenticated_repository: RepositoryIdentity,
+    local_artifact: PlanLocalArtifactOrigin,
+};
+
 pub const PriorInstalled = struct {
     package: []const u8,
     version: []const u8,
@@ -768,9 +858,13 @@ pub const PlanAction = struct {
     reason: ActionReason,
     essential: bool = false,
     has_pre_depends: bool = false,
-    /// Present for archive-producing actions. This is the authenticated,
-    /// solver-selected record identity consumed by package acquisition.
+    /// Present for archive-producing actions. Repository selections are
+    /// consumed by package acquisition; local selections retain their
+    /// separately verified artifact evidence.
     selected_origin: ?PackageOrigin,
+    /// Tagged production identity. Schema v2 continues serializing
+    /// `repository`; schema v3 serializes this field as `origin`.
+    origin: ?PlanOrigin = null,
 };
 
 pub const Plan = struct {
@@ -824,6 +918,7 @@ pub const ProblemKind = enum {
     lock_package_missing,
     lock_package_mismatch,
     lock_closure_drift,
+    invalid_local_artifact,
     invalid_solver_state,
 };
 
@@ -910,10 +1005,19 @@ pub fn planTransaction(
     if (input.installed.hold_authority != .explicit_policy) {
         return failureOne(allocator, arena_ptr, .unsupported_feature, null, null, "planning requires explicit hold policy");
     }
+    if (input.exact_lock != null and input.exact_lock_v2 != null) {
+        return failureOne(allocator, arena_ptr, .invalid_policy, null, null, "only one exact lock version may be supplied");
+    }
     if (input.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, input.target_architecture))
             return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "exact lock target architecture differs from planning architecture");
         if (try validateExactLockInput(allocator, arena_ptr, input.repositories, lock)) |failure|
+            return .{ .failure = failure };
+    }
+    if (input.exact_lock_v2) |lock| {
+        if (!std.mem.eql(u8, lock.target_architecture, input.target_architecture))
+            return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "exact lock target architecture differs from planning architecture");
+        if (try validateExactLockV2Input(allocator, arena_ptr, input.repositories, lock)) |failure|
             return .{ .failure = failure };
     }
     for (input.repositories) |repository| {
@@ -962,6 +1066,7 @@ pub fn planTransaction(
                 error.UnsupportedProvidesPredicate,
                 error.RepositoryIdentityMismatch,
                 => .unsupported_feature,
+                error.InvalidLocalArtifact => .invalid_local_artifact,
                 error.TooManyRepositories,
                 error.TooManyPackages,
                 error.TooManyDependencyGroups,
@@ -986,6 +1091,10 @@ pub fn planTransaction(
         return .{ .failure = failure };
     if (input.exact_lock) |lock| {
         if (try addExactLockJobs(allocator, arena_ptr, context, input, lock, &jobs)) |failure|
+            return .{ .failure = failure };
+    }
+    if (input.exact_lock_v2) |lock| {
+        if (try addExactLockV2Jobs(allocator, arena_ptr, context, input, lock, &jobs)) |failure|
             return .{ .failure = failure };
     }
     addEssentialJobs(context, input, &jobs);
@@ -1063,12 +1172,25 @@ pub fn planTransaction(
                 return failureOne(allocator, arena_ptr, .lock_package_mismatch, action.package, null, "planned package evidence differs from the exact lock");
         }
     }
+    if (input.exact_lock_v2) |lock| {
+        for (actions.items) |action| {
+            if (action.kind == .remove) continue;
+            const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
+                return failureOne(allocator, arena_ptr, .lock_closure_drift, action.package, null, "solver selected a package outside the exact locked closure");
+            if (action.sha256 == null or action.package_size == null or
+                !planActionMatchesLockV2(action, locked) or
+                !std.mem.eql(u8, &action.sha256.?, &hex32(locked.sha256)) or
+                action.package_size.? != locked.declared_size)
+                return failureOne(allocator, arena_ptr, .lock_package_mismatch, action.package, null, "planned package evidence differs from the exact lock");
+        }
+    }
     const ordered_actions = try materializeOrdering(owned, actions.items);
     std.mem.sort(PlanAction, actions.items, {}, lessAction);
     const action_slice = try actions.toOwnedSlice(owned);
     const summary = summarizeActions(action_slice, download_bytes, size_delta);
     const target = try owned.dupe(u8, input.target_architecture);
     return .{ .plan = .{
+        .schema_version = if (hasLocalArtifactAction(action_slice)) 3 else 2,
         .target_architecture = target,
         .mode = input.mode,
         .actions = action_slice,
@@ -1207,6 +1329,47 @@ fn validateExactLockInput(
     return null;
 }
 
+fn validateExactLockV2Input(
+    backing: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    repositories: []const RepositoryInput,
+    lock: *const exact_lock_v2.Lock,
+) PlanningError!?PlanFailure {
+    for (lock.repositories) |locked_repository| {
+        var matched: ?RepositoryInput = null;
+        for (repositories) |repository| {
+            if (std.mem.eql(u8, repository.repository_id.slice(), &locked_repository.id)) {
+                matched = repository;
+                break;
+            }
+        }
+        const repository = matched orelse
+            return (try failureOne(backing, arena, .lock_repository_missing, null, null, "exact lock repository is unavailable")).failure;
+        if (repository.eligibility != .verified_refresh)
+            return (try failureOne(backing, arena, .unauthenticated_repository, null, null, "repository lock reproduction requires authenticated refresh metadata")).failure;
+        const snapshot = repository.authenticated_snapshot_sha256 orelse
+            return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository has no authenticated snapshot identity")).failure;
+        if (!std.mem.eql(u8, &snapshot, &locked_repository.snapshot_sha256))
+            return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository snapshot differs from the exact lock")).failure;
+    }
+    for (lock.local_artifacts) |locked_artifact| {
+        var matched = false;
+        for (repositories) |repository| {
+            if (repository.eligibility != .verified_local_artifact) continue;
+            const artifact = repository.local_artifact orelse continue;
+            if (std.mem.eql(u8, &artifact.artifact_id, &locked_artifact.artifact_id) and
+                package_origin.eqlLocalArtifact(artifact, locked_artifact))
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "verified local artifact evidence differs from the exact lock")).failure;
+    }
+    return null;
+}
+
 fn addExactLockJobs(
     backing: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
@@ -1269,6 +1432,85 @@ fn addExactLockJobs(
         libsolv.queue_push2(jobs, libsolv.SOLVER_ERASE | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
     }
     return null;
+}
+
+fn addExactLockV2Jobs(
+    backing: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    context: *Context,
+    input: PlanInput,
+    lock: *const exact_lock_v2.Lock,
+    jobs: *libsolv.Queue,
+) PlanningError!?PlanFailure {
+    const state = internal(context);
+    for (lock.packages) |locked| {
+        var candidate: ?libsolv.Id = null;
+        var identity_seen = false;
+        for (state.origins.items) |origin| {
+            if (!std.mem.eql(u8, origin.package, locked.name) or
+                !std.mem.eql(u8, origin.version, locked.version) or
+                !std.mem.eql(u8, origin.architecture, locked.architecture))
+                continue;
+            identity_seen = true;
+            const repository_index = findRepositoryIndex(input.repositories, origin.repository_id) orelse
+                continue;
+            const record = input.repositories[repository_index].packages.records[origin.record_index];
+            if (!std.mem.eql(u8, &record.transport.sha256.bytes, &locked.sha256) or
+                record.transport.size.value != locked.declared_size or
+                !originMatchesLockV2(origin, locked.origin))
+                continue;
+            candidate = origin.solvable_id;
+            break;
+        }
+        if (candidate == null) {
+            return (try failureOne(
+                backing,
+                arena,
+                if (identity_seen) .lock_package_mismatch else .lock_package_missing,
+                locked.name,
+                null,
+                if (identity_seen)
+                    "exact lock package origin, digest, or declared size differs"
+                else
+                    "exact lock package version and architecture are unavailable",
+            )).failure;
+        }
+        if (findInstalledSelector(context, .{
+            .name = locked.name,
+            .version = locked.version,
+            .architecture = locked.architecture,
+        })) |installed_index| {
+            const mapping = state.mappings[installed_index];
+            if (state.source_records[mapping.record_index].status.isFullyInstalled()) continue;
+        }
+        libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE, candidate.?);
+    }
+
+    for (state.mappings, 0..) |mapping, installed_index| {
+        const installed = state.source_records[mapping.record_index];
+        if (!installed.status.isFullyInstalled()) continue;
+        if (lock.findIdentity(installed.name.value, installed.architecture.value) != null) continue;
+        if (isHeld(context, installed_index) and !input.policy.allow_change_held)
+            return (try failureOne(backing, arena, .held_violation, installed.name.value, null, "exact lock excludes a held installed package")).failure;
+        if (removalViolation(context, input, installed_index)) |kind|
+            return (try failureOne(backing, arena, kind, installed.name.value, null, "safe removal policy prevents exact lock closure reproduction")).failure;
+        libsolv.queue_push2(jobs, libsolv.SOLVER_ERASE | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
+    }
+    return null;
+}
+
+fn originMatchesLockV2(
+    origin: OriginOwned,
+    locked: exact_lock_v2.PackageOrigin,
+) bool {
+    return switch (locked) {
+        .authenticated_repository => |repository| origin.local_artifact == null and
+            std.mem.eql(u8, origin.repository_id.slice(), &repository.repository_id),
+        .local_artifact => |artifact| if (origin.local_artifact) |observed|
+            package_origin.eqlLocalArtifact(observed, artifact)
+        else
+            false,
+    };
 }
 
 fn preflightRequest(
@@ -2042,6 +2284,7 @@ fn materializeAction(
     var package_size: ?u64 = null;
     var sha256: ?[64]u8 = null;
     var repository: ?RepositoryIdentity = null;
+    var plan_origin: ?PlanOrigin = null;
     var installed_size: u64 = 0;
     var source_name: []const u8 = undefined;
     var package_name: []const u8 = undefined;
@@ -2061,10 +2304,23 @@ fn materializeAction(
         sha256 = hex32(record.transport.sha256.bytes);
         installed_size = record.control.installed_size orelse 0;
         source_name = if (record.control.source) |source_value| source_value.package.text else package_name;
-        repository = .{
-            .id = available.repository_id.bytes,
-            .priority = available.repository_priority,
-        };
+        if (available.local_artifact) |artifact| {
+            var owned_artifact = artifact;
+            owned_artifact.package = try allocator.dupe(u8, artifact.package);
+            owned_artifact.version = try allocator.dupe(u8, artifact.version);
+            owned_artifact.architecture = try allocator.dupe(u8, artifact.architecture);
+            owned_artifact.acquisition_url = try allocator.dupe(u8, artifact.acquisition_url);
+            plan_origin = .{ .local_artifact = .{
+                .evidence = owned_artifact,
+                .solver_priority = available.repository_priority,
+            } };
+        } else {
+            repository = .{
+                .id = available.repository_id.bytes,
+                .priority = available.repository_priority,
+            };
+            plan_origin = .{ .authenticated_repository = repository.? };
+        }
     } else {
         const index = installed_index.?;
         const record = state.source_records[state.mappings[index].record_index];
@@ -2091,16 +2347,40 @@ fn materializeAction(
         .reason = actionReason(context, solvable_id, kind, input, package_name, version, architecture),
         .essential = essential,
         .has_pre_depends = has_pre_depends,
-        .selected_origin = if (origin) |available| .{
-            .repository_id = available.repository_id,
-            .repository_priority = available.repository_priority,
-            .record_index = available.record_index,
-            .package = try allocator.dupe(u8, available.package),
-            .version = try allocator.dupe(u8, available.version),
-            .architecture = try allocator.dupe(u8, available.architecture),
-            .source_location = try allocator.dupe(u8, available.source_location),
-        } else null,
+        .selected_origin = if (origin) |available|
+            try ownedPackageOrigin(allocator, available)
+        else
+            null,
+        .origin = plan_origin,
     };
+}
+
+fn ownedPackageOrigin(
+    allocator: std.mem.Allocator,
+    available: *const OriginOwned,
+) !PackageOrigin {
+    if (available.local_artifact) |artifact| {
+        var owned_artifact = artifact;
+        owned_artifact.package = try allocator.dupe(u8, artifact.package);
+        owned_artifact.version = try allocator.dupe(u8, artifact.version);
+        owned_artifact.architecture = try allocator.dupe(u8, artifact.architecture);
+        owned_artifact.acquisition_url = try allocator.dupe(u8, artifact.acquisition_url);
+        return .{ .local_artifact = .{
+            .evidence = owned_artifact,
+            .solver_priority = available.repository_priority,
+            .record_index = available.record_index,
+            .source_location = try allocator.dupe(u8, available.source_location),
+        } };
+    }
+    return .{ .authenticated_repository = .{
+        .repository_id = available.repository_id,
+        .repository_priority = available.repository_priority,
+        .record_index = available.record_index,
+        .package = try allocator.dupe(u8, available.package),
+        .version = try allocator.dupe(u8, available.version),
+        .architecture = try allocator.dupe(u8, available.architecture),
+        .source_location = try allocator.dupe(u8, available.source_location),
+    } };
 }
 
 fn isInstallOnly(input: PlanInput, name: []const u8, architecture: []const u8) bool {
@@ -2313,6 +2593,28 @@ fn lessAction(_: void, a: PlanAction, b: PlanAction) bool {
     return a.repository != null;
 }
 
+fn hasLocalArtifactAction(actions: []const PlanAction) bool {
+    for (actions) |action| if (action.origin) |origin| switch (origin) {
+        .authenticated_repository => {},
+        .local_artifact => return true,
+    };
+    return false;
+}
+
+fn planActionMatchesLockV2(action: PlanAction, locked: exact_lock_v2.Package) bool {
+    const origin = action.origin orelse return false;
+    return switch (locked.origin) {
+        .authenticated_repository => |repository| switch (origin) {
+            .authenticated_repository => |observed| std.mem.eql(u8, &observed.id, &repository.repository_id),
+            .local_artifact => false,
+        },
+        .local_artifact => |artifact| switch (origin) {
+            .authenticated_repository => false,
+            .local_artifact => |observed| package_origin.eqlLocalArtifact(observed.evidence, artifact),
+        },
+    };
+}
+
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeByte('"');
     for (value) |byte| {
@@ -2348,12 +2650,17 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
         try writeJsonString(writer, action.version);
         try writer.writeAll(",\"architecture\":");
         try writeJsonString(writer, action.architecture);
-        try writer.writeAll(",\"repository\":");
-        if (action.repository) |repository| {
-            try writer.writeAll("{\"id\":");
-            try writeJsonString(writer, &repository.id);
-            try writer.print(",\"priority\":{}}}", .{repository.priority});
-        } else try writer.writeAll("null");
+        if (plan.schema_version == 2) {
+            try writer.writeAll(",\"repository\":");
+            if (action.repository) |repository| {
+                try writer.writeAll("{\"id\":");
+                try writeJsonString(writer, &repository.id);
+                try writer.print(",\"priority\":{}}}", .{repository.priority});
+            } else try writer.writeAll("null");
+        } else {
+            try writer.writeAll(",\"origin\":");
+            if (action.origin) |origin| try writePlanOrigin(writer, origin) else try writer.writeAll("null");
+        }
         try writer.writeAll(",\"sha256\":");
         if (action.sha256) |sha| try writeJsonString(writer, &sha) else try writer.writeAll("null");
         try writer.writeAll(",\"package_size\":");
@@ -2403,6 +2710,35 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
         plan.download_bytes,
         plan.installed_size_delta_bytes,
     });
+}
+
+fn writePlanOrigin(writer: *std.Io.Writer, origin: PlanOrigin) !void {
+    switch (origin) {
+        .authenticated_repository => |repository| {
+            try writer.writeAll("{\"type\":\"authenticated_repository\",\"id\":");
+            try writeJsonString(writer, &repository.id);
+            try writer.print(",\"priority\":{}}}", .{repository.priority});
+        },
+        .local_artifact => |local| {
+            const artifact = local.evidence;
+            const digest_hex = hex32(artifact.sha256);
+            try writer.writeAll("{\"type\":\"local_artifact\",\"artifact_id\":");
+            try writeJsonString(writer, &artifact.artifact_id);
+            try writer.writeAll(",\"sha256\":");
+            try writeJsonString(writer, &digest_hex);
+            try writer.print(",\"size\":{},\"package\":{{\"name\":", .{artifact.size});
+            try writeJsonString(writer, artifact.package);
+            try writer.writeAll(",\"version\":");
+            try writeJsonString(writer, artifact.version);
+            try writer.writeAll(",\"architecture\":");
+            try writeJsonString(writer, artifact.architecture);
+            try writer.writeAll("},\"acquisition_url\":");
+            try writeJsonString(writer, artifact.acquisition_url);
+            try writer.writeAll(",\"trust_mode\":");
+            try writeJsonString(writer, @tagName(artifact.trust_mode));
+            try writer.print(",\"solver_priority\":{}}}", .{local.solver_priority});
+        },
+    }
 }
 
 fn writeFailureJson(failure: PlanFailure, writer: *std.Io.Writer) !void {
@@ -3140,7 +3476,11 @@ fn solveAvailable(context: *Context, name: []const u8) ![]PackageOrigin {
 
 fn hasSelected(selected: []const PackageOrigin, name: []const u8) bool {
     for (selected) |origin| {
-        if (std.mem.eql(u8, origin.package, name)) return true;
+        const package = switch (origin) {
+            .authenticated_repository => |repository| repository.package,
+            .local_artifact => |artifact| artifact.evidence.package,
+        };
+        if (std.mem.eql(u8, package, name)) return true;
     }
     return false;
 }
@@ -3197,7 +3537,10 @@ test "available import requires explicit trust and owns identities" {
     input.eligibility = .untrusted;
     try std.testing.expectError(error.UntrustedRepository, context.importAvailable(input, .{}));
     try context.importAvailable(RepositoryInput.trustedTest(id, 500, &index), .{});
-    const origin = context.originAt(0).?;
+    const origin = switch (context.originAt(0).?) {
+        .authenticated_repository => |value| value,
+        .local_artifact => unreachable,
+    };
     try std.testing.expectEqualStrings("base", origin.package);
     try std.testing.expectEqualStrings("1:2.0-3", origin.version);
     try std.testing.expectEqualStrings("amd64", origin.architecture);
@@ -3414,6 +3757,264 @@ test "planner materializes owned install closure and stable canonical JSON" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"schema_version\":2") != null);
+}
+
+test "solver.test.mixed authenticated repository and verified local artifact produce plan v3" {
+    const repository_text =
+        "Package: ca-certificates\nVersion: 1\nArchitecture: amd64\nFilename: pool/ca-certificates.deb\nSize: 7\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n\n" ++
+        "Package: installed-base\nVersion: 1\nArchitecture: amd64\nFilename: pool/installed-base.deb\nSize: 8\n" ++
+        "SHA256: 8888888888888888888888888888888888888888888888888888888888888888\n";
+    const repository_id = testRepositoryId('a');
+    var repository_index = try availableIndex(repository_id, repository_text);
+    defer repository_index.deinit();
+    var repository = RepositoryInput.trustedTest(repository_id, 500, &repository_index);
+    repository.eligibility = .verified_refresh;
+    repository.authenticated_snapshot_sha256 = @splat(1);
+    var database = try parsedDatabase(
+        "Package: installed-base\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    const installed_policies = [_]InstalledPolicy{.{
+        .name = "installed-base",
+        .architecture = "amd64",
+        .install_reason = .manual,
+        .held = false,
+    }};
+
+    const local_text =
+        "Package: vendor-repo\nVersion: 1.0\nArchitecture: amd64\nDepends: ca-certificates\nFilename: vendor-repo.deb\nSize: 42\n" ++
+        "SHA256: 3333333333333333333333333333333333333333333333333333333333333333\n";
+    const artifact_id = testRepositoryId('3');
+    var local_index = try availableIndex(artifact_id, local_text);
+    defer local_index.deinit();
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = artifact_id.bytes,
+        .sha256 = @splat(0x33),
+        .size = 42,
+        .package = "vendor-repo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .acquisition_url = "https://example.test/vendor-repo.deb?REDACTED",
+        .trust_mode = .verified_https,
+    };
+    const local = RepositoryInput.fromLocalArtifact(&local_index, 1000, artifact);
+    const repositories = [_]RepositoryInput{ local, repository };
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &installed_policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "vendor-repo" } },
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u32, 3), plan.schema_version);
+    try std.testing.expectEqual(@as(usize, 2), plan.actions.len);
+    try std.testing.expectEqualStrings("ca-certificates", plan.actions[0].package);
+    try std.testing.expectEqualStrings("vendor-repo", plan.actions[1].package);
+    try std.testing.expect(plan.actions[0].repository != null);
+    try std.testing.expect(plan.actions[1].repository == null);
+    switch (plan.actions[1].origin.?) {
+        .authenticated_repository => return error.TestExpectedLocalArtifact,
+        .local_artifact => |origin| try std.testing.expect(
+            package_origin.eqlLocalArtifact(origin.evidence, artifact),
+        ),
+    }
+    const json = try plan.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"origin\":{\"type\":\"local_artifact\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repository\":") == null);
+
+    const locked_packages = [_]exact_lock_v2.Package{
+        .{
+            .name = "ca-certificates",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id.bytes,
+                .repository_snapshot_sha256 = @splat(1),
+            } },
+            .sha256 = @splat(0x22),
+            .declared_size = 7,
+            .retention = .dependency,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .origin = .{ .local_artifact = artifact },
+            .sha256 = artifact.sha256,
+            .declared_size = artifact.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "installed-base",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id.bytes,
+                .repository_snapshot_sha256 = @splat(1),
+            } },
+            .sha256 = @splat(0x88),
+            .declared_size = 8,
+            .retention = .retained,
+            .dpkg_selection_hold = false,
+        },
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(5),
+        .policy_sha256 = @splat(6),
+        .repositories = &.{.{
+            .id = repository_id.bytes,
+            .snapshot_sha256 = @splat(1),
+            .release_sha256 = @splat(7),
+            .index_sha256 = @splat(8),
+            .signer_fingerprints = &.{@splat(9)},
+        }},
+        .local_artifacts = &.{artifact},
+        .packages = &locked_packages,
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const replay_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &installed_policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .exact_lock_v2 = &lock.lock,
+    });
+    var replay_plan = replay_result.plan;
+    defer replay_plan.deinit();
+    const replay_json = try replay_plan.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(replay_json);
+    try std.testing.expectEqualStrings(json, replay_json);
+
+    const reversed = [_]RepositoryInput{ repository, local };
+    const reversed_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &reversed,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &installed_policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "vendor-repo" } },
+    });
+    var reversed_plan = reversed_result.plan;
+    defer reversed_plan.deinit();
+    const reversed_json = try reversed_plan.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(reversed_json);
+    try std.testing.expectEqualStrings(json, reversed_json);
+
+    var substituted = local;
+    substituted.eligibility = .verified_refresh;
+    substituted.authenticated_snapshot_sha256 = @splat(1);
+    substituted.local_artifact = null;
+    const substituted_repositories = [_]RepositoryInput{ substituted, repository };
+    const substituted_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &substituted_repositories,
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &installed_policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .exact_lock_v2 = &lock.lock,
+    });
+    var substitution_failure = substituted_result.failure;
+    defer substitution_failure.deinit();
+    try std.testing.expectEqual(
+        ProblemKind.lock_package_mismatch,
+        substitution_failure.problems[0].kind,
+    );
+
+    var forbidden = local;
+    forbidden.eligibility = .trusted_test;
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try std.testing.expectError(
+        error.InvalidLocalArtifact,
+        context.importAvailable(forbidden, .{}),
+    );
+}
+
+test "solver.test.v1 exact lock replay remains repository-only schema v2" {
+    const text =
+        "Package: app\nVersion: 1\nArchitecture: amd64\nFilename: pool/app.deb\nSize: 5\n" ++
+        "SHA256: 5555555555555555555555555555555555555555555555555555555555555555\n";
+    const repository_id = testRepositoryId('a');
+    var index = try availableIndex(repository_id, text);
+    defer index.deinit();
+    var repository = RepositoryInput.trustedTest(repository_id, 500, &index);
+    repository.eligibility = .verified_refresh;
+    repository.authenticated_snapshot_sha256 = @splat(1);
+    const lock_repository: exact_lock_module.Repository = .{
+        .id = repository_id.bytes,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    };
+    const lock_package: exact_lock_module.Package = .{
+        .name = "app",
+        .version = "1",
+        .architecture = "amd64",
+        .repository_id = repository_id.bytes,
+        .repository_snapshot_sha256 = @splat(1),
+        .sha256 = @splat(0x55),
+        .declared_size = 5,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var lock = try exact_lock_module.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &.{lock_repository},
+        .packages = &.{lock_package},
+        .authenticated_metadata = true,
+    });
+    defer lock.deinit();
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{repository},
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = .{ .name = "app" } },
+        .exact_lock = &lock.lock,
+    });
+    var plan = result.plan;
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u32, 2), plan.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+    const json = try plan.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repository\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"origin\":") == null);
 }
 
 test "planner installs a named package with Debian replacement metadata" {

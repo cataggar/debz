@@ -2,6 +2,7 @@ const std = @import("std");
 const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 
 pub const journal_version: u32 = 2;
 pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
@@ -546,6 +547,51 @@ pub fn verify(
 pub fn verifyExactLock(
     allocator: std.mem.Allocator,
     lock: exact_lock.Lock,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const source = reader.read(allocator, root, maximum_status_bytes) catch
+        return .{ .failure = .status_query_failed };
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return .{ .failure = .status_parse_failed },
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    var installed_count: usize = 0;
+    for (database.database.packages) |package| {
+        if (package.status.requiresRepair())
+            return .{ .failure = .unhealthy_package, .package = package.name.value };
+        if (!package.status.isFullyInstalled()) continue;
+        installed_count += 1;
+        const locked = lock.findIdentity(package.name.value, package.architecture.value) orelse
+            return .{ .failure = .unrelated_package, .package = package.name.value };
+        if (!std.mem.eql(u8, locked.version, package.version.spelling.value))
+            return .{
+                .failure = .expected_identity_mismatch,
+                .package = package.name.value,
+                .expected_version = locked.version,
+                .observed_version = package.version.spelling.value,
+            };
+    }
+    if (installed_count != lock.packages.len) {
+        for (lock.packages) |locked| {
+            const package = database.database.find(locked.name, locked.architecture) orelse
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+            if (!package.status.isFullyInstalled())
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+        }
+        return .{ .failure = .expected_package_missing };
+    }
+    return .{};
+}
+
+pub fn verifyExactLockV2(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
     root: []const u8,
     reader: StatusReader,
     maximum_status_bytes: usize,

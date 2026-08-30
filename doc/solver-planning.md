@@ -6,6 +6,12 @@ installed state and holds, native/foreign architectures, a typed request, and
 explicit policy. Candidate order is repository priority, Debian version,
 architecture, then repository ID.
 
+One strictly verified local artifact may be imported through
+`RepositoryInput.fromLocalArtifact` alongside authenticated repositories.
+libsolv receives a synthetic container, but the selected `PackageOrigin` and
+public plan remain tagged `local_artifact`; the local archive cannot enter
+through the trusted-test or repository package-acquisition boundaries.
+
 Holds, protected and essential packages, downgrades, replacements,
 reverse-dependency removals, Recommends, and phased updates are denied unless
 their policy permits them. Phased updates are disabled by default.
@@ -40,3 +46,7 @@ candidate rejection records, and graph edges. Configure barriers preserve
 Pre-Depends while leaving normal dependency-cycle ordering to dpkg. Plan-only
 and download-only never execute dpkg. Schema v1 remains published for older
 consumers.
+
+Repository-only plans retain canonical schema-v2 output. A plan containing a
+local artifact uses schema v3, where every archive-producing action serializes
+a tagged `origin` rather than reinterpreting the v2 `repository` field.

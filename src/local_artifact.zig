@@ -2,6 +2,7 @@ const std = @import("std");
 const repository_acquisition = @import("repository_acquisition.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const metadata_cache = @import("metadata_cache.zig");
+const package_origin = @import("package_origin.zig");
 
 pub const Digest = metadata_cache.Digest;
 
@@ -45,6 +46,27 @@ pub const Provenance = struct {
     pub fn deinit(self: *Provenance, allocator: std.mem.Allocator) void {
         allocator.free(self.effective_uri);
         self.* = undefined;
+    }
+
+    pub fn originEvidence(
+        self: Provenance,
+        package: []const u8,
+        version: []const u8,
+        architecture: []const u8,
+    ) package_origin.LocalArtifactEvidence {
+        return .{
+            .artifact_id = package_origin.artifactIdFromSha256(self.sha256.bytes),
+            .sha256 = self.sha256.bytes,
+            .size = self.size,
+            .package = package,
+            .version = version,
+            .architecture = architecture,
+            .acquisition_url = self.effective_uri,
+            .trust_mode = switch (self.trust_mode) {
+                .sha256 => .pinned_sha256,
+                .https => .verified_https,
+            },
+        };
     }
 };
 
@@ -341,6 +363,12 @@ test "unpinned HTTPS records transport trust and enforces an expected size" {
     defer artifact.deinit();
     try std.testing.expectEqual(TrustMode.https, artifact.provenance.trust_mode);
     try std.testing.expectEqual(Outcome.acquired, artifact.provenance.outcome);
+    const evidence = artifact.provenance.originEvidence("demo", "1", "amd64");
+    try package_origin.validateLocalArtifact(evidence);
+    try std.testing.expectEqual(
+        package_origin.LocalArtifactTrustMode.verified_https,
+        evidence.trust_mode,
+    );
 
     transport.body = "wrong";
     try std.testing.expectError(error.SizeMismatch, acquire(

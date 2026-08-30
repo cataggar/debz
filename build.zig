@@ -244,7 +244,7 @@ pub fn build(b: *std.Build) void {
 
     const lock_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"exact_lock.test."},
+        .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
     });
     const run_lock_tests = b.addRunArtifact(lock_tests);
     b.step("test-exact-lock", "Run exact solved-closure lock tests")
@@ -252,7 +252,7 @@ pub fn build(b: *std.Build) void {
 
     const provenance_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"transaction_provenance.test."},
+        .filters = &.{ "transaction_provenance.test.", "transaction_provenance_v2.test." },
     });
     const run_provenance_tests = b.addRunArtifact(provenance_tests);
     b.step("test-transaction-provenance", "Run transaction provenance tests")
@@ -339,9 +339,12 @@ fn installReleaseFiles(
         "apt-config-snapshot-v1.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
+        "exact-closure-lock-v2.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
+        "transaction-plan-v3.json",
         "transaction-result-v1.json",
+        "transaction-result-v2.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
