@@ -28,9 +28,12 @@ recovery verification require a completed unpack journal entry with that
 artifact digest and an exact plan-origin/size match; matching dpkg identity
 alone is insufficient.
 
-The recovery journal's plan digest binds the complete tagged origin of every
-archive-producing action, including the union tag, artifact ID, SHA-256, size,
-package identity, acquisition URL, trust mode, and solver priority.
+Schema-v2 recovery journals retain the released plan-digest algorithm so
+interrupted repository-only transactions remain recoverable after an upgrade.
+For schema-v3 plans, the recovery journal's plan digest additionally binds the
+complete tagged origin of every archive-producing action, including the union
+tag, artifact ID, SHA-256, size, package identity, acquisition URL, trust mode,
+and solver priority.
 
 For a new root, the authenticated closure containing absent Essential packages
 receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before

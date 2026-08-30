@@ -1695,7 +1695,7 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
         if (action.repository) |repository| hash.update(&repository.id);
         hash.update("\x00");
-        hashPlanOrigin(&hash, action.origin);
+        if (plan.schema_version == 3) hashPlanOrigin(&hash, action.origin);
         if (action.sha256) |digest| hash.update(&digest);
         hash.update("\x00");
         std.mem.writeInt(u64, &number, action.package_size orelse 0, .little);
@@ -3396,6 +3396,45 @@ test "transaction_executor.test.system lock manager provisions missing debz stat
 
     var provisioned = try directory.dir.openDir(std.testing.io, "root/var/lib/debz", .{ .follow_symlinks = false });
     provisioned.close(std.testing.io);
+}
+
+test "transaction_executor.test.schema v2 plan hash and interrupted journal remain compatible" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    const released_plan_sha256 = try parseHexDigest(
+        "169c8fb07908a3e3fdcd626c950d5033ed32be2238ea658b66223e46ae0621c5".*,
+    );
+    try std.testing.expectEqual(@as(u32, 2), plan.schema_version);
+    try std.testing.expectEqualSlices(u8, &released_plan_sha256, &hashPlan(plan));
+
+    const policy: Policy = .{ .conffile = .keep_existing };
+    const journal: recovery.Journal = .{
+        .state = .interrupted,
+        .boundary = .before_command,
+        .plan_sha256 = released_plan_sha256,
+        .root_identity = recovery.rootIdentity("/target"),
+        .policy_sha256 = hashPolicy(policy),
+        .next_command = 0,
+        .commands = &.{},
+        .failure = "released v0.2.0 interruption",
+    };
+    const fixture = try recovery.encode(std.testing.allocator, journal);
+    defer std.testing.allocator.free(fixture);
+    var harness: TestHarness = .{ .bytes = "", .status_source = "" };
+    try TestHarness.writeJournal(&harness, "/target", fixture);
+
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = policy,
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expect(report.succeeded());
+    try std.testing.expectEqualSlices(u8, &released_plan_sha256, &report.plan_sha256);
+    try std.testing.expect(harness.journal_archived);
 }
 
 test "transaction_executor.test.plan hash binds every tagged local origin field" {
