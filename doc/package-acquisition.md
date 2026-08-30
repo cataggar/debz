@@ -59,7 +59,7 @@ object, and byte limits; names are sorted before deletion for deterministic
 results. `cleanupStaging` provides bounded crash recovery.
 
 Errors never contain authorization values. Effective URLs omit user info,
-fragments, and query values; cache keys and provenance contain only the
+fragments, and all query data; cache keys and provenance contain only the
 authenticated repository identity and expected SHA-256.
 
 ## Local artifacts

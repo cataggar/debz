@@ -170,7 +170,7 @@ pub const Diagnostic = struct {
             .maintainer_script_limit => "maintainer scripts exceed configured count or byte limits",
             .descriptor_control_entry => "repository descriptor contains an unsupported control archive entry",
             .descriptor_payload_path => "repository descriptor payload is outside approved repository configuration locations",
-            .descriptor_unsafe_mode => "repository descriptor contains a setuid or setgid entry",
+            .descriptor_unsafe_mode => "repository descriptor contains a setuid, setgid, or writable trust-bearing entry",
             .descriptor_link => "repository descriptor payload must not contain symbolic or hard links",
             .descriptor_relationship => "repository descriptor declares a disallowed package relationship or system importance flag",
             .descriptor_limit => "repository descriptor exceeds configured entry or byte limits",
@@ -199,6 +199,8 @@ pub const TarInventory = struct {
     compressed_bytes: usize,
     decompressed_bytes: usize,
     entries: []Entry,
+    entry_headers: usize,
+    inventory_bytes: usize,
     regular_bytes: u64,
 };
 
@@ -392,6 +394,10 @@ fn validateInternal(
     limits: Limits,
 ) Result {
     var ownership_transferred = false;
+    const descriptor_profile = switch (request) {
+        .repository => false,
+        .local => |expected| expected.profile == .repository_descriptor,
+    };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     switch (request) {
@@ -421,18 +427,29 @@ fn validateInternal(
         } },
     };
 
-    const control_bytes = decompressMember(allocator, outer, outer.control, true, limits) catch |err|
+    var control_limits = limits;
+    if (descriptor_profile) applyInitialDescriptorLimits(&control_limits);
+    const control_bytes = decompressMember(allocator, outer, outer.control, true, control_limits) catch |err|
         return decompressionFailure(.control_decompression, outer.control.content.start, err);
     defer if (!ownership_transferred) allocator.free(control_bytes);
-    const data_bytes = decompressMember(allocator, outer, outer.data, false, limits) catch |err|
-        return decompressionFailure(.data_decompression, outer.data.content.start, err);
-    defer if (!ownership_transferred) allocator.free(data_bytes);
 
     var tar_diagnostic: Diagnostic = undefined;
-    var control_tar = parseTar(allocator, control_bytes, outer.control, .control_tar, limits, &tar_diagnostic) catch
+    var control_tar = parseTar(allocator, control_bytes, outer.control, .control_tar, control_limits, &tar_diagnostic) catch
         return .{ .diagnostic = tar_diagnostic };
     defer if (!ownership_transferred) freeInventory(allocator, &control_tar);
-    var data_tar = parseTar(allocator, data_bytes, outer.data, .data_tar, limits, &tar_diagnostic) catch
+
+    var data_limits = limits;
+    if (descriptor_profile) applyRemainingDescriptorLimits(
+        &data_limits,
+        control_bytes.len,
+        control_tar.entry_headers,
+        control_tar.inventory_bytes,
+        control_tar.regular_bytes,
+    );
+    const data_bytes = decompressMember(allocator, outer, outer.data, false, data_limits) catch |err|
+        return decompressionFailure(.data_decompression, outer.data.content.start, err);
+    defer if (!ownership_transferred) allocator.free(data_bytes);
+    var data_tar = parseTar(allocator, data_bytes, outer.data, .data_tar, data_limits, &tar_diagnostic) catch
         return .{ .diagnostic = tar_diagnostic };
     defer if (!ownership_transferred) freeInventory(allocator, &data_tar);
 
@@ -649,6 +666,9 @@ fn validateDescriptorProfile(
         if (!classification.allowed) {
             return profileFailure(.descriptor_payload_path, data_member, entry, index);
         }
+        if (classification.trust_bearing and entry.mode & 0o022 != 0) {
+            return profileFailure(.descriptor_unsafe_mode, data_member, entry, index);
+        }
         if (entry.kind == .regular) {
             if (entry.size > limits.max_descriptor_file_bytes or
                 (classification.source and entry.size > limits.max_descriptor_source_bytes) or
@@ -698,6 +718,7 @@ const DescriptorPathClassification = struct {
     allowed: bool = false,
     source: bool = false,
     keyring: bool = false,
+    trust_bearing: bool = false,
 };
 
 fn classifyDescriptorPath(path: []const u8, kind: EntryKind, package: []const u8) DescriptorPathClassification {
@@ -715,31 +736,40 @@ fn classifyDescriptorPath(path: []const u8, kind: EntryKind, package: []const u8
     if (kind == .directory) {
         for (source_roots ++ keyring_roots ++ tree_roots) |root| {
             if (isPathAncestorOrEqual(path, root) or isPathWithin(path, root))
-                return .{ .allowed = true };
+                return .{ .allowed = true, .trust_bearing = true };
         }
-        if (isPackageDocPath(path, package, true) or isLintianPath(path, package, true))
-            return .{ .allowed = true };
+        if (isPackageDocPath(path, package, true))
+            return .{ .allowed = true, .trust_bearing = true };
+        if (isLintianPath(path, package, true)) return .{ .allowed = true };
         return .{};
     }
 
     for (source_roots) |root| {
         if (isDirectChild(path, root) and
             (std.mem.endsWith(u8, path, ".list") or std.mem.endsWith(u8, path, ".sources")))
-            return .{ .allowed = true, .source = true };
+            return .{ .allowed = true, .source = true, .trust_bearing = true };
     }
     for (keyring_roots) |root| {
         if (isDirectChild(path, root) and
             (std.mem.endsWith(u8, path, ".gpg") or
                 std.mem.endsWith(u8, path, ".pgp") or
                 std.mem.endsWith(u8, path, ".asc")))
-            return .{ .allowed = true, .keyring = true };
+            return .{ .allowed = true, .keyring = true, .trust_bearing = true };
     }
     for (tree_roots) |root| {
-        if (isPathWithin(path, root)) return .{ .allowed = true };
+        if (isPathWithin(path, root)) return .{ .allowed = true, .trust_bearing = true };
     }
-    if (isPackageDocPath(path, package, false) or isLintianPath(path, package, false))
-        return .{ .allowed = true };
+    if (isPackageDocPath(path, package, false))
+        return .{ .allowed = true, .trust_bearing = trustFileSuffix(path) };
+    if (isLintianPath(path, package, false)) return .{ .allowed = true };
     return .{};
+}
+
+fn trustFileSuffix(path: []const u8) bool {
+    inline for (.{ ".list", ".sources", ".gpg", ".pgp", ".asc", ".pol" }) |suffix| {
+        if (std.mem.endsWith(u8, path, suffix)) return true;
+    }
+    return false;
 }
 
 fn isPathAncestorOrEqual(path: []const u8, root: []const u8) bool {
@@ -786,6 +816,38 @@ fn profileFailure(
         .inner_offset = entry.header_offset,
         .entry_index = index,
     };
+}
+
+fn applyInitialDescriptorLimits(limits: *Limits) void {
+    const maximum_bytes = descriptorBytesAsUsize(limits.max_descriptor_total_bytes);
+    limits.max_control_compressed_bytes = @min(limits.max_control_compressed_bytes, maximum_bytes);
+    limits.max_control_decompressed_bytes = @min(limits.max_control_decompressed_bytes, maximum_bytes);
+    limits.max_entries_per_tar = @min(limits.max_entries_per_tar, limits.max_descriptor_entries);
+    limits.max_inventory_bytes_per_tar = @min(limits.max_inventory_bytes_per_tar, maximum_bytes);
+    limits.max_total_entry_bytes = @min(limits.max_total_entry_bytes, limits.max_descriptor_total_bytes);
+}
+
+fn applyRemainingDescriptorLimits(
+    limits: *Limits,
+    control_decompressed_bytes: usize,
+    control_entry_headers: usize,
+    control_inventory_bytes: usize,
+    control_regular_bytes: u64,
+) void {
+    const maximum_bytes = descriptorBytesAsUsize(limits.max_descriptor_total_bytes);
+    const remaining_decompressed = maximum_bytes -| control_decompressed_bytes;
+    const remaining_entries = limits.max_descriptor_entries -| control_entry_headers;
+    const remaining_inventory = maximum_bytes -| control_inventory_bytes;
+    const remaining_regular = limits.max_descriptor_total_bytes -| control_regular_bytes;
+    limits.max_data_compressed_bytes = @min(limits.max_data_compressed_bytes, maximum_bytes);
+    limits.max_data_decompressed_bytes = @min(limits.max_data_decompressed_bytes, remaining_decompressed);
+    limits.max_entries_per_tar = @min(limits.max_entries_per_tar, remaining_entries);
+    limits.max_inventory_bytes_per_tar = @min(limits.max_inventory_bytes_per_tar, remaining_inventory);
+    limits.max_total_entry_bytes = @min(limits.max_total_entry_bytes, remaining_regular);
+}
+
+fn descriptorBytesAsUsize(maximum: u64) usize {
+    return std.math.cast(usize, maximum) orelse std.math.maxInt(usize);
 }
 
 fn decompressMember(allocator: std.mem.Allocator, archive: deb_archive.Archive, member: deb_archive.Member, is_control: bool, limits: Limits) metadata_decompression.Error![]u8 {
@@ -1028,6 +1090,8 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         .compressed_bytes = member.size,
         .decompressed_bytes = bytes.len,
         .entries = entries.toOwnedSlice(allocator) catch return setTarFailure(diagnostic, stage, .out_of_memory, member, 0, null),
+        .entry_headers = header_count,
+        .inventory_bytes = inventory_bytes,
         .regular_bytes = regular_bytes,
     };
 }
@@ -1400,19 +1464,24 @@ fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
     return testDebWithConffiles(allocator, bad_data_path, "/etc/demo.conf\n");
 }
 
-fn descriptorTestDeb(
-    allocator: std.mem.Allocator,
-    extra_control_fields: []const u8,
-    extra_data_path: ?[]const u8,
-    source_mode: u32,
-    source_kind: u8,
-) ![]u8 {
+const DescriptorTestOptions = struct {
+    extra_control_fields: []const u8 = "",
+    extra_data_path: ?[]const u8 = null,
+    source_mode: u32 = 0o644,
+    source_kind: u8 = '0',
+    keyring_mode: u32 = 0o644,
+    doc_trust_mode: u32 = 0o644,
+    source_parent_mode: u32 = 0o755,
+    keyring_parent_mode: u32 = 0o755,
+};
+
+fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOptions) ![]u8 {
     var control: std.ArrayList(u8) = .empty;
     defer control.deinit(allocator);
     const metadata = try std.fmt.allocPrint(
         allocator,
         "Package: repo-config\nVersion: 2.0\nArchitecture: all\nDepends: ca-certificates\n{s}",
-        .{extra_control_fields},
+        .{options.extra_control_fields},
     );
     defer allocator.free(metadata);
     try appendTarEntry(allocator, &control, "./control", '0', 0o644, "", metadata);
@@ -1435,21 +1504,38 @@ fn descriptorTestDeb(
 
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
+    try appendTarEntry(allocator, &data, "./etc", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./etc/" ++ "apt", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./etc/" ++ "apt/sources.list.d", '5', options.source_parent_mode, "", "");
     try appendTarEntry(
         allocator,
         &data,
         "./etc/" ++ "apt/sources.list.d/vendor.list",
-        source_kind,
-        source_mode,
-        if (source_kind == '2') "other.list" else "",
-        if (source_kind == '0') "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://example.test stable main\n" else "",
+        options.source_kind,
+        options.source_mode,
+        if (options.source_kind == '2') "other.list" else "",
+        if (options.source_kind == '0') "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://example.test stable main\n" else "",
     );
-    try appendTarEntry(allocator, &data, "./usr/share/keyrings/vendor.gpg", '0', 0o644, "", "keyring");
+    try appendTarEntry(allocator, &data, "./usr", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/keyrings", '5', options.keyring_parent_mode, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/keyrings/vendor.gpg", '0', options.keyring_mode, "", "keyring");
+    try appendTarEntry(allocator, &data, "./etc/debsig", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./etc/debsig/policies", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./etc/debsig/policies/ABC", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./etc/debsig/policies/ABC/vendor.pol", '0', 0o644, "", "policy");
+    try appendTarEntry(allocator, &data, "./usr/share/debsig", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/debsig/keyrings", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/debsig/keyrings/ABC", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./usr/share/debsig/keyrings/ABC/vendor.gpg", '0', 0o644, "", "debsig-key");
+    try appendTarEntry(allocator, &data, "./usr/share/doc", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/doc/repo-config", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./usr/share/doc/repo-config/copyright", '0', 0o644, "", "copyright");
+    try appendTarEntry(allocator, &data, "./usr/share/doc/repo-config/vendor.list", '0', options.doc_trust_mode, "", "deb https://example.test stable main\n");
+    try appendTarEntry(allocator, &data, "./usr/share/lintian", '5', 0o755, "", "");
+    try appendTarEntry(allocator, &data, "./usr/share/lintian/overrides", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./usr/share/lintian/overrides/repo-config", '0', 0o644, "", "override");
-    if (extra_data_path) |path|
+    if (options.extra_data_path) |path|
         try appendTarEntry(allocator, &data, path, '0', 0o644, "", "unexpected");
     try finishTar(allocator, &data);
 
@@ -1505,7 +1591,7 @@ test "full validation inventories scripts conffiles and payload without unpackin
 
 test "local inspection derives identity and copies selected static repository files" {
     const allocator = std.testing.allocator;
-    const bytes = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    const bytes = try descriptorTestDeb(allocator, .{});
     defer allocator.free(bytes);
     const digest = metadataDigest(bytes);
     const result = inspectLocal(allocator, bytes, .{
@@ -1581,7 +1667,7 @@ test "local inspection derives identity and copies selected static repository fi
 
 test "local inspection enforces optional digest size and identity expectations" {
     const allocator = std.testing.allocator;
-    const bytes = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    const bytes = try descriptorTestDeb(allocator, .{});
     defer allocator.free(bytes);
     var bad_digest = metadataDigest(bytes);
     bad_digest[0] ^= 1;
@@ -1599,31 +1685,31 @@ test "local inspection enforces optional digest size and identity expectations" 
 test "repository descriptor profile rejects unsafe payloads relationships and script excess" {
     const allocator = std.testing.allocator;
 
-    const outside = try descriptorTestDeb(allocator, "", "./usr/bin/tool", 0o644, '0');
+    const outside = try descriptorTestDeb(allocator, .{ .extra_data_path = "./usr/bin/tool" });
     defer allocator.free(outside);
     try std.testing.expectEqual(Code.descriptor_payload_path, inspectLocal(allocator, outside, .{
         .profile = .repository_descriptor,
     }, .{}).diagnostic.code);
 
-    const setuid = try descriptorTestDeb(allocator, "", null, 0o4644, '0');
+    const setuid = try descriptorTestDeb(allocator, .{ .source_mode = 0o4644 });
     defer allocator.free(setuid);
     try std.testing.expectEqual(Code.descriptor_unsafe_mode, inspectLocal(allocator, setuid, .{
         .profile = .repository_descriptor,
     }, .{}).diagnostic.code);
 
-    const linked = try descriptorTestDeb(allocator, "", null, 0o777, '2');
+    const linked = try descriptorTestDeb(allocator, .{ .source_mode = 0o777, .source_kind = '2' });
     defer allocator.free(linked);
     try std.testing.expectEqual(Code.descriptor_link, inspectLocal(allocator, linked, .{
         .profile = .repository_descriptor,
     }, .{}).diagnostic.code);
 
-    const conflicting = try descriptorTestDeb(allocator, "Conflicts: apt\n", null, 0o644, '0');
+    const conflicting = try descriptorTestDeb(allocator, .{ .extra_control_fields = "Conflicts: apt\n" });
     defer allocator.free(conflicting);
     try std.testing.expectEqual(Code.descriptor_relationship, inspectLocal(allocator, conflicting, .{
         .profile = .repository_descriptor,
     }, .{}).diagnostic.code);
 
-    const scripts = try descriptorTestDeb(allocator, "", null, 0o644, '0');
+    const scripts = try descriptorTestDeb(allocator, .{});
     defer allocator.free(scripts);
     try std.testing.expectEqual(Code.maintainer_script_limit, inspectLocal(allocator, scripts, .{
         .profile = .repository_descriptor,
@@ -1631,6 +1717,49 @@ test "repository descriptor profile rejects unsafe payloads relationships and sc
     try std.testing.expectEqual(Code.descriptor_limit, inspectLocal(allocator, scripts, .{
         .profile = .repository_descriptor,
     }, .{ .max_descriptor_source_bytes = 8 }).diagnostic.code);
+}
+
+test "repository descriptor rejects writable trust files and parent directories" {
+    const allocator = std.testing.allocator;
+    const cases = [_]DescriptorTestOptions{
+        .{ .source_mode = 0o664 },
+        .{ .keyring_mode = 0o646 },
+        .{ .doc_trust_mode = 0o666 },
+        .{ .source_parent_mode = 0o775 },
+        .{ .keyring_parent_mode = 0o757 },
+    };
+    for (cases) |options| {
+        const bytes = try descriptorTestDeb(allocator, options);
+        defer allocator.free(bytes);
+        const result = inspectLocal(allocator, bytes, .{
+            .profile = .repository_descriptor,
+        }, .{});
+        try std.testing.expectEqual(Stage.descriptor_profile, result.diagnostic.stage);
+        try std.testing.expectEqual(Code.descriptor_unsafe_mode, result.diagnostic.code);
+    }
+}
+
+test "repository descriptor bounds apply before data decompression and inventory materialization" {
+    const allocator = std.testing.allocator;
+    const bytes = try descriptorTestDeb(allocator, .{});
+    defer allocator.free(bytes);
+    const archive = deb_archive.parse(bytes, .{}).archive;
+
+    const decompression_result = inspectLocal(allocator, bytes, .{
+        .profile = .repository_descriptor,
+    }, .{
+        .max_descriptor_total_bytes = archive.control.size + 512,
+    });
+    try std.testing.expectEqual(Stage.data_decompression, decompression_result.diagnostic.stage);
+    try std.testing.expectEqual(Code.decompression_failed, decompression_result.diagnostic.code);
+
+    const inventory_result = inspectLocal(allocator, bytes, .{
+        .profile = .repository_descriptor,
+    }, .{
+        .max_descriptor_entries = 6,
+    });
+    try std.testing.expectEqual(Stage.data_tar, inventory_result.diagnostic.stage);
+    try std.testing.expectEqual(Code.tar_entry_limit, inventory_result.diagnostic.code);
 }
 
 test "validates plain gzip xz and zstd payload members" {

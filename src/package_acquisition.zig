@@ -1062,7 +1062,7 @@ test "redirect credentials are origin scoped and observable provenance is redact
     try std.testing.expect(!transport.authorization_seen[1]);
     try std.testing.expect(std.mem.indexOf(u8, result.provenance.resolved_uri, "secret") == null);
     try std.testing.expectEqualStrings(
-        "https://mirror.example/file.deb?token=REDACTED",
+        "https://mirror.example/file.deb?REDACTED",
         result.provenance.resolved_uri,
     );
 }

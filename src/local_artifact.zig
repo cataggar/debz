@@ -126,15 +126,19 @@ pub fn acquire(
         }
     }
 
+    const maximum_transfer_bytes = @min(
+        request.policy.maximum_artifact_bytes,
+        cache.limits.maximum_object_bytes,
+    );
     const response_limit = if (request.expected_size) |size|
         @min(
-            request.policy.maximum_artifact_bytes,
+            maximum_transfer_bytes,
             std.math.cast(usize, std.math.add(u64, size, 1) catch size) orelse
-                request.policy.maximum_artifact_bytes,
+                maximum_transfer_bytes,
         )
     else
-        request.policy.maximum_artifact_bytes;
-    var acquired = try repository_acquisition.acquire(allocator, .{
+        maximum_transfer_bytes;
+    var acquired = repository_acquisition.acquire(allocator, .{
         .uri = request.uri,
         .proxy = request.policy.proxy,
         .deadlines = request.policy.deadlines,
@@ -142,7 +146,13 @@ pub fn acquire(
         .retry = request.policy.retry,
         .max_response_bytes = response_limit,
         .credentials = request.policy.credentials,
-    }, dependencies);
+    }, dependencies) catch |err| switch (err) {
+        error.ResponseTooLarge => if (response_limit < maximum_transfer_bytes)
+            return error.SizeMismatch
+        else
+            return error.ArtifactTooLarge,
+        else => |other| return other,
+    };
     defer acquired.deinit(allocator);
 
     if (acquired.bytes.len > request.policy.maximum_artifact_bytes or
@@ -205,6 +215,7 @@ const TestTransport = struct {
     body: []const u8 = "",
     count: usize = 0,
     now_ms: u64 = 0,
+    maximum_response_bytes: usize = 0,
 
     fn dependencies(self: *TestTransport) repository_acquisition.Dependencies {
         return .{
@@ -221,6 +232,7 @@ const TestTransport = struct {
     ) !repository_acquisition.HttpResponse {
         const self: *TestTransport = @ptrCast(@alignCast(context.?));
         self.count += 1;
+        self.maximum_response_bytes = value.max_response_bytes;
         if (self.body.len > value.max_response_bytes) return error.ResponseTooLarge;
         return .{ .status = 200, .body = try allocator.dupe(u8, self.body) };
     }
@@ -234,6 +246,7 @@ const TestTransport = struct {
     ) !repository_acquisition.FileRead {
         const self: *TestTransport = @ptrCast(@alignCast(context.?));
         self.count += 1;
+        self.maximum_response_bytes = limit;
         if (self.body.len > limit) return error.ResponseTooLarge;
         return .{ .bytes = try allocator.dupe(u8, self.body), .regular = true };
     }
@@ -250,10 +263,17 @@ const TestTransport = struct {
 };
 
 fn testCache(tmp: *std.testing.TmpDir) !package_acquisition.Cache {
+    return testCacheWithLimit(tmp, 1024);
+}
+
+fn testCacheWithLimit(
+    tmp: *std.testing.TmpDir,
+    maximum_object_bytes: usize,
+) !package_acquisition.Cache {
     return package_acquisition.Cache.initFromDir(
         std.testing.io,
         tmp.dir,
-        .{ .maximum_object_bytes = 1024 },
+        .{ .maximum_object_bytes = maximum_object_bytes },
     );
 }
 
@@ -288,7 +308,7 @@ test "SHA-256 pin permits HTTP and publishes exact bytes to package CAS" {
     var transport: TestTransport = .{ .body = body };
 
     var artifact = try acquire(std.testing.allocator, &cache, .{
-        .uri = try repository_acquisition.Uri.parse("http://example.test/package.deb?token=secret"),
+        .uri = try repository_acquisition.Uri.parse("http://example.test/package.deb?bare-secret"),
         .expected_sha256 = digest,
         .expected_size = body.len,
         .policy = testPolicy(),
@@ -297,7 +317,7 @@ test "SHA-256 pin permits HTTP and publishes exact bytes to package CAS" {
     try std.testing.expectEqualStrings(body, artifact.bytes);
     try std.testing.expectEqual(TrustMode.sha256, artifact.provenance.trust_mode);
     try std.testing.expectEqualStrings(
-        "http://example.test/package.deb?token=REDACTED",
+        "http://example.test/package.deb?REDACTED",
         artifact.provenance.effective_uri,
     );
 
@@ -333,6 +353,26 @@ test "unpinned HTTPS records transport trust and enforces an expected size" {
         },
         transport.dependencies(),
     ));
+}
+
+test "unpinned expected-size transfer is capped by package CAS capacity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCacheWithLimit(&tmp, 8);
+    defer cache.deinit();
+    var transport: TestTransport = .{ .body = "123456789" };
+
+    try std.testing.expectError(error.ArtifactTooLarge, acquire(
+        std.testing.allocator,
+        &cache,
+        .{
+            .uri = try repository_acquisition.Uri.parse("https://example.test/package.deb"),
+            .expected_size = 8,
+            .policy = testPolicy(),
+        },
+        transport.dependencies(),
+    ));
+    try std.testing.expectEqual(@as(usize, 8), transport.maximum_response_bytes);
 }
 
 test "pinned digest mismatch is not published" {
