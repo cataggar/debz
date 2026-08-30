@@ -30,6 +30,21 @@ pub const SelectedPackage = struct {
         return checked(repository, origin, repository_base_uri);
     }
 
+    pub fn fromTaggedSolverSelection(
+        repository: solver.RepositoryInput,
+        origin: solver.TaggedPackageOrigin,
+        repository_base_uri: acquisition.Uri,
+    ) TaggedSelectionError!SelectedPackage {
+        return switch (origin) {
+            .authenticated_repository => |selected| fromSolverSelection(
+                repository,
+                selected,
+                repository_base_uri,
+            ),
+            .local_artifact => error.LocalArtifactRequiresDedicatedAcquisition,
+        };
+    }
+
     /// Test-only trust boundary, matching `SolverRepositoryInput.trustedTest`.
     pub fn fromTrustedTest(
         repository: solver.RepositoryInput,
@@ -40,9 +55,24 @@ pub const SelectedPackage = struct {
         return checked(repository, origin, repository_base_uri);
     }
 
+    pub fn fromTaggedTrustedTest(
+        repository: solver.RepositoryInput,
+        origin: solver.TaggedPackageOrigin,
+        repository_base_uri: acquisition.Uri,
+    ) TaggedSelectionError!SelectedPackage {
+        return switch (origin) {
+            .authenticated_repository => |selected| fromTrustedTest(
+                repository,
+                selected,
+                repository_base_uri,
+            ),
+            .local_artifact => error.LocalArtifactRequiresDedicatedAcquisition,
+        };
+    }
+
     fn checked(
         repository: solver.RepositoryInput,
-        origin: solver.PackageOrigin,
+        origin: solver.AuthenticatedRepositoryPackageOrigin,
         repository_base_uri: acquisition.Uri,
     ) SelectionError!SelectedPackage {
         if (!std.mem.eql(u8, repository.repository_id.slice(), origin.repository_id.slice()) or
@@ -72,6 +102,9 @@ pub const SelectionError = error{
     UnsupportedScheme,
     CredentialBearingBaseUri,
     InvalidBaseUri,
+};
+pub const TaggedSelectionError = SelectionError || error{
+    LocalArtifactRequiresDedicatedAcquisition,
 };
 
 pub const Mode = enum { online, cache_only };
@@ -837,6 +870,30 @@ test "authenticated solver selection rejects untrusted and conflicting provenanc
         selection.origin,
         try acquisition.Uri.parse("https://user:secret@packages.example/repository"),
     ));
+    const record = selection.index.records[0];
+    const local: solver.TaggedPackageOrigin = .{ .local_artifact = .{
+        .evidence = .{
+            .artifact_id = selection.repository.repository_id.bytes,
+            .sha256 = record.transport.sha256.bytes,
+            .size = record.transport.size.value,
+            .package = record.control.package.text,
+            .version = record.control.version.value.original,
+            .architecture = record.control.architecture.text,
+            .acquisition_url = "https://packages.example/local.deb",
+            .trust_mode = .verified_https,
+        },
+        .solver_priority = selection.repository.priority,
+        .record_index = 0,
+        .source_location = record.location.source,
+    } };
+    try std.testing.expectError(
+        error.LocalArtifactRequiresDedicatedAcquisition,
+        SelectedPackage.fromTaggedTrustedTest(
+            selection.repository,
+            local,
+            try acquisition.Uri.parse("https://packages.example/repository"),
+        ),
+    );
 }
 
 test "package_acquisition.test.exact lock rejects repository and artifact substitution" {

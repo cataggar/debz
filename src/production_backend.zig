@@ -379,7 +379,7 @@ pub const Backend = struct {
             verified.deinit(allocator);
         }
         for (plan.actions) |action| {
-            const origin = action.selected_origin orelse continue;
+            const origin = try authenticatedPackageOrigin(action.selected_origin_v2 orelse continue);
             const repository_input = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
                 return error.MissingRepository;
             const normalized_repository = findNormalized(configuration.repositories, origin.repository_id) orelse
@@ -1199,7 +1199,7 @@ fn lockFromPlan(
     defer repository_ids.deinit(allocator);
 
     for (plan.actions) |action| {
-        const origin = action.selected_origin orelse continue;
+        const origin = try authenticatedPackageOrigin(action.selected_origin_v2 orelse continue);
         const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
             return error.MissingRepository;
         const record = repository.packages.records[origin.record_index];
@@ -1333,15 +1333,15 @@ fn findRetainedOrigin(
     name: []const u8,
     version: []const u8,
     architecture: []const u8,
-) ?solver.PackageOrigin {
-    var best: ?solver.PackageOrigin = null;
+) ?solver.AuthenticatedRepositoryPackageOrigin {
+    var best: ?solver.AuthenticatedRepositoryPackageOrigin = null;
     for (repositories) |repository| {
         for (repository.packages.records, 0..) |record, index| {
             if (!std.mem.eql(u8, record.control.package.text, name) or
                 !std.mem.eql(u8, record.control.version.value.original, version) or
                 !std.mem.eql(u8, record.control.architecture.text, architecture))
                 continue;
-            const candidate: solver.PackageOrigin = .{
+            const candidate: solver.AuthenticatedRepositoryPackageOrigin = .{
                 .repository_id = repository.repository_id,
                 .repository_priority = repository.priority,
                 .record_index = index,
@@ -1356,7 +1356,10 @@ fn findRetainedOrigin(
     return best;
 }
 
-fn betterRetainedOrigin(candidate: solver.PackageOrigin, current: solver.PackageOrigin) bool {
+fn betterRetainedOrigin(
+    candidate: solver.AuthenticatedRepositoryPackageOrigin,
+    current: solver.AuthenticatedRepositoryPackageOrigin,
+) bool {
     if (candidate.repository_priority != current.repository_priority)
         return candidate.repository_priority > current.repository_priority;
     return std.mem.order(
@@ -1575,6 +1578,15 @@ fn findRepositoryInput(
     for (repositories) |repository|
         if (std.mem.eql(u8, repository.repository_id.slice(), id.slice())) return repository;
     return null;
+}
+
+fn authenticatedPackageOrigin(
+    origin: solver.TaggedPackageOrigin,
+) !solver.AuthenticatedRepositoryPackageOrigin {
+    return switch (origin) {
+        .authenticated_repository => |repository| repository,
+        .local_artifact => error.UnsupportedLocalArtifactOrigin,
+    };
 }
 
 fn findNormalized(

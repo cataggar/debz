@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/transaction-plan-v3.json",
+  "title": "debz deterministic transaction planning result v3",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["schema_version", "target_architecture", "mode", "actions", "ordered_actions", "summary", "download_bytes", "installed_size_delta_bytes"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "target_architecture": { "type": "string" },
+        "mode": { "enum": ["plan_only", "download_only"] },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } },
+        "ordered_actions": { "type": "array", "items": { "$ref": "#/$defs/ordered_action" } },
+        "summary": { "$ref": "#/$defs/summary" },
+        "download_bytes": { "type": "integer", "minimum": 0 },
+        "installed_size_delta_bytes": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema_version", "problems"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "problems": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/problem" } }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "architecture"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 }
+      }
+    },
+    "repositoryOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "priority"],
+      "properties": {
+        "type": { "const": "authenticated_repository" },
+        "id": { "$ref": "#/$defs/sha256" },
+        "priority": { "type": "integer" }
+      }
+    },
+    "localOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "artifact_id", "sha256", "size", "package", "acquisition_url", "trust_mode", "solver_priority"],
+      "properties": {
+        "type": { "const": "local_artifact" },
+        "artifact_id": { "$ref": "#/$defs/sha256" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "package": { "$ref": "#/$defs/identity" },
+        "acquisition_url": { "type": "string", "minLength": 1 },
+        "trust_mode": { "enum": ["pinned_sha256", "verified_https"] },
+        "solver_priority": { "type": "integer" }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["kind", "package", "version", "architecture", "origin", "sha256", "package_size", "installed_size_delta_bytes", "source_package", "prior_installed", "requested", "reason", "essential", "has_pre_depends"],
+      "properties": {
+        "kind": { "enum": ["install", "remove", "upgrade", "downgrade", "reinstall"] },
+        "package": { "type": "string" },
+        "version": { "type": "string" },
+        "architecture": { "type": "string" },
+        "origin": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/repositoryOrigin" },
+            { "$ref": "#/$defs/localOrigin" }
+          ]
+        },
+        "sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "package_size": { "type": ["integer", "null"], "minimum": 0 },
+        "installed_size_delta_bytes": { "type": "integer" },
+        "source_package": { "type": "string" },
+        "prior_installed": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["package", "version", "architecture", "installed_size_kib"],
+              "properties": {
+                "package": { "type": "string" },
+                "version": { "type": "string" },
+                "architecture": { "type": "string" },
+                "installed_size_kib": { "type": ["integer", "null"], "minimum": 0 }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "requested": { "type": "boolean" },
+        "reason": { "enum": ["explicit_request", "dependency", "recommends", "replacement", "upgrade"] },
+        "essential": { "type": "boolean" },
+        "has_pre_depends": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "ordered_action": {
+      "type": "object",
+      "required": ["sequence", "kind", "package", "version", "architecture"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "kind": { "enum": ["bootstrap_extract", "remove", "unpack", "configure_pending"] },
+        "package": { "type": "string" },
+        "version": { "type": "string" },
+        "architecture": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": ["installs", "removals", "upgrades", "downgrades", "reinstalls", "download_bytes", "installed_size_delta_bytes"],
+      "properties": {
+        "installs": { "type": "integer", "minimum": 0 },
+        "removals": { "type": "integer", "minimum": 0 },
+        "upgrades": { "type": "integer", "minimum": 0 },
+        "downgrades": { "type": "integer", "minimum": 0 },
+        "reinstalls": { "type": "integer", "minimum": 0 },
+        "download_bytes": { "type": "integer", "minimum": 0 },
+        "installed_size_delta_bytes": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "problem": {
+      "type": "object",
+      "required": ["id", "kind", "package", "dependency", "detail", "candidate_rejections", "related_problem_ids"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 0 },
+        "kind": { "type": "string", "minLength": 1 },
+        "package": { "type": ["string", "null"] },
+        "dependency": { "type": ["string", "null"] },
+        "detail": { "type": "string" },
+        "candidate_rejections": { "type": "array" },
+        "related_problem_ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

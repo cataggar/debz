@@ -484,7 +484,7 @@ pub const VerifyDiagnostic = struct {
         return self.buffer[0..self.len];
     }
 
-    fn note(self: *VerifyDiagnostic, comptime fmt: []const u8, args: anytype) void {
+    pub fn note(self: *VerifyDiagnostic, comptime fmt: []const u8, args: anytype) void {
         const rendered = std.fmt.bufPrint(&self.buffer, fmt, args) catch {
             self.len = 0;
             return;
@@ -637,7 +637,7 @@ fn secretAssignment(value: []const u8, start: usize) ?Assignment {
     return null;
 }
 
-fn secretName(name: []const u8) bool {
+pub fn secretName(name: []const u8) bool {
     const secrets = [_][]const u8{ "authorization", "proxy-authorization", "token", "password", "http_proxy", "https_proxy", "apt_auth_conf" };
     for (secrets) |secret| if (std.ascii.eqlIgnoreCase(name, secret)) return true;
     return false;

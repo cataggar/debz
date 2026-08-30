@@ -25,7 +25,9 @@ const archive_corpus = &.{
 };
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
+    @embedFile("corpus/state/lock-v2.json"),
     @embedFile("corpus/state/provenance.json"),
+    @embedFile("corpus/state/provenance-v2.json"),
     @embedFile("corpus/state/journal"),
 };
 
@@ -363,7 +365,15 @@ fn exerciseState(bytes: []const u8) !void {
         var lock = value;
         lock.deinit();
     } else |_| {}
+    if (debz.exact_lock_v2.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var lock = value;
+        lock.deinit();
+    } else |_| {}
     if (debz.transaction_provenance.validateDocument(std.testing.allocator, bytes, max_input)) |value| {
+        var document = value;
+        document.deinit();
+    } else |_| {}
+    if (debz.transaction_provenance_v2.validateDocument(std.testing.allocator, bytes, max_input)) |value| {
         var document = value;
         document.deinit();
     } else |_| {}

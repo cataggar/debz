@@ -39,3 +39,26 @@ test "public package supplies source-built compression dependencies" {
         try std.testing.expectEqualStrings(plain, output);
     }
 }
+
+test "repository package origin remains source compatible beside tagged v2 origin" {
+    const repository_id: debz.source.RepositoryId = .{ .bytes = @splat('a') };
+    const legacy: debz.SolverPackageOrigin = .{
+        .repository_id = repository_id,
+        .repository_priority = 500,
+        .record_index = 3,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .source_location = "pool/demo.deb",
+    };
+    const tagged: debz.SolverPackageOriginV2 = .{
+        .authenticated_repository = legacy,
+    };
+    try std.testing.expectEqualStrings("demo", legacy.package);
+    try std.testing.expectEqualStrings(
+        "demo",
+        tagged.authenticated_repository.package,
+    );
+    _ = debz.PackageSelectedRecord.fromSolverSelection;
+    _ = debz.PackageSelectedRecord.fromTaggedSolverSelection;
+}

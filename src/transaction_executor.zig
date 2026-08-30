@@ -4,6 +4,8 @@ const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
+const package_origin = @import("package_origin.zig");
 
 pub const Phase = enum { bootstrap_extract, remove, unpack, configure_pending, configure, triggers, audit };
 pub const ConffilePolicy = enum { keep_existing, use_package_version };
@@ -52,6 +54,7 @@ pub const Request = struct {
     artifacts: []const Artifact,
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
+    exact_lock_v2: ?*const exact_lock_v2.Lock = null,
 };
 
 pub const EnvironmentEntry = struct {
@@ -251,6 +254,7 @@ pub const RecoveryRequest = struct {
     install_root: []const u8,
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
+    exact_lock_v2: ?*const exact_lock_v2.Lock = null,
 };
 
 pub const RecoveryReport = struct {
@@ -301,7 +305,12 @@ pub fn execute(
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
-    state.lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
+    state.lock_sha256 = if (request.exact_lock) |lock|
+        lock.digest_sha256
+    else if (request.exact_lock_v2) |lock|
+        lock.digest_sha256
+    else
+        null;
 
     preflight(arena, request, dependencies.filesystem) catch |err| {
         state.failure = .{
@@ -711,7 +720,7 @@ pub fn execute(
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist verification boundary");
         return finish(allocator, arena_ptr, &state, plan_sha256);
     };
-    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status) catch |err| {
+    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status) catch |err| {
         journal.state = .verification_failed;
         journal.failure = @errorName(err);
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -771,7 +780,12 @@ pub fn recover(
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
-    state.lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
+    state.lock_sha256 = if (request.exact_lock) |lock|
+        lock.digest_sha256
+    else if (request.exact_lock_v2) |lock|
+        lock.digest_sha256
+    else
+        null;
 
     preflight(arena, .{
         .plan = request.plan,
@@ -779,6 +793,7 @@ pub fn recover(
         .artifacts = &.{},
         .policy = request.policy,
         .exact_lock = request.exact_lock,
+        .exact_lock_v2 = request.exact_lock_v2,
     }, dependencies.filesystem) catch |err| {
         // Recovery does not need package artifacts, so only retain root, plan,
         // and policy validation errors from the shared preflight.
@@ -838,7 +853,7 @@ pub fn recover(
             state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
-        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status);
+        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
         if (!verification.succeeded()) {
             journal.state = .verification_failed;
             journal.failure = @tagName(verification.failure.?);
@@ -979,7 +994,7 @@ pub fn recover(
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
 
-    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.install_root, dependencies.status);
+    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
     if (!verification.succeeded()) {
         journal.state = .verification_failed;
         journal.failure = @tagName(verification.failure.?);
@@ -1050,11 +1065,23 @@ fn verifyFinal(
     allocator: std.mem.Allocator,
     plan: solver.Plan,
     lock: ?*const exact_lock.Lock,
+    lock_v2: ?*const exact_lock_v2.Lock,
+    journal: recovery.Journal,
     root: []const u8,
     status: recovery.StatusReader,
 ) !recovery.Verification {
     if (lock) |closure|
         return recovery.verifyExactLock(allocator, closure.*, root, status, 64 * 1024 * 1024);
+    if (lock_v2) |closure|
+        return recovery.verifyExactLockV2WithEvidence(
+            allocator,
+            closure.*,
+            plan,
+            journal,
+            root,
+            status,
+            64 * 1024 * 1024,
+        );
     return recovery.verify(allocator, plan, root, status, .{});
 }
 
@@ -1117,10 +1144,13 @@ fn journalFailure(
 fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem) !void {
     try validateRootLexical(request.install_root, request.policy.risk.allow_host_root);
     filesystem.validateRoot(request.install_root) catch return error.UnsafeInstallRoot;
-    if (request.plan.schema_version != 2) return error.UnsupportedPlanVersion;
+    if (request.plan.schema_version != 2 and request.plan.schema_version != 3)
+        return error.UnsupportedPlanVersion;
     if (request.plan.mode != .plan_only) return error.NonExecutablePlanMode;
     if (request.plan.actions.len > 100_000 or request.plan.ordered_actions.len > 300_000)
         return error.PlanTooLarge;
+    if (request.exact_lock != null and request.exact_lock_v2 != null)
+        return error.MultipleExactLocks;
     if (request.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
             return error.LockArchitectureMismatch;
@@ -1132,6 +1162,23 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 return error.MissingAuthenticatedArtifactMetadata;
             const digest = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
             if (!std.mem.eql(u8, &locked.repository_id, &action.repository.?.id) or
+                !std.mem.eql(u8, &locked.sha256, &digest) or
+                locked.declared_size != action.package_size.?)
+                return error.PlanLockEvidenceMismatch;
+        }
+    }
+    if (request.exact_lock_v2) |lock| {
+        if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
+            return error.LockArchitectureMismatch;
+        for (request.plan.actions) |action| {
+            if (action.kind == .remove) continue;
+            const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
+                return error.PlanOutsideLockedClosure;
+            if (action.sha256 == null or action.package_size == null)
+                return error.MissingAuthenticatedArtifactMetadata;
+            const digest = parseHexDigest(action.sha256.?) catch
+                return error.InvalidAuthenticatedDigest;
+            if (!actionMatchesLockV2(action, locked) or
                 !std.mem.eql(u8, &locked.sha256, &digest) or
                 locked.declared_size != action.package_size.?)
                 return error.PlanLockEvidenceMismatch;
@@ -1189,9 +1236,10 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         } else {
             const expected_bootstrap: usize = if (requiresRootBootstrap(request.plan.actions) and action.prior_installed == null) 1 else 0;
             if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
-            if (action.repository == null or action.sha256 == null or action.package_size == null)
+            if (action.sha256 == null or action.package_size == null)
                 return error.MissingAuthenticatedArtifactMetadata;
             _ = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
+            try validateActionOrigin(request.plan.schema_version, action);
         }
     }
     var last_unpack: ?usize = null;
@@ -1222,6 +1270,53 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     _ = arena;
 }
 
+fn validateActionOrigin(schema_version: u32, action: solver.PlanAction) !void {
+    if (schema_version == 2) {
+        if (action.repository == null) return error.MissingAuthenticatedArtifactMetadata;
+        return;
+    }
+    const origin = action.origin orelse return error.MissingPackageOrigin;
+    switch (origin) {
+        .authenticated_repository => |repository| {
+            if (action.repository == null or
+                !std.mem.eql(u8, &action.repository.?.id, &repository.id) or
+                action.repository.?.priority != repository.priority)
+                return error.PackageOriginMismatch;
+        },
+        .local_artifact => |local| {
+            if (action.repository != null) return error.PackageOriginMismatch;
+            package_origin.validateLocalArtifact(local.evidence) catch
+                return error.InvalidLocalArtifactOrigin;
+            const digest = parseHexDigest(action.sha256 orelse
+                return error.MissingAuthenticatedDigest) catch
+                return error.InvalidAuthenticatedDigest;
+            if (!std.mem.eql(u8, action.package, local.evidence.package) or
+                !std.mem.eql(u8, action.version, local.evidence.version) or
+                !std.mem.eql(u8, action.architecture, local.evidence.architecture) or
+                !std.mem.eql(u8, &digest, &local.evidence.sha256) or
+                action.package_size != local.evidence.size)
+                return error.PackageOriginMismatch;
+        },
+    }
+}
+
+fn actionMatchesLockV2(
+    action: solver.PlanAction,
+    locked: exact_lock_v2.Package,
+) bool {
+    const origin = action.origin orelse return false;
+    return switch (locked.origin) {
+        .authenticated_repository => |expected| switch (origin) {
+            .authenticated_repository => |actual| std.mem.eql(u8, &actual.id, &expected.repository_id),
+            .local_artifact => false,
+        },
+        .local_artifact => |expected| switch (origin) {
+            .authenticated_repository => false,
+            .local_artifact => |actual| package_origin.eqlLocalArtifact(actual.evidence, expected),
+        },
+    };
+}
+
 fn validateArtifact(
     allocator: std.mem.Allocator,
     filesystem: FileSystem,
@@ -1240,21 +1335,34 @@ fn validateArtifact(
     std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
     if (!std.mem.eql(u8, &actual, &expected_digest)) return error.DigestMismatch;
 
-    var repository_hex: [64]u8 = @splat('0');
-    if (action.repository) |repository| repository_hex = repository.id;
-    const validation = deb_payload.validate(allocator, bytes, .{
-        .repository = &repository_hex,
-        .package = artifact.package,
-        .version = artifact.version,
-        .architecture = artifact.architecture,
-        .requested_package = action.package,
-        .requested_version = action.version,
-        .requested_architecture = action.architecture,
-        .filename = std.fs.path.basename(artifact.path),
-        .size = expected_size,
-        .sha256 = expected_digest,
-        .require_conventional_filename = false,
-    }, limits);
+    const validation = if (isLocalArtifactAction(action))
+        deb_payload.inspectLocal(allocator, bytes, .{
+            .size = expected_size,
+            .sha256 = expected_digest,
+            .filename = std.fs.path.basename(artifact.path),
+            .identity = .{
+                .package = artifact.package,
+                .version = artifact.version,
+                .architecture = artifact.architecture,
+            },
+        }, limits)
+    else blk: {
+        var repository_hex: [64]u8 = @splat('0');
+        if (action.repository) |repository| repository_hex = repository.id;
+        break :blk deb_payload.validate(allocator, bytes, .{
+            .repository = &repository_hex,
+            .package = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .requested_package = action.package,
+            .requested_version = action.version,
+            .requested_architecture = action.architecture,
+            .filename = std.fs.path.basename(artifact.path),
+            .size = expected_size,
+            .sha256 = expected_digest,
+            .require_conventional_filename = false,
+        }, limits);
+    };
     switch (validation) {
         .diagnostic => |diagnostic| switch (diagnostic.code) {
             .digest_mismatch, .size_mismatch => return error.DigestMismatch,
@@ -1267,6 +1375,14 @@ fn validateArtifact(
         },
     }
     return actual;
+}
+
+fn isLocalArtifactAction(action: solver.PlanAction) bool {
+    const origin = action.origin orelse return false;
+    return switch (origin) {
+        .authenticated_repository => false,
+        .local_artifact => true,
+    };
 }
 
 fn buildArgv(
@@ -1579,6 +1695,7 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
         if (action.repository) |repository| hash.update(&repository.id);
         hash.update("\x00");
+        if (plan.schema_version == 3) hashPlanOrigin(&hash, action.origin);
         if (action.sha256) |digest| hash.update(&digest);
         hash.update("\x00");
         std.mem.writeInt(u64, &number, action.package_size orelse 0, .little);
@@ -1598,6 +1715,48 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
     }
     return hash.finalResult();
+}
+
+fn hashPlanOrigin(
+    hash: *std.crypto.hash.sha2.Sha256,
+    origin: ?solver.PlanOrigin,
+) void {
+    const value = origin orelse {
+        hash.update(&.{0});
+        return;
+    };
+    var number: [8]u8 = undefined;
+    var priority: [4]u8 = undefined;
+    switch (value) {
+        .authenticated_repository => |repository| {
+            hash.update(&.{1});
+            hash.update(&repository.id);
+            std.mem.writeInt(i32, &priority, repository.priority, .little);
+            hash.update(&priority);
+        },
+        .local_artifact => |local| {
+            const evidence = local.evidence;
+            hash.update(&.{2});
+            hash.update(&evidence.artifact_id);
+            hash.update(&evidence.sha256);
+            std.mem.writeInt(u64, &number, evidence.size, .little);
+            hash.update(&number);
+            hashPlanString(hash, evidence.package);
+            hashPlanString(hash, evidence.version);
+            hashPlanString(hash, evidence.architecture);
+            hashPlanString(hash, evidence.acquisition_url);
+            hashPlanString(hash, @tagName(evidence.trust_mode));
+            std.mem.writeInt(i32, &priority, local.solver_priority, .little);
+            hash.update(&priority);
+        },
+    }
+}
+
+fn hashPlanString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(value.len), .little);
+    hash.update(&length);
+    hash.update(value);
 }
 
 fn hashInvocation(argv: []const []const u8, environment: []const EnvironmentEntry) [32]u8 {
@@ -2289,6 +2448,111 @@ fn testRemoveAction(package: []const u8) solver.PlanAction {
         .reason = .explicit_request,
         .selected_origin = null,
     };
+}
+
+test "transaction_executor.test.local artifact preflight and reread require exact origin evidence" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var action = testInstallAction(bytes, "demo");
+    action.repository = null;
+    const digest = try parseHexDigest(action.sha256.?);
+    const artifact_evidence: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = bytes.len,
+        .package = action.package,
+        .version = action.version,
+        .architecture = action.architecture,
+        .acquisition_url = "file:///cache/demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    action.origin = .{ .local_artifact = .{
+        .evidence = artifact_evidence,
+        .solver_priority = 1000,
+    } };
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var actions = [_]solver.PlanAction{action};
+    var plan = testPlan(&actions, &ordered);
+    plan.schema_version = 3;
+    var harness: TestHarness = .{ .bytes = bytes };
+    const artifact: Artifact = .{
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .path = "/cache/demo.deb",
+    };
+    try preflight(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies().filesystem);
+    const reread = try validateArtifact(
+        std.testing.allocator,
+        harness.dependencies().filesystem,
+        artifact,
+        action,
+        .{},
+    );
+    try std.testing.expectEqualSlices(u8, &digest, &reread);
+
+    const locked_package: exact_lock_v2.Package = .{
+        .name = artifact_evidence.package,
+        .version = artifact_evidence.version,
+        .architecture = artifact_evidence.architecture,
+        .origin = .{ .local_artifact = artifact_evidence },
+        .sha256 = artifact_evidence.sha256,
+        .declared_size = artifact_evidence.size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{artifact_evidence},
+        .packages = &.{locked_package},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    try preflight(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v2 = &lock.lock,
+    }, harness.dependencies().filesystem);
+
+    actions[0].origin.?.local_artifact.evidence.acquisition_url =
+        "file:///cache/substituted.deb";
+    try std.testing.expectError(error.PlanLockEvidenceMismatch, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{artifact},
+            .policy = .{ .conffile = .keep_existing },
+            .exact_lock_v2 = &lock.lock,
+        },
+        harness.dependencies().filesystem,
+    ));
+    actions[0].origin.?.local_artifact.evidence.acquisition_url =
+        artifact_evidence.acquisition_url;
+    actions[0].package_size.? += 1;
+    try std.testing.expectError(error.PackageOriginMismatch, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{artifact},
+            .policy = .{ .conffile = .keep_existing },
+        },
+        harness.dependencies().filesystem,
+    ));
 }
 
 fn testDeb(allocator: std.mem.Allocator) ![]u8 {
@@ -3132,4 +3396,143 @@ test "transaction_executor.test.system lock manager provisions missing debz stat
 
     var provisioned = try directory.dir.openDir(std.testing.io, "root/var/lib/debz", .{ .follow_symlinks = false });
     provisioned.close(std.testing.io);
+}
+
+test "transaction_executor.test.schema v2 plan hash and interrupted journal remain compatible" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    const released_plan_sha256 = try parseHexDigest(
+        "169c8fb07908a3e3fdcd626c950d5033ed32be2238ea658b66223e46ae0621c5".*,
+    );
+    try std.testing.expectEqual(@as(u32, 2), plan.schema_version);
+    try std.testing.expectEqualSlices(u8, &released_plan_sha256, &hashPlan(plan));
+
+    const policy: Policy = .{ .conffile = .keep_existing };
+    const journal: recovery.Journal = .{
+        .state = .interrupted,
+        .boundary = .before_command,
+        .plan_sha256 = released_plan_sha256,
+        .root_identity = recovery.rootIdentity("/target"),
+        .policy_sha256 = hashPolicy(policy),
+        .next_command = 0,
+        .commands = &.{},
+        .failure = "released v0.2.0 interruption",
+    };
+    const fixture = try recovery.encode(std.testing.allocator, journal);
+    defer std.testing.allocator.free(fixture);
+    var harness: TestHarness = .{ .bytes = "", .status_source = "" };
+    try TestHarness.writeJournal(&harness, "/target", fixture);
+
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = policy,
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expect(report.succeeded());
+    try std.testing.expectEqualSlices(u8, &released_plan_sha256, &report.plan_sha256);
+    try std.testing.expect(harness.journal_archived);
+}
+
+test "transaction_executor.test.plan hash binds every tagged local origin field" {
+    const digest: [32]u8 = @splat(0x11);
+    const evidence: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = 17,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    var actions = [_]solver.PlanAction{.{
+        .kind = .install,
+        .package = evidence.package,
+        .version = evidence.version,
+        .architecture = evidence.architecture,
+        .repository = null,
+        .sha256 = @splat('1'),
+        .package_size = evidence.size,
+        .installed_size_delta_bytes = 0,
+        .source_package = evidence.package,
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+        .origin = .{ .local_artifact = .{
+            .evidence = evidence,
+            .solver_priority = 500,
+        } },
+    }};
+    const plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &.{},
+        .summary = .{ .installs = 1, .download_bytes = evidence.size },
+        .download_bytes = evidence.size,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    const expected = hashPlan(plan);
+    const Mutation = enum {
+        union_tag,
+        artifact_id,
+        sha256,
+        size,
+        package,
+        version,
+        architecture,
+        acquisition_url,
+        trust_mode,
+        solver_priority,
+    };
+    inline for ([_]Mutation{
+        .union_tag,
+        .artifact_id,
+        .sha256,
+        .size,
+        .package,
+        .version,
+        .architecture,
+        .acquisition_url,
+        .trust_mode,
+        .solver_priority,
+    }) |mutation| {
+        var changed_actions = actions;
+        if (mutation == .union_tag) {
+            changed_actions[0].origin = .{ .authenticated_repository = .{
+                .id = @splat('a'),
+                .priority = 500,
+            } };
+        } else {
+            var local = changed_actions[0].origin.?.local_artifact;
+            switch (mutation) {
+                .union_tag => unreachable,
+                .artifact_id => local.evidence.artifact_id = @splat('b'),
+                .sha256 => local.evidence.sha256 = @splat(0x22),
+                .size => local.evidence.size += 1,
+                .package => local.evidence.package = "other",
+                .version => local.evidence.version = "2",
+                .architecture => local.evidence.architecture = "arm64",
+                .acquisition_url => local.evidence.acquisition_url = "file:///other.deb",
+                .trust_mode => local.evidence.trust_mode = .verified_https,
+                .solver_priority => local.solver_priority += 1,
+            }
+            changed_actions[0].origin = .{ .local_artifact = local };
+        }
+        var changed_plan = plan;
+        changed_plan.actions = &changed_actions;
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &expected,
+            &hashPlan(changed_plan),
+        ));
+    }
 }

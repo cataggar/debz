@@ -2,6 +2,8 @@ const std = @import("std");
 const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
+const package_origin = @import("package_origin.zig");
 
 pub const journal_version: u32 = 2;
 pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
@@ -288,6 +290,8 @@ pub const VerificationFailure = enum {
     expected_identity_mismatch,
     removed_package_present,
     unrelated_package,
+    local_origin_evidence_missing,
+    local_origin_evidence_mismatch,
 };
 
 pub const Verification = struct {
@@ -588,6 +592,220 @@ pub fn verifyExactLock(
     return .{};
 }
 
+pub fn verifyExactLockV2(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const verification = try verifyExactLockV2Status(
+        allocator,
+        lock,
+        root,
+        reader,
+        maximum_status_bytes,
+    );
+    if (!verification.succeeded()) return verification;
+    for (lock.packages) |package| switch (package.origin) {
+        .authenticated_repository => {},
+        .local_artifact => return .{
+            .failure = .local_origin_evidence_missing,
+            .package = package.name,
+        },
+    };
+    return verification;
+}
+
+pub fn verifyExactLockV2WithEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const verification = try verifyExactLockV2Status(
+        allocator,
+        lock,
+        root,
+        reader,
+        maximum_status_bytes,
+    );
+    if (!verification.succeeded()) return verification;
+    return verifyExactLockV2LocalEvidence(allocator, lock, plan, journal);
+}
+
+fn verifyExactLockV2Status(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const source = reader.read(allocator, root, maximum_status_bytes) catch
+        return .{ .failure = .status_query_failed };
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return .{ .failure = .status_parse_failed },
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    var installed_count: usize = 0;
+    for (database.database.packages) |package| {
+        if (package.status.requiresRepair())
+            return .{ .failure = .unhealthy_package, .package = package.name.value };
+        if (!package.status.isFullyInstalled()) continue;
+        installed_count += 1;
+        const locked = lock.findIdentity(package.name.value, package.architecture.value) orelse
+            return .{ .failure = .unrelated_package, .package = package.name.value };
+        if (!std.mem.eql(u8, locked.version, package.version.spelling.value))
+            return .{
+                .failure = .expected_identity_mismatch,
+                .package = package.name.value,
+                .expected_version = locked.version,
+                .observed_version = package.version.spelling.value,
+            };
+    }
+    if (installed_count != lock.packages.len) {
+        for (lock.packages) |locked| {
+            const package = database.database.find(locked.name, locked.architecture) orelse
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+            if (!package.status.isFullyInstalled())
+                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+        }
+        return .{ .failure = .expected_package_missing };
+    }
+    return .{};
+}
+
+fn verifyExactLockV2LocalEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+) !Verification {
+    const action_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(action_seen);
+    @memset(action_seen, false);
+    const unpack_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(unpack_seen);
+    @memset(unpack_seen, false);
+
+    var local_package_count: usize = 0;
+    for (lock.packages) |package| switch (package.origin) {
+        .authenticated_repository => {},
+        .local_artifact => local_package_count += 1,
+    };
+    if (local_package_count == 0) return .{};
+    if (plan.schema_version != 3 or
+        !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
+        journal.lock_sha256 == null or
+        !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or
+        journal.next_command > journal.commands.len)
+        return .{ .failure = .local_origin_evidence_mismatch };
+
+    for (plan.actions) |action| {
+        if (action.kind == .remove) continue;
+        const package_index = lock.findPackageIndex(
+            action.package,
+            action.version,
+            action.architecture,
+        ) orelse continue;
+        const locked = lock.packages[package_index];
+        switch (locked.origin) {
+            .authenticated_repository => {},
+            .local_artifact => |expected| {
+                if (action_seen[package_index])
+                    return .{
+                        .failure = .local_origin_evidence_mismatch,
+                        .package = action.package,
+                    };
+                const observed = action.origin orelse
+                    return .{
+                        .failure = .local_origin_evidence_missing,
+                        .package = action.package,
+                    };
+                const local = switch (observed) {
+                    .authenticated_repository => return .{
+                        .failure = .local_origin_evidence_mismatch,
+                        .package = action.package,
+                    },
+                    .local_artifact => |value| value,
+                };
+                const digest_hex = action.sha256 orelse return .{
+                    .failure = .local_origin_evidence_missing,
+                    .package = action.package,
+                };
+                const digest = parseDigest(&digest_hex) catch return .{
+                    .failure = .local_origin_evidence_mismatch,
+                    .package = action.package,
+                };
+                if (!package_origin.eqlLocalArtifact(local.evidence, expected) or
+                    !std.mem.eql(u8, &digest, &expected.sha256) or
+                    action.package_size != expected.size)
+                    return .{
+                        .failure = .local_origin_evidence_mismatch,
+                        .package = action.package,
+                    };
+                action_seen[package_index] = true;
+            },
+        }
+    }
+
+    const completed = @min(journal.next_command, journal.commands.len);
+    for (plan.ordered_actions, 0..) |ordered, command_index| {
+        if (ordered.kind != .unpack or command_index >= completed) continue;
+        const package_index = lock.findPackageIndex(
+            ordered.package,
+            ordered.version,
+            ordered.architecture,
+        ) orelse continue;
+        const locked = lock.packages[package_index];
+        switch (locked.origin) {
+            .authenticated_repository => {},
+            .local_artifact => {
+                if (unpack_seen[package_index])
+                    return .{
+                        .failure = .local_origin_evidence_mismatch,
+                        .package = ordered.package,
+                    };
+                const command = journal.commands[command_index];
+                const command_digest = command.artifact_sha256 orelse
+                    return .{
+                        .failure = .local_origin_evidence_missing,
+                        .package = ordered.package,
+                    };
+                if (!std.mem.eql(u8, command.phase, "unpack") or
+                    command.package == null or
+                    !std.mem.eql(u8, command.package.?, ordered.package) or
+                    !std.mem.eql(u8, &command_digest, &locked.sha256))
+                    return .{
+                        .failure = .local_origin_evidence_mismatch,
+                        .package = ordered.package,
+                    };
+                unpack_seen[package_index] = true;
+            },
+        }
+    }
+
+    var action_count: usize = 0;
+    var unpack_count: usize = 0;
+    for (lock.packages, 0..) |package, index| switch (package.origin) {
+        .authenticated_repository => {},
+        .local_artifact => {
+            action_count += @intFromBool(action_seen[index]);
+            unpack_count += @intFromBool(unpack_seen[index]);
+        },
+    };
+    if (action_count != local_package_count or unpack_count != local_package_count)
+        return .{ .failure = .local_origin_evidence_missing };
+    return .{};
+}
+
 fn findAction(actions: []const solver.PlanAction, package: []const u8, architecture: []const u8) ?solver.PlanAction {
     for (actions) |action| {
         if (std.mem.eql(u8, action.package, package) and std.mem.eql(u8, action.architecture, architecture))
@@ -648,6 +866,184 @@ test "transaction_recovery.test.exact closure verification rejects drift" {
     };
     const mismatch = try verifyExactLock(std.testing.allocator, lock, "/target", drift.interface(), 4096);
     try std.testing.expectEqual(VerificationFailure.expected_identity_mismatch, mismatch.failure.?);
+}
+
+test "transaction_recovery.test.local exact verification requires completed origin evidence" {
+    const digest: [32]u8 = @splat(0x11);
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = 17,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    const package: exact_lock_v2.Package = .{
+        .name = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .origin = .{ .local_artifact = artifact },
+        .sha256 = artifact.sha256,
+        .declared_size = artifact.size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    const lock: exact_lock_v2.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{artifact},
+        .packages = &.{package},
+        .digest_sha256 = @splat(3),
+    };
+    var actions = [_]solver.PlanAction{.{
+        .kind = .reinstall,
+        .package = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .repository = null,
+        .sha256 = @splat('1'),
+        .package_size = artifact.size,
+        .installed_size_delta_bytes = 0,
+        .source_package = artifact.package,
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+        .selected_origin_v2 = .{ .local_artifact = .{
+            .evidence = artifact,
+            .solver_priority = 500,
+            .record_index = 0,
+            .source_location = artifact.acquisition_url,
+        } },
+        .origin = .{ .local_artifact = .{
+            .evidence = artifact,
+            .solver_priority = 500,
+        } },
+    }};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .unpack,
+        .package = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+    }};
+    const plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &ordered,
+        .summary = .{ .reinstalls = 1, .download_bytes = artifact.size },
+        .download_bytes = artifact.size,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    var commands = [_]Command{.{
+        .phase = "unpack",
+        .package = artifact.package,
+        .command_sha256 = @splat(4),
+        .artifact_sha256 = artifact.sha256,
+    }};
+    var journal: Journal = .{
+        .state = .complete,
+        .boundary = .verifying,
+        .plan_sha256 = @splat(5),
+        .root_identity = @splat(6),
+        .policy_sha256 = @splat(7),
+        .lock_sha256 = lock.digest_sha256,
+        .next_command = 1,
+        .commands = &commands,
+    };
+    var status: TestStatusReader = .{
+        .source = "Package: demo\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n",
+    };
+    const weak = try verifyExactLockV2(
+        std.testing.allocator,
+        lock,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    try std.testing.expectEqual(
+        VerificationFailure.local_origin_evidence_missing,
+        weak.failure.?,
+    );
+    try std.testing.expect((try verifyExactLockV2WithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    )).succeeded());
+
+    actions[0].package_size = artifact.size + 1;
+    try std.testing.expectEqual(
+        VerificationFailure.local_origin_evidence_mismatch,
+        (try verifyExactLockV2WithEvidence(
+            std.testing.allocator,
+            lock,
+            plan,
+            journal,
+            "/target",
+            status.interface(),
+            4096,
+        )).failure.?,
+    );
+    actions[0].package_size = artifact.size;
+    actions[0].origin = .{ .authenticated_repository = .{
+        .id = @splat('a'),
+        .priority = 500,
+    } };
+    try std.testing.expectEqual(
+        VerificationFailure.local_origin_evidence_mismatch,
+        (try verifyExactLockV2WithEvidence(
+            std.testing.allocator,
+            lock,
+            plan,
+            journal,
+            "/target",
+            status.interface(),
+            4096,
+        )).failure.?,
+    );
+    actions[0].origin = .{ .local_artifact = .{
+        .evidence = artifact,
+        .solver_priority = 500,
+    } };
+    commands[0].artifact_sha256 = @splat(0x22);
+    try std.testing.expectEqual(
+        VerificationFailure.local_origin_evidence_mismatch,
+        (try verifyExactLockV2WithEvidence(
+            std.testing.allocator,
+            lock,
+            plan,
+            journal,
+            "/target",
+            status.interface(),
+            4096,
+        )).failure.?,
+    );
+    commands[0].artifact_sha256 = artifact.sha256;
+    journal.next_command = 0;
+    try std.testing.expectEqual(
+        VerificationFailure.local_origin_evidence_missing,
+        (try verifyExactLockV2WithEvidence(
+            std.testing.allocator,
+            lock,
+            plan,
+            journal,
+            "/target",
+            status.interface(),
+            4096,
+        )).failure.?,
+    );
 }
 
 fn writeDigest(writer: anytype, name: []const u8, digest: [32]u8) !void {

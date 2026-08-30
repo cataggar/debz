@@ -39,8 +39,20 @@ fi
 
 test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
-test -f "$release_prefix/share/debz/schema/apt-config-snapshot-v1.json"
-test -f "$release_prefix/share/doc/debz/schema/apt-config-snapshot-v1.json"
+for schema in \
+  apt-config-snapshot-v1.json \
+  command-result-v1.json \
+  exact-closure-lock-v1.json \
+  exact-closure-lock-v2.json \
+  transaction-plan-v1.json \
+  transaction-plan-v2.json \
+  transaction-plan-v3.json \
+  transaction-result-v1.json \
+  transaction-result-v2.json
+do
+  test -f "$release_prefix/share/debz/schema/$schema"
+  test -f "$release_prefix/share/doc/debz/schema/$schema"
+done
 test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
 python3 - "$release_prefix/share/debz/runtime-dependencies.json" <<'PY'
 import json

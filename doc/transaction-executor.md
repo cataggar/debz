@@ -1,6 +1,6 @@
 # Dpkg transaction executor
 
-`debz.executeTransaction` executes an owned schema-v2 solver plan against one
+`debz.executeTransaction` executes an owned schema-v2 or schema-v3 solver plan against one
 explicit absolute install root. Host root (`/`) is denied unless
 `RiskPolicy.allow_host_root` is explicitly enabled. The production filesystem
 adapter rejects symlinks in every root and artifact-path component.
@@ -17,7 +17,23 @@ retains its transaction lock and the frontend lock, with
 
 Each cached archive is reread immediately before its bootstrap-extract or unpack command. Size,
 SHA-256, outer archive, payload paths, control identity, requested identity,
-scripts, and conffiles are revalidated with `deb_payload.validate`.
+scripts, and conffiles are revalidated with `deb_payload.validate` for
+repository packages or `deb_payload.inspectLocal` for tagged local artifacts.
+Every install-like action requires an exact SHA-256 and size. Origin checks
+branch explicitly between authenticated repository identity and local artifact
+ID, acquisition URL, trust mode, digest, size, and control identity.
+An exact-lock-v2 local package is always replayed from its locked artifact when
+dpkg status alone is the only installed-state evidence. Final execution and
+recovery verification require a completed unpack journal entry with that
+artifact digest and an exact plan-origin/size match; matching dpkg identity
+alone is insufficient.
+
+Schema-v2 recovery journals retain the released plan-digest algorithm so
+interrupted repository-only transactions remain recoverable after an upgrade.
+For schema-v3 plans, the recovery journal's plan digest additionally binds the
+complete tagged origin of every archive-producing action, including the union
+tag, artifact ID, SHA-256, size, package identity, acquisition URL, trust mode,
+and solver priority.
 
 For a new root, the authenticated closure containing absent Essential packages
 receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before
