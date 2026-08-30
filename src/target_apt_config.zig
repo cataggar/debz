@@ -274,15 +274,22 @@ pub const Snapshot = struct {
     ) !RuntimeTrust {
         var keyrings: std.ArrayList(openpgp.Keyring) = .empty;
         errdefer keyrings.deinit(allocator);
+        var seen_paths = std.StringHashMap(void).init(allocator);
+        defer seen_paths.deinit();
         if (repository.signed_by.len == 0) {
             for (self.keyring_materials) |material| {
-                if (material.use == .global or material.use == .declared_and_global)
-                    try keyrings.append(allocator, .{ .bytes = material.bytes });
+                if (material.use != .global and material.use != .declared_and_global)
+                    continue;
+                if (seen_paths.contains(material.logical_path)) continue;
+                try seen_paths.put(material.logical_path, {});
+                try keyrings.append(allocator, .{ .bytes = material.bytes });
             }
         } else {
             for (repository.signed_by) |logical_path| {
+                if (seen_paths.contains(logical_path)) continue;
                 const material = self.findKeyring(logical_path) orelse
                     return error.MissingKeyring;
+                try seen_paths.put(logical_path, {});
                 try keyrings.append(allocator, .{ .bytes = material.bytes });
             }
         }
@@ -1279,7 +1286,7 @@ pub const ProductionFileSystem = struct {
         var parent = openLogicalDirectory(self, parent_path) catch |err|
             return mapDirectoryOpenError(err);
         defer parent.close(self.io);
-        const kind = try findEntryKind(self.io, parent, leaf);
+        const kind = try statEntryKind(self.io, parent, leaf);
         switch (kind) {
             .regular => {},
             .symlink => return error.Symlink,
@@ -1325,7 +1332,7 @@ pub const ProductionFileSystem = struct {
         var parent = openLogicalDirectory(self, parent_path) catch |err|
             return mapDirectoryOpenError(err);
         defer parent.close(self.io);
-        const kind = try findEntryKind(self.io, parent, leaf);
+        const kind = try statEntryKind(self.io, parent, leaf);
         switch (kind) {
             .directory => {},
             .symlink => return error.Symlink,
@@ -1388,18 +1395,26 @@ pub const ProductionFileSystem = struct {
         return current;
     }
 
-    fn findEntryKind(io: std.Io, directory: std.Io.Dir, leaf: []const u8) !EntryKind {
-        var iterator = directory.iterate();
-        while (try iterator.next(io)) |entry| {
-            if (!std.mem.eql(u8, entry.name, leaf)) continue;
-            return switch (entry.kind) {
-                .file => .regular,
-                .directory => .directory,
-                .sym_link => .symlink,
-                else => .other,
-            };
-        }
-        return error.FileNotFound;
+    fn statEntryKind(io: std.Io, directory: std.Io.Dir, leaf: []const u8) !EntryKind {
+        var entry = directory.openFile(io, leaf, .{
+            .mode = .read_only,
+            .allow_directory = true,
+            .path_only = true,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.SymLinkLoop => return .symlink,
+            else => return err,
+        };
+        defer entry.close(io);
+        const stat = try entry.stat(io);
+        return switch (stat.kind) {
+            .file => .regular,
+            .directory => .directory,
+            .sym_link => .symlink,
+            else => .other,
+        };
     }
 
     fn mapDirectoryOpenError(err: anyerror) anyerror {
@@ -2078,6 +2093,144 @@ test "target_apt_config enforces aggregate keyring material bounds" {
             .keyring = .{ .max_keys = single_totals.keys * 2 - 1 },
         },
     }));
+}
+
+test "target_apt_config runtime trust deduplicates repeated declared keyrings" {
+    var single_totals: openpgp.KeyringInspectionTotals = .{};
+    var single = try openpgp.inspectKeyringWithTotals(
+        std.testing.allocator,
+        &test_fixture.keyring,
+        .{},
+        &single_totals,
+    );
+    single.deinit(std.testing.allocator);
+
+    var source_bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source_bytes.deinit();
+    try source_bytes.writer.writeAll(
+        "Types: deb\n" ++
+            "URIs: https://repeated.invalid\n" ++
+            "Suites: stable\n" ++
+            "Components: main\n" ++
+            "Signed-By:",
+    );
+    for (0..32) |_| try source_bytes.writer.writeAll(" /keyrings/shared.gpg");
+    try source_bytes.writer.writeByte('\n');
+    const source_document = try source_bytes.toOwnedSlice();
+    defer std.testing.allocator.free(source_document);
+
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.createDirPath(std.testing.io, "root/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/repeated.sources",
+        .data = source_document,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/keyrings/shared.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{
+            .max_keyrings = 1,
+            .max_keyring_material_bytes = test_fixture.keyring.len,
+            .keyring = .{
+                .max_keyring_bytes = test_fixture.keyring.len,
+                .max_packets = single_totals.packets,
+                .max_keys = single_totals.keys,
+            },
+        },
+    });
+    defer imported.deinit();
+    const repository = imported.configuration.repositories[0];
+    try std.testing.expectEqual(@as(usize, 32), repository.signed_by.len);
+    var trust = try imported.runtimeTrust(std.testing.allocator, repository);
+    defer trust.deinit();
+    try std.testing.expectEqual(@as(usize, 32), trust.declared_keyrings.len);
+    try std.testing.expectEqual(@as(usize, 1), trust.keyrings.len);
+
+    const authentication = trust.authentication(test_fixture.created + 30).in_release;
+    var verified = try openpgp.verify(std.testing.allocator, .{
+        .io = std.testing.io,
+        .signed_bytes = &test_fixture.message,
+        .signatures = &.{&test_fixture.signature},
+        .keyrings = authentication.keyrings,
+        .policy = .{ .verification_time = authentication.verification_time },
+        .limits = authentication.verifier_limits,
+    });
+    defer verified.deinit(std.testing.allocator);
+    try std.testing.expect(verified == .accepted);
+}
+
+test "target_apt_config specific reads do not scan oversized parent directories" {
+    var source_bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source_bytes.deinit();
+    try source_bytes.writer.writeAll(
+        "Types: deb\n" ++
+            "URIs: https://specific.invalid\n" ++
+            "Suites: stable\n" ++
+            "Components: main\n" ++
+            "Signed-By:",
+    );
+    for (0..8) |index| {
+        try source_bytes.writer.print(" /keyrings/key{}.gpg", .{index});
+    }
+    try source_bytes.writer.writeByte('\n');
+    const source_document = try source_bytes.toOwnedSlice();
+    defer std.testing.allocator.free(source_document);
+
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.createDirPath(std.testing.io, "root/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/specific.sources",
+        .data = source_document,
+    });
+    for (0..64) |index| {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "root/keyrings/unrelated-{}",
+            .{index},
+        );
+        defer std.testing.allocator.free(path);
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = path,
+            .data = "",
+        });
+    }
+    for (0..8) |index| {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "root/keyrings/key{}.gpg",
+            .{index},
+        );
+        defer std.testing.allocator.free(path);
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = path,
+            .data = &test_fixture.keyring,
+        });
+    }
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+        .limits = .{ .max_directory_entries = 2 },
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(@as(usize, 8), imported.keyring_materials.len);
 }
 
 test "target_apt_config bounds unique keyring candidates while deduplicating repeats" {

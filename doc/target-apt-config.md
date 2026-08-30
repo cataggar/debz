@@ -21,7 +21,8 @@ Unrelated directory entries are excluded deterministically and recorded with a
 reason. Eligible symlinks, directories, special files, traversing paths, and
 malformed sources fail explicitly. The production adapter opens the selected
 root, every parent, and every file without following symlinks and resolves file
-reads beneath their opened parent.
+reads beneath their opened parent. Specific-file classification uses a direct
+no-follow path-only open and stat rather than scanning the parent directory.
 
 Source fragments follow APT's basename grammar before extension matching:
 ASCII letters, digits, underscore, hyphen, and period only. Names containing
@@ -58,10 +59,11 @@ Those exact verifier limits are carried into runtime authentication, so every
 accepted snapshot remains usable by the runtime verifier.
 
 `Snapshot.runtimeTrust` constructs `openpgp_verifier.Keyring.bytes` values from
-the imported bytes. It separately returns the repository's logical
-`declared_keyrings`, so `repository_policy` runtime matching remains bound to
-the original `Signed-By` values. Sources without `Signed-By` receive only the
-enumerated global keyrings, and the manifest marks global-trust compatibility.
+the imported bytes. Repeated logical paths contribute only one authentication
+keyring, while the original `declared_keyrings` sequence is preserved so
+`repository_policy` runtime matching remains bound to the exact normalized
+`Signed-By` declaration. Sources without `Signed-By` receive only the enumerated
+global keyrings, and the manifest marks global-trust compatibility.
 
 ## Architecture and manifest
 
