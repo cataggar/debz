@@ -33,6 +33,10 @@ work. Help flags take precedence over other command arguments wherever they
 appear. The `package-family-capabilities` metadata command follows the same
 help contract. Positional `help` is not a command or alias.
 
+Version `0.3.0` replaces the `debz --version` flag with the `debz version`
+subcommand. The removed flag is rejected as an unknown command rather than
+retained as a compatibility alias.
+
 Inputs are explicit: `--source`, `--config`, `--keyring`, `--status-path`,
 `--default-release`,
 `--repository-policy`, `--lock-input`, `--lock-output`, `--offline`,

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 import io
 import json
 import lzma
@@ -19,7 +18,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import uuid
 import zlib
 
 PLATFORMS = ("linux-x64", "linux-arm64")
@@ -59,31 +57,11 @@ def canonical_json(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
 
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def write_bytes(path: pathlib.Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".new")
     temporary.write_bytes(data)
     os.replace(temporary, path)
-
-
-def write_checksum(path: pathlib.Path) -> pathlib.Path:
-    sidecar = path.with_name(path.name + ".sha256")
-    write_bytes(sidecar, f"{sha256_bytes(path.read_bytes())}  {path.name}\n".encode("ascii"))
-    return sidecar
-
-
-def validate_checksum(sidecar: pathlib.Path, asset: pathlib.Path) -> None:
-    expected = f"{sha256_bytes(asset.read_bytes())}  {asset.name}\n"
-    try:
-        actual = sidecar.read_text(encoding="ascii")
-    except (OSError, UnicodeError) as error:
-        raise ReleaseError(f"cannot read checksum {sidecar}: {error}") from error
-    if actual != expected:
-        raise ReleaseError(f"checksum mismatch or non-portable sidecar: {sidecar.name}")
 
 
 def safe_relative(name: str) -> pathlib.PurePosixPath:
@@ -479,176 +457,11 @@ def validate_static_elf(binary: bytes, platform: str) -> None:
             raise ReleaseError("bin/debz has an unterminated PT_DYNAMIC segment")
 
 
-def spdx_document(
-    name: str,
-    version: str,
-    archive_name: str,
-    entries: list[tuple[str, bytes, int]],
-    dependencies: list[dict[str, object]],
-    archive_checksum: str,
-) -> dict[str, object]:
-    package_id = "SPDXRef-Package-debz"
-    files = []
-    relationships = []
-    file_sha1_values = []
-    for index, (path, data, _) in enumerate(sorted(entries), 1):
-        digest = sha256_bytes(data)
-        sha1 = hashlib.sha1(data).hexdigest()
-        file_sha1_values.append(sha1)
-        file_id = f"SPDXRef-File-{index:04d}"
-        files.append(
-            {
-                "SPDXID": file_id,
-                "checksums": [
-                    {"algorithm": "SHA1", "checksumValue": sha1},
-                    {"algorithm": "SHA256", "checksumValue": digest},
-                ],
-                "copyrightText": "NOASSERTION",
-                "fileName": "./" + path,
-                "licenseConcluded": "NOASSERTION",
-                "licenseInfoInFiles": ["NOASSERTION"],
-            }
-        )
-        relationships.append(
-            {"spdxElementId": package_id, "relationshipType": "CONTAINS", "relatedSpdxElement": file_id}
-        )
-    packages = [
-        {
-            "SPDXID": package_id,
-            "checksums": [{"algorithm": "SHA256", "checksumValue": archive_checksum}],
-            "copyrightText": "Copyright 2026 debz contributors",
-            "downloadLocation": "NOASSERTION",
-            "filesAnalyzed": True,
-            "licenseConcluded": "Apache-2.0",
-            "licenseDeclared": "Apache-2.0",
-            "name": "debz",
-            "packageFileName": archive_name,
-            "packageVerificationCode": {
-                "packageVerificationCodeValue": hashlib.sha1(
-                    "".join(sorted(file_sha1_values)).encode("ascii")
-                ).hexdigest()
-            },
-            "versionInfo": version,
-        }
-    ]
-    for index, dependency in enumerate(dependencies, 1):
-        dependency_id = f"SPDXRef-Dependency-{index:04d}"
-        packages.append(
-            {
-                "SPDXID": dependency_id,
-                "copyrightText": "NOASSERTION",
-                "downloadLocation": str(dependency.get("source", "NOASSERTION")),
-                "filesAnalyzed": False,
-                "licenseConcluded": str(dependency["license"]),
-                "licenseDeclared": str(dependency["license"]),
-                "name": str(dependency["name"]),
-                "versionInfo": str(dependency.get("version", dependency.get("minimum_version"))),
-            }
-        )
-        relationships.append(
-            {"spdxElementId": package_id, "relationshipType": "DEPENDS_ON", "relatedSpdxElement": dependency_id}
-        )
-    namespace_seed = canonical_json({"archive": archive_name, "files": files, "packages": packages})
-    return {
-        "SPDXID": "SPDXRef-DOCUMENT",
-        "creationInfo": {
-            "created": "1970-01-01T00:00:00Z",
-            "creators": ["Tool: debz-release"],
-            "licenseListVersion": "3.25",
-        },
-        "dataLicense": "CC0-1.0",
-        "documentDescribes": [package_id],
-        "documentNamespace": f"https://github.com/cataggar/debz/releases/{name}/{uuid.uuid5(uuid.NAMESPACE_URL, sha256_bytes(namespace_seed))}",
-        "name": f"{name}-sbom",
-        "packages": packages,
-        "relationships": sorted(
-            relationships, key=lambda item: (item["spdxElementId"], item["relationshipType"], item["relatedSpdxElement"])
-        ),
-        "spdxVersion": "SPDX-2.3",
-        "files": files,
-    }
-
-
-def verify_sbom(
-    path: pathlib.Path,
-    archive_name: str,
-    dependencies: list[dict[str, object]],
-) -> None:
-    try:
-        document = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ReleaseError(f"invalid SBOM {path.name}: {error}") from error
-    for field in ("SPDXID", "spdxVersion", "dataLicense", "documentNamespace", "creationInfo", "packages", "files", "relationships"):
-        if field not in document:
-            raise ReleaseError(f"SBOM missing {field}: {path.name}")
-    if document["spdxVersion"] != "SPDX-2.3" or document["dataLicense"] != "CC0-1.0":
-        raise ReleaseError(f"SBOM has unsupported schema identifiers: {path.name}")
-    packages = document["packages"]
-    if not packages or packages[0].get("packageFileName") != archive_name:
-        raise ReleaseError(f"SBOM does not describe {archive_name}")
-    dependency_packages = {
-        item.get("name"): item
-        for item in packages[1:]
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    expected_dependencies = {
-        str(item["name"]): {
-            "downloadLocation": str(item.get("source", "NOASSERTION")),
-            "filesAnalyzed": False,
-            "licenseConcluded": str(item["license"]),
-            "licenseDeclared": str(item["license"]),
-            "versionInfo": str(item.get("version", item.get("minimum_version"))),
-        }
-        for item in dependencies
-    }
-    if (
-        len(packages) != len(expected_dependencies) + 1
-        or set(dependency_packages) != set(expected_dependencies)
-    ):
-        raise ReleaseError(f"SBOM dependency coverage is incomplete: {path.name}")
-    for name, expected in expected_dependencies.items():
-        package = dependency_packages[name]
-        if any(package.get(field) != value for field, value in expected.items()):
-            raise ReleaseError(
-                f"SBOM dependency metadata differs from reviewed policy for {name}: {path.name}"
-            )
-    file_sha1_values = []
-    for file_entry in document["files"]:
-        license_info = file_entry.get("licenseInfoInFiles")
-        if not isinstance(license_info, list) or not license_info or not all(
-            isinstance(item, str) for item in license_info
-        ):
-            raise ReleaseError(f"SBOM file has invalid licenseInfoInFiles: {path.name}")
-        checksums = file_entry.get("checksums")
-        if not isinstance(checksums, list):
-            raise ReleaseError(f"SBOM file has invalid checksums: {path.name}")
-        sha1_values = [
-            item.get("checksumValue")
-            for item in checksums
-            if isinstance(item, dict) and item.get("algorithm") == "SHA1"
-        ]
-        if len(sha1_values) != 1 or not isinstance(sha1_values[0], str) or not re.fullmatch(
-            r"[0-9a-f]{40}", sha1_values[0]
-        ):
-            raise ReleaseError(f"SBOM file has invalid SHA1 checksum: {path.name}")
-        file_sha1_values.append(sha1_values[0])
-    expected_verification = hashlib.sha1(
-        "".join(sorted(file_sha1_values)).encode("ascii")
-    ).hexdigest()
-    verification = packages[0].get("packageVerificationCode")
-    if not isinstance(verification, dict) or verification.get("packageVerificationCodeValue") != expected_verification:
-        raise ReleaseError(f"SBOM packageVerificationCode is invalid: {path.name}")
-    if canonical_json(document) != path.read_bytes():
-        raise ReleaseError(f"SBOM is not canonical JSON: {path.name}")
-
-
 def create_release_files(
     output: pathlib.Path,
     base_name: str,
-    version: str,
     entries: list[tuple[str, bytes, int]],
     epoch: int,
-    dependencies: list[dict[str, object]],
 ) -> list[pathlib.Path]:
     output.mkdir(parents=True, exist_ok=True)
     tar_data = build_tar(entries, epoch)
@@ -657,15 +470,7 @@ def create_release_files(
         archive = output / f"{base_name}.{archive_format}"
         archive_data = compress_tar(tar_data, archive_format)
         write_bytes(archive, archive_data)
-        created.extend((archive, write_checksum(archive)))
-        sbom = archive.with_name(archive.name + ".spdx.json")
-        write_bytes(
-            sbom,
-            canonical_json(
-                spdx_document(base_name, version, archive.name, entries, dependencies, sha256_bytes(archive_data))
-            ),
-        )
-        created.extend((sbom, write_checksum(sbom)))
+        created.append(archive)
     return created
 
 
@@ -702,57 +507,15 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
     return entries, binary
 
 
-def git(repo: pathlib.Path, *arguments: str, text: bool = False) -> bytes | str:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=repo,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-    )
-    if result.returncode:
-        stderr = result.stderr if text else result.stderr.decode(errors="replace")
-        raise ReleaseError(f"git {' '.join(arguments)} failed: {stderr.strip()}")
-    return result.stdout
-
-
-def source_entries(repo: pathlib.Path, commit: str, root_name: str) -> list[tuple[str, bytes, int]]:
-    resolved = str(git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}", text=True)).strip()
-    listing = bytes(git(repo, "ls-tree", "-rrz", "--full-tree", resolved)).split(b"\0")
-    entries = []
-    for record in listing:
-        if not record:
-            continue
-        metadata, raw_path = record.split(b"\t", 1)
-        mode, kind, object_id = metadata.decode("ascii").split()
-        if kind != "blob":
-            raise ReleaseError(f"source tree contains unsupported {kind}: {raw_path!r}")
-        path_text = raw_path.decode("utf-8", "strict")
-        relative = safe_relative(path_text)
-        data = bytes(git(repo, "cat-file", "blob", object_id))
-        validate_payload(relative, data)
-        if data.startswith((b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")):
-            raise ReleaseError(f"source tree contains a generated binary: {relative}")
-        if mode not in {"100644", "100755"}:
-            raise ReleaseError(f"source tree contains unsupported mode {mode}: {relative}")
-        file_mode = 0o755 if mode == "100755" else 0o644
-        entries.append((f"{root_name}/{relative}", data, file_mode))
-    return entries
-
-
 def expected_asset_names(version: str) -> list[str]:
-    names = []
-    bases = [f"debz-{version}-{platform}" for platform in PLATFORMS] + [f"debz-{version}-source"]
-    for base in bases:
-        for archive_format in FORMATS:
-            archive = f"{base}.{archive_format}"
-            names.extend((archive, archive + ".sha256", archive + ".spdx.json", archive + ".spdx.json.sha256"))
-    names.extend((f"debz-{version}-release-manifest.json", f"debz-{version}-release-manifest.json.sha256"))
-    return sorted(names)
+    return sorted(
+        f"debz-{version}-{platform}.{archive_format}"
+        for platform in PLATFORMS
+        for archive_format in FORMATS
+    )
 
 
-def manifest_document(tag: str) -> dict[str, object]:
+def release_plan(tag: str) -> dict[str, object]:
     version = parse_tag(tag)
     return {
         "schemaVersion": 1,
@@ -766,42 +529,30 @@ def manifest_document(tag: str) -> dict[str, object]:
     }
 
 
-def write_manifest(tag: str, output: pathlib.Path) -> pathlib.Path:
-    version = parse_tag(tag)
-    path = output / f"debz-{version}-release-manifest.json"
-    write_bytes(path, canonical_json(manifest_document(tag)))
-    write_checksum(path)
-    return path
-
-
 def audit_archive(
-    path: pathlib.Path, kind: str, version: str, platform: str | None
+    path: pathlib.Path, version: str, platform: str
 ) -> list[tuple[tarfile.TarInfo, bytes | None]]:
     entries = archive_entries(path)
     names = {member.name.rstrip("/") for member, _ in entries}
-    root = f"debz-{version}-source" if kind == "source" else f"debz-{version}-{platform}"
+    root = f"debz-{version}-{platform}"
     if not names or any(name != root and not name.startswith(root + "/") for name in names):
         raise ReleaseError(f"archive has an unexpected top-level path: {path.name}")
-    if kind == "binary":
-        required = {
-            f"{root}/bin/debz",
-            f"{root}/share/doc/debz/LICENSE",
-            f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
-            f"{root}/share/debz/runtime-dependencies.json",
-        }
-    else:
-        required = {f"{root}/LICENSE", f"{root}/THIRD_PARTY_NOTICES", f"{root}/build.zig.zon"}
+    required = {
+        f"{root}/bin/debz",
+        f"{root}/share/doc/debz/LICENSE",
+        f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
+        f"{root}/share/debz/runtime-dependencies.json",
+    }
     missing = required - names
     if missing:
         raise ReleaseError(f"archive is missing: {', '.join(sorted(missing))}")
-    if kind == "binary":
-        for member, _ in entries:
-            name = member.name.rstrip("/")
-            relative = pathlib.PurePosixPath(name).relative_to(root)
-            if len(relative.parts) > 0 and relative.parts[0] not in {"bin", "lib", "share"}:
-                raise ReleaseError(f"unexpected install path in binary archive: {name}")
-            if member.isfile() and member.mode == 0o755 and name != f"{root}/bin/debz":
-                raise ReleaseError(f"unexpected executable in binary archive: {name}")
+    for member, _ in entries:
+        name = member.name.rstrip("/")
+        relative = pathlib.PurePosixPath(name).relative_to(root)
+        if len(relative.parts) > 0 and relative.parts[0] not in {"bin", "lib", "share"}:
+            raise ReleaseError(f"unexpected install path in binary archive: {name}")
+        if member.isfile() and member.mode == 0o755 and name != f"{root}/bin/debz":
+            raise ReleaseError(f"unexpected executable in binary archive: {name}")
     files = [(member.name, data, member.mode) for member, data in entries if member.isfile() and data is not None]
     epoch = int(entries[0][0].mtime)
     if decompressed_tar(path) != build_tar(files, epoch):
@@ -843,7 +594,7 @@ def smoke_binary(archive_path: pathlib.Path, version: str) -> None:
             archive.extractall(root, filter="data")
         binary = next(root.glob("*/bin/debz"))
         for argument, expected in (
-            ("--version", version),
+            ("version", version),
             ("-h", "debz <command> [options] [packages...]"),
             ("--help", "debz <command> [options] [packages...]"),
         ):
@@ -873,49 +624,22 @@ def command_binary(args: argparse.Namespace) -> None:
     validate_static_elf(binary, args.platform)
     runtime_data = next(data for name, data, _ in entries if name.endswith("/share/debz/runtime-dependencies.json"))
     validate_runtime_manifest(runtime_data, dependencies)
-    for path in create_release_files(args.output, root_name, version, entries, args.epoch, dependencies):
+    for path in create_release_files(args.output, root_name, entries, args.epoch):
         print(path)
-
-
-def command_source(args: argparse.Namespace) -> None:
-    version = parse_tag(args.tag)
-    dependencies = policy_dependencies(args.policy)
-    resolved = str(git(args.repo, "rev-parse", "--verify", f"{args.commit}^{{commit}}", text=True)).strip()
-    epoch = int(str(git(args.repo, "show", "-s", "--format=%ct", resolved, text=True)).strip())
-    root_name = f"debz-{version}-source"
-    entries = source_entries(args.repo, resolved, root_name)
-    for path in create_release_files(args.output, root_name, version, entries, epoch, dependencies):
-        print(path)
-
-
-def command_manifest(args: argparse.Namespace) -> None:
-    print(write_manifest(args.tag, args.output))
 
 
 def command_audit(args: argparse.Namespace) -> None:
     version = parse_tag(args.tag)
-    entries = audit_archive(args.archive, args.kind, version, args.platform)
+    entries = audit_archive(args.archive, version, args.platform)
     dependencies = policy_dependencies(args.policy)
-    if args.kind == "binary":
-        validate_archived_binary(entries, version, args.platform, dependencies)
-    validate_checksum(args.archive.with_name(args.archive.name + ".sha256"), args.archive)
-    sbom = args.archive.with_name(args.archive.name + ".spdx.json")
-    validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-    verify_sbom(sbom, args.archive.name, dependencies)
-    if args.smoke and args.kind == "binary" and args.platform == native_platform():
+    validate_archived_binary(entries, version, args.platform, dependencies)
+    if args.smoke and args.platform == native_platform():
         smoke_binary(args.archive, version)
     print(f"verified {args.archive}")
 
 
 def command_verify(args: argparse.Namespace) -> None:
-    try:
-        manifest = json.loads(args.manifest.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ReleaseError(f"invalid manifest: {error}") from error
-    tag = manifest.get("tag")
-    version = parse_tag(tag) if isinstance(tag, str) else ""
-    if manifest != manifest_document(tag) or canonical_json(manifest) != args.manifest.read_bytes():
-        raise ReleaseError("release manifest is incomplete or non-canonical")
+    version = parse_tag(args.tag)
     expected = set(expected_asset_names(version))
     actual = set()
     for path in args.assets.iterdir():
@@ -927,28 +651,13 @@ def command_verify(args: argparse.Namespace) -> None:
         raise ReleaseError("release assets are missing: " + ", ".join(sorted(missing)))
     unexpected = actual - expected
     if unexpected:
-        raise ReleaseError("release assets are undeclared: " + ", ".join(sorted(unexpected)))
-    expected_manifest = args.assets / args.manifest.name
-    if args.manifest.resolve() != expected_manifest.resolve():
-        raise ReleaseError("release manifest must be the declared file in the assets directory")
-    validate_checksum(args.manifest.with_name(args.manifest.name + ".sha256"), args.manifest)
+        raise ReleaseError("release assets are forbidden: " + ", ".join(sorted(unexpected)))
     dependencies = policy_dependencies(args.policy)
     for platform in PLATFORMS:
         for archive_format in FORMATS:
             archive = args.assets / f"debz-{version}-{platform}.{archive_format}"
-            entries = audit_archive(archive, "binary", version, platform)
+            entries = audit_archive(archive, version, platform)
             validate_archived_binary(entries, version, platform, dependencies)
-            validate_checksum(archive.with_name(archive.name + ".sha256"), archive)
-            sbom = archive.with_name(archive.name + ".spdx.json")
-            validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-            verify_sbom(sbom, archive.name, dependencies)
-    for archive_format in FORMATS:
-        archive = args.assets / f"debz-{version}-source.{archive_format}"
-        audit_archive(archive, "source", version, None)
-        validate_checksum(archive.with_name(archive.name + ".sha256"), archive)
-        sbom = archive.with_name(archive.name + ".spdx.json")
-        validate_checksum(sbom.with_name(sbom.name + ".sha256"), sbom)
-        verify_sbom(sbom, archive.name, dependencies)
     if args.smoke:
         platform = native_platform()
         if platform:
@@ -957,7 +666,7 @@ def command_verify(args: argparse.Namespace) -> None:
 
 
 def command_dry_run(args: argparse.Namespace) -> None:
-    print(canonical_json(manifest_document(args.tag)).decode(), end="")
+    print(canonical_json(release_plan(args.tag)).decode(), end="")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -977,36 +686,22 @@ def parser() -> argparse.ArgumentParser:
     binary.add_argument("--policy", type=pathlib.Path, default=pathlib.Path("security/dependency-policy.json"))
     binary.set_defaults(func=command_binary)
 
-    source = subcommands.add_parser("source", help="create deterministic source release assets")
-    source.add_argument("--tag", required=True)
-    source.add_argument("--repo", type=pathlib.Path, default=pathlib.Path("."))
-    source.add_argument("--commit", default="HEAD")
-    source.add_argument("--output", type=pathlib.Path, required=True)
-    source.add_argument("--policy", type=pathlib.Path, default=pathlib.Path("security/dependency-policy.json"))
-    source.set_defaults(func=command_source)
-
-    manifest = subcommands.add_parser("manifest", help="write the exact release asset manifest")
-    manifest.add_argument("--tag", required=True)
-    manifest.add_argument("--output", type=pathlib.Path, required=True)
-    manifest.set_defaults(func=command_manifest)
-
-    audit = subcommands.add_parser("audit", help="audit one archive, checksum and SBOM")
+    audit = subcommands.add_parser("audit", help="audit one binary archive")
     audit.add_argument("--tag", required=True)
     audit.add_argument("--archive", type=pathlib.Path, required=True)
-    audit.add_argument("--kind", choices=("binary", "source"), required=True)
-    audit.add_argument("--platform", choices=PLATFORMS)
+    audit.add_argument("--platform", choices=PLATFORMS, required=True)
     audit.add_argument("--policy", type=pathlib.Path, default=pathlib.Path("security/dependency-policy.json"))
     audit.add_argument("--smoke", action="store_true")
     audit.set_defaults(func=command_audit)
 
     verify = subcommands.add_parser("verify", help="verify a complete release asset directory")
-    verify.add_argument("--manifest", type=pathlib.Path, required=True)
+    verify.add_argument("--tag", required=True)
     verify.add_argument("--assets", type=pathlib.Path, required=True)
     verify.add_argument("--policy", type=pathlib.Path, default=pathlib.Path("security/dependency-policy.json"))
     verify.add_argument("--smoke", action="store_true")
     verify.set_defaults(func=command_verify)
 
-    dry_run = subcommands.add_parser("dry-run", help="print the exact planned asset manifest")
+    dry_run = subcommands.add_parser("dry-run", help="print the exact four-archive release plan")
     dry_run.add_argument("--tag", required=True)
     dry_run.set_defaults(func=command_dry_run)
     return result
@@ -1015,8 +710,6 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = parser().parse_args()
-        if args.command == "audit" and args.kind == "binary" and not args.platform:
-            raise ReleaseError("--platform is required for binary archive audit")
         args.func(args)
         return 0
     except ReleaseError as error:

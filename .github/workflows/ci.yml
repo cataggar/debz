@@ -127,65 +127,39 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-      - name: Build, package, and audit v0.2.0 binary assets
+      - name: Build, package, and audit v0.3.0 binary assets
         env:
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
         run: |
           zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version v0.2.0 --expect "zon=$zon_version")
+          version=$(python3 tools/release.py version v0.3.0 --expect "zon=$zon_version")
           zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$version" release-install \
             --prefix "$PWD/.zig-cache/release-install"
-          python3 tools/release.py version v0.2.0 --expect "zon=$zon_version" \
-            --expect "binary=$(.zig-cache/release-install/bin/debz --version)"
+          python3 tools/release.py version v0.3.0 --expect "zon=$zon_version" \
+            --expect "binary=$(.zig-cache/release-install/bin/debz version)"
           epoch=$(git show -s --format=%ct HEAD)
-          python3 tools/release.py binary --tag v0.2.0 --platform "$PLATFORM" \
+          python3 tools/release.py binary --tag v0.3.0 --platform "$PLATFORM" \
             --prefix .zig-cache/release-install --epoch "$epoch" \
             --output release-assets
           for format in tar.gz tar.xz; do
-            python3 tools/release.py audit --tag v0.2.0 --kind binary \
+            python3 tools/release.py audit --tag v0.3.0 \
               --platform "$PLATFORM" \
-              --archive "release-assets/debz-0.2.0-$PLATFORM.$format" --smoke
+              --archive "release-assets/debz-0.3.0-$PLATFORM.$format" --smoke
           done
       - name: Upload dry-run binary assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-dry-run-${{ matrix.platform }}
-          path: release-assets/
-          if-no-files-found: error
-          retention-days: 1
-
-  release-dry-run-source:
-    name: Required release dry-run source
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Package and audit deterministic source assets
-        run: |
-          python3 tools/release.py version v0.2.0 --expect zon=0.2.0
-          python3 tools/release.py source --tag v0.2.0 --commit HEAD --output release-assets
-          python3 tools/release.py source --tag v0.2.0 --commit HEAD --output source-repeat
-          diff --recursive --brief release-assets source-repeat
-          python3 tools/release.py manifest --tag v0.2.0 --output release-assets
-          for format in tar.gz tar.xz; do
-            python3 tools/release.py audit --tag v0.2.0 --kind source \
-              --archive "release-assets/debz-0.2.0-source.$format"
-          done
-      - name: Upload dry-run source and manifest assets
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-dry-run-source
-          path: release-assets/
+          path: |
+            release-assets/debz-0.3.0-${{ matrix.platform }}.tar.gz
+            release-assets/debz-0.3.0-${{ matrix.platform }}.tar.xz
           if-no-files-found: error
           retention-days: 1
 
   release-dry-run-verify:
     name: Required release dry-run exact verification
-    needs: [release-dry-run, release-dry-run-source]
+    needs: release-dry-run
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -198,10 +172,9 @@ jobs:
           pattern: release-dry-run-*
           path: release-assets
           merge-multiple: true
-      - name: Verify exact complete 26-asset dry-run
+      - name: Verify exact four-archive dry-run
         run: |
-          python3 tools/release.py verify \
-            --manifest release-assets/debz-0.2.0-release-manifest.json \
+          python3 tools/release.py verify --tag v0.3.0 \
             --assets release-assets --smoke
 
   release-policy:

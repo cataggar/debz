@@ -4,7 +4,14 @@ An embeddable Debian-family package manager library and CLI written in Zig.
 
 ## Install
 
-Install the latest published Linux x64 or arm64 release with `ghr install cataggar/debz@v0.1.0`. Release binaries are fully static executables with Zig 0.16.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd included. Gzip and xz archives include checksums and SPDX SBOMs and are covered by GitHub provenance attestations. Artifacts and checksum files are unsigned.
+```sh
+ghr install cataggar/debz@v0.2.0
+```
+
+Release binaries are fully static Linux x64 or arm64 executables with Zig
+0.16.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd
+included. Gzip and xz binary archives are covered by GitHub provenance
+attestations.
 
 ## Build
 
@@ -12,7 +19,7 @@ Install the latest published Linux x64 or arm64 release with `ghr install catagg
 zig build
 zig build test
 zig build run -- --help
-zig build -Dversion=0.2.0
+zig build -Dversion=0.3.0
 zig build install --prefix "$PWD/install-root"
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
   release-install --prefix "$PWD/release-root"

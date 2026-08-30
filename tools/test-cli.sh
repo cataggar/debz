@@ -18,7 +18,13 @@ for help in -h --help; do
     test ! -s cli-test-stderr
     printf '%s' "$output" | grep -q 'debz <command> \[options\] \[packages\.\.\.\]'
 done
-test "$("$debz" --version)" = "$expected_version"
+test "$("$debz" version)" = "$expected_version"
+set +e
+"$debz" --version >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+grep -q "unknown command '--version'" cli-test-stderr
 
 output=$("$debz" list-installed $read_common 2>cli-test-stderr)
 test ! -s cli-test-stderr

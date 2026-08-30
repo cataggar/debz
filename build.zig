@@ -1,14 +1,14 @@
 const std = @import("std");
 const liblzma_build = @import("build/liblzma.zig");
 
-const package_version = "0.2.0";
+const package_version = "0.3.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Release version (SemVer)") orelse package_version;
     _ = std.SemanticVersion.parse(version) catch {
-        std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.2.0 or 1.2.3-rc.1)", .{version});
+        std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.3.0 or 1.2.3-rc.1)", .{version});
     };
 
     const build_options = b.addOptions();
@@ -114,6 +114,7 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{"clean"}, .usage = "debz clean [options]" },
         .{ .args = &.{"recover"}, .usage = "debz recover [options]" },
         .{ .args = &.{"package-family-capabilities"}, .usage = "debz package-family-capabilities" },
+        .{ .args = &.{"version"}, .usage = "debz version" },
         // Help wins after positional or malformed arguments so parsing and IO never begin.
         .{ .args = &.{ "install", "example" }, .usage = "debz install [options] <package>" },
         .{ .args = &.{ "install", "--deadline-ms" }, .usage = "debz install [options] <package>" },
@@ -135,6 +136,13 @@ pub fn build(b: *std.Build) void {
     positional_help.expectStdOutEqual("");
     positional_help.expectStdErrMatch("debz: unknown command 'help'");
     test_step.dependOn(&positional_help.step);
+
+    const removed_version_flag = b.addRunArtifact(cli);
+    removed_version_flag.addArg("--version");
+    removed_version_flag.expectExitCode(2);
+    removed_version_flag.expectStdOutEqual("");
+    removed_version_flag.expectStdErrMatch("debz: unknown command '--version'");
+    test_step.dependOn(&removed_version_flag.step);
 
     const consumer_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
