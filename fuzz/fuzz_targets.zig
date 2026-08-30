@@ -213,6 +213,16 @@ fn exerciseSigned(bytes: []const u8) !void {
         .diagnostic => {},
     }
 
+    if (debz.openpgp_verifier.inspectKeyring(std.testing.allocator, bytes, .{
+        .max_keyring_bytes = max_input,
+        .max_packet_bytes = max_input,
+        .max_packets = 128,
+        .max_keys = 32,
+    })) |value| {
+        var inspection = value;
+        inspection.deinit(std.testing.allocator);
+    } else |_| {}
+
     var outcome = debz.openpgp_verifier.verify(std.testing.allocator, .{
         .io = std.testing.io,
         .signed_bytes = "Release",
@@ -360,6 +370,10 @@ fn exerciseState(bytes: []const u8) !void {
     if (debz.transaction_recovery.decode(std.testing.allocator, bytes)) |value| {
         var journal = value;
         journal.deinit();
+    } else |_| {}
+    if (debz.target_apt_config.decodeManifest(std.testing.allocator, bytes, max_input)) |value| {
+        var manifest = value;
+        manifest.deinit();
     } else |_| {}
 }
 

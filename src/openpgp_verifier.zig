@@ -107,6 +107,26 @@ pub const VerifyError = error{
     UnsupportedKeyringArmor,
 } || std.Io.Dir.ReadFileAllocError;
 
+pub const KeyringInspection = struct {
+    primary_fingerprints: [][20]u8,
+
+    pub fn deinit(self: *KeyringInspection, allocator: std.mem.Allocator) void {
+        allocator.free(self.primary_fingerprints);
+        self.* = undefined;
+    }
+};
+
+pub const InspectKeyringError = error{
+    KeyringTooLarge,
+    PacketTooLarge,
+    TooManyPackets,
+    TooManyKeys,
+    MalformedKeyring,
+    UnsupportedKeyringArmor,
+    UnsupportedKeyMaterial,
+    NoSupportedPrimaryKeys,
+} || std.mem.Allocator.Error;
+
 const Packet = struct {
     tag: u6,
     body: []const u8,
@@ -258,6 +278,50 @@ pub fn verify(allocator: std.mem.Allocator, request: Request) VerifyError!Outcom
     return if (accepted != null) .{ .accepted = report } else .{ .rejected = report };
 }
 
+/// Parses a binary keyring without performing signature verification and
+/// returns every supported v4 primary-key fingerprint. Unlike `verify`, this
+/// preflight is strict: unsupported public or secret key material is rejected
+/// rather than ignored.
+pub fn inspectKeyring(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    limits: Limits,
+) InspectKeyringError!KeyringInspection {
+    if (bytes.len > limits.max_keyring_bytes) return error.KeyringTooLarge;
+    if (std.mem.startsWith(
+        u8,
+        std.mem.trimStart(u8, bytes, " \t\r\n"),
+        "-----BEGIN PGP",
+    ))
+        return error.UnsupportedKeyringArmor;
+
+    var state = KeyringState{ .allocator = allocator };
+    defer state.deinit();
+    try parseKeyringMode(&state, bytes, limits, true);
+
+    var fingerprints: std.ArrayList([20]u8) = .empty;
+    defer fingerprints.deinit(allocator);
+    for (state.keys.items) |key| {
+        if (key.is_primary) try fingerprints.append(allocator, key.fingerprint);
+    }
+    if (fingerprints.items.len == 0) return error.NoSupportedPrimaryKeys;
+    std.mem.sort([20]u8, fingerprints.items, {}, struct {
+        fn less(_: void, left: [20]u8, right: [20]u8) bool {
+            return std.mem.order(u8, &left, &right) == .lt;
+        }
+    }.less);
+    var write_index: usize = 0;
+    for (fingerprints.items) |fingerprint| {
+        if (write_index != 0 and
+            std.mem.eql(u8, &fingerprint, &fingerprints.items[write_index - 1]))
+            continue;
+        fingerprints.items[write_index] = fingerprint;
+        write_index += 1;
+    }
+    fingerprints.items.len = write_index;
+    return .{ .primary_fingerprints = try fingerprints.toOwnedSlice(allocator) };
+}
+
 fn addKeyring(
     state: *KeyringState,
     source: Keyring,
@@ -285,10 +349,18 @@ fn addKeyring(
         return error.KeyringTooLarge;
     if (total_keyring_bytes.* > request.limits.max_keyring_bytes) return error.KeyringTooLarge;
     if (std.mem.startsWith(u8, bytes, "-----BEGIN PGP")) return error.UnsupportedKeyringArmor;
-    try parseKeyring(state, bytes, request.limits);
+    parseKeyringMode(state, bytes, request.limits, false) catch |err| switch (err) {
+        error.UnsupportedKeyMaterial => unreachable,
+        else => |other| return other,
+    };
 }
 
-fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
+fn parseKeyringMode(
+    state: *KeyringState,
+    bytes: []const u8,
+    limits: Limits,
+    reject_unsupported: bool,
+) !void {
     var parser = Parser{ .bytes = bytes, .count = state.packet_count, .limits = limits };
     defer state.packet_count = parser.count;
     var primary_index: ?usize = null;
@@ -301,6 +373,7 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
                 if (state.keys.items.len >= limits.max_keys) return error.TooManyKeys;
                 const key = parseKey(packet.body, null, true) catch |err| switch (err) {
                     error.UnsupportedAlgorithm => {
+                        if (reject_unsupported) return error.UnsupportedKeyMaterial;
                         primary_index = null;
                         subject_index = null;
                         user_id = null;
@@ -322,6 +395,7 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
                 if (state.keys.items.len >= limits.max_keys) return error.TooManyKeys;
                 const key = parseKey(packet.body, state.keys.items[pi].fingerprint, false) catch |err| switch (err) {
                     error.UnsupportedAlgorithm => {
+                        if (reject_unsupported) return error.UnsupportedKeyMaterial;
                         subject_index = null;
                         user_id = null;
                         continue;
@@ -344,6 +418,7 @@ fn parseKeyring(state: *KeyringState, bytes: []const u8, limits: Limits) !void {
                 applyKeySignature(state.keys.items, pi, si, user_id, packet.body, limits) catch
                     return error.MalformedKeyring;
             },
+            5, 7 => if (reject_unsupported) return error.UnsupportedKeyMaterial,
             else => {},
         }
     }
@@ -1142,4 +1217,30 @@ test "strict keyring and count bounds reject before verification" {
     request = fixtureRequest(&fixture.keyring, &.{&fixture.signature}, fixture.created + 30);
     request.limits.max_signed_bytes = fixture.message.len - 1;
     try std.testing.expectError(error.SignedDataTooLarge, verify(std.testing.allocator, request));
+}
+
+test "keyring inspection returns primary fingerprints and rejects unsupported material" {
+    var inspected = try inspectKeyring(std.testing.allocator, &fixture.keyring, .{});
+    defer inspected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), inspected.primary_fingerprints.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fixture.primary_fingerprint,
+        &inspected.primary_fingerprints[0],
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedKeyringArmor,
+        inspectKeyring(std.testing.allocator, "-----BEGIN PGP PUBLIC KEY BLOCK-----\n", .{}),
+    );
+
+    var unsupported_key = fixture.ed25519_keyring;
+    var packet_parser = Parser{ .bytes = &unsupported_key, .limits = .{} };
+    const packet = (try packet_parser.next()).?;
+    const body_offset = @intFromPtr(packet.body.ptr) - @intFromPtr(unsupported_key[0..].ptr);
+    unsupported_key[body_offset + 5] = 19;
+    try std.testing.expectError(
+        error.UnsupportedKeyMaterial,
+        inspectKeyring(std.testing.allocator, &unsupported_key, .{}),
+    );
 }

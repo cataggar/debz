@@ -142,11 +142,21 @@ def audit_production_sources() -> None:
     allowed_test_canaries = {
         ("src/repository_policy.zig", "/etc/apt/", '&.{"/etc/apt/trusted.gpg"}'),
     }
+    target_apt_paths = {
+        'const sources_list_path = "/etc/apt/sources.list";',
+        'const sources_directory_path = "/etc/apt/sources.list.d";',
+        'const global_keyring_path = "/etc/apt/trusted.gpg";',
+        'const global_keyring_directory_path = "/etc/apt/trusted.gpg.d";',
+    }
     process_calls: list[str] = []
     for path in sorted((ROOT / "src").rglob("*.zig")):
         text = path.read_text(errors="strict")
         relative = str(path.relative_to(ROOT))
         first_test = text.find('\ntest "')
+        if relative == "src/target_apt_config.zig":
+            fixture_start = text.find("\nconst test_fixture =")
+            if fixture_start >= 0:
+                first_test = fixture_start
         for pattern, reason in forbidden.items():
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 value = match.group()
@@ -162,11 +172,24 @@ def audit_production_sources() -> None:
                     for allowed_path, allowed_value, exact_line in allowed_test_canaries
                 ):
                     continue
+                if (
+                    relative == "src/target_apt_config.zig"
+                    and reason == "ambient APT configuration"
+                    and (
+                        line_text.strip() in target_apt_paths
+                        or (first_test >= 0 and match.start() > first_test)
+                    )
+                ):
+                    continue
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative}:{line}: forbidden {reason}")
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
-    if len(process_calls) != 1 or not process_calls[0].startswith("src/transaction_executor.zig:"):
+    process_paths = [call.rsplit(":", 1)[0] for call in process_calls]
+    if sorted(process_paths) != [
+        "src/target_apt_config.zig",
+        "src/transaction_executor.zig",
+    ]:
         fail(f"production process boundary changed: {process_calls!r}")
 
 
