@@ -78,7 +78,12 @@ fn validRedactedUrl(value: []const u8) bool {
     if (value.len == 0 or std.mem.indexOfScalar(u8, value, '#') != null)
         return false;
     for (value) |byte| if (byte <= 0x20 or byte == 0x7f) return false;
-    const scheme_end = std.mem.indexOf(u8, value, "://") orelse return false;
+    const scheme_end = std.mem.indexOf(u8, value, "://") orelse {
+        if (!std.mem.startsWith(u8, value, "file:/")) return false;
+        if (std.mem.indexOfScalar(u8, value, '?')) |query|
+            return std.mem.eql(u8, value[query + 1 ..], "REDACTED");
+        return true;
+    };
     if (scheme_end == 0) return false;
     const authority_start = scheme_end + 3;
     const authority_end = std.mem.indexOfAnyPos(u8, value, authority_start, "/?") orelse
@@ -111,4 +116,9 @@ test "package_origin.test.local artifact evidence is explicit and redacted" {
     var wrong_trust = evidence;
     wrong_trust.acquisition_url = "http://example.test/vendor.deb";
     try std.testing.expectError(error.TrustModeMismatch, validateLocalArtifact(wrong_trust));
+
+    var local = evidence;
+    local.acquisition_url = "file:/packages/vendor.deb";
+    local.trust_mode = .pinned_sha256;
+    try validateLocalArtifact(local);
 }

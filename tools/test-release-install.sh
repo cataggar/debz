@@ -44,6 +44,8 @@ for schema in \
   command-result-v1.json \
   exact-closure-lock-v1.json \
   exact-closure-lock-v2.json \
+  repository-add-state-v1.json \
+  repository-operation-result-v1.json \
   transaction-plan-v1.json \
   transaction-plan-v2.json \
   transaction-plan-v3.json \
@@ -54,6 +56,7 @@ do
   test -f "$release_prefix/share/doc/debz/schema/$schema"
 done
 test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
+test -f "$release_prefix/share/doc/debz/doc/repository-management.md"
 python3 - "$release_prefix/share/debz/runtime-dependencies.json" <<'PY'
 import json
 import pathlib

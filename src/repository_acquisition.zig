@@ -27,6 +27,9 @@ pub const RetryPolicy = struct {
     retry_408: bool = true,
     retry_429: bool = true,
     retry_5xx: bool = true,
+    /// When set, use `attempt * linear_backoff_base_ms`. This permits
+    /// request-scoped policy without process-global callback state.
+    linear_backoff_base_ms: ?u64 = null,
     backoff_ms: *const fn (attempt: u16) u64 = noBackoff,
 
     fn noBackoff(_: u16) u64 {
@@ -366,7 +369,10 @@ fn acquireHttp(
 }
 
 fn deterministicBackoff(request_value: Request, dependencies: Dependencies, attempt: u16, started_ms: u64) !void {
-    const delay = request_value.retry.backoff_ms(attempt);
+    const delay = if (request_value.retry.linear_backoff_base_ms) |base|
+        base *| @as(u64, attempt)
+    else
+        request_value.retry.backoff_ms(attempt);
     const now = dependencies.clock.nowMs();
     if (elapsed(started_ms, now) > request_value.deadlines.overall_ms or
         delay > request_value.deadlines.overall_ms - elapsed(started_ms, now))

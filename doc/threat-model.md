@@ -6,7 +6,8 @@ Untrusted inputs include repository source declarations, HTTP/file responses,
 DEB822 records, versions and relations, Release and Packages indexes,
 OpenPGP envelopes, packets and keyrings, compressed metadata, `.deb`/ar/tar
 bytes, exact locks, transaction provenance, journals, package-cache contents,
-and installed-state files. Install roots, cache roots, clocks, proxy settings,
+repository descriptor packages, repository-add operation state, and
+installed-state files. Install roots, cache roots, clocks, proxy settings,
 credentials, keyrings and policy are explicit caller inputs; host APT, GnuPG,
 proxy and environment configuration is never consulted.
 
@@ -25,6 +26,9 @@ child-process boundary and is executed with fixed argv/environment policy.
   staging, fsync and atomic rename. Lock waits and garbage collection are
   bounded; interrupted state remains non-success evidence.
 - Repository and package publication is digest-bound and fail-closed.
+- Repository descriptors require verified HTTPS or an explicit SHA-256.
+  Bundled keyrings authenticate only the repositories they name; they never
+  authenticate the descriptor package that carried them.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.
