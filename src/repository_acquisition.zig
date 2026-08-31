@@ -73,6 +73,31 @@ pub const Clock = struct {
     }
 };
 
+pub const RetryCause = union(enum) {
+    transport_error: anyerror,
+    http_status: u16,
+};
+
+pub const RetryEvent = struct {
+    failed_attempt: u16,
+    max_attempts: u16,
+    delay_ms: u64,
+    cause: RetryCause,
+};
+
+pub const RetryObserver = struct {
+    context: ?*anyopaque = null,
+    reportFn: *const fn (?*anyopaque, RetryEvent) void = ignore,
+
+    pub fn report(self: RetryObserver, event: RetryEvent) void {
+        self.reportFn(self.context, event);
+    }
+
+    fn ignore(_: ?*anyopaque, _: RetryEvent) void {}
+
+    pub const none: RetryObserver = .{};
+};
+
 pub const Request = struct {
     uri: Uri,
     proxy: ProxyPolicy = .direct,
@@ -167,6 +192,7 @@ pub const Dependencies = struct {
     transport: Transport,
     files: FileSystem,
     clock: Clock,
+    retry_observer: RetryObserver = .none,
 };
 
 pub const Error = error{
@@ -326,7 +352,13 @@ fn acquireHttp(
             .authorization = if (credential) |value| value.authorization else null,
         }) catch |err| {
             if (attempts < request_value.retry.max_attempts and isSafeTransient(err)) {
-                try deterministicBackoff(request_value, dependencies, attempts, started_ms);
+                try deterministicBackoff(
+                    request_value,
+                    dependencies,
+                    attempts,
+                    started_ms,
+                    .{ .transport_error = err },
+                );
                 continue;
             }
             return err;
@@ -360,9 +392,16 @@ fn acquireHttp(
             if (attempts < request_value.retry.max_attempts and
                 shouldRetryStatus(request_value.retry, response.status))
             {
+                const status = response.status;
                 response.deinit(allocator);
                 response_live = false;
-                try deterministicBackoff(request_value, dependencies, attempts, started_ms);
+                try deterministicBackoff(
+                    request_value,
+                    dependencies,
+                    attempts,
+                    started_ms,
+                    .{ .http_status = status },
+                );
                 continue;
             }
             if (response.status == 404) return error.NotFound;
@@ -399,7 +438,13 @@ fn acquireHttp(
     }
 }
 
-fn deterministicBackoff(request_value: Request, dependencies: Dependencies, attempt: u16, started_ms: u64) !void {
+fn deterministicBackoff(
+    request_value: Request,
+    dependencies: Dependencies,
+    attempt: u16,
+    started_ms: u64,
+    cause: RetryCause,
+) !void {
     const delay = if (request_value.retry.linear_backoff_base_ms) |base|
         base *| @as(u64, attempt)
     else
@@ -411,6 +456,12 @@ fn deterministicBackoff(request_value: Request, dependencies: Dependencies, atte
     ) catch return error.OverallDeadlineExceeded;
     if (delay >= remaining_ms)
         return error.OverallDeadlineExceeded;
+    dependencies.retry_observer.report(.{
+        .failed_attempt = attempt,
+        .max_attempts = request_value.retry.max_attempts,
+        .delay_ms = delay,
+        .cause = cause,
+    });
     try dependencies.clock.sleepMs(delay);
 }
 
@@ -459,6 +510,7 @@ fn isSafeTransient(err: anyerror) bool {
         error.ConnectionTimedOut,
         error.NetworkUnreachable,
         error.HostLacksNetworkAddresses,
+        error.NameServerFailure,
         error.TemporaryNameServerFailure,
         error.ReadFailed,
         error.WriteFailed,
@@ -566,7 +618,21 @@ pub const Production = struct {
                 .nowMsFn = nowMs,
                 .sleepMsFn = sleepMs,
             },
+            .retry_observer = .{ .reportFn = reportRetry },
         };
+    }
+
+    fn reportRetry(_: ?*anyopaque, event: RetryEvent) void {
+        switch (event.cause) {
+            .transport_error => |err| std.debug.print(
+                "debz acquisition retry failed_attempt={d}/{d} delay_ms={d} error={s}\n",
+                .{ event.failed_attempt, event.max_attempts, event.delay_ms, @errorName(err) },
+            ),
+            .http_status => |status| std.debug.print(
+                "debz acquisition retry failed_attempt={d}/{d} delay_ms={d} http_status={d}\n",
+                .{ event.failed_attempt, event.max_attempts, event.delay_ms, status },
+            ),
+        }
     }
 
     fn nowMs(context: ?*anyopaque) u64 {
@@ -1036,6 +1102,68 @@ test "safe transient status retries with deterministic backoff" {
     try std.testing.expectEqualStrings("ready", result.bytes);
     try std.testing.expectEqual(@as(u64, 7), fixture.now_ms);
     try std.testing.expectEqual(@as(u16, 2), result.provenance.timing.attempts);
+    try std.testing.expectEqual(@as(usize, 1), fixture.retry_event_count);
+    const event = fixture.retry_events[0];
+    try std.testing.expectEqual(@as(u16, 1), event.failed_attempt);
+    try std.testing.expectEqual(@as(u16, 2), event.max_attempts);
+    try std.testing.expectEqual(@as(u64, 7), event.delay_ms);
+    switch (event.cause) {
+        .http_status => |status| try std.testing.expectEqual(@as(u16, 503), status),
+        else => return error.UnexpectedRetryCause,
+    }
+}
+
+test "Zig name server failures retry and preserve the final transport error" {
+    const allocator = std.testing.allocator;
+    var recovered = TestFixture{
+        .transport_failures = &.{error.NameServerFailure},
+        .responses = &.{.{ .status = 200, .body = "ready" }},
+    };
+    var result = try acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/Packages"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 0,
+        .retry = .{ .max_attempts = 3, .backoff_ms = fixedBackoff },
+        .max_response_bytes = 16,
+    }, recovered.dependencies());
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("ready", result.bytes);
+    try std.testing.expectEqual(@as(usize, 2), recovered.request_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.retry_event_count);
+    switch (recovered.retry_events[0].cause) {
+        .transport_error => |err| try std.testing.expectEqual(error.NameServerFailure, err),
+        else => return error.UnexpectedRetryCause,
+    }
+
+    var exhausted = TestFixture{
+        .transport_failures = &.{ error.NameServerFailure, error.NameServerFailure },
+    };
+    try std.testing.expectError(error.NameServerFailure, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/Packages"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 0,
+        .retry = .{ .max_attempts = 2, .backoff_ms = fixedBackoff },
+        .max_response_bytes = 16,
+    }, exhausted.dependencies()));
+    try std.testing.expectEqual(@as(usize, 2), exhausted.request_count);
+    try std.testing.expectEqual(@as(usize, 1), exhausted.retry_event_count);
+}
+
+test "deterministic host lookup failures are not retried" {
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{
+        .transport_failures = &.{error.UnknownHostName},
+        .responses = &.{.{ .status = 200, .body = "unreachable" }},
+    };
+    try std.testing.expectError(error.UnknownHostName, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/Packages"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 0,
+        .retry = .{ .max_attempts = 3, .backoff_ms = fixedBackoff },
+        .max_response_bytes = 16,
+    }, fixture.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.retry_event_count);
 }
 
 test "not found status is explicit and has no partial-success fallback" {
@@ -1083,16 +1211,20 @@ const TestFixture = struct {
     now_ms: u64 = 0,
     file_bytes: []const u8 = "",
     file_regular: bool = true,
+    transport_failures: []const anyerror = &.{},
     responses: []const FixtureResponse = &.{},
     request_count: usize = 0,
     saw_authorization: [8]bool = @splat(false),
     credential: ?Credential = null,
+    retry_events: [8]RetryEvent = undefined,
+    retry_event_count: usize = 0,
 
     fn dependencies(self: *TestFixture) Dependencies {
         return .{
             .transport = .{ .context = self, .requestFn = transportRequest },
             .files = .{ .context = self, .readFn = readFile },
             .clock = .{ .context = self, .nowMsFn = nowMs, .sleepMsFn = sleepMs },
+            .retry_observer = .{ .context = self, .reportFn = reportRetry },
         };
     }
 
@@ -1108,6 +1240,13 @@ const TestFixture = struct {
     fn sleepMs(context: ?*anyopaque, milliseconds: u64) !void {
         const self: *TestFixture = @ptrCast(@alignCast(context.?));
         self.now_ms += milliseconds;
+    }
+
+    fn reportRetry(context: ?*anyopaque, event: RetryEvent) void {
+        const self: *TestFixture = @ptrCast(@alignCast(context.?));
+        std.debug.assert(self.retry_event_count < self.retry_events.len);
+        self.retry_events[self.retry_event_count] = event;
+        self.retry_event_count += 1;
     }
 
     fn getCredential(context: ?*anyopaque, _: Uri) !?Credential {
@@ -1132,11 +1271,14 @@ const TestFixture = struct {
 
     fn transportRequest(context: ?*anyopaque, allocator: std.mem.Allocator, request_value: HttpRequest) !HttpResponse {
         const self: *TestFixture = @ptrCast(@alignCast(context.?));
-        if (self.request_count >= self.responses.len) return error.ConnectionResetByPeer;
         const index = self.request_count;
+        if (index >= self.transport_failures.len + self.responses.len)
+            return error.ConnectionResetByPeer;
         self.request_count += 1;
         self.saw_authorization[index] = request_value.authorization != null;
-        const fixture = self.responses[index];
+        if (index < self.transport_failures.len)
+            return self.transport_failures[index];
+        const fixture = self.responses[index - self.transport_failures.len];
         if (fixture.body.len > request_value.max_response_bytes) return error.ResponseTooLarge;
         return .{
             .status = fixture.status,
