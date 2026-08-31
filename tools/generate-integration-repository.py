@@ -116,6 +116,7 @@ def build_deb(
 def package_specs(suite: str, architecture: str):
     suite_version = "1.0-1debian1" if suite == "debian-stable" else "1.0-1ubuntu1"
     return [
+        ("ca-certificates", "20240203", "all", {}, {}),
         ("base-dep", "1.0-1", architecture, {}, {}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
@@ -255,15 +256,89 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
         raise RuntimeError(f"fixture repository exceeds {MAX_REPOSITORY_BYTES} bytes")
 
 
+def write_repository_descriptor(
+    output: pathlib.Path,
+    repository_url: str,
+    suite: str,
+    architecture: str,
+    keyring: bytes,
+) -> None:
+    source_path = "etc/apt/sources.list.d/microsoft-prod.list"
+    keyring_path = "usr/share/keyrings/microsoft-prod.gpg"
+    package = "packages-microsoft-prod"
+    control = (
+        f"Package: {package}\n"
+        "Version: 1.2-fixture\n"
+        "Architecture: all\n"
+        "Depends: ca-certificates\n"
+        "Maintainer: debz fixture <fixture.invalid>\n"
+        "Description: Microsoft-shaped repository descriptor fixture\n"
+    ).encode()
+    script = b"#!/bin/sh\nset -e\nexit 0\n"
+    control_entries = [
+        ("./control", control, 0o644),
+        ("./conffiles", f"/{source_path}\n".encode(), 0o644),
+        ("./preinst", script, 0o755),
+        ("./postinst", script, 0o755),
+        ("./prerm", script, 0o755),
+    ]
+    source = (
+        f"deb [arch={architecture} signed-by=/{keyring_path}] "
+        f"{repository_url} {suite} main\n"
+    ).encode()
+    data_entries = [
+        (f"./{source_path}", source, 0o644),
+        (f"./{keyring_path}", keyring, 0o644),
+        (
+            "./etc/debsig/policies/fixture/packages-microsoft-prod.pol",
+            b"<Policy xmlns=\"https://www.debian.org/debsig/1.0/\"/>\n",
+            0o644,
+        ),
+        (
+            "./usr/share/debsig/keyrings/fixture/debsig.gpg",
+            keyring,
+            0o644,
+        ),
+        (
+            f"./usr/share/doc/{package}/README",
+            b"Hermetic Microsoft-shaped descriptor fixture.\n",
+            0o644,
+        ),
+    ]
+    descriptor = (
+        b"!<arch>\n"
+        + ar_member("debian-binary", b"2.0\n")
+        + ar_member("control.tar.gz", tar_gz(control_entries))
+        + ar_member("data.tar.gz", tar_gz(data_entries))
+        + ar_member("_gpgorigin", b"fixture structural signature member")
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(descriptor)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--suite", required=True, choices=("debian-stable", "ubuntu-26.04"))
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
+    parser.add_argument("--descriptor-output", type=pathlib.Path)
+    parser.add_argument("--descriptor-repository-url")
     args = parser.parse_args()
     if not args.output.is_absolute():
         raise SystemExit("--output must be absolute")
+    if (args.descriptor_output is None) != (args.descriptor_repository_url is None):
+        raise SystemExit("--descriptor-output and --descriptor-repository-url must be used together")
+    if args.descriptor_output is not None and not args.descriptor_output.is_absolute():
+        raise SystemExit("--descriptor-output must be absolute")
     write_repository(args.output, args.suite, args.architecture)
+    if args.descriptor_output is not None:
+        write_repository_descriptor(
+            args.descriptor_output,
+            args.descriptor_repository_url,
+            args.suite,
+            args.architecture,
+            (args.output / "fixture-keyring.gpg").read_bytes(),
+        )
 
 
 if __name__ == "__main__":

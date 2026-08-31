@@ -11,6 +11,13 @@ installed-state files. Install roots, cache roots, clocks, proxy settings,
 credentials, keyrings and policy are explicit caller inputs; host APT, GnuPG,
 proxy and environment configuration is never consulted.
 
+`debz repo add` is the one explicit compatibility import boundary: it snapshots
+APT sources, referenced keyrings, and dpkg architecture from the selected
+target root. This is operation-scoped input, not ambient inheritance. `/` is
+enabled only inside the typed repository-add backend; alternate roots never
+fall back to host source, keyring, architecture, cache, state, or lock paths.
+Generic product operations continue to deny `/`.
+
 Production parsing, verification, decompression and archive inspection are
 in-process and never invoke a shell. `dpkg` is the sole intended production
 child-process boundary and is executed with fixed argv/environment policy.
@@ -47,6 +54,9 @@ child-process boundary and is executed with fixed argv/environment policy.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.
+- Repository-add CLI parsing is noninteractive: there are no prompts, stdin or
+  TTY branches, consent flags, or apt subprocesses. The direct process boundary
+  remains fixed-environment dpkg/dpkg-deb execution.
 
 Defaults are part of the public API and remain stable within a major version.
 Overrides may lower limits or raise them deliberately; callers remain

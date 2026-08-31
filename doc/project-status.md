@@ -65,7 +65,9 @@ boundary. Its production `add` backend acquires a trusted descriptor `.deb`,
 authenticates its static repositories and payload keyrings before mutation,
 solves dependencies with installed-state-first behavior, persists exact-lock
 and resumable state evidence, executes through the transaction executor, and
-verifies/imports/refreshes the resulting target configuration. See
+verifies/imports/refreshes the resulting target configuration. The standalone
+`debz repo add --url URL` command wires this backend with `/` as its intentional
+default root and `--root` for isolated images. See
 [Repository management API](repository-management.md).
 
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.

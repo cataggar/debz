@@ -26,6 +26,11 @@ Commands are `refresh`, `install`, `remove`, `upgrade`, `upgrade-all`,
 `reinstall`, `download`, `plan`, `list-installed`, `list-available`, `info`,
 `provides`, `why`, `clean`, and `recover`.
 
+The nested `debz repo add` command is not a product API v1 operation. It uses
+the separate versioned `debz.repository_api` surface documented in
+[Repository management API](repository-management.md), preserving every
+product API v1 request, result, schema, exit meaning, and host-root denial.
+
 `debz -h` and `debz --help` print root help. Every command accepts `-h` and
 `--help` after the command name and prints command-specific help without
 performing validation, filesystem access, repository access, or other backend
