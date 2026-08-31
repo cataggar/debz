@@ -210,6 +210,14 @@ pub fn build(b: *std.Build) void {
     const run_refresh_tests = b.addRunArtifact(refresh_tests);
     b.step("test-refresh", "Run repository refresh tests").dependOn(&run_refresh_tests.step);
 
+    const acquisition_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"repository_acquisition.test."},
+    });
+    const run_acquisition_tests = b.addRunArtifact(acquisition_tests);
+    b.step("test-repository-acquisition", "Run repository byte acquisition tests")
+        .dependOn(&run_acquisition_tests.step);
+
     const package_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"package_acquisition.test."},
