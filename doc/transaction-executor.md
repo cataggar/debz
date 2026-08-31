@@ -9,7 +9,10 @@ Before mutation, the executor validates the complete action/ordering shape,
 identities, artifact mappings, paths, conffile policy, and typed force policy.
 It then acquires, in fixed order, the debz transaction lock,
 `var/lib/dpkg/lock-frontend`, and `var/lib/dpkg/lock`, using bounded waits.
-The production adapter uses POSIX record locks compatible with dpkg.
+On Linux, the production adapter uses `F_OFD_SETLK` open-file-description write
+locks. They conflict with dpkg's POSIX record locks, preserving cross-process
+exclusion, while making independent same-process manager instances serialize
+and preventing an unrelated descriptor close from releasing the held lock.
 Timeout identifies the blocking path and no dpkg process is started. The
 database lock is released after this bounded probe so dpkg can own it; debz
 retains its transaction lock and the frontend lock, with
@@ -95,7 +98,15 @@ diagnostics, completed-command count, plan digest, and command/artifact
 digests. Root safety and lock ownership are rechecked at command boundaries. A report is
 successful only after every ordered command makes its required state transition,
 the final trigger command exits zero, and exact post-state verification passes.
-Recovery and post-state verification are intentionally deferred to #28.
+Durable journal recovery is implemented and exported as `recoverTransaction`:
+it integrity-decodes the journal, requires the supplied plan, root, executor
+policy, and exact lock to match its bindings, and runs the bounded dpkg
+audit/configure/trigger repair sequence when needed. Repository recovery reloads
+and validates the canonical persisted executable plan before calling it.
+Execution and recovery succeed only after final-state verification under the
+dpkg database lock—against planned package transitions, the full exact-lock
+closure by default, or exact locked-package identities and persisted
+plan/journal origin evidence for repository operations.
 
 `FileSystem`, `LockManager`, `ProcessRunner`, and `Cancellation` are injectable
 for hermetic tests. `SystemFileSystem`, `SystemLockManager`, and

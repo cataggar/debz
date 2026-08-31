@@ -19,8 +19,13 @@ fall back to host source, keyring, architecture, cache, state, or lock paths.
 Generic product operations continue to deny `/`.
 
 Production parsing, verification, decompression and archive inspection are
-in-process and never invoke a shell. `dpkg` is the sole intended production
-child-process boundary and is executed with fixed argv/environment policy.
+in-process and never invoke a shell. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb`
+are the only production child processes started directly by debz. These
+fixed-path host tools are trusted dependencies; debz supplies explicit argv
+and a replacement environment and bounds captured output and runtime. Debz
+never directly invokes a shell, apt, or another ambient package manager; dpkg
+may in turn run package maintainer scripts within the package-execution trust
+boundary.
 
 ## Security properties
 
