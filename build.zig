@@ -61,12 +61,20 @@ pub fn build(b: *std.Build) void {
     debz.linkLibrary(zstd);
     debz.link_libc = true;
 
+    const repository_cli = b.createModule(.{
+        .root_source_file = b.path("src/repository_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repository_cli.addImport("debz", debz);
+
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     cli_module.addImport("debz", debz);
+    cli_module.addImport("repository_cli", repository_cli);
 
     const cli = b.addExecutable(.{
         .name = "debz",
@@ -88,6 +96,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and CLI integration tests");
     test_step.dependOn(&run_tests.step);
 
+    const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
+    const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
+    test_step.dependOn(&run_repository_cli_tests.step);
+
     const cli_tests = b.addSystemCommand(&.{ "sh", "tools/test-cli.sh" });
     cli_tests.addArtifactArg(cli);
     cli_tests.addArg(version);
@@ -98,6 +110,8 @@ pub fn build(b: *std.Build) void {
         usage: []const u8,
     }{
         .{ .args = &.{}, .usage = "debz <command> [options] [packages...]" },
+        .{ .args = &.{"repo"}, .usage = "debz repo <command> [options]" },
+        .{ .args = &.{ "repo", "add" }, .usage = "debz repo add --url URL [options]" },
         .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
         .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
         .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
@@ -119,6 +133,8 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "install", "example" }, .usage = "debz install [options] <package>" },
         .{ .args = &.{ "install", "--deadline-ms" }, .usage = "debz install [options] <package>" },
         .{ .args = &.{ "install", "--unknown" }, .usage = "debz install [options] <package>" },
+        .{ .args = &.{ "repo", "add", "--url" }, .usage = "debz repo add --url URL [options]" },
+        .{ .args = &.{ "repo", "add", "--unknown" }, .usage = "debz repo add --url URL [options]" },
     };
     for (help_cases) |case| {
         addHelpFlagTests(b, test_step, cli, case.args, case.usage);
@@ -157,6 +173,29 @@ pub fn build(b: *std.Build) void {
     integration_tests.addArtifactArg(cli);
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
+
+    const repository_add_module = b.createModule(.{
+        .root_source_file = b.path("test/repository-add-integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repository_add_module.addImport("debz", debz);
+    repository_add_module.addImport("repository_cli", repository_cli);
+    const repository_add_harness = b.addExecutable(.{
+        .name = "repository-add-integration",
+        .root_module = repository_add_module,
+    });
+    const repository_add_tests = b.addSystemCommand(
+        &.{ "sh", "tools/test-repository-add.sh" },
+    );
+    repository_add_tests.addArtifactArg(cli);
+    repository_add_tests.addArtifactArg(repository_add_harness);
+    const repository_add_step = b.step(
+        "test-repository-add",
+        "Run the hermetic Microsoft-shaped repository add integration",
+    );
+    repository_add_step.dependOn(&repository_add_tests.step);
+    test_step.dependOn(&repository_add_tests.step);
 
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{

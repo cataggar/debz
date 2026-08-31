@@ -25,6 +25,22 @@ zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
   release-install --prefix "$PWD/release-root"
 ```
 
+## Add a system repository
+
+Repository descriptors are installed through the separate repository-management
+surface:
+
+```sh
+sudo debz repo add \
+  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+```
+
+The target defaults to `/`; `--root PATH` selects an isolated image root.
+Repository add is noninteractive, refreshes by default, and never invokes apt.
+Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
+metadata refresh. See
+[`doc/repository-management.md`](doc/repository-management.md).
+
 `-Dversion` must be a SemVer value and defaults to the package version in `build.zig.zon`. An ordinary install places the target-selected CLI in `bin/`, documentation under `share/doc/debz/`, and schemas under `share/debz/`. The dedicated static-musl `release-install` graph additionally installs reviewed release runtime metadata.
 
 See [`doc/README.md`](doc/README.md) for the CLI, library, JSON, security, and implementation reference. Licensed under [Apache-2.0](LICENSE).

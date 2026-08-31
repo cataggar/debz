@@ -1,6 +1,8 @@
 const std = @import("std");
 const debz = @import("debz");
+const repository_cli = @import("repository_cli");
 const api = debz.product_api;
+const repository_api = debz.repository_api;
 
 const root_help =
     \\debz - deterministic Debian package operations
@@ -9,6 +11,7 @@ const root_help =
     \\  debz <command> [options] [packages...]
     \\
     \\Commands:
+    \\  repo                         Manage repository descriptors
     \\  refresh                      Refresh authenticated repository metadata
     \\  install                      Install one package
     \\  remove                       Remove one package
@@ -91,6 +94,65 @@ const common_options_help =
     \\
 ;
 
+const repository_help =
+    \\debz repo - manage repository descriptors
+    \\
+    \\Usage:
+    \\  debz repo <command> [options]
+    \\
+    \\Commands:
+    \\  add                          Acquire, install, import, and refresh a descriptor
+    \\
+    \\Options:
+    \\  -h, --help                   Show this help
+    \\
+    \\Run 'debz repo add --help' for command-specific help.
+    \\Repository operations are noninteractive and inherit no host APT, proxy,
+    \\credential, keyring, or architecture configuration.
+    \\
+;
+
+const repository_add_help =
+    \\debz repo add - acquire and activate a repository descriptor
+    \\
+    \\Usage:
+    \\  debz repo add --url URL [options]
+    \\
+    \\Required options:
+    \\  --url URL                    Repository descriptor URL
+    \\
+    \\Target options:
+    \\  --root PATH                  Target root (default: /)
+    \\  --architecture ARCH          Override target dpkg architecture
+    \\  --cache-path PATH            Logical cache path inside the target root
+    \\  --state-path PATH            Logical state path inside the target root
+    \\  --sha256 DIGEST              Expected descriptor SHA-256
+    \\  --no-refresh                 Install and import without final refresh
+    \\
+    \\Network options:
+    \\  --proxy URI
+    \\  --connect-timeout-ms N --read-timeout-ms N --deadline-ms N
+    \\  --redirect-limit N --retry-attempts N --retry-backoff-ms N
+    \\  --maximum-descriptor-bytes N --maximum-package-bytes N
+    \\  --maximum-release-bytes N --maximum-compressed-index-bytes N
+    \\  --maximum-decompressed-index-bytes N --maximum-decoder-memory N
+    \\
+    \\Resource options:
+    \\  --maximum-cache-object-bytes N --lock-wait-ms N
+    \\  --maximum-operation-state-bytes N --maximum-repositories N
+    \\  --maximum-actions N --maximum-total-metadata-bytes N
+    \\  --maximum-total-package-bytes N --maximum-retained-package-bytes N
+    \\  --maximum-cache-growth-bytes N
+    \\
+    \\Output options:
+    \\  --json                       Write canonical repository result JSON
+    \\  -h, --help                   Show this help
+    \\
+    \\The operation is authorization to mutate the selected root. It never
+    \\prompts, reads stdin, invokes apt, or imports configuration outside that root.
+    \\
+;
+
 const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory };
 const SingleOption = enum {
     install_root,
@@ -112,6 +174,8 @@ const SingleOption = enum {
 const HelpTopic = union(enum) {
     root,
     operation: api.Operation,
+    repository,
+    repository_add,
     package_family_capabilities,
     version,
 };
@@ -158,6 +222,15 @@ pub fn main(init: std.process.Init) !void {
         try stdout.writeByte('\n');
         return;
     }
+    if (std.mem.eql(u8, command, "repo")) {
+        try runRepository(
+            init,
+            &args,
+            stdout,
+            stderr,
+        );
+        return;
+    }
     const operation = debz.parseOperation(command) orelse {
         try stderr.print("debz: unknown command '{s}'\n", .{command});
         try stderr.writeAll(root_help);
@@ -200,6 +273,18 @@ pub fn main(init: std.process.Init) !void {
 fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpTopic {
     if (isHelpFlag(command)) return .root;
 
+    if (std.mem.eql(u8, command, "repo")) {
+        const subcommand = args.next() orelse return null;
+        var has_help = isHelpFlag(subcommand);
+        while (args.next()) |argument| {
+            if (isHelpFlag(argument)) has_help = true;
+        }
+        if (!has_help) return null;
+        if (isHelpFlag(subcommand)) return .repository;
+        if (std.mem.eql(u8, subcommand, "add")) return .repository_add;
+        return null;
+    }
+
     var has_help = false;
     while (args.next()) |argument| {
         if (isHelpFlag(argument)) has_help = true;
@@ -221,6 +306,8 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
     switch (topic) {
         .root => try stdout.writeAll(root_help),
         .operation => |operation| try printOperationHelp(stdout, operation),
+        .repository => try stdout.writeAll(repository_help),
+        .repository_add => try stdout.writeAll(repository_add_help),
         .package_family_capabilities => try stdout.writeAll(
             \\debz package-family-capabilities - print package-family capabilities as JSON
             \\
@@ -241,6 +328,132 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\  -h, --help  Show this help
             \\
         ),
+    }
+}
+
+fn runRepository(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const subcommand = args.next() orelse {
+        try stderr.writeAll("debz: missing command for 'debz repo'\n");
+        try stderr.writeAll(repository_help);
+        try stderr.flush();
+        std.process.exit(@intFromEnum(repository_api.ExitStatus.usage));
+    };
+    if (!std.mem.eql(u8, subcommand, "add")) {
+        try stderr.print("debz: unknown repository command '{s}'\n", .{subcommand});
+        try stderr.writeAll(repository_help);
+        try stderr.flush();
+        std.process.exit(@intFromEnum(repository_api.ExitStatus.usage));
+    }
+
+    var arguments: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |argument| try arguments.append(init.arena.allocator(), argument);
+    const parsed = repository_cli.parseAdd(arguments.items) catch |err| {
+        const output = requestedRepositoryOutput(arguments.items);
+        if (output == .json) {
+            const invalid = repository_api.failure(
+                .usage,
+                if (err == error.InvalidDigest) .invalid_digest else .invalid_request,
+                "request",
+                @errorName(err),
+            );
+            try renderRepository(init.arena.allocator(), stdout, stderr, output, invalid);
+        } else {
+            try stderr.print("debz: {s}\n", .{@errorName(err)});
+            try stderr.writeAll("Try 'debz repo add --help'.\n");
+        }
+        try stdout.flush();
+        try stderr.flush();
+        std.process.exit(@intFromEnum(repository_api.ExitStatus.usage));
+    };
+
+    var backend_context: debz.ProductionRepositoryBackend = .{ .io = init.io };
+    var result = repository_api.execute(
+        init.arena.allocator(),
+        parsed.request,
+        backend_context.interface(),
+    ) catch {
+        const internal = repository_api.failure(
+            .internal,
+            .internal_error,
+            "internal",
+            "internal execution error",
+        );
+        try renderRepository(
+            init.arena.allocator(),
+            stdout,
+            stderr,
+            parsed.output,
+            internal,
+        );
+        try stdout.flush();
+        try stderr.flush();
+        std.process.exit(@intFromEnum(internal.exit_status));
+    };
+    defer result.deinit();
+    try renderRepository(
+        init.arena.allocator(),
+        stdout,
+        stderr,
+        parsed.output,
+        result,
+    );
+    if (result.exit_status != .success) {
+        try stdout.flush();
+        try stderr.flush();
+        std.process.exit(@intFromEnum(result.exit_status));
+    }
+}
+
+fn requestedRepositoryOutput(arguments: []const []const u8) repository_cli.OutputFormat {
+    for (arguments) |argument| {
+        if (std.mem.eql(u8, argument, "--json")) return .json;
+    }
+    return .human;
+}
+
+fn renderRepository(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    format: repository_cli.OutputFormat,
+    result: repository_api.Result,
+) !void {
+    if (format == .json) {
+        const json = try result.canonicalJson(allocator);
+        try stdout.writeAll(json);
+        return;
+    }
+    const writer = if (result.exit_status == .success) stdout else stderr;
+    const summary = try result.humanSummary(allocator);
+    defer allocator.free(summary);
+    try writer.print("repo add: {s}", .{summary});
+    if (result.descriptor == null and result.installed_phase != .pending) {
+        try writer.print(
+            "; installed={s}; refreshed={s}",
+            .{
+                if (result.installed) "yes" else "no",
+                if (result.refreshed) "yes" else "no",
+            },
+        );
+    }
+    try writer.writeByte('\n');
+    for (result.diagnostics[0..result.diagnostic_count]) |diagnostic| {
+        if (diagnostic.phase) |phase| {
+            try writer.print(
+                "debz[{s}] ({s}): {s}\n",
+                .{ @tagName(diagnostic.id), phase, diagnostic.message },
+            );
+        } else {
+            try writer.print(
+                "debz[{s}]: {s}\n",
+                .{ @tagName(diagnostic.id), diagnostic.message },
+            );
+        }
     }
 }
 

@@ -68,8 +68,18 @@ test "repository management API is exported without CLI coupling" {
         .root = "/target",
         .descriptor_url = "https://packages.example.test/config.deb",
         .architecture = "amd64",
+        .network = debz.RepositoryNetworkPolicy{
+            .overall_timeout_ms = 60_000,
+        },
+        .cache = debz.RepositoryCachePolicy{},
+        .state = debz.RepositoryStatePolicy{},
+        .resources = debz.RepositoryResourcePolicy{},
     };
     try std.testing.expectEqual(debz.RepositoryOperation.add, request.operation);
+    _ = debz.RepositoryTrustMode;
+    _ = debz.RepositoryPhaseState;
+    _ = debz.RepositoryDescriptorIdentity;
+    _ = debz.RepositoryEvidencePaths;
     _ = debz.RepositoryResult;
     _ = debz.ProductionRepositoryBackend;
 }

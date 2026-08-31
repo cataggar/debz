@@ -7,6 +7,39 @@ SHA-256, optional target architecture, `no_refresh`, and bounded cache, state,
 network, and operation-wide resource policy. The production implementation is
 `debz.ProductionRepositoryBackend`.
 
+## CLI
+
+The standalone binary wires the typed backend directly:
+
+```sh
+sudo debz repo add \
+  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+```
+
+`--url` is required. `--root` defaults to `/`; alternate roots use the same
+logical `/var/cache/debz` and `/var/lib/debz` defaults beneath the selected
+root. `--architecture` overrides target dpkg architecture discovery,
+`--sha256` pins descriptor bytes, `--no-refresh` skips only the final refresh,
+and `--json` emits canonical
+[`repository-operation-result-v1`](../schema/repository-operation-result-v1.json).
+Explicit logical cache/state paths, proxy policy, timeouts, retry/redirect
+bounds, byte limits, lock wait, and aggregate repository/action/metadata/
+package/cache budgets map directly to the v1 request fields; see
+`debz repo add --help` for spellings.
+
+`debz repo add` is the authorization to mutate the selected root. It does not
+accept or require `--assume-yes`, `--allow-host-root`,
+`--import-target-apt-config`, `--install-root`, `--refresh`, or a separate
+noninteractive flag. It never prompts, checks TTY state, reads stdin, invokes
+apt, or consults environment proxy/netrc/credential helpers. Help flags take
+precedence over malformed or incomplete command arguments.
+
+Human output reports descriptor identity and truthful installed/refreshed
+state. JSON output is the canonical typed result, including diagnostics and
+evidence paths. A post-install import or refresh failure exits nonzero while
+retaining `installed=true`; no output claims rollback. Observable descriptor
+URLs redact the complete query and never persist URI user information.
+
 The canonical result schema is
 [`repository-operation-result-v1`](../schema/repository-operation-result-v1.json).
 It records acquisition, structural validation, authenticated repository
@@ -38,6 +71,13 @@ declarations fail before target mutation. Explicit false values remain valid.
 Architecture comes only from an explicit request or target-root dpkg
 configuration. Host `uname`, host APT configuration, environment proxies,
 netrc, prompts, and TTY input are not used.
+
+The CLI default `/` is intentionally safe only because it enters this typed
+operation, whose executor policy enables host-root mutation for repository add
+alone. Product API v1 and every generic product command continue to reject
+host root. An alternate `--root` resolves source files, keyrings, architecture,
+cache, state, locks, and evidence only within that root; it never falls back
+to `/`.
 
 ## Planning and mutation boundary
 

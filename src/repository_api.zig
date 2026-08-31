@@ -401,6 +401,14 @@ pub fn validateResult(result: Result) !void {
             return error.InvalidDescriptor;
         const uri = std.Uri.parse(descriptor.effective_url) catch return error.InvalidDescriptor;
         if (uri.user != null or uri.password != null) return error.UnredactedCredential;
+        if (uri.fragment != null) return error.UnredactedCredential;
+        if (uri.query) |query| {
+            const value = switch (query) {
+                .raw, .percent_encoded => |bytes| bytes,
+            };
+            if (!std.mem.eql(u8, value, "REDACTED"))
+                return error.UnredactedQuery;
+        }
     }
     inline for (.{
         result.paths.exact_lock,
@@ -957,6 +965,23 @@ test "repository result forbids success-shaped partial state and is deterministi
     );
     result.summary = "tampered";
     try std.testing.expectError(error.DigestMismatch, result.canonicalJson(std.testing.allocator));
+}
+
+test "repository result rejects unredacted descriptor query data" {
+    var result = failure(.download, .acquisition_failed, "acquire", "failed");
+    result.descriptor = .{
+        .package = "packages-microsoft-prod",
+        .version = "1",
+        .architecture = "all",
+        .sha256 = @splat(1),
+        .size = 1,
+        .effective_url = "https://packages.example.test/config.deb?token=secret",
+        .trust_mode = .verified_https,
+    };
+    try std.testing.expectError(
+        error.UnredactedQuery,
+        result.canonicalJson(std.testing.allocator),
+    );
 }
 
 test "repository result represents explicit no-refresh success" {

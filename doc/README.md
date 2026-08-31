@@ -2,7 +2,7 @@
 
 - [Stable product API and CLI contract](product-api.md)
 - [Repository management API](repository-management.md) documents the
-  versioned library-only repository-add request, trust model, state machine,
+  versioned API and `debz repo add` CLI, trust model, state machine,
   idempotence, and recovery evidence.
 - [Release installation and runtime requirements](release-installation.md) describes version injection, the installed tree, and fully static Linux binaries.
 - [Deterministic release packaging and validation](release-tooling.md)

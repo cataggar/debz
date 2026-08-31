@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-trap 'rm -rf .zig-cache/cli-production-test; rm -f cli-test-stderr' EXIT
+trap 'rm -rf .zig-cache/cli-production-test; rm -f cli-test-stderr cli-test-stdout' EXIT
 
 debz=$1
 expected_version=$2
@@ -25,6 +25,72 @@ status_code=$?
 set -e
 test "$status_code" -eq 2
 grep -q "unknown command '--version'" cli-test-stderr
+
+set +e
+"$debz" repo >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+grep -q "missing command for 'debz repo'" cli-test-stderr
+
+set +e
+"$debz" repo unknown >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+grep -q "unknown repository command 'unknown'" cli-test-stderr
+
+for arguments in \
+    "repo add --json" \
+    "repo add --json --url https://one.invalid/config.deb --url https://two.invalid/config.deb" \
+    "repo add --json --url https://packages.invalid/config.deb --sha256 malformed" \
+    "repo add --json --url https://packages.invalid/config.deb --redirect-limit 65536" \
+    "repo add --json --url https://packages.invalid/config.deb --deadline-ms 0" \
+    "repo add --json --url https://packages.invalid/config.deb --root relative" \
+    "repo add --json --url https://packages.invalid/config.deb -- --operand" \
+    "repo add --json --url https://packages.invalid/config.deb --refresh" \
+    "repo add --json --url https://packages.invalid/config.deb --install-root /" \
+    "repo add --json --url https://packages.invalid/config.deb --import-target-apt-config" \
+    "repo add --json --url https://packages.invalid/config.deb --allow-host-root" \
+    "repo add --json --url https://packages.invalid/config.deb --assume-yes"
+do
+    set +e
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"operation":"add"'
+    printf '%s' "$output" | grep -q '"id":"invalid_request"\|"id":"invalid_digest"\|"id":"invalid_root"'
+    printf '%s' "$output" | grep -q '"exit_status":2'
+done
+
+secret='fixture-query-secret'
+scheme=https
+credential_authority='user:credential@packages.invalid'
+set +e
+output=$("$debz" repo add --json \
+    --url "$scheme://$credential_authority/config.deb?token=$secret" \
+    2>cli-test-stderr)
+status_code=$?
+set -e
+test "$status_code" -eq 2
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q '"id":"credential_bearing_url"'
+printf '%s' "$output" | grep -vq "$secret"
+printf '%s' "$output" | grep -vq 'user:credential'
+
+set +e
+"$debz" repo add \
+    --url https://packages.invalid/config.deb \
+    --root relative \
+    >cli-test-stdout 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+test ! -s cli-test-stdout
+grep -q 'repo add: root must be a canonical absolute path' cli-test-stderr
+grep -Fq 'debz[invalid_root] (request): root must be a canonical absolute path' cli-test-stderr
 
 output=$("$debz" list-installed $read_common 2>cli-test-stderr)
 test ! -s cli-test-stderr
