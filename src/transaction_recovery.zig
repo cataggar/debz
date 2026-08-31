@@ -652,7 +652,7 @@ pub fn verifyExactLockV2LockedPackagesWithEvidence(
     reader: StatusReader,
     maximum_status_bytes: usize,
 ) !Verification {
-    const verification = try verifyExactLockV2LockedPackageStatus(
+    const verification = try verifyExactLockV2LockedPackages(
         allocator,
         lock,
         root,
@@ -708,7 +708,11 @@ fn verifyExactLockV2Status(
     return .{};
 }
 
-fn verifyExactLockV2LockedPackageStatus(
+/// Verifies current dpkg identities for every package in an operation-scoped
+/// lock and rejects any unhealthy package, including packages outside the
+/// lock. Artifact origins must be established separately from durable
+/// lock/provenance evidence; dpkg status cannot prove historical origin.
+pub fn verifyExactLockV2LockedPackages(
     allocator: std.mem.Allocator,
     lock: exact_lock_v2.Lock,
     root: []const u8,
