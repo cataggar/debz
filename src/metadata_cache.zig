@@ -97,6 +97,21 @@ pub const Record = struct {
 pub const PublishOptions = struct {
     lock: LockPolicy = .fail_fast,
     hooks: Hooks = .{},
+    reservation: ?Reservation = null,
+};
+
+pub const Reservation = struct {
+    context: *anyopaque,
+    reserveFn: *const fn (*anyopaque, u64) anyerror!*anyopaque,
+    finishFn: *const fn (*anyopaque, *anyopaque, u64) void,
+
+    pub fn reserve(self: Reservation, bytes: u64) !*anyopaque {
+        return self.reserveFn(self.context, bytes);
+    }
+
+    pub fn finish(self: Reservation, token: *anyopaque, committed: u64) void {
+        self.finishFn(self.context, token, committed);
+    }
 };
 
 pub const LockPolicy = union(enum) {
@@ -142,6 +157,23 @@ pub const GcResult = struct {
     deleted: usize,
     complete: bool,
 };
+
+fn existingFileSize(dir: Dir, io: Io, name: []const u8) !?u64 {
+    var file = dir.openFile(io, name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop, error.NotDir, error.AccessDenied => return error.CorruptObject,
+        else => |other| return other,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.CorruptObject;
+    return stat.size;
+}
 
 pub const Cache = struct {
     io: Io,
@@ -230,6 +262,42 @@ pub const Cache = struct {
 
         var digest_hex: [64]u8 = undefined;
         expected.digest.formatHex(&digest_hex);
+        const manifest_name = manifestName(repository, snapshot);
+        var manifest_buffer: [manifest_limit]u8 = undefined;
+        const manifest_bytes = try encodeManifest(
+            &manifest_buffer,
+            repository,
+            snapshot,
+            provenance,
+            expected,
+        );
+        const existing_object_size = try existingFileSize(
+            self.objects,
+            self.io,
+            &digest_hex,
+        );
+        const existing_manifest_size = try existingFileSize(
+            self.manifests,
+            self.io,
+            &manifest_name,
+        );
+        const object_growth = expected.size -| (existing_object_size orelse 0);
+        const manifest_growth: u64 =
+            @as(u64, @intCast(manifest_bytes.len)) -|
+            (existing_manifest_size orelse 0);
+        const requested_growth = std.math.add(
+            u64,
+            object_growth,
+            manifest_growth,
+        ) catch return error.ObjectTooLarge;
+        var reservation_token: ?*anyopaque = null;
+        var committed_growth: u64 = 0;
+        if (options.reservation) |reservation| {
+            reservation_token = try reservation.reserve(requested_growth);
+        }
+        defer if (reservation_token) |token|
+            options.reservation.?.finish(token, committed_growth);
+
         const object_stage = try stageName("object", expected.digest);
         defer self.staging.deleteFile(self.io, &object_stage) catch {};
 
@@ -247,19 +315,11 @@ pub const Cache = struct {
 
         try self.staging.rename(&object_stage, self.objects, &digest_hex, self.io);
         try syncDirectory(self.io, self.objects);
+        committed_growth = object_growth;
         try options.hooks.run(.object_published);
 
-        const manifest_name = manifestName(repository, snapshot);
         const manifest_stage = try stageName("manifest", expected.digest);
         defer self.staging.deleteFile(self.io, &manifest_stage) catch {};
-        var manifest_buffer: [manifest_limit]u8 = undefined;
-        const manifest_bytes = try encodeManifest(
-            &manifest_buffer,
-            repository,
-            snapshot,
-            provenance,
-            expected,
-        );
         {
             var staged_manifest = try self.staging.createFile(self.io, &manifest_stage, .{
                 .exclusive = true,
@@ -273,6 +333,7 @@ pub const Cache = struct {
         try options.hooks.run(.manifest_staged);
         try self.staging.rename(&manifest_stage, self.manifests, &manifest_name, self.io);
         try syncDirectory(self.io, self.manifests);
+        committed_growth = requested_growth;
     }
 
     /// Cache-only lookup fails closed if either the manifest or object is absent or invalid.
@@ -297,6 +358,7 @@ pub const Cache = struct {
             error.SymLinkLoop, error.NotDir, error.AccessDenied => return error.CorruptManifest,
             else => |e| return e,
         };
+
         defer allocator.free(raw_manifest);
         const manifest = decodeManifest(raw_manifest, repository, snapshot) catch
             return error.CorruptManifest;
@@ -642,6 +704,93 @@ test "failed verification publishes no manifest and cleans staging" {
     try std.testing.expect(try staging.next(std.testing.io) == null);
 }
 
+const TestReservation = struct {
+    limit: u64,
+    used: u64 = 0,
+    pending: u64 = 0,
+    calls: usize = 0,
+    last_requested: u64 = 0,
+    last_committed: u64 = 0,
+
+    fn interface(self: *TestReservation) Reservation {
+        return .{
+            .context = self,
+            .reserveFn = reserve,
+            .finishFn = finish,
+        };
+    }
+
+    fn reserve(context: *anyopaque, bytes: u64) !*anyopaque {
+        const self: *TestReservation = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.last_requested = bytes;
+        if (self.used + self.pending + bytes > self.limit)
+            return error.ResourceBudgetExceeded;
+        self.pending += bytes;
+        return self;
+    }
+
+    fn finish(context: *anyopaque, _: *anyopaque, committed: u64) void {
+        const self: *TestReservation = @ptrCast(@alignCast(context));
+        self.pending -= self.last_requested;
+        self.used += committed;
+        self.last_committed = committed;
+    }
+};
+
+test "cache growth is reserved before objects or derived manifests are published" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+
+    const bytes = "budgeted metadata";
+    const identity: ObjectIdentity = .{
+        .digest = Digest.of(bytes),
+        .size = bytes.len,
+    };
+    var denied: TestReservation = .{ .limit = bytes.len };
+    try std.testing.expectError(error.ResourceBudgetExceeded, cache.publish(
+        test_repository,
+        test_snapshot,
+        test_provenance,
+        identity,
+        bytes,
+        .{ .reservation = denied.interface() },
+    ));
+    try std.testing.expect(denied.last_requested > bytes.len);
+    var objects = cache.objects.iterate();
+    try std.testing.expect(try objects.next(std.testing.io) == null);
+    var manifests = cache.manifests.iterate();
+    try std.testing.expect(try manifests.next(std.testing.io) == null);
+    var staging = cache.staging.iterate();
+    try std.testing.expect(try staging.next(std.testing.io) == null);
+
+    var exact: TestReservation = .{ .limit = denied.last_requested };
+    try cache.publish(
+        test_repository,
+        test_snapshot,
+        test_provenance,
+        identity,
+        bytes,
+        .{ .reservation = exact.interface() },
+    );
+    try std.testing.expectEqual(exact.limit, exact.used);
+    try std.testing.expectEqual(@as(u64, 0), exact.pending);
+
+    const used = exact.used;
+    try cache.publish(
+        test_repository,
+        test_snapshot,
+        test_provenance,
+        identity,
+        bytes,
+        .{ .reservation = exact.interface() },
+    );
+    try std.testing.expectEqual(used, exact.used);
+    try std.testing.expectEqual(@as(u64, 0), exact.last_requested);
+}
+
 const Interrupt = struct {
     point: HookPoint,
 
@@ -677,6 +826,71 @@ test "interruption before manifest rename preserves old complete snapshot" {
     var record = try cache.lookup(std.testing.allocator, test_repository, test_snapshot);
     defer record.deinit();
     try std.testing.expectEqualStrings(old, record.bytes);
+}
+
+test "failed publication releases uncommitted cache reservation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const bytes = "interrupted metadata";
+    var budget: TestReservation = .{ .limit = 4096 };
+    var interrupt: Interrupt = .{ .point = .object_staged };
+    try std.testing.expectError(error.Interrupted, cache.publish(
+        test_repository,
+        test_snapshot,
+        test_provenance,
+        .{ .digest = Digest.of(bytes), .size = bytes.len },
+        bytes,
+        .{
+            .reservation = budget.interface(),
+            .hooks = .{ .context = &interrupt, .runFn = Interrupt.run },
+        },
+    ));
+    try std.testing.expectEqual(@as(u64, 0), budget.used);
+    try std.testing.expectEqual(@as(u64, 0), budget.pending);
+    var staging = cache.staging.iterate();
+    try std.testing.expect(try staging.next(std.testing.io) == null);
+}
+
+test "failed publication commits only cache growth already published" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const bytes = "published object without manifest";
+    const identity: ObjectIdentity = .{
+        .digest = Digest.of(bytes),
+        .size = bytes.len,
+    };
+    var budget: TestReservation = .{ .limit = 4096 };
+    var interrupt: Interrupt = .{ .point = .object_published };
+    try std.testing.expectError(error.Interrupted, cache.publish(
+        test_repository,
+        test_snapshot,
+        test_provenance,
+        identity,
+        bytes,
+        .{
+            .reservation = budget.interface(),
+            .hooks = .{ .context = &interrupt, .runFn = Interrupt.run },
+        },
+    ));
+    try std.testing.expectEqual(@as(u64, bytes.len), budget.used);
+    try std.testing.expectEqual(@as(u64, 0), budget.pending);
+    var digest_hex: [64]u8 = undefined;
+    identity.digest.formatHex(&digest_hex);
+    try cache.objects.access(std.testing.io, &digest_hex, .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        cache.manifests.access(
+            std.testing.io,
+            &manifestName(test_repository, test_snapshot),
+            .{},
+        ),
+    );
+    var staging = cache.staging.iterate();
+    try std.testing.expect(try staging.next(std.testing.io) == null);
 }
 
 test "corrupt object and mismatched manifest fail closed" {

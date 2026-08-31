@@ -48,11 +48,15 @@ only authenticated or stale-authenticated complete snapshots are solver
 eligible. Repository dependencies use verified acquisition; the descriptor
 uses its existing CAS object.
 
-An exact-lock v2 file is atomically persisted before dpkg and is passed to both
-execution and recovery. It records the
+The exact canonical executable plan and an exact-lock v2 file are atomically
+persisted before dpkg and passed to both execution and recovery. The plan is
+reloaded byte-canonically on resume rather than regenerated from the
+potentially incomplete current dpkg state. The lock records the
 descriptor and every repository-selected package in the mutation closure;
 already-installed dependency satisfiers are retained from target state rather
-than assigned invented artifact origins. The executor uses a fixed
+than assigned invented artifact origins, and binds the complete request,
+authenticated repository snapshots, local artifacts, and executable plan.
+The executor uses a fixed
 noninteractive, keep-existing-conffile policy. Only this typed backend may opt
 into host-root execution, and only when the requested root is `/`; product API
 v1 continues to deny host-root execution for every operation.
@@ -66,7 +70,14 @@ lock digests cannot be replaced by caller-supplied provenance fields.
 
 Operation-wide limits bound normalized repositories, solver actions,
 authenticated metadata bytes, total package bytes, retained package memory,
-cache growth, and elapsed time. Package bodies are validated after CAS
+cache growth, and elapsed time. Metadata objects and per-repository/aggregate
+manifests reserve their actual cache growth before publication; retained
+snapshot and aggregate-manifest memory is likewise reserved before it becomes
+an accepted result. One absolute monotonic deadline is propagated through
+descriptor/repository/package acquisition, dpkg execution, and recovery.
+Every transport, lock wait, and process timeout is capped by the remaining
+operation time, and expiry cancels a running dpkg process. Package bodies are
+validated after CAS
 publication and released before the next package; the executor retains only
 CAS paths and immutable provenance.
 
@@ -88,6 +99,13 @@ evidence, and makes no rollback claim. Missing or inconsistent durable
 evidence produces `recovery_required` rather than a success-shaped result.
 State write/fsync failures after mutation return progress-aware nonzero results
 with `installed=true` and every known evidence path. Resume validates
-persisted lock, provenance, manifest, managed files, and dpkg state rather than
+the persisted plan, request, local artifacts, repository snapshots, lock,
+provenance, manifest, managed files, and dpkg state rather than
 requiring stale state path fields; durable `refreshed=true` history is
-monotonic.
+monotonic. If dpkg completed before provenance/state publication, provenance
+is reconstructed only from the original plan, lock, report/journal, and
+authenticated evidence.
+
+All root and logical-path fields use one schema-aligned grammar: valid UTF-8,
+canonical absolute components, no backslashes, C0/DEL controls, dot
+components, duplicate separators, or trailing separator.

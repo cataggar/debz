@@ -1,4 +1,5 @@
 const std = @import("std");
+const absolute_path = @import("absolute_path.zig");
 const solver = @import("solver.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
@@ -169,6 +170,23 @@ pub const Cancellation = struct {
 
 const never_context: u8 = 0;
 
+pub const Deadline = struct {
+    context: ?*anyopaque,
+    nowMsFn: *const fn (?*anyopaque) u64,
+    expires_at_ms: u64,
+
+    pub fn remainingMs(self: Deadline) !u64 {
+        const now = self.nowMsFn(self.context);
+        if (now >= self.expires_at_ms) return error.DeadlineExceeded;
+        return self.expires_at_ms - now;
+    }
+
+    pub fn expired(self: Deadline) bool {
+        _ = self.remainingMs() catch return true;
+        return false;
+    }
+};
+
 pub const Dependencies = struct {
     filesystem: FileSystem,
     locks: LockManager,
@@ -176,6 +194,7 @@ pub const Dependencies = struct {
     journal: recovery.Store,
     status: recovery.StatusReader,
     cancellation: Cancellation = Cancellation.never(),
+    deadline: ?Deadline = null,
     crash: recovery.CrashInjector = recovery.CrashInjector.none(),
 };
 
@@ -280,6 +299,10 @@ pub const RecoveryReport = struct {
     }
 };
 
+pub fn planDigest(plan: solver.Plan) [32]u8 {
+    return hashPlan(plan);
+}
+
 const State = struct {
     arena: std.mem.Allocator,
     commands: std.ArrayList(CommandProvenance) = .empty,
@@ -302,6 +325,15 @@ pub fn execute(
     const arena = arena_ptr.allocator();
 
     var state: State = .{ .arena = arena };
+    var cancellation_context: DeadlineCancellationContext = .{
+        .base = dependencies.cancellation,
+        .deadline = dependencies.deadline,
+    };
+    const cancellation = cancellation_context.interface();
+    if (deadlineExpired(dependencies.deadline)) {
+        state.failure = deadlineFailure(arena, null, null, 0);
+        return finish(allocator, arena_ptr, &state, hashPlan(request.plan.*));
+    }
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
@@ -336,7 +368,14 @@ pub fn execute(
     };
 
     for (lock_paths, 0..) |path, index| {
-        held[index] = dependencies.locks.acquire(path, request.policy.locks.wait_ms) catch |err| {
+        const wait_ms = remainingTimeout(
+            dependencies.deadline,
+            request.policy.locks.wait_ms,
+        ) catch {
+            state.failure = deadlineFailure(arena, null, null, 0);
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        };
+        held[index] = dependencies.locks.acquire(path, wait_ms) catch |err| {
             state.failure = .{
                 .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
                 .lock_path = path,
@@ -417,7 +456,7 @@ pub fn execute(
             };
             bootstrap_normalized = true;
         }
-        if (dependencies.cancellation.cancelled()) {
+        if (cancellation.cancelled()) {
             journal.state = .interrupted;
             journal.failure = "cancelled before dpkg invocation";
             recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -514,8 +553,23 @@ pub fn execute(
             .environment = &audited_environment,
             .phase = phase,
             .package = if (phase == .configure_pending) null else ordered.package,
-            .timeout_ms = request.policy.process_timeout_ms,
-            .cancellation = dependencies.cancellation,
+            .timeout_ms = remainingTimeout(
+                dependencies.deadline,
+                request.policy.process_timeout_ms,
+            ) catch {
+                journal.state = .interrupted;
+                journal.failure = "operation deadline expired before dpkg invocation";
+                recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+                state.transaction_state = .interrupted;
+                state.failure = deadlineFailure(
+                    arena,
+                    phase,
+                    if (phase == .configure_pending) null else ordered.package,
+                    state.commands.items.len,
+                );
+                return finish(allocator, arena_ptr, &state, plan_sha256);
+            },
+            .cancellation = cancellation,
         }) catch |err| {
             state.failure = .{
                 .code = if (err == error.Timeout) .process_timeout else .process_spawn,
@@ -530,6 +584,19 @@ pub fn execute(
             state.transaction_state = journal.state;
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
+        if (deadlineExpired(dependencies.deadline)) {
+            journal.state = .interrupted;
+            journal.failure = "operation deadline expired during dpkg invocation";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = deadlineFailure(
+                arena,
+                phase,
+                if (phase == .configure_pending) null else ordered.package,
+                state.commands.items.len,
+            );
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        }
         try state.commands.append(arena, provenance);
         const made_configuration_progress = if (!successful(result.termination) and configured_before != null)
             if (configuredPackageCount(arena, dependencies.status, request.install_root) catch null) |after|
@@ -573,7 +640,7 @@ pub fn execute(
     }
 
     if (request.plan.ordered_actions.len != 0) {
-        if (dependencies.cancellation.cancelled()) {
+        if (cancellation.cancelled()) {
             journal.state = .interrupted;
             journal.failure = "cancelled before trigger processing";
             recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -623,8 +690,23 @@ pub fn execute(
             .environment = &audited_environment,
             .phase = .triggers,
             .package = null,
-            .timeout_ms = request.policy.process_timeout_ms,
-            .cancellation = dependencies.cancellation,
+            .timeout_ms = remainingTimeout(
+                dependencies.deadline,
+                request.policy.process_timeout_ms,
+            ) catch {
+                journal.state = .interrupted;
+                journal.failure = "operation deadline expired before triggers";
+                recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+                state.transaction_state = .interrupted;
+                state.failure = deadlineFailure(
+                    arena,
+                    .triggers,
+                    null,
+                    state.commands.items.len,
+                );
+                return finish(allocator, arena_ptr, &state, plan_sha256);
+            },
+            .cancellation = cancellation,
         }) catch |err| {
             state.failure = .{
                 .code = if (err == error.Timeout) .process_timeout else .process_spawn,
@@ -638,6 +720,19 @@ pub fn execute(
             state.transaction_state = journal.state;
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
+        if (deadlineExpired(dependencies.deadline)) {
+            journal.state = .interrupted;
+            journal.failure = "operation deadline expired during triggers";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = deadlineFailure(
+                arena,
+                .triggers,
+                null,
+                state.commands.items.len,
+            );
+            return finish(allocator, arena_ptr, &state, plan_sha256);
+        }
         try state.commands.append(arena, .{
             .phase = .triggers,
             .package = null,
@@ -681,7 +776,18 @@ pub fn execute(
         }
     }
 
-    held[2] = dependencies.locks.acquire(lock_paths[2], request.policy.locks.wait_ms) catch |err| {
+    const verification_wait_ms = remainingTimeout(
+        dependencies.deadline,
+        request.policy.locks.wait_ms,
+    ) catch {
+        journal.state = .interrupted;
+        journal.failure = "operation deadline expired before verification lock";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = deadlineFailure(arena, null, null, state.commands.items.len);
+        return finish(allocator, arena_ptr, &state, plan_sha256);
+    };
+    held[2] = dependencies.locks.acquire(lock_paths[2], verification_wait_ms) catch |err| {
         journal.state = .interrupted;
         journal.failure = "cannot establish stable verification lock";
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -777,6 +883,20 @@ pub fn recover(
     errdefer arena_ptr.deinit();
     const arena = arena_ptr.allocator();
     var state: State = .{ .arena = arena };
+    var cancellation_context: DeadlineCancellationContext = .{
+        .base = dependencies.cancellation,
+        .deadline = dependencies.deadline,
+    };
+    const cancellation = cancellation_context.interface();
+    if (deadlineExpired(dependencies.deadline)) {
+        state.failure = deadlineFailure(arena, null, null, 0);
+        return finishRecovery(
+            allocator,
+            arena_ptr,
+            &state,
+            hashPlan(request.plan.*),
+        );
+    }
     const plan_sha256 = hashPlan(request.plan.*);
     state.root_identity = recovery.rootIdentity(request.install_root);
     state.policy_sha256 = hashPolicy(request.policy);
@@ -839,7 +959,14 @@ pub fn recover(
         held[index] = null;
     };
     for (lock_paths, 0..) |path, index| {
-        held[index] = dependencies.locks.acquire(path, request.policy.locks.wait_ms) catch |err| {
+        const wait_ms = remainingTimeout(
+            dependencies.deadline,
+            request.policy.locks.wait_ms,
+        ) catch {
+            state.failure = deadlineFailure(arena, null, null, 0);
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        };
+        held[index] = dependencies.locks.acquire(path, wait_ms) catch |err| {
             state.failure = .{
                 .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
                 .lock_path = path,
@@ -895,7 +1022,7 @@ pub fn recover(
         .{ .phase = .triggers, .argv = try buildRecoveryArgv(arena, root_flag, admin_flag, request.policy, .triggers) },
     };
     for (recovery_commands) |command| {
-        if (dependencies.cancellation.cancelled()) {
+        if (cancellation.cancelled()) {
             journal.state = .interrupted;
             journal.failure = "recovery cancelled";
             recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -934,8 +1061,23 @@ pub fn recover(
             .environment = &audited_environment,
             .phase = command.phase,
             .package = null,
-            .timeout_ms = request.policy.process_timeout_ms,
-            .cancellation = dependencies.cancellation,
+            .timeout_ms = remainingTimeout(
+                dependencies.deadline,
+                request.policy.process_timeout_ms,
+            ) catch {
+                journal.state = .interrupted;
+                journal.failure = "operation deadline expired during recovery";
+                recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+                state.transaction_state = .interrupted;
+                state.failure = deadlineFailure(
+                    arena,
+                    command.phase,
+                    null,
+                    state.commands.items.len,
+                );
+                return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+            },
+            .cancellation = cancellation,
         }) catch |err| {
             journal.state = .interrupted;
             journal.failure = @errorName(err);
@@ -944,6 +1086,19 @@ pub fn recover(
             state.failure = journalFailure(arena, err, .recovery_failed, "recovery command could not complete");
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
+        if (deadlineExpired(dependencies.deadline)) {
+            journal.state = .interrupted;
+            journal.failure = "operation deadline expired during recovery command";
+            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+            state.transaction_state = .interrupted;
+            state.failure = deadlineFailure(
+                arena,
+                command.phase,
+                null,
+                state.commands.items.len,
+            );
+            return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+        }
         try state.commands.append(arena, .{
             .phase = command.phase,
             .package = null,
@@ -968,7 +1123,18 @@ pub fn recover(
         }
     }
 
-    held[2] = dependencies.locks.acquire(lock_paths[2], request.policy.locks.wait_ms) catch |err| {
+    const verification_wait_ms = remainingTimeout(
+        dependencies.deadline,
+        request.policy.locks.wait_ms,
+    ) catch {
+        journal.state = .interrupted;
+        journal.failure = "operation deadline expired before recovery verification lock";
+        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
+        state.transaction_state = .interrupted;
+        state.failure = deadlineFailure(arena, null, null, state.commands.items.len);
+        return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
+    };
+    held[2] = dependencies.locks.acquire(lock_paths[2], verification_wait_ms) catch |err| {
         journal.state = .interrupted;
         journal.failure = "cannot establish stable recovery verification lock";
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -1551,6 +1717,53 @@ fn successful(termination: ProcessTermination) bool {
     };
 }
 
+const DeadlineCancellationContext = struct {
+    base: Cancellation,
+    deadline: ?Deadline,
+
+    fn interface(self: *DeadlineCancellationContext) Cancellation {
+        return .{ .context = self, .cancelledFn = cancelled };
+    }
+
+    fn cancelled(context: *anyopaque) bool {
+        const self: *DeadlineCancellationContext = @ptrCast(@alignCast(context));
+        return self.base.cancelled() or deadlineExpired(self.deadline);
+    }
+};
+
+fn deadlineExpired(deadline: ?Deadline) bool {
+    return if (deadline) |value| value.expired() else false;
+}
+
+fn remainingTimeout(deadline: ?Deadline, requested_ms: u64) !u64 {
+    if (requested_ms == 0) return error.DeadlineExceeded;
+    const remaining = if (deadline) |value|
+        try value.remainingMs()
+    else
+        requested_ms;
+    const bounded = @min(requested_ms, remaining);
+    if (bounded == 0) return error.DeadlineExceeded;
+    return bounded;
+}
+
+fn deadlineFailure(
+    allocator: std.mem.Allocator,
+    phase: ?Phase,
+    package: ?[]const u8,
+    completed: usize,
+) Failure {
+    return .{
+        .code = .process_timeout,
+        .phase = phase,
+        .package = if (package) |value|
+            allocator.dupe(u8, value) catch value
+        else
+            null,
+        .diagnostic = "overall operation deadline exceeded",
+        .completed_commands = completed,
+    };
+}
+
 fn locksHeld(manager: LockManager, held: []const ?LockToken) bool {
     for (held) |token| if (token) |value| {
         if (!manager.held(value)) return false;
@@ -1565,14 +1778,7 @@ fn validateRootLexical(root: []const u8, allow_host_root: bool) !void {
 }
 
 fn validateAbsolutePath(path: []const u8) !void {
-    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
-        return error.InvalidAbsolutePath;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
-        if (component.len == 0 and path.len != 1) return error.AmbiguousPath;
-        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
-            return error.AmbiguousPath;
-    }
+    if (!absolute_path.root(path)) return error.InvalidAbsolutePath;
 }
 
 fn validateIdentity(value: []const u8) !void {
@@ -2260,6 +2466,10 @@ const TestHarness = struct {
     status_reads: usize = 0,
     crash_point: ?recovery.CrashPoint = null,
     crash_index: usize = 0,
+    now_ms: u64 = 0,
+    advance_ms_per_root_validation: u64 = 0,
+    advance_ms_per_run: u64 = 0,
+    saw_running_cancellation: bool = false,
 
     fn dependencies(self: *TestHarness) Dependencies {
         return .{
@@ -2293,6 +2503,7 @@ const TestHarness = struct {
         const self: *TestHarness = @ptrCast(@alignCast(context));
         const current = self.root_validate_count;
         self.root_validate_count += 1;
+        self.now_ms +|= self.advance_ms_per_root_validation;
         if (!self.root_valid or self.root_fail_after == current) return error.SymlinkRoot;
     }
 
@@ -2330,6 +2541,9 @@ const TestHarness = struct {
         const current = self.invocation_count;
         self.invocations[current] = invocation;
         self.invocation_count += 1;
+        self.now_ms +|= self.advance_ms_per_run;
+        self.saw_running_cancellation =
+            self.saw_running_cancellation or invocation.cancellation.cancelled();
         if (self.run_error) |err| return err;
         if (self.fail_at == current) return .{
             .termination = self.fail_termination,
@@ -2341,6 +2555,11 @@ const TestHarness = struct {
     fn cancelled(context: *anyopaque) bool {
         const self: *TestHarness = @ptrCast(@alignCast(context));
         return self.cancelled_value;
+    }
+
+    fn nowMilliseconds(context: ?*anyopaque) u64 {
+        const self: *TestHarness = @ptrCast(@alignCast(context.?));
+        return self.now_ms;
     }
 
     fn loadJournal(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8) !?[]u8 {
@@ -2804,6 +3023,73 @@ test "transaction_executor.test.process timeout is bounded and structured" {
     try std.testing.expectEqual(@as(usize, 3), harness.lock_releases);
 }
 
+test "transaction_executor.test.absolute deadline expires between phases" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{
+        .bytes = "",
+        .advance_ms_per_root_validation = 10,
+    };
+    var dependencies = harness.dependencies();
+    dependencies.deadline = .{
+        .context = &harness,
+        .nowMsFn = TestHarness.nowMilliseconds,
+        .expires_at_ms = 10,
+    };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, dependencies);
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
+}
+
+test "transaction_executor.test.absolute deadline cancels a running dpkg command" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{
+        .bytes = "",
+        .advance_ms_per_run = 21,
+    };
+    var dependencies = harness.dependencies();
+    dependencies.deadline = .{
+        .context = &harness,
+        .nowMsFn = TestHarness.nowMilliseconds,
+        .expires_at_ms = 20,
+    };
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{
+            .conffile = .keep_existing,
+            .process_timeout_ms = 1_000,
+        },
+    }, dependencies);
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 1), harness.invocation_count);
+    try std.testing.expectEqual(@as(u64, 20), harness.invocations[0].timeout_ms);
+    try std.testing.expect(harness.saw_running_cancellation);
+}
+
 test "transaction_executor.test.provenance is stable redacted and interruption is recovery ready" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{
@@ -2980,6 +3266,60 @@ test "transaction_executor.test.explicit recovery audits repairs verifies archiv
     defer repeated.deinit();
     try std.testing.expect(repeated.succeeded());
     try std.testing.expectEqual(after, harness.invocation_count);
+}
+
+test "transaction_executor.test.absolute deadline cancels a running recovery command" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var plan = testPlan(&actions, &ordered);
+    var harness: TestHarness = .{
+        .bytes = "",
+        .fail_at = 0,
+        .fail_termination = .{ .signaled = 15 },
+        .status_source = "",
+    };
+    var interrupted = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{
+            .conffile = .keep_existing,
+            .process_timeout_ms = 1_000,
+        },
+    }, harness.dependencies());
+    defer interrupted.deinit();
+    try std.testing.expectEqual(recovery.State.interrupted, interrupted.transaction_state);
+
+    harness.fail_at = null;
+    harness.invocation_count = 0;
+    harness.now_ms = 0;
+    harness.advance_ms_per_run = 21;
+    harness.saw_running_cancellation = false;
+    var dependencies = harness.dependencies();
+    dependencies.deadline = .{
+        .context = &harness,
+        .nowMsFn = TestHarness.nowMilliseconds,
+        .expires_at_ms = 20,
+    };
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{
+            .conffile = .keep_existing,
+            .process_timeout_ms = 1_000,
+        },
+    }, dependencies);
+    defer report.deinit();
+    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 1), harness.invocation_count);
+    try std.testing.expectEqual(@as(u64, 20), harness.invocations[0].timeout_ms);
+    try std.testing.expect(harness.saw_running_cancellation);
 }
 
 test "transaction_executor.test.recovery rejects corrupt wrong-root lock contention and command failure" {

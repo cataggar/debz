@@ -1,4 +1,5 @@
 const std = @import("std");
+const absolute_path = @import("absolute_path.zig");
 
 pub const api_version: u32 = 1;
 pub const schema_id = "https://debz.dev/schema/repository-operation-result-v1";
@@ -626,23 +627,11 @@ fn validResourcePolicy(policy: ResourcePolicy) bool {
 }
 
 fn validRoot(path: []const u8) bool {
-    return validLogicalPath(path) and (path.len == 1 or path[path.len - 1] != '/');
+    return absolute_path.root(path);
 }
 
 fn validLogicalPath(path: []const u8) bool {
-    if (path.len == 0 or path[0] != '/' or
-        std.mem.indexOfScalar(u8, path, 0) != null or
-        std.mem.indexOfScalar(u8, path, '\\') != null)
-        return false;
-    if (path.len == 1) return true;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or
-            std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
-            return false;
-    }
-    return true;
+    return absolute_path.logical(path);
 }
 
 fn validArchitecture(value: []const u8) bool {
@@ -819,6 +808,91 @@ test "repository API rejects unsafe trust and invalid root before backend" {
     result = try execute(std.testing.allocator, request, backend.interface());
     try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 2), backend.calls);
+}
+
+test "repository API rejects invalid UTF-8 and control-containing absolute paths" {
+    const invalid_paths = [_][]const u8{
+        "/target\x00child",
+        "/target\x1fchild",
+        "/target\x7fchild",
+        "/target/\xc3\x28",
+    };
+    for (invalid_paths) |path| {
+        var backend: TestBackend = .{};
+        var result = try execute(std.testing.allocator, .{
+            .root = path,
+            .descriptor_url = "file:///descriptor.deb",
+        }, backend.interface());
+        defer result.deinit();
+        try std.testing.expectEqual(DiagnosticId.invalid_root, result.diagnostics[0].id);
+        try std.testing.expectEqual(@as(usize, 0), backend.calls);
+
+        result = try execute(std.testing.allocator, .{
+            .root = "/target",
+            .descriptor_url = "file:///descriptor.deb",
+            .cache = .{ .path = path },
+        }, backend.interface());
+        try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
+        try std.testing.expectEqual(@as(usize, 0), backend.calls);
+    }
+}
+
+test "repository diagnostic enums serialize and exactly match both schemas" {
+    const schemas = [_]struct {
+        path: []const u8,
+        state_schema: bool,
+    }{
+        .{ .path = "schema/repository-operation-result-v1.json", .state_schema = false },
+        .{ .path = "schema/repository-add-state-v1.json", .state_schema = true },
+    };
+    for (schemas) |schema| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            schema.path,
+            std.testing.allocator,
+            .limited(maximum_document_bytes),
+        );
+        defer std.testing.allocator.free(source);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            source,
+            .{},
+        );
+        defer parsed.deinit();
+        const definitions = parsed.value.object.get("$defs").?.object;
+        const path_pattern = if (schema.state_schema)
+            definitions.get("path").?.object.get("pattern").?.string
+        else
+            definitions.get("logicalPath").?.object.get("pattern").?.string;
+        try std.testing.expectEqualStrings(absolute_path.schema_pattern, path_pattern);
+        const values = if (schema.state_schema)
+            definitions.get("diagnosticId").?.object.get("enum").?.array.items
+        else
+            definitions.get("diagnostic").?.object
+                .get("properties").?.object
+                .get("id").?.object
+                .get("enum").?.array.items;
+        try std.testing.expectEqual(std.meta.fields(DiagnosticId).len, values.len);
+        inline for (std.meta.fields(DiagnosticId)) |field| {
+            var matches: usize = 0;
+            for (values) |value| {
+                if (value == .string and std.mem.eql(u8, field.name, value.string))
+                    matches += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), matches);
+        }
+    }
+
+    inline for (std.meta.fields(DiagnosticId)) |field| {
+        const id: DiagnosticId = @enumFromInt(field.value);
+        const result = failure(.internal, id, "test", "diagnostic");
+        const document = try result.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(document);
+        var decoded = try decode(std.testing.allocator, document, maximum_document_bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqual(id, decoded.result.diagnostics[0].id);
+    }
 }
 
 test "repository result forbids success-shaped partial state and is deterministic" {

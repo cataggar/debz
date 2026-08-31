@@ -46,7 +46,11 @@ atomically publishes a deterministic aggregate manifest through the explicit
 index digests, selected index paths, signer fingerprints, explicit clock time,
 immutability identity, and stale decisions. Cache publish locking is controlled
 by `aggregate_publish`; per-repository locking remains controlled by each
-runtime refresh policy.
+runtime refresh policy. Optional reservation hooks reject retained snapshot
+memory, aggregate-manifest memory, object growth, or derived-manifest growth
+before the corresponding result or cache entry is committed. Reservations
+report only growth already published on failure and charge repeated cache hits
+as zero growth.
 
 `CombinedUniverse` contains authenticated `SolverRepositoryInput` values and a
 total-ordered candidate view. Effective priority applies the base priority,

@@ -6,6 +6,9 @@ pub const Deadlines = struct {
     connect_ms: u64,
     read_ms: u64,
     overall_ms: u64,
+    /// Absolute time on `Dependencies.clock`. This composes many acquisitions
+    /// under one caller-owned operation deadline.
+    absolute_ms: ?u64 = null,
 };
 
 pub const ProxyEndpoint = struct {
@@ -242,10 +245,11 @@ fn acquireFile(
     if (std.mem.findScalar(u8, decoded, 0) != null or hasDotSegment(decoded))
         return error.AmbiguousFilePath;
 
-    checkOverall(dependencies.clock, started_ms, request_value.deadlines.overall_ms) catch
-        return error.OverallDeadlineExceeded;
-    const remaining_ms = request_value.deadlines.overall_ms -
-        elapsed(started_ms, dependencies.clock.nowMs());
+    const remaining_ms = remainingOverall(
+        dependencies.clock,
+        started_ms,
+        request_value.deadlines,
+    ) catch return error.OverallDeadlineExceeded;
     const read = try dependencies.files.read(
         allocator,
         decoded,
@@ -256,7 +260,11 @@ fn acquireFile(
     if (!read.regular) return error.NotRegularFile;
     if (read.bytes.len > request_value.max_response_bytes) return error.ResponseTooLarge;
     const completed_ms = dependencies.clock.nowMs();
-    if (elapsed(started_ms, completed_ms) > request_value.deadlines.overall_ms)
+    if (completed(
+        started_ms,
+        completed_ms,
+        request_value.deadlines,
+    ))
         return error.OverallDeadlineExceeded;
 
     return .{
@@ -296,8 +304,11 @@ fn acquireHttp(
         https_chain_verified = https_chain_verified and current_is_https;
         if (request_value.require_https and !current_is_https)
             return error.InsecureTransport;
-        checkOverall(dependencies.clock, started_ms, request_value.deadlines.overall_ms) catch
-            return error.OverallDeadlineExceeded;
+        const remaining_ms = remainingOverall(
+            dependencies.clock,
+            started_ms,
+            request_value.deadlines,
+        ) catch return error.OverallDeadlineExceeded;
 
         const current_origin = try origin(allocator, current_uri);
         defer allocator.free(current_origin);
@@ -307,8 +318,6 @@ fn acquireHttp(
         attempts += 1;
         total_attempts = std.math.add(u16, total_attempts, 1) catch
             return error.InvalidConfiguration;
-        const remaining_ms = request_value.deadlines.overall_ms -
-            elapsed(started_ms, dependencies.clock.nowMs());
         var response = dependencies.transport.request(allocator, .{
             .uri = current_uri,
             .proxy = request_value.proxy,
@@ -361,7 +370,11 @@ fn acquireHttp(
         }
 
         const completed_ms = dependencies.clock.nowMs();
-        if (elapsed(started_ms, completed_ms) > request_value.deadlines.overall_ms)
+        if (completed(
+            started_ms,
+            completed_ms,
+            request_value.deadlines,
+        ))
             return error.OverallDeadlineExceeded;
         const effective_uri = try redactUri(allocator, current_uri);
         const status = response.status;
@@ -391,15 +404,33 @@ fn deterministicBackoff(request_value: Request, dependencies: Dependencies, atte
         base *| @as(u64, attempt)
     else
         request_value.retry.backoff_ms(attempt);
-    const now = dependencies.clock.nowMs();
-    if (elapsed(started_ms, now) > request_value.deadlines.overall_ms or
-        delay > request_value.deadlines.overall_ms - elapsed(started_ms, now))
+    const remaining_ms = remainingOverall(
+        dependencies.clock,
+        started_ms,
+        request_value.deadlines,
+    ) catch return error.OverallDeadlineExceeded;
+    if (delay >= remaining_ms)
         return error.OverallDeadlineExceeded;
     try dependencies.clock.sleepMs(delay);
 }
 
-fn checkOverall(clock: Clock, started_ms: u64, overall_ms: u64) !void {
-    if (elapsed(started_ms, clock.nowMs()) > overall_ms) return error.OverallDeadlineExceeded;
+fn remainingOverall(clock: Clock, started_ms: u64, deadlines: Deadlines) !u64 {
+    const now = clock.nowMs();
+    const spent = elapsed(started_ms, now);
+    if (spent >= deadlines.overall_ms) return error.OverallDeadlineExceeded;
+    var remaining = deadlines.overall_ms - spent;
+    if (deadlines.absolute_ms) |absolute| {
+        if (now >= absolute) return error.OverallDeadlineExceeded;
+        remaining = @min(remaining, absolute - now);
+    }
+    if (remaining == 0) return error.OverallDeadlineExceeded;
+    return remaining;
+}
+
+fn completed(started_ms: u64, completed_ms: u64, deadlines: Deadlines) bool {
+    if (elapsed(started_ms, completed_ms) >= deadlines.overall_ms) return true;
+    if (deadlines.absolute_ms) |absolute| return completed_ms >= absolute;
+    return false;
 }
 
 fn elapsed(started: u64, now: u64) u64 {
@@ -411,6 +442,7 @@ fn withRemainingOverall(deadlines: Deadlines, remaining_ms: u64) Deadlines {
         .connect_ms = @min(deadlines.connect_ms, remaining_ms),
         .read_ms = @min(deadlines.read_ms, remaining_ms),
         .overall_ms = remaining_ms,
+        .absolute_ms = deadlines.absolute_ms,
     };
 }
 

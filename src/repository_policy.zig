@@ -699,6 +699,7 @@ pub const RefreshRequest = struct {
     failure_policy: FailurePolicy = .all_or_nothing,
     dependencies: refresh_module.Dependencies,
     aggregate_publish: cache_module.PublishOptions = .{},
+    retained_reservation: ?cache_module.Reservation = null,
 };
 
 pub const RefreshResult = struct {
@@ -892,6 +893,12 @@ pub fn refreshAll(
         state_slice,
     );
     errdefer allocator.free(manifest);
+    var retained_token: ?*anyopaque = null;
+    var retained_committed: u64 = 0;
+    if (request.retained_reservation) |reservation|
+        retained_token = try reservation.reserve(@intCast(manifest.len));
+    defer if (retained_token) |token|
+        request.retained_reservation.?.finish(token, retained_committed);
 
     for (state_slice) |state| {
         const repository_manifest = try encodeRepositoryManifest(allocator, state);
@@ -931,6 +938,7 @@ pub fn refreshAll(
     ) catch {
         return error.AggregatePublicationFailed;
     };
+    retained_committed = @intCast(manifest.len);
 
     return .{ .published = .{
         .snapshots = snapshot_slice,
@@ -998,9 +1006,12 @@ fn refreshRepository(
 }
 
 fn runtimeMatches(repository: NormalizedRepository, runtime: Runtime) bool {
-    if (repository.deadlines.connect_ms != runtime.acquisition.deadlines.connect_ms or
-        repository.deadlines.read_ms != runtime.acquisition.deadlines.read_ms or
-        repository.deadlines.overall_ms != runtime.acquisition.deadlines.overall_ms)
+    if (runtime.acquisition.deadlines.connect_ms == 0 or
+        runtime.acquisition.deadlines.read_ms == 0 or
+        runtime.acquisition.deadlines.overall_ms == 0 or
+        runtime.acquisition.deadlines.connect_ms > repository.deadlines.connect_ms or
+        runtime.acquisition.deadlines.read_ms > repository.deadlines.read_ms or
+        runtime.acquisition.deadlines.overall_ms > repository.deadlines.overall_ms)
         return false;
     switch (repository.proxy) {
         .direct => {

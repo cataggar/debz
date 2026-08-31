@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("repository_api.zig");
+const absolute_path = @import("absolute_path.zig");
 
 pub const schema_id = "https://debz.dev/schema/repository-add-state-v1";
 pub const schema_version: u32 = 1;
@@ -45,6 +46,8 @@ pub const State = struct {
     managed_files: []const FileEvidence = &.{},
     installed: bool = false,
     refreshed: bool = false,
+    plan_path: ?[]const u8 = null,
+    plan_sha256: ?[32]u8 = null,
     exact_lock_path: ?[]const u8 = null,
     provenance_path: ?[]const u8 = null,
     manifest_path: ?[]const u8 = null,
@@ -91,6 +94,7 @@ pub fn create(allocator: std.mem.Allocator, input: State) !OwnedState {
     output.root = try owned.dupe(u8, input.root);
     output.architecture = try owned.dupe(u8, input.architecture);
     output.diagnostic = try owned.dupe(u8, input.diagnostic);
+    output.plan_path = try dupeOptional(owned, input.plan_path);
     output.exact_lock_path = try dupeOptional(owned, input.exact_lock_path);
     output.provenance_path = try dupeOptional(owned, input.provenance_path);
     output.manifest_path = try dupeOptional(owned, input.manifest_path);
@@ -140,6 +144,8 @@ const WireState = struct {
     managed_files: []const WireFile,
     installed: bool,
     refreshed: bool,
+    plan_path: ?[]const u8,
+    plan_sha256: ?[]const u8,
     exact_lock_path: ?[]const u8,
     provenance_path: ?[]const u8,
     manifest_path: ?[]const u8,
@@ -192,6 +198,12 @@ pub fn decode(
             .size = file.size,
         };
     }
+    var plan_sha256: ?[32]u8 = null;
+    if (wire.plan_sha256) |value| {
+        var parsed_plan_sha256: [32]u8 = undefined;
+        try parseHex(&parsed_plan_sha256, value);
+        plan_sha256 = parsed_plan_sha256;
+    }
     const decoded_state: State = .{
         .root = wire.root,
         .architecture = wire.architecture,
@@ -201,6 +213,8 @@ pub fn decode(
         .managed_files = files,
         .installed = wire.installed,
         .refreshed = wire.refreshed,
+        .plan_path = wire.plan_path,
+        .plan_sha256 = plan_sha256,
         .exact_lock_path = wire.exact_lock_path,
         .provenance_path = wire.provenance_path,
         .manifest_path = wire.manifest_path,
@@ -305,8 +319,8 @@ pub const WriteHooks = struct {
 };
 
 fn validate(state: State) !void {
-    if (!validPath(state.root) or !validIdentity(state.architecture))
-        return error.InvalidIdentity;
+    if (!validPath(state.root)) return error.InvalidPath;
+    if (!validIdentity(state.architecture)) return error.InvalidIdentity;
     if (state.managed_files.len > maximum_files) return error.TooManyFiles;
     if (state.installed and state.descriptor == null) return error.InvalidState;
     if (state.refreshed and !state.installed) return error.InvalidState;
@@ -316,13 +330,23 @@ fn validate(state: State) !void {
         .initialized, .acquired => {
             if (state.descriptor != null or state.managed_files.len != 0 or
                 state.installed or state.refreshed or
+                state.plan_path != null or state.plan_sha256 != null or
                 state.exact_lock_path != null or state.provenance_path != null or
                 state.manifest_path != null)
                 return error.InvalidState;
         },
-        .validated, .preflight_authenticated, .planned => {
+        .validated, .preflight_authenticated => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 state.installed or state.refreshed or
+                state.plan_path != null or state.plan_sha256 != null or
+                state.exact_lock_path != null or state.provenance_path != null or
+                state.manifest_path != null)
+                return error.InvalidState;
+        },
+        .planned => {
+            if (state.descriptor == null or state.managed_files.len == 0 or
+                state.installed or state.refreshed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path != null or state.provenance_path != null or
                 state.manifest_path != null)
                 return error.InvalidState;
@@ -330,6 +354,7 @@ fn validate(state: State) !void {
         .locked => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 state.installed or state.refreshed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path == null or state.provenance_path != null or
                 state.manifest_path != null)
                 return error.InvalidState;
@@ -337,6 +362,7 @@ fn validate(state: State) !void {
         .installed => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 !state.installed or state.refreshed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path == null or state.manifest_path != null or
                 (state.diagnostic_id == null and state.provenance_path == null))
                 return error.InvalidState;
@@ -344,6 +370,7 @@ fn validate(state: State) !void {
         .imported => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 !state.installed or state.refreshed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path == null or state.provenance_path == null or
                 state.manifest_path == null)
                 return error.InvalidState;
@@ -351,6 +378,7 @@ fn validate(state: State) !void {
         .refreshed => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 !state.installed or !state.refreshed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path == null or state.provenance_path == null or
                 state.manifest_path == null)
                 return error.InvalidState;
@@ -358,6 +386,7 @@ fn validate(state: State) !void {
         .complete => {
             if (state.descriptor == null or state.managed_files.len == 0 or
                 !state.installed or
+                state.plan_path == null or state.plan_sha256 == null or
                 state.exact_lock_path == null or state.provenance_path == null or
                 state.manifest_path == null)
                 return error.InvalidState;
@@ -382,6 +411,7 @@ fn validate(state: State) !void {
         }
     }
     inline for (.{
+        state.plan_path,
         state.exact_lock_path,
         state.provenance_path,
         state.manifest_path,
@@ -447,10 +477,14 @@ fn writePayload(state: State, writer: *std.Io.Writer) !void {
         try writeHex(writer, &file.sha256);
         try writer.print(",\"size\":{}}}", .{file.size});
     }
-    try writer.print("],\"installed\":{},\"refreshed\":{},\"exact_lock_path\":", .{
+    try writer.print("],\"installed\":{},\"refreshed\":{},\"plan_path\":", .{
         state.installed,
         state.refreshed,
     });
+    try writeOptionalString(writer, state.plan_path);
+    try writer.writeAll(",\"plan_sha256\":");
+    if (state.plan_sha256) |digest| try writeHex(writer, &digest) else try writer.writeAll("null");
+    try writer.writeAll(",\"exact_lock_path\":");
     try writeOptionalString(writer, state.exact_lock_path);
     try writer.writeAll(",\"provenance_path\":");
     try writeOptionalString(writer, state.provenance_path);
@@ -480,18 +514,7 @@ fn nibble(value: u8) !u4 {
 }
 
 fn validPath(path: []const u8) bool {
-    if (path.len == 0 or path[0] != '/' or
-        std.mem.indexOfScalar(u8, path, 0) != null or
-        std.mem.indexOfScalar(u8, path, '\\') != null)
-        return false;
-    if (path.len == 1) return true;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
-            return false;
-    }
-    return true;
+    return absolute_path.logical(path);
 }
 
 fn validIdentity(value: []const u8) bool {
@@ -560,6 +583,8 @@ test "repository state round trips canonically and detects tampering" {
         },
         .managed_files = &files,
         .installed = true,
+        .plan_path = "/var/lib/debz/repository/transaction-plan-v3.json",
+        .plan_sha256 = @splat(3),
         .exact_lock_path = "/var/lib/debz/repository/exact-lock-v2.json",
         .provenance_path = "/var/lib/debz/repository/transaction-result-v2.json",
     });
@@ -609,6 +634,8 @@ test "repository state preserves installed-but-refresh-failed evidence" {
         .managed_files = &files,
         .installed = true,
         .refreshed = false,
+        .plan_path = "/var/lib/debz/repository/transaction-plan-v3.json",
+        .plan_sha256 = @splat(0x66),
         .exact_lock_path = "/var/lib/debz/repository/exact-lock-v2.json",
         .provenance_path = "/var/lib/debz/repository/transaction-result-v2.json",
         .manifest_path = "/var/lib/debz/repository/apt-config-snapshot-v1.json",
@@ -623,4 +650,43 @@ test "repository state preserves installed-but-refresh-failed evidence" {
     try std.testing.expect(decoded.state.installed);
     try std.testing.expect(!decoded.state.refreshed);
     try std.testing.expectEqual(api.DiagnosticId.refresh_failed, decoded.state.diagnostic_id.?);
+}
+
+test "repository state rejects invalid UTF-8 and control-containing absolute paths" {
+    const invalid_paths = [_][]const u8{
+        "/target\x00child",
+        "/target\x1fchild",
+        "/target\x7fchild",
+        "/target/\xc3\x28",
+    };
+    for (invalid_paths) |path| {
+        try std.testing.expectError(error.InvalidPath, create(std.testing.allocator, .{
+            .root = path,
+            .architecture = "amd64",
+            .no_refresh = false,
+            .phase = .initialized,
+        }));
+        try std.testing.expectError(error.InvalidPath, create(std.testing.allocator, .{
+            .root = "/target",
+            .architecture = "amd64",
+            .no_refresh = false,
+            .phase = .planned,
+            .descriptor = .{
+                .package = "descriptor",
+                .version = "1",
+                .architecture = "all",
+                .sha256 = @splat(1),
+                .size = 1,
+                .effective_url = "file:///descriptor.deb",
+                .trust_mode = .pinned_sha256,
+            },
+            .managed_files = &.{.{
+                .logical_path = "/etc/descriptor.list",
+                .sha256 = @splat(2),
+                .size = 1,
+            }},
+            .plan_path = path,
+            .plan_sha256 = @splat(3),
+        }));
+    }
 }

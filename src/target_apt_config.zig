@@ -1,4 +1,5 @@
 const std = @import("std");
+const absolute_path = @import("absolute_path.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const openpgp = @import("openpgp_verifier.zig");
 const repository_policy = @import("repository_policy.zig");
@@ -1609,27 +1610,15 @@ fn validLowerHex(value: []const u8) bool {
 }
 
 fn validRootPath(path: []const u8) bool {
-    return validAbsolutePath(path, true);
+    return absolute_path.root(path);
 }
 
 fn validLogicalPath(path: []const u8) bool {
-    return validAbsolutePath(path, false);
+    return absolute_path.nonRoot(path);
 }
 
 fn validLogicalDirectoryPath(path: []const u8) bool {
-    return validAbsolutePath(path, true);
-}
-
-fn validAbsolutePath(path: []const u8, allow_root: bool) bool {
-    if (!std.unicode.utf8ValidateSlice(path) or !std.fs.path.isAbsolute(path))
-        return false;
-    if (std.mem.eql(u8, path, "/")) return allow_root;
-    if (path[path.len - 1] == '/') return false;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
-        if (!safeLeaf(component)) return false;
-    }
-    return true;
+    return absolute_path.logical(path);
 }
 
 fn safeLeaf(name: []const u8) bool {
