@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/repository-add-state-v1",
+  "title": "debz repository add operation state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "root", "architecture", "no_refresh", "phase",
+    "descriptor", "managed_files", "installed", "refreshed",
+    "plan_path", "plan_sha256",
+    "exact_lock_path", "provenance_path", "manifest_path", "diagnostic_id",
+    "diagnostic", "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/repository-add-state-v1" },
+    "version": { "const": 1 },
+    "root": { "$ref": "#/$defs/path" },
+    "architecture": { "type": "string", "minLength": 1 },
+    "no_refresh": { "type": "boolean" },
+    "phase": {
+      "enum": [
+        "initialized", "acquired", "validated", "preflight_authenticated",
+        "planned", "locked", "installed", "imported", "refreshed", "complete",
+        "failed"
+      ]
+    },
+    "descriptor": {
+      "oneOf": [{ "$ref": "#/$defs/descriptor" }, { "type": "null" }]
+    },
+    "managed_files": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/file" }
+    },
+    "installed": { "type": "boolean" },
+    "refreshed": { "type": "boolean" },
+    "plan_path": { "$ref": "#/$defs/nullablePath" },
+    "plan_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "exact_lock_path": { "$ref": "#/$defs/nullablePath" },
+    "provenance_path": { "$ref": "#/$defs/nullablePath" },
+    "manifest_path": { "$ref": "#/$defs/nullablePath" },
+    "diagnostic_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/diagnosticId" },
+        { "type": "null" }
+      ]
+    },
+    "diagnostic": { "type": "string" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "phase": { "enum": ["initialized", "acquired"] } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "type": "null" },
+          "managed_files": { "maxItems": 0 },
+          "installed": { "const": false },
+          "refreshed": { "const": false },
+          "plan_path": { "type": "null" },
+          "plan_sha256": { "type": "null" },
+          "exact_lock_path": { "type": "null" },
+          "provenance_path": { "type": "null" },
+          "manifest_path": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "enum": ["validated", "preflight_authenticated"]
+          }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": false },
+          "refreshed": { "const": false },
+          "plan_path": { "type": "null" },
+          "plan_sha256": { "type": "null" },
+          "exact_lock_path": { "type": "null" },
+          "provenance_path": { "type": "null" },
+          "manifest_path": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "planned" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": false },
+          "refreshed": { "const": false },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "type": "null" },
+          "provenance_path": { "type": "null" },
+          "manifest_path": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "locked" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": false },
+          "refreshed": { "const": false },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "$ref": "#/$defs/path" },
+          "provenance_path": { "type": "null" },
+          "manifest_path": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "installed" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": true },
+          "refreshed": { "const": false },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "$ref": "#/$defs/path" },
+          "manifest_path": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "imported" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": true },
+          "refreshed": { "const": false },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "$ref": "#/$defs/path" },
+          "provenance_path": { "$ref": "#/$defs/path" },
+          "manifest_path": { "$ref": "#/$defs/path" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "installed" },
+          "diagnostic_id": { "type": "null" }
+        },
+        "required": ["phase", "diagnostic_id"]
+      },
+      "then": {
+        "properties": {
+          "provenance_path": { "$ref": "#/$defs/path" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "refreshed" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": true },
+          "refreshed": { "const": true },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "$ref": "#/$defs/path" },
+          "provenance_path": { "$ref": "#/$defs/path" },
+          "manifest_path": { "$ref": "#/$defs/path" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "complete" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "descriptor": { "$ref": "#/$defs/descriptor" },
+          "managed_files": { "minItems": 1 },
+          "installed": { "const": true },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "exact_lock_path": { "$ref": "#/$defs/path" },
+          "provenance_path": { "$ref": "#/$defs/path" },
+          "manifest_path": { "$ref": "#/$defs/path" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "failed" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "diagnostic_id": { "$ref": "#/$defs/diagnosticId" },
+          "diagnostic": { "minLength": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "nullablePath": {
+      "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }]
+    },
+    "diagnosticId": {
+      "enum": [
+        "unsupported_api_version", "invalid_request", "invalid_root",
+        "invalid_descriptor_url", "credential_bearing_url",
+        "insecure_unpinned_url", "invalid_digest",
+        "target_configuration_failed", "architecture_unavailable",
+        "acquisition_failed", "descriptor_invalid", "descriptor_dynamic",
+        "descriptor_trust_unresolved", "repository_authentication_failed",
+        "dependency_planning_failed", "dependency_refresh_failed",
+        "dependency_acquisition_failed", "existing_descriptor_conflict",
+        "managed_file_conflict", "lock_publication_failed",
+        "transaction_failed", "installed_verification_failed",
+        "target_import_failed", "refresh_failed",
+        "provenance_publication_failed", "resource_limit_exceeded",
+        "state_persistence_failed", "state_corrupt",
+        "recovery_required", "internal_error"
+      ]
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package", "version", "architecture", "sha256", "size",
+        "effective_url", "trust_mode"
+      ],
+      "properties": {
+        "package": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 1 },
+        "effective_url": { "type": "string", "minLength": 1 },
+        "trust_mode": { "enum": ["verified_https", "pinned_sha256"] }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_path", "sha256", "size"],
+      "properties": {
+        "logical_path": { "$ref": "#/$defs/path" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

@@ -60,6 +60,14 @@ the imported bytes. Imports produce the canonical, digest-bound
 [`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) manifest. See
 [Target-root APT configuration snapshots](target-apt-config.md).
 
+`debz.repository_api` is the separate versioned repository-management
+boundary. Its production `add` backend acquires a trusted descriptor `.deb`,
+authenticates its static repositories and payload keyrings before mutation,
+solves dependencies with installed-state-first behavior, persists exact-lock
+and resumable state evidence, executes through the transaction executor, and
+verifies/imports/refreshes the resulting target configuration. See
+[Repository management API](repository-management.md).
+
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 
 ## Repository metadata

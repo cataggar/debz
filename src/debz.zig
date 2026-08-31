@@ -4,6 +4,21 @@ const build_options = @import("debz_build_options");
 
 pub const version = build_options.version;
 pub const product_api = @import("product_api.zig");
+pub const repository_api = @import("repository_api.zig");
+pub const repository_state = @import("repository_state.zig");
+pub const repository_backend = @import("repository_backend.zig");
+pub const RepositoryApiVersion = repository_api.api_version;
+pub const RepositoryOperation = repository_api.Operation;
+pub const RepositoryRequest = repository_api.Request;
+pub const RepositoryResult = repository_api.Result;
+pub const RepositoryOwnedResult = repository_api.OwnedResult;
+pub const RepositoryDiagnostic = repository_api.Diagnostic;
+pub const RepositoryDiagnosticId = repository_api.DiagnosticId;
+pub const RepositoryExitStatus = repository_api.ExitStatus;
+pub const RepositoryBackend = repository_api.Backend;
+pub const ProductionRepositoryBackend = repository_backend.Backend;
+pub const executeRepositoryRequest = repository_api.execute;
+pub const decodeRepositoryResult = repository_api.decode;
 pub const ApiVersion = product_api.api_version;
 pub const ProductOperation = product_api.Operation;
 pub const ProductCommonOptions = product_api.CommonOptions;
@@ -256,4 +271,7 @@ test {
     _ = transaction_provenance;
     _ = transaction_provenance_v2;
     _ = package_family_backend;
+    _ = repository_api;
+    _ = repository_state;
+    _ = repository_backend;
 }

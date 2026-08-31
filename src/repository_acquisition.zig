@@ -6,6 +6,9 @@ pub const Deadlines = struct {
     connect_ms: u64,
     read_ms: u64,
     overall_ms: u64,
+    /// Absolute time on `Dependencies.clock`. This composes many acquisitions
+    /// under one caller-owned operation deadline.
+    absolute_ms: ?u64 = null,
 };
 
 pub const ProxyEndpoint = struct {
@@ -27,6 +30,9 @@ pub const RetryPolicy = struct {
     retry_408: bool = true,
     retry_429: bool = true,
     retry_5xx: bool = true,
+    /// When set, use `attempt * linear_backoff_base_ms`. This permits
+    /// request-scoped policy without process-global callback state.
+    linear_backoff_base_ms: ?u64 = null,
     backoff_ms: *const fn (attempt: u16) u64 = noBackoff,
 
     fn noBackoff(_: u16) u64 {
@@ -75,6 +81,7 @@ pub const Request = struct {
     retry: RetryPolicy = .{},
     max_response_bytes: usize,
     credentials: CredentialsProvider = .none,
+    require_https: bool = false,
 };
 
 pub const Timing = struct {
@@ -88,6 +95,7 @@ pub const Provenance = struct {
     status: ?u16,
     size: usize,
     timing: Timing,
+    https_chain_verified: bool,
 
     pub fn deinit(self: *Provenance, allocator: std.mem.Allocator) void {
         allocator.free(self.effective_uri);
@@ -175,6 +183,7 @@ pub const Error = error{
     NotFound,
     HttpStatus,
     OverallDeadlineExceeded,
+    InsecureTransport,
 };
 
 pub fn acquire(
@@ -193,6 +202,7 @@ pub fn acquire(
 
     const started_ms = dependencies.clock.nowMs();
     if (std.ascii.eqlIgnoreCase(request_value.uri.scheme, "file")) {
+        if (request_value.require_https) return error.InsecureTransport;
         return acquireFile(allocator, request_value, dependencies, started_ms);
     }
     if (!std.ascii.eqlIgnoreCase(request_value.uri.scheme, "http") and
@@ -200,6 +210,9 @@ pub fn acquire(
     {
         return error.UnsupportedScheme;
     }
+    if (request_value.require_https and
+        !std.ascii.eqlIgnoreCase(request_value.uri.scheme, "https"))
+        return error.InsecureTransport;
     return acquireHttp(allocator, request_value, dependencies, started_ms);
 }
 
@@ -232,10 +245,11 @@ fn acquireFile(
     if (std.mem.findScalar(u8, decoded, 0) != null or hasDotSegment(decoded))
         return error.AmbiguousFilePath;
 
-    checkOverall(dependencies.clock, started_ms, request_value.deadlines.overall_ms) catch
-        return error.OverallDeadlineExceeded;
-    const remaining_ms = request_value.deadlines.overall_ms -
-        elapsed(started_ms, dependencies.clock.nowMs());
+    const remaining_ms = remainingOverall(
+        dependencies.clock,
+        started_ms,
+        request_value.deadlines,
+    ) catch return error.OverallDeadlineExceeded;
     const read = try dependencies.files.read(
         allocator,
         decoded,
@@ -246,7 +260,11 @@ fn acquireFile(
     if (!read.regular) return error.NotRegularFile;
     if (read.bytes.len > request_value.max_response_bytes) return error.ResponseTooLarge;
     const completed_ms = dependencies.clock.nowMs();
-    if (elapsed(started_ms, completed_ms) > request_value.deadlines.overall_ms)
+    if (completed(
+        started_ms,
+        completed_ms,
+        request_value.deadlines,
+    ))
         return error.OverallDeadlineExceeded;
 
     return .{
@@ -260,6 +278,7 @@ fn acquireFile(
                 .completed_ms = completed_ms,
                 .attempts = 1,
             },
+            .https_chain_verified = false,
         },
     };
 }
@@ -278,10 +297,18 @@ fn acquireHttp(
     var total_attempts: u16 = 0;
     const initial_origin = try origin(allocator, current_uri);
     defer allocator.free(initial_origin);
+    var https_chain_verified = true;
 
     while (true) {
-        checkOverall(dependencies.clock, started_ms, request_value.deadlines.overall_ms) catch
-            return error.OverallDeadlineExceeded;
+        const current_is_https = std.ascii.eqlIgnoreCase(current_uri.scheme, "https");
+        https_chain_verified = https_chain_verified and current_is_https;
+        if (request_value.require_https and !current_is_https)
+            return error.InsecureTransport;
+        const remaining_ms = remainingOverall(
+            dependencies.clock,
+            started_ms,
+            request_value.deadlines,
+        ) catch return error.OverallDeadlineExceeded;
 
         const current_origin = try origin(allocator, current_uri);
         defer allocator.free(current_origin);
@@ -291,8 +318,6 @@ fn acquireHttp(
         attempts += 1;
         total_attempts = std.math.add(u16, total_attempts, 1) catch
             return error.InvalidConfiguration;
-        const remaining_ms = request_value.deadlines.overall_ms -
-            elapsed(started_ms, dependencies.clock.nowMs());
         var response = dependencies.transport.request(allocator, .{
             .uri = current_uri,
             .proxy = request_value.proxy,
@@ -322,6 +347,10 @@ fn acquireHttp(
             if (!std.ascii.eqlIgnoreCase(current_uri.scheme, "http") and
                 !std.ascii.eqlIgnoreCase(current_uri.scheme, "https"))
                 return error.InvalidRedirect;
+            const next_is_https = std.ascii.eqlIgnoreCase(current_uri.scheme, "https");
+            https_chain_verified = https_chain_verified and next_is_https;
+            if (request_value.require_https and !next_is_https)
+                return error.InsecureTransport;
             redirects += 1;
             attempts = 0;
             continue;
@@ -341,7 +370,11 @@ fn acquireHttp(
         }
 
         const completed_ms = dependencies.clock.nowMs();
-        if (elapsed(started_ms, completed_ms) > request_value.deadlines.overall_ms)
+        if (completed(
+            started_ms,
+            completed_ms,
+            request_value.deadlines,
+        ))
             return error.OverallDeadlineExceeded;
         const effective_uri = try redactUri(allocator, current_uri);
         const status = response.status;
@@ -360,22 +393,44 @@ fn acquireHttp(
                     .completed_ms = completed_ms,
                     .attempts = total_attempts,
                 },
+                .https_chain_verified = https_chain_verified,
             },
         };
     }
 }
 
 fn deterministicBackoff(request_value: Request, dependencies: Dependencies, attempt: u16, started_ms: u64) !void {
-    const delay = request_value.retry.backoff_ms(attempt);
-    const now = dependencies.clock.nowMs();
-    if (elapsed(started_ms, now) > request_value.deadlines.overall_ms or
-        delay > request_value.deadlines.overall_ms - elapsed(started_ms, now))
+    const delay = if (request_value.retry.linear_backoff_base_ms) |base|
+        base *| @as(u64, attempt)
+    else
+        request_value.retry.backoff_ms(attempt);
+    const remaining_ms = remainingOverall(
+        dependencies.clock,
+        started_ms,
+        request_value.deadlines,
+    ) catch return error.OverallDeadlineExceeded;
+    if (delay >= remaining_ms)
         return error.OverallDeadlineExceeded;
     try dependencies.clock.sleepMs(delay);
 }
 
-fn checkOverall(clock: Clock, started_ms: u64, overall_ms: u64) !void {
-    if (elapsed(started_ms, clock.nowMs()) > overall_ms) return error.OverallDeadlineExceeded;
+fn remainingOverall(clock: Clock, started_ms: u64, deadlines: Deadlines) !u64 {
+    const now = clock.nowMs();
+    const spent = elapsed(started_ms, now);
+    if (spent >= deadlines.overall_ms) return error.OverallDeadlineExceeded;
+    var remaining = deadlines.overall_ms - spent;
+    if (deadlines.absolute_ms) |absolute| {
+        if (now >= absolute) return error.OverallDeadlineExceeded;
+        remaining = @min(remaining, absolute - now);
+    }
+    if (remaining == 0) return error.OverallDeadlineExceeded;
+    return remaining;
+}
+
+fn completed(started_ms: u64, completed_ms: u64, deadlines: Deadlines) bool {
+    if (elapsed(started_ms, completed_ms) >= deadlines.overall_ms) return true;
+    if (deadlines.absolute_ms) |absolute| return completed_ms >= absolute;
+    return false;
 }
 
 fn elapsed(started: u64, now: u64) u64 {
@@ -387,6 +442,7 @@ fn withRemainingOverall(deadlines: Deadlines, remaining_ms: u64) Deadlines {
         .connect_ms = @min(deadlines.connect_ms, remaining_ms),
         .read_ms = @min(deadlines.read_ms, remaining_ms),
         .overall_ms = remaining_ms,
+        .absolute_ms = deadlines.absolute_ms,
     };
 }
 
@@ -493,9 +549,6 @@ fn resolveUri(allocator: std.mem.Allocator, base: Uri, location: []const u8) ![]
             else => return err,
         };
         if (resolved.user != null or resolved.password != null) return error.InvalidRedirect;
-        if (std.ascii.eqlIgnoreCase(base.scheme, "https") and
-            std.ascii.eqlIgnoreCase(resolved.scheme, "http"))
-            return error.InvalidRedirect;
         return formatUri(allocator, resolved, false);
     }
     return error.InvalidRedirect;
@@ -892,24 +945,76 @@ test "redirect limit is bounded" {
     }, fixture.dependencies()));
 }
 
-test "redirect rejects embedded credentials and HTTPS downgrade" {
+test "redirect rejects embedded credentials" {
     const allocator = std.testing.allocator;
-    const locations = [_][]const u8{
-        "https://" ++ "user@" ++ "other.test/final",
-        "http://example.test/final",
+    var fixture = TestFixture{
+        .responses = &.{.{
+            .status = 302,
+            .body = "",
+            .location = "https://" ++ "user@" ++ "other.test/final",
+        }},
     };
-    for (locations) |location| {
-        var fixture = TestFixture{
-            .responses = &.{.{ .status = 302, .body = "", .location = location }},
-        };
-        try std.testing.expectError(error.InvalidRedirect, acquire(allocator, .{
-            .uri = try Uri.parse("https://example.test/start"),
-            .deadlines = testDeadlines(),
-            .redirect_limit = 1,
-            .max_response_bytes = 16,
-        }, fixture.dependencies()));
-        try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
-    }
+    try std.testing.expectError(error.InvalidRedirect, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 1,
+        .max_response_bytes = 16,
+    }, fixture.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
+}
+
+test "required HTTPS applies to every redirect hop while relative redirects remain trusted" {
+    const allocator = std.testing.allocator;
+    var downgrade = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "http://other.test/middle" },
+            .{ .status = 302, .body = "", .location = "https://other.test/final" },
+            .{ .status = 200, .body = "unreachable" },
+        },
+    };
+    try std.testing.expectError(error.InsecureTransport, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 3,
+        .max_response_bytes = 16,
+        .require_https = true,
+    }, downgrade.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), downgrade.request_count);
+
+    var relative = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "../final" },
+            .{ .status = 200, .body = "ok" },
+        },
+    };
+    var result = try acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/path/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 2,
+        .max_response_bytes = 16,
+        .require_https = true,
+    }, relative.dependencies());
+    defer result.deinit(allocator);
+    try std.testing.expect(result.provenance.https_chain_verified);
+    try std.testing.expectEqualStrings("https://example.test/final", result.provenance.effective_uri);
+}
+
+test "configured HTTP redirects are recorded as unverified transport chains" {
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "http://other.test/final" },
+            .{ .status = 200, .body = "ok" },
+        },
+    };
+    var result = try acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 2,
+        .max_response_bytes = 16,
+    }, fixture.dependencies());
+    defer result.deinit(allocator);
+    try std.testing.expect(!result.provenance.https_chain_verified);
 }
 
 test "safe transient status retries with deterministic backoff" {

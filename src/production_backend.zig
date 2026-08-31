@@ -1113,6 +1113,28 @@ fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
     };
 }
 
+test "product API operations exhaustively deny host-root execution" {
+    inline for (std.meta.fields(api.Operation)) |field| {
+        const operation: api.Operation = @enumFromInt(field.value);
+        var request: api.Request = .{
+            .operation = operation,
+            .options = .{
+                .install_root = "/",
+                .cache_path = "/cache",
+                .state_path = "/state",
+                .architecture = "amd64",
+            },
+        };
+        const policy = try executionPolicy(std.testing.allocator, request);
+        defer std.testing.allocator.free(policy.risk.force);
+        try std.testing.expect(!policy.risk.allow_host_root);
+        request.options.install_root = "/alternate";
+        const alternate = try executionPolicy(std.testing.allocator, request);
+        defer std.testing.allocator.free(alternate.risk.force);
+        try std.testing.expect(!alternate.risk.allow_host_root);
+    }
+}
+
 test "production acquisition is unbounded unless a deadline is explicit" {
     const unbounded: u64 = @intCast(std.math.maxInt(i64));
     try std.testing.expectEqual(

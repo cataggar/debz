@@ -61,6 +61,7 @@ pub const RefreshPolicy = struct {
     maximum_decompressed_bytes: usize,
     maximum_decoder_memory: u64,
     cache_publish_options: cache_module.PublishOptions = .{},
+    retained_reservation: ?cache_module.Reservation = null,
 };
 
 pub const AcquisitionPolicy = struct {
@@ -285,7 +286,7 @@ fn refreshInternal(
         };
         const snapshot_bytes = record.bytes;
         record.bytes = &.{};
-        const result = try loadSnapshot(
+        var result = try loadSnapshot(
             allocator,
             snapshot_bytes,
             repository,
@@ -295,6 +296,24 @@ fn refreshInternal(
             authentication_input,
             dependencies.io,
         );
+        const retained_bytes = std.math.add(
+            u64,
+            @intCast(result.bytes.len),
+            @intCast(result.packages_bytes.len),
+        ) catch {
+            result.deinit();
+            return error.ResourceBudgetExceeded;
+        };
+        var retained_token: ?*anyopaque = null;
+        var retained_committed: u64 = 0;
+        if (refresh_policy.retained_reservation) |reservation| {
+            retained_token = reservation.reserve(retained_bytes) catch |err| {
+                result.deinit();
+                return err;
+            };
+        }
+        defer if (retained_token) |token|
+            refresh_policy.retained_reservation.?.finish(token, retained_committed);
         if (result.provenance.authentication != cached_authentication or
             result.provenance.authentication_evidence.mode != cached_mode)
         {
@@ -302,6 +321,7 @@ fn refreshInternal(
             invalid.deinit();
             return error.CorruptSnapshot;
         }
+        retained_committed = retained_bytes;
         return result;
     }
 
@@ -556,6 +576,17 @@ fn refreshInternal(
         .digest = cache_module.Digest.of(snapshot),
         .size = snapshot.len,
     };
+    const retained_bytes = std.math.add(
+        u64,
+        @intCast(snapshot.len),
+        @intCast(uncompressed.len),
+    ) catch return error.ResourceBudgetExceeded;
+    var retained_token: ?*anyopaque = null;
+    var retained_committed: u64 = 0;
+    if (refresh_policy.retained_reservation) |reservation|
+        retained_token = try reservation.reserve(retained_bytes);
+    defer if (retained_token) |token|
+        refresh_policy.retained_reservation.?.finish(token, retained_committed);
     try dependencies.cache.publish(
         .{ .value = repository.id.slice() },
         snapshot_id,
@@ -568,7 +599,7 @@ fn refreshInternal(
         snapshot,
         refresh_policy.cache_publish_options,
     );
-    return loadSnapshot(
+    const result = try loadSnapshot(
         allocator,
         try allocator.dupe(u8, snapshot),
         repository,
@@ -578,6 +609,8 @@ fn refreshInternal(
         authentication_input,
         dependencies.io,
     );
+    retained_committed = retained_bytes;
+    return result;
 }
 
 const SelectedIndex = struct {

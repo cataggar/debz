@@ -29,6 +29,8 @@ const state_corpus = &.{
     @embedFile("corpus/state/provenance.json"),
     @embedFile("corpus/state/provenance-v2.json"),
     @embedFile("corpus/state/journal"),
+    @embedFile("corpus/state/repository-result.json"),
+    @embedFile("corpus/state/repository-add-state.json"),
 };
 
 fn input(smith: *std.testing.Smith, storage: *[max_input]u8) []const u8 {
@@ -384,6 +386,14 @@ fn exerciseState(bytes: []const u8) !void {
     if (debz.target_apt_config.decodeManifest(std.testing.allocator, bytes, max_input)) |value| {
         var manifest = value;
         manifest.deinit();
+    } else |_| {}
+    if (debz.repository_api.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var result = value;
+        result.deinit();
+    } else |_| {}
+    if (debz.repository_state.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var state = value;
+        state.deinit();
     } else |_| {}
 }
 

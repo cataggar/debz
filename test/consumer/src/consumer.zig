@@ -62,3 +62,14 @@ test "repository package origin remains source compatible beside tagged v2 origi
     _ = debz.PackageSelectedRecord.fromSolverSelection;
     _ = debz.PackageSelectedRecord.fromTaggedSolverSelection;
 }
+
+test "repository management API is exported without CLI coupling" {
+    const request: debz.RepositoryRequest = .{
+        .root = "/target",
+        .descriptor_url = "https://packages.example.test/config.deb",
+        .architecture = "amd64",
+    };
+    try std.testing.expectEqual(debz.RepositoryOperation.add, request.operation);
+    _ = debz.RepositoryResult;
+    _ = debz.ProductionRepositoryBackend;
+}
