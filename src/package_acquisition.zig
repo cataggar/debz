@@ -309,6 +309,25 @@ pub const Cache = struct {
         return bytes;
     }
 
+    pub fn objectSize(self: *Cache, digest: Digest) !?u64 {
+        var name: [64]u8 = undefined;
+        digest.formatHex(&name);
+        var file = self.objects.openFile(self.io, &name, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.SymLinkLoop, error.NotDir, error.AccessDenied => return error.CorruptObject,
+            else => |other| return other,
+        };
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.kind != .file) return error.CorruptObject;
+        return stat.size;
+    }
+
     pub fn publish(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -547,7 +566,8 @@ pub fn acquirePackage(
         request.policy.cache_lock,
         .{},
     );
-    const owned = try allocator.dupe(u8, downloaded.bytes);
+    const owned = downloaded.bytes;
+    downloaded.bytes = &.{};
     return makeResult(
         allocator,
         request,

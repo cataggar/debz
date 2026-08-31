@@ -36,10 +36,17 @@ pub const Executor = struct {
         transaction_executor.Request,
         transaction_executor.Dependencies,
     ) anyerror!transaction_executor.Report,
+    recoverFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        transaction_executor.RecoveryRequest,
+        transaction_executor.Dependencies,
+    ) anyerror!transaction_executor.RecoveryReport,
 
     pub const system: Executor = .{
         .context = @ptrCast(@constCast(&system_executor_context)),
         .executeFn = systemExecute,
+        .recoverFn = systemRecover,
     };
 };
 
@@ -54,12 +61,22 @@ fn systemExecute(
     return transaction_executor.execute(allocator, request, dependencies);
 }
 
+fn systemRecover(
+    _: *anyopaque,
+    allocator: std.mem.Allocator,
+    request: transaction_executor.RecoveryRequest,
+    dependencies: transaction_executor.Dependencies,
+) !transaction_executor.RecoveryReport {
+    return transaction_executor.recover(allocator, request, dependencies);
+}
+
 pub const Backend = struct {
     io: std.Io,
     executor: Executor = .system,
     process_runner: ?transaction_executor.ProcessRunner = null,
     acquisition_dependencies: ?repository_acquisition.Dependencies = null,
     now_unix: ?i64 = null,
+    state_write_hooks: state_module.WriteHooks = .{},
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -127,7 +144,8 @@ pub const Backend = struct {
         var operation_dir = openOrCreateAbsoluteDirectory(self.io, paths.operation_physical) catch
             return api.failure(.usage, .invalid_root, "paths", "repository operation path is unsafe or unavailable");
         defer operation_dir.close(self.io);
-        const state_store = try state_module.Store.init(self.io, operation_dir, operation_state_name);
+        var state_store = try state_module.Store.init(self.io, operation_dir, operation_state_name);
+        state_store.write_hooks = self.state_write_hooks;
 
         var prior_state: ?state_module.OwnedState = state_store.read(
             allocator,
@@ -138,6 +156,15 @@ pub const Backend = struct {
         };
         defer if (prior_state) |*value| value.deinit();
 
+        var production_acquisition = repository_acquisition.Production{ .io = self.io };
+        const acquisition_dependencies = self.acquisition_dependencies orelse
+            production_acquisition.dependencies();
+        var budget = OperationBudget.init(
+            acquisition_dependencies.clock,
+            request.resources,
+            request.network.overall_timeout_ms,
+        );
+
         var target_files = target_apt_config.ProductionFileSystem.init(self.io, request.root) catch
             return api.failure(.usage, .invalid_root, "target", "target root is unsafe or unavailable");
         defer target_files.deinit();
@@ -145,6 +172,7 @@ pub const Backend = struct {
         var before_snapshot = target_apt_config.snapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = request.architecture,
+            .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
                 .process = architecture_process.interface(),
@@ -162,7 +190,8 @@ pub const Backend = struct {
         const architecture = before_snapshot.manifest.manifest.native_architecture;
         if (prior_state) |*prior| {
             if (!std.mem.eql(u8, prior.state.root, request.root) or
-                !std.mem.eql(u8, prior.state.architecture, architecture))
+                !std.mem.eql(u8, prior.state.architecture, architecture) or
+                prior.state.no_refresh != request.no_refresh)
                 return api.failure(
                     .recovery,
                     .state_corrupt,
@@ -212,6 +241,8 @@ pub const Backend = struct {
             progress.exact_lock_path = prior.state.exact_lock_path;
             progress.provenance_path = prior.state.provenance_path;
             progress.manifest_path = prior.state.manifest_path;
+            progress.diagnostic_id = prior.state.diagnostic_id;
+            progress.diagnostic = prior.state.diagnostic;
             if (prior.state.installed) {
                 progress.installed = true;
                 progress.installed_phase = .complete;
@@ -226,12 +257,19 @@ pub const Backend = struct {
                     .pending;
             }
         } else {
-            try progress.persist(
+            progress.persist(
                 state_store,
                 allocator,
                 .initialized,
                 null,
                 &.{},
+            ) catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .unavailable,
+                .state_persistence_failed,
+                "state",
+                @errorName(err),
             );
         }
 
@@ -246,9 +284,15 @@ pub const Backend = struct {
             @errorName(err),
         );
         defer package_cache.deinit();
-        var production_acquisition = repository_acquisition.Production{ .io = self.io };
-        const acquisition_dependencies = self.acquisition_dependencies orelse
-            production_acquisition.dependencies();
+        const descriptor_limit = budget.descriptorLimit(request.network.maximum_descriptor_bytes) catch |err|
+            return progress.fail(
+                state_store,
+                allocator,
+                .unavailable,
+                .resource_limit_exceeded,
+                "acquire",
+                @errorName(err),
+            );
         var artifact = local_artifact.acquire(allocator, &package_cache, .{
             .uri = repository_acquisition.Uri.parse(request.descriptor_url) catch
                 return progress.fail(
@@ -264,7 +308,7 @@ pub const Backend = struct {
             else
                 null,
             .policy = .{
-                .maximum_artifact_bytes = request.network.maximum_descriptor_bytes,
+                .maximum_artifact_bytes = descriptor_limit,
                 .proxy = proxyPolicy(request.network.proxy_url) catch
                     return progress.fail(
                         state_store,
@@ -281,12 +325,28 @@ pub const Backend = struct {
         }, acquisition_dependencies) catch |err| return progress.fail(
             state_store,
             allocator,
-            .download,
-            .acquisition_failed,
+            if (err == error.ArtifactTooLarge and
+                descriptor_limit < request.network.maximum_descriptor_bytes)
+                .unavailable
+            else
+                .download,
+            if (err == error.ArtifactTooLarge and
+                descriptor_limit < request.network.maximum_descriptor_bytes)
+                .resource_limit_exceeded
+            else
+                .acquisition_failed,
             "acquire",
             @errorName(err),
         );
         defer artifact.deinit();
+        budget.chargeDescriptor(artifact.provenance) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .unavailable,
+            .resource_limit_exceeded,
+            "acquire",
+            @errorName(err),
+        );
         progress.acquired = .complete;
 
         if (prior_state) |*prior| {
@@ -311,7 +371,15 @@ pub const Backend = struct {
                         "an installed incomplete repository operation must be recovered before another descriptor is added",
                 );
         }
-        try progress.persist(state_store, allocator, .acquired, null, &.{});
+        progress.persist(state_store, allocator, .acquired, null, &.{}) catch |err|
+            return progress.fail(
+                state_store,
+                allocator,
+                .unavailable,
+                .state_persistence_failed,
+                "state",
+                @errorName(err),
+            );
 
         const inspected = deb_payload.inspectLocal(allocator, artifact.bytes, .{
             .source = "repository-descriptor",
@@ -351,11 +419,14 @@ pub const Backend = struct {
             &validation,
             architecture,
             request.network,
+            request.resources,
         ) catch |err| return progress.fail(
             state_store,
             allocator,
-            .usage,
-            switch (err) {
+            if (err == error.ResourceBudgetExceeded) .unavailable else .usage,
+            if (err == error.ResourceBudgetExceeded)
+                .resource_limit_exceeded
+            else switch (err) {
                 error.MissingPayloadKeyring, error.UnsignedRepository => .descriptor_trust_unresolved,
                 error.DynamicRepositoryMaterial => .descriptor_dynamic,
                 else => .descriptor_invalid,
@@ -366,22 +437,29 @@ pub const Backend = struct {
         defer material.deinit();
         progress.validated = .complete;
         progress.managed_files = material.evidence;
-        const resume_refresh = if (prior_state) |*prior|
+        var resume_refresh = if (prior_state) |*prior|
             prior.state.installed and
                 !prior.state.refreshed and
-                prior.state.phase == .imported
+                prior.state.phase != .complete
         else
             false;
         const repository_material_changed = !snapshotContainsManagedMaterial(
             before_snapshot,
             material.evidence,
         );
-        try progress.persist(
+        progress.persist(
             state_store,
             allocator,
             .validated,
             descriptor,
             material.evidence,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .unavailable,
+            .state_persistence_failed,
+            "state",
+            @errorName(err),
         );
 
         var metadata = metadata_cache.Cache.initFromDir(self.io, cache_root, .{}) catch |err|
@@ -395,44 +473,73 @@ pub const Backend = struct {
             );
         defer metadata.deinit();
         const now = self.now_unix orelse realNow(self.io);
-        var descriptor_refresh = refreshDescriptor(
-            allocator,
-            &material,
-            &material.configuration,
-            &metadata,
-            acquisition_dependencies,
-            request.network,
-            now,
-        ) catch |err| return progress.fail(
-            state_store,
-            allocator,
-            .authentication,
-            .repository_authentication_failed,
-            "preflight",
-            @errorName(err),
-        );
-        defer descriptor_refresh.deinit(allocator);
-        switch (descriptor_refresh) {
-            .failed => |diagnostics| return progress.fail(
+        {
+            var descriptor_refresh = refreshDescriptor(
+                allocator,
+                &material,
+                &material.configuration,
+                &metadata,
+                acquisition_dependencies,
+                request.network,
+                &budget,
+                now,
+            ) catch |err| return progress.fail(
                 state_store,
                 allocator,
-                .authentication,
-                .repository_authentication_failed,
-                "preflight",
-                if (diagnostics.len == 0)
-                    "repository authentication failed"
+                if (err == error.ResourceBudgetExceeded) .unavailable else .authentication,
+                if (err == error.ResourceBudgetExceeded)
+                    .resource_limit_exceeded
                 else
-                    diagnostics[0].error_name,
-            ),
-            .published => {},
+                    .repository_authentication_failed,
+                "preflight",
+                @errorName(err),
+            );
+            defer descriptor_refresh.deinit(allocator);
+            budget.checkTime() catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .unavailable,
+                .resource_limit_exceeded,
+                "preflight",
+                @errorName(err),
+            );
+            switch (descriptor_refresh) {
+                .failed => |diagnostics| return progress.fail(
+                    state_store,
+                    allocator,
+                    .authentication,
+                    .repository_authentication_failed,
+                    "preflight",
+                    if (diagnostics.len == 0)
+                        "repository authentication failed"
+                    else
+                        diagnostics[0].error_name,
+                ),
+                .published => |*published| budget.chargeMetadata(published) catch |err|
+                    return progress.fail(
+                        state_store,
+                        allocator,
+                        .unavailable,
+                        .resource_limit_exceeded,
+                        "preflight",
+                        @errorName(err),
+                    ),
+            }
         }
         progress.authenticated = .complete;
-        try progress.persist(
+        progress.persist(
             state_store,
             allocator,
             .preflight_authenticated,
             descriptor,
             material.evidence,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .unavailable,
+            .state_persistence_failed,
+            "state",
+            @errorName(err),
         );
 
         var installed = loadInstalled(
@@ -498,30 +605,9 @@ pub const Backend = struct {
             skip_install = true;
             progress.installed = true;
             progress.installed_phase = .complete;
-            const durable = &prior_state.?.state;
-            if (durable.provenance_path == null or
-                !std.mem.eql(u8, durable.provenance_path.?, paths.provenance_logical))
-                return progress.fail(
-                    state_store,
-                    allocator,
-                    .recovery,
-                    .recovery_required,
-                    "resume",
-                    "installed repository state has no matching transaction provenance",
-                );
-            validateRecoveryEvidence(
-                allocator,
-                self.io,
-                operation_dir,
-                descriptor,
-            ) catch |err| return progress.fail(
-                state_store,
-                allocator,
-                .recovery,
-                .recovery_required,
-                "resume",
-                @errorName(err),
-            );
+            if (!prior_state.?.state.refreshed and
+                prior_state.?.state.phase != .complete)
+                resume_refresh = true;
         } else if (progress.installed) {
             return progress.fail(
                 state_store,
@@ -585,6 +671,7 @@ pub const Backend = struct {
             validation.package,
             validation.version,
             skip_install,
+            request.resources,
         );
         if (planning == .failure) {
             var first_failure = planning.failure;
@@ -608,12 +695,24 @@ pub const Backend = struct {
                 &metadata,
                 acquisition_dependencies,
                 request.network,
+                &budget,
                 now,
             ) catch |err| return progress.fail(
                 state_store,
                 allocator,
-                .authentication,
-                .dependency_refresh_failed,
+                if (err == error.ResourceBudgetExceeded) .unavailable else .authentication,
+                if (err == error.ResourceBudgetExceeded)
+                    .resource_limit_exceeded
+                else
+                    .dependency_refresh_failed,
+                "dependency-refresh",
+                @errorName(err),
+            );
+            budget.checkTime() catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .unavailable,
+                .resource_limit_exceeded,
                 "dependency-refresh",
                 @errorName(err),
             );
@@ -629,7 +728,17 @@ pub const Backend = struct {
                     else
                         diagnostics[0].error_name,
                 ),
-                .published => |*value| value,
+                .published => |*value| blk: {
+                    budget.chargeMetadata(value) catch |err| return progress.fail(
+                        state_store,
+                        allocator,
+                        .unavailable,
+                        .resource_limit_exceeded,
+                        "dependency-refresh",
+                        @errorName(err),
+                    );
+                    break :blk value;
+                },
             };
             const repositories = try allocator.alloc(
                 solver.RepositoryInput,
@@ -647,6 +756,7 @@ pub const Backend = struct {
                 validation.package,
                 validation.version,
                 skip_install,
+                request.resources,
             );
         }
         var plan = switch (planning) {
@@ -668,14 +778,35 @@ pub const Backend = struct {
             .plan => |value| value,
         };
         defer plan.deinit();
+        budget.validatePlan(plan) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .planning,
+            .resource_limit_exceeded,
+            "plan",
+            @errorName(err),
+        );
         progress.planned = .complete;
-        try progress.persist(
+        progress.persist(
             state_store,
             allocator,
             .planned,
             descriptor,
             material.evidence,
-        );
+        ) catch |err| {
+            if (skip_install) {
+                progress.installed = true;
+                progress.installed_phase = .complete;
+            }
+            return progress.fail(
+                state_store,
+                allocator,
+                if (progress.installed) .post_install else .unavailable,
+                .state_persistence_failed,
+                "state",
+                @errorName(err),
+            );
+        };
 
         const dependency_published: ?*repository_policy.RefreshResult =
             if (dependency_refresh) |*outcome| switch (outcome.*) {
@@ -687,7 +818,12 @@ pub const Backend = struct {
             operation_dir,
             exact_lock_name,
         );
-        var lock = if (skip_install)
+        const persisted_lock_required = skip_install or
+            if (prior_state) |*prior|
+                phaseAtLeast(prior.state.phase, .locked)
+            else
+                false;
+        var lock = if (persisted_lock_required)
             lock_store.read(allocator, exact_lock_v2.maximum_document_bytes) catch |err|
                 return progress.fail(
                     state_store,
@@ -713,7 +849,23 @@ pub const Backend = struct {
                 @errorName(err),
             );
         defer lock.deinit();
-        if (!skip_install)
+        budget.validateLock(lock.lock) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .planning,
+            .resource_limit_exceeded,
+            "lock",
+            @errorName(err),
+        );
+        validateLockDescriptor(lock.lock, descriptor) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .recovery,
+            .recovery_required,
+            "lock",
+            @errorName(err),
+        );
+        if (!persisted_lock_required)
             lock_store.writeAtomic(allocator, lock.lock) catch |err|
                 return progress.fail(
                     state_store,
@@ -724,25 +876,32 @@ pub const Backend = struct {
                     @errorName(err),
                 );
         progress.exact_lock_path = paths.exact_lock_logical;
-        try progress.persist(
+        progress.persist(
             state_store,
             allocator,
             .locked,
             descriptor,
             material.evidence,
-        );
-
+        ) catch |err| {
+            if (skip_install) {
+                progress.installed = true;
+                progress.installed_phase = .complete;
+            }
+            return progress.fail(
+                state_store,
+                allocator,
+                if (progress.installed) .post_install else .unavailable,
+                .state_persistence_failed,
+                "state",
+                @errorName(err),
+            );
+        };
         var artifacts: std.ArrayList(transaction_executor.Artifact) = .empty;
         defer {
             for (artifacts.items) |item| allocator.free(item.path);
             artifacts.deinit(allocator);
         }
-        var verified_dependencies: std.ArrayList(package_acquisition.VerifiedPackage) = .empty;
-        defer {
-            for (verified_dependencies.items) |*item| item.deinit();
-            verified_dependencies.deinit(allocator);
-        }
-        acquirePlanArtifacts(
+        if (!skip_install) acquirePlanArtifacts(
             allocator,
             request,
             paths.cache_physical,
@@ -751,20 +910,49 @@ pub const Backend = struct {
             plan,
             dependency_published,
             &before_snapshot.configuration,
+            &budget,
             &artifacts,
-            &verified_dependencies,
         ) catch |err| return progress.fail(
             state_store,
             allocator,
-            .download,
-            .dependency_acquisition_failed,
+            if (err == error.ResourceBudgetExceeded) .unavailable else .download,
+            if (err == error.ResourceBudgetExceeded)
+                .resource_limit_exceeded
+            else
+                .dependency_acquisition_failed,
             "dependency-acquire",
             @errorName(err),
         );
 
         var report: ?transaction_executor.Report = null;
         defer if (report) |*value| value.deinit();
-        if (!skip_install) {
+        var recovery_report: ?transaction_executor.RecoveryReport = null;
+        defer if (recovery_report) |*value| value.deinit();
+        var recovery_needed = false;
+        if (skip_install) {
+            validateRecoveryEvidence(
+                allocator,
+                self.io,
+                operation_dir,
+                descriptor,
+            ) catch |err| {
+                if (prior_state.?.state.phase == .complete)
+                    return progress.fail(
+                        state_store,
+                        allocator,
+                        .recovery,
+                        .recovery_required,
+                        "resume",
+                        @errorName(err),
+                    );
+                recovery_needed = true;
+            };
+            if (!recovery_needed) {
+                progress.exact_lock_path = paths.exact_lock_logical;
+                progress.provenance_path = paths.provenance_logical;
+            }
+        }
+        if (!skip_install or recovery_needed) {
             var system_process = transaction_executor.SystemProcessRunner{
                 .allocator = allocator,
                 .io = self.io,
@@ -802,20 +990,71 @@ pub const Backend = struct {
                 .journal = journal.interface(),
                 .status = status_reader.interface(),
             };
-            report = self.executor.executeFn(self.executor.context, allocator, .{
-                .plan = &plan,
-                .install_root = request.root,
-                .artifacts = artifacts.items,
-                .policy = repositoryExecutionPolicy(request),
-            }, dependencies) catch |err| return progress.fail(
-                state_store,
-                allocator,
-                .transaction,
-                .transaction_failed,
-                "install",
-                @errorName(err),
-            );
-            if (!report.?.succeeded()) {
+            if (recovery_needed) {
+                recovery_report = self.executor.recoverFn(
+                    self.executor.context,
+                    allocator,
+                    .{
+                        .plan = &plan,
+                        .install_root = request.root,
+                        .policy = repositoryExecutionPolicy(request),
+                        .exact_lock_v2 = &lock.lock,
+                    },
+                    dependencies,
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .transaction,
+                    .transaction_failed,
+                    "recover",
+                    @errorName(err),
+                );
+            } else {
+                report = self.executor.executeFn(self.executor.context, allocator, .{
+                    .plan = &plan,
+                    .install_root = request.root,
+                    .artifacts = artifacts.items,
+                    .policy = repositoryExecutionPolicy(request),
+                    .exact_lock_v2 = &lock.lock,
+                }, dependencies) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .transaction,
+                    .transaction_failed,
+                    "install",
+                    @errorName(err),
+                );
+                if (!report.?.succeeded() and
+                    report.?.failure != null and
+                    report.?.failure.?.code == .invalid_recovery_transition)
+                {
+                    report.?.deinit();
+                    report = null;
+                    recovery_report = self.executor.recoverFn(
+                        self.executor.context,
+                        allocator,
+                        .{
+                            .plan = &plan,
+                            .install_root = request.root,
+                            .policy = repositoryExecutionPolicy(request),
+                            .exact_lock_v2 = &lock.lock,
+                        },
+                        dependencies,
+                    ) catch |err| return progress.fail(
+                        state_store,
+                        allocator,
+                        .transaction,
+                        .transaction_failed,
+                        "recover",
+                        @errorName(err),
+                    );
+                }
+            }
+            const succeeded = if (recovery_report) |value|
+                value.succeeded()
+            else
+                report.?.succeeded();
+            if (!succeeded) {
                 if (descriptorIdentityInstalled(
                     allocator,
                     target_files.interface(),
@@ -830,45 +1069,78 @@ pub const Backend = struct {
                     allocator,
                     .transaction,
                     .transaction_failed,
-                    "install",
-                    if (report.?.failure) |failure|
+                    if (recovery_report != null) "recover" else "install",
+                    if (recovery_report) |value| if (value.failure) |failure|
+                        failure.diagnostic
+                    else
+                        "dpkg transaction recovery failed" else if (report.?.failure) |failure|
                         failure.diagnostic
                     else
                         "dpkg transaction failed",
                 );
             }
-            progress.changed = true;
+            progress.changed = !skip_install;
             progress.installed = true;
             progress.installed_phase = .complete;
 
-            publishProvenance(
-                allocator,
-                self.io,
-                operation_dir,
-                request.root,
-                &lock.lock,
-                plan,
-                report.?,
-                dependency_published,
-            ) catch |err| return progress.fail(
-                state_store,
-                allocator,
-                .post_install,
-                .provenance_publication_failed,
-                "provenance",
-                @errorName(err),
-            );
+            if (recovery_report) |value|
+                publishRecoveryProvenance(
+                    allocator,
+                    self.io,
+                    operation_dir,
+                    request.root,
+                    &lock.lock,
+                    value,
+                    dependency_published,
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .post_install,
+                    .provenance_publication_failed,
+                    "provenance",
+                    @errorName(err),
+                )
+            else
+                publishProvenance(
+                    allocator,
+                    self.io,
+                    operation_dir,
+                    request.root,
+                    &lock.lock,
+                    report.?,
+                    dependency_published,
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .post_install,
+                    .provenance_publication_failed,
+                    "provenance",
+                    @errorName(err),
+                );
             progress.provenance_path = paths.provenance_logical;
-            try progress.persist(
+            progress.persist(
                 state_store,
                 allocator,
                 .installed,
                 descriptor,
                 material.evidence,
+            ) catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .post_install,
+                .state_persistence_failed,
+                "state",
+                @errorName(err),
             );
-        } else {
-            progress.provenance_path = prior_state.?.state.provenance_path;
         }
+        budget.checkTime() catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .resource_limit_exceeded,
+            "install",
+            @errorName(err),
+        );
 
         verifyInstalledDescriptor(
             allocator,
@@ -887,6 +1159,7 @@ pub const Backend = struct {
         var after_snapshot = target_apt_config.snapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = architecture,
+            .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
                 .process = architecture_process.interface(),
@@ -909,10 +1182,17 @@ pub const Backend = struct {
                 "import",
                 @errorName(err),
             );
-        const manifest_store = try target_apt_config.Store.init(
+        const manifest_store = target_apt_config.Store.init(
             self.io,
             operation_dir,
             manifest_name,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .target_import_failed,
+            "manifest",
+            @errorName(err),
         );
         manifest_store.writeAtomic(allocator, after_snapshot.manifest.manifest) catch |err|
             return progress.fail(
@@ -925,28 +1205,53 @@ pub const Backend = struct {
             );
         progress.manifest_path = paths.manifest_logical;
         progress.imported = .complete;
-        try progress.persist(
+        progress.persist(
             state_store,
             allocator,
             .imported,
             descriptor,
             material.evidence,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .state_persistence_failed,
+            "state",
+            @errorName(err),
+        );
+        budget.checkTime() catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .resource_limit_exceeded,
+            "import",
+            @errorName(err),
         );
 
         if (request.no_refresh) {
-            progress.refreshed = false;
-            progress.refreshed_phase = .skipped;
+            progress.refreshed_phase = if (progress.refreshed) .complete else .skipped;
         } else if (!progress.refreshed and
             (resume_refresh or repository_material_changed))
         {
             var changed_configuration: ?repository_policy.Configuration = null;
             defer if (changed_configuration) |*value| value.deinit();
-            if (!resume_refresh) changed_configuration = try changedDescriptorConfiguration(
+            if (!resume_refresh) changed_configuration = changedDescriptorConfiguration(
                 allocator,
                 &material,
                 before_snapshot,
                 architecture,
                 request.network,
+                request.resources,
+            ) catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .post_install,
+                if (err == error.ResourceBudgetExceeded)
+                    .resource_limit_exceeded
+                else
+                    .refresh_failed,
+                "refresh",
+                @errorName(err),
             );
             const refresh_configuration: ?*const repository_policy.Configuration =
                 if (resume_refresh)
@@ -956,16 +1261,35 @@ pub const Backend = struct {
                 else
                     null;
             if (refresh_configuration) |configuration| {
-                var final_refresh = try refreshDescriptor(
+                var final_refresh = refreshDescriptor(
                     allocator,
                     &material,
                     configuration,
                     &metadata,
                     acquisition_dependencies,
                     request.network,
+                    &budget,
                     now,
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    if (err == error.ResourceBudgetExceeded) .unavailable else .post_install,
+                    if (err == error.ResourceBudgetExceeded)
+                        .resource_limit_exceeded
+                    else
+                        .refresh_failed,
+                    "refresh",
+                    @errorName(err),
                 );
                 defer final_refresh.deinit(allocator);
+                budget.checkTime() catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .unavailable,
+                    .resource_limit_exceeded,
+                    "refresh",
+                    @errorName(err),
+                );
                 switch (final_refresh) {
                     .failed => |diagnostics| return progress.fail(
                         state_store,
@@ -978,16 +1302,31 @@ pub const Backend = struct {
                         else
                             diagnostics[0].error_name,
                     ),
-                    .published => {},
+                    .published => |*published| budget.chargeMetadata(published) catch |err|
+                        return progress.fail(
+                            state_store,
+                            allocator,
+                            .unavailable,
+                            .resource_limit_exceeded,
+                            "refresh",
+                            @errorName(err),
+                        ),
                 }
                 progress.refreshed = true;
                 progress.refreshed_phase = .complete;
-                try progress.persist(
+                progress.persist(
                     state_store,
                     allocator,
                     .refreshed,
                     descriptor,
                     material.evidence,
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .post_install,
+                    .state_persistence_failed,
+                    "state",
+                    @errorName(err),
                 );
             } else {
                 progress.refreshed_phase = .skipped;
@@ -998,12 +1337,35 @@ pub const Backend = struct {
             progress.refreshed_phase = .skipped;
         }
 
-        try progress.persist(
+        budget.checkTime() catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .resource_limit_exceeded,
+            "complete",
+            @errorName(err),
+        );
+        progress.persist(
             state_store,
             allocator,
             .complete,
             descriptor,
             material.evidence,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .state_persistence_failed,
+            "state",
+            @errorName(err),
+        );
+        budget.checkTime() catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .resource_limit_exceeded,
+            "complete",
+            @errorName(err),
         );
         return progress.success(allocator);
     }
@@ -1031,6 +1393,8 @@ const Progress = struct {
     manifest_path: ?[]const u8 = null,
     managed_files: []const state_module.FileEvidence = &.{},
     durable_phase: state_module.Phase = .initialized,
+    diagnostic_id: ?api.DiagnosticId = null,
+    diagnostic: []const u8 = "",
 
     fn persist(
         self: *Progress,
@@ -1054,6 +1418,12 @@ const Progress = struct {
             self.durable_phase
         else
             phase;
+        const retain_diagnostic = phaseOrder(self.durable_phase) > phaseOrder(phase) and
+            self.diagnostic_id != null;
+        const persist_installed = self.installed and
+            phaseAtLeast(durable_phase, .installed);
+        const persist_refreshed = self.refreshed and
+            phaseAtLeast(durable_phase, .refreshed);
         var state = try state_module.create(allocator, .{
             .root = self.root,
             .architecture = self.architecture,
@@ -1061,15 +1431,21 @@ const Progress = struct {
             .phase = durable_phase,
             .descriptor = state_descriptor,
             .managed_files = if (files.len != 0) files else self.managed_files,
-            .installed = self.installed,
-            .refreshed = self.refreshed,
+            .installed = persist_installed,
+            .refreshed = persist_refreshed,
             .exact_lock_path = self.exact_lock_path,
             .provenance_path = self.provenance_path,
             .manifest_path = self.manifest_path,
+            .diagnostic_id = if (retain_diagnostic) self.diagnostic_id else null,
+            .diagnostic = if (retain_diagnostic) self.diagnostic else "",
         });
         defer state.deinit();
         try store.writeAtomic(allocator, state.state, self.maximum_state_bytes);
         self.durable_phase = durable_phase;
+        if (!retain_diagnostic) {
+            self.diagnostic_id = null;
+            self.diagnostic = "";
+        }
     }
 
     fn fail(
@@ -1320,10 +1696,242 @@ fn requestOperationId(request: api.Request) [64]u8 {
     } else {
         hash.update("\x00");
     }
+    hash.update(if (request.no_refresh) "\x01" else "\x00");
     var result: [64]u8 = undefined;
     const digest = hash.finalResult();
     formatHex(&result, &digest);
     return result;
+}
+
+const OperationBudget = struct {
+    clock: repository_acquisition.Clock,
+    policy: api.ResourcePolicy,
+    started_ms: u64,
+    overall_timeout_ms: u64,
+    descriptor_bytes: u64 = 0,
+    metadata_bytes: u64 = 0,
+    cache_growth_bytes: u64 = 0,
+
+    fn init(
+        clock: repository_acquisition.Clock,
+        policy: api.ResourcePolicy,
+        overall_timeout_ms: u64,
+    ) OperationBudget {
+        return .{
+            .clock = clock,
+            .policy = policy,
+            .started_ms = clock.nowMs(),
+            .overall_timeout_ms = overall_timeout_ms,
+        };
+    }
+
+    fn checkTime(self: OperationBudget) !void {
+        if (self.clock.nowMs() -| self.started_ms > self.overall_timeout_ms)
+            return error.ResourceBudgetExceeded;
+    }
+
+    fn remainingTime(self: OperationBudget) !u64 {
+        try self.checkTime();
+        const spent = self.clock.nowMs() -| self.started_ms;
+        if (spent >= self.overall_timeout_ms) return error.ResourceBudgetExceeded;
+        return self.overall_timeout_ms - spent;
+    }
+
+    fn descriptorLimit(self: OperationBudget, requested: usize) !usize {
+        try self.checkTime();
+        const bounded = @min(
+            @as(u64, requested),
+            @min(
+                self.policy.maximum_total_package_bytes,
+                @min(
+                    self.policy.maximum_retained_package_bytes,
+                    self.policy.maximum_cache_growth_bytes,
+                ),
+            ),
+        );
+        if (bounded == 0) return error.ResourceBudgetExceeded;
+        return std.math.cast(usize, bounded) orelse error.ResourceBudgetExceeded;
+    }
+
+    fn chargeDescriptor(
+        self: *OperationBudget,
+        provenance: local_artifact.Provenance,
+    ) !void {
+        self.descriptor_bytes = provenance.size;
+        if (self.descriptor_bytes > self.policy.maximum_total_package_bytes or
+            self.descriptor_bytes > self.policy.maximum_retained_package_bytes)
+            return error.ResourceBudgetExceeded;
+        try charge(
+            &self.cache_growth_bytes,
+            provenance.cache_growth_bytes,
+            self.policy.maximum_cache_growth_bytes,
+        );
+        try self.checkTime();
+    }
+
+    fn validatePlan(self: OperationBudget, plan: solver.Plan) !void {
+        if (plan.actions.len > self.policy.maximum_actions)
+            return error.ResourceBudgetExceeded;
+        try self.checkTime();
+    }
+
+    fn validateLock(self: OperationBudget, lock: exact_lock_v2.Lock) !void {
+        if (lock.repositories.len > self.policy.maximum_repositories or
+            lock.packages.len > self.policy.maximum_actions)
+            return error.ResourceBudgetExceeded;
+        var total: u64 = 0;
+        var largest_dependency: u64 = 0;
+        for (lock.packages) |package| {
+            total = std.math.add(u64, total, package.declared_size) catch
+                return error.ResourceBudgetExceeded;
+            switch (package.origin) {
+                .local_artifact => {},
+                .authenticated_repository => largest_dependency =
+                    @max(largest_dependency, package.declared_size),
+            }
+        }
+        if (total > self.policy.maximum_total_package_bytes)
+            return error.ResourceBudgetExceeded;
+        const retained = std.math.add(
+            u64,
+            self.descriptor_bytes,
+            largest_dependency,
+        ) catch return error.ResourceBudgetExceeded;
+        if (retained > self.policy.maximum_retained_package_bytes)
+            return error.ResourceBudgetExceeded;
+        try self.checkTime();
+    }
+
+    fn packageLimit(self: OperationBudget, requested: usize) !usize {
+        try self.checkTime();
+        const retained_remaining = self.policy.maximum_retained_package_bytes -|
+            self.descriptor_bytes;
+        const bounded = @min(
+            @as(u64, requested),
+            @min(self.policy.maximum_total_package_bytes, retained_remaining),
+        );
+        if (bounded == 0) return error.ResourceBudgetExceeded;
+        return std.math.cast(usize, bounded) orelse error.ResourceBudgetExceeded;
+    }
+
+    fn reserveCacheGrowth(
+        self: *OperationBudget,
+        desired_size: u64,
+        existing_size: ?u64,
+    ) !void {
+        const growth = desired_size -| (existing_size orelse 0);
+        try charge(
+            &self.cache_growth_bytes,
+            growth,
+            self.policy.maximum_cache_growth_bytes,
+        );
+    }
+
+    fn boundedTime(
+        self: OperationBudget,
+        network: api.NetworkPolicy,
+    ) !api.NetworkPolicy {
+        var bounded = network;
+        bounded.overall_timeout_ms = @min(network.overall_timeout_ms, try self.remainingTime());
+        bounded.connect_timeout_ms = @min(
+            network.connect_timeout_ms,
+            bounded.overall_timeout_ms,
+        );
+        bounded.read_timeout_ms = @min(
+            network.read_timeout_ms,
+            bounded.overall_timeout_ms,
+        );
+        return bounded;
+    }
+
+    fn boundedNetwork(
+        self: OperationBudget,
+        network: api.NetworkPolicy,
+        repository_count: usize,
+    ) !api.NetworkPolicy {
+        if (repository_count == 0 or
+            repository_count > self.policy.maximum_repositories)
+            return error.ResourceBudgetExceeded;
+        const remaining_metadata = self.policy.maximum_total_metadata_bytes -|
+            self.metadata_bytes;
+        const remaining_cache = self.policy.maximum_cache_growth_bytes -|
+            self.cache_growth_bytes;
+        const available = @min(remaining_metadata, remaining_cache);
+        const share = available / repository_count;
+        if (share < 2) return error.ResourceBudgetExceeded;
+        const release_share = @max(@as(u64, 1), share / 8);
+        const index_share = share - release_share;
+        var bounded = try self.boundedTime(network);
+        bounded.maximum_release_bytes = @min(
+            network.maximum_release_bytes,
+            std.math.cast(usize, release_share) orelse network.maximum_release_bytes,
+        );
+        bounded.maximum_compressed_index_bytes = @min(
+            network.maximum_compressed_index_bytes,
+            std.math.cast(usize, index_share) orelse
+                network.maximum_compressed_index_bytes,
+        );
+        bounded.maximum_decompressed_index_bytes = @min(
+            network.maximum_decompressed_index_bytes,
+            std.math.cast(usize, index_share) orelse
+                network.maximum_decompressed_index_bytes,
+        );
+        if (bounded.maximum_release_bytes == 0 or
+            bounded.maximum_compressed_index_bytes == 0 or
+            bounded.maximum_decompressed_index_bytes == 0)
+            return error.ResourceBudgetExceeded;
+        return bounded;
+    }
+
+    fn chargeMetadata(
+        self: *OperationBudget,
+        result: *const repository_policy.RefreshResult,
+    ) !void {
+        var bytes: u64 = result.aggregate_manifest.len;
+        for (result.snapshots) |snapshot| {
+            bytes = std.math.add(u64, bytes, snapshot.snapshot.bytes.len) catch
+                return error.ResourceBudgetExceeded;
+            bytes = std.math.add(
+                u64,
+                bytes,
+                snapshot.snapshot.packages_bytes.len,
+            ) catch return error.ResourceBudgetExceeded;
+        }
+        try charge(
+            &self.metadata_bytes,
+            bytes,
+            self.policy.maximum_total_metadata_bytes,
+        );
+        try charge(
+            &self.cache_growth_bytes,
+            bytes,
+            self.policy.maximum_cache_growth_bytes,
+        );
+        try self.checkTime();
+    }
+
+    fn charge(counter: *u64, amount: u64, limit: u64) !void {
+        const total = std.math.add(u64, counter.*, amount) catch
+            return error.ResourceBudgetExceeded;
+        if (total > limit) return error.ResourceBudgetExceeded;
+        counter.* = total;
+    }
+};
+
+fn repositoryLimits(resources: api.ResourcePolicy) repository_policy.Limits {
+    return .{
+        .source = .{ .max_sources = resources.maximum_repositories },
+        .max_documents = resources.maximum_repositories,
+        .max_repositories = resources.maximum_repositories,
+    };
+}
+
+fn targetLimits(resources: api.ResourcePolicy) target_apt_config.Limits {
+    return .{
+        .source = .{ .max_sources = resources.maximum_repositories },
+        .repository = repositoryLimits(resources),
+        .max_sources = resources.maximum_repositories,
+    };
 }
 
 const MaterialFile = struct {
@@ -1360,9 +1968,15 @@ fn inspectDescriptorMaterial(
     validation: *const deb_payload.Validation,
     architecture: []const u8,
     network: api.NetworkPolicy,
+    resources: api.ResourcePolicy,
 ) !DescriptorMaterial {
     var source_files: std.ArrayList(MaterialFile) = .empty;
-    defer source_files.deinit(allocator);
+    defer {
+        for (source_files.items) |file| {
+            if (file.logical_path.len != 0) allocator.free(file.logical_path);
+        }
+        source_files.deinit(allocator);
+    }
     for (validation.data.entries) |entry| {
         if (entry.kind != .regular or
             (!std.mem.endsWith(u8, entry.path, ".list") and
@@ -1370,6 +1984,8 @@ fn inspectDescriptorMaterial(
             continue;
         if (!std.mem.startsWith(u8, entry.path, "etc/apt/sources.list.d/"))
             return error.DynamicRepositoryMaterial;
+        if (source_files.items.len == resources.maximum_repositories)
+            return error.ResourceBudgetExceeded;
         const logical_path = try std.fmt.allocPrint(allocator, "/{s}", .{entry.path});
         errdefer allocator.free(logical_path);
         const bytes = try validation.regularPayloadBytes(
@@ -1411,7 +2027,7 @@ fn inspectDescriptorMaterial(
         allocator,
         documents,
         architecture,
-        .{},
+        repositoryLimits(resources),
     );
     var configuration = switch (normalized) {
         .diagnostic => return error.MalformedRepositorySource,
@@ -1482,8 +2098,13 @@ fn refreshDescriptor(
     cache: *metadata_cache.Cache,
     acquisition: repository_acquisition.Dependencies,
     network: api.NetworkPolicy,
+    budget: *OperationBudget,
     now: i64,
 ) !repository_policy.RefreshOutcome {
+    const bounded_network = try budget.boundedNetwork(
+        network,
+        configuration.repositories.len,
+    );
     const runtimes = try allocator.alloc(
         repository_policy.Runtime,
         configuration.repositories.len,
@@ -1505,7 +2126,7 @@ fn refreshDescriptor(
         runtimes[index] = runtimeForRepository(
             repository,
             keyrings,
-            network,
+            bounded_network,
             now,
         );
     }
@@ -1530,6 +2151,7 @@ fn changedDescriptorConfiguration(
     snapshot: target_apt_config.Snapshot,
     architecture: []const u8,
     network: api.NetworkPolicy,
+    resources: api.ResourcePolicy,
 ) !?repository_policy.Configuration {
     var changed_documents: std.ArrayList(repository_policy.SourceDocument) = .empty;
     defer changed_documents.deinit(allocator);
@@ -1553,7 +2175,7 @@ fn changedDescriptorConfiguration(
             allocator,
             &.{document},
             architecture,
-            .{},
+            repositoryLimits(resources),
         );
         var configuration = switch (normalized) {
             .diagnostic => return error.MalformedRepositorySource,
@@ -1591,7 +2213,7 @@ fn changedDescriptorConfiguration(
         allocator,
         changed_documents.items,
         architecture,
-        .{},
+        repositoryLimits(resources),
     );
     return switch (normalized) {
         .diagnostic => error.MalformedRepositorySource,
@@ -1605,8 +2227,13 @@ fn refreshTarget(
     cache: *metadata_cache.Cache,
     acquisition: repository_acquisition.Dependencies,
     network: api.NetworkPolicy,
+    budget: *OperationBudget,
     now: i64,
 ) !repository_policy.RefreshOutcome {
+    const bounded_network = try budget.boundedNetwork(
+        network,
+        snapshot.configuration.repositories.len,
+    );
     const runtimes = try allocator.alloc(
         repository_policy.Runtime,
         snapshot.configuration.repositories.len,
@@ -1627,7 +2254,7 @@ fn refreshTarget(
         runtimes[index] = runtimeForRepository(
             repository,
             trusts[index].keyrings,
-            network,
+            bounded_network,
             now,
         );
         runtimes[index].authentication = trusts[index].authentication(now);
@@ -1778,6 +2405,7 @@ fn planDescriptor(
     package: []const u8,
     version: []const u8,
     reinstall: bool,
+    resources: api.ResourcePolicy,
 ) !solver.PlanningResult {
     return solver.planTransaction(allocator, .{
         .repositories = repositories,
@@ -1805,6 +2433,12 @@ fn planDescriptor(
             .allow_replacements = false,
             .strict_repository_priority = true,
             .phased_updates = .disabled,
+        },
+        .limits = .{
+            .import = .{
+                .max_repositories = resources.maximum_repositories,
+            },
+            .max_actions = resources.maximum_actions,
         },
     });
 }
@@ -1934,9 +2568,10 @@ fn acquirePlanArtifacts(
     plan: solver.Plan,
     refreshed: ?*repository_policy.RefreshResult,
     configuration: *const repository_policy.Configuration,
+    budget: *OperationBudget,
     artifacts: *std.ArrayList(transaction_executor.Artifact),
-    verified: *std.ArrayList(package_acquisition.VerifiedPackage),
 ) !void {
+    try budget.checkTime();
     for (plan.actions) |action| {
         if (action.kind == .remove) continue;
         const origin = action.selected_origin_v2 orelse return error.MissingPackageOrigin;
@@ -1970,6 +2605,18 @@ fn acquirePlanArtifacts(
                     repository_origin,
                     try repository_acquisition.Uri.parse(normalized.uri),
                 );
+                const digest: metadata_cache.Digest = .{
+                    .bytes = selected.record.transport.sha256.bytes,
+                };
+                const existing_size = try cache.objectSize(digest);
+                try budget.reserveCacheGrowth(
+                    selected.record.transport.size.value,
+                    existing_size,
+                );
+                const package_network = try budget.boundedTime(request.network);
+                const package_limit = try budget.packageLimit(
+                    package_network.maximum_package_bytes,
+                );
                 var package = try package_acquisition.acquirePackage(
                     allocator,
                     cache,
@@ -1978,16 +2625,16 @@ fn acquirePlanArtifacts(
                         .policy = .{
                             .mode = .online,
                             .workflow = .transaction,
-                            .maximum_package_bytes = request.network.maximum_package_bytes,
-                            .proxy = try proxyPolicy(request.network.proxy_url),
-                            .deadlines = deadlines(request.network),
-                            .redirect_limit = request.network.redirect_limit,
-                            .retry = retryPolicy(request.network),
+                            .maximum_package_bytes = package_limit,
+                            .proxy = try proxyPolicy(package_network.proxy_url),
+                            .deadlines = deadlines(package_network),
+                            .redirect_limit = package_network.redirect_limit,
+                            .retry = retryPolicy(package_network),
                         },
                     },
                     acquisition,
                 );
-                errdefer package.deinit();
+                defer package.deinit();
                 var payload = deb_payload.validate(allocator, package.bytes, .{
                     .repository = repository_origin.repository_id.slice(),
                     .package = action.package,
@@ -2016,9 +2663,9 @@ fn acquirePlanArtifacts(
                     .architecture = action.architecture,
                     .path = path,
                 });
-                try verified.append(allocator, package);
             },
         }
+        try budget.checkTime();
     }
 }
 
@@ -2028,8 +2675,52 @@ fn publishProvenance(
     operation_dir: std.Io.Dir,
     root: []const u8,
     lock: *const exact_lock_v2.Lock,
-    plan: solver.Plan,
     report: transaction_executor.Report,
+    refreshed: ?*repository_policy.RefreshResult,
+) !void {
+    return publishBoundProvenance(
+        allocator,
+        io,
+        operation_dir,
+        root,
+        lock,
+        .{ .execution = report },
+        refreshed,
+    );
+}
+
+fn publishRecoveryProvenance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation_dir: std.Io.Dir,
+    root: []const u8,
+    lock: *const exact_lock_v2.Lock,
+    report: transaction_executor.RecoveryReport,
+    refreshed: ?*repository_policy.RefreshResult,
+) !void {
+    return publishBoundProvenance(
+        allocator,
+        io,
+        operation_dir,
+        root,
+        lock,
+        .{ .recovery = report },
+        refreshed,
+    );
+}
+
+const ProvenanceReport = union(enum) {
+    execution: transaction_executor.Report,
+    recovery: transaction_executor.RecoveryReport,
+};
+
+fn publishBoundProvenance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation_dir: std.Io.Dir,
+    root: []const u8,
+    lock: *const exact_lock_v2.Lock,
+    report: ProvenanceReport,
     refreshed: ?*repository_policy.RefreshResult,
 ) !void {
     const repositories = try allocator.alloc(
@@ -2087,36 +2778,6 @@ fn publishProvenance(
         .cas_sha256 = package.sha256,
         .declared_size = package.declared_size,
     };
-    const commands = try allocator.alloc(
-        transaction_provenance_v2.CommandEvidence,
-        report.commands.len,
-    );
-    defer allocator.free(commands);
-    var environment_storage: std.ArrayList(
-        []transaction_provenance_v2.EnvironmentEntry,
-    ) = .empty;
-    defer {
-        for (environment_storage.items) |entries| allocator.free(entries);
-        environment_storage.deinit(allocator);
-    }
-    for (report.commands, 0..) |command, index| {
-        const environment = try allocator.alloc(
-            transaction_provenance_v2.EnvironmentEntry,
-            command.environment.len,
-        );
-        for (command.environment, 0..) |entry, entry_index| {
-            environment[entry_index] = .{ .key = entry.key, .value = entry.value };
-        }
-        try environment_storage.append(allocator, environment);
-        commands[index] = .{
-            .phase = @tagName(command.phase),
-            .package = command.package,
-            .argv = command.argv,
-            .environment = environment,
-            .command_sha256 = command.command_sha256,
-            .artifact_sha256 = command.artifact_sha256,
-        };
-    }
     var status_reader = transaction_recovery.SystemStatusFileReader{
         .io = io,
         .expected_root = root,
@@ -2128,16 +2789,13 @@ fn publishProvenance(
     );
     defer allocator.free(status_bytes);
     const status_digest = sha256(status_bytes);
-    var provenance = try transaction_provenance_v2.create(allocator, .{
+    const input: transaction_provenance_v2.ExecutionInput = .{
+        .exact_lock = lock,
         .target_architecture = lock.target_architecture,
         .request_sha256 = lock.request_sha256,
         .solver_policy_sha256 = lock.policy_sha256,
-        .executor_policy_sha256 = report.policy_sha256,
-        .plan_sha256 = report.plan_sha256,
-        .lock_sha256 = lock.digest_sha256,
         .repositories = repositories,
         .packages = packages,
-        .commands = commands,
         .journal_steps = &.{},
         .final_verification = .{
             .status = .exact_match,
@@ -2145,8 +2803,19 @@ fn publishProvenance(
             .package_origins_sha256 = lock.digest_sha256,
             .detail = "repository add transaction and local artifact evidence verified",
         },
-        .outcome = .succeeded,
-    });
+    };
+    var provenance = switch (report) {
+        .execution => |value| try transaction_provenance_v2.createFromExecution(
+            allocator,
+            input,
+            value,
+        ),
+        .recovery => |value| try transaction_provenance_v2.createFromRecovery(
+            allocator,
+            input,
+            value,
+        ),
+    };
     defer provenance.deinit();
     const store = try transaction_provenance_v2.Store.init(
         io,
@@ -2154,7 +2823,6 @@ fn publishProvenance(
         provenance_name,
     );
     try store.writeAtomic(allocator, provenance.result);
-    _ = plan;
 }
 
 fn verifyInstalledDescriptor(
@@ -2226,35 +2894,7 @@ fn validateRecoveryEvidence(
         exact_lock_v2.maximum_document_bytes,
     );
     defer lock.deinit();
-    const locked = lock.lock.findPackage(
-        descriptor.package,
-        descriptor.version,
-        descriptor.architecture,
-    ) orelse return error.DescriptorMissingFromLock;
-    if (!std.mem.eql(u8, &locked.sha256, &descriptor.sha256) or
-        locked.declared_size != descriptor.size)
-        return error.DescriptorLockMismatch;
-    switch (locked.origin) {
-        .authenticated_repository => return error.DescriptorLockMismatch,
-        .local_artifact => |local| {
-            const expected_trust: package_origin.LocalArtifactTrustMode =
-                switch (descriptor.trust_mode) {
-                    .verified_https => .verified_https,
-                    .pinned_sha256 => .pinned_sha256,
-                };
-            const expected_artifact_id =
-                package_origin.artifactIdFromSha256(descriptor.sha256);
-            if (!std.mem.eql(u8, &local.artifact_id, &expected_artifact_id) or
-                !std.mem.eql(u8, &local.sha256, &descriptor.sha256) or
-                local.size != descriptor.size or
-                !std.mem.eql(u8, local.package, descriptor.package) or
-                !std.mem.eql(u8, local.version, descriptor.version) or
-                !std.mem.eql(u8, local.architecture, descriptor.architecture) or
-                !std.mem.eql(u8, local.acquisition_url, descriptor.effective_url) or
-                local.trust_mode != expected_trust)
-                return error.DescriptorLockMismatch;
-        },
-    }
+    try validateLockDescriptor(lock.lock, descriptor);
 
     var file = try operation_dir.openFile(io, provenance_name, .{
         .mode = .read_only,
@@ -2303,6 +2943,41 @@ fn validateRecoveryEvidence(
         "package_origins_sha256",
         &lock_digest,
     );
+}
+
+fn validateLockDescriptor(
+    lock: exact_lock_v2.Lock,
+    descriptor: api.DescriptorIdentity,
+) !void {
+    const locked = lock.findPackage(
+        descriptor.package,
+        descriptor.version,
+        descriptor.architecture,
+    ) orelse return error.DescriptorMissingFromLock;
+    if (!std.mem.eql(u8, &locked.sha256, &descriptor.sha256) or
+        locked.declared_size != descriptor.size)
+        return error.DescriptorLockMismatch;
+    switch (locked.origin) {
+        .authenticated_repository => return error.DescriptorLockMismatch,
+        .local_artifact => |local| {
+            const expected_trust: package_origin.LocalArtifactTrustMode =
+                switch (descriptor.trust_mode) {
+                    .verified_https => .verified_https,
+                    .pinned_sha256 => .pinned_sha256,
+                };
+            const expected_artifact_id =
+                package_origin.artifactIdFromSha256(descriptor.sha256);
+            if (!std.mem.eql(u8, &local.artifact_id, &expected_artifact_id) or
+                !std.mem.eql(u8, &local.sha256, &descriptor.sha256) or
+                local.size != descriptor.size or
+                !std.mem.eql(u8, local.package, descriptor.package) or
+                !std.mem.eql(u8, local.version, descriptor.version) or
+                !std.mem.eql(u8, local.architecture, descriptor.architecture) or
+                !std.mem.eql(u8, local.acquisition_url, descriptor.effective_url) or
+                local.trust_mode != expected_trust)
+                return error.DescriptorLockMismatch;
+        },
+    }
 }
 
 fn expectJsonString(
@@ -2698,6 +3373,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         &validation,
         "amd64",
         .{},
+        .{},
     );
     defer material.deinit();
     try std.testing.expectEqual(@as(usize, 1), material.configuration.repositories.len);
@@ -2711,6 +3387,46 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         material.evidence[1].logical_path,
     );
 
+    const trusted_sources = [_]struct {
+        path: []const u8,
+        bytes: []const u8,
+    }{
+        .{
+            .path = "etc/apt/sources.list.d/microsoft-prod.list",
+            .bytes = "deb [trusted=yes signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+                "https://packages.microsoft.test/noble prod main\n",
+        },
+        .{
+            .path = "etc/apt/sources.list.d/microsoft-prod.sources",
+            .bytes = "Types: deb\nURIs: https://packages.microsoft.test/noble\n" ++
+                "Suites: prod\nComponents: main\nArchitectures: amd64\n" ++
+                "Signed-By: /usr/share/keyrings/microsoft-prod.gpg\nTrusted: yes\n",
+        },
+    };
+    for (trusted_sources) |trusted| {
+        const trusted_payload = try std.mem.concat(
+            std.testing.allocator,
+            u8,
+            &.{ trusted.bytes, &fixture.keyring },
+        );
+        defer std.testing.allocator.free(trusted_payload);
+        entries[0].path = @constCast(trusted.path);
+        entries[0].size = trusted.bytes.len;
+        entries[1].header_offset = trusted.bytes.len;
+        entries[1].content_offset = trusted.bytes.len;
+        validation.data_bytes = trusted_payload;
+        try std.testing.expectError(
+            error.MalformedRepositorySource,
+            inspectDescriptorMaterial(
+                std.testing.allocator,
+                &validation,
+                "amd64",
+                .{},
+                .{},
+            ),
+        );
+    }
+
     const unsigned_source = "deb file:///synthetic-repository stable main\n";
     const unsigned_payload = try std.mem.concat(
         std.testing.allocator,
@@ -2718,6 +3434,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         &.{ unsigned_source, &fixture.keyring },
     );
     defer std.testing.allocator.free(unsigned_payload);
+    entries[0].path = @constCast("etc/apt/sources.list.d/microsoft-prod.list");
     entries[0].size = unsigned_source.len;
     entries[1].header_offset = unsigned_source.len;
     entries[1].content_offset = unsigned_source.len;
@@ -2729,6 +3446,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             &validation,
             "amd64",
             .{},
+            .{},
         ),
     );
     entries[0].path = @constCast("usr/share/doc/microsoft-prod.list");
@@ -2738,6 +3456,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             std.testing.allocator,
             &validation,
             "amd64",
+            .{},
             .{},
         ),
     );
@@ -2813,6 +3532,7 @@ test "repository backend uses installed dependencies before requesting refresh" 
         "packages-microsoft-prod",
         "1.1",
         false,
+        .{},
     );
     var plan = switch (result) {
         .failure => |failure_value| {
@@ -2835,6 +3555,7 @@ test "repository backend uses installed dependencies before requesting refresh" 
         "packages-microsoft-prod",
         "1.1",
         false,
+        .{},
     );
     switch (missing) {
         .plan => |*unexpected| {
@@ -2856,14 +3577,16 @@ const RepositoryTestAcquisition = struct {
     in_release_requests: usize = 0,
     fail_in_release_request: ?usize = null,
     network_requests: usize = 0,
+    now_ms: u64 = 0,
+    advance_ms_per_read: u64 = 0,
 
     fn dependencies(self: *RepositoryTestAcquisition) repository_acquisition.Dependencies {
         return .{
             .transport = .{ .context = self, .requestFn = rejectNetwork },
             .files = .{ .context = self, .readFn = readFile },
             .clock = .{
-                .context = null,
-                .nowMsFn = zeroMilliseconds,
+                .context = self,
+                .nowMsFn = nowMilliseconds,
                 .sleepMsFn = noSleep,
             },
         };
@@ -2900,25 +3623,45 @@ const RepositoryTestAcquisition = struct {
         else
             return error.FileNotFound;
         if (bytes.len > limit) return error.ResponseTooLarge;
+        self.now_ms +|= self.advance_ms_per_read;
         return .{ .bytes = try allocator.dupe(u8, bytes), .regular = true };
     }
 
-    fn zeroMilliseconds(_: ?*anyopaque) u64 {
-        return 0;
+    fn nowMilliseconds(context: ?*anyopaque) u64 {
+        const self: *RepositoryTestAcquisition = @ptrCast(@alignCast(context.?));
+        return self.now_ms;
     }
 
     fn noSleep(_: ?*anyopaque, _: u64) !void {}
 };
 
 const RepositoryTestExecutor = struct {
+    const LockDigestMode = enum {
+        exact,
+        missing,
+        mismatch,
+    };
+
     io: std.Io,
     directory: std.Io.Dir,
     calls: usize = 0,
+    recover_calls: usize = 0,
     saw_lock_before_install: bool = false,
+    saw_exact_lock: bool = false,
+    recovered_exact_lock: bool = false,
     last_allow_host_root: bool = false,
+    interrupt_first: bool = false,
+    interrupt_before_install: bool = false,
+    lock_digest_mode: LockDigestMode = .exact,
+    clock_ms: ?*u64 = null,
+    advance_ms_after_install: u64 = 0,
 
     fn interface(self: *RepositoryTestExecutor) Executor {
-        return .{ .context = self, .executeFn = execute };
+        return .{
+            .context = self,
+            .executeFn = execute,
+            .recoverFn = recover,
+        };
     }
 
     fn execute(
@@ -2948,6 +3691,83 @@ const RepositoryTestExecutor = struct {
         if (!found_lock) return error.LockNotPublishedBeforeInstall;
         self.saw_lock_before_install = true;
         self.last_allow_host_root = request.policy.risk.allow_host_root;
+        const exact_lock = request.exact_lock_v2 orelse
+            return error.MissingExactLock;
+        self.saw_exact_lock = true;
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        const interrupted = self.interrupt_first and self.calls == 1;
+        const recovery_required = self.interrupt_first and self.calls > 1;
+        if ((!interrupted or !self.interrupt_before_install) and !recovery_required) {
+            try self.installDescriptor();
+            if (self.clock_ms) |clock|
+                clock.* +|= self.advance_ms_after_install;
+        }
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = @splat(0x21),
+            .transaction_state = if (interrupted or recovery_required)
+                .interrupted
+            else
+                .complete,
+            .root_identity = @splat(0x22),
+            .policy_sha256 = @splat(0x23),
+            .lock_sha256 = switch (self.lock_digest_mode) {
+                .exact => exact_lock.digest_sha256,
+                .missing => null,
+                .mismatch => @splat(0xfe),
+            },
+            .failure = if (interrupted)
+                .{
+                    .code = .interrupted,
+                    .diagnostic = "injected interruption",
+                }
+            else if (recovery_required)
+                .{
+                    .code = .invalid_recovery_transition,
+                    .diagnostic = "injected recovery requirement",
+                }
+            else
+                null,
+        };
+    }
+
+    fn recover(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: transaction_executor.RecoveryRequest,
+        _: transaction_executor.Dependencies,
+    ) !transaction_executor.RecoveryReport {
+        const self: *RepositoryTestExecutor = @ptrCast(@alignCast(context));
+        self.recover_calls += 1;
+        const exact_lock = request.exact_lock_v2 orelse
+            return error.MissingExactLock;
+        self.recovered_exact_lock = true;
+        try self.installDescriptor();
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .state = .complete,
+            .commands = &.{},
+            .plan_sha256 = @splat(0x21),
+            .root_identity = @splat(0x22),
+            .policy_sha256 = @splat(0x23),
+            .lock_sha256 = switch (self.lock_digest_mode) {
+                .exact => exact_lock.digest_sha256,
+                .missing => null,
+                .mismatch => @splat(0xfe),
+            },
+            .failure = null,
+        };
+    }
+
+    fn installDescriptor(self: *RepositoryTestExecutor) !void {
         const fixture = @import("fixtures/openpgp.zig");
         try self.directory.createDirPath(
             self.io,
@@ -2969,20 +3789,23 @@ const RepositoryTestExecutor = struct {
                 "Architecture: all\n" ++
                 "Version: 1.1\n",
         });
-        const arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(arena);
-        arena.* = .init(allocator);
-        return .{
-            .allocator = allocator,
-            .arena = arena,
-            .commands = &.{},
-            .plan_sha256 = @splat(0x21),
-            .transaction_state = .complete,
-            .root_identity = @splat(0x22),
-            .policy_sha256 = @splat(0x23),
-            .lock_sha256 = null,
-            .failure = null,
-        };
+    }
+};
+
+const RepositoryStateFailure = struct {
+    boundary: state_module.WriteBoundary,
+    fail_from_write: usize,
+    writes: usize = 0,
+
+    fn hooks(self: *RepositoryStateFailure) state_module.WriteHooks {
+        return .{ .context = self, .runFn = run };
+    }
+
+    fn run(context: ?*anyopaque, boundary: state_module.WriteBoundary) !void {
+        const self: *RepositoryStateFailure = @ptrCast(@alignCast(context.?));
+        if (boundary == .before_stage) self.writes += 1;
+        if (boundary == self.boundary and self.writes >= self.fail_from_write)
+            return error.InjectedStateWriteFailure;
     }
 };
 
@@ -3134,6 +3957,518 @@ test "repository backend completes and idempotently resumes every production pha
         api.DiagnosticId.recovery_required,
         result.diagnostics[0].id,
     );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "repository backend binds execution and recovery provenance to the persisted exact lock" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+        .interrupt_first = true,
+        .interrupt_before_install = true,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+    };
+    var interrupted = try api.execute(
+        std.testing.allocator,
+        request,
+        backend.interface(),
+    );
+    try std.testing.expectEqual(api.ExitStatus.transaction, interrupted.exit_status);
+    try std.testing.expect(!interrupted.installed);
+    try std.testing.expect(interrupted.paths.exact_lock != null);
+    try std.testing.expect(interrupted.paths.provenance == null);
+    try std.testing.expect(executor.saw_exact_lock);
+
+    var paths = try ResolvedPaths.init(std.testing.allocator, request);
+    defer paths.deinit();
+    var operation_dir = try std.Io.Dir.cwd().openDir(
+        std.testing.io,
+        paths.operation_physical,
+        .{ .follow_symlinks = false },
+    );
+    defer operation_dir.close(std.testing.io);
+    const lock_store = try exact_lock_v2.Store.init(
+        std.testing.io,
+        operation_dir,
+        exact_lock_name,
+    );
+    var first_lock = try lock_store.read(
+        std.testing.allocator,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer first_lock.deinit();
+    const persisted_digest = first_lock.lock.digest_sha256;
+
+    interrupted.deinit();
+    try operation_dir.deleteFile(std.testing.io, exact_lock_name);
+    var missing_lock = try api.execute(
+        std.testing.allocator,
+        request,
+        backend.interface(),
+    );
+    try std.testing.expectEqual(api.ExitStatus.recovery, missing_lock.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.recovery_required,
+        missing_lock.diagnostics[0].id,
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    missing_lock.deinit();
+    try lock_store.writeAtomic(std.testing.allocator, first_lock.lock);
+
+    var recovered = try api.execute(
+        std.testing.allocator,
+        request,
+        backend.interface(),
+    );
+    defer recovered.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
+    try std.testing.expect(recovered.installed);
+    try std.testing.expect(recovered.paths.provenance != null);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.recover_calls);
+    try std.testing.expect(executor.recovered_exact_lock);
+    var final_lock = try lock_store.read(
+        std.testing.allocator,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer final_lock.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &persisted_digest,
+        &final_lock.lock.digest_sha256,
+    );
+    try validateRecoveryEvidence(
+        std.testing.allocator,
+        std.testing.io,
+        operation_dir,
+        recovered.descriptor.?,
+    );
+}
+
+test "repository backend rejects missing and mismatched executor lock digests" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    inline for (.{ RepositoryTestExecutor.LockDigestMode.missing, .mismatch }) |mode| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            .lock_digest_mode = mode,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var result = try api.execute(std.testing.allocator, .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        }, backend.interface());
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.post_install, result.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.provenance_publication_failed,
+            result.diagnostics[0].id,
+        );
+        try std.testing.expect(result.installed);
+        try std.testing.expect(result.paths.exact_lock != null);
+        try std.testing.expect(result.paths.provenance == null);
+        try std.testing.expect(executor.saw_exact_lock);
+    }
+}
+
+test "repository backend reports and reconciles interrupted state transitions after mutation" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const cases = [_]struct {
+        fail_from_write: usize,
+        boundary: state_module.WriteBoundary,
+        expect_manifest: bool,
+        expect_refreshed: bool,
+    }{
+        .{ .fail_from_write = 7, .boundary = .before_stage, .expect_manifest = false, .expect_refreshed = false },
+        .{ .fail_from_write = 7, .boundary = .after_rename, .expect_manifest = false, .expect_refreshed = false },
+        .{ .fail_from_write = 8, .boundary = .before_stage, .expect_manifest = true, .expect_refreshed = false },
+        .{ .fail_from_write = 9, .boundary = .before_stage, .expect_manifest = true, .expect_refreshed = true },
+    };
+    for (cases) |case| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+        };
+        var failure: RepositoryStateFailure = .{
+            .boundary = case.boundary,
+            .fail_from_write = case.fail_from_write,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .state_write_hooks = failure.hooks(),
+        };
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        var failed = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        try std.testing.expectEqual(api.ExitStatus.post_install, failed.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.state_persistence_failed,
+            failed.diagnostics[0].id,
+        );
+        try std.testing.expect(failed.installed);
+        try std.testing.expect(failed.paths.exact_lock != null);
+        try std.testing.expect(failed.paths.provenance != null);
+        try std.testing.expectEqual(case.expect_manifest, failed.paths.target_manifest != null);
+        try std.testing.expectEqual(case.expect_refreshed, failed.refreshed);
+
+        backend.state_write_hooks = .{};
+        failed.deinit();
+        var resumed = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
+        try std.testing.expect(resumed.installed);
+        try std.testing.expect(resumed.refreshed);
+        try std.testing.expect(resumed.paths.exact_lock != null);
+        try std.testing.expect(resumed.paths.provenance != null);
+        try std.testing.expect(resumed.paths.target_manifest != null);
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    }
+}
+
+test "repository operation identity separates both no-refresh transitions" {
+    const base: api.Request = .{
+        .root = "/target",
+        .descriptor_url = "https://example.test/descriptor.deb",
+        .architecture = "amd64",
+    };
+    var no_refresh = base;
+    no_refresh.no_refresh = true;
+    const refreshed_id = requestOperationId(base);
+    const no_refresh_id = requestOperationId(no_refresh);
+    try std.testing.expect(!std.mem.eql(u8, &refreshed_id, &no_refresh_id));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &requestOperationId(no_refresh),
+        &requestOperationId(base),
+    ));
+}
+
+test "opposite no-refresh invocations never reuse or erase durable operation history" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    inline for (.{ false, true }) |first_no_refresh| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        const first_request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+            .no_refresh = first_no_refresh,
+        };
+        var first = try api.execute(
+            std.testing.allocator,
+            first_request,
+            backend.interface(),
+        );
+        try std.testing.expectEqual(api.ExitStatus.success, first.exit_status);
+        try std.testing.expectEqual(!first_no_refresh, first.refreshed);
+
+        var second_request = first_request;
+        second_request.no_refresh = !first_no_refresh;
+        first.deinit();
+        var second = try api.execute(
+            std.testing.allocator,
+            second_request,
+            backend.interface(),
+        );
+        defer second.deinit();
+        try std.testing.expectEqual(api.ExitStatus.planning, second.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.existing_descriptor_conflict,
+            second.diagnostics[0].id,
+        );
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+
+        var first_paths = try ResolvedPaths.init(
+            std.testing.allocator,
+            first_request,
+        );
+        defer first_paths.deinit();
+        var first_operation_dir = try std.Io.Dir.cwd().openDir(
+            std.testing.io,
+            first_paths.operation_physical,
+            .{ .follow_symlinks = false },
+        );
+        defer first_operation_dir.close(std.testing.io);
+        const state_store = try state_module.Store.init(
+            std.testing.io,
+            first_operation_dir,
+            operation_state_name,
+        );
+        var durable = try state_store.read(
+            std.testing.allocator,
+            state_module.maximum_document_bytes,
+        );
+        defer durable.deinit();
+        try std.testing.expectEqual(first_no_refresh, durable.state.no_refresh);
+        try std.testing.expectEqual(!first_no_refresh, durable.state.refreshed);
+        try std.testing.expectEqual(state_module.Phase.complete, durable.state.phase);
+    }
+}
+
+test "repository operation budget enforces exact boundaries and checked overflow" {
+    var counter: u64 = 0;
+    try OperationBudget.charge(&counter, 10, 10);
+    try std.testing.expectEqual(@as(u64, 10), counter);
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        OperationBudget.charge(&counter, 1, 10),
+    );
+    counter = std.math.maxInt(u64);
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        OperationBudget.charge(&counter, 1, std.math.maxInt(u64)),
+    );
+
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = "" };
+    var budget = OperationBudget.init(
+        acquisition.dependencies().clock,
+        .{ .maximum_repositories = 2 },
+        100,
+    );
+    acquisition.now_ms = 40;
+    const bounded_time = try budget.boundedTime(.{
+        .connect_timeout_ms = 90,
+        .read_timeout_ms = 80,
+        .overall_timeout_ms = 70,
+    });
+    try std.testing.expectEqual(@as(u64, 60), bounded_time.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 60), bounded_time.read_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 60), bounded_time.overall_timeout_ms);
+    _ = try budget.boundedNetwork(.{}, 2);
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        budget.boundedNetwork(.{}, 3),
+    );
+    budget.cache_growth_bytes = budget.policy.maximum_cache_growth_bytes;
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        budget.reserveCacheGrowth(1, null),
+    );
+
+    const local_evidence: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = @splat('a'),
+        .sha256 = @splat(0x11),
+        .size = 4,
+        .package = "descriptor",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///descriptor.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    const packages = [_]exact_lock_v2.Package{
+        .{
+            .name = "dependency",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = @splat('b'),
+                .repository_snapshot_sha256 = @splat(0x22),
+            } },
+            .sha256 = @splat(0x33),
+            .declared_size = 7,
+            .retention = .dependency,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "descriptor",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .local_artifact = local_evidence },
+            .sha256 = local_evidence.sha256,
+            .declared_size = local_evidence.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        },
+    };
+    const lock: exact_lock_v2.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(0x44),
+        .policy_sha256 = @splat(0x55),
+        .repositories = &.{},
+        .local_artifacts = &.{local_evidence},
+        .packages = &packages,
+        .digest_sha256 = @splat(0x66),
+    };
+    var aggregate = OperationBudget.init(
+        acquisition.dependencies().clock,
+        .{
+            .maximum_actions = packages.len,
+            .maximum_total_package_bytes = 11,
+            .maximum_retained_package_bytes = 11,
+        },
+        100,
+    );
+    aggregate.descriptor_bytes = local_evidence.size;
+    try aggregate.validateLock(lock);
+    try std.testing.expectEqual(@as(usize, 7), try aggregate.packageLimit(20));
+    aggregate.policy.maximum_total_package_bytes = 10;
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        aggregate.validateLock(lock),
+    );
+    aggregate.policy.maximum_total_package_bytes = 11;
+    aggregate.policy.maximum_retained_package_bytes = 10;
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        aggregate.validateLock(lock),
+    );
+    aggregate.policy.maximum_retained_package_bytes = 11;
+    aggregate.policy.maximum_actions = 1;
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        aggregate.validateLock(lock),
+    );
+}
+
+test "repository backend enforces an operation-wide elapsed deadline" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{
+        .descriptor = descriptor,
+        .advance_ms_per_read = 6,
+    };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+        .network = .{
+            .connect_timeout_ms = 15,
+            .read_timeout_ms = 15,
+            .overall_timeout_ms = 15,
+        },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.resource_limit_exceeded,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
+}
+
+test "repository backend reports elapsed budget exhaustion after mutation truthfully" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+        .clock_ms = &acquisition.now_ms,
+        .advance_ms_after_install = 101,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+        .no_refresh = true,
+        .network = .{
+            .connect_timeout_ms = 100,
+            .read_timeout_ms = 100,
+            .overall_timeout_ms = 100,
+        },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.post_install, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.resource_limit_exceeded,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expect(result.installed);
+    try std.testing.expect(result.paths.exact_lock != null);
+    try std.testing.expect(result.paths.provenance != null);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
 }
 
@@ -3426,6 +4761,7 @@ test "repository backend selects only changed descriptor repositories for final 
         &material,
         snapshot,
         "amd64",
+        .{},
         .{},
     )) orelse return error.MissingChangedConfiguration;
     defer changed.deinit();

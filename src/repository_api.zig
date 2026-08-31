@@ -61,6 +61,8 @@ pub const DiagnosticId = enum {
     target_import_failed,
     refresh_failed,
     provenance_publication_failed,
+    resource_limit_exceeded,
+    state_persistence_failed,
     state_corrupt,
     recovery_required,
     internal_error,
@@ -101,6 +103,15 @@ pub const StatePolicy = struct {
     maximum_operation_state_bytes: usize = 1024 * 1024,
 };
 
+pub const ResourcePolicy = struct {
+    maximum_repositories: usize = 16,
+    maximum_actions: usize = 4096,
+    maximum_total_metadata_bytes: u64 = 2 * 1024 * 1024 * 1024,
+    maximum_total_package_bytes: u64 = 8 * 1024 * 1024 * 1024,
+    maximum_retained_package_bytes: u64 = 1280 * 1024 * 1024,
+    maximum_cache_growth_bytes: u64 = 8 * 1024 * 1024 * 1024,
+};
+
 pub const Request = struct {
     api_version: u32 = api_version,
     operation: Operation = .add,
@@ -112,6 +123,7 @@ pub const Request = struct {
     cache: CachePolicy = .{},
     state: StatePolicy = .{},
     network: NetworkPolicy = .{},
+    resources: ResourcePolicy = .{},
 };
 
 pub const DescriptorIdentity = struct {
@@ -275,6 +287,7 @@ pub fn execute(
             return failure(.usage, .invalid_request, "request", "state path must be canonical and root-relative");
     }
     if (!validNetworkPolicy(request.network) or
+        !validResourcePolicy(request.resources) or
         request.cache.maximum_object_bytes == 0 or
         request.state.lock_wait_ms == 0 or
         request.state.maximum_operation_state_bytes == 0 or
@@ -603,6 +616,15 @@ fn validNetworkPolicy(policy: NetworkPolicy) bool {
         policy.maximum_decoder_memory != 0;
 }
 
+fn validResourcePolicy(policy: ResourcePolicy) bool {
+    return policy.maximum_repositories != 0 and
+        policy.maximum_actions != 0 and
+        policy.maximum_total_metadata_bytes != 0 and
+        policy.maximum_total_package_bytes != 0 and
+        policy.maximum_retained_package_bytes != 0 and
+        policy.maximum_cache_growth_bytes != 0;
+}
+
 fn validRoot(path: []const u8) bool {
     return validLogicalPath(path) and (path.len == 1 or path[path.len - 1] != '/');
 }
@@ -790,6 +812,12 @@ test "repository API rejects unsafe trust and invalid root before backend" {
     request.network.proxy_url = "https://user" ++ ":value@proxy.test";
     result = try execute(std.testing.allocator, request, backend.interface());
     try std.testing.expectEqual(DiagnosticId.credential_bearing_url, result.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 2), backend.calls);
+
+    request.network.proxy_url = null;
+    request.resources.maximum_actions = 0;
+    result = try execute(std.testing.allocator, request, backend.interface());
+    try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 2), backend.calls);
 }
 

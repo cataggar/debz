@@ -242,7 +242,8 @@
             "managed_file_conflict", "lock_publication_failed",
             "transaction_failed", "installed_verification_failed",
             "target_import_failed", "refresh_failed",
-            "provenance_publication_failed", "state_corrupt",
+            "provenance_publication_failed", "resource_limit_exceeded",
+            "state_persistence_failed", "state_corrupt",
             "recovery_required", "internal_error"
           ]
         },

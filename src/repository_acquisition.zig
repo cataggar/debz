@@ -78,6 +78,7 @@ pub const Request = struct {
     retry: RetryPolicy = .{},
     max_response_bytes: usize,
     credentials: CredentialsProvider = .none,
+    require_https: bool = false,
 };
 
 pub const Timing = struct {
@@ -91,6 +92,7 @@ pub const Provenance = struct {
     status: ?u16,
     size: usize,
     timing: Timing,
+    https_chain_verified: bool,
 
     pub fn deinit(self: *Provenance, allocator: std.mem.Allocator) void {
         allocator.free(self.effective_uri);
@@ -178,6 +180,7 @@ pub const Error = error{
     NotFound,
     HttpStatus,
     OverallDeadlineExceeded,
+    InsecureTransport,
 };
 
 pub fn acquire(
@@ -196,6 +199,7 @@ pub fn acquire(
 
     const started_ms = dependencies.clock.nowMs();
     if (std.ascii.eqlIgnoreCase(request_value.uri.scheme, "file")) {
+        if (request_value.require_https) return error.InsecureTransport;
         return acquireFile(allocator, request_value, dependencies, started_ms);
     }
     if (!std.ascii.eqlIgnoreCase(request_value.uri.scheme, "http") and
@@ -203,6 +207,9 @@ pub fn acquire(
     {
         return error.UnsupportedScheme;
     }
+    if (request_value.require_https and
+        !std.ascii.eqlIgnoreCase(request_value.uri.scheme, "https"))
+        return error.InsecureTransport;
     return acquireHttp(allocator, request_value, dependencies, started_ms);
 }
 
@@ -263,6 +270,7 @@ fn acquireFile(
                 .completed_ms = completed_ms,
                 .attempts = 1,
             },
+            .https_chain_verified = false,
         },
     };
 }
@@ -281,8 +289,13 @@ fn acquireHttp(
     var total_attempts: u16 = 0;
     const initial_origin = try origin(allocator, current_uri);
     defer allocator.free(initial_origin);
+    var https_chain_verified = true;
 
     while (true) {
+        const current_is_https = std.ascii.eqlIgnoreCase(current_uri.scheme, "https");
+        https_chain_verified = https_chain_verified and current_is_https;
+        if (request_value.require_https and !current_is_https)
+            return error.InsecureTransport;
         checkOverall(dependencies.clock, started_ms, request_value.deadlines.overall_ms) catch
             return error.OverallDeadlineExceeded;
 
@@ -325,6 +338,10 @@ fn acquireHttp(
             if (!std.ascii.eqlIgnoreCase(current_uri.scheme, "http") and
                 !std.ascii.eqlIgnoreCase(current_uri.scheme, "https"))
                 return error.InvalidRedirect;
+            const next_is_https = std.ascii.eqlIgnoreCase(current_uri.scheme, "https");
+            https_chain_verified = https_chain_verified and next_is_https;
+            if (request_value.require_https and !next_is_https)
+                return error.InsecureTransport;
             redirects += 1;
             attempts = 0;
             continue;
@@ -363,6 +380,7 @@ fn acquireHttp(
                     .completed_ms = completed_ms,
                     .attempts = total_attempts,
                 },
+                .https_chain_verified = https_chain_verified,
             },
         };
     }
@@ -499,9 +517,6 @@ fn resolveUri(allocator: std.mem.Allocator, base: Uri, location: []const u8) ![]
             else => return err,
         };
         if (resolved.user != null or resolved.password != null) return error.InvalidRedirect;
-        if (std.ascii.eqlIgnoreCase(base.scheme, "https") and
-            std.ascii.eqlIgnoreCase(resolved.scheme, "http"))
-            return error.InvalidRedirect;
         return formatUri(allocator, resolved, false);
     }
     return error.InvalidRedirect;
@@ -898,24 +913,76 @@ test "redirect limit is bounded" {
     }, fixture.dependencies()));
 }
 
-test "redirect rejects embedded credentials and HTTPS downgrade" {
+test "redirect rejects embedded credentials" {
     const allocator = std.testing.allocator;
-    const locations = [_][]const u8{
-        "https://" ++ "user@" ++ "other.test/final",
-        "http://example.test/final",
+    var fixture = TestFixture{
+        .responses = &.{.{
+            .status = 302,
+            .body = "",
+            .location = "https://" ++ "user@" ++ "other.test/final",
+        }},
     };
-    for (locations) |location| {
-        var fixture = TestFixture{
-            .responses = &.{.{ .status = 302, .body = "", .location = location }},
-        };
-        try std.testing.expectError(error.InvalidRedirect, acquire(allocator, .{
-            .uri = try Uri.parse("https://example.test/start"),
-            .deadlines = testDeadlines(),
-            .redirect_limit = 1,
-            .max_response_bytes = 16,
-        }, fixture.dependencies()));
-        try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
-    }
+    try std.testing.expectError(error.InvalidRedirect, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 1,
+        .max_response_bytes = 16,
+    }, fixture.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.request_count);
+}
+
+test "required HTTPS applies to every redirect hop while relative redirects remain trusted" {
+    const allocator = std.testing.allocator;
+    var downgrade = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "http://other.test/middle" },
+            .{ .status = 302, .body = "", .location = "https://other.test/final" },
+            .{ .status = 200, .body = "unreachable" },
+        },
+    };
+    try std.testing.expectError(error.InsecureTransport, acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 3,
+        .max_response_bytes = 16,
+        .require_https = true,
+    }, downgrade.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), downgrade.request_count);
+
+    var relative = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "../final" },
+            .{ .status = 200, .body = "ok" },
+        },
+    };
+    var result = try acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/path/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 2,
+        .max_response_bytes = 16,
+        .require_https = true,
+    }, relative.dependencies());
+    defer result.deinit(allocator);
+    try std.testing.expect(result.provenance.https_chain_verified);
+    try std.testing.expectEqualStrings("https://example.test/final", result.provenance.effective_uri);
+}
+
+test "configured HTTP redirects are recorded as unverified transport chains" {
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{
+        .responses = &.{
+            .{ .status = 302, .body = "", .location = "http://other.test/final" },
+            .{ .status = 200, .body = "ok" },
+        },
+    };
+    var result = try acquire(allocator, .{
+        .uri = try Uri.parse("https://example.test/start"),
+        .deadlines = testDeadlines(),
+        .redirect_limit = 2,
+        .max_response_bytes = 16,
+    }, fixture.dependencies());
+    defer result.deinit(allocator);
+    try std.testing.expect(!result.provenance.https_chain_verified);
 }
 
 test "safe transient status retries with deterministic backoff" {

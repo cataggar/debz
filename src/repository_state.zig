@@ -222,6 +222,7 @@ pub const Store = struct {
     io: std.Io,
     dir: std.Io.Dir,
     name: []const u8,
+    write_hooks: WriteHooks = .{},
 
     pub fn init(io: std.Io, dir: std.Io.Dir, name: []const u8) !Store {
         if (!safeLeaf(name)) return error.InvalidPath;
@@ -257,6 +258,7 @@ pub const Store = struct {
     ) !void {
         if (maximum_bytes == 0 or maximum_bytes > maximum_document_bytes)
             return error.DocumentTooLarge;
+        try self.write_hooks.run(.before_stage);
         const bytes = try state.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > maximum_bytes) return error.DocumentTooLarge;
@@ -279,11 +281,26 @@ pub const Store = struct {
             try file.sync(self.io);
         }
         try self.dir.rename(stage, self.dir, self.name, self.io);
+        try self.write_hooks.run(.after_rename);
         switch (@import("builtin").os.tag) {
             .linux => if (std.posix.errno(std.os.linux.fsync(self.dir.handle)) != .SUCCESS)
                 return error.Unexpected,
             else => {},
         }
+    }
+};
+
+pub const WriteBoundary = enum {
+    before_stage,
+    after_rename,
+};
+
+pub const WriteHooks = struct {
+    context: ?*anyopaque = null,
+    runFn: ?*const fn (?*anyopaque, WriteBoundary) anyerror!void = null,
+
+    fn run(self: WriteHooks, boundary: WriteBoundary) !void {
+        if (self.runFn) |runFn| try runFn(self.context, boundary);
     }
 };
 

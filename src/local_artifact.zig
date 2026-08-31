@@ -40,6 +40,7 @@ pub const Provenance = struct {
     cache_key: [64]u8,
     trust_mode: TrustMode,
     outcome: Outcome,
+    cache_growth_bytes: u64,
     status: ?u16,
     timing: repository_acquisition.Timing,
 
@@ -132,6 +133,7 @@ pub fn acquire(
                         .cache_key = cache_key,
                         .trust_mode = .sha256,
                         .outcome = .cache_hit,
+                        .cache_growth_bytes = 0,
                         .status = null,
                         .timing = .{
                             .started_ms = now,
@@ -168,6 +170,7 @@ pub fn acquire(
         .retry = request.policy.retry,
         .max_response_bytes = response_limit,
         .credentials = request.policy.credentials,
+        .require_https = !pinned,
     }, dependencies) catch |err| switch (err) {
         error.ResponseTooLarge => if (response_limit < maximum_transfer_bytes)
             return error.SizeMismatch
@@ -177,6 +180,8 @@ pub fn acquire(
     };
     defer acquired.deinit(allocator);
 
+    if (!pinned and !acquired.provenance.https_chain_verified)
+        return error.UnsupportedScheme;
     if (acquired.bytes.len > request.policy.maximum_artifact_bytes or
         acquired.bytes.len > cache.limits.maximum_object_bytes)
         return error.ArtifactTooLarge;
@@ -187,6 +192,7 @@ pub fn acquire(
     if (request.expected_sha256) |expected| {
         if (!digest.eql(expected)) return error.DigestMismatch;
     }
+    const existing_size = try cache.objectSize(digest);
     try cache.publish(
         allocator,
         digest,
@@ -212,6 +218,7 @@ pub fn acquire(
             .cache_key = cache_key,
             .trust_mode = if (pinned) .sha256 else .https,
             .outcome = .acquired,
+            .cache_growth_bytes = bytes.len -| (existing_size orelse 0),
             .status = provenance.status,
             .timing = provenance.timing,
         },
@@ -234,7 +241,14 @@ fn testPolicy() Policy {
 }
 
 const TestTransport = struct {
+    const Response = struct {
+        status: u16,
+        body: []const u8,
+        location: ?[]const u8 = null,
+    };
+
     body: []const u8 = "",
+    responses: []const Response = &.{},
     count: usize = 0,
     now_ms: u64 = 0,
     maximum_response_bytes: usize = 0,
@@ -253,8 +267,23 @@ const TestTransport = struct {
         value: repository_acquisition.HttpRequest,
     ) !repository_acquisition.HttpResponse {
         const self: *TestTransport = @ptrCast(@alignCast(context.?));
+        const index = self.count;
         self.count += 1;
         self.maximum_response_bytes = value.max_response_bytes;
+        if (self.responses.len != 0) {
+            if (index >= self.responses.len) return error.ConnectionResetByPeer;
+            const response = self.responses[index];
+            if (response.body.len > value.max_response_bytes)
+                return error.ResponseTooLarge;
+            return .{
+                .status = response.status,
+                .body = try allocator.dupe(u8, response.body),
+                .location = if (response.location) |location|
+                    try allocator.dupe(u8, location)
+                else
+                    null,
+            };
+        }
         if (self.body.len > value.max_response_bytes) return error.ResponseTooLarge;
         return .{ .status = 200, .body = try allocator.dupe(u8, self.body) };
     }
@@ -381,6 +410,63 @@ test "unpinned HTTPS records transport trust and enforces an expected size" {
         },
         transport.dependencies(),
     ));
+}
+
+test "unpinned artifact rejects downgrade chains and trusts relative HTTPS redirects" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+
+    var downgrade: TestTransport = .{ .responses = &.{
+        .{ .status = 302, .body = "", .location = "http://example.test/middle" },
+        .{ .status = 302, .body = "", .location = "https://example.test/final" },
+        .{ .status = 200, .body = "artifact" },
+    } };
+    try std.testing.expectError(error.InsecureTransport, acquire(
+        std.testing.allocator,
+        &cache,
+        .{
+            .uri = try repository_acquisition.Uri.parse("https://example.test/start"),
+            .policy = testPolicy(),
+        },
+        downgrade.dependencies(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), downgrade.count);
+
+    var relative: TestTransport = .{ .responses = &.{
+        .{ .status = 302, .body = "", .location = "../final" },
+        .{ .status = 200, .body = "artifact" },
+    } };
+    var artifact = try acquire(std.testing.allocator, &cache, .{
+        .uri = try repository_acquisition.Uri.parse("https://example.test/path/start"),
+        .policy = testPolicy(),
+    }, relative.dependencies());
+    defer artifact.deinit();
+    try std.testing.expectEqual(TrustMode.https, artifact.provenance.trust_mode);
+    try std.testing.expectEqualStrings(
+        "https://example.test/final",
+        artifact.provenance.effective_uri,
+    );
+}
+
+test "pinned artifact policy permits configured HTTPS to HTTP redirects" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const body = "artifact";
+    var transport: TestTransport = .{ .responses = &.{
+        .{ .status = 302, .body = "", .location = "http://example.test/final" },
+        .{ .status = 200, .body = body },
+    } };
+    var artifact = try acquire(std.testing.allocator, &cache, .{
+        .uri = try repository_acquisition.Uri.parse("https://example.test/start"),
+        .expected_sha256 = Digest.of(body),
+        .policy = testPolicy(),
+    }, transport.dependencies());
+    defer artifact.deinit();
+    try std.testing.expectEqual(TrustMode.sha256, artifact.provenance.trust_mode);
 }
 
 test "unpinned expected-size transfer is capped by package CAS capacity" {

@@ -2523,6 +2523,15 @@ test "target_apt_config rejects malformed sources and traversing Signed-By paths
             .source_bytes = "deb [signed-by=/../outside.gpg] https://example.invalid stable main\n",
             .expected = error.UnsafeKeyringPath,
         },
+        .{
+            .source_bytes = "deb [trusted=yes] https://example.invalid stable main\n",
+            .expected = error.MalformedSource,
+        },
+        .{
+            .source_bytes = "Types: deb\nURIs: https://example.invalid\n" ++
+                "Suites: stable\nComponents: main\nTrusted: yes\n",
+            .expected = error.MalformedSource,
+        },
     };
     for (cases) |case| {
         var directory = std.testing.tmpDir(.{});
@@ -2542,6 +2551,37 @@ test "target_apt_config rejects malformed sources and traversing Signed-By paths
             .dependencies = .{ .filesystem = files.interface() },
         }));
     }
+}
+
+test "target_apt_config accepts explicit trusted false without weakening authentication" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt");
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = "deb [trusted=no signed-by=/usr/share/keyrings/vendor.gpg] " ++
+            "https://example.invalid stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/keyrings/vendor.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(@as(usize, 1), imported.configuration.repositories.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        imported.configuration.repositories[0].signed_by.len,
+    );
 }
 
 const MissingFileSystem = struct {

@@ -70,6 +70,7 @@ pub const DiagnosticCode = enum {
     source_invalid,
     unsupported_source_type,
     unsupported_repository_uri,
+    authentication_bypass,
     unsupported_exact_suite,
     missing_architecture,
     invalid_policy,
@@ -94,6 +95,7 @@ pub const Diagnostic = struct {
             .source_invalid => "repository source input is invalid",
             .unsupported_source_type => "only binary repository entries can be refreshed",
             .unsupported_repository_uri => "repository URI must be an explicit file, HTTP, or HTTPS URI without credentials, query, or fragment",
+            .authentication_bypass => "repository declarations must not disable authentication with Trusted: yes or trusted=yes",
             .unsupported_exact_suite => "exact-path suites are not supported by authenticated refresh",
             .missing_architecture => "repository architecture must be explicit or supplied as the native architecture",
             .invalid_policy => "repository policy is invalid",
@@ -219,6 +221,14 @@ fn normalizeInternal(
         defer source_list.deinit();
 
         for (source_list.repositories) |repository| {
+            if (repository.trusted == true) return finishDiagnostic(
+                allocator,
+                arena,
+                .{
+                    .code = .authentication_bypass,
+                    .document_index = document_index,
+                },
+            );
             var has_binary = false;
             for (repository.types) |kind| if (kind == .binary) {
                 has_binary = true;
@@ -1319,6 +1329,60 @@ test "binary refresh normalization excludes source-only declarations" {
         "https://binary.example",
         configuration.repositories[0].uri,
     );
+}
+
+test "normalization rejects authentication-bypassing trusted declarations" {
+    const cases = [_]SourceDocument{
+        .{
+            .bytes = "deb [arch=amd64 trusted=yes] https://legacy.example stable main\n",
+            .format = .legacy,
+        },
+        .{
+            .bytes = "Types: deb\nURIs: https://deb822.example\nSuites: stable\n" ++
+                "Components: main\nArchitectures: amd64\nTrusted: yes\n",
+            .format = .deb822,
+        },
+    };
+    for (cases) |document| {
+        const result = try normalizeBinaryRefresh(
+            std.testing.allocator,
+            &.{document},
+            null,
+            .{},
+        );
+        try std.testing.expectEqual(
+            DiagnosticCode.authentication_bypass,
+            result.diagnostic.code,
+        );
+    }
+}
+
+test "normalization retains trusted false compatibility" {
+    const cases = [_]SourceDocument{
+        .{
+            .bytes = "deb [arch=amd64 trusted=no] https://legacy.example stable main\n",
+            .format = .legacy,
+        },
+        .{
+            .bytes = "Types: deb\nURIs: https://deb822.example\nSuites: stable\n" ++
+                "Components: main\nArchitectures: amd64\nTrusted: no\n",
+            .format = .deb822,
+        },
+    };
+    for (cases) |document| {
+        const result = try normalizeBinaryRefresh(
+            std.testing.allocator,
+            &.{document},
+            null,
+            .{},
+        );
+        var configuration = switch (result) {
+            .configuration => |value| value,
+            .diagnostic => return error.UnexpectedDiagnostic,
+        };
+        defer configuration.deinit();
+        try std.testing.expectEqual(@as(usize, 1), configuration.repositories.len);
+    }
 }
 
 test "priority pins and default release have deterministic precedence" {

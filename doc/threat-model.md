@@ -27,8 +27,15 @@ child-process boundary and is executed with fixed argv/environment policy.
   bounded; interrupted state remains non-success evidence.
 - Repository and package publication is digest-bound and fail-closed.
 - Repository descriptors require verified HTTPS or an explicit SHA-256.
+  Unpinned transport trust covers the complete redirect chain, not only the
+  initial URL.
   Bundled keyrings authenticate only the repositories they name; they never
   authenticate the descriptor package that carried them.
+- Repository declarations that set `Trusted`/`trusted` true are rejected before
+  authentication or target import.
+- Repository-add operations apply aggregate repository, action, metadata,
+  package, retained-memory, cache-growth, and elapsed-time budgets in addition
+  to per-object parser and transfer limits.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.
