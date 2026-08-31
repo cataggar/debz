@@ -51,12 +51,20 @@ uses its existing CAS object.
 The exact canonical executable plan and an exact-lock v2 file are atomically
 persisted before dpkg and passed to both execution and recovery. The plan is
 reloaded byte-canonically on resume rather than regenerated from the
-potentially incomplete current dpkg state. The lock records the
+potentially incomplete current dpkg state. Lock construction uses only the
+persisted action origin, digest, and size plus the authenticated snapshot
+evidence bound to those actions; transient solver pointers and record indexes
+are never recovery inputs. The lock records the
 descriptor and every repository-selected package in the mutation closure;
 already-installed dependency satisfiers are retained from target state rather
 than assigned invented artifact origins, and binds the complete request,
 authenticated repository snapshots, local artifacts, and executable plan.
-The executor uses a fixed
+Its policy digest explicitly binds repository-add's `locked_packages`
+verification scope. Under that scope every locked mutation package must have
+the exact installed identity, plan origin, digest, size, and completed journal
+artifact digest, while unrelated healthy packages already present on the
+target are allowed to remain or change. The executor's default full-closure
+exact-lock semantics remain unchanged for product operations. The executor uses a fixed
 noninteractive, keep-existing-conffile policy. Only this typed backend may opt
 into host-root execution, and only when the requested root is `/`; product API
 v1 continues to deny host-root execution for every operation.
@@ -73,10 +81,13 @@ authenticated metadata bytes, total package bytes, retained package memory,
 cache growth, and elapsed time. Metadata objects and per-repository/aggregate
 manifests reserve their actual cache growth before publication; retained
 snapshot and aggregate-manifest memory is likewise reserved before it becomes
-an accepted result. One absolute monotonic deadline is propagated through
+an accepted result. One absolute monotonic deadline starts before the repository operation lock is
+acquired and is propagated through
 descriptor/repository/package acquisition, dpkg execution, and recovery.
-Every transport, lock wait, and process timeout is capped by the remaining
-operation time, and expiry cancels a running dpkg process. Package bodies are
+The repository lock wait is capped by both its configured wait and remaining
+operation time; expiry after or during that wait prevents all acquisition and
+mutation work. Every later transport, lock wait, and process timeout is
+likewise capped by the remaining operation time, and expiry cancels a running dpkg process. Package bodies are
 validated after CAS
 publication and released before the next package; the executor retains only
 CAS paths and immutable provenance.
@@ -105,6 +116,15 @@ requiring stale state path fields; durable `refreshed=true` history is
 monotonic. If dpkg completed before provenance/state publication, provenance
 is reconstructed only from the original plan, lock, report/journal, and
 authenticated evidence.
+
+Once validated descriptor state exists, resume first reads the exact persisted
+digest and size from CAS. A missing or corrupt object may be reacquired only at
+that digest and size; an originally unpinned HTTPS descriptor also retains its
+all-HTTPS transport requirement and original trust evidence. Changed transport
+content is rejected. Shared transaction journals are decoded before selecting
+recovery: only an exact plan/root/executor-policy/lock match is recovered,
+mismatched incomplete journals block, and unrelated completed archives are
+ignored so a normal execution can publish its own journal safely.
 
 All root and logical-path fields use one schema-aligned grammar: valid UTF-8,
 canonical absolute components, no backslashes, C0/DEL controls, dot

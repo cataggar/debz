@@ -30,6 +30,9 @@ pub const Request = struct {
     uri: repository_acquisition.Uri,
     expected_sha256: ?Digest = null,
     expected_size: ?u64 = null,
+    /// Retains an already-established HTTPS trust requirement while also
+    /// pinning resumed acquisition to persisted content identity.
+    require_https: bool = false,
     policy: Policy,
 };
 
@@ -108,7 +111,8 @@ pub fn acquire(
         return error.CredentialBearingUri;
 
     const pinned = request.expected_sha256 != null;
-    if (!allowedScheme(request.uri, pinned)) return error.UnsupportedScheme;
+    if (!allowedScheme(request.uri, pinned, request.require_https))
+        return error.UnsupportedScheme;
     if (request.expected_size) |size| {
         if (size > request.policy.maximum_artifact_bytes or
             size > cache.limits.maximum_object_bytes)
@@ -131,7 +135,7 @@ pub fn acquire(
                         .size = size,
                         .sha256 = digest,
                         .cache_key = cache_key,
-                        .trust_mode = .sha256,
+                        .trust_mode = if (request.require_https) .https else .sha256,
                         .outcome = .cache_hit,
                         .cache_growth_bytes = 0,
                         .status = null,
@@ -170,7 +174,7 @@ pub fn acquire(
         .retry = request.policy.retry,
         .max_response_bytes = response_limit,
         .credentials = request.policy.credentials,
-        .require_https = !pinned,
+        .require_https = request.require_https or !pinned,
     }, dependencies) catch |err| switch (err) {
         error.ResponseTooLarge => if (response_limit < maximum_transfer_bytes)
             return error.SizeMismatch
@@ -180,7 +184,8 @@ pub fn acquire(
     };
     defer acquired.deinit(allocator);
 
-    if (!pinned and !acquired.provenance.https_chain_verified)
+    if ((!pinned or request.require_https) and
+        !acquired.provenance.https_chain_verified)
         return error.UnsupportedScheme;
     if (acquired.bytes.len > request.policy.maximum_artifact_bytes or
         acquired.bytes.len > cache.limits.maximum_object_bytes)
@@ -216,7 +221,7 @@ pub fn acquire(
             .size = bytes.len,
             .sha256 = digest,
             .cache_key = cache_key,
-            .trust_mode = if (pinned) .sha256 else .https,
+            .trust_mode = if (!pinned or request.require_https) .https else .sha256,
             .outcome = .acquired,
             .cache_growth_bytes = bytes.len -| (existing_size orelse 0),
             .status = provenance.status,
@@ -225,9 +230,13 @@ pub fn acquire(
     };
 }
 
-fn allowedScheme(uri: repository_acquisition.Uri, pinned: bool) bool {
+fn allowedScheme(
+    uri: repository_acquisition.Uri,
+    pinned: bool,
+    require_https: bool,
+) bool {
     if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
-    if (!pinned) return false;
+    if (!pinned or require_https) return false;
     return std.ascii.eqlIgnoreCase(uri.scheme, "http") or
         std.ascii.eqlIgnoreCase(uri.scheme, "file");
 }
@@ -467,6 +476,30 @@ test "pinned artifact policy permits configured HTTPS to HTTP redirects" {
     }, transport.dependencies());
     defer artifact.deinit();
     try std.testing.expectEqual(TrustMode.sha256, artifact.provenance.trust_mode);
+}
+
+test "pinned resume can retain the original all-HTTPS trust requirement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const body = "artifact";
+    var transport: TestTransport = .{ .responses = &.{
+        .{ .status = 302, .body = "", .location = "http://example.test/final" },
+        .{ .status = 200, .body = body },
+    } };
+    try std.testing.expectError(error.InsecureTransport, acquire(
+        std.testing.allocator,
+        &cache,
+        .{
+            .uri = try repository_acquisition.Uri.parse("https://example.test/start"),
+            .expected_sha256 = Digest.of(body),
+            .expected_size = body.len,
+            .require_https = true,
+            .policy = testPolicy(),
+        },
+        transport.dependencies(),
+    ));
 }
 
 test "unpinned expected-size transfer is capped by package CAS capacity" {

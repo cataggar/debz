@@ -30,6 +30,13 @@ not a complete root manifest. The dpkg database lock is reacquired under the
 bounded lock policy before this final query, so completion is never decided
 from a concurrently changing status database.
 
+Exact locks are stricter unless the caller selects the policy-bound
+`locked_packages` mode. Full-closure verification rejects every installed
+identity absent from the lock. Operation-scoped verification instead checks
+every locked package and its plan/journal origin evidence exactly while
+allowing unrelated healthy identities; the distinct executor policy digest
+prevents a journal from being replayed under the other interpretation.
+
 `SystemJournalStore` provides fsync-and-rename publication in an explicit
 directory and refuses symlinked path components. `SystemStatusFileReader`
 securely walks and reads only the explicit install root.

@@ -292,6 +292,8 @@ pub const VerificationFailure = enum {
     unrelated_package,
     local_origin_evidence_missing,
     local_origin_evidence_mismatch,
+    locked_origin_evidence_missing,
+    locked_origin_evidence_mismatch,
 };
 
 pub const Verification = struct {
@@ -637,6 +639,30 @@ pub fn verifyExactLockV2WithEvidence(
     return verifyExactLockV2LocalEvidence(allocator, lock, plan, journal);
 }
 
+/// Verifies an operation-scoped exact lock. Every locked package must be
+/// installed at the exact identity and be backed by the persisted plan and
+/// completed journal artifact evidence. Healthy packages outside the lock are
+/// deliberately ignored.
+pub fn verifyExactLockV2LockedPackagesWithEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const verification = try verifyExactLockV2LockedPackageStatus(
+        allocator,
+        lock,
+        root,
+        reader,
+        maximum_status_bytes,
+    );
+    if (!verification.succeeded()) return verification;
+    return verifyExactLockV2LockedPackageEvidence(allocator, lock, plan, journal);
+}
+
 fn verifyExactLockV2Status(
     allocator: std.mem.Allocator,
     lock: exact_lock_v2.Lock,
@@ -678,6 +704,160 @@ fn verifyExactLockV2Status(
                 return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
         }
         return .{ .failure = .expected_package_missing };
+    }
+    return .{};
+}
+
+fn verifyExactLockV2LockedPackageStatus(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const source = reader.read(allocator, root, maximum_status_bytes) catch
+        return .{ .failure = .status_query_failed };
+    defer allocator.free(source);
+    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
+    var database = switch (parsed) {
+        .diagnostic => return .{ .failure = .status_parse_failed },
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    for (database.database.packages) |package| {
+        if (package.status.requiresRepair())
+            return .{ .failure = .unhealthy_package, .package = package.name.value };
+    }
+    for (lock.packages) |locked| {
+        const package = database.database.find(
+            locked.name,
+            locked.architecture,
+        ) orelse return .{
+            .failure = .expected_package_missing,
+            .package = locked.name,
+            .expected_version = locked.version,
+        };
+        if (!package.status.isFullyInstalled() or
+            !std.mem.eql(u8, locked.version, package.version.spelling.value))
+            return .{
+                .failure = .expected_identity_mismatch,
+                .package = locked.name,
+                .expected_version = locked.version,
+                .observed_version = package.version.spelling.value,
+            };
+    }
+    return .{};
+}
+
+fn verifyExactLockV2LockedPackageEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+) !Verification {
+    if (plan.schema_version != 3 or
+        !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
+        journal.lock_sha256 == null or
+        !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or
+        journal.next_command > journal.commands.len)
+        return .{ .failure = .locked_origin_evidence_mismatch };
+
+    const action_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(action_seen);
+    @memset(action_seen, false);
+    const unpack_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(unpack_seen);
+    @memset(unpack_seen, false);
+
+    for (plan.actions) |action| {
+        if (action.kind == .remove) continue;
+        const package_index = lock.findPackageIndex(
+            action.package,
+            action.version,
+            action.architecture,
+        ) orelse return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = action.package,
+        };
+        if (action_seen[package_index]) return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = action.package,
+        };
+        const locked = lock.packages[package_index];
+        const digest_hex = action.sha256 orelse return .{
+            .failure = .locked_origin_evidence_missing,
+            .package = action.package,
+        };
+        const digest = parseDigest(&digest_hex) catch return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = action.package,
+        };
+        if (!std.mem.eql(u8, &digest, &locked.sha256) or
+            action.package_size != locked.declared_size)
+            return .{
+                .failure = .locked_origin_evidence_mismatch,
+                .package = action.package,
+            };
+        const observed_origin = action.origin orelse return .{
+            .failure = .locked_origin_evidence_missing,
+            .package = action.package,
+        };
+        const origin_matches = switch (locked.origin) {
+            .authenticated_repository => |expected| switch (observed_origin) {
+                .authenticated_repository => |observed| std.mem.eql(u8, &observed.id, &expected.repository_id),
+                .local_artifact => false,
+            },
+            .local_artifact => |expected| switch (observed_origin) {
+                .authenticated_repository => false,
+                .local_artifact => |observed| package_origin.eqlLocalArtifact(observed.evidence, expected),
+            },
+        };
+        if (!origin_matches) return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = action.package,
+        };
+        action_seen[package_index] = true;
+    }
+
+    const completed = @min(journal.next_command, journal.commands.len);
+    for (plan.ordered_actions, 0..) |ordered, command_index| {
+        if (ordered.kind != .unpack) continue;
+        const package_index = lock.findPackageIndex(
+            ordered.package,
+            ordered.version,
+            ordered.architecture,
+        ) orelse return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = ordered.package,
+        };
+        if (command_index >= completed) continue;
+        if (unpack_seen[package_index]) return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = ordered.package,
+        };
+        const command = journal.commands[command_index];
+        const command_digest = command.artifact_sha256 orelse return .{
+            .failure = .locked_origin_evidence_missing,
+            .package = ordered.package,
+        };
+        if (!std.mem.eql(u8, command.phase, "unpack") or
+            command.package == null or
+            !std.mem.eql(u8, command.package.?, ordered.package) or
+            !std.mem.eql(u8, &command_digest, &lock.packages[package_index].sha256))
+            return .{
+                .failure = .locked_origin_evidence_mismatch,
+                .package = ordered.package,
+            };
+        unpack_seen[package_index] = true;
+    }
+
+    for (lock.packages, 0..) |package, index| {
+        if (!action_seen[index] or !unpack_seen[index])
+            return .{
+                .failure = .locked_origin_evidence_missing,
+                .package = package.name,
+            };
     }
     return .{};
 }
@@ -1043,6 +1223,226 @@ test "transaction_recovery.test.local exact verification requires completed orig
             status.interface(),
             4096,
         )).failure.?,
+    );
+}
+
+test "transaction_recovery.test.operation lock verifies exact mutations on populated targets" {
+    const descriptor_digest: [32]u8 = @splat(0x11);
+    const dependency_digest: [32]u8 = @splat(0x22);
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot_digest: [32]u8 = @splat(0x33);
+    const descriptor_origin: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(descriptor_digest),
+        .sha256 = descriptor_digest,
+        .size = 17,
+        .package = "vendor-repository",
+        .version = "1",
+        .architecture = "all",
+        .acquisition_url = "https://vendor.test/repository.deb",
+        .trust_mode = .verified_https,
+    };
+    const locked_packages = [_]exact_lock_v2.Package{
+        .{
+            .name = "dependency",
+            .version = "2",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot_digest,
+            } },
+            .sha256 = dependency_digest,
+            .declared_size = 22,
+            .retention = .dependency,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = descriptor_origin.package,
+            .version = descriptor_origin.version,
+            .architecture = descriptor_origin.architecture,
+            .origin = .{ .local_artifact = descriptor_origin },
+            .sha256 = descriptor_digest,
+            .declared_size = descriptor_origin.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        },
+    };
+    const lock: exact_lock_v2.Lock = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{descriptor_origin},
+        .packages = &locked_packages,
+        .digest_sha256 = @splat(3),
+    };
+    var actions = [_]solver.PlanAction{
+        .{
+            .kind = .install,
+            .package = "dependency",
+            .version = "2",
+            .architecture = "amd64",
+            .repository = .{ .id = repository_id, .priority = 500 },
+            .sha256 = @splat('2'),
+            .package_size = 22,
+            .installed_size_delta_bytes = 0,
+            .source_package = "dependency",
+            .prior_installed = null,
+            .requested = false,
+            .reason = .dependency,
+            .selected_origin = null,
+            .origin = .{ .authenticated_repository = .{
+                .id = repository_id,
+                .priority = 500,
+            } },
+        },
+        .{
+            .kind = .install,
+            .package = descriptor_origin.package,
+            .version = descriptor_origin.version,
+            .architecture = descriptor_origin.architecture,
+            .repository = null,
+            .sha256 = @splat('1'),
+            .package_size = descriptor_origin.size,
+            .installed_size_delta_bytes = 0,
+            .source_package = descriptor_origin.package,
+            .prior_installed = null,
+            .requested = true,
+            .reason = .explicit_request,
+            .selected_origin = null,
+            .origin = .{ .local_artifact = .{
+                .evidence = descriptor_origin,
+                .solver_priority = 1000,
+            } },
+        },
+    };
+    var ordered = [_]solver.OrderedAction{
+        .{
+            .sequence = 0,
+            .kind = .unpack,
+            .package = "dependency",
+            .version = "2",
+            .architecture = "amd64",
+        },
+        .{
+            .sequence = 1,
+            .kind = .unpack,
+            .package = descriptor_origin.package,
+            .version = descriptor_origin.version,
+            .architecture = descriptor_origin.architecture,
+        },
+    };
+    const plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &ordered,
+        .summary = .{ .installs = 2, .download_bytes = 39 },
+        .download_bytes = 39,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    const commands = [_]Command{
+        .{
+            .phase = "unpack",
+            .package = "dependency",
+            .command_sha256 = @splat(4),
+            .artifact_sha256 = dependency_digest,
+        },
+        .{
+            .phase = "unpack",
+            .package = descriptor_origin.package,
+            .command_sha256 = @splat(5),
+            .artifact_sha256 = descriptor_digest,
+        },
+    };
+    const journal: Journal = .{
+        .state = .complete,
+        .boundary = .verifying,
+        .plan_sha256 = @splat(6),
+        .root_identity = @splat(7),
+        .policy_sha256 = @splat(8),
+        .lock_sha256 = lock.digest_sha256,
+        .next_command = commands.len,
+        .commands = &commands,
+    };
+    const populated =
+        "Package: ca-certificates\nStatus: install ok installed\nArchitecture: amd64\nVersion: 20240203\n\n" ++
+        "Package: dependency\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2\n\n" ++
+        "Package: vendor-repository\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n" ++
+        "Package: unrelated\nStatus: install ok installed\nArchitecture: amd64\nVersion: 9\n";
+    var status: TestStatusReader = .{ .source = populated };
+    try std.testing.expect((try verifyExactLockV2LockedPackagesWithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    )).succeeded());
+
+    const full = try verifyExactLockV2WithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    try std.testing.expectEqual(VerificationFailure.unrelated_package, full.failure.?);
+
+    status.source =
+        "Package: ca-certificates\nStatus: install ok installed\nArchitecture: amd64\nVersion: 20250101\n\n" ++
+        "Package: dependency\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2\n\n" ++
+        "Package: vendor-repository\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n" ++
+        "Package: other\nStatus: install ok installed\nArchitecture: amd64\nVersion: 42\n";
+    try std.testing.expect((try verifyExactLockV2LockedPackagesWithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    )).succeeded());
+
+    status.source =
+        "Package: dependency\nStatus: install ok installed\nArchitecture: amd64\nVersion: 3\n\n" ++
+        "Package: vendor-repository\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n";
+    const wrong_version = try verifyExactLockV2LockedPackagesWithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    try std.testing.expectEqual(
+        VerificationFailure.expected_identity_mismatch,
+        wrong_version.failure.?,
+    );
+
+    status.source = populated;
+    actions[0].origin = .{ .authenticated_repository = .{
+        .id = @splat('b'),
+        .priority = 500,
+    } };
+    const wrong_origin = try verifyExactLockV2LockedPackagesWithEvidence(
+        std.testing.allocator,
+        lock,
+        plan,
+        journal,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    try std.testing.expectEqual(
+        VerificationFailure.locked_origin_evidence_mismatch,
+        wrong_origin.failure.?,
     );
 }
 

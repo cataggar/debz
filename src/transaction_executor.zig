@@ -29,6 +29,11 @@ pub const LockPolicy = struct {
     wait_ms: u64 = 30_000,
 };
 
+pub const ExactLockVerification = enum {
+    full_closure,
+    locked_packages,
+};
+
 pub const Policy = struct {
     conffile: ConffilePolicy,
     locks: LockPolicy = .{},
@@ -36,6 +41,7 @@ pub const Policy = struct {
     validation_limits: deb_payload.Limits = .{},
     maximum_diagnostic_bytes: usize = 64 * 1024,
     process_timeout_ms: u64 = 5 * 60 * 1000,
+    exact_lock_verification: ExactLockVerification = .full_closure,
 };
 
 const maximum_diagnostic_limit = 1024 * 1024;
@@ -826,7 +832,16 @@ pub fn execute(
         state.failure = journalFailure(arena, err, .journal_io, "cannot persist verification boundary");
         return finish(allocator, arena_ptr, &state, plan_sha256);
     };
-    const verification = verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status) catch |err| {
+    const verification = verifyFinal(
+        arena,
+        request.plan.*,
+        request.exact_lock,
+        request.exact_lock_v2,
+        request.policy.exact_lock_verification,
+        journal,
+        request.install_root,
+        dependencies.status,
+    ) catch |err| {
         journal.state = .verification_failed;
         journal.failure = @errorName(err);
         recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
@@ -980,7 +995,16 @@ pub fn recover(
             state.failure = .{ .code = .invalid_root, .diagnostic = try arena.dupe(u8, @errorName(err)) };
             return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
         };
-        const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
+        const verification = try verifyFinal(
+            arena,
+            request.plan.*,
+            request.exact_lock,
+            request.exact_lock_v2,
+            request.policy.exact_lock_verification,
+            journal,
+            request.install_root,
+            dependencies.status,
+        );
         if (!verification.succeeded()) {
             journal.state = .verification_failed;
             journal.failure = @tagName(verification.failure.?);
@@ -1160,7 +1184,16 @@ pub fn recover(
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     };
 
-    const verification = try verifyFinal(arena, request.plan.*, request.exact_lock, request.exact_lock_v2, journal, request.install_root, dependencies.status);
+    const verification = try verifyFinal(
+        arena,
+        request.plan.*,
+        request.exact_lock,
+        request.exact_lock_v2,
+        request.policy.exact_lock_verification,
+        journal,
+        request.install_root,
+        dependencies.status,
+    );
     if (!verification.succeeded()) {
         journal.state = .verification_failed;
         journal.failure = @tagName(verification.failure.?);
@@ -1232,14 +1265,15 @@ fn verifyFinal(
     plan: solver.Plan,
     lock: ?*const exact_lock.Lock,
     lock_v2: ?*const exact_lock_v2.Lock,
+    verification: ExactLockVerification,
     journal: recovery.Journal,
     root: []const u8,
     status: recovery.StatusReader,
 ) !recovery.Verification {
     if (lock) |closure|
         return recovery.verifyExactLock(allocator, closure.*, root, status, 64 * 1024 * 1024);
-    if (lock_v2) |closure|
-        return recovery.verifyExactLockV2WithEvidence(
+    if (lock_v2) |closure| return switch (verification) {
+        .full_closure => recovery.verifyExactLockV2WithEvidence(
             allocator,
             closure.*,
             plan,
@@ -1247,7 +1281,17 @@ fn verifyFinal(
             root,
             status,
             64 * 1024 * 1024,
-        );
+        ),
+        .locked_packages => recovery.verifyExactLockV2LockedPackagesWithEvidence(
+            allocator,
+            closure.*,
+            plan,
+            journal,
+            root,
+            status,
+            64 * 1024 * 1024,
+        ),
+    };
     return recovery.verify(allocator, plan, root, status, .{});
 }
 
@@ -1317,6 +1361,9 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         return error.PlanTooLarge;
     if (request.exact_lock != null and request.exact_lock_v2 != null)
         return error.MultipleExactLocks;
+    if (request.policy.exact_lock_verification == .locked_packages and
+        request.exact_lock_v2 == null)
+        return error.LockedPackageVerificationRequiresV2Lock;
     if (request.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
             return error.LockArchitectureMismatch;
@@ -1983,7 +2030,7 @@ fn hashInvocation(argv: []const []const u8, environment: []const EnvironmentEntr
     return hash.finalResult();
 }
 
-fn hashPolicy(policy: Policy) [32]u8 {
+pub fn policyDigest(policy: Policy) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("debz-executor-policy-v1\x00");
     hash.update(@tagName(policy.conffile));
@@ -1996,7 +2043,16 @@ fn hashPolicy(policy: Policy) [32]u8 {
         hash.update(@tagName(force));
         hash.update("\x00");
     }
+    if (policy.exact_lock_verification != .full_closure) {
+        hash.update("\xffexact-lock-verification\x00");
+        hash.update(@tagName(policy.exact_lock_verification));
+        hash.update("\x00");
+    }
     return hash.finalResult();
+}
+
+fn hashPolicy(policy: Policy) [32]u8 {
+    return policyDigest(policy);
 }
 
 fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
@@ -2667,6 +2723,26 @@ fn testRemoveAction(package: []const u8) solver.PlanAction {
         .reason = .explicit_request,
         .selected_origin = null,
     };
+}
+
+test "transaction_executor.test.exact lock scope is policy-bound without changing full closure digest" {
+    const policy: Policy = .{ .conffile = .keep_existing };
+    const legacy = recovery.policyDigest(
+        "keep_existing",
+        policy.locks.wait_ms,
+        policy.process_timeout_ms,
+        &.{},
+    );
+    const full_closure = policyDigest(policy);
+    try std.testing.expectEqualSlices(u8, &legacy, &full_closure);
+    var operation_policy = policy;
+    operation_policy.exact_lock_verification = .locked_packages;
+    const locked_packages = policyDigest(operation_policy);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &legacy,
+        &locked_packages,
+    ));
 }
 
 test "transaction_executor.test.local artifact preflight and reread require exact origin evidence" {
