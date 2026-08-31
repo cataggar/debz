@@ -103,8 +103,15 @@ bounded, canonical, and digest checked. A repository-root advisory lock
 serializes add operations even though their evidence directories are separate.
 
 An identical installed package and managed-file set resumes import or refresh
-without invoking dpkg. A different version, artifact digest, or divergent
-managed file fails before mutation. A post-dpkg import or refresh failure
+without invoking dpkg. When no matching recovery journal exists, that shortcut
+also rereads dpkg state and requires every package in the persisted
+operation-scoped lock to have its exact version and architecture, while
+preserving the invariant that every unrelated installed package is healthy.
+The persisted lock and successful provenance establish historical artifact
+origins; current dpkg state establishes only package identities and health. A
+different version, artifact digest, divergent managed file, missing locked
+package, or unhealthy package fails with recovery required before mutation. A
+post-dpkg import or refresh failure
 returns nonzero with `installed=true`, preserves lock/provenance/state
 evidence, and makes no rollback claim. Missing or inconsistent durable
 evidence produces `recovery_required` rather than a success-shaped result.
