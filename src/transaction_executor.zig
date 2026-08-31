@@ -2369,8 +2369,8 @@ fn mergeBootstrapDirectory(io: std.Io, source: std.Io.Dir, target: std.Io.Dir) !
     }
 }
 
-/// Production bounded advisory lock adapter. A token owns the locked file
-/// descriptor until release.
+/// Production bounded advisory lock adapter. A token owns an open-file-
+/// description lock and its file descriptor until release.
 pub const SystemLockManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2405,13 +2405,18 @@ pub const SystemLockManager = struct {
             };
             const lock_result = std.os.linux.fcntl(
                 file.handle,
-                std.os.linux.F.SETLK,
+                // OFD locks conflict with dpkg's POSIX record locks, but are
+                // scoped to this open file description instead of the whole
+                // process. Independent managers in concurrent embedding
+                // threads therefore serialize just like separate processes,
+                // and closing another descriptor cannot release this token.
+                std.os.linux.F.OFD_SETLK,
                 @intFromPtr(&record),
             );
-            if (std.posix.errno(lock_result) != .SUCCESS) {
-                const errno = std.posix.errno(lock_result);
+            const lock_errno = std.os.linux.errno(lock_result);
+            if (lock_errno != .SUCCESS) {
                 file.close(self.io);
-                if (errno == .ACCES or errno == .AGAIN) {
+                if (lock_errno == .ACCES or lock_errno == .AGAIN) {
                     const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
                     if (elapsed >= wait_ms) return error.LockTimeout;
                     try std.Io.sleep(
@@ -3603,6 +3608,52 @@ test "transaction_executor.test.completed recovery retains unhealthy-state evide
     try std.testing.expectEqual(recovery.State.verification_failed, decoded.journal.state);
 }
 
+const SystemLockThread = struct {
+    manager: *SystemLockManager,
+    path: []const u8,
+    wait_ms: u64,
+    started: std.atomic.Value(bool) = .init(false),
+    acquired: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+    release_requested: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn run(self: *SystemLockThread) void {
+        const locks = self.manager.interface();
+        self.started.store(true, .release);
+        const token = locks.acquire(self.path, self.wait_ms) catch |err| {
+            self.failure = err;
+            self.finished.store(true, .release);
+            return;
+        };
+        self.acquired.store(true, .release);
+        while (!self.release_requested.load(.acquire))
+            std.atomic.spinLoopHint();
+        locks.release(token);
+        self.finished.store(true, .release);
+    }
+};
+
+fn waitForSystemLockTestFlag(flag: *const std.atomic.Value(bool), wait_ms: u64) !void {
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (!flag.load(.acquire)) {
+        const elapsed = started.durationTo(
+            std.Io.Clock.awake.now(std.testing.io),
+        ).toMilliseconds();
+        if (elapsed >= wait_ms) return error.TestTimedOut;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+}
+
+fn expectSystemLockTimeout(locks: LockManager, path: []const u8) !void {
+    if (locks.acquire(path, 0)) |token| {
+        locks.release(token);
+        return error.TestUnexpectedLockAcquisition;
+    } else |err| {
+        try std.testing.expectEqual(error.LockTimeout, err);
+    }
+}
+
 test "transaction_executor.test.production adapters expose injectable interfaces" {
     var filesystem: SystemFileSystem = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     var locks: SystemLockManager = .{ .allocator = std.testing.allocator, .io = std.testing.io };
@@ -3748,6 +3799,231 @@ test "transaction_executor.test.production lock adapter refuses parent and leaf 
     try std.testing.expectError(error.SymLinkLoop, locks.openLockFile(leaf_link_path));
     var safe_file = try locks.openLockFile(safe_path);
     safe_file.close(std.testing.io);
+}
+
+test "transaction_executor.test.system lock manager serializes independent managers in one process" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/same.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(lock_path);
+
+    var first_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var second_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const first_locks = first_manager.interface();
+    const first_token = try first_locks.acquire(lock_path, 100);
+    var first_released = false;
+    defer if (!first_released) first_locks.release(first_token);
+
+    try expectSystemLockTimeout(second_manager.interface(), lock_path);
+
+    var context: SystemLockThread = .{
+        .manager = &second_manager,
+        .path = lock_path,
+        .wait_ms = 1_000,
+    };
+    const thread = try std.Thread.spawn(.{}, SystemLockThread.run, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        context.release_requested.store(true, .release);
+        if (!first_released) {
+            first_locks.release(first_token);
+            first_released = true;
+        }
+        thread.join();
+    };
+    try waitForSystemLockTestFlag(&context.started, 500);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
+    try std.testing.expect(!context.acquired.load(.acquire));
+    try std.testing.expect(!context.finished.load(.acquire));
+
+    context.release_requested.store(true, .release);
+    first_locks.release(first_token);
+    first_released = true;
+    try waitForSystemLockTestFlag(&context.finished, 1_000);
+    thread.join();
+    joined = true;
+    try std.testing.expect(context.failure == null);
+    try std.testing.expect(context.acquired.load(.acquire));
+}
+
+test "transaction_executor.test.system lock manager same-path wait times out across threads" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/timeout.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(lock_path);
+
+    var first_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var second_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .retry_ms = 1,
+    };
+    const first_locks = first_manager.interface();
+    const first_token = try first_locks.acquire(lock_path, 100);
+    var first_released = false;
+    defer if (!first_released) first_locks.release(first_token);
+
+    var context: SystemLockThread = .{
+        .manager = &second_manager,
+        .path = lock_path,
+        .wait_ms = 25,
+    };
+    const thread = try std.Thread.spawn(.{}, SystemLockThread.run, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        context.release_requested.store(true, .release);
+        if (!first_released) {
+            first_locks.release(first_token);
+            first_released = true;
+        }
+        thread.join();
+    };
+    try waitForSystemLockTestFlag(&context.finished, 500);
+    thread.join();
+    joined = true;
+    try std.testing.expect(!context.acquired.load(.acquire));
+    try std.testing.expectEqual(error.LockTimeout, context.failure.?);
+}
+
+test "transaction_executor.test.system lock manager permits distinct paths concurrently" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const first_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/first.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(first_path);
+    const second_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/second.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(second_path);
+
+    var first_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var second_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const first_locks = first_manager.interface();
+    const first_token = try first_locks.acquire(first_path, 100);
+    defer first_locks.release(first_token);
+
+    var context: SystemLockThread = .{
+        .manager = &second_manager,
+        .path = second_path,
+        .wait_ms = 100,
+    };
+    context.release_requested.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, SystemLockThread.run, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        context.release_requested.store(true, .release);
+        thread.join();
+    };
+    try waitForSystemLockTestFlag(&context.finished, 500);
+    thread.join();
+    joined = true;
+    try std.testing.expect(context.failure == null);
+    try std.testing.expect(context.acquired.load(.acquire));
+    try std.testing.expect(first_locks.held(first_token));
+}
+
+test "transaction_executor.test.system lock survives closing an unrelated descriptor" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/close.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(lock_path);
+
+    var first_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var second_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const first_locks = first_manager.interface();
+    const first_token = try first_locks.acquire(lock_path, 100);
+    var first_released = false;
+    defer if (!first_released) first_locks.release(first_token);
+
+    var unrelated = try first_manager.openLockFile(lock_path);
+    unrelated.close(std.testing.io);
+    try expectSystemLockTimeout(second_manager.interface(), lock_path);
+
+    first_locks.release(first_token);
+    first_released = true;
+    const next_token = try second_manager.interface().acquire(lock_path, 100);
+    second_manager.interface().release(next_token);
+}
+
+test "transaction_executor.test.system lock acquisition failure releases kernel state" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/cleanup.lock",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(lock_path);
+
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var failing_manager: SystemLockManager = .{
+        .allocator = fixed.allocator(),
+        .io = std.testing.io,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failing_manager.interface().acquire(lock_path, 100),
+    );
+
+    var next_manager: SystemLockManager = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const next_locks = next_manager.interface();
+    const token = try next_locks.acquire(lock_path, 0);
+    next_locks.release(token);
 }
 
 test "transaction_executor.test.production process adapter observes cancellation and reaps child" {
