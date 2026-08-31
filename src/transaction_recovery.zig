@@ -307,6 +307,20 @@ pub const Verification = struct {
     }
 };
 
+pub const ExactLockV2StatusFailure = struct {
+    kind: VerificationFailure,
+    locked_package_index: ?usize = null,
+};
+
+pub const ExactLockV2StatusVerification = union(enum) {
+    success,
+    failure: ExactLockV2StatusFailure,
+
+    pub fn succeeded(self: ExactLockV2StatusVerification) bool {
+        return self == .success;
+    }
+};
+
 pub fn rootIdentity(root: []const u8) [32]u8 {
     var result: [32]u8 = undefined;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -601,12 +615,15 @@ pub fn verifyExactLockV2(
     reader: StatusReader,
     maximum_status_bytes: usize,
 ) !Verification {
-    const verification = try verifyExactLockV2Status(
-        allocator,
+    const verification = exactLockV2StatusVerification(
         lock,
-        root,
-        reader,
-        maximum_status_bytes,
+        try verifyExactLockV2Status(
+            allocator,
+            lock,
+            root,
+            reader,
+            maximum_status_bytes,
+        ),
     );
     if (!verification.succeeded()) return verification;
     for (lock.packages) |package| switch (package.origin) {
@@ -628,12 +645,15 @@ pub fn verifyExactLockV2WithEvidence(
     reader: StatusReader,
     maximum_status_bytes: usize,
 ) !Verification {
-    const verification = try verifyExactLockV2Status(
-        allocator,
+    const verification = exactLockV2StatusVerification(
         lock,
-        root,
-        reader,
-        maximum_status_bytes,
+        try verifyExactLockV2Status(
+            allocator,
+            lock,
+            root,
+            reader,
+            maximum_status_bytes,
+        ),
     );
     if (!verification.succeeded()) return verification;
     return verifyExactLockV2LocalEvidence(allocator, lock, plan, journal);
@@ -652,12 +672,15 @@ pub fn verifyExactLockV2LockedPackagesWithEvidence(
     reader: StatusReader,
     maximum_status_bytes: usize,
 ) !Verification {
-    const verification = try verifyExactLockV2LockedPackages(
-        allocator,
+    const verification = exactLockV2StatusVerification(
         lock,
-        root,
-        reader,
-        maximum_status_bytes,
+        try verifyExactLockV2LockedPackages(
+            allocator,
+            lock,
+            root,
+            reader,
+            maximum_status_bytes,
+        ),
     );
     if (!verification.succeeded()) return verification;
     return verifyExactLockV2LockedPackageEvidence(allocator, lock, plan, journal);
@@ -669,89 +692,130 @@ fn verifyExactLockV2Status(
     root: []const u8,
     reader: StatusReader,
     maximum_status_bytes: usize,
-) !Verification {
+) !ExactLockV2StatusVerification {
     const source = reader.read(allocator, root, maximum_status_bytes) catch
-        return .{ .failure = .status_query_failed };
+        return .{ .failure = .{ .kind = .status_query_failed } };
     defer allocator.free(source);
     const parsed = try dpkg_status.parseOwned(allocator, source, .{});
     var database = switch (parsed) {
-        .diagnostic => return .{ .failure = .status_parse_failed },
+        .diagnostic => return .{ .failure = .{ .kind = .status_parse_failed } },
         .database => |value| value,
     };
     defer database.deinit();
 
     var installed_count: usize = 0;
     for (database.database.packages) |package| {
-        if (package.status.requiresRepair())
-            return .{ .failure = .unhealthy_package, .package = package.name.value };
+        if (package.status.requiresRepair()) return .{ .failure = .{
+            .kind = .unhealthy_package,
+            .locked_package_index = lock.findIdentityIndex(
+                package.name.value,
+                package.architecture.value,
+            ),
+        } };
         if (!package.status.isFullyInstalled()) continue;
         installed_count += 1;
-        const locked = lock.findIdentity(package.name.value, package.architecture.value) orelse
-            return .{ .failure = .unrelated_package, .package = package.name.value };
+        const locked_index = lock.findIdentityIndex(
+            package.name.value,
+            package.architecture.value,
+        ) orelse return .{ .failure = .{ .kind = .unrelated_package } };
+        const locked = lock.packages[locked_index];
         if (!std.mem.eql(u8, locked.version, package.version.spelling.value))
-            return .{
-                .failure = .expected_identity_mismatch,
-                .package = package.name.value,
-                .expected_version = locked.version,
-                .observed_version = package.version.spelling.value,
-            };
+            return .{ .failure = .{
+                .kind = .expected_identity_mismatch,
+                .locked_package_index = locked_index,
+            } };
     }
     if (installed_count != lock.packages.len) {
-        for (lock.packages) |locked| {
+        for (lock.packages, 0..) |locked, index| {
             const package = database.database.find(locked.name, locked.architecture) orelse
-                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+                return .{ .failure = .{
+                    .kind = .expected_package_missing,
+                    .locked_package_index = index,
+                } };
             if (!package.status.isFullyInstalled())
-                return .{ .failure = .expected_package_missing, .package = locked.name, .expected_version = locked.version };
+                return .{ .failure = .{
+                    .kind = .expected_package_missing,
+                    .locked_package_index = index,
+                } };
         }
-        return .{ .failure = .expected_package_missing };
+        return .{ .failure = .{ .kind = .expected_package_missing } };
     }
-    return .{};
+    return .success;
 }
 
 /// Verifies current dpkg identities for every package in an operation-scoped
 /// lock and rejects any unhealthy package, including packages outside the
 /// lock. Artifact origins must be established separately from durable
 /// lock/provenance evidence; dpkg status cannot prove historical origin.
+/// Diagnostics identify locked packages by index so no returned value borrows
+/// from the temporary parsed status database.
 pub fn verifyExactLockV2LockedPackages(
     allocator: std.mem.Allocator,
     lock: exact_lock_v2.Lock,
     root: []const u8,
     reader: StatusReader,
     maximum_status_bytes: usize,
-) !Verification {
+) !ExactLockV2StatusVerification {
     const source = reader.read(allocator, root, maximum_status_bytes) catch
-        return .{ .failure = .status_query_failed };
+        return .{ .failure = .{ .kind = .status_query_failed } };
     defer allocator.free(source);
     const parsed = try dpkg_status.parseOwned(allocator, source, .{});
     var database = switch (parsed) {
-        .diagnostic => return .{ .failure = .status_parse_failed },
+        .diagnostic => return .{ .failure = .{ .kind = .status_parse_failed } },
         .database => |value| value,
     };
     defer database.deinit();
 
     for (database.database.packages) |package| {
-        if (package.status.requiresRepair())
-            return .{ .failure = .unhealthy_package, .package = package.name.value };
+        if (package.status.requiresRepair()) return .{ .failure = .{
+            .kind = .unhealthy_package,
+            .locked_package_index = lock.findIdentityIndex(
+                package.name.value,
+                package.architecture.value,
+            ),
+        } };
     }
-    for (lock.packages) |locked| {
+    for (lock.packages, 0..) |locked, index| {
         const package = database.database.find(
             locked.name,
             locked.architecture,
-        ) orelse return .{
-            .failure = .expected_package_missing,
-            .package = locked.name,
-            .expected_version = locked.version,
-        };
+        ) orelse return .{ .failure = .{
+            .kind = .expected_package_missing,
+            .locked_package_index = index,
+        } };
         if (!package.status.isFullyInstalled() or
             !std.mem.eql(u8, locked.version, package.version.spelling.value))
-            return .{
-                .failure = .expected_identity_mismatch,
-                .package = locked.name,
-                .expected_version = locked.version,
-                .observed_version = package.version.spelling.value,
-            };
+            return .{ .failure = .{
+                .kind = .expected_identity_mismatch,
+                .locked_package_index = index,
+            } };
     }
-    return .{};
+    return .success;
+}
+
+fn exactLockV2StatusVerification(
+    lock: exact_lock_v2.Lock,
+    status: ExactLockV2StatusVerification,
+) Verification {
+    return switch (status) {
+        .success => .{},
+        .failure => |failure| .{
+            .failure = failure.kind,
+            .package = if (failure.locked_package_index) |index|
+                lock.packages[index].name
+            else
+                null,
+            .expected_version = if (failure.locked_package_index) |index|
+                switch (failure.kind) {
+                    .expected_package_missing,
+                    .expected_identity_mismatch,
+                    => lock.packages[index].version,
+                    else => null,
+                }
+            else
+                null,
+        },
+    };
 }
 
 fn verifyExactLockV2LockedPackageEvidence(
@@ -1157,6 +1221,28 @@ test "transaction_recovery.test.local exact verification requires completed orig
         VerificationFailure.local_origin_evidence_missing,
         weak.failure.?,
     );
+    status.source =
+        "Package: demo\nStatus: install ok installed\nVersion: 2\nArchitecture: amd64\n";
+    const drift = try verifyExactLockV2(
+        std.testing.allocator,
+        lock,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    const churn = try std.testing.allocator.alloc(u8, 4096);
+    @memset(churn, 0xa5);
+    std.testing.allocator.free(churn);
+    try std.testing.expectEqual(
+        VerificationFailure.expected_identity_mismatch,
+        drift.failure.?,
+    );
+    try std.testing.expectEqualStrings("demo", drift.package.?);
+    try std.testing.expectEqualStrings("1", drift.expected_version.?);
+    try std.testing.expect(drift.observed_version == null);
+
+    status.source =
+        "Package: demo\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n";
     try std.testing.expect((try verifyExactLockV2WithEvidence(
         std.testing.allocator,
         lock,
@@ -1416,6 +1502,34 @@ test "transaction_recovery.test.operation lock verifies exact mutations on popul
     status.source =
         "Package: dependency\nStatus: install ok installed\nArchitecture: amd64\nVersion: 3\n\n" ++
         "Package: vendor-repository\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n";
+    const current_wrong_version = try verifyExactLockV2LockedPackages(
+        std.testing.allocator,
+        lock,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    const churn = try std.testing.allocator.alloc(u8, 4096);
+    @memset(churn, 0xa5);
+    std.testing.allocator.free(churn);
+    switch (current_wrong_version) {
+        .success => return error.ExpectedVerificationFailure,
+        .failure => |failure| {
+            try std.testing.expectEqual(
+                VerificationFailure.expected_identity_mismatch,
+                failure.kind,
+            );
+            try std.testing.expectEqual(@as(?usize, 0), failure.locked_package_index);
+            try std.testing.expectEqualStrings(
+                "dependency",
+                lock.packages[failure.locked_package_index.?].name,
+            );
+            try std.testing.expectEqualStrings(
+                "2",
+                lock.packages[failure.locked_package_index.?].version,
+            );
+        },
+    }
     const wrong_version = try verifyExactLockV2LockedPackagesWithEvidence(
         std.testing.allocator,
         lock,
@@ -1429,6 +1543,31 @@ test "transaction_recovery.test.operation lock verifies exact mutations on popul
         VerificationFailure.expected_identity_mismatch,
         wrong_version.failure.?,
     );
+    try std.testing.expectEqualStrings("dependency", wrong_version.package.?);
+    try std.testing.expectEqualStrings("2", wrong_version.expected_version.?);
+    try std.testing.expect(wrong_version.observed_version == null);
+
+    status.source =
+        "Package: dependency\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2\n\n" ++
+        "Package: vendor-repository\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n" ++
+        "Package: unrelated\nStatus: install ok half-configured\nArchitecture: amd64\nVersion: 9\n";
+    const unrelated_unhealthy = try verifyExactLockV2LockedPackages(
+        std.testing.allocator,
+        lock,
+        "/target",
+        status.interface(),
+        4096,
+    );
+    switch (unrelated_unhealthy) {
+        .success => return error.ExpectedVerificationFailure,
+        .failure => |failure| {
+            try std.testing.expectEqual(
+                VerificationFailure.unhealthy_package,
+                failure.kind,
+            );
+            try std.testing.expect(failure.locked_package_index == null);
+        },
+    }
 
     status.source = populated;
     actions[0].origin = .{ .authenticated_repository = .{
