@@ -28,6 +28,16 @@ recovery verification require a completed unpack journal entry with that
 artifact digest and an exact plan-origin/size match; matching dpkg identity
 alone is insufficient.
 
+`Policy.exact_lock_verification` defaults to `full_closure`, preserving the
+existing rule that every installed package must appear in the exact lock.
+The explicit `locked_packages` policy is available for operation locks that
+contain every non-remove plan action rather than a complete target manifest.
+It still rejects a missing or wrong locked identity and requires each locked
+repository or local origin, digest, size, and completed unpack digest to match;
+only unrelated healthy package identities are outside that verification scope.
+The selected scope is part of the executor policy digest and therefore the
+recovery journal and transaction provenance binding.
+
 Schema-v2 recovery journals retain the released plan-digest algorithm so
 interrupted repository-only transactions remain recoverable after an upgrade.
 For schema-v3 plans, the recovery journal's plan digest additionally binds the

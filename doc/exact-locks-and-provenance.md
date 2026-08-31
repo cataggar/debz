@@ -19,6 +19,15 @@ does not authoritatively retain archive origin. Final verification additionally
 requires the completed journal's local archive digest and the plan's exact
 origin, digest, and size evidence. V1 decoding and replay remain unchanged.
 
+Exact-lock v2 keeps its complete-closure meaning by default. The transaction
+executor also exposes a separately policy-digested `locked_packages` mode for
+repository-add operations whose lock intentionally contains only non-remove
+mutation actions. That mode requires every locked package at exact identity and
+requires exact plan origin/digest/size plus completed unpack digest evidence,
+but does not reject unrelated healthy installed packages. Repository-add binds
+the mode in its validated lock policy digest, executor journal policy digest,
+and transaction provenance; product full-closure verification is not relaxed.
+
 `dpkg_selection_hold` records dpkg selection intent. It is not an exact-lock
 constraint. `SolverPlanInput.exact_lock` separately constrains the complete
 final closure. Planning fails if a repository snapshot, version, architecture,

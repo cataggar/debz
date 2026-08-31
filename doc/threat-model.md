@@ -35,7 +35,15 @@ child-process boundary and is executed with fixed argv/environment policy.
   authentication or target import.
 - Repository-add operations apply aggregate repository, action, metadata,
   package, retained-memory, cache-growth, and elapsed-time budgets in addition
-  to per-object parser and transfer limits.
+  to per-object parser and transfer limits. The elapsed budget starts before
+  the repository operation lock and caps that wait.
+- Validated descriptor recovery is pinned to persisted CAS digest and size.
+  Missing or corrupt CAS data can only be reacquired at that identity, and
+  previously established HTTPS trust cannot be replaced by a weaker redirect
+  chain or newly labeled evidence.
+- Repository operation journals are integrity-decoded and matched to plan,
+  root, executor policy, and exact lock before recovery. Unrelated completed
+  archives do not select recovery; mismatched incomplete evidence blocks.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.
