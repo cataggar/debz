@@ -103,6 +103,16 @@ pub const Lock = struct {
     }
 
     pub fn findIdentity(self: Lock, name: []const u8, architecture: []const u8) ?Package {
+        const index = self.findIdentityIndex(name, architecture) orelse
+            return null;
+        return self.packages[index];
+    }
+
+    pub fn findIdentityIndex(
+        self: Lock,
+        name: []const u8,
+        architecture: []const u8,
+    ) ?usize {
         var low: usize = 0;
         var high = self.packages.len;
         while (low < high) {
@@ -116,7 +126,7 @@ pub const Lock = struct {
             switch (order) {
                 .lt => low = middle + 1,
                 .gt => high = middle,
-                .eq => return package,
+                .eq => return middle,
             }
         }
         return null;

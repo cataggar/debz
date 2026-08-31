@@ -78,6 +78,8 @@ pub const Backend = struct {
     executor: Executor = .system,
     process_runner: ?transaction_executor.ProcessRunner = null,
     operation_locks: ?transaction_executor.LockManager = null,
+    target_locks: ?transaction_executor.LockManager = null,
+    status_reader: ?transaction_recovery.StatusReader = null,
     acquisition_dependencies: ?repository_acquisition.Dependencies = null,
     now_unix: ?i64 = null,
     state_write_hooks: state_module.WriteHooks = .{},
@@ -1297,34 +1299,142 @@ pub const Backend = struct {
                 recovery_needed = true;
             };
             if (!recovery_needed) {
-                var status_reader = transaction_recovery.SystemStatusFileReader{
-                    .io = self.io,
-                    .expected_root = request.root,
+                const transaction_lock_path = try rootPath(
+                    allocator,
+                    request.root,
+                    "/var/lib/debz/transaction.lock",
+                );
+                defer allocator.free(transaction_lock_path);
+                const frontend_lock_path = try rootPath(
+                    allocator,
+                    request.root,
+                    "/var/lib/dpkg/lock-frontend",
+                );
+                defer allocator.free(frontend_lock_path);
+                const dpkg_lock_path = try rootPath(
+                    allocator,
+                    request.root,
+                    "/var/lib/dpkg/lock",
+                );
+                defer allocator.free(dpkg_lock_path);
+                const target_lock_paths = [_][]const u8{
+                    transaction_lock_path,
+                    frontend_lock_path,
+                    dpkg_lock_path,
                 };
+                var system_target_locks = transaction_executor.SystemLockManager{
+                    .allocator = allocator,
+                    .io = self.io,
+                };
+                const target_locks = self.target_locks orelse
+                    system_target_locks.interface();
+                // The repository-operation lock is already held. Keep the
+                // established install/recovery order beneath it so repository
+                // paths never invert the target transaction lock hierarchy.
+                var held_target_locks: [target_lock_paths.len]?transaction_executor.LockToken =
+                    @splat(null);
+                defer {
+                    var index = held_target_locks.len;
+                    while (index > 0) {
+                        index -= 1;
+                        if (held_target_locks[index]) |value|
+                            target_locks.release(value);
+                        held_target_locks[index] = null;
+                    }
+                }
+                for (target_lock_paths, 0..) |path, index| {
+                    const remaining = budget.remainingTime() catch |err|
+                        return progress.fail(
+                            state_store,
+                            allocator,
+                            .unavailable,
+                            .resource_limit_exceeded,
+                            "resume-current-state-lock",
+                            @errorName(err),
+                        );
+                    held_target_locks[index] = target_locks.acquire(
+                        path,
+                        @min(request.state.lock_wait_ms, remaining),
+                    ) catch |err| {
+                        budget.checkTime() catch |deadline_err|
+                            return progress.fail(
+                                state_store,
+                                allocator,
+                                .unavailable,
+                                .resource_limit_exceeded,
+                                "resume-current-state-lock",
+                                @errorName(deadline_err),
+                            );
+                        return progress.fail(
+                            state_store,
+                            allocator,
+                            .recovery,
+                            .recovery_required,
+                            "resume-current-state-lock",
+                            @errorName(err),
+                        );
+                    };
+                    budget.checkTime() catch |err| return progress.fail(
+                        state_store,
+                        allocator,
+                        .unavailable,
+                        .resource_limit_exceeded,
+                        "resume-current-state-lock",
+                        @errorName(err),
+                    );
+                }
+                var system_status_reader =
+                    transaction_recovery.SystemStatusFileReader{
+                        .io = self.io,
+                        .expected_root = request.root,
+                    };
+                const status_reader = self.status_reader orelse
+                    system_status_reader.interface();
                 const verification =
                     transaction_recovery.verifyExactLockV2LockedPackages(
                         allocator,
                         lock.lock,
                         request.root,
-                        status_reader.interface(),
+                        status_reader,
                         64 * 1024 * 1024,
-                    ) catch |err| return progress.fail(
+                    ) catch |err| {
+                        budget.checkTime() catch |deadline_err|
+                            return progress.fail(
+                                state_store,
+                                allocator,
+                                .unavailable,
+                                .resource_limit_exceeded,
+                                "resume-current-state",
+                                @errorName(deadline_err),
+                            );
+                        return progress.fail(
+                            state_store,
+                            allocator,
+                            .recovery,
+                            .recovery_required,
+                            "resume-current-state",
+                            @errorName(err),
+                        );
+                    };
+                budget.checkTime() catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .unavailable,
+                    .resource_limit_exceeded,
+                    "resume-current-state",
+                    @errorName(err),
+                );
+                switch (verification) {
+                    .success => {},
+                    .failure => |failure| return progress.fail(
                         state_store,
                         allocator,
                         .recovery,
                         .recovery_required,
                         "resume-current-state",
-                        @errorName(err),
-                    );
-                if (!verification.succeeded())
-                    return progress.fail(
-                        state_store,
-                        allocator,
-                        .recovery,
-                        .recovery_required,
-                        "resume-current-state",
-                        @tagName(verification.failure.?),
-                    );
+                        @tagName(failure.kind),
+                    ),
+                }
                 progress.exact_lock_path = paths.exact_lock_logical;
                 progress.provenance_path = paths.provenance_logical;
             }
@@ -1365,7 +1475,7 @@ pub const Backend = struct {
                 .locks = system_locks.interface(),
                 .process = self.process_runner orelse system_process.interface(),
                 .journal = journal.interface(),
-                .status = status_reader.interface(),
+                .status = self.status_reader orelse status_reader.interface(),
                 .deadline = .{
                     .context = budget.clock.context,
                     .nowMsFn = budget.clock.nowMsFn,
@@ -4467,6 +4577,88 @@ const RepositoryOperationLock = struct {
     fn release(_: *anyopaque, _: transaction_executor.LockToken) void {}
 };
 
+const RepositoryTargetLocks = struct {
+    clock_ms: *u64,
+    fail_call: ?usize = null,
+    calls: usize = 0,
+    releases: usize = 0,
+    held_count: usize = 0,
+    waits: [3]?u64 = @splat(null),
+
+    fn interface(self: *RepositoryTargetLocks) transaction_executor.LockManager {
+        return .{
+            .context = self,
+            .acquireFn = acquire,
+            .heldFn = held,
+            .releaseFn = release,
+        };
+    }
+
+    fn acquire(
+        context: *anyopaque,
+        path: []const u8,
+        wait_ms: u64,
+    ) !transaction_executor.LockToken {
+        const self: *RepositoryTargetLocks = @ptrCast(@alignCast(context));
+        const expected_suffixes = [_][]const u8{
+            "/var/lib/debz/transaction.lock",
+            "/var/lib/dpkg/lock-frontend",
+            "/var/lib/dpkg/lock",
+        };
+        if (self.calls >= expected_suffixes.len or
+            !std.mem.endsWith(u8, path, expected_suffixes[self.calls]))
+            return error.UnexpectedTargetLock;
+        self.waits[self.calls] = wait_ms;
+        self.calls += 1;
+        self.clock_ms.* +|= self.calls;
+        if (self.fail_call == self.calls) return error.LockTimeout;
+        self.held_count += 1;
+        return self;
+    }
+
+    fn held(context: *anyopaque, _: transaction_executor.LockToken) bool {
+        const self: *RepositoryTargetLocks = @ptrCast(@alignCast(context));
+        return self.held_count != 0;
+    }
+
+    fn release(context: *anyopaque, _: transaction_executor.LockToken) void {
+        const self: *RepositoryTargetLocks = @ptrCast(@alignCast(context));
+        std.debug.assert(self.held_count != 0);
+        self.held_count -= 1;
+        self.releases += 1;
+    }
+};
+
+const RepositoryLockedStatusReader = struct {
+    locks: *RepositoryTargetLocks,
+    stable: []const u8,
+    intermediate: []const u8,
+    calls: usize = 0,
+    read_before_all_locks: bool = false,
+
+    fn interface(self: *RepositoryLockedStatusReader) transaction_recovery.StatusReader {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: []const u8,
+        maximum: usize,
+    ) ![]u8 {
+        const self: *RepositoryLockedStatusReader = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        const bytes = if (self.locks.held_count == 3)
+            self.stable
+        else blk: {
+            self.read_before_all_locks = true;
+            break :blk self.intermediate;
+        };
+        if (bytes.len > maximum) return error.StreamTooLong;
+        return allocator.dupe(u8, bytes);
+    }
+};
+
 const RepositoryTestExecutor = struct {
     const LockDigestMode = enum {
         exact,
@@ -4812,7 +5004,7 @@ test "repository backend completes and idempotently resumes every production pha
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
 }
 
-test "repository backend revalidates operation lock before idempotent resume" {
+test "repository backend holds bounded target locks for idempotent verification" {
     const descriptor = @embedFile(
         "fixtures/packages-microsoft-prod-depends_1.1_all.deb",
     );
@@ -4869,6 +5061,7 @@ test "repository backend revalidates operation lock before idempotent resume" {
         journal: JournalMode,
         expected_failure: ?transaction_recovery.VerificationFailure = null,
         expected_recovery_calls: usize = 0,
+        target_lock_failure: ?usize = null,
     };
     const cases = [_]Case{
         .{ .status = exact_status, .journal = .none },
@@ -4926,6 +5119,16 @@ test "repository backend revalidates operation lock before idempotent resume" {
             .journal = .matching_incomplete,
             .expected_recovery_calls = 1,
         },
+        .{
+            .status = exact_status,
+            .journal = .none,
+            .target_lock_failure = 2,
+        },
+        .{
+            .status = exact_status,
+            .journal = .unrelated_completed,
+            .target_lock_failure = 3,
+        },
     };
 
     for (cases) |case| {
@@ -4961,9 +5164,23 @@ test "repository backend revalidates operation lock before idempotent resume" {
             .directory = directory.dir,
             .install_status = case.status,
         };
+        var target_locks: RepositoryTargetLocks = .{
+            .clock_ms = &acquisition.now_ms,
+            .fail_call = case.target_lock_failure,
+        };
+        var locked_status: RepositoryLockedStatusReader = .{
+            .locks = &target_locks,
+            .stable = case.status,
+            .intermediate = "Package: hello\n" ++
+                "Status: install ok half-configured\n" ++
+                "Architecture: amd64\n" ++
+                "Version: 2.0\n",
+        };
         var backend: Backend = .{
             .io = std.testing.io,
             .executor = executor.interface(),
+            .target_locks = target_locks.interface(),
+            .status_reader = locked_status.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = fixture.created + 30,
         };
@@ -4972,6 +5189,12 @@ test "repository backend revalidates operation lock before idempotent resume" {
             .descriptor_url = "file:///descriptor.deb",
             .expected_sha256 = sha256(descriptor),
             .architecture = "amd64",
+            .network = .{
+                .connect_timeout_ms = 100,
+                .read_timeout_ms = 100,
+                .overall_timeout_ms = 100,
+            },
+            .state = .{ .lock_wait_ms = 100 },
         };
         var first = try api.execute(
             std.testing.allocator,
@@ -5090,7 +5313,24 @@ test "repository backend revalidates operation lock before idempotent resume" {
             backend.interface(),
         );
         defer resumed.deinit();
-        if (case.expected_failure) |failure| {
+        if (case.target_lock_failure) |_| {
+            try std.testing.expectEqual(
+                api.ExitStatus.recovery,
+                resumed.exit_status,
+            );
+            try std.testing.expectEqual(
+                api.DiagnosticId.recovery_required,
+                resumed.diagnostics[0].id,
+            );
+            try std.testing.expectEqualStrings(
+                "resume-current-state-lock",
+                resumed.diagnostics[0].phase.?,
+            );
+            try std.testing.expectEqualStrings(
+                "LockTimeout",
+                resumed.diagnostics[0].message,
+            );
+        } else if (case.expected_failure) |failure| {
             try std.testing.expectEqual(
                 api.ExitStatus.recovery,
                 resumed.exit_status,
@@ -5119,6 +5359,26 @@ test "repository backend revalidates operation lock before idempotent resume" {
             case.expected_recovery_calls,
             executor.recover_calls,
         );
+        if (case.journal == .matching_incomplete) {
+            try std.testing.expectEqual(@as(usize, 0), target_locks.calls);
+            try std.testing.expectEqual(@as(usize, 0), target_locks.releases);
+            try std.testing.expectEqual(@as(usize, 0), locked_status.calls);
+        } else if (case.target_lock_failure) |failure_call| {
+            try std.testing.expectEqual(failure_call, target_locks.calls);
+            try std.testing.expectEqual(
+                failure_call - 1,
+                target_locks.releases,
+            );
+            try std.testing.expectEqual(@as(usize, 0), locked_status.calls);
+        } else {
+            try std.testing.expectEqual(@as(usize, 3), target_locks.calls);
+            try std.testing.expectEqual(@as(usize, 3), target_locks.releases);
+            try std.testing.expectEqual(@as(usize, 1), locked_status.calls);
+            try std.testing.expect(!locked_status.read_before_all_locks);
+            try std.testing.expectEqual(@as(u64, 100), target_locks.waits[0].?);
+            try std.testing.expectEqual(@as(u64, 99), target_locks.waits[1].?);
+            try std.testing.expectEqual(@as(u64, 97), target_locks.waits[2].?);
+        }
     }
 }
 
