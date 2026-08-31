@@ -1297,6 +1297,34 @@ pub const Backend = struct {
                 recovery_needed = true;
             };
             if (!recovery_needed) {
+                var status_reader = transaction_recovery.SystemStatusFileReader{
+                    .io = self.io,
+                    .expected_root = request.root,
+                };
+                const verification =
+                    transaction_recovery.verifyExactLockV2LockedPackages(
+                        allocator,
+                        lock.lock,
+                        request.root,
+                        status_reader.interface(),
+                        64 * 1024 * 1024,
+                    ) catch |err| return progress.fail(
+                        state_store,
+                        allocator,
+                        .recovery,
+                        .recovery_required,
+                        "resume-current-state",
+                        @errorName(err),
+                    );
+                if (!verification.succeeded())
+                    return progress.fail(
+                        state_store,
+                        allocator,
+                        .recovery,
+                        .recovery_required,
+                        "resume-current-state",
+                        @tagName(verification.failure.?),
+                    );
                 progress.exact_lock_path = paths.exact_lock_logical;
                 progress.provenance_path = paths.provenance_logical;
             }
@@ -4462,6 +4490,7 @@ const RepositoryTestExecutor = struct {
     recovery_plan_sha256: ?[32]u8 = null,
     clock_ms: ?*u64 = null,
     advance_ms_after_install: u64 = 0,
+    install_status: ?[]const u8 = null,
 
     fn interface(self: *RepositoryTestExecutor) Executor {
         return .{
@@ -4582,10 +4611,11 @@ const RepositoryTestExecutor = struct {
 
     fn installDescriptor(self: *RepositoryTestExecutor) !void {
         return self.installDescriptorWithStatus(
-            "Package: packages-microsoft-prod\n" ++
-                "Status: install ok installed\n" ++
-                "Architecture: all\n" ++
-                "Version: 1.1\n",
+            self.install_status orelse
+                "Package: packages-microsoft-prod\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 1.1\n",
         );
     }
 
@@ -4780,6 +4810,316 @@ test "repository backend completes and idempotently resumes every production pha
         result.diagnostics[0].id,
     );
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "repository backend revalidates operation lock before idempotent resume" {
+    const descriptor = @embedFile(
+        "fixtures/packages-microsoft-prod-depends_1.1_all.deb",
+    );
+    const fixture = @import("fixtures/openpgp.zig");
+    const exact_status =
+        "Package: hello\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 1.0-1\n\n" ++
+        "Package: packages-microsoft-prod\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: all\n" ++
+        "Version: 1.1\n";
+    const missing_dependency_status =
+        "Package: packages-microsoft-prod\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: all\n" ++
+        "Version: 1.1\n";
+    const changed_version_status =
+        "Package: hello\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2.0\n\n" ++
+        "Package: packages-microsoft-prod\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: all\n" ++
+        "Version: 1.1\n";
+    const changed_architecture_status =
+        "Package: hello\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: arm64\n" ++
+        "Version: 1.0-1\n\n" ++
+        "Package: packages-microsoft-prod\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: all\n" ++
+        "Version: 1.1\n";
+    const unhealthy_unrelated_status = exact_status ++
+        "\nPackage: unrelated\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 9\n";
+    const healthy_unrelated_status = exact_status ++
+        "\nPackage: unrelated\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 9\n";
+    const JournalMode = enum {
+        none,
+        unrelated_completed,
+        matching_incomplete,
+    };
+    const Case = struct {
+        status: []const u8,
+        journal: JournalMode,
+        expected_failure: ?transaction_recovery.VerificationFailure = null,
+        expected_recovery_calls: usize = 0,
+    };
+    const cases = [_]Case{
+        .{ .status = exact_status, .journal = .none },
+        .{ .status = exact_status, .journal = .unrelated_completed },
+        .{
+            .status = missing_dependency_status,
+            .journal = .none,
+            .expected_failure = .expected_package_missing,
+        },
+        .{
+            .status = missing_dependency_status,
+            .journal = .unrelated_completed,
+            .expected_failure = .expected_package_missing,
+        },
+        .{
+            .status = changed_version_status,
+            .journal = .none,
+            .expected_failure = .expected_identity_mismatch,
+        },
+        .{
+            .status = changed_version_status,
+            .journal = .unrelated_completed,
+            .expected_failure = .expected_identity_mismatch,
+        },
+        .{
+            .status = changed_architecture_status,
+            .journal = .none,
+            .expected_failure = .expected_package_missing,
+        },
+        .{
+            .status = changed_architecture_status,
+            .journal = .unrelated_completed,
+            .expected_failure = .expected_package_missing,
+        },
+        .{
+            .status = unhealthy_unrelated_status,
+            .journal = .none,
+            .expected_failure = .unhealthy_package,
+        },
+        .{
+            .status = unhealthy_unrelated_status,
+            .journal = .unrelated_completed,
+            .expected_failure = .unhealthy_package,
+        },
+        .{
+            .status = healthy_unrelated_status,
+            .journal = .none,
+        },
+        .{
+            .status = healthy_unrelated_status,
+            .journal = .unrelated_completed,
+        },
+        .{
+            .status = exact_status,
+            .journal = .matching_incomplete,
+            .expected_recovery_calls = 1,
+        },
+    };
+
+    for (cases) |case| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        try directory.dir.createDirPath(
+            std.testing.io,
+            "root/etc" ++ "/apt/sources.list.d",
+        );
+        try directory.dir.createDirPath(
+            std.testing.io,
+            "root/usr/share/keyrings",
+        );
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/etc" ++ "/apt/sources.list.d/microsoft-prod.list",
+            .data = test_repository_source,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/usr/share/keyrings/microsoft-prod.gpg",
+            .data = &fixture.keyring,
+        });
+        const root = try repositoryTestRoot(
+            std.testing.allocator,
+            directory.dir,
+        );
+        defer std.testing.allocator.free(root);
+        var acquisition: RepositoryTestAcquisition = .{
+            .descriptor = descriptor,
+        };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            .install_status = case.status,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = fixture.created + 30,
+        };
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        var first = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        try std.testing.expectEqual(api.ExitStatus.download, first.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.dependency_acquisition_failed,
+            first.diagnostics[0].id,
+        );
+        first.deinit();
+
+        var paths = try ResolvedPaths.init(std.testing.allocator, request);
+        defer paths.deinit();
+        var operation_dir = try std.Io.Dir.cwd().openDir(
+            std.testing.io,
+            paths.operation_physical,
+            .{ .follow_symlinks = false },
+        );
+        defer operation_dir.close(std.testing.io);
+        const plan_store = try repository_plan.Store.init(
+            std.testing.io,
+            operation_dir,
+            exact_plan_name,
+        );
+        var plan = try plan_store.read(std.testing.allocator);
+        defer plan.deinit();
+        const lock_store = try exact_lock_v2.Store.init(
+            std.testing.io,
+            operation_dir,
+            exact_lock_name,
+        );
+        var lock = try lock_store.read(
+            std.testing.allocator,
+            exact_lock_v2.maximum_document_bytes,
+        );
+        defer lock.deinit();
+        try std.testing.expectEqual(@as(usize, 2), lock.lock.packages.len);
+        try executor.installDescriptorWithStatus(case.status);
+
+        if (case.journal != .matching_incomplete) {
+            const arena = try std.testing.allocator.create(
+                std.heap.ArenaAllocator,
+            );
+            arena.* = .init(std.testing.allocator);
+            var report: transaction_executor.Report = .{
+                .allocator = std.testing.allocator,
+                .arena = arena,
+                .commands = &.{},
+                .plan_sha256 = transaction_executor.planDigest(plan),
+                .transaction_state = .complete,
+                .root_identity = transaction_recovery.rootIdentity(root),
+                .policy_sha256 = transaction_executor.policyDigest(
+                    repositoryExecutionPolicy(request),
+                ),
+                .lock_sha256 = lock.lock.digest_sha256,
+                .failure = null,
+            };
+            defer report.deinit();
+            try publishProvenance(
+                std.testing.allocator,
+                std.testing.io,
+                operation_dir,
+                root,
+                &lock.lock,
+                report,
+                null,
+            );
+        }
+
+        if (case.journal != .none) {
+            const matching = case.journal == .matching_incomplete;
+            const journal: transaction_recovery.Journal = .{
+                .state = if (matching) .interrupted else .complete,
+                .boundary = if (matching) .before_command else .verifying,
+                .plan_sha256 = if (matching)
+                    transaction_executor.planDigest(plan)
+                else
+                    @splat(0xa1),
+                .root_identity = transaction_recovery.rootIdentity(root),
+                .policy_sha256 = transaction_executor.policyDigest(
+                    repositoryExecutionPolicy(request),
+                ),
+                .lock_sha256 = lock.lock.digest_sha256,
+                .next_command = 0,
+                .commands = &.{},
+                .failure = if (matching) "injected interruption" else null,
+            };
+            var journal_store =
+                try transaction_recovery.SystemJournalStore.init(
+                    std.testing.io,
+                    paths.state_physical,
+                    root,
+                );
+            defer journal_store.deinit();
+            if (matching)
+                try transaction_recovery.persist(
+                    std.testing.allocator,
+                    journal_store.interface(),
+                    root,
+                    journal,
+                )
+            else
+                try transaction_recovery.archive(
+                    std.testing.allocator,
+                    journal_store.interface(),
+                    root,
+                    journal,
+                );
+        }
+
+        var resumed = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        defer resumed.deinit();
+        if (case.expected_failure) |failure| {
+            try std.testing.expectEqual(
+                api.ExitStatus.recovery,
+                resumed.exit_status,
+            );
+            try std.testing.expectEqual(
+                api.DiagnosticId.recovery_required,
+                resumed.diagnostics[0].id,
+            );
+            try std.testing.expectEqualStrings(
+                "resume-current-state",
+                resumed.diagnostics[0].phase.?,
+            );
+            try std.testing.expectEqualStrings(
+                @tagName(failure),
+                resumed.diagnostics[0].message,
+            );
+        } else {
+            try std.testing.expectEqual(
+                api.ExitStatus.success,
+                resumed.exit_status,
+            );
+            try std.testing.expect(!resumed.changed);
+        }
+        try std.testing.expectEqual(@as(usize, 0), executor.calls);
+        try std.testing.expectEqual(
+            case.expected_recovery_calls,
+            executor.recover_calls,
+        );
+    }
 }
 
 test "repository backend resumes immediately after durable planned checkpoint" {
