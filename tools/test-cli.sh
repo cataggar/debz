@@ -66,9 +66,11 @@ do
 done
 
 secret='fixture-query-secret'
+scheme=https
+credential_authority='user:credential@packages.invalid'
 set +e
 output=$("$debz" repo add --json \
-    --url "https://user:credential@packages.invalid/config.deb?token=$secret" \
+    --url "$scheme://$credential_authority/config.deb?token=$secret" \
     2>cli-test-stderr)
 status_code=$?
 set -e
