@@ -25,10 +25,19 @@ Release/Packages, signed envelopes and OpenPGP packets, gzip/xz/zstd
 decompression, ar/deb/tar payloads, exact locks, provenance JSON and journals.
 Harnesses call production bounded APIs directly and never shell out.
 
+GitHub Actions lanes reproduce both JavaScript bundles, audit their locked
+dependencies, run native x64/arm64 package preparation, exercise cold,
+compatible-prefix, and exact cache semantics with run-unique CLI versions, and
+run `actions/download` in a bare Ubuntu container without installing Python,
+curl, `gh`, or APT tooling there. Hermetic signed-repository integration tests
+cover corruption, explicit repair, offline metadata requirements, moving
+repository failure, and retained-closure GC.
+
 `zig build security-audit` is network-free and rejects:
 
 - ambient APT/GnuPG/proxy/environment access and shell construction;
 - unpinned GitHub Actions or dependencies outside the reviewed allowlist;
+- unpinned external actions in composite action manifests;
 - missing dependency notices or GPL/LGPL/AGPL production dependencies;
 - expired recorded vulnerability/license reviews or source pins that differ
   from the reviewed libsolv, liblzma, and libzstd inputs;

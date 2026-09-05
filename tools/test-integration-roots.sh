@@ -95,6 +95,132 @@ run_json download $common --lock-input "$resolved_lock" base-dep | grep -q '"exi
 run_json plan $common --lock-input "$resolved_lock" --lock-output "$workspace/base-dep.copy.lock.json" base-dep |
   grep -q '"exit_status":0'
 cmp "$resolved_lock" "$workspace/base-dep.copy.lock.json"
+
+package_cache_root="$workspace/package-cache"
+package_cache_common="--lock-input $resolved_lock --cache-path $package_cache_root --architecture $architecture"
+fingerprint=$(run_json package-cache fingerprint $package_cache_common --json)
+printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v1"'
+printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v1"'
+printf '%s' "$fingerprint" | grep -q '"cas_layout":"packages-v1"'
+
+python3 - "$resolved_lock" "$workspace/unsupported-v2.lock.json" <<'PY'
+import json
+import pathlib
+import sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+value["schema"] = "https://debz.dev/schema/exact-closure-lock-v2"
+value["version"] = 2
+pathlib.Path(sys.argv[2]).write_text(json.dumps(value, separators=(",", ":")) + "\n")
+PY
+set +e
+unsupported=$("$debz" package-cache fingerprint \
+  --lock-input "$workspace/unsupported-v2.lock.json" \
+  --cache-path "$package_cache_root" --architecture "$architecture" --json \
+  2>"$stderr_file")
+unsupported_status=$?
+set -e
+test "$unsupported_status" -eq 5
+test ! -s "$stderr_file"
+printf '%s' "$unsupported" | grep -q '"id":"unsupported_lock_schema"'
+
+set +e
+wrong_architecture=$("$debz" package-cache fingerprint \
+  --lock-input "$resolved_lock" --cache-path "$package_cache_root" \
+  --architecture other-architecture --json 2>"$stderr_file")
+wrong_architecture_status=$?
+set -e
+test "$wrong_architecture_status" -eq 2
+test ! -s "$stderr_file"
+printf '%s' "$wrong_architecture" | grep -q '"id":"invalid_request"'
+
+set +e
+incomplete_exact=$("$debz" package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" \
+  --restored-cache exact --json 2>"$stderr_file")
+incomplete_exact_status=$?
+set -e
+test "$incomplete_exact_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$incomplete_exact" | grep -q '"id":"corrupt_cache_object"'
+
+cold=$(run_json package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --json)
+printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v1"'
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == value["verified_count"]; assert value["reused_count"] == 0' <<EOF
+$cold
+EOF
+
+exact=$(run_json package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --offline --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]' <<EOF
+$exact
+EOF
+
+scenario_lock="$workspace/scenario-main.lock.json"
+run_json plan $common --lock-output "$scenario_lock" scenario-main | grep -q '"exit_status":0'
+partial=$(run_json package-cache prepare \
+  --lock-input "$scenario_lock" --cache-path "$package_cache_root" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] > 0; assert value["reused_count"] > 0' <<EOF
+$partial
+EOF
+
+pruned=$(run_json package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --offline --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["gc"]["deleted"] > 0; assert value["gc"]["complete"] is True' <<EOF
+$pruned
+EOF
+
+first_cache_object=$(find "$package_cache_root/packages-v1/objects" -type f | head -n 1 || true)
+test -n "$first_cache_object"
+cp "$first_cache_object" "$workspace/package-cache-object.backup"
+printf 'corrupt' >"$first_cache_object"
+set +e
+corrupt=$("$debz" package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --offline --json 2>"$stderr_file")
+corrupt_status=$?
+set -e
+test "$corrupt_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$corrupt" | grep -q '"id":"corrupt_cache_object"'
+
+repaired=$(run_json package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --repair-corrupt-cache --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 1; assert value["reused_count"] + 1 == value["verified_count"]' <<EOF
+$repaired
+EOF
+rm -f "$workspace/package-cache-object.backup"
+
+offline_objects_only="$workspace/offline-objects-only"
+mkdir -p "$offline_objects_only/packages-v1"
+cp -R "$package_cache_root/packages-v1/objects" "$offline_objects_only/packages-v1/objects"
+set +e
+offline_without_metadata=$("$debz" package-cache prepare \
+  --lock-input "$resolved_lock" --cache-path "$offline_objects_only" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --offline --json 2>"$stderr_file")
+offline_without_metadata_status=$?
+set -e
+test "$offline_without_metadata_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$offline_without_metadata" | grep -q '"id":"offline_cache_miss"'
+
+printf 'tamper' >>"$repo/dists/$suite/InRelease"
+set +e
+moving_repository=$("$debz" package-cache prepare $package_cache_common \
+  --source "$source_file" --keyring "$keyring" --json 2>"$stderr_file")
+moving_repository_status=$?
+set -e
+test "$moving_repository_status" -eq 4
+test ! -s "$stderr_file"
+printf '%s' "$moving_repository" | grep -q '"id":"repository_authentication_failed"'
+python3 tools/generate-integration-repository.py \
+  --output "$repo" --suite "$suite" --architecture "$architecture"
+
+find "$package_cache_root/packages-v1/objects" -mindepth 1 -maxdepth 1 -type f |
+  while IFS= read -r object; do
+    basename "$object" | grep -Eq '^[0-9a-f]{64}$'
+  done
 case "$suite" in
   debian-stable) run_json info $common trigger-pkg | grep -q '"version":"1.0-1debian1"' ;;
   ubuntu-26.04) run_json info $common trigger-pkg | grep -q '"version":"1.0-1ubuntu1"' ;;

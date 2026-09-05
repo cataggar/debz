@@ -40,6 +40,29 @@ set -e
 test "$status_code" -eq 2
 grep -q "unknown repository command 'unknown'" cli-test-stderr
 
+set +e
+"$debz" package-cache unknown >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+grep -q "unknown package-cache command 'unknown'" cli-test-stderr
+
+for arguments in \
+    "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64" \
+    "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline" \
+    "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --repair-corrupt-cache --offline" \
+    "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64"
+do
+    set +e
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"schema":"io.github.cataggar.debz.package-cache-error.v1"'
+    printf '%s' "$output" | grep -q '"id":"invalid_request"'
+done
+
 for arguments in \
     "repo add --json" \
     "repo add --json --url https://one.invalid/config.deb --url https://two.invalid/config.deb" \

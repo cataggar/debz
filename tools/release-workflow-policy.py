@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RELEASE = ROOT / ".github/workflows/release.yml"
 CI = ROOT / ".github/workflows/ci.yml"
 SETUP = ROOT / "actions/setup"
+DOWNLOAD = ROOT / "actions/download"
 FAILURES: list[str] = []
 
 
@@ -163,6 +164,113 @@ def audit_setup_action(ci: str, release: str) -> None:
         FAILURES.append("CI setup jobs require top-level attestations: read permission")
 
 
+def audit_download_action(ci: str, release: str) -> None:
+    required_files = (
+        DOWNLOAD / "action.yml",
+        DOWNLOAD / "package.json",
+        DOWNLOAD / "package-lock.json",
+        DOWNLOAD / "THIRD_PARTY_NOTICES.md",
+        DOWNLOAD / "dist/index.js",
+        DOWNLOAD / "dist/package.json",
+        DOWNLOAD / "dist/licenses.txt",
+    )
+    for path in required_files:
+        if not path.is_file() or path.stat().st_size == 0:
+            FAILURES.append(f"download action file is missing or empty: {path.relative_to(ROOT)}")
+
+    manifest_path = DOWNLOAD / "action.yml"
+    if manifest_path.is_file():
+        manifest = manifest_path.read_text()
+        for action, revision in re.findall(r"uses:\s*([^@\s]+)@([^\s#]+)", manifest):
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                FAILURES.append(f"download action dependency {action} is not commit-pinned")
+        for token in (
+            "using: node24",
+            "main: dist/index.js",
+            "cache-hit:",
+            "cache-matched-key:",
+            "cache-path:",
+            "cache-root:",
+            "lock-digest:",
+            "downloaded-count:",
+            "reused-count:",
+        ):
+            if token not in manifest:
+                FAILURES.append(f"download action metadata is missing policy token: {token}")
+
+    package_path = DOWNLOAD / "package.json"
+    lock_path = DOWNLOAD / "package-lock.json"
+    if package_path.is_file() and lock_path.is_file():
+        package = json.loads(package_path.read_text())
+        lock = json.loads(lock_path.read_text())
+        if package.get("dependencies") != {
+            "@actions/cache": "6.2.0",
+            "@actions/core": "3.0.1",
+        }:
+            FAILURES.append("download action runtime dependencies differ from policy")
+        for group in ("dependencies", "devDependencies"):
+            dependencies = package.get(group)
+            if not isinstance(dependencies, dict) or not dependencies:
+                FAILURES.append(f"download action {group} are missing")
+                continue
+            for name, version in dependencies.items():
+                if not isinstance(version, str) or not re.fullmatch(
+                    r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version
+                ):
+                    FAILURES.append(
+                        f"download action dependency {name} is not exactly pinned: {version!r}"
+                    )
+        if lock.get("lockfileVersion") != 3:
+            FAILURES.append("download action package-lock.json must use lockfileVersion 3")
+        root_package = lock.get("packages", {}).get("")
+        if not isinstance(root_package, dict):
+            FAILURES.append("download action lockfile has no root package")
+        else:
+            for group in ("dependencies", "devDependencies"):
+                if root_package.get(group) != package.get(group):
+                    FAILURES.append(
+                        f"download action lockfile {group} differ from package.json"
+                    )
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "actions/download/node_modules"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if tracked.strip():
+        FAILURES.append("download action node_modules must not be tracked")
+
+    for token in (
+        "Download action unit and bundle checks",
+        "npm --prefix actions/download ci",
+        "npm --prefix actions/download audit --audit-level=high",
+        "npm --prefix actions/download test",
+        "npm --prefix actions/download run bundle",
+        "git diff --exit-code -- actions/download/dist",
+        "Download action cache semantics",
+        "uses: ./actions/download",
+        "cache-matched-key",
+        "downloaded-count",
+        "reused-count",
+        "Reject corrupt package object",
+        "Reject package-only offline restore",
+        'test "$OUTCOME" = failure',
+    ):
+        if token not in ci:
+            FAILURES.append(f"CI download action coverage is missing policy token: {token}")
+    for token in (
+        "Prepare release smoke package closure",
+        "uses: ./actions/download",
+        "cache: 'false'",
+        "downloaded-count",
+        "reused-count",
+    ):
+        if token not in release:
+            FAILURES.append(f"release download smoke is missing policy token: {token}")
+
+
 def main() -> None:
     release = RELEASE.read_text()
     ci = CI.read_text()
@@ -178,6 +286,7 @@ def main() -> None:
     audit_actions(release, RELEASE)
     audit_actions(ci, CI)
     audit_setup_action(ci, release)
+    audit_download_action(ci, release)
 
     required_release_tokens = (
         "ubuntu-24.04",

@@ -183,6 +183,7 @@ pub const Error = SelectionError || error{
 
 pub const LockPolicy = union(enum) {
     fail_fast,
+    held: *const Cache.WriterLock,
     injected: Lock,
 };
 
@@ -280,6 +281,39 @@ pub const Cache = struct {
         self.packages.close(self.io);
         if (self.owns_root) self.root.close(self.io);
         self.* = undefined;
+    }
+
+    pub const WriterLock = struct {
+        cache: *Cache,
+        file: ?File,
+
+        pub fn release(self: *WriterLock) void {
+            if (self.file) |file| file.close(self.cache.io);
+            self.file = null;
+        }
+    };
+
+    pub fn acquireWriter(self: *Cache, wait_ms: u64) !WriterLock {
+        if (wait_ms == 0) return error.InvalidConfiguration;
+        const started = std.Io.Clock.awake.now(self.io);
+        while (true) {
+            const file = self.locks.createFile(self.io, "writer.lock", .{
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+                .permissions = filePermissions(),
+                .resolve_beneath = true,
+            }) catch |err| switch (err) {
+                error.WouldBlock => {
+                    const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
+                    if (elapsed >= wait_ms) return error.LockBusy;
+                    const remaining = wait_ms - @as(u64, @intCast(elapsed));
+                    try self.io.sleep(.fromMilliseconds(@intCast(@min(remaining, 10))), .awake);
+                    continue;
+                },
+                else => |other| return other,
+            };
+            return .{ .cache = self, .file = file };
+        }
     }
 
     pub fn lookup(
@@ -410,8 +444,8 @@ pub const Cache = struct {
         return .{ .scanned = names.items.len, .deleted = deleted, .complete = true };
     }
 
-    /// Deterministically deletes sorted, unretained CAS objects within all
-    /// configured object, byte, scan, and directory-entry bounds.
+    /// Deterministically sorts retained identities and deletes unretained CAS
+    /// objects within all configured object, byte, scan, and entry bounds.
     pub fn garbageCollect(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -424,6 +458,9 @@ pub const Cache = struct {
             for (names.items) |name| allocator.free(name);
             names.deinit(allocator);
         }
+        const retained = try allocator.dupe(Digest, options.retained);
+        defer allocator.free(retained);
+        std.mem.sort(Digest, retained, {}, lessDigest);
         var iterator = self.objects.iterate();
         while (try iterator.next(self.io)) |entry| {
             if (names.items.len == options.maximum_directory_entries)
@@ -442,7 +479,7 @@ pub const Cache = struct {
                 result.complete = false;
                 continue;
             };
-            if (containsDigest(options.retained, digest)) continue;
+            if (containsDigest(retained, digest)) continue;
             if (result.deleted == options.maximum_objects_deleted) {
                 result.complete = false;
                 continue;
@@ -473,11 +510,13 @@ pub const Cache = struct {
 
     const HeldLock = union(enum) {
         file: File,
+        borrowed,
         injected: struct { lock: Lock, token: *anyopaque },
 
         fn release(self: *HeldLock, cache: *Cache) void {
             switch (self.*) {
                 .file => |file| file.close(cache.io),
+                .borrowed => {},
                 .injected => |held| held.lock.releaseFn(held.lock.context, held.token),
             }
         }
@@ -494,6 +533,10 @@ pub const Cache = struct {
                 error.WouldBlock => return error.LockBusy,
                 else => |e| return e,
             } },
+            .held => |held| if (held.cache == self and held.file != null)
+                .borrowed
+            else
+                error.InvalidConfiguration,
             .injected => |lock| .{ .injected = .{
                 .lock = lock,
                 .token = lock.acquireFn(lock.context) catch return error.LockBusy,
@@ -652,8 +695,21 @@ fn resolvePackageUri(
 }
 
 fn containsDigest(values: []const Digest, wanted: Digest) bool {
-    for (values) |value| if (value.eql(wanted)) return true;
+    var lower: usize = 0;
+    var upper = values.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        switch (std.mem.order(u8, &values[middle].bytes, &wanted.bytes)) {
+            .lt => lower = middle + 1,
+            .gt => upper = middle,
+            .eq => return true,
+        }
+    }
     return false;
+}
+
+fn lessDigest(_: void, left: Digest, right: Digest) bool {
+    return std.mem.order(u8, &left.bytes, &right.bytes) == .lt;
 }
 
 fn sortNames(names: [][]u8) void {
@@ -1304,6 +1360,46 @@ test "writer and garbage collector expose stable lock-busy semantics" {
         .maximum_bytes_deleted = 1,
         .lock = lock,
     }));
+}
+
+test "package_acquisition.test.writer lock spans publication cleanup and garbage collection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first = try testCache(&tmp);
+    defer first.deinit();
+    var second = try Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = 1024,
+    });
+    defer second.deinit();
+
+    var writer = try first.acquireWriter(10);
+    defer writer.release();
+    try std.testing.expectError(error.LockBusy, second.acquireWriter(1));
+
+    const digest = Digest.of("held");
+    try first.publish(
+        std.testing.allocator,
+        digest,
+        "held".len,
+        "held",
+        .{ .held = &writer },
+        .{},
+    );
+    const cleanup = try first.cleanupStaging(
+        std.testing.allocator,
+        1,
+        .{ .held = &writer },
+    );
+    try std.testing.expect(cleanup.complete);
+    const gc = try first.garbageCollect(std.testing.allocator, .{
+        .retained = &.{digest},
+        .maximum_directory_entries = 1,
+        .maximum_objects_scanned = 1,
+        .maximum_objects_deleted = 1,
+        .maximum_bytes_deleted = 1,
+        .lock = .{ .held = &writer },
+    });
+    try std.testing.expect(gc.complete);
 }
 
 test "duplicate publication is idempotent and competing digests remain isolated" {

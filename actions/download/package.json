@@ -1,0 +1,25 @@
+{
+  "name": "@cataggar/debz-download-action",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Restore, verify, and complete an exact-lock debz package CAS",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-concurrency=1 lib/__tests__/*.test.js",
+    "bundle": "ncc build src/main.ts -o dist --minify --license licenses.txt"
+  },
+  "dependencies": {
+    "@actions/cache": "6.2.0",
+    "@actions/core": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@vercel/ncc": "0.45.0",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": "^24.15.0"
+  }
+}

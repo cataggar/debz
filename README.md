@@ -31,6 +31,26 @@ archive tools, and revalidates exact cache hits. See
 [`actions/setup/README.md`](actions/setup/README.md) for pinning, permissions,
 trust, cache, platform, and container details.
 
+Prepare the complete package closure from a reviewed exact lock without
+installing it:
+
+```yaml
+- uses: cataggar/debz/actions/download@<reviewed-commit-sha>
+  id: packages
+  with:
+    lock-input: .github/debz/noble-amd64.lock.json
+    config: .github/debz/noble.json
+    keyring: .github/debz/ubuntu-archive-keyring.gpg
+    architecture: amd64
+```
+
+The download action caches only verified `packages-v1/objects`. Exact and
+compatible-prefix restores are always revalidated by `debz`; repository
+metadata, credentials, keyrings, roots, dpkg state, and transaction journals
+are excluded. A cache hit is not installed state. See
+[`actions/download/README.md`](actions/download/README.md) for the complete
+input/output, offline, repair, and trust contract.
+
 ## Build
 
 ```sh

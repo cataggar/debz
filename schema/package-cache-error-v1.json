@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/package-cache-error-v1.json",
+  "title": "debz package-cache error v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "api_version", "operation", "exit_status", "diagnostics"],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.package-cache-error.v1" },
+    "api_version": { "const": 1 },
+    "operation": { "enum": ["fingerprint", "prepare"] },
+    "exit_status": { "enum": [2, 3, 4, 5, 6, 70] },
+    "diagnostics": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "message"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

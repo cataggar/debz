@@ -112,6 +112,9 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{}, .usage = "debz <command> [options] [packages...]" },
         .{ .args = &.{"repo"}, .usage = "debz repo <command> [options]" },
         .{ .args = &.{ "repo", "add" }, .usage = "debz repo add --url URL [options]" },
+        .{ .args = &.{"package-cache"}, .usage = "debz package-cache <command> [options]" },
+        .{ .args = &.{ "package-cache", "fingerprint" }, .usage = "debz package-cache fingerprint --lock-input PATH" },
+        .{ .args = &.{ "package-cache", "prepare" }, .usage = "debz package-cache prepare --lock-input PATH" },
         .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
         .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
         .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
@@ -135,6 +138,8 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "install", "--unknown" }, .usage = "debz install [options] <package>" },
         .{ .args = &.{ "repo", "add", "--url" }, .usage = "debz repo add --url URL [options]" },
         .{ .args = &.{ "repo", "add", "--unknown" }, .usage = "debz repo add --url URL [options]" },
+        .{ .args = &.{ "package-cache", "prepare", "--lock-input" }, .usage = "debz package-cache prepare --lock-input PATH" },
+        .{ .args = &.{ "package-cache", "fingerprint", "--unknown" }, .usage = "debz package-cache fingerprint --lock-input PATH" },
     };
     for (help_cases) |case| {
         addHelpFlagTests(b, test_step, cli, case.args, case.usage);
@@ -265,6 +270,27 @@ pub fn build(b: *std.Build) void {
     b.step("test-package-acquisition", "Run verified package acquisition tests")
         .dependOn(&run_package_tests.step);
 
+    const package_cache_test_module = b.createModule(.{
+        .root_source_file = b.path("src/package_cache_workflow.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_cache_test_module.addIncludePath(libsolv_dependency.path("src"));
+    package_cache_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    package_cache_test_module.addIncludePath(zstd_dependency.path("lib"));
+    package_cache_test_module.addCMacro("LZMA_API_STATIC", "1");
+    package_cache_test_module.linkLibrary(libsolv);
+    package_cache_test_module.linkLibrary(liblzma);
+    package_cache_test_module.linkLibrary(zstd);
+    package_cache_test_module.link_libc = true;
+    const package_cache_tests = b.addTest(.{
+        .root_module = package_cache_test_module,
+        .filters = &.{"package_cache_workflow.test."},
+    });
+    const run_package_cache_tests = b.addRunArtifact(package_cache_tests);
+    b.step("test-package-cache", "Run exact-lock package cache workflow tests")
+        .dependOn(&run_package_cache_tests.step);
+
     const policy_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"repository_policy.test."},
@@ -388,6 +414,9 @@ fn installReleaseFiles(
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
+        "package-cache-error-v1.json",
+        "package-cache-fingerprint-v1.json",
+        "package-cache-result-v1.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
         "transaction-plan-v1.json",

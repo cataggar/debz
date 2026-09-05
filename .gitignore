@@ -1,6 +1,8 @@
 /.zig-cache/
 /actions/setup/lib/
 /actions/setup/node_modules/
+/actions/download/lib/
+/actions/download/node_modules/
 /.cache/
 /.tmp/
 /.tools/

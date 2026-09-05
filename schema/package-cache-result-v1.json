@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/package-cache-result-v1.json",
+  "title": "debz package-cache preparation result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "api_version",
+    "capability",
+    "lock_digest",
+    "fingerprint",
+    "target_architecture",
+    "cas_layout",
+    "cache_root",
+    "cache_path",
+    "downloaded_count",
+    "reused_count",
+    "verified_count",
+    "staging",
+    "gc"
+  ],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.package-cache-result.v1" },
+    "api_version": { "const": 1 },
+    "capability": { "const": "package-cache-v1" },
+    "lock_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "target_architecture": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "cas_layout": { "const": "packages-v1" },
+    "cache_root": { "type": "string", "pattern": "^/" },
+    "cache_path": { "type": "string", "pattern": "/packages-v1/objects$" },
+    "downloaded_count": { "type": "integer", "minimum": 0 },
+    "reused_count": { "type": "integer", "minimum": 0 },
+    "verified_count": { "type": "integer", "minimum": 1 },
+    "staging": { "$ref": "#/$defs/cleanup" },
+    "gc": { "$ref": "#/$defs/gc" }
+  },
+  "$defs": {
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scanned", "deleted", "complete"],
+      "properties": {
+        "scanned": { "type": "integer", "minimum": 0 },
+        "deleted": { "type": "integer", "minimum": 0 },
+        "complete": { "const": true }
+      }
+    },
+    "gc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scanned", "deleted", "bytes_deleted", "complete"],
+      "properties": {
+        "scanned": { "type": "integer", "minimum": 0 },
+        "deleted": { "type": "integer", "minimum": 0 },
+        "bytes_deleted": { "type": "integer", "minimum": 0 },
+        "complete": { "const": true }
+      }
+    }
+  }
+}

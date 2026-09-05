@@ -138,14 +138,19 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
     }
 
     const packages = try owned.alloc(Package, input.packages.len);
+    const referenced_repositories = try allocator.alloc(bool, repositories.len);
+    defer allocator.free(referenced_repositories);
+    @memset(referenced_repositories, false);
     for (input.packages, 0..) |package, index| {
         if (package.name.len == 0 or package.version.len == 0 or package.architecture.len == 0 or
             !validLowerHex(&package.repository_id))
             return error.InvalidIdentity;
-        const repository = findRepository(repositories, package.repository_id) orelse
+        const repository_index = findRepositoryIndex(repositories, package.repository_id) orelse
             return error.MissingRepository;
+        const repository = repositories[repository_index];
         if (!std.mem.eql(u8, &repository.snapshot_sha256, &package.repository_snapshot_sha256))
             return error.RepositorySnapshotMismatch;
+        referenced_repositories[repository_index] = true;
         packages[index] = package;
         packages[index].name = try owned.dupe(u8, package.name);
         packages[index].version = try owned.dupe(u8, package.version);
@@ -156,16 +161,8 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;
     }
-    for (repositories) |repository| {
-        var referenced = false;
-        for (packages) |package| {
-            if (std.mem.eql(u8, &repository.id, &package.repository_id)) {
-                referenced = true;
-                break;
-            }
-        }
+    for (referenced_repositories) |referenced|
         if (!referenced) return error.UnusedRepository;
-    }
 
     var lock: Lock = .{
         .target_architecture = try owned.dupe(u8, input.target_architecture),
@@ -216,13 +213,22 @@ pub fn decode(
     maximum_bytes: usize,
 ) !OwnedLock {
     if (source.len > maximum_bytes or source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    const Header = struct {
+        schema: []const u8,
+        version: u32,
+    };
+    var header = try std.json.parseFromSlice(Header, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer header.deinit();
+    if (!std.mem.eql(u8, header.value.schema, schema_id) or header.value.version != schema_version)
+        return error.UnsupportedSchema;
     var parsed = try std.json.parseFromSlice(WireLock, allocator, source, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     });
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, schema_id) or parsed.value.version != schema_version)
-        return error.UnsupportedSchema;
 
     const repositories = try allocator.alloc(Repository, parsed.value.repositories.len);
     var repositories_initialized: usize = 0;
@@ -438,8 +444,17 @@ fn validLowerHex(value: []const u8) bool {
     return true;
 }
 
-fn findRepository(repositories: []const Repository, id: [64]u8) ?Repository {
-    for (repositories) |repository| if (std.mem.eql(u8, &repository.id, &id)) return repository;
+fn findRepositoryIndex(repositories: []const Repository, id: [64]u8) ?usize {
+    var lower: usize = 0;
+    var upper = repositories.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        switch (std.mem.order(u8, &repositories[middle].id, &id)) {
+            .lt => lower = middle + 1,
+            .gt => upper = middle,
+            .eq => return middle,
+        }
+    }
     return null;
 }
 
@@ -534,6 +549,16 @@ test "exact_lock.test.canonical roundtrip tamper holds and closure ordering" {
     const version_offset = std.mem.indexOf(u8, unknown, "\"version\":1").? + "\"version\":".len;
     unknown[version_offset] = '2';
     try std.testing.expectError(error.UnsupportedSchema, decode(std.testing.allocator, unknown, maximum_document_bytes));
+}
+
+test "exact_lock.test.unsupported schema is typed before version-specific field decoding" {
+    const v2_shape =
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v2","version":2,"target_architecture":"amd64","local_artifacts":[]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        decode(std.testing.allocator, v2_shape, maximum_document_bytes),
+    );
 }
 
 test "exact_lock.test.rejects ambiguous repository ownership and identities" {

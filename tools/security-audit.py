@@ -409,8 +409,28 @@ def audit_ci_pins() -> None:
             fail(f"{relative}: pull_request_target executes untrusted changes with base privileges")
         if re.search(r"\$\{\{\s*secrets\.", text):
             fail(f"{relative}: workflow exposes repository secrets")
-        if re.search(r"(?m)^\s*continue-on-error\s*:\s*true\s*$", text):
-            fail(f"{relative}: workflow hides a failing command")
+        allowed_negative_steps = {
+            "Reject corrupt package object",
+            "Reject package-only offline restore",
+        }
+        allowed_continue = 0
+        for match in re.finditer(
+            r"(?ms)^\s*-\s+name:\s*(?P<name>[^\n]+)\n(?P<body>(?:\s{8,}[^\n]*\n)*)",
+            text,
+        ):
+            if not re.search(r"(?m)^\s+continue-on-error:\s*true\s*$", match.group("body")):
+                continue
+            if match.group("name").strip() not in allowed_negative_steps:
+                fail(f"{relative}: workflow hides a failing command")
+            allowed_continue += 1
+        if text.count("continue-on-error: true") != allowed_continue:
+            fail(f"{relative}: workflow has an unaudited continue-on-error")
+        if allowed_continue and (
+            "Validate corrupt-object failure" not in text
+            or "Validate offline metadata failure" not in text
+            or 'test "$OUTCOME" = failure' not in text
+        ):
+            fail(f"{relative}: expected-failure action coverage lacks outcome assertions")
         if not re.search(r"(?m)^permissions:\s*\n\s{2}contents:\s*read\s*$", text):
             fail(f"{relative}: top-level permissions must be contents: read")
         checkout_blocks = re.findall(
@@ -430,6 +450,24 @@ def audit_ci_pins() -> None:
             name, revision = action
             if not re.fullmatch(r"[0-9a-f]{40}", revision):
                 fail(f"{relative}: {name} is not commit-pinned")
+
+
+def action_pin_failures(text: str, label: str) -> list[str]:
+    return [
+        f"{label}: {name} is not commit-pinned"
+        for name, revision in re.findall(r"uses:\s*([^@\s]+)@([^\s#]+)", text)
+        if not re.fullmatch(r"[0-9a-f]{40}", revision)
+    ]
+
+
+def audit_composite_action_pins() -> None:
+    for manifest in sorted((ROOT / "actions").glob("*/action.y*ml")):
+        text = manifest.read_text()
+        if not re.search(r"(?m)^\s*using:\s*composite\s*$", text):
+            continue
+        relative = manifest.relative_to(ROOT)
+        for failure in action_pin_failures(text, str(relative)):
+            fail(failure)
 
 
 def audit_setup_action_dependencies() -> None:
@@ -492,6 +530,161 @@ def audit_setup_action_dependencies() -> None:
         license_path = setup / relative
         if not license_path.is_file() or license_path.stat().st_size == 0:
             fail(f"setup action bundled licenses are missing: actions/setup/{relative}")
+
+
+def audit_download_action() -> None:
+    action = ROOT / "actions/download"
+    required = (
+        action / "action.yml",
+        action / "package.json",
+        action / "package-lock.json",
+        action / "THIRD_PARTY_NOTICES.md",
+        action / "dist/index.js",
+        action / "dist/package.json",
+        action / "dist/licenses.txt",
+    )
+    for path in required:
+        if not path.is_file() or path.stat().st_size == 0:
+            fail(f"download action file is missing or empty: {path.relative_to(ROOT)}")
+    if any(not path.is_file() for path in required):
+        return
+
+    manifest = (action / "action.yml").read_text()
+    for token in (
+        "using: node24",
+        "main: dist/index.js",
+        "lock-input:",
+        "architecture:",
+        "keyring:",
+        "cache-hit:",
+        "cache-matched-key:",
+        "downloaded-count:",
+        "reused-count:",
+        "maximum-repository-records:",
+    ):
+        if token not in manifest:
+            fail(f"download action metadata is missing policy token: {token}")
+    for forbidden in ("install-root:", "state-path:", "\n  args:"):
+        if forbidden in manifest:
+            fail(f"download action exposes forbidden transaction input: {forbidden.strip()}")
+
+    source_requirements = {
+        "src/inputs.ts": (
+            "cache-root must be an absolute child of RUNNER_TEMP",
+            "must not traverse a symbolic link",
+            "must be outside cache-root",
+        ),
+        "src/runner.ts": (
+            "execFile(",
+            "LANG: 'C'",
+            "LC_ALL: 'C'",
+            "package-cache",
+            "fingerprint",
+            "prepare",
+            "--restored-cache",
+            "outside the CLI-provided restore prefix",
+        ),
+        "src/cache.ts": (
+            "cache.restoreCache(",
+            "[restorePrefix]",
+            "cache.saveCache(",
+            "process.chdir(parent)",
+            "immutable key already exists",
+        ),
+        "src/action.ts": (
+            "fingerprintCache(",
+            "requires the maintained Node 24 runtime",
+            "delete process.env.DEBZ_DOWNLOAD_CREDENTIAL_REFERENCE",
+            "delete process.env['INPUT_CREDENTIAL-REFERENCE']",
+            "cache.save(fingerprint.cache_path, fingerprint.primary_key)",
+            "core.setOutput('cache-hit'",
+            "core.setOutput('downloaded-count'",
+        ),
+    }
+    for relative, tokens in source_requirements.items():
+        path = action / relative
+        if not path.is_file():
+            fail(f"download action source is missing: actions/download/{relative}")
+            continue
+        text = path.read_text()
+        for token in tokens:
+            if token not in text:
+                fail(f"download action {relative} is missing policy token: {token}")
+    source_text = "\n".join(
+        path.read_text() for path in sorted((action / "src").glob("*.ts"))
+    )
+    for forbidden in ("HTTP_PROXY", "HTTPS_PROXY", "GH_TOKEN", "GITHUB_TOKEN", ".npmrc"):
+        if forbidden in source_text:
+            fail(f"download action source reads forbidden ambient input: {forbidden}")
+    action_source = (action / "src/action.ts").read_text()
+    prepare_index = action_source.find("const prepared = await prepareCache(")
+    save_index = action_source.find("await cache.save(")
+    output_index = action_source.find("core.setOutput('cache-hit'")
+    if min(prepare_index, save_index, output_index) < 0 or not (
+        prepare_index < save_index < output_index
+    ):
+        fail("download action must prepare, save best-effort, and only then publish outputs")
+
+    package = json.loads((action / "package.json").read_text())
+    lock = json.loads((action / "package-lock.json").read_text())
+    dependencies = package.get("dependencies")
+    if dependencies != {"@actions/cache": "6.2.0", "@actions/core": "3.0.1"}:
+        fail("download action runtime dependencies differ from the reviewed allowlist")
+    for group in ("dependencies", "devDependencies"):
+        values = package.get(group)
+        if not isinstance(values, dict) or not values:
+            fail(f"download action {group} are missing")
+            continue
+        for name, version in values.items():
+            if not isinstance(version, str) or not re.fullmatch(
+                r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version
+            ):
+                fail(f"download action dependency {name} is not exactly pinned: {version!r}")
+    if lock.get("lockfileVersion") != 3:
+        fail("download action package-lock.json must use lockfileVersion 3")
+    root_package = lock.get("packages", {}).get("")
+    if not isinstance(root_package, dict):
+        fail("download action lockfile has no root package")
+    else:
+        for group in ("dependencies", "devDependencies"):
+            if root_package.get(group) != package.get(group):
+                fail(f"download action lockfile {group} differ from package.json")
+
+    allowed_licenses = {
+        "0BSD",
+        "Apache-2.0",
+        "(Apache-2.0 AND BSD-3-Clause)",
+        "ISC",
+        "MIT",
+    }
+    for name, metadata in lock.get("packages", {}).items():
+        if not name:
+            continue
+        if not isinstance(metadata, dict):
+            fail(f"download action lock entry is malformed: {name}")
+            continue
+        if metadata.get("license") not in allowed_licenses:
+            fail(f"download action dependency has an unreviewed license: {name}")
+        if metadata.get("hasInstallScript"):
+            fail(f"download action dependency has an install script: {name}")
+        if not str(metadata.get("resolved", "")).startswith("https://registry.npmjs.org/"):
+            fail(f"download action dependency is not resolved from the npm registry: {name}")
+        if not str(metadata.get("integrity", "")).startswith("sha512-"):
+            fail(f"download action dependency lacks SHA-512 lock integrity: {name}")
+
+    notices = (action / "THIRD_PARTY_NOTICES.md").read_text()
+    for name in ("@actions/cache", "@actions/core"):
+        if name not in notices:
+            fail(f"download action notices omit direct dependency {name}")
+    tracked = subprocess.run(
+        ["git", "ls-files", "actions/download/node_modules"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if tracked.strip():
+        fail("download action node_modules must not be tracked")
 
 
 def audit_docs() -> None:
@@ -564,7 +757,9 @@ def main() -> int:
     audit_dependencies()
     audit_release_targets()
     audit_ci_pins()
+    audit_composite_action_pins()
     audit_setup_action_dependencies()
+    audit_download_action()
     audit_docs()
     audit_secrets_and_artifacts(files)
     if FAILURES:

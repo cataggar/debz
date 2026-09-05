@@ -123,6 +123,23 @@ class SecurityAuditTests(unittest.TestCase):
             source,
         )
 
+    def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
+        self.assertEqual(
+            [],
+            security_audit.action_pin_failures(
+                "uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684\n",
+                "action.yml",
+            ),
+        )
+        failures = security_audit.action_pin_failures(
+            "uses: actions/cache/restore@v4\n",
+            "action.yml",
+        )
+        self.assertEqual(
+            ["action.yml: actions/cache/restore is not commit-pinned"],
+            failures,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

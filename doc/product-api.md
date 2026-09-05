@@ -31,6 +31,29 @@ the separate versioned `debz.repository_api` surface documented in
 [Repository management API](repository-management.md), preserving every
 product API v1 request, result, schema, exit meaning, and host-root denial.
 
+The nested `debz package-cache fingerprint` and `debz package-cache prepare`
+commands likewise use dedicated versioned schemas rather than changing product
+API v1. They expose `debz.package_cache_workflow` as a lock-oriented,
+non-installing API: fingerprinting performs no repository or package I/O, and
+preparation authenticates and verifies the complete exact-lock v1 closure.
+Exact-lock v2/local-artifact origins are rejected explicitly.
+
+```sh
+debz package-cache fingerprint \
+  --lock-input /work/closure.lock.json \
+  --cache-path /work/cache --architecture amd64 --json
+
+debz package-cache prepare \
+  --lock-input /work/closure.lock.json \
+  --cache-path /work/cache --architecture amd64 \
+  --source /work/repository.sources --keyring /work/archive-keyring.gpg --json
+```
+
+`--restored-cache none|partial|exact` is a typed orchestration hint. The
+first-party action computes it from the cache service response; it is not
+caller-provided action input. An exact restore makes any missing lock object a
+corruption failure unless explicit online repair is enabled.
+
 `debz -h` and `debz --help` print root help. Every command accepts `-h` and
 `--help` after the command name and prints command-specific help without
 performing validation, filesystem access, repository access, or other backend
@@ -86,6 +109,17 @@ Exit codes are 0 success, 2 usage/confirmation, 3 unavailable configuration,
 4 authentication, 5 planning, 6 download, 7 transaction, 8 recovery, and 70
 internal error. Human wording and formatting are not machine interfaces.
 There is no promise of APT output, wording, or option-spelling compatibility.
+
+Package-cache JSON schemas are:
+
+- [`package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
+- [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
+- [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
+
+Their successful outputs include the canonical lock digest, CLI-owned
+fingerprint, exact/compatible cache keys or verified preparation counts, and
+the exact `packages-v1/objects` path. Error documents contain no cache key or
+success-shaped path.
 
 Credentials must not be placed in diagnostics. `product_api.redact` removes
 URI user information before provenance or output is constructed.

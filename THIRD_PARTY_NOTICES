@@ -179,3 +179,11 @@ The first-party JavaScript action under actions/setup has a separately pinned
 npm dependency graph. Its direct dependency summary is in
 actions/setup/THIRD_PARTY_NOTICES.md, and complete bundled license texts are in
 actions/setup/dist/main/licenses.txt and actions/setup/dist/post/licenses.txt.
+
+GitHub download action bundle
+=============================
+
+The first-party JavaScript action under actions/download has a separately
+pinned npm dependency graph. Its direct dependency summary is in
+actions/download/THIRD_PARTY_NOTICES.md, and complete bundled license texts are
+in actions/download/dist/licenses.txt.

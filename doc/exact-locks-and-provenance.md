@@ -48,6 +48,24 @@ The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
 
+The separate `debz package-cache` interface supports canonical v1 locks only.
+`fingerprint` rejects unsupported schema versions, noncanonical/tampered
+documents, target or solver-policy drift, duplicate object digests, and
+resource-limit violations before cache restore. `prepare` reauthenticates all
+repository evidence and verifies the complete lock closure independent of
+installed state. V2/local-artifact origins are rejected explicitly rather than
+being omitted; they can be added only with an end-to-end reviewed acquisition
+path.
+
+The package-cache fingerprint is domain-separated and covers the lock digest,
+schema, target and foreign architectures, exact runtime version, package-CAS
+layout, corruption mode, package size/total bounds, origin mode, and payload
+validation policy version. Its compatible restore prefix omits only the exact
+lock digest. Prefix-restored objects remain untrusted until complete
+revalidation. The action reports whether the service matched the exact key or
+only the prefix; an exact restore missing any current-lock object is corruption
+unless explicit online repair is selected.
+
 `debz.transaction_provenance` defines transaction-result schema version 1. It
 binds request and policy digests, architecture, source configuration IDs,
 Release/signature/metadata/snapshot evidence and signer fingerprints, plan and
@@ -80,5 +98,8 @@ Schemas:
 
 - [`schema/exact-closure-lock-v1.json`](../schema/exact-closure-lock-v1.json)
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
+- [`schema/package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
+- [`schema/package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
+- [`schema/package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
