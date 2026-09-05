@@ -239,7 +239,9 @@ failed_lock=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print
 failed_provenance=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["provenance"])')
 test -s "$failed_lock"
 test -s "$failed_provenance"
-grep -q 'outcome.*failed' "$failed_provenance"
+python3 -c \
+  'import json,sys; assert json.load(open(sys.argv[1]))["execution"]["outcome"] == "recovery_required"' \
+  "$failed_provenance"
 requests_before_retry=$(wc -l <"$request_log")
 
 set +e
