@@ -1,0 +1,138 @@
+name: Download debz package closure
+description: Restore, verify, and complete the package CAS for one exact debz lock
+author: cataggar/debz contributors
+
+branding:
+  icon: download-cloud
+  color: blue
+
+inputs:
+  lock-input:
+    description: Workspace-relative or absolute path to a canonical exact-lock v1 document
+    required: true
+  architecture:
+    description: Target Debian architecture (amd64 or arm64)
+    required: true
+  source:
+    description: Newline-delimited explicit Debian source files
+    required: false
+    default: ''
+  config:
+    description: Newline-delimited explicit debz repository config files
+    required: false
+    default: ''
+  keyring:
+    description: Newline-delimited explicit repository keyring files
+    required: true
+  foreign-architecture:
+    description: Newline-delimited allowed foreign Debian architectures
+    required: false
+    default: ''
+  default-release:
+    description: Optional default release/codename policy
+    required: false
+    default: ''
+  repository-policy:
+    description: Repository selection policy (strict-priority or best-version)
+    required: false
+    default: strict-priority
+  recommends:
+    description: Require the lock's solver policy to include recommendations
+    required: false
+    default: 'false'
+  allow-downgrade:
+    description: Require the lock's solver policy to allow downgrades
+    required: false
+    default: 'false'
+  proxy:
+    description: Explicit proxy URI; user information is rejected
+    required: false
+    default: ''
+  credential-reference:
+    description: Explicit credential file path used only by debz for the declared repository origin
+    required: false
+    default: ''
+  deadline-ms:
+    description: Optional positive overall repository/package deadline in milliseconds
+    required: false
+    default: ''
+  lock-wait-ms:
+    description: Bounded package-CAS writer lock wait in milliseconds
+    required: false
+    default: '30000'
+  maximum-package-bytes:
+    description: Maximum bytes accepted for one package object
+    required: false
+    default: '1073741824'
+  maximum-total-package-bytes:
+    description: Maximum total bytes represented or downloaded by the lock
+    required: false
+    default: '8589934592'
+  maximum-lock-packages:
+    description: Maximum package count accepted from the exact lock
+    required: false
+    default: '100000'
+  maximum-repository-records:
+    description: Maximum authenticated Packages records scanned during exact matching
+    required: false
+    default: '1000000'
+  maximum-staging-entries:
+    description: Maximum abandoned staging entries cleaned before save
+    required: false
+    default: '100000'
+  maximum-gc-directory-entries:
+    description: Maximum package object directory entries inspected by GC
+    required: false
+    default: '100000'
+  maximum-gc-objects-scanned:
+    description: Maximum package objects scanned by GC
+    required: false
+    default: '100000'
+  maximum-gc-objects-deleted:
+    description: Maximum unretained package objects deleted by GC
+    required: false
+    default: '100000'
+  maximum-gc-bytes-deleted:
+    description: Maximum unretained package bytes deleted by GC
+    required: false
+    default: '8589934592'
+  cache:
+    description: Restore and save a CLI-validated opaque archive of package objects
+    required: false
+    default: 'true'
+  cache-root:
+    description: Optional absolute cache root below RUNNER_TEMP
+    required: false
+    default: ''
+  offline:
+    description: Require authenticated local metadata and package objects; never use network transport
+    required: false
+    default: 'false'
+  cache-only:
+    description: Alias for offline package-cache preparation
+    required: false
+    default: 'false'
+  repair-corrupt-cache:
+    description: Explicitly reacquire corrupt objects online instead of failing closed
+    required: false
+    default: 'false'
+
+outputs:
+  cache-hit:
+    description: "'true' only when the exact CLI-provided primary key was restored"
+  cache-matched-key:
+    description: Exact or compatible-prefix key restored, or empty when no cache was restored
+  cache-path:
+    description: Absolute verified packages-v1/objects path used by later debz operations
+  cache-root:
+    description: Absolute parent cache root accepted by debz --cache-path
+  lock-digest:
+    description: Canonical exact-lock SHA-256 reported by debz
+  downloaded-count:
+    description: Current-lock objects acquired from package transport
+  reused-count:
+    description: Current-lock objects reopened and fully verified from the CAS
+
+runs:
+  using: node24
+  main: dist/index.js

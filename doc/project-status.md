@@ -102,6 +102,22 @@ cleanup, and deterministic bounded garbage collection. It does not parse
 payloads or execute transactions. See
 [Verified package acquisition](package-acquisition.md).
 
+`debz.package_cache_workflow` adds the non-installing exact-lock cache
+boundary used by `actions/download`. It deterministically fingerprints
+canonical v1 locks and acceptance policy, authenticates current repository
+evidence, verifies/downloads every closure object, payload-validates cache hits
+and downloads alike, and performs bounded retained-closure cleanup under one
+writer lock. Its public JSON schemas and offline limitations are documented in
+[GitHub Actions](github-actions.md) and
+[Exact closure locks and transaction provenance](exact-locks-and-provenance.md).
+
+`debz.package_cache_archive` is the cache-service transport boundary. It
+exports and imports a canonical path-free binary stream containing sorted
+digest, size, and package-byte records plus an archive digest. It has no path,
+link, owner, mode, or special-file representation; imports enforce object,
+expanded-byte, ordering, duplicate, digest, and exact-lock size limits before
+CAS publication.
+
 ## Package-family image builder
 
 `debz.package_family_backend` is the stable Ubuntu/Debian image-builder

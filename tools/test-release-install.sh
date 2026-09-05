@@ -44,6 +44,9 @@ for schema in \
   command-result-v1.json \
   exact-closure-lock-v1.json \
   exact-closure-lock-v2.json \
+  package-cache-error-v1.json \
+  package-cache-fingerprint-v1.json \
+  package-cache-result-v1.json \
   repository-add-state-v1.json \
   repository-operation-result-v1.json \
   transaction-plan-v1.json \

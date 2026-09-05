@@ -136,6 +136,279 @@ jobs:
           test "$TARGET" = linux-x64
           test "$("$DEBZ_PATH" --version)" = 0.2.0
 
+  download-action-unit:
+    name: Download action unit and bundle checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+      - name: Test and reproduce download action bundle
+        run: |
+          npm --prefix actions/download ci
+          npm --prefix actions/download audit --audit-level=high
+          npm --prefix actions/download test
+          npm --prefix actions/download run bundle
+          git diff --exit-code -- actions/download/dist
+
+  download-action-cache:
+    name: Download action cache semantics
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Build unique CLI and exact locks
+        id: fixture
+        env:
+          VERSION: 0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }}
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
+            -Dversion="$VERSION"
+          workspace="$PWD/.zig-cache/download-action"
+          mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
+          python3 tools/generate-integration-repository.py \
+            --output "$workspace/repository" --suite debian-stable --architecture amd64
+          cat >"$workspace/fixture.sources" <<EOF
+          Types: deb
+          URIs: file://$workspace/repository
+          Suites: debian-stable
+          Components: main
+          Architectures: amd64
+          Signed-By: $workspace/repository/fixture-keyring.gpg
+          EOF
+          common=(
+            --install-root "$workspace/root"
+            --cache-path "$workspace/metadata"
+            --state-path "$workspace/state"
+            --architecture amd64
+            --source "$workspace/fixture.sources"
+            --keyring "$workspace/repository/fixture-keyring.gpg"
+            --json
+          )
+          zig-out/bin/debz plan "${common[@]}" \
+            --lock-output "$workspace/base.lock.json" base-dep >/dev/null
+          zig-out/bin/debz plan "${common[@]}" \
+            --lock-output "$workspace/scenario.lock.json" scenario-main >/dev/null
+          printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\n' \
+            "$workspace" "$workspace/fixture.sources" \
+            "$workspace/repository/fixture-keyring.gpg" \
+            "$workspace/base.lock.json" "$workspace/scenario.lock.json" \
+            >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$PWD/zig-out/bin" >>"$GITHUB_PATH"
+      - name: Populate cold exact-lock cache
+        id: cold
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.base_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-cold
+      - name: Validate cold result
+        env:
+          CACHE_HIT: ${{ steps.cold.outputs.cache-hit }}
+          MATCHED: ${{ steps.cold.outputs.cache-matched-key }}
+          DOWNLOADED: ${{ steps.cold.outputs.downloaded-count }}
+          REUSED: ${{ steps.cold.outputs.reused-count }}
+        run: |
+          test "$CACHE_HIT" = false
+          test -z "$MATCHED"
+          test "$DOWNLOADED" -gt 0
+          test "$REUSED" -eq 0
+      - name: Restore compatible partial cache
+        id: partial
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-partial
+      - name: Validate partial result
+        env:
+          CACHE_HIT: ${{ steps.partial.outputs.cache-hit }}
+          MATCHED: ${{ steps.partial.outputs.cache-matched-key }}
+          DOWNLOADED: ${{ steps.partial.outputs.downloaded-count }}
+          REUSED: ${{ steps.partial.outputs.reused-count }}
+        run: |
+          test "$CACHE_HIT" = false
+          test -n "$MATCHED"
+          test "$DOWNLOADED" -gt 0
+          test "$REUSED" -gt 0
+      - name: Restore exact completed cache
+        id: exact
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-exact
+      - name: Validate exact result
+        env:
+          CACHE_HIT: ${{ steps.exact.outputs.cache-hit }}
+          MATCHED: ${{ steps.exact.outputs.cache-matched-key }}
+          DOWNLOADED: ${{ steps.exact.outputs.downloaded-count }}
+          REUSED: ${{ steps.exact.outputs.reused-count }}
+        run: |
+          test "$CACHE_HIT" = true
+          test -n "$MATCHED"
+          test "$DOWNLOADED" -eq 0
+          test "$REUSED" -gt 0
+      - name: Corrupt one exact-restored object
+        run: |
+          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v1/objects" \
+            -maxdepth 1 -type f -print -quit)
+          test -n "$object"
+          printf 'corrupt\n' >"$object"
+      - name: Reject corrupt package object
+        id: corrupt
+        continue-on-error: true
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-exact
+          cache: 'false'
+          offline: 'true'
+      - name: Validate corrupt-object failure
+        env:
+          CACHE_PATH: ${{ steps.corrupt.outputs.cache-path }}
+          OUTCOME: ${{ steps.corrupt.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          test -z "$CACHE_PATH"
+          rm -rf "$RUNNER_TEMP/debz-download-exact"
+      - name: Reject package-only offline restore
+        id: offline
+        continue-on-error: true
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-offline
+          offline: 'true'
+      - name: Validate offline metadata failure
+        env:
+          CACHE_PATH: ${{ steps.offline.outputs.cache-path }}
+          OUTCOME: ${{ steps.offline.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          test -z "$CACHE_PATH"
+
+  download-action-container-fixture:
+    name: Build download action container fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Build static CLI and signed fixture
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
+            -Dversion=0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }} \
+            release-install --prefix "$PWD/out/download-container/release"
+          python3 tools/generate-integration-repository.py \
+            --output "$PWD/out/download-container/repository" \
+            --suite debian-stable --architecture amd64
+      - name: Upload container fixture
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: download-action-container-fixture
+          path: out/download-container
+          if-no-files-found: error
+          retention-days: 1
+
+  download-action-container:
+    name: Download action in bare Ubuntu container
+    needs: download-action-container-fixture
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download prepared fixture
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: download-action-container-fixture
+          path: out/download-container
+      - name: Confirm optional host tools are absent and create lock
+        id: fixture
+        shell: sh
+        run: |
+          ! command -v python3
+          ! command -v pipx
+          ! command -v curl
+          ! command -v gh
+          workspace="$PWD/out/download-container"
+          chmod 0755 "$workspace/release/bin/debz"
+          mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
+          cat >"$workspace/fixture.sources" <<EOF
+          Types: deb
+          URIs: file://$workspace/repository
+          Suites: debian-stable
+          Components: main
+          Architectures: amd64
+          Signed-By: $workspace/repository/fixture-keyring.gpg
+          EOF
+          "$workspace/release/bin/debz" plan \
+            --install-root "$workspace/root" \
+            --cache-path "$workspace/metadata" \
+            --state-path "$workspace/state" \
+            --architecture amd64 \
+            --source "$workspace/fixture.sources" \
+            --keyring "$workspace/repository/fixture-keyring.gpg" \
+            --lock-output "$workspace/lock.json" scenario-main --json >/dev/null
+          printf 'source=%s\nkeyring=%s\nlock=%s\n' \
+            "$workspace/fixture.sources" \
+            "$workspace/repository/fixture-keyring.gpg" \
+            "$workspace/lock.json" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$workspace/release/bin" >>"$GITHUB_PATH"
+      - name: Prepare closure without host package or download tools
+        id: download
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache: 'false'
+      - name: Validate clean-container download
+        shell: sh
+        env:
+          CACHE_HIT: ${{ steps.download.outputs.cache-hit }}
+          DOWNLOADED: ${{ steps.download.outputs.downloaded-count }}
+          REUSED: ${{ steps.download.outputs.reused-count }}
+        run: |
+          test "$CACHE_HIT" = false
+          test "$DOWNLOADED" -gt 0
+          test "$REUSED" -eq 0
+
   build-and-test:
     name: Build and test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -146,8 +419,10 @@ jobs:
         include:
           - os: ubuntu-24.04
             name: linux-x64
+            architecture: amd64
           - os: ubuntu-24.04-arm
             name: linux-arm64
+            architecture: arm64
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -180,6 +455,57 @@ jobs:
           zig build -Doptimize=ReleaseSafe test
           zig build -Doptimize=ReleaseSafe fuzz
           zig build run -- --help
+      - name: Prepare native download action fixture
+        id: download-fixture
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          workspace="$PWD/.zig-cache/download-native"
+          mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
+          python3 tools/generate-integration-repository.py \
+            --output "$workspace/repository" --suite debian-stable \
+            --architecture "$ARCHITECTURE"
+          cat >"$workspace/fixture.sources" <<EOF
+          Types: deb
+          URIs: file://$workspace/repository
+          Suites: debian-stable
+          Components: main
+          Architectures: $ARCHITECTURE
+          Signed-By: $workspace/repository/fixture-keyring.gpg
+          EOF
+          zig-out/bin/debz plan \
+            --install-root "$workspace/root" \
+            --cache-path "$workspace/metadata" \
+            --state-path "$workspace/state" \
+            --architecture "$ARCHITECTURE" \
+            --source "$workspace/fixture.sources" \
+            --keyring "$workspace/repository/fixture-keyring.gpg" \
+            --lock-output "$workspace/lock.json" scenario-main --json >/dev/null
+          printf 'source=%s\nkeyring=%s\nlock=%s\n' \
+            "$workspace/fixture.sources" \
+            "$workspace/repository/fixture-keyring.gpg" \
+            "$workspace/lock.json" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$PWD/zig-out/bin" >>"$GITHUB_PATH"
+      - name: Prepare native exact-lock package closure
+        id: download
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.download-fixture.outputs.lock }}
+          source: ${{ steps.download-fixture.outputs.source }}
+          keyring: ${{ steps.download-fixture.outputs.keyring }}
+          architecture: ${{ matrix.architecture }}
+          cache: 'false'
+      - name: Validate native download action outputs
+        env:
+          CACHE_HIT: ${{ steps.download.outputs.cache-hit }}
+          CACHE_PATH: ${{ steps.download.outputs.cache-path }}
+          DOWNLOADED: ${{ steps.download.outputs.downloaded-count }}
+          REUSED: ${{ steps.download.outputs.reused-count }}
+        run: |
+          test "$CACHE_HIT" = false
+          test -d "$CACHE_PATH"
+          test "$DOWNLOADED" -gt 0
+          test "$REUSED" -eq 0
 
   security-audit:
     name: Security and dependency policy

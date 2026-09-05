@@ -51,3 +51,9 @@ format because Node provides in-process decompression; the action does not
 depend on a target container's tar or xz tools. The release workflow verifies
 the checked-in action against the newly published tag on both native release
 architectures after attestations and publication complete.
+
+The same post-publication matrix then creates a hermetic signed repository and
+exact lock and runs [`actions/download`](../actions/download/README.md) with
+caching disabled. This proves the just-published CLI implements the
+`package-cache-v1` contract and prepares the complete closure on both native
+architectures without treating setup or package cache state as installation.

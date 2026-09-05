@@ -123,6 +123,42 @@ class SecurityAuditTests(unittest.TestCase):
             source,
         )
 
+    def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
+        self.assertEqual(
+            [],
+            security_audit.action_pin_failures(
+                "uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684\n",
+                "action.yml",
+            ),
+        )
+        failures = security_audit.action_pin_failures(
+            "uses: actions/cache/restore@v4\n",
+            "action.yml",
+        )
+        self.assertEqual(
+            ["action.yml: actions/cache/restore is not commit-pinned"],
+            failures,
+        )
+
+    def test_download_cache_uses_opaque_cli_owned_archive(self) -> None:
+        package = json.loads(
+            (ROOT / "actions/download/package.json").read_text()
+        )
+        self.assertNotIn("@actions/cache", package["dependencies"])
+        self.assertEqual(
+            package["dependencies"]["@azure/storage-blob"],
+            "12.31.0",
+        )
+        cache_source = (ROOT / "actions/download/src/cache.ts").read_text()
+        self.assertIn("GetCacheEntryDownloadURL", cache_source)
+        self.assertIn("downloadToFile(", cache_source)
+        self.assertNotIn("restoreCache(", cache_source)
+        archive_source = (ROOT / "src/package_cache_archive.zig").read_text()
+        self.assertIn(
+            'pub const format_id = "debz-package-cache-archive-v1"',
+            archive_source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

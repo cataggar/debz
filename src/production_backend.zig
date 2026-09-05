@@ -4,6 +4,8 @@ const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const package_acquisition = @import("package_acquisition.zig");
+const package_cache_archive = @import("package_cache_archive.zig");
+const package_cache_workflow = @import("package_cache_workflow.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
@@ -38,6 +40,17 @@ pub const Executor = struct {
 };
 
 var system_executor_context: u8 = 0;
+
+const RepositoryOptions = struct {
+    source_paths: []const []const u8,
+    config_paths: []const []const u8,
+    keyring_paths: []const []const u8,
+    default_release: ?[]const u8,
+    proxy: ?[]const u8,
+    credential_reference: ?[]const u8,
+    deadline_ms: ?u64,
+    offline: bool,
+};
 
 fn systemExecute(
     _: *anyopaque,
@@ -79,6 +92,240 @@ pub const Backend = struct {
     pub fn execute(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
         return self.route(allocator, request) catch |err|
             mapRuntimeError(request.operation, err);
+    }
+
+    pub fn packageCacheFingerprint(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: package_cache_workflow.Request,
+        debz_version: []const u8,
+    ) !package_cache_workflow.Fingerprint {
+        try package_cache_workflow.validateRequest(request, false);
+        var lock = readLock(allocator, self.io, request.lock_input_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedSchema => return error.UnsupportedLockSchema,
+            else => return error.InvalidExactLock,
+        };
+        defer lock.deinit();
+        return package_cache_workflow.createFingerprint(
+            allocator,
+            lock.lock,
+            request.architecture,
+            debz_version,
+            request.cache_root,
+            request.policy(),
+        );
+    }
+
+    pub fn packageCachePrepare(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: package_cache_workflow.Request,
+        debz_version: []const u8,
+    ) !package_cache_workflow.PrepareResult {
+        try package_cache_workflow.validateRequest(request, true);
+        var lock = readLock(allocator, self.io, request.lock_input_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedSchema => return error.UnsupportedLockSchema,
+            else => return error.InvalidExactLock,
+        };
+        defer lock.deinit();
+        var validated_fingerprint = try package_cache_workflow.createFingerprint(
+            allocator,
+            lock.lock,
+            request.architecture,
+            debz_version,
+            request.cache_root,
+            request.policy(),
+        );
+        defer validated_fingerprint.deinit();
+
+        const repository_options: RepositoryOptions = .{
+            .source_paths = request.source_paths,
+            .config_paths = request.config_paths,
+            .keyring_paths = request.keyring_paths,
+            .default_release = request.default_release,
+            .proxy = request.proxy,
+            .credential_reference = request.credential_reference,
+            .deadline_ms = request.deadline_ms,
+            .offline = request.offline,
+        };
+
+        var loaded = try self.loadRepositoryDocuments(allocator, repository_options);
+        defer loaded.deinit();
+        const normalized = try repository_policy.normalize(
+            allocator,
+            loaded.documents,
+            request.architecture,
+            .{},
+        );
+        var configuration = switch (normalized) {
+            .diagnostic => return error.InvalidRepositoryConfig,
+            .configuration => |value| value,
+        };
+        defer configuration.deinit();
+        for (configuration.repositories) |repository| {
+            if (repository.signed_by.len == 0) return error.NoKeyrings;
+            for (repository.signed_by) |path| if (!containsString(request.keyring_paths, path))
+                return error.NoKeyrings;
+        }
+        for (request.keyring_paths) |path| try validateRegularFile(self.io, path);
+        if (request.credential_reference) |path| try validateRegularFile(self.io, path);
+
+        var cache_root = try openOrCreateAbsoluteDirectory(self.io, request.cache_root);
+        defer cache_root.close(self.io);
+        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
+            .maximum_object_bytes = request.limits.maximum_package_bytes,
+        });
+        defer package_cache.deinit();
+        var package_writer = try package_cache.acquireWriter(request.lock_wait_ms);
+        defer package_writer.release();
+        const initial_cleanup = try package_cache_workflow.cleanupStagingForPrepare(
+            allocator,
+            &package_cache,
+            request.policy(),
+            &package_writer,
+        );
+        if (request.archive_input_path) |path| {
+            var archive = try openRegularFileAbsoluteNoFollow(self.io, path);
+            defer archive.close(self.io);
+            _ = try package_cache_archive.importFile(
+                allocator,
+                self.io,
+                archive,
+                &package_cache,
+                lock.lock,
+                .{
+                    .maximum_objects = request.limits.maximum_lock_packages,
+                    .maximum_object_bytes = request.limits.maximum_package_bytes,
+                    .maximum_total_object_bytes = request.limits.maximum_total_package_bytes,
+                },
+                .{
+                    .repair_corrupt = request.corrupt_cache == .repair_online,
+                    .require_exact_closure = request.restored_cache == .exact,
+                },
+                &package_writer,
+            );
+        }
+        _ = try package_cache_workflow.preflight(
+            allocator,
+            lock.lock,
+            &package_cache,
+            request.policy(),
+            &package_writer,
+        );
+        var metadata = try metadata_cache.Cache.initFromDir(self.io, cache_root, .{});
+        defer metadata.deinit();
+        var acquisition = repository_acquisition.Production{ .io = self.io };
+        const credential_bytes: ?[]u8 = if (request.credential_reference) |path|
+            try readCredential(allocator, self.io, path)
+        else
+            null;
+        defer if (credential_bytes) |value| allocator.free(value);
+        var credential_context = if (credential_bytes != null)
+            try CredentialContext.init(allocator, configuration.repositories, credential_bytes.?)
+        else
+            CredentialContext.empty();
+        defer credential_context.deinit(allocator);
+        const credentials: repository_acquisition.CredentialsProvider = if (credential_bytes != null)
+            .{ .context = &credential_context, .getFn = CredentialContext.get }
+        else
+            .none;
+        var now = self.now_unix orelse realNow(self.io);
+        const runtimes = try makeRuntimes(
+            allocator,
+            repository_options,
+            &configuration,
+            now,
+            credentials,
+        );
+        defer freeRuntimes(allocator, runtimes);
+        var refresh_outcome = try repository_policy.refreshAll(allocator, .{
+            .configuration = &configuration,
+            .runtimes = runtimes,
+            .mode = if (request.offline) .cache_only else .online,
+            .dependencies = .{
+                .acquisition = acquisition.dependencies(),
+                .cache = &metadata,
+                .clock = .{ .context = &now, .nowUnixFn = fixedNow },
+                .io = self.io,
+            },
+        });
+        defer refresh_outcome.deinit(allocator);
+        const refreshed = switch (refresh_outcome) {
+            .failed => return if (request.offline)
+                error.OfflineRepositoryEvidenceMissing
+            else
+                error.RepositoryAuthenticationFailed,
+            .published => |*value| value,
+        };
+
+        const views = try allocator.alloc(
+            package_cache_workflow.RepositoryView,
+            refreshed.universe.repositories.len,
+        );
+        defer allocator.free(views);
+        for (refreshed.universe.repositories, 0..) |repository, index| {
+            const normalized_repository = findNormalized(
+                configuration.repositories,
+                repository.repository_id,
+            ) orelse return error.MissingRepository;
+            const state = findPublishedState(
+                refreshed.states,
+                repository.repository_id,
+            ) orelse return error.MissingRepository;
+            views[index] = .{
+                .input = repository,
+                .base_uri = try repository_acquisition.Uri.parse(normalized_repository.uri),
+                .release_sha256 = state.release_digest.bytes,
+                .index_sha256 = state.index_digest.bytes,
+                .signer_fingerprint = state.signer_fingerprint,
+            };
+        }
+
+        var result = try package_cache_workflow.prepareWithWriterLockAfterCleanup(allocator, .{
+            .lock = &lock.lock,
+            .cache = &package_cache,
+            .repositories = views,
+            .architecture = request.architecture,
+            .debz_version = debz_version,
+            .cache_root = request.cache_root,
+            .policy = request.policy(),
+            .proxy = try proxyPolicy(request.proxy),
+            .credentials = credentials,
+            .acquisition = acquisition.dependencies(),
+        }, &package_writer, initial_cleanup);
+        errdefer result.deinit();
+        if (request.archive_output_path) |path| {
+            const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+            const leaf = std.fs.path.basename(path);
+            var output_dir = try openAbsoluteDirectory(self.io, parent);
+            defer output_dir.close(self.io);
+            var output = try output_dir.createFile(self.io, leaf, .{
+                .exclusive = true,
+                .permissions = if (@import("builtin").os.tag == .windows)
+                    .default_file
+                else
+                    .fromMode(0o600),
+                .resolve_beneath = true,
+            });
+            errdefer output_dir.deleteFile(self.io, leaf) catch {};
+            defer output.close(self.io);
+            _ = try package_cache_archive.exportFile(
+                allocator,
+                self.io,
+                output,
+                &package_cache,
+                lock.lock,
+                .{
+                    .maximum_objects = request.limits.maximum_lock_packages,
+                    .maximum_object_bytes = request.limits.maximum_package_bytes,
+                    .maximum_total_object_bytes = request.limits.maximum_total_package_bytes,
+                },
+                &package_writer,
+            );
+        }
+        return result;
     }
 
     fn route(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
@@ -180,7 +427,17 @@ pub const Backend = struct {
         if (request.options.keyring_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "authenticated repository command requires --keyring");
 
-        var loaded = try self.loadRepositoryDocuments(allocator, request);
+        const repository_options: RepositoryOptions = .{
+            .source_paths = request.options.source_paths,
+            .config_paths = request.options.config_paths,
+            .keyring_paths = request.options.keyring_paths,
+            .default_release = request.options.default_release,
+            .proxy = request.options.proxy,
+            .credential_reference = request.options.credential_reference,
+            .deadline_ms = request.options.deadline_ms,
+            .offline = request.options.offline,
+        };
+        var loaded = try self.loadRepositoryDocuments(allocator, repository_options);
         defer loaded.deinit();
         const normalized = try repository_policy.normalize(
             allocator,
@@ -225,7 +482,7 @@ pub const Backend = struct {
         else
             .none;
         var now = self.now_unix orelse realNow(self.io);
-        const runtimes = try makeRuntimes(allocator, request, &configuration, now, credentials);
+        const runtimes = try makeRuntimes(allocator, repository_options, &configuration, now, credentials);
         defer freeRuntimes(allocator, runtimes);
         var refresh_outcome = try repository_policy.refreshAll(allocator, .{
             .configuration = &configuration,
@@ -604,20 +861,20 @@ pub const Backend = struct {
     fn loadRepositoryDocuments(
         self: *Backend,
         allocator: std.mem.Allocator,
-        request: api.Request,
+        options: RepositoryOptions,
     ) !LoadedDocuments {
         var documents: std.ArrayList(repository_policy.SourceDocument) = .empty;
         var bytes: std.ArrayList([]u8) = .empty;
-        for (request.options.source_paths) |path| {
+        for (options.source_paths) |path| {
             const contents = try readFile(allocator, self.io, path, 8 * 1024 * 1024);
             try bytes.append(allocator, contents);
             try documents.append(allocator, .{
                 .bytes = contents,
                 .format = sourceFormat(path),
-                .policy = basePolicy(request),
+                .policy = basePolicy(options),
             });
         }
-        for (request.options.config_paths) |path| {
+        for (options.config_paths) |path| {
             const config_bytes = try readFile(allocator, self.io, path, 1024 * 1024);
             defer allocator.free(config_bytes);
             const Wire = struct {
@@ -635,12 +892,12 @@ pub const Backend = struct {
                 return error.InvalidRepositoryConfig;
             const contents = try readFile(allocator, self.io, parsed.value.source_path, 8 * 1024 * 1024);
             try bytes.append(allocator, contents);
-            var policy = basePolicy(request);
+            var policy = basePolicy(options);
             policy.priority = parsed.value.priority;
             policy.default_release = if (parsed.value.default_release) |value|
                 try allocator.dupe(u8, value)
             else
-                request.options.default_release;
+                options.default_release;
             policy.immutability.kind = if (parsed.value.immutable) .immutable_url else .moving;
             try documents.append(allocator, .{
                 .bytes = contents,
@@ -857,24 +1114,24 @@ fn readCredential(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![
     return bytes[0..value.len];
 }
 
-fn basePolicy(request: api.Request) repository_policy.Policy {
+fn basePolicy(options: RepositoryOptions) repository_policy.Policy {
     return .{
-        .default_release = request.options.default_release,
-        .proxy = if (request.options.proxy != null)
+        .default_release = options.default_release,
+        .proxy = if (options.proxy != null)
             .{ .declared = .{ .id = "cli-proxy" } }
         else
             .direct,
-        .credentials = if (request.options.credential_reference) |value|
+        .credentials = if (options.credential_reference) |value|
             .{ .id = value }
         else
             null,
-        .deadlines = deadlines(request.options.deadline_ms),
+        .deadlines = deadlines(options.deadline_ms),
     };
 }
 
 fn makeRuntimes(
     allocator: std.mem.Allocator,
-    request: api.Request,
+    options: RepositoryOptions,
     configuration: *const repository_policy.Configuration,
     now_unix: i64,
     credentials: repository_acquisition.CredentialsProvider,
@@ -886,7 +1143,7 @@ fn makeRuntimes(
         allocator.free(runtimes);
     }
     for (configuration.repositories, 0..) |repository, index| {
-        const proxy = try proxyPolicy(request.options.proxy);
+        const proxy = try proxyPolicy(options.proxy);
         var keyrings = try allocator.alloc(openpgp.Keyring, repository.signed_by.len);
         for (repository.signed_by, 0..) |path, key_index| keyrings[key_index] = .{ .path = path };
         const auth: repository_refresh.AuthenticationInput = .{ .in_release = .{
@@ -896,20 +1153,20 @@ fn makeRuntimes(
         } };
         runtimes[index] = .{
             .repository_id = repository.id,
-            .declared_proxy = if (request.options.proxy != null) .{ .id = "cli-proxy" } else null,
-            .declared_credentials = if (request.options.credential_reference) |value| .{ .id = value } else null,
+            .declared_proxy = if (options.proxy != null) .{ .id = "cli-proxy" } else null,
+            .declared_credentials = if (options.credential_reference) |value| .{ .id = value } else null,
             .declared_keyrings = repository.signed_by,
             .authentication = auth,
             .acquisition = .{
                 .proxy = proxy,
-                .deadlines = deadlines(request.options.deadline_ms),
+                .deadlines = deadlines(options.deadline_ms),
                 .redirect_limit = 8,
                 .retry = productionRetryPolicy(),
                 .credentials = credentials,
                 .maximum_release_bytes = 16 * 1024 * 1024,
             },
             .refresh = .{
-                .mode = if (request.options.offline) .cache_only else .online,
+                .mode = if (options.offline) .cache_only else .online,
                 .compression_order = &.{ .xz, .gzip, .zstd, .uncompressed },
                 .by_hash_fallback = .not_found_only,
                 .maximum_future_seconds = 300,
@@ -1188,6 +1445,37 @@ fn readFile(
     return reader.interface.allocRemaining(allocator, .limited(maximum));
 }
 
+fn validateRegularFile(io: std.Io, path: []const u8) !void {
+    var file = try openRegularFileAbsoluteNoFollow(io, path);
+    defer file.close(io);
+}
+
+fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+    const leaf = std.fs.path.basename(path);
+    var dir = try openAbsoluteDirectory(io, parent);
+    defer dir.close(io);
+    const file = package_acquisition.openRegularFileNoFollow(dir, io, leaf) catch |err|
+        return switch (err) {
+            error.IsDir,
+            error.SymLinkLoop,
+            error.NotDir,
+            error.NotRegularFile,
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.PipeBusy,
+            error.NoDevice,
+            error.DeviceBusy,
+            error.WouldBlock,
+            => error.NotRegularFile,
+            else => |other| other,
+        };
+    errdefer file.close(io);
+    const stat = file.stat(io) catch return error.NotRegularFile;
+    if (stat.kind != .file) return error.NotRegularFile;
+    return file;
+}
+
 fn readLock(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !exact_lock.OwnedLock {
     const bytes = try readFile(allocator, io, path, exact_lock.maximum_document_bytes);
     defer allocator.free(bytes);
@@ -1321,16 +1609,17 @@ fn lockFromPlan(
     defer allocator.free(plan_json);
     var request_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(plan_json, &request_digest, .{});
-    var policy_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    policy_hash.update("debz-solver-policy-v1\x00");
-    policy_hash.update(if (request.options.recommends) "recommends\x00" else "no-recommends\x00");
-    policy_hash.update(if (request.options.allow_downgrade) "allow-downgrade\x00" else "no-downgrade\x00");
-    policy_hash.update(@tagName(request.options.repository_policy));
-
     return exact_lock.create(allocator, .{
         .target_architecture = request.options.architecture,
         .request_sha256 = request_digest,
-        .policy_sha256 = policy_hash.finalResult(),
+        .policy_sha256 = package_cache_workflow.solverPolicyDigest(
+            request.options.recommends,
+            request.options.allow_downgrade,
+            switch (request.options.repository_policy) {
+                .strict_priority => .strict_priority,
+                .best_version => .best_version,
+            },
+        ),
         .repositories = repositories.items,
         .packages = packages.items,
         .authenticated_metadata = true,
@@ -1617,6 +1906,15 @@ fn findNormalized(
 ) ?repository_policy.NormalizedRepository {
     for (repositories) |repository|
         if (std.mem.eql(u8, repository.id.slice(), id.slice())) return repository;
+    return null;
+}
+
+fn findPublishedState(
+    states: []const repository_policy.PublishedRepositoryState,
+    id: source.RepositoryId,
+) ?repository_policy.PublishedRepositoryState {
+    for (states) |state|
+        if (std.mem.eql(u8, state.repository_id.slice(), id.slice())) return state;
     return null;
 }
 
