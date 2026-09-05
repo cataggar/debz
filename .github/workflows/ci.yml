@@ -375,6 +375,11 @@ jobs:
           DEBZ_INTEGRATION_MODE: full
           DEBZ_INTEGRATION_SUDO: "1"
         run: zig build test-integration
+      - name: Run required SymCrypt workflow
+        env:
+          DEBZ_REPOSITORY_ADD_ARCH: ${{ matrix.architecture }}
+          DEBZ_SYSTEM_INSTALL_INTEGRATION: "1"
+        run: zig build test-repository-add
       - name: Normalize diagnostic ownership
         if: always()
         run: sudo chown -R "$USER:$USER" ".zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}" || true

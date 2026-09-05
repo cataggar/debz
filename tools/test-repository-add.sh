@@ -6,6 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 debz=$1
 harness=$2
 architecture=${DEBZ_REPOSITORY_ADD_ARCH:-amd64}
+system_install_integration=${DEBZ_SYSTEM_INSTALL_INTEGRATION:-0}
 workspace="$PWD/.zig-cache/repository-add-integration"
 http_root="$workspace/http"
 repository="$http_root/repository"
@@ -161,6 +162,7 @@ if grep -R -a -q 'fixture-query-secret' "$full_root"; then
   exit 1
 fi
 
+if [ "$system_install_integration" = 1 ]; then
 prepare_dpkg_root "$full_root"
 set +e
 system_install=$(run_product install \
@@ -325,6 +327,7 @@ test ! -e "$conflict_root/var/lib/debz/transactions"
 if grep -q '^Package: symcrypt$' "$conflict_root/var/lib/dpkg/status"; then
   echo "solver conflict mutated the target" >&2
   exit 1
+fi
 fi
 
 in_release_before=$(grep -c '/repository/dists/debian-stable/InRelease' "$request_log")
