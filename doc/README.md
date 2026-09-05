@@ -6,6 +6,7 @@
   idempotence, and recovery evidence.
 - [Release installation and runtime requirements](release-installation.md) describes version injection, the installed tree, and fully static Linux binaries.
 - [Deterministic release packaging and validation](release-tooling.md)
+- [GitHub Actions](github-actions.md) documents the first-party verified setup action and its boundary with later package actions.
 
 - [Project status and API overview](project-status.md) describes implemented modules, public boundaries, limitations, and transaction-plan schema.
 - [Authenticated repository refresh](authenticated-refresh.md) explains trusted refresh usage, policy, provenance, and cache behavior.

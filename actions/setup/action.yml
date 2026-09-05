@@ -1,0 +1,50 @@
+name: Setup debz
+description: Install one exact, cryptographically verified static debz release
+author: cataggar/debz contributors
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  debz-version:
+    description: >-
+      Exact debz release tag or version (for example, v0.3.0). When omitted,
+      the action derives it only from an exact vMAJOR.MINOR.PATCH action ref.
+    required: false
+    default: ''
+  sha256:
+    description: >-
+      Optional independently trusted SHA-256 for the selected archive. It must
+      also match the GitHub release-asset digest. When omitted, GitHub release
+      provenance is verified cryptographically with Sigstore.
+    required: false
+    default: ''
+  token:
+    description: >-
+      Token used only for GitHub release and attestation API requests. Public
+      anonymous access is supported with lower rate limits.
+    required: false
+    default: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+  cache:
+    description: >-
+      Cache the exact verified CLI archive and installation. Exact cache hits
+      are rehashed before use.
+    required: false
+    default: 'true'
+
+outputs:
+  debz-path:
+    description: Absolute path to the verified debz executable
+  debz-version:
+    description: Canonical exact release tag, including the leading v
+  target:
+    description: Normalized release target (linux-x64 or linux-arm64)
+  cache-hit:
+    description: "'true' only when an exact CLI cache entry was restored and reverified"
+
+runs:
+  using: node24
+  main: dist/main/index.js
+  post: dist/post/index.js
+  post-if: success()

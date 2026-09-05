@@ -1,4 +1,9 @@
 /.zig-cache/
+/actions/setup/lib/
+/actions/setup/node_modules/
+/.cache/
+/.tmp/
+/.tools/
 /zig-pkg/
 /zig-out/
 /out/

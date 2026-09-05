@@ -432,13 +432,89 @@ def audit_ci_pins() -> None:
                 fail(f"{relative}: {name} is not commit-pinned")
 
 
+def audit_setup_action_dependencies() -> None:
+    setup = ROOT / "actions/setup"
+    package_path = setup / "package.json"
+    lock_path = setup / "package-lock.json"
+    notices_path = setup / "THIRD_PARTY_NOTICES.md"
+    if not package_path.is_file() or not lock_path.is_file() or not notices_path.is_file():
+        fail("setup action dependency manifests or notices are missing")
+        return
+
+    package = json.loads(package_path.read_text())
+    lock = json.loads(lock_path.read_text())
+    expected_runtime = {
+        "@actions/core",
+        "@sigstore/bundle",
+        "@sigstore/protobuf-specs",
+        "@sigstore/tuf",
+        "@sigstore/verify",
+        "semver",
+        "undici",
+    }
+    dependencies = package.get("dependencies")
+    if not isinstance(dependencies, dict) or set(dependencies) != expected_runtime:
+        fail("setup action runtime dependencies differ from the reviewed allowlist")
+    allowed_licenses = {
+        "0BSD",
+        "Apache-2.0",
+        "(Apache-2.0 AND BSD-3-Clause)",
+        "BlueOak-1.0.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "ISC",
+        "MIT",
+    }
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        fail("setup action lockfile packages table is missing")
+        return
+    for name, metadata in packages.items():
+        if not name:
+            continue
+        if not isinstance(metadata, dict):
+            fail(f"setup action lock entry is malformed: {name}")
+            continue
+        if metadata.get("license") not in allowed_licenses:
+            fail(f"setup action dependency has an unreviewed license: {name}")
+        if metadata.get("hasInstallScript"):
+            fail(f"setup action dependency has an install script: {name}")
+        if not str(metadata.get("resolved", "")).startswith("https://registry.npmjs.org/"):
+            fail(f"setup action dependency is not resolved from the npm registry: {name}")
+        if not str(metadata.get("integrity", "")).startswith("sha512-"):
+            fail(f"setup action dependency lacks SHA-512 lock integrity: {name}")
+
+    notices = notices_path.read_text()
+    for name in sorted(expected_runtime):
+        if name not in notices:
+            fail(f"setup action notices omit direct dependency {name}")
+    for relative in ("dist/main/licenses.txt", "dist/post/licenses.txt"):
+        license_path = setup / relative
+        if not license_path.is_file() or license_path.stat().st_size == 0:
+            fail(f"setup action bundled licenses are missing: actions/setup/{relative}")
+
+
 def audit_docs() -> None:
     if (ROOT / "docs").exists():
         fail("stale docs/ directory exists; documentation belongs under doc/")
     link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
     for path in sorted(ROOT.rglob("*.md")):
         relative = path.relative_to(ROOT)
-        if any(part in {".git", ".zig-cache", "zig-out", "zig-pkg"} for part in relative.parts):
+        if any(
+            part
+            in {
+                ".cache",
+                ".git",
+                ".tmp",
+                ".tools",
+                ".zig-cache",
+                "lib",
+                "node_modules",
+                "zig-out",
+                "zig-pkg",
+            }
+            for part in relative.parts
+        ):
             continue
         for target in link_pattern.findall(path.read_text(errors="strict")):
             target = target.split("#", 1)[0]
@@ -488,6 +564,7 @@ def main() -> int:
     audit_dependencies()
     audit_release_targets()
     audit_ci_pins()
+    audit_setup_action_dependencies()
     audit_docs()
     audit_secrets_and_artifacts(files)
     if FAILURES:

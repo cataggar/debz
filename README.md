@@ -13,6 +13,24 @@ Release binaries are fully static Linux x64 or arm64 executables with Zig
 included. Gzip and xz binary archives are covered by GitHub provenance
 attestations.
 
+### GitHub Actions
+
+Install one exact release with the first-party setup action:
+
+```yaml
+- id: debz
+  uses: cataggar/debz/actions/setup@<reviewed-commit-sha>
+  with:
+    debz-version: v0.3.0
+- run: '"${{ steps.debz.outputs.debz-path }}" version'
+```
+
+The action verifies the GitHub asset digest plus either GitHub/Sigstore release
+provenance or an explicitly supplied trusted SHA-256, extracts without host
+archive tools, and revalidates exact cache hits. See
+[`actions/setup/README.md`](actions/setup/README.md) for pinning, permissions,
+trust, cache, platform, and container details.
+
 ## Build
 
 ```sh
