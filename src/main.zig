@@ -38,9 +38,12 @@ const root_help =
     \\
 ;
 
-const required_options_help =
-    \\Required options:
-    \\  --install-root PATH --cache-path PATH --state-path PATH --architecture ARCH
+const target_options_help =
+    \\Target options:
+    \\  --install-root PATH           Override target root (default: /)
+    \\  --cache-path PATH             Override cache (default: /var/cache/debz)
+    \\  --state-path PATH             Override state (default: /var/lib/debz)
+    \\  --architecture ARCH           Override target dpkg architecture
     \\
 ;
 
@@ -73,7 +76,7 @@ const resolution_options_help =
 
 const mutation_options_help =
     \\Mutation options:
-    \\  --assume-yes                   Confirm the requested mutation
+    \\  --assume-yes                   Confirm an explicit/legacy mutation
     \\
 ;
 
@@ -128,6 +131,8 @@ const repository_add_help =
     \\  --state-path PATH            Logical state path inside the target root
     \\  --sha256 DIGEST              Expected descriptor SHA-256
     \\  --no-refresh                 Install and import without final refresh
+    \\  --missing-valid-until-max-age-seconds N
+    \\                               Explicit bounded policy for descriptor sources
     \\
     \\Network options:
     \\  --proxy URI
@@ -251,11 +256,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
 
-    var backend_context: debz.ProductionBackend = .{ .io = init.io };
-    const result = api.execute(init.arena.allocator(), request, .{
-        .context = &backend_context,
-        .executeFn = debz.ProductionBackend.executeOpaque,
-    }) catch {
+    const result = debz.executeSystemProductRequest(
+        init.arena.allocator(),
+        init.io,
+        request,
+    ) catch {
         const internal = api.failure(operation, .internal, .internal_error, "internal execution error");
         try render(init.arena.allocator(), stdout, stderr, request.options.output, internal);
         try stdout.flush();
@@ -471,7 +476,7 @@ fn printOperationHelp(stdout: *std.Io.Writer, operation: api.Operation) !void {
         operation.spelling(),
         operationOperands(operation),
     });
-    try stdout.writeAll(required_options_help);
+    try stdout.writeAll(target_options_help);
     if (usesRepositories(operation)) try stdout.writeAll(repository_options_help);
     if (!operation.mutates()) try stdout.writeAll(status_option_help);
     if (supportsExactLocks(operation)) try stdout.writeAll(lock_options_help);
@@ -677,6 +682,12 @@ fn render(
         if (item.detail) |value| try writer.print(": {s}", .{value});
         try writer.writeByte('\n');
     }
+    if (result.paths.exact_lock) |path|
+        try writer.print("exact lock: {s}\n", .{path});
+    if (result.paths.provenance) |path|
+        try writer.print("provenance: {s}\n", .{path});
+    if (result.paths.recovery) |path|
+        try writer.print("recovery: {s}\n", .{path});
     for (result.diagnostics[0..result.diagnostic_count]) |diagnostic|
         try writer.print("debz[{s}]: {s}\n", .{ @tagName(diagnostic.id), diagnostic.message });
 }

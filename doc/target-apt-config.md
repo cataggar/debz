@@ -75,14 +75,17 @@ target state has no native answer, an injected runner may execute the fixed
 argv `/usr/bin/dpkg --print-architecture` with an empty environment. Alternate
 roots never fall back to the host architecture or `uname`.
 
-The canonical `apt-config-snapshot-v1` document records source paths and
+The canonical `apt-config-snapshot-v2` document records source paths and
 digests, normalized configuration and repository identities, keyring paths,
 digests and fingerprints, global compatibility use, deterministic exclusions,
-native and foreign architectures, and an aggregate SHA-256. Decode is bounded,
+native and foreign architectures, repository-specific freshness policy, and
+an aggregate SHA-256. Decode is bounded,
 rejects unknown fields and noncanonical documents, and verifies the aggregate
-digest. `Store.writeAtomic` publishes through a no-follow directory handle,
+digest. `loadRecordedSnapshot` reopens only the named source/keyring files under the
+selected root and verifies every digest, fingerprint, repository identity, and
+freshness decision. `Store.writeAtomic` publishes through a no-follow directory handle,
 file sync, rename, and directory sync.
 
-The module is a foundation for the separately scoped `repo add` workflow. It
-does not install descriptors, mutate repository configuration, alter exact
-locks or transaction provenance, or add CLI commands.
+`repo add` retains an operation copy and publishes a well-known active v2 copy
+under the selected debz state root. Alternate-root snapshots cannot select or
+reuse the host-root active record.

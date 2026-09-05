@@ -824,7 +824,13 @@ fn verifyExactLockV2LockedPackageEvidence(
     plan: solver.Plan,
     journal: Journal,
 ) !Verification {
-    if (plan.schema_version != 3 or
+    var repository_only = true;
+    for (lock.packages) |package| switch (package.origin) {
+        .authenticated_repository => {},
+        .local_artifact => repository_only = false,
+    };
+    if ((plan.schema_version != 3 and
+        !(plan.schema_version == 2 and repository_only)) or
         !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
         journal.lock_sha256 == null or
         !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or

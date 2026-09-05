@@ -57,7 +57,8 @@ boundary for APT sources, binary OpenPGP keyrings, and dpkg-native architecture
 state. Its production filesystem adapter is traversal-safe and no-follow;
 logical `Signed-By` values remain root-independent while verifier inputs use
 the imported bytes. Imports produce the canonical, digest-bound
-[`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) manifest. See
+[`apt-config-snapshot-v2`](../schema/apt-config-snapshot-v2.json) manifest,
+including repository freshness policy. See
 [Target-root APT configuration snapshots](target-apt-config.md).
 
 `debz.repository_api` is the separate versioned repository-management
@@ -69,6 +70,13 @@ verifies/imports/refreshes the resulting target configuration. The standalone
 `debz repo add --url URL` command wires this backend with `/` as its intentional
 default root and `--root` for isolated images. See
 [Repository management API](repository-management.md).
+
+The standalone CLI now exposes a system profile that consumes the active
+root-scoped snapshot, derives target defaults and architecture, generates and
+persists an exact lock before mutation, and retains per-lock recovery and
+transaction-result-v3 evidence. This supports the two-command Microsoft Noble
+SymCrypt workflow while preserving explicit product API and image-building
+paths.
 
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 

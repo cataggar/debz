@@ -28,6 +28,16 @@
         }
       }
     },
+    "paths": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["exact_lock", "provenance", "recovery"],
+      "properties": {
+        "exact_lock": { "type": ["string", "null"] },
+        "provenance": { "type": ["string", "null"] },
+        "recovery": { "type": ["string", "null"] }
+      }
+    },
     "diagnostics": {
       "type": "array",
       "items": {

@@ -5,6 +5,7 @@ const packages_index = @import("packages_index.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -131,6 +132,7 @@ pub const Request = struct {
     selected: SelectedPackage,
     policy: Policy,
     exact_lock_package: ?exact_lock.Package = null,
+    exact_lock_package_v2: ?exact_lock_v2.Package = null,
 };
 
 pub const Provenance = struct {
@@ -510,6 +512,8 @@ pub fn acquirePackage(
 ) !VerifiedPackage {
     const record = request.selected.record;
     const declared_size = record.transport.size.value;
+    if (request.exact_lock_package != null and request.exact_lock_package_v2 != null)
+        return error.LockPackageMismatch;
     if (request.exact_lock_package) |locked| {
         if (!std.mem.eql(u8, locked.name, record.control.package.text) or
             !std.mem.eql(u8, locked.version, record.control.version.value.original) or
@@ -517,6 +521,21 @@ pub fn acquirePackage(
             !std.mem.eql(u8, &locked.repository_id, request.selected.repository_id.slice()) or
             request.selected.authenticated_snapshot_sha256 == null or
             !std.mem.eql(u8, &locked.repository_snapshot_sha256, &request.selected.authenticated_snapshot_sha256.?) or
+            !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
+            locked.declared_size != declared_size)
+            return error.LockPackageMismatch;
+    }
+    if (request.exact_lock_package_v2) |locked| {
+        const origin = switch (locked.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => return error.LockPackageMismatch,
+        };
+        if (!std.mem.eql(u8, locked.name, record.control.package.text) or
+            !std.mem.eql(u8, locked.version, record.control.version.value.original) or
+            !std.mem.eql(u8, locked.architecture, record.control.architecture.text) or
+            !std.mem.eql(u8, &origin.repository_id, request.selected.repository_id.slice()) or
+            request.selected.authenticated_snapshot_sha256 == null or
+            !std.mem.eql(u8, &origin.repository_snapshot_sha256, &request.selected.authenticated_snapshot_sha256.?) or
             !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
             locked.declared_size != declared_size)
             return error.LockPackageMismatch;

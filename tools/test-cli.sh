@@ -122,7 +122,7 @@ status_code=$?
 set -e
 test "$status_code" -eq 2
 test ! -s cli-test-stderr
-printf '%s' "$output" | grep -q '"id":"confirmation_required"'
+printf '%s' "$output" | grep -q '"id":"configuration_required"'
 
 output=$("$debz" clean $common --assume-yes 2>cli-test-stderr)
 test ! -s cli-test-stderr

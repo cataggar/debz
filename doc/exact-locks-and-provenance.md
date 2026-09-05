@@ -70,6 +70,21 @@ package-origin digest exactly equal to the bound lock digest. Package,
 repository, and signer verification is count-bounded and uses sorted/indexed
 matching rather than nested scans.
 
+The simple system install creates an exact-lock v2 before dpkg and uses the
+policy-digested `locked_packages` verification scope because the lock contains
+the complete mutation closure rather than unrelated packages already present
+on the system. Acquisition receives the same locked package evidence. The lock
+is retained at `STATE/locks/<digest>.json`, copied into the unique
+`STATE/transactions/<digest>/` evidence directory, and never replaced on a
+digest collision without canonical equality.
+
+`transaction-result-v3` embeds the complete v2 execution result and adds, for
+each repository used by the lock, the signed Release date, optional
+`Valid-Until`, verification time, observed age, exact bounded missing-expiry
+policy, whether that exception was exercised, selected Packages path, and
+compression. Failure provenance is retained after dpkg has begun as well as on
+success.
+
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
 provenance can be bounded and digest-validated with
@@ -82,3 +97,4 @@ Schemas:
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
+- [`schema/transaction-result-v3.json`](../schema/transaction-result-v3.json)

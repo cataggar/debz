@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("product_api.zig");
+const debian_version = @import("debian_version.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const metadata_cache = @import("metadata_cache.zig");
@@ -9,10 +10,14 @@ const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const target_apt_config = @import("target_apt_config.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
+const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
+const transaction_provenance_v3 = @import("transaction_provenance_v3.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = struct {
@@ -62,6 +67,8 @@ pub const Backend = struct {
     executor: Executor = .system,
     process_runner: ?transaction_executor.ProcessRunner = null,
     now_unix: ?i64 = null,
+    system_profile: bool = false,
+    system_snapshot: ?*const target_apt_config.Snapshot = null,
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -175,35 +182,80 @@ pub const Backend = struct {
     }
 
     fn withRepositories(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
-        if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
-            return api.failure(request.operation, .usage, .configuration_required, "repository command requires --source or --config");
-        if (request.options.keyring_paths.len == 0)
-            return api.failure(request.operation, .usage, .configuration_required, "authenticated repository command requires --keyring");
-
-        var loaded = try self.loadRepositoryDocuments(allocator, request);
-        defer loaded.deinit();
-        const normalized = try repository_policy.normalize(
-            allocator,
-            loaded.documents,
-            request.options.architecture,
-            .{},
-        );
-        var configuration = switch (normalized) {
-            .diagnostic => |diagnostic| return api.failure(
-                request.operation,
-                .usage,
-                .configuration_required,
-                diagnostic.message(),
-            ),
-            .configuration => |value| value,
-        };
-        defer configuration.deinit();
-        for (configuration.repositories) |repository| {
-            if (repository.signed_by.len == 0)
-                return api.failure(request.operation, .usage, .configuration_required, "every repository source must declare Signed-By");
-            for (repository.signed_by) |path| if (!containsString(request.options.keyring_paths, path))
-                return api.failure(request.operation, .usage, .configuration_required, "Signed-By path was not declared with --keyring");
+        if (self.system_profile and request.operation.mutates() and
+            request.operation != .recover)
+        {
+            var pending = try readRecoveryIntentIfPresent(
+                allocator,
+                self.io,
+                request.options.state_path,
+            );
+            defer if (pending) |*intent| intent.deinit();
+            if (pending) |*intent| {
+                const exact_lock_path = if (intent.value.exact_lock_path) |path|
+                    try allocator.dupe(u8, path)
+                else
+                    null;
+                const recovery_path = if (intent.value.evidence_directory) |path|
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/recovery-request.json",
+                        .{path},
+                    )
+                else
+                    null;
+                return api.failureWithPaths(
+                    request.operation,
+                    .recovery,
+                    .recovery_required,
+                    "an interrupted transaction is retained; run 'debz recover' before planning another mutation",
+                    .{
+                        .exact_lock = exact_lock_path,
+                        .recovery = recovery_path,
+                    },
+                );
+            }
         }
+        var loaded_storage: LoadedDocuments = undefined;
+        var loaded_initialized = false;
+        defer if (loaded_initialized) loaded_storage.deinit();
+        var configuration_storage: repository_policy.Configuration = undefined;
+        var configuration_initialized = false;
+        defer if (configuration_initialized) configuration_storage.deinit();
+        const configuration: *const repository_policy.Configuration = if (self.system_snapshot) |snapshot|
+            &snapshot.configuration
+        else blk: {
+            if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
+                return api.failure(request.operation, .usage, .configuration_required, "repository command requires --source or --config");
+            if (request.options.keyring_paths.len == 0)
+                return api.failure(request.operation, .usage, .configuration_required, "authenticated repository command requires --keyring");
+
+            loaded_storage = try self.loadRepositoryDocuments(allocator, request);
+            loaded_initialized = true;
+            const normalized = try repository_policy.normalize(
+                allocator,
+                loaded_storage.documents,
+                request.options.architecture,
+                .{},
+            );
+            configuration_storage = switch (normalized) {
+                .diagnostic => |diagnostic| return api.failure(
+                    request.operation,
+                    .usage,
+                    .configuration_required,
+                    diagnostic.message(),
+                ),
+                .configuration => |value| value,
+            };
+            configuration_initialized = true;
+            for (configuration_storage.repositories) |repository| {
+                if (repository.signed_by.len == 0)
+                    return api.failure(request.operation, .usage, .configuration_required, "every repository source must declare Signed-By");
+                for (repository.signed_by) |path| if (!containsString(request.options.keyring_paths, path))
+                    return api.failure(request.operation, .usage, .configuration_required, "Signed-By path was not declared with --keyring");
+            }
+            break :blk &configuration_storage;
+        };
 
         var cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
         defer cache_root.close(self.io);
@@ -225,10 +277,17 @@ pub const Backend = struct {
         else
             .none;
         var now = self.now_unix orelse realNow(self.io);
-        const runtimes = try makeRuntimes(allocator, request, &configuration, now, credentials);
+        const runtimes = try makeRuntimes(
+            allocator,
+            request,
+            configuration,
+            self.system_snapshot,
+            now,
+            credentials,
+        );
         defer freeRuntimes(allocator, runtimes);
         var refresh_outcome = try repository_policy.refreshAll(allocator, .{
-            .configuration = &configuration,
+            .configuration = configuration,
             .runtimes = runtimes,
             .mode = if (request.operation == .recover or request.options.offline or request.options.cache_only)
                 .cache_only
@@ -292,16 +351,28 @@ pub const Backend = struct {
             effective_request.options.conffile = intent.value.conffile;
             effective_request.options.force = intent.value.force;
             effective_request.options.lock_wait_ms = intent.value.lock_wait_ms;
+            if (effective_request.options.lock_input_path == null)
+                effective_request.options.lock_input_path = intent.value.exact_lock_path;
         }
-        if (request.options.lock_output_path != null and request.options.lock_input_path == null and
+        if (request.options.lock_output_path != null and effective_request.options.lock_input_path == null and
             request.operation != .plan and request.operation != .download)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output without --lock-input is restricted to non-mutating plan or download lock resolution");
-        var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
-            readLock(allocator, self.io, path) catch
-                return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
-        else
-            null;
+        var lock: ?exact_lock.OwnedLock = null;
         defer if (lock) |*value| value.deinit();
+        var lock_v2: ?exact_lock_v2.OwnedLock = null;
+        defer if (lock_v2) |*value| value.deinit();
+        if (effective_request.options.lock_input_path) |path| {
+            lock = readLock(allocator, self.io, path) catch null;
+            if (lock == null and self.system_profile)
+                lock_v2 = readLockV2(allocator, self.io, path) catch null;
+            if (lock == null and lock_v2 == null)
+                return api.failure(
+                    request.operation,
+                    .planning,
+                    .planning_failed,
+                    "exact lock is invalid",
+                );
+        }
         const selectors = try allocator.alloc(solver.PackageSelector, effective_request.packages.len);
         defer allocator.free(selectors);
         for (effective_request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
@@ -337,36 +408,197 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
-        var generated_lock: ?exact_lock.OwnedLock = null;
-        defer if (generated_lock) |*value| value.deinit();
-        if (request.options.lock_output_path) |path| {
-            if (lock) |*value| {
-                try writeLock(allocator, self.io, path, value.lock);
-            } else {
-                generated_lock = lockFromPlan(
-                    allocator,
-                    effective_request,
-                    refreshed,
-                    planning_records,
-                    plan.*,
-                ) catch |err|
-                    switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return api.failure(
-                            request.operation,
-                            .planning,
-                            .planning_failed,
-                            try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
+        if (try dependencyVersionConflict(
+            allocator,
+            plan.*,
+            planning_records,
+            refreshed.universe.repositories,
+        )) |message|
+            return api.failure(
+                request.operation,
+                .planning,
+                .planning_failed,
+                message,
+            );
+        if (!effective_request.options.allow_downgrade) {
+            for (plan.actions) |action| {
+                if (action.kind == .downgrade)
+                    return api.failure(
+                        request.operation,
+                        .planning,
+                        .planning_failed,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "dependency solution requires forbidden downgrade of {s} to {s}",
+                            .{ action.package, action.version },
                         ),
-                    };
-                try writeLock(allocator, self.io, path, generated_lock.?.lock);
+                    );
             }
         }
-        if (request.operation == .plan) return planResult(allocator, request.operation, plan.*);
+        var generated_lock: ?exact_lock.OwnedLock = null;
+        defer if (generated_lock) |*value| value.deinit();
+        var generated_lock_v2: ?exact_lock_v2.OwnedLock = null;
+        defer if (generated_lock_v2) |*value| value.deinit();
+        if (self.system_profile and request.operation.mutates() and
+            request.operation != .recover and
+            effective_request.options.lock_input_path == null and
+            plan.actions.len == 0)
+            return planResultChanged(
+                allocator,
+                request.operation,
+                plan.*,
+                false,
+                "requested state already satisfied",
+            );
+        const generate_lock = lock == null and lock_v2 == null and
+            request.options.lock_output_path != null;
+        if (generate_lock) {
+            generated_lock = lockFromPlan(
+                allocator,
+                effective_request,
+                refreshed,
+                planning_records,
+                plan.*,
+                request.options.lock_output_path != null,
+            ) catch |err|
+                switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return api.failure(
+                        request.operation,
+                        .planning,
+                        .planning_failed,
+                        try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
+                    ),
+                };
+        }
+        const generate_system_lock = lock == null and lock_v2 == null and
+            self.system_profile and request.operation.mutates() and
+            request.operation != .recover;
+        if (generate_system_lock) {
+            generated_lock_v2 = lockV2FromPlan(
+                allocator,
+                effective_request,
+                refreshed,
+                plan.*,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return api.failure(
+                    request.operation,
+                    .planning,
+                    .planning_failed,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "authenticated plan could not produce a complete exact lock: {s}",
+                        .{@errorName(err)},
+                    ),
+                ),
+            };
+        }
+        const effective_lock: ?*const exact_lock.Lock = if (lock) |*value|
+            &value.lock
+        else if (generated_lock) |*value|
+            &value.lock
+        else
+            null;
+        const effective_lock_v2: ?*const exact_lock_v2.Lock = if (lock_v2) |*value|
+            &value.lock
+        else if (generated_lock_v2) |*value|
+            &value.lock
+        else
+            null;
+        if (request.options.lock_output_path) |path| {
+            try writeLock(allocator, self.io, path, effective_lock.?.*);
+        }
+        var transaction_evidence: ?TransactionEvidence = null;
+        if (self.system_profile and request.operation.mutates() and
+            request.operation != .recover)
+        {
+            transaction_evidence = (if (effective_lock_v2) |value|
+                prepareTransactionEvidenceV2(
+                    allocator,
+                    self.io,
+                    request.options.state_path,
+                    value.*,
+                    effective_request.options.lock_input_path,
+                )
+            else
+                prepareTransactionEvidence(
+                    allocator,
+                    self.io,
+                    request.options.state_path,
+                    effective_lock.?.*,
+                    effective_request.options.lock_input_path,
+                )) catch |err| return api.failure(
+                request.operation,
+                .planning,
+                .planning_failed,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "exact lock could not be retained before mutation: {s}",
+                    .{@errorName(err)},
+                ),
+            );
+        } else if (request.operation == .recover and recovery_intent != null and
+            (effective_lock != null or effective_lock_v2 != null))
+        {
+            transaction_evidence = .{
+                .exact_lock_path = try allocator.dupe(
+                    u8,
+                    effective_request.options.lock_input_path.?,
+                ),
+                .directory_path = try allocator.dupe(
+                    u8,
+                    recovery_intent.?.value.evidence_directory orelse
+                        request.options.state_path,
+                ),
+                .provenance_path = if (recovery_intent.?.value.evidence_directory) |path|
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/{s}",
+                        .{
+                            path,
+                            if (effective_lock_v2 != null)
+                                "transaction-result-v3.json"
+                            else
+                                "transaction-result.json",
+                        },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/transaction-result.json",
+                        .{request.options.state_path},
+                    ),
+                .recovery_path = if (recovery_intent.?.value.evidence_directory) |path|
+                    try std.fmt.allocPrint(allocator, "{s}/recovery-request.json", .{path})
+                else
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/recovery-request.json",
+                        .{request.options.state_path},
+                    ),
+            };
+        }
+        if (request.operation == .plan) {
+            var result = try planResult(allocator, request.operation, plan.*);
+            result.paths.exact_lock = request.options.lock_output_path orelse
+                effective_request.options.lock_input_path;
+            return result;
+        }
 
-        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
+        var package_cache = package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
-        });
+        }) catch |err| return api.failureWithPaths(
+            request.operation,
+            .download,
+            .download_failed,
+            try std.fmt.allocPrint(
+                allocator,
+                "package cache initialization failed: {s}",
+                .{@errorName(err)},
+            ),
+            exactEvidence(transaction_evidence),
+        );
         defer package_cache.deinit();
         var artifacts: std.ArrayList(transaction_executor.Artifact) = .empty;
         defer {
@@ -404,13 +636,17 @@ pub const Backend = struct {
                         .proxy = try proxyPolicy(request.options.proxy),
                         .credentials = credentials,
                     },
-                    .exact_lock_package = if (lock) |*value|
-                        value.lock.findPackage(action.package, action.version, action.architecture)
+                    .exact_lock_package = if (effective_lock) |value|
+                        value.findPackage(action.package, action.version, action.architecture)
+                    else
+                        null,
+                    .exact_lock_package_v2 = if (effective_lock_v2) |value|
+                        value.findPackage(action.package, action.version, action.architecture)
                     else
                         null,
                 },
                 acquisition.dependencies(),
-            ) catch |err| return api.failure(
+            ) catch |err| return api.failureWithPaths(
                 request.operation,
                 .download,
                 .download_failed,
@@ -419,6 +655,7 @@ pub const Backend = struct {
                     "package acquisition failed for {s}={s}:{s}: {s}",
                     .{ action.package, action.version, action.architecture, @errorName(err) },
                 ),
+                exactEvidence(transaction_evidence),
             );
             var validation_result = deb_payload.validate(allocator, package.bytes, .{
                 .repository = origin.repository_id.slice(),
@@ -448,11 +685,12 @@ pub const Backend = struct {
                         },
                     );
                     package.deinit();
-                    return api.failure(
+                    return api.failureWithPaths(
                         request.operation,
                         .download,
                         .download_failed,
                         message,
+                        exactEvidence(transaction_evidence),
                     );
                 },
                 .validation => |*validation| validation.deinit(),
@@ -470,18 +708,48 @@ pub const Backend = struct {
             });
             try verified.append(allocator, package);
         }
-        if (request.operation == .download)
-            return planResultChanged(allocator, request.operation, plan.*, false, "packages downloaded and verified");
+        if (request.operation == .download) {
+            var result = try planResultChanged(
+                allocator,
+                request.operation,
+                plan.*,
+                false,
+                "packages downloaded and verified",
+            );
+            result.paths.exact_lock = request.options.lock_output_path orelse
+                effective_request.options.lock_input_path;
+            return result;
+        }
 
-        const executor_policy = try executionPolicy(allocator, effective_request);
+        var executor_policy = try executionPolicy(
+            allocator,
+            effective_request,
+            self.system_profile,
+        );
+        if (effective_lock_v2 != null)
+            executor_policy.exact_lock_verification = .locked_packages;
         var system_process = transaction_executor.SystemProcessRunner{ .allocator = allocator, .io = self.io };
         defer system_process.deinit();
         var system_files = transaction_executor.SystemFileSystem{ .allocator = allocator, .io = self.io };
         var system_locks = transaction_executor.SystemLockManager{ .allocator = allocator, .io = self.io };
-        var journal = try transaction_recovery.SystemJournalStore.init(
+        const journal_path = if (transaction_evidence) |paths|
+            paths.directory_path
+        else
+            request.options.state_path;
+        var journal = transaction_recovery.SystemJournalStore.init(
             self.io,
-            request.options.state_path,
+            journal_path,
             request.options.install_root,
+        ) catch |err| return api.failureWithPaths(
+            request.operation,
+            .recovery,
+            .recovery_failed,
+            try std.fmt.allocPrint(
+                allocator,
+                "transaction journal initialization failed: {s}",
+                .{@errorName(err)},
+            ),
+            exactEvidence(transaction_evidence),
         );
         defer journal.deinit();
         var status_reader = transaction_recovery.SystemStatusFileReader{
@@ -496,52 +764,171 @@ pub const Backend = struct {
             .status = status_reader.interface(),
         };
         if (request.operation == .recover) {
-            var report = try self.executor.recoverFn(self.executor.context, allocator, .{
+            var report = self.executor.recoverFn(self.executor.context, allocator, .{
                 .plan = plan,
                 .install_root = request.options.install_root,
                 .policy = executor_policy,
-                .exact_lock = if (lock) |*value| &value.lock else null,
-            }, dependencies);
+                .exact_lock = effective_lock,
+                .exact_lock_v2 = effective_lock_v2,
+            }, dependencies) catch |err| return api.failureWithPaths(
+                request.operation,
+                .recovery,
+                .recovery_failed,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "recovery executor failed before producing a report: {s}",
+                    .{@errorName(err)},
+                ),
+                resultEvidence(transaction_evidence),
+            );
             defer report.deinit();
+            if (effective_lock_v2) |value| {
+                var verify: transaction_provenance_v2.VerifyDiagnostic = .{};
+                writeRecoveryProvenanceV2(
+                    allocator,
+                    self.io,
+                    request,
+                    refreshed,
+                    value.*,
+                    report,
+                    dependencies.status,
+                    &verify,
+                    if (transaction_evidence) |paths|
+                        paths.provenance_path
+                    else
+                        null,
+                ) catch |err| switch (err) {
+                    error.RepositoryEvidenceMismatch,
+                    error.MissingPackageEvidence,
+                    error.PackageDigestMismatch,
+                    => return api.failureWithPaths(
+                        request.operation,
+                        .internal,
+                        .lock_verification_failed,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "exact-lock evidence rejected during recovery: {s}",
+                            .{verify.message()},
+                        ),
+                        resultEvidence(transaction_evidence),
+                    ),
+                    else => return api.failureWithPaths(
+                        request.operation,
+                        .internal,
+                        .internal_error,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "recovery provenance publication failed: {s}",
+                            .{@errorName(err)},
+                        ),
+                        resultEvidence(transaction_evidence),
+                    ),
+                };
+            }
             if (!report.succeeded())
-                return api.failure(request.operation, .recovery, .recovery_failed, if (report.failure) |failure|
+                return api.failureWithPaths(request.operation, .recovery, .recovery_failed, if (report.failure) |failure|
                     try describeExecutorFailure(allocator, "recovery", failure)
                 else
-                    "recovery failed");
-            try deleteRecoveryIntent(self.io, request.options.state_path);
-            return success(request.operation, true, "transaction recovery completed", &.{});
+                    "recovery failed", resultEvidence(transaction_evidence));
+            deleteRecoveryIntent(self.io, request.options.state_path) catch |err|
+                return api.failureWithPaths(
+                    request.operation,
+                    .recovery,
+                    .recovery_failed,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "recovery completed but intent cleanup failed: {s}",
+                        .{@errorName(err)},
+                    ),
+                    resultEvidence(transaction_evidence),
+                );
+            var result = success(request.operation, true, "transaction recovery completed", &.{});
+            result.paths = resultEvidence(transaction_evidence);
+            return result;
         }
-        try writeRecoveryIntent(allocator, self.io, request.options.state_path, effective_request);
-        var report = try self.executor.executeFn(self.executor.context, allocator, .{
+        writeRecoveryIntent(
+            allocator,
+            self.io,
+            request.options.state_path,
+            effective_request,
+            transaction_evidence,
+        ) catch |err| return api.failureWithPaths(
+            request.operation,
+            .recovery,
+            .recovery_failed,
+            try std.fmt.allocPrint(
+                allocator,
+                "recovery intent publication failed: {s}",
+                .{@errorName(err)},
+            ),
+            exactEvidence(transaction_evidence),
+        );
+        if (transaction_evidence) |paths| {
+            writeRecoveryIntent(
+                allocator,
+                self.io,
+                paths.directory_path,
+                effective_request,
+                transaction_evidence,
+            ) catch |err| {
+                var evidence = exactEvidence(transaction_evidence);
+                evidence.recovery = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/recovery-request.json",
+                    .{request.options.state_path},
+                );
+                return api.failureWithPaths(
+                    request.operation,
+                    .recovery,
+                    .recovery_failed,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "transaction recovery evidence publication failed: {s}",
+                        .{@errorName(err)},
+                    ),
+                    evidence,
+                );
+            };
+        }
+        var report = self.executor.executeFn(self.executor.context, allocator, .{
             .plan = plan,
             .install_root = request.options.install_root,
             .artifacts = artifacts.items,
             .policy = executor_policy,
-            .exact_lock = if (lock) |*value| &value.lock else null,
-        }, dependencies);
+            .exact_lock = effective_lock,
+            .exact_lock_v2 = effective_lock_v2,
+        }, dependencies) catch |err| return api.failureWithPaths(
+            request.operation,
+            .transaction,
+            .transaction_failed,
+            try std.fmt.allocPrint(
+                allocator,
+                "transaction executor failed before producing a report: {s}",
+                .{@errorName(err)},
+            ),
+            recoveryEvidence(transaction_evidence),
+        );
         defer report.deinit();
-        if (!report.succeeded())
-            return api.failure(request.operation, .transaction, .transaction_failed, if (report.failure) |failure|
-                try describeExecutorFailure(allocator, "transaction", failure)
-            else
-                "transaction failed");
-        try deleteRecoveryIntent(self.io, request.options.state_path);
-        if (lock) |*value| {
-            var verify: transaction_provenance.VerifyDiagnostic = .{};
-            writeExecutionProvenance(
+        if (effective_lock_v2) |value| {
+            var verify: transaction_provenance_v2.VerifyDiagnostic = .{};
+            writeExecutionProvenanceV2(
                 allocator,
                 self.io,
                 request,
                 refreshed,
-                value.lock,
+                value.*,
                 report,
                 dependencies.status,
                 &verify,
+                if (transaction_evidence) |paths|
+                    paths.provenance_path
+                else
+                    null,
             ) catch |err| switch (err) {
                 error.RepositoryEvidenceMismatch,
                 error.MissingPackageEvidence,
                 error.PackageDigestMismatch,
-                => return api.failure(
+                => return api.failureWithPaths(
                     request.operation,
                     .internal,
                     .lock_verification_failed,
@@ -550,16 +937,102 @@ pub const Backend = struct {
                         "exact-lock evidence rejected during {s}: {s}",
                         .{ @tagName(request.operation), verify.message() },
                     ),
+                    recoveryEvidence(transaction_evidence),
                 ),
-                else => return err,
+                else => return api.failureWithPaths(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "transaction provenance publication failed: {s}",
+                        .{@errorName(err)},
+                    ),
+                    recoveryEvidence(transaction_evidence),
+                ),
             };
         }
-        return planResultChanged(allocator, request.operation, plan.*, true, "transaction completed");
+        if (!report.succeeded())
+            return api.failureWithPaths(request.operation, .transaction, .transaction_failed, if (report.failure) |failure|
+                try describeExecutorFailure(allocator, "transaction", failure)
+            else
+                "transaction failed", resultEvidence(transaction_evidence));
+        deleteRecoveryIntent(self.io, request.options.state_path) catch |err|
+            return api.failureWithPaths(
+                request.operation,
+                .recovery,
+                .recovery_failed,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "transaction completed but recovery intent cleanup failed: {s}",
+                    .{@errorName(err)},
+                ),
+                resultEvidence(transaction_evidence),
+            );
+        if (effective_lock_v2 == null) if (effective_lock) |value| {
+            var verify: transaction_provenance.VerifyDiagnostic = .{};
+            writeExecutionProvenance(
+                allocator,
+                self.io,
+                request,
+                refreshed,
+                value.*,
+                report,
+                dependencies.status,
+                &verify,
+                if (transaction_evidence) |paths|
+                    paths.provenance_path
+                else
+                    null,
+            ) catch |err| switch (err) {
+                error.RepositoryEvidenceMismatch,
+                error.MissingPackageEvidence,
+                error.PackageDigestMismatch,
+                => return api.failureWithPaths(
+                    request.operation,
+                    .internal,
+                    .lock_verification_failed,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "exact-lock evidence rejected during {s}: {s}",
+                        .{ @tagName(request.operation), verify.message() },
+                    ),
+                    recoveryEvidence(transaction_evidence),
+                ),
+                else => return api.failureWithPaths(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "transaction provenance publication failed: {s}",
+                        .{@errorName(err)},
+                    ),
+                    recoveryEvidence(transaction_evidence),
+                ),
+            };
+        };
+        var result = try planResultChanged(
+            allocator,
+            request.operation,
+            plan.*,
+            true,
+            "transaction completed",
+        );
+        result.paths = resultEvidence(transaction_evidence);
+        return result;
     }
 
     fn loadInstalled(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !dpkg_status.OwnedDatabase {
         const allocated_path = if (request.options.status_path == null)
-            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/status", .{request.options.install_root})
+            if (std.mem.eql(u8, request.options.install_root, "/"))
+                try allocator.dupe(u8, "/var/lib/dpkg/status")
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/var/lib/dpkg/status",
+                    .{request.options.install_root},
+                )
         else
             null;
         defer if (allocated_path) |path| allocator.free(path);
@@ -752,6 +1225,8 @@ const RecoveryIntent = struct {
     conffile: api.ConffilePolicy,
     force: []const api.ForcePolicy,
     lock_wait_ms: u64,
+    exact_lock_path: ?[]const u8 = null,
+    evidence_directory: ?[]const u8 = null,
 };
 
 fn readRecoveryIntent(
@@ -769,11 +1244,23 @@ fn readRecoveryIntent(
     });
 }
 
+fn readRecoveryIntentIfPresent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+) !?std.json.Parsed(RecoveryIntent) {
+    return readRecoveryIntent(allocator, io, state_path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
 fn writeRecoveryIntent(
     allocator: std.mem.Allocator,
     io: std.Io,
     state_path: []const u8,
     request: api.Request,
+    evidence: ?TransactionEvidence,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -799,7 +1286,19 @@ fn writeRecoveryIntent(
         if (index != 0) try writer.writeByte(',');
         try writer.print("\"{s}\"", .{@tagName(force)});
     }
-    try writer.print("],\"lock_wait_ms\":{d}}}\n", .{request.options.lock_wait_ms});
+    try writer.print("],\"lock_wait_ms\":{d},\"exact_lock_path\":", .{
+        request.options.lock_wait_ms,
+    });
+    if (evidence) |paths|
+        try writeJsonString(writer, paths.exact_lock_path)
+    else
+        try writer.writeAll("null");
+    try writer.writeAll(",\"evidence_directory\":");
+    if (evidence) |paths|
+        try writeJsonString(writer, paths.directory_path)
+    else
+        try writer.writeAll("null");
+    try writer.writeAll("}\n");
     const bytes = try output.toOwnedSlice();
     defer allocator.free(bytes);
     var dir = try openAbsoluteDirectory(io, state_path);
@@ -822,6 +1321,20 @@ fn writeRecoveryIntent(
 
     try dir.rename(stage, dir, "recovery-request.json", io);
     try syncDirectory(dir);
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |byte| switch (byte) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0...8, 11, 12, 14...31 => try writer.print("\\u00{x:0>2}", .{byte}),
+        else => try writer.writeByte(byte),
+    };
+    try writer.writeByte('"');
 }
 
 fn deleteRecoveryIntent(io: std.Io, state_path: []const u8) !void {
@@ -876,6 +1389,7 @@ fn makeRuntimes(
     allocator: std.mem.Allocator,
     request: api.Request,
     configuration: *const repository_policy.Configuration,
+    snapshot: ?*const target_apt_config.Snapshot,
     now_unix: i64,
     credentials: repository_acquisition.CredentialsProvider,
 ) ![]repository_policy.Runtime {
@@ -887,8 +1401,15 @@ fn makeRuntimes(
     }
     for (configuration.repositories, 0..) |repository, index| {
         const proxy = try proxyPolicy(request.options.proxy);
-        var keyrings = try allocator.alloc(openpgp.Keyring, repository.signed_by.len);
-        for (repository.signed_by, 0..) |path, key_index| keyrings[key_index] = .{ .path = path };
+        const keyrings = if (snapshot) |recorded| blk: {
+            const trust = try recorded.runtimeTrust(allocator, repository);
+            break :blk trust.keyrings;
+        } else blk: {
+            const paths = try allocator.alloc(openpgp.Keyring, repository.signed_by.len);
+            for (repository.signed_by, 0..) |path, key_index|
+                paths[key_index] = .{ .path = path };
+            break :blk paths;
+        };
         const auth: repository_refresh.AuthenticationInput = .{ .in_release = .{
             .keyrings = .{ .many = keyrings },
             .accepted_primary_fingerprints = &.{},
@@ -902,7 +1423,10 @@ fn makeRuntimes(
             .authentication = auth,
             .acquisition = .{
                 .proxy = proxy,
-                .deadlines = deadlines(request.options.deadline_ms),
+                .deadlines = boundedDeadlines(
+                    deadlines(request.options.deadline_ms),
+                    repository.deadlines,
+                ),
                 .redirect_limit = 8,
                 .retry = productionRetryPolicy(),
                 .credentials = credentials,
@@ -913,10 +1437,7 @@ fn makeRuntimes(
                 .compression_order = &.{ .xz, .gzip, .zstd, .uncompressed },
                 .by_hash_fallback = .not_found_only,
                 .maximum_future_seconds = 300,
-                .expiry_policy = if (repository.immutability.kind == .moving)
-                    .require_valid_until
-                else
-                    .allow_missing_valid_until,
+                .expiry_policy = repository.freshness,
                 .maximum_compressed_bytes = 64 * 1024 * 1024,
                 .maximum_decompressed_bytes = 256 * 1024 * 1024,
                 .maximum_decoder_memory = 256 * 1024 * 1024,
@@ -990,7 +1511,7 @@ fn describeExecutorFailure(
     stage: []const u8,
     failure: transaction_executor.Failure,
 ) ![]u8 {
-    return std.fmt.allocPrint(
+    return try std.fmt.allocPrint(
         allocator,
         "{s} failed: code={s} phase={s} package={s} lock_path={s} completed_commands={d}: {s}",
         .{
@@ -1065,7 +1586,11 @@ fn selectorName(value: []const u8) []const u8 {
     return parseSelector(value).name;
 }
 
-fn executionPolicy(allocator: std.mem.Allocator, request: api.Request) !transaction_executor.Policy {
+fn executionPolicy(
+    allocator: std.mem.Allocator,
+    request: api.Request,
+    system_profile: bool,
+) !transaction_executor.Policy {
     const forces = try allocator.alloc(transaction_executor.ForceRisk, request.options.force.len);
     for (request.options.force, 0..) |force, index| forces[index] = switch (force) {
         .depends => .depends,
@@ -1083,7 +1608,7 @@ fn executionPolicy(allocator: std.mem.Allocator, request: api.Request) !transact
         },
         .locks = .{ .wait_ms = request.options.lock_wait_ms },
         .risk = .{
-            .allow_host_root = false,
+            .allow_host_root = system_profile,
             .force = forces,
         },
     };
@@ -1113,6 +1638,18 @@ fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
     };
 }
 
+fn boundedDeadlines(
+    requested: repository_acquisition.Deadlines,
+    configured: repository_acquisition.Deadlines,
+) repository_acquisition.Deadlines {
+    return .{
+        .connect_ms = @min(requested.connect_ms, configured.connect_ms),
+        .read_ms = @min(requested.read_ms, configured.read_ms),
+        .overall_ms = @min(requested.overall_ms, configured.overall_ms),
+        .absolute_ms = requested.absolute_ms,
+    };
+}
+
 test "product API operations exhaustively deny host-root execution" {
     inline for (std.meta.fields(api.Operation)) |field| {
         const operation: api.Operation = @enumFromInt(field.value);
@@ -1125,11 +1662,11 @@ test "product API operations exhaustively deny host-root execution" {
                 .architecture = "amd64",
             },
         };
-        const policy = try executionPolicy(std.testing.allocator, request);
+        const policy = try executionPolicy(std.testing.allocator, request, false);
         defer std.testing.allocator.free(policy.risk.force);
         try std.testing.expect(!policy.risk.allow_host_root);
         request.options.install_root = "/alternate";
-        const alternate = try executionPolicy(std.testing.allocator, request);
+        const alternate = try executionPolicy(std.testing.allocator, request, false);
         defer std.testing.allocator.free(alternate.risk.force);
         try std.testing.expect(!alternate.risk.allow_host_root);
     }
@@ -1194,6 +1731,25 @@ fn readLock(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !exact_l
     return exact_lock.decode(allocator, bytes, exact_lock.maximum_document_bytes);
 }
 
+fn readLockV2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !exact_lock_v2.OwnedLock {
+    const bytes = try readFile(
+        allocator,
+        io,
+        path,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer allocator.free(bytes);
+    return exact_lock_v2.decode(
+        allocator,
+        bytes,
+        exact_lock_v2.maximum_document_bytes,
+    );
+}
+
 fn writeLock(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1208,12 +1764,308 @@ fn writeLock(
     try store.writeAtomic(allocator, lock);
 }
 
+const TransactionEvidence = struct {
+    exact_lock_path: []const u8,
+    directory_path: []const u8,
+    provenance_path: []const u8,
+    recovery_path: []const u8,
+};
+
+fn resultEvidence(evidence: ?TransactionEvidence) api.EvidencePaths {
+    const paths = evidence orelse return .{};
+    return .{
+        .exact_lock = paths.exact_lock_path,
+        .provenance = paths.provenance_path,
+        .recovery = paths.recovery_path,
+    };
+}
+
+fn exactEvidence(evidence: ?TransactionEvidence) api.EvidencePaths {
+    const paths = evidence orelse return .{};
+    return .{ .exact_lock = paths.exact_lock_path };
+}
+
+fn recoveryEvidence(evidence: ?TransactionEvidence) api.EvidencePaths {
+    const paths = evidence orelse return .{};
+    return .{
+        .exact_lock = paths.exact_lock_path,
+        .recovery = paths.recovery_path,
+    };
+}
+
+fn prepareTransactionEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    lock: exact_lock.Lock,
+    existing_lock_path: ?[]const u8,
+) !TransactionEvidence {
+    const digest_hex = std.fmt.bytesToHex(lock.digest_sha256, .lower);
+    const locks_directory = try std.fmt.allocPrint(
+        allocator,
+        "{s}/locks",
+        .{state_path},
+    );
+    defer allocator.free(locks_directory);
+    const retained_lock_path = if (existing_lock_path) |path|
+        try allocator.dupe(u8, path)
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}.json",
+            .{ locks_directory, &digest_hex },
+        );
+    if (existing_lock_path == null)
+        try publishLockAt(allocator, io, retained_lock_path, lock);
+
+    const evidence_directory = try std.fmt.allocPrint(
+        allocator,
+        "{s}/transactions/{s}",
+        .{ state_path, &digest_hex },
+    );
+    var directory = try openOrCreateAbsoluteDirectory(io, evidence_directory);
+    directory.close(io);
+    const evidence_lock_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/exact-lock.json",
+        .{evidence_directory},
+    );
+    try publishLockAt(allocator, io, evidence_lock_path, lock);
+    return .{
+        .exact_lock_path = retained_lock_path,
+        .directory_path = evidence_directory,
+        .provenance_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/transaction-result.json",
+            .{evidence_directory},
+        ),
+        .recovery_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/recovery-request.json",
+            .{evidence_directory},
+        ),
+    };
+}
+
+fn prepareTransactionEvidenceV2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    lock: exact_lock_v2.Lock,
+    existing_lock_path: ?[]const u8,
+) !TransactionEvidence {
+    const digest_hex = std.fmt.bytesToHex(lock.digest_sha256, .lower);
+    const locks_directory = try std.fmt.allocPrint(
+        allocator,
+        "{s}/locks",
+        .{state_path},
+    );
+    defer allocator.free(locks_directory);
+    const retained_lock_path = if (existing_lock_path) |path|
+        try allocator.dupe(u8, path)
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}.json",
+            .{ locks_directory, &digest_hex },
+        );
+    if (existing_lock_path == null)
+        try publishLockV2At(allocator, io, retained_lock_path, lock);
+
+    const evidence_directory = try std.fmt.allocPrint(
+        allocator,
+        "{s}/transactions/{s}",
+        .{ state_path, &digest_hex },
+    );
+    var directory = try openOrCreateAbsoluteDirectory(io, evidence_directory);
+    directory.close(io);
+    const evidence_lock_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/exact-lock.json",
+        .{evidence_directory},
+    );
+    try publishLockV2At(allocator, io, evidence_lock_path, lock);
+    return .{
+        .exact_lock_path = retained_lock_path,
+        .directory_path = evidence_directory,
+        .provenance_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/transaction-result-v3.json",
+            .{evidence_directory},
+        ),
+        .recovery_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/recovery-request.json",
+            .{evidence_directory},
+        ),
+    };
+}
+
+fn publishLockAt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    lock: exact_lock.Lock,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+    const leaf = std.fs.path.basename(path);
+    var dir = try openOrCreateAbsoluteDirectory(io, parent);
+    defer dir.close(io);
+    const store = try exact_lock.Store.init(io, dir, leaf);
+    var existing = store.read(
+        allocator,
+        exact_lock.maximum_document_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            try store.writeAtomic(allocator, lock);
+            return;
+        },
+        else => return err,
+    };
+    defer existing.deinit();
+    const expected = try lock.canonicalJson(allocator);
+    defer allocator.free(expected);
+    const actual = try existing.lock.canonicalJson(allocator);
+    defer allocator.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.LockCollision;
+}
+
+fn publishLockV2At(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    lock: exact_lock_v2.Lock,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+    const leaf = std.fs.path.basename(path);
+    var dir = try openOrCreateAbsoluteDirectory(io, parent);
+    defer dir.close(io);
+    const store = try exact_lock_v2.Store.init(io, dir, leaf);
+    var existing = store.read(
+        allocator,
+        exact_lock_v2.maximum_document_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            try store.writeAtomic(allocator, lock);
+            return;
+        },
+        else => return err,
+    };
+    defer existing.deinit();
+    const expected = try lock.canonicalJson(allocator);
+    defer allocator.free(expected);
+    const actual = try existing.lock.canonicalJson(allocator);
+    defer allocator.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.LockCollision;
+}
+
+fn lockV2FromPlan(
+    allocator: std.mem.Allocator,
+    request: api.Request,
+    refreshed: *repository_policy.RefreshResult,
+    plan: solver.Plan,
+) !exact_lock_v2.OwnedLock {
+    var packages: std.ArrayList(exact_lock_v2.Package) = .empty;
+    defer packages.deinit(allocator);
+    var repository_ids: std.ArrayList([64]u8) = .empty;
+    defer repository_ids.deinit(allocator);
+
+    for (plan.actions) |action| {
+        const origin = try authenticatedPackageOrigin(action.selected_origin_v2 orelse continue);
+        const repository = findRepositoryInput(
+            refreshed.universe.repositories,
+            origin.repository_id,
+        ) orelse return error.MissingRepository;
+        const record = repository.packages.records[origin.record_index];
+        const snapshot_digest = repository.authenticated_snapshot_sha256 orelse
+            return error.MissingRepository;
+        var repository_id: [64]u8 = undefined;
+        @memcpy(&repository_id, origin.repository_id.slice());
+        if (!containsRepositoryId(repository_ids.items, repository_id))
+            try repository_ids.append(allocator, repository_id);
+        try packages.append(allocator, .{
+            .name = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot_digest,
+            } },
+            .sha256 = record.transport.sha256.bytes,
+            .declared_size = record.transport.size.value,
+            .retention = if (action.requested) .requested else .dependency,
+            .dpkg_selection_hold = false,
+        });
+    }
+
+    var repositories: std.ArrayList(exact_lock_v2.Repository) = .empty;
+    defer repositories.deinit(allocator);
+    var signer_storage: std.ArrayList([][20]u8) = .empty;
+    defer {
+        for (signer_storage.items) |signers| allocator.free(signers);
+        signer_storage.deinit(allocator);
+    }
+    for (repository_ids.items) |repository_id| {
+        const snapshot = findSnapshot(refreshed.snapshots, repository_id) orelse
+            return error.MissingRepository;
+        const evidence = snapshot.snapshot.provenance.authentication_evidence;
+        const signers = try allocator.alloc([20]u8, evidence.signatures.len);
+        var signer_count: usize = 0;
+        for (evidence.signatures) |signature| {
+            if (signature.primary_fingerprint) |fingerprint| {
+                signers[signer_count] = fingerprint;
+                signer_count += 1;
+            }
+        }
+        if (signer_count == 0) {
+            allocator.free(signers);
+            return error.MissingRepository;
+        }
+        try signer_storage.append(allocator, signers);
+        try repositories.append(allocator, .{
+            .id = repository_id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+            .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+            .index_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+            .signer_fingerprints = signers[0..signer_count],
+        });
+    }
+
+    const plan_json = try plan.canonicalJson(allocator);
+    defer allocator.free(plan_json);
+    var request_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plan_json, &request_digest, .{});
+    var policy_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    policy_hash.update("debz-solver-policy-v1\x00");
+    policy_hash.update(if (request.options.recommends) "recommends\x00" else "no-recommends\x00");
+    policy_hash.update(if (request.options.allow_downgrade) "allow-downgrade\x00" else "no-downgrade\x00");
+    policy_hash.update(@tagName(request.options.repository_policy));
+
+    return exact_lock_v2.create(allocator, .{
+        .target_architecture = request.options.architecture,
+        .request_sha256 = request_digest,
+        .policy_sha256 = policy_hash.finalResult(),
+        .repositories = repositories.items,
+        .local_artifacts = &.{},
+        .packages = packages.items,
+        .verified_origins = true,
+    });
+}
+
+fn containsRepositoryId(ids: []const [64]u8, wanted: [64]u8) bool {
+    for (ids) |id| {
+        if (std.mem.eql(u8, &id, &wanted)) return true;
+    }
+    return false;
+}
+
 fn lockFromPlan(
     allocator: std.mem.Allocator,
     request: api.Request,
     refreshed: *repository_policy.RefreshResult,
     installed: []const dpkg_status.Package,
     plan: solver.Plan,
+    include_retained: bool,
 ) !exact_lock.OwnedLock {
     var packages: std.ArrayList(exact_lock.Package) = .empty;
     defer packages.deinit(allocator);
@@ -1248,41 +2100,43 @@ fn lockFromPlan(
             .dpkg_selection_hold = false,
         });
     }
-    for (installed) |package| {
-        if (!package.status.isFullyInstalled() or
-            planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
-            continue;
-        const origin = findRetainedOrigin(
-            refreshed.universe.repositories,
-            package.name.value,
-            package.version.spelling.value,
-            package.architecture.value,
-        ) orelse return error.RetainedPackageUnavailable;
-        const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
-            return error.MissingRepository;
-        const record = repository.packages.records[origin.record_index];
-        var repository_id: [64]u8 = undefined;
-        @memcpy(&repository_id, origin.repository_id.slice());
-        var seen = false;
-        for (repository_ids.items) |existing| {
-            if (std.mem.eql(u8, &existing, &repository_id)) {
-                seen = true;
-                break;
+    if (include_retained) {
+        for (installed) |package| {
+            if (!package.status.isFullyInstalled() or
+                planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
+                continue;
+            const origin = findRetainedOrigin(
+                refreshed.universe.repositories,
+                package.name.value,
+                package.version.spelling.value,
+                package.architecture.value,
+            ) orelse return error.RetainedPackageUnavailable;
+            const repository = findRepositoryInput(refreshed.universe.repositories, origin.repository_id) orelse
+                return error.MissingRepository;
+            const record = repository.packages.records[origin.record_index];
+            var repository_id: [64]u8 = undefined;
+            @memcpy(&repository_id, origin.repository_id.slice());
+            var seen = false;
+            for (repository_ids.items) |existing| {
+                if (std.mem.eql(u8, &existing, &repository_id)) {
+                    seen = true;
+                    break;
+                }
             }
+            if (!seen) try repository_ids.append(allocator, repository_id);
+            try packages.append(allocator, .{
+                .name = package.name.value,
+                .version = package.version.spelling.value,
+                .architecture = package.architecture.value,
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
+                    return error.MissingRepository,
+                .sha256 = record.transport.sha256.bytes,
+                .declared_size = record.transport.size.value,
+                .retention = .retained,
+                .dpkg_selection_hold = package.status.want == .hold,
+            });
         }
-        if (!seen) try repository_ids.append(allocator, repository_id);
-        try packages.append(allocator, .{
-            .name = package.name.value,
-            .version = package.version.spelling.value,
-            .architecture = package.architecture.value,
-            .repository_id = repository_id,
-            .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
-                return error.MissingRepository,
-            .sha256 = record.transport.sha256.bytes,
-            .declared_size = record.transport.size.value,
-            .retention = .retained,
-            .dpkg_selection_hold = package.status.want == .hold,
-        });
     }
 
     var repositories: std.ArrayList(exact_lock.Repository) = .empty;
@@ -1350,6 +2204,173 @@ fn planChangesIdentity(
     return false;
 }
 
+fn dependencyVersionConflict(
+    allocator: std.mem.Allocator,
+    plan: solver.Plan,
+    installed: []const dpkg_status.Package,
+    repositories: []const solver.RepositoryInput,
+) !?[]u8 {
+    for (plan.actions) |action| {
+        if (action.kind == .remove) continue;
+        const origin = authenticatedPackageOrigin(action.selected_origin_v2 orelse
+            continue) catch continue;
+        const repository = findRepositoryInput(repositories, origin.repository_id) orelse
+            continue;
+        const record = repository.packages.records[origin.record_index];
+        for ([_]?@import("control_record.zig").RelationValue{
+            record.control.pre_depends,
+            record.control.depends,
+        }) |maybe_relation| {
+            const dependency = maybe_relation orelse continue;
+            for (dependency.value.groups) |group| {
+                var all_alternatives_found = true;
+                var satisfied = false;
+                for (group.alternatives) |alternative| {
+                    const state = finalAlternativeState(
+                        plan.actions,
+                        installed,
+                        repositories,
+                        alternative,
+                    );
+                    if (!state.found) {
+                        all_alternatives_found = false;
+                        continue;
+                    }
+                    if (state.satisfied) {
+                        satisfied = true;
+                        break;
+                    }
+                }
+                if (!satisfied and all_alternatives_found)
+                    return try std.fmt.allocPrint(
+                        allocator,
+                        "{s} dependency is unsatisfied by the final installed identity: {s}",
+                        .{
+                            action.package,
+                            group.span.slice(dependency.source),
+                        },
+                    );
+            }
+        }
+    }
+    return null;
+}
+
+const AlternativeState = struct {
+    found: bool = false,
+    satisfied: bool = false,
+};
+
+fn finalAlternativeState(
+    actions: []const solver.PlanAction,
+    installed: []const dpkg_status.Package,
+    repositories: []const solver.RepositoryInput,
+    alternative: @import("relation.zig").Alternative,
+) AlternativeState {
+    if (alternative.package.architecture_qualifier != null or
+        alternative.restrictions.architectures != null or
+        alternative.restrictions.build_profiles.len != 0)
+        return .{};
+    const name = alternative.package.name.text;
+    for (actions) |action| {
+        if (!std.mem.eql(u8, action.package, name)) continue;
+        if (action.kind == .remove) return .{ .found = true };
+        return .{
+            .found = true,
+            .satisfied = alternative.version == null or
+                versionSatisfies(action.version, alternative.version.?),
+        };
+    }
+    for (installed) |package| {
+        if (package.status.isFullyInstalled() and
+            std.mem.eql(u8, package.name.value, name))
+            return .{
+                .found = true,
+                .satisfied = alternative.version == null or
+                    versionSatisfies(
+                        package.version.spelling.value,
+                        alternative.version.?,
+                    ),
+            };
+    }
+
+    var found_provider = false;
+    for (actions) |action| {
+        if (action.kind == .remove) continue;
+        const origin = authenticatedPackageOrigin(action.selected_origin_v2 orelse
+            continue) catch continue;
+        const repository = findRepositoryInput(repositories, origin.repository_id) orelse
+            continue;
+        const record = repository.packages.records[origin.record_index];
+        if (record.control.provides) |provides| {
+            const state = providedAlternativeState(
+                provides.value,
+                name,
+                alternative.version,
+            );
+            found_provider = found_provider or state.found;
+            if (state.satisfied) return state;
+        }
+    }
+    for (installed) |package| {
+        if (!package.status.isFullyInstalled() or
+            planChangesPackage(actions, package.name.value))
+            continue;
+        if (package.relation(.provides)) |provides| {
+            const state = providedAlternativeState(
+                provides.relation,
+                name,
+                alternative.version,
+            );
+            found_provider = found_provider or state.found;
+            if (state.satisfied) return state;
+        }
+    }
+    return .{ .found = found_provider };
+}
+
+fn providedAlternativeState(
+    provides: @import("relation.zig").Relation,
+    name: []const u8,
+    constraint: ?@import("relation.zig").VersionConstraint,
+) AlternativeState {
+    var found = false;
+    for (provides.groups) |group| {
+        for (group.alternatives) |provided| {
+            if (!std.mem.eql(u8, provided.package.name.text, name)) continue;
+            found = true;
+            if (constraint == null) return .{ .found = true, .satisfied = true };
+            const provided_version = provided.version orelse continue;
+            if (versionSatisfies(provided_version.version.text, constraint.?))
+                return .{ .found = true, .satisfied = true };
+        }
+    }
+    return .{ .found = found };
+}
+
+fn planChangesPackage(actions: []const solver.PlanAction, name: []const u8) bool {
+    for (actions) |action| {
+        if (std.mem.eql(u8, action.package, name)) return true;
+    }
+    return false;
+}
+
+fn versionSatisfies(
+    actual_text: []const u8,
+    constraint: @import("relation.zig").VersionConstraint,
+) bool {
+    const actual = debian_version.DebianVersion.parse(actual_text) catch return false;
+    const expected = debian_version.DebianVersion.parse(constraint.version.text) catch
+        return false;
+    return switch (constraint.operator) {
+        .less_than => actual.order(expected) == .lt,
+        .less_than_or_equal => actual.order(expected) != .gt,
+        .equal => actual.order(expected) == .eq,
+        .greater_than_or_equal => actual.order(expected) != .lt,
+        .greater_than => actual.order(expected) == .gt,
+    };
+}
+
 fn findRetainedOrigin(
     repositories: []const solver.RepositoryInput,
     name: []const u8,
@@ -1402,6 +2423,274 @@ fn findSnapshot(
     return null;
 }
 
+fn writeRecoveryProvenanceV2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: api.Request,
+    refreshed: *repository_policy.RefreshResult,
+    lock: exact_lock_v2.Lock,
+    report: transaction_executor.RecoveryReport,
+    status: transaction_recovery.StatusReader,
+    verify: *transaction_provenance_v2.VerifyDiagnostic,
+    output_path: ?[]const u8,
+) !void {
+    const repositories = try allocator.alloc(
+        transaction_provenance_v2.RepositoryEvidence,
+        lock.repositories.len,
+    );
+    for (lock.repositories, 0..) |locked, index| {
+        const snapshot = findSnapshot(refreshed.snapshots, locked.id) orelse
+            return error.MissingRepository;
+        const evidence = snapshot.snapshot.provenance.authentication_evidence;
+        const signers = try allocator.alloc([20]u8, evidence.signatures.len);
+        var signer_count: usize = 0;
+        for (evidence.signatures) |signature| {
+            if (signature.primary_fingerprint) |fingerprint| {
+                signers[signer_count] = fingerprint;
+                signer_count += 1;
+            }
+        }
+        repositories[index] = .{
+            .source_config_id = locked.id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+            .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+            .signature_sha256 = if (evidence.signature_digest) |digest|
+                digest.bytes
+            else
+                null,
+            .metadata_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+            .signer_fingerprints = signers[0..signer_count],
+            .signature_verified = true,
+        };
+    }
+    const packages = try allocator.alloc(
+        transaction_provenance_v2.PackageEvidence,
+        lock.packages.len,
+    );
+    for (lock.packages, 0..) |package, index| packages[index] = .{
+        .name = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .origin = package.origin,
+        .package_sha256 = package.sha256,
+        .cas_sha256 = package.sha256,
+        .declared_size = package.declared_size,
+    };
+    try transaction_provenance_v2.verifyLockEvidence(
+        allocator,
+        lock,
+        repositories,
+        packages,
+        verify,
+    );
+    var status_digest: ?[32]u8 = null;
+    var status_bytes: ?[]u8 = null;
+    defer if (status_bytes) |bytes| allocator.free(bytes);
+    if (report.succeeded()) {
+        status_bytes = try status.read(
+            allocator,
+            request.options.install_root,
+            64 * 1024 * 1024,
+        );
+        status_digest = sha256Bytes(status_bytes.?);
+    }
+    var provenance = try transaction_provenance_v2.createFromRecovery(
+        allocator,
+        .{
+            .exact_lock = &lock,
+            .target_architecture = request.options.architecture,
+            .request_sha256 = lock.request_sha256,
+            .solver_policy_sha256 = lock.policy_sha256,
+            .repositories = repositories,
+            .packages = packages,
+            .journal_steps = &.{},
+            .final_verification = .{
+                .status = if (report.succeeded()) .exact_match else .not_run,
+                .installed_state_sha256 = status_digest,
+                .package_origins_sha256 = if (report.succeeded())
+                    lock.digest_sha256
+                else
+                    null,
+                .detail = if (report.succeeded())
+                    "recovery and exact-lock verification completed"
+                else
+                    "recovery failed; exact transaction evidence retained",
+            },
+        },
+        report,
+    );
+    defer provenance.deinit();
+    try writeFreshnessProvenance(
+        allocator,
+        io,
+        request.options.state_path,
+        output_path,
+        refreshed,
+        lock,
+        provenance.result,
+    );
+}
+
+fn writeExecutionProvenanceV2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: api.Request,
+    refreshed: *repository_policy.RefreshResult,
+    lock: exact_lock_v2.Lock,
+    report: transaction_executor.Report,
+    status: transaction_recovery.StatusReader,
+    verify: *transaction_provenance_v2.VerifyDiagnostic,
+    output_path: ?[]const u8,
+) !void {
+    const repositories = try allocator.alloc(
+        transaction_provenance_v2.RepositoryEvidence,
+        lock.repositories.len,
+    );
+    for (lock.repositories, 0..) |locked, index| {
+        const snapshot = findSnapshot(refreshed.snapshots, locked.id) orelse
+            return error.MissingRepository;
+        const evidence = snapshot.snapshot.provenance.authentication_evidence;
+        const signers = try allocator.alloc([20]u8, evidence.signatures.len);
+        var signer_count: usize = 0;
+        for (evidence.signatures) |signature| {
+            if (signature.primary_fingerprint) |fingerprint| {
+                signers[signer_count] = fingerprint;
+                signer_count += 1;
+            }
+        }
+        repositories[index] = .{
+            .source_config_id = locked.id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+            .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+            .signature_sha256 = if (evidence.signature_digest) |digest|
+                digest.bytes
+            else
+                null,
+            .metadata_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+            .signer_fingerprints = signers[0..signer_count],
+            .signature_verified = true,
+        };
+    }
+    const packages = try allocator.alloc(
+        transaction_provenance_v2.PackageEvidence,
+        lock.packages.len,
+    );
+    for (lock.packages, 0..) |package, index| packages[index] = .{
+        .name = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .origin = package.origin,
+        .package_sha256 = package.sha256,
+        .cas_sha256 = package.sha256,
+        .declared_size = package.declared_size,
+    };
+    try transaction_provenance_v2.verifyLockEvidence(
+        allocator,
+        lock,
+        repositories,
+        packages,
+        verify,
+    );
+    var status_digest: ?[32]u8 = null;
+    var status_bytes: ?[]u8 = null;
+    defer if (status_bytes) |bytes| allocator.free(bytes);
+    if (report.succeeded()) {
+        status_bytes = try status.read(
+            allocator,
+            request.options.install_root,
+            64 * 1024 * 1024,
+        );
+        status_digest = sha256Bytes(status_bytes.?);
+    }
+    var provenance = try transaction_provenance_v2.createFromExecution(
+        allocator,
+        .{
+            .exact_lock = &lock,
+            .target_architecture = request.options.architecture,
+            .request_sha256 = lock.request_sha256,
+            .solver_policy_sha256 = lock.policy_sha256,
+            .repositories = repositories,
+            .packages = packages,
+            .journal_steps = &.{},
+            .final_verification = .{
+                .status = if (report.succeeded()) .exact_match else .not_run,
+                .installed_state_sha256 = status_digest,
+                .package_origins_sha256 = if (report.succeeded())
+                    lock.digest_sha256
+                else
+                    null,
+                .detail = if (report.succeeded())
+                    "executor and exact-lock verification completed"
+                else
+                    "executor failed; recovery evidence retained",
+            },
+        },
+        report,
+    );
+    defer provenance.deinit();
+    try writeFreshnessProvenance(
+        allocator,
+        io,
+        request.options.state_path,
+        output_path,
+        refreshed,
+        lock,
+        provenance.result,
+    );
+}
+
+fn writeFreshnessProvenance(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    output_path: ?[]const u8,
+    refreshed: *repository_policy.RefreshResult,
+    lock: exact_lock_v2.Lock,
+    execution: transaction_provenance_v2.Result,
+) !void {
+    const refresh_evidence = try allocator.alloc(
+        transaction_provenance_v3.RepositoryRefreshEvidence,
+        lock.repositories.len,
+    );
+    defer allocator.free(refresh_evidence);
+    for (lock.repositories, 0..) |locked, index| {
+        const snapshot = findSnapshot(refreshed.snapshots, locked.id) orelse
+            return error.MissingRepository;
+        const policy = snapshot.snapshot.provenance.policy;
+        refresh_evidence[index] = .{
+            .source_config_id = locked.id,
+            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+            .signed_release_date_unix = policy.release_date_unix,
+            .valid_until_unix = policy.valid_until_unix,
+            .verification_time_unix = policy.verification_time_unix,
+            .observed_release_age_seconds = policy.observed_release_age_seconds,
+            .expiry_policy = policy.expiry_policy,
+            .maximum_release_age_seconds = policy.maximum_release_age_seconds,
+            .missing_valid_until_exception_exercised = policy.missing_valid_until_exception_exercised,
+            .selected_packages_path = snapshot.snapshot.provenance.selected_path,
+            .compression = snapshot.snapshot.provenance.compression,
+        };
+    }
+    var complete_provenance = try transaction_provenance_v3.create(
+        allocator,
+        execution,
+        refresh_evidence,
+    );
+    defer complete_provenance.deinit();
+    const directory_path = if (output_path) |path|
+        std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath
+    else
+        state_path;
+    const name = if (output_path) |path|
+        std.fs.path.basename(path)
+    else
+        "transaction-result-v3.json";
+    var dir = try openAbsoluteDirectory(io, directory_path);
+    defer dir.close(io);
+    const store = try transaction_provenance_v3.Store.init(io, dir, name);
+    try store.writeAtomic(allocator, complete_provenance.result);
+}
+
 fn writeExecutionProvenance(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1411,6 +2700,7 @@ fn writeExecutionProvenance(
     report: transaction_executor.Report,
     status: transaction_recovery.StatusReader,
     verify: *transaction_provenance.VerifyDiagnostic,
+    output_path: ?[]const u8,
 ) !void {
     // The lock records only repositories that actually supplied a package, so the
     // evidence has to be drawn from the lock rather than from every refreshed
@@ -1468,9 +2758,17 @@ fn writeExecutionProvenance(
         },
     }, report);
     defer provenance.deinit();
-    var dir = try openAbsoluteDirectory(io, request.options.state_path);
+    const directory_path = if (output_path) |path|
+        std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath
+    else
+        request.options.state_path;
+    const name = if (output_path) |path|
+        std.fs.path.basename(path)
+    else
+        "transaction-result.json";
+    var dir = try openAbsoluteDirectory(io, directory_path);
     defer dir.close(io);
-    const store = try transaction_provenance.Store.init(io, dir, "transaction-result.json");
+    const store = try transaction_provenance.Store.init(io, dir, name);
     try store.writeAtomic(allocator, provenance.result);
 }
 
@@ -1622,6 +2920,12 @@ fn findNormalized(
 
 fn fixedNow(context: ?*anyopaque) i64 {
     return @as(*const i64, @ptrCast(@alignCast(context.?))).*;
+}
+
+fn sha256Bytes(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
 }
 
 fn realNow(io: std.Io) i64 {

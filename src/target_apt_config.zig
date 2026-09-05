@@ -6,8 +6,8 @@ const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
 
-pub const schema_id = "https://debz.dev/schema/apt-config-snapshot-v1";
-pub const schema_version: u32 = 1;
+pub const schema_id = "https://debz.dev/schema/apt-config-snapshot-v2";
+pub const schema_version: u32 = 2;
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
 
 const sources_list_path = "/etc/apt/sources.list";
@@ -146,14 +146,59 @@ pub const Request = struct {
     /// filesystem adapter owns logical-to-physical root mapping.
     root_path: []const u8,
     architecture_override: ?[]const u8 = null,
+    source_policies: []const SourcePolicy = &.{},
     limits: Limits = .{},
     dependencies: Dependencies,
+};
+
+pub const RecordedRequest = struct {
+    root_path: []const u8,
+    manifest: Manifest,
+    limits: Limits = .{},
+    dependencies: Dependencies,
+};
+
+pub const ArchitectureRequest = struct {
+    root_path: []const u8,
+    architecture_override: ?[]const u8 = null,
+    limits: Limits = .{},
+    dependencies: Dependencies,
+};
+
+pub fn discoverNativeArchitecture(
+    allocator: std.mem.Allocator,
+    request: ArchitectureRequest,
+) ![]u8 {
+    if (!validRootPath(request.root_path) or
+        request.dependencies.filesystem.host_root !=
+            std.mem.eql(u8, request.root_path, "/"))
+        return error.InvalidRootPath;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const architecture = try discoverArchitecture(arena.allocator(), allocator, .{
+        .root_path = request.root_path,
+        .architecture_override = request.architecture_override,
+        .limits = request.limits,
+        .dependencies = request.dependencies,
+    });
+    return allocator.dupe(u8, architecture.native);
+}
+
+pub const SourcePolicy = struct {
+    logical_path: []const u8,
+    freshness: repository_refresh.ExpiryPolicy,
 };
 
 pub const SourceRecord = struct {
     logical_path: []const u8,
     sha256: [32]u8,
     format: source.Format,
+    freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
+};
+
+pub const RepositoryPolicyRecord = struct {
+    repository_id: [64]u8,
+    freshness: repository_refresh.ExpiryPolicy,
 };
 
 pub const KeyringUse = enum {
@@ -187,6 +232,7 @@ pub const Manifest = struct {
     sources: []const SourceRecord,
     configuration_id: [64]u8,
     repository_ids: []const [64]u8,
+    repository_policies: []const RepositoryPolicyRecord = &.{},
     keyrings: []const KeyringRecord,
     global_trust_compatibility: bool,
     exclusions: []const Exclusion,
@@ -208,11 +254,20 @@ fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
         if (!validArchitecture(architecture)) return error.InvalidArchitecture;
     }
     for (manifest.sources) |record| {
-        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+        if (!validLogicalPath(record.logical_path) or
+            !repository_refresh.validExpiryPolicy(record.freshness))
+            return error.InvalidPath;
     }
     if (!validLowerHex(&manifest.configuration_id)) return error.InvalidIdentity;
     for (manifest.repository_ids) |id| {
         if (!validLowerHex(&id)) return error.InvalidIdentity;
+    }
+    if (manifest.repository_policies.len != manifest.repository_ids.len)
+        return error.InvalidIdentity;
+    for (manifest.repository_policies, manifest.repository_ids) |policy, id| {
+        if (!std.mem.eql(u8, &policy.repository_id, &id) or
+            !repository_refresh.validExpiryPolicy(policy.freshness))
+            return error.InvalidIdentity;
     }
     for (manifest.keyrings) |record| {
         if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
@@ -341,6 +396,7 @@ pub const ManifestInput = struct {
     sources: []const SourceRecord,
     configuration_id: [64]u8,
     repository_ids: []const [64]u8,
+    repository_policies: []const RepositoryPolicyRecord = &.{},
     keyrings: []const KeyringRecord,
     global_trust_compatibility: bool,
     exclusions: []const Exclusion,
@@ -358,6 +414,7 @@ pub const ValidationError = error{
     DuplicateSource,
     DuplicateKeyring,
     DuplicateRepository,
+    DuplicateSourcePolicy,
     DuplicateExclusion,
     MissingFingerprint,
     DuplicateFingerprint,
@@ -367,8 +424,11 @@ pub const ImportError = error{
     InvalidRootPath,
     TooManySources,
     SourceMaterialTooLarge,
+    SourceDigestMismatch,
     TooManyKeyrings,
     KeyringMaterialTooLarge,
+    KeyringDigestMismatch,
+    KeyringFingerprintMismatch,
     TooManyKeyringPackets,
     TooManyKeyringKeys,
     TooManyExclusions,
@@ -411,6 +471,15 @@ pub fn snapshot(
     if (request.dependencies.filesystem.host_root !=
         std.mem.eql(u8, request.root_path, "/"))
         return error.InvalidRootPath;
+    for (request.source_policies, 0..) |policy, index| {
+        if (!validLogicalPath(policy.logical_path) or
+            !repository_refresh.validExpiryPolicy(policy.freshness))
+            return error.InvalidRootPath;
+        for (request.source_policies[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.logical_path, policy.logical_path))
+                return error.DuplicateSourcePolicy;
+        }
+    }
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -426,6 +495,10 @@ pub fn snapshot(
     for (source_materials, 0..) |material, index| documents[index] = .{
         .bytes = material.bytes,
         .format = material.format,
+        .policy = .{ .freshness = sourceFreshness(
+            request.source_policies,
+            material.logical_path,
+        ) },
     };
     var repository_limits = request.limits.repository;
     repository_limits.source = request.limits.source;
@@ -563,11 +636,23 @@ pub fn snapshot(
         .logical_path = material.logical_path,
         .sha256 = material.sha256,
         .format = material.format,
+        .freshness = documents[index].policy.freshness,
     };
     const repository_ids = try allocator.alloc([64]u8, configuration.repositories.len);
     defer allocator.free(repository_ids);
     for (configuration.repositories, 0..) |repository, index|
         repository_ids[index] = repository.id.bytes;
+    const repository_policies = try allocator.alloc(
+        RepositoryPolicyRecord,
+        configuration.repositories.len,
+    );
+    defer allocator.free(repository_policies);
+    for (configuration.repositories, 0..) |repository, index| {
+        repository_policies[index] = .{
+            .repository_id = repository.id.bytes,
+            .freshness = repository.freshness,
+        };
+    }
     const keyring_records = try allocator.alloc(KeyringRecord, keyring_materials.items.len);
     defer allocator.free(keyring_records);
     for (keyring_materials.items, 0..) |material, index| keyring_records[index] = .{
@@ -583,6 +668,7 @@ pub fn snapshot(
         .sources = source_records,
         .configuration_id = configuration.identity.bytes,
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyring_records,
         .global_trust_compatibility = global_trust,
         .exclusions = exclusions.items,
@@ -594,6 +680,198 @@ pub fn snapshot(
         .manifest = manifest,
         .source_materials = source_materials,
         .keyring_materials = try owned.dupe(KeyringMaterial, keyring_materials.items),
+        .verifier_limits = request.limits.keyring,
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+}
+
+/// Re-opens only the source and keyring files named by a recorded manifest.
+/// Every leaf is no-follow through the supplied root-scoped filesystem, and
+/// every byte digest and normalized repository policy is revalidated.
+pub fn loadRecordedSnapshot(
+    allocator: std.mem.Allocator,
+    request: RecordedRequest,
+) !Snapshot {
+    if (!validRootPath(request.root_path) or
+        request.dependencies.filesystem.host_root !=
+            std.mem.eql(u8, request.root_path, "/"))
+        return error.InvalidRootPath;
+    try validateSerializableManifest(request.manifest);
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const architecture = try discoverArchitecture(owned, allocator, .{
+        .root_path = request.root_path,
+        .architecture_override = request.manifest.native_architecture,
+        .limits = request.limits,
+        .dependencies = request.dependencies,
+    });
+    if (!std.mem.eql(
+        u8,
+        architecture.native,
+        request.manifest.native_architecture,
+    )) return error.InvalidArchitecture;
+
+    const source_materials = try owned.alloc(SourceMaterial, request.manifest.sources.len);
+    var total_source_bytes: usize = 0;
+    for (request.manifest.sources, 0..) |record, index| {
+        const bytes = request.dependencies.filesystem.readFile(
+            allocator,
+            record.logical_path,
+            request.limits.source.max_input_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.MalformedSource,
+            error.Symlink => return error.SymlinkedSource,
+            error.NotRegular => return error.SourceNotRegular,
+            error.UnsafePath => return error.UnsafeSourcePath,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        total_source_bytes = std.math.add(
+            usize,
+            total_source_bytes,
+            bytes.len,
+        ) catch return error.SourceMaterialTooLarge;
+        if (total_source_bytes > request.limits.max_source_material_bytes)
+            return error.SourceMaterialTooLarge;
+        if (!std.mem.eql(u8, &sha256(bytes), &record.sha256))
+            return error.SourceDigestMismatch;
+        source_materials[index] = .{
+            .logical_path = try owned.dupe(u8, record.logical_path),
+            .bytes = try owned.dupe(u8, bytes),
+            .sha256 = record.sha256,
+            .format = record.format,
+        };
+    }
+
+    const documents = try allocator.alloc(
+        repository_policy.SourceDocument,
+        source_materials.len,
+    );
+    defer allocator.free(documents);
+    for (source_materials, request.manifest.sources, 0..) |material, record, index| {
+        documents[index] = .{
+            .bytes = material.bytes,
+            .format = material.format,
+            .policy = .{ .freshness = record.freshness },
+        };
+    }
+    var repository_limits = request.limits.repository;
+    repository_limits.source = request.limits.source;
+    const normalized = try repository_policy.normalizeBinaryRefresh(
+        allocator,
+        documents,
+        request.manifest.native_architecture,
+        repository_limits,
+    );
+    var configuration = switch (normalized) {
+        .diagnostic => return error.MalformedSource,
+        .configuration => |value| value,
+    };
+    errdefer configuration.deinit();
+    if (!std.mem.eql(
+        u8,
+        configuration.identity.slice(),
+        &request.manifest.configuration_id,
+    ) or configuration.repositories.len != request.manifest.repository_policies.len)
+        return error.DigestMismatch;
+    for (configuration.repositories, request.manifest.repository_policies) |repository, policy| {
+        if (!std.mem.eql(u8, repository.id.slice(), &policy.repository_id) or
+            !repository_refresh.expiryPoliciesEqual(
+                repository.freshness,
+                policy.freshness,
+            ))
+            return error.DigestMismatch;
+    }
+
+    const keyring_materials = try owned.alloc(
+        KeyringMaterial,
+        request.manifest.keyrings.len,
+    );
+    var total_keyring_bytes: usize = 0;
+    var inspection_totals: openpgp.KeyringInspectionTotals = .{};
+    for (request.manifest.keyrings, 0..) |record, index| {
+        const bytes = request.dependencies.filesystem.readFile(
+            allocator,
+            record.logical_path,
+            request.limits.keyring.max_keyring_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.MissingKeyring,
+            error.Symlink => return error.SymlinkedKeyring,
+            error.NotRegular => return error.KeyringNotRegular,
+            error.UnsafePath => return error.UnsafeKeyringPath,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        total_keyring_bytes = std.math.add(
+            usize,
+            total_keyring_bytes,
+            bytes.len,
+        ) catch return error.KeyringMaterialTooLarge;
+        if (total_keyring_bytes > request.limits.max_keyring_material_bytes)
+            return error.KeyringMaterialTooLarge;
+        if (!std.mem.eql(u8, &sha256(bytes), &record.sha256))
+            return error.KeyringDigestMismatch;
+        var inspected = openpgp.inspectKeyringWithTotals(
+            allocator,
+            bytes,
+            request.limits.keyring,
+            &inspection_totals,
+        ) catch |err| switch (err) {
+            error.KeyringTooLarge => return error.KeyringMaterialTooLarge,
+            error.TooManyPackets => return error.TooManyKeyringPackets,
+            error.TooManyKeys => return error.TooManyKeyringKeys,
+            error.UnsupportedKeyringArmor => return error.UnsupportedKeyringArmor,
+            error.UnsupportedKeyMaterial => return error.UnsupportedKeyMaterial,
+            error.UnsupportedKeySize => return error.UnsupportedKeySize,
+            error.NoSupportedPrimaryKeys => return error.NoSupportedPrimaryKeys,
+            error.MalformedKeyring => return error.MalformedKeyring,
+            else => return err,
+        };
+        defer inspected.deinit(allocator);
+        if (!equalFingerprints(
+            inspected.primary_fingerprints,
+            record.primary_fingerprints,
+        )) return error.KeyringFingerprintMismatch;
+        keyring_materials[index] = .{
+            .logical_path = try owned.dupe(u8, record.logical_path),
+            .bytes = try owned.dupe(u8, bytes),
+            .sha256 = record.sha256,
+            .primary_fingerprints = try owned.dupe(
+                [20]u8,
+                record.primary_fingerprints,
+            ),
+            .use = record.use,
+        };
+    }
+
+    var manifest = try createManifest(allocator, .{
+        .native_architecture = request.manifest.native_architecture,
+        .foreign_architectures = request.manifest.foreign_architectures,
+        .sources = request.manifest.sources,
+        .configuration_id = request.manifest.configuration_id,
+        .repository_ids = request.manifest.repository_ids,
+        .repository_policies = request.manifest.repository_policies,
+        .keyrings = request.manifest.keyrings,
+        .global_trust_compatibility = request.manifest.global_trust_compatibility,
+        .exclusions = request.manifest.exclusions,
+    });
+    errdefer manifest.deinit();
+    if (!std.mem.eql(
+        u8,
+        &manifest.manifest.digest_sha256,
+        &request.manifest.digest_sha256,
+    )) return error.DigestMismatch;
+
+    return .{
+        .configuration = configuration,
+        .manifest = manifest,
+        .source_materials = source_materials,
+        .keyring_materials = keyring_materials,
         .verifier_limits = request.limits.keyring,
         .arena = arena,
         .backing_allocator = allocator,
@@ -646,6 +924,7 @@ fn discoverSources(
             .symlink => return error.SymlinkedSource,
             else => return error.SourceNotRegular,
         }
+
         const path = try joinLogical(allocator, sources_directory_path, entry.name);
         defer allocator.free(path);
         try appendSourceIfPresent(
@@ -661,6 +940,17 @@ fn discoverSources(
     if (materials.items.len > request.limits.max_sources) return error.TooManySources;
     std.mem.sort(SourceMaterial, materials.items, {}, lessSourceMaterial);
     return owned.dupe(SourceMaterial, materials.items);
+}
+
+fn sourceFreshness(
+    policies: []const SourcePolicy,
+    logical_path: []const u8,
+) repository_refresh.ExpiryPolicy {
+    for (policies) |policy| {
+        if (std.mem.eql(u8, policy.logical_path, logical_path))
+            return policy.freshness;
+    }
+    return .require_valid_until;
 }
 
 fn appendSourceIfPresent(
@@ -999,7 +1289,9 @@ pub fn createManifest(
 
     const sources = try owned.alloc(SourceRecord, input.sources.len);
     for (input.sources, 0..) |record, index| {
-        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+        if (!validLogicalPath(record.logical_path) or
+            !repository_refresh.validExpiryPolicy(record.freshness))
+            return error.InvalidPath;
         sources[index] = record;
         sources[index].logical_path = try owned.dupe(u8, record.logical_path);
     }
@@ -1016,6 +1308,31 @@ pub fn createManifest(
         if (!validLowerHex(&id)) return error.InvalidIdentity;
         if (index != 0 and std.mem.eql(u8, &id, &repository_ids[index - 1]))
             return error.DuplicateRepository;
+    }
+    const repository_policies = try owned.alloc(
+        RepositoryPolicyRecord,
+        repository_ids.len,
+    );
+    if (input.repository_policies.len == 0) {
+        for (repository_ids, 0..) |id, index| repository_policies[index] = .{
+            .repository_id = id,
+            .freshness = .require_valid_until,
+        };
+    } else {
+        if (input.repository_policies.len != repository_ids.len)
+            return error.InvalidIdentity;
+        @memcpy(repository_policies, input.repository_policies);
+        std.mem.sort(
+            RepositoryPolicyRecord,
+            repository_policies,
+            {},
+            lessRepositoryPolicy,
+        );
+        for (repository_policies, repository_ids) |policy, id| {
+            if (!std.mem.eql(u8, &policy.repository_id, &id) or
+                !repository_refresh.validExpiryPolicy(policy.freshness))
+                return error.InvalidIdentity;
+        }
     }
 
     const keyrings = try owned.alloc(KeyringRecord, input.keyrings.len);
@@ -1062,6 +1379,7 @@ pub fn createManifest(
         .sources = sources,
         .configuration_id = input.configuration_id,
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyrings,
         .global_trust_compatibility = input.global_trust_compatibility,
         .exclusions = exclusions,
@@ -1071,10 +1389,26 @@ pub fn createManifest(
     return .{ .manifest = manifest, .arena = arena, .backing_allocator = allocator };
 }
 
+const FreshnessMode = enum {
+    require_valid_until,
+    allow_missing_valid_until_with_max_age_seconds,
+};
+
+const WireFreshness = struct {
+    mode: FreshnessMode,
+    maximum_release_age_seconds: ?u64,
+};
+
 const WireSource = struct {
     logical_path: []const u8,
     sha256: []const u8,
     format: source.Format,
+    freshness: WireFreshness,
+};
+
+const WireRepositoryPolicy = struct {
+    repository_id: []const u8,
+    freshness: WireFreshness,
 };
 
 const WireKeyring = struct {
@@ -1097,6 +1431,7 @@ const WireManifest = struct {
     sources: []const WireSource,
     configuration_id: []const u8,
     repository_ids: []const []const u8,
+    repository_policies: []const WireRepositoryPolicy,
     keyrings: []const WireKeyring,
     global_trust_compatibility: bool,
     exclusions: []const WireExclusion,
@@ -1125,11 +1460,23 @@ pub fn decodeManifest(
         .logical_path = record.logical_path,
         .sha256 = try parseHex(32, record.sha256),
         .format = record.format,
+        .freshness = try parseFreshness(record.freshness),
     };
     const repository_ids = try allocator.alloc([64]u8, parsed.value.repository_ids.len);
     defer allocator.free(repository_ids);
     for (parsed.value.repository_ids, 0..) |id, index|
         repository_ids[index] = try parseId(id);
+    const repository_policies = try allocator.alloc(
+        RepositoryPolicyRecord,
+        parsed.value.repository_policies.len,
+    );
+    defer allocator.free(repository_policies);
+    for (parsed.value.repository_policies, 0..) |policy, index| {
+        repository_policies[index] = .{
+            .repository_id = try parseId(policy.repository_id),
+            .freshness = try parseFreshness(policy.freshness),
+        };
+    }
     const keyrings = try allocator.alloc(KeyringRecord, parsed.value.keyrings.len);
     var keyrings_initialized: usize = 0;
     defer {
@@ -1163,6 +1510,7 @@ pub fn decodeManifest(
         .sources = sources,
         .configuration_id = try parseId(parsed.value.configuration_id),
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyrings,
         .global_trust_compatibility = parsed.value.global_trust_compatibility,
         .exclusions = exclusions,
@@ -1523,6 +1871,8 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         try writeHexString(writer, &record.sha256);
         try writer.writeAll(",\"format\":");
         try writeJsonString(writer, @tagName(record.format));
+        try writer.writeAll(",\"freshness\":");
+        try writeFreshness(writer, record.freshness);
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"configuration_id\":");
@@ -1531,6 +1881,15 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
     for (manifest.repository_ids, 0..) |id, index| {
         if (index != 0) try writer.writeByte(',');
         try writeJsonString(writer, &id);
+    }
+    try writer.writeAll("],\"repository_policies\":[");
+    for (manifest.repository_policies, 0..) |policy, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"repository_id\":");
+        try writeJsonString(writer, &policy.repository_id);
+        try writer.writeAll(",\"freshness\":");
+        try writeFreshness(writer, policy.freshness);
+        try writer.writeByte('}');
     }
     try writer.writeAll("],\"keyrings\":[");
     for (manifest.keyrings, 0..) |record, index| {
@@ -1561,6 +1920,20 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
+}
+
+fn writeFreshness(
+    writer: *std.Io.Writer,
+    freshness: repository_refresh.ExpiryPolicy,
+) !void {
+    try writer.writeAll("{\"mode\":");
+    try writeJsonString(writer, @tagName(freshness));
+    try writer.writeAll(",\"maximum_release_age_seconds\":");
+    if (repository_refresh.expiryPolicyMaxAge(freshness)) |seconds|
+        try writer.print("{d}", .{seconds})
+    else
+        try writer.writeAll("null");
+    try writer.writeByte('}');
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
@@ -1599,6 +1972,24 @@ fn parseId(value: []const u8) ValidationError![64]u8 {
     var result: [64]u8 = undefined;
     @memcpy(&result, value);
     return result;
+}
+
+fn parseFreshness(
+    wire: WireFreshness,
+) ValidationError!repository_refresh.ExpiryPolicy {
+    const policy: repository_refresh.ExpiryPolicy = switch (wire.mode) {
+        .require_valid_until => blk: {
+            if (wire.maximum_release_age_seconds != null)
+                return error.InvalidIdentity;
+            break :blk .require_valid_until;
+        },
+        .allow_missing_valid_until_with_max_age_seconds => .{
+            .allow_missing_valid_until_with_max_age_seconds = wire.maximum_release_age_seconds orelse return error.InvalidIdentity,
+        },
+    };
+    if (!repository_refresh.validExpiryPolicy(policy))
+        return error.InvalidIdentity;
+    return policy;
 }
 
 fn validLowerHex(value: []const u8) bool {
@@ -1704,8 +2095,36 @@ fn lessId(_: void, left: [64]u8, right: [64]u8) bool {
     return std.mem.order(u8, &left, &right) == .lt;
 }
 
+fn lessRepositoryPolicy(
+    _: void,
+    left: RepositoryPolicyRecord,
+    right: RepositoryPolicyRecord,
+) bool {
+    return std.mem.order(
+        u8,
+        &left.repository_id,
+        &right.repository_id,
+    ) == .lt;
+}
+
 fn lessFingerprint(_: void, left: [20]u8, right: [20]u8) bool {
     return std.mem.order(u8, &left, &right) == .lt;
+}
+
+fn equalFingerprints(left: []const [20]u8, right: []const [20]u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, &a, &b)) return false;
+    }
+    return true;
+}
+
+fn equalStrings(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+    return true;
 }
 
 const test_fixture = @import("fixtures/openpgp.zig");
@@ -1887,6 +2306,30 @@ test "target_apt_config deterministic alternate-root import preserves logical id
     });
     defer verified.deinit(std.testing.allocator);
     try std.testing.expect(verified == .accepted);
+
+    var recorded = try loadRecordedSnapshot(std.testing.allocator, .{
+        .root_path = first_path,
+        .manifest = first_snapshot.manifest.manifest,
+        .dependencies = .{ .filesystem = first_files.interface() },
+    });
+    defer recorded.deinit();
+    try std.testing.expectEqualStrings(
+        first_snapshot.configuration.identity.slice(),
+        recorded.configuration.identity.slice(),
+    );
+
+    try first.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/a.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://changed.invalid stable main\n",
+    });
+    try std.testing.expectError(error.SourceDigestMismatch, loadRecordedSnapshot(
+        std.testing.allocator,
+        .{
+            .root_path = first_path,
+            .manifest = first_snapshot.manifest.manifest,
+            .dependencies = .{ .filesystem = first_files.interface() },
+        },
+    ));
 }
 
 test "target_apt_config retains source-only evidence but excludes it from binary refresh" {

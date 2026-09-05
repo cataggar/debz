@@ -8,8 +8,8 @@ const signed_envelope = @import("signed_release_envelope.zig");
 const openpgp = @import("openpgp_verifier.zig");
 const source = @import("source.zig");
 
-const snapshot_magic = "debz-repository-snapshot-v2";
-const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v2" };
+const snapshot_magic = "debz-repository-snapshot-v3";
+const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v3" };
 
 pub const Repository = struct {
     id: source.RepositoryId,
@@ -46,7 +46,36 @@ pub const Compression = enum(u8) {
 
 pub const ByHashFallback = enum { disabled, not_found_only };
 pub const Mode = enum { online, cache_only };
-pub const ExpiryPolicy = enum { require_valid_until, allow_missing_valid_until };
+pub const maximum_missing_valid_until_age_seconds: u64 = 31 * 24 * 60 * 60;
+
+pub const ExpiryPolicy = union(enum) {
+    require_valid_until,
+    allow_missing_valid_until_with_max_age_seconds: u64,
+};
+
+pub fn validExpiryPolicy(policy: ExpiryPolicy) bool {
+    return switch (policy) {
+        .require_valid_until => true,
+        .allow_missing_valid_until_with_max_age_seconds => |seconds| seconds != 0 and seconds <= maximum_missing_valid_until_age_seconds,
+    };
+}
+
+pub fn expiryPolicyMaxAge(policy: ExpiryPolicy) ?u64 {
+    return switch (policy) {
+        .require_valid_until => null,
+        .allow_missing_valid_until_with_max_age_seconds => |seconds| seconds,
+    };
+}
+
+pub fn expiryPoliciesEqual(left: ExpiryPolicy, right: ExpiryPolicy) bool {
+    return switch (left) {
+        .require_valid_until => right == .require_valid_until,
+        .allow_missing_valid_until_with_max_age_seconds => |seconds| switch (right) {
+            .require_valid_until => false,
+            .allow_missing_valid_until_with_max_age_seconds => |other| seconds == other,
+        },
+    };
+}
 
 pub const RefreshPolicy = struct {
     mode: Mode,
@@ -111,8 +140,12 @@ pub const AuthenticationEvidence = struct {
 pub const PolicyDecisions = struct {
     release_date_unix: i64,
     valid_until_unix: ?i64,
+    verification_time_unix: i64,
+    observed_release_age_seconds: u64,
+    expiry_policy: ExpiryPolicy,
+    maximum_release_age_seconds: ?u64,
+    missing_valid_until_exception_exercised: bool,
     future_date_accepted: bool,
-    valid_until_required: bool,
     acquire_by_hash_advertised: bool,
     acquire_by_hash_used: bool,
     fallback_used: bool,
@@ -560,7 +593,10 @@ fn refreshInternal(
         .origin_source = origin_source,
         .compression = selected.compression,
         .future_date_accepted = release_policy.future_date_accepted,
-        .valid_until_required = refresh_policy.expiry_policy == .require_valid_until,
+        .maximum_release_age_seconds = release_policy.maximum_release_age_seconds,
+        .verification_time_unix = release_policy.verification_time,
+        .observed_release_age_seconds = release_policy.observed_age_seconds,
+        .missing_valid_until_exception_exercised = release_policy.missing_valid_until_exception_exercised,
         .by_hash_advertised = advertised,
         .by_hash_used = advertised and !fallback_used,
         .fallback_used = fallback_used,
@@ -622,6 +658,10 @@ const SelectedIndex = struct {
 const ReleasePolicyResult = struct {
     date: i64,
     valid_until: ?i64,
+    verification_time: i64,
+    observed_age_seconds: u64,
+    maximum_release_age_seconds: ?u64,
+    missing_valid_until_exception_exercised: bool,
     future_date_accepted: bool,
 };
 
@@ -636,7 +676,8 @@ fn validateConfiguration(
         acquisition_policy.maximum_signature_bytes == 0 or
         refresh_policy.maximum_compressed_bytes == 0 or
         refresh_policy.maximum_decompressed_bytes == 0 or
-        refresh_policy.maximum_decoder_memory == 0)
+        refresh_policy.maximum_decoder_memory == 0 or
+        !validExpiryPolicy(refresh_policy.expiry_policy))
         return error.InvalidConfiguration;
     if (!validPathToken(repository.suite, false) or
         !validPathToken(repository.component, true) or
@@ -770,8 +811,20 @@ fn validateRelease(
     const future_limit = saturatingAdd(now, policy.maximum_future_seconds);
     if (date > future_limit) return error.ReleaseDateInFuture;
     const valid_until = if (metadata.valid_until) |value| timestampUnix(value.value) else null;
-    if (valid_until == null and policy.expiry_policy == .require_valid_until)
-        return error.ReleaseMissingValidUntil;
+    var exception_exercised = false;
+    const maximum_release_age = expiryPolicyMaxAge(policy.expiry_policy);
+    if (valid_until == null) switch (policy.expiry_policy) {
+        .require_valid_until => return error.ReleaseMissingValidUntil,
+        .allow_missing_valid_until_with_max_age_seconds => |maximum_age| {
+            const maximum_time = std.math.add(
+                i64,
+                date,
+                @intCast(maximum_age),
+            ) catch return error.InvalidConfiguration;
+            if (now > maximum_time) return error.ReleaseExpired;
+            exception_exercised = true;
+        },
+    };
     if (valid_until) |valid| {
         if (valid < date) return error.ReleaseValidityInverted;
         if (now > saturatingAdd(valid, policy.expiry_grace_seconds))
@@ -780,6 +833,10 @@ fn validateRelease(
     return .{
         .date = date,
         .valid_until = valid_until,
+        .verification_time = now,
+        .observed_age_seconds = releaseAgeSeconds(now, date),
+        .maximum_release_age_seconds = maximum_release_age,
+        .missing_valid_until_exception_exercised = exception_exercised,
         .future_date_accepted = date > now,
     };
 }
@@ -956,6 +1013,11 @@ fn saturatingAdd(value: i64, seconds: u64) i64 {
     return std.math.add(i64, value, bounded) catch std.math.maxInt(i64);
 }
 
+fn releaseAgeSeconds(now: i64, date: i64) u64 {
+    if (now <= date) return 0;
+    return @intCast(std.math.sub(i64, now, date) catch std.math.maxInt(i64));
+}
+
 fn timestampUnix(timestamp: release_metadata.Timestamp) i64 {
     const year: i64 = timestamp.year;
     const adjusted_year = year - @intFromBool(timestamp.month <= 2);
@@ -988,7 +1050,10 @@ const SnapshotManifest = struct {
     origin_source: MetadataSource,
     compression: Compression,
     future_date_accepted: bool,
-    valid_until_required: bool,
+    maximum_release_age_seconds: ?u64,
+    verification_time_unix: i64,
+    observed_release_age_seconds: u64,
+    missing_valid_until_exception_exercised: bool,
     by_hash_advertised: bool,
     by_hash_used: bool,
     fallback_used: bool,
@@ -1008,6 +1073,14 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
     try appendInt(&bytes, allocator, i64, manifest.refreshed_at_unix);
     try appendInt(&bytes, allocator, i64, manifest.release_date_unix);
     try appendInt(&bytes, allocator, i64, manifest.valid_until_unix orelse 0);
+    try appendInt(
+        &bytes,
+        allocator,
+        u64,
+        manifest.maximum_release_age_seconds orelse 0,
+    );
+    try appendInt(&bytes, allocator, i64, manifest.verification_time_unix);
+    try appendInt(&bytes, allocator, u64, manifest.observed_release_age_seconds);
     inline for (.{
         manifest.release_bytes.len,
         manifest.index_bytes.len,
@@ -1023,12 +1096,13 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
         @intFromEnum(manifest.compression),
         @intFromBool(manifest.valid_until_unix != null) |
             (@as(u8, @intFromBool(manifest.future_date_accepted)) << 1) |
-            (@as(u8, @intFromBool(manifest.valid_until_required)) << 2) |
+            (@as(u8, @intFromBool(manifest.maximum_release_age_seconds != null)) << 2) |
             (@as(u8, @intFromBool(manifest.by_hash_advertised)) << 3) |
             (@as(u8, @intFromBool(manifest.by_hash_used)) << 4) |
             (@as(u8, @intFromBool(manifest.fallback_used)) << 5) |
             (@as(u8, @intFromBool(manifest.signature_digest != null)) << 6) |
             (@as(u8, @intFromBool(manifest.verification_time != null)) << 7),
+        @intFromBool(manifest.missing_valid_until_exception_exercised),
     });
     try appendInt(&bytes, allocator, u16, @intCast(manifest.signature_results.len));
     try appendInt(
@@ -1083,6 +1157,9 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     const refreshed = reader.int(i64);
     const date = reader.int(i64);
     const valid_raw = reader.int(i64);
+    const maximum_release_age_raw = reader.int(u64);
+    const policy_verification_time = reader.int(i64);
+    const observed_release_age = reader.int(u64);
     const release_len = std.math.cast(usize, reader.int(u64)) orelse
         return error.CorruptSnapshot;
     const index_len = std.math.cast(usize, reader.int(u64)) orelse
@@ -1119,6 +1196,8 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
         else => return error.CorruptSnapshot,
     };
     const flags = reader.byte();
+    const policy_flags = reader.byte();
+    if (policy_flags & 0xfe != 0) return error.CorruptSnapshot;
     const signature_count = reader.int(u16);
     const accepted_raw = reader.int(i32);
     const stored_verification_time = reader.int(i64);
@@ -1170,7 +1249,13 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
         .compression = compression_kind,
         .valid_until_unix = if (flags & 1 != 0) valid_raw else null,
         .future_date_accepted = flags & 2 != 0,
-        .valid_until_required = flags & 4 != 0,
+        .maximum_release_age_seconds = if (flags & 4 != 0)
+            maximum_release_age_raw
+        else
+            null,
+        .verification_time_unix = policy_verification_time,
+        .observed_release_age_seconds = observed_release_age,
+        .missing_valid_until_exception_exercised = policy_flags & 1 != 0,
         .by_hash_advertised = flags & 8 != 0,
         .by_hash_used = flags & 16 != 0,
         .fallback_used = flags & 32 != 0,
@@ -1213,6 +1298,27 @@ fn loadSnapshot(
     var release = try parseRelease(allocator, manifest.release_bytes, policy.release_limits);
     errdefer release.deinit();
     const release_policy = try validateRelease(&release, repository, policy, now);
+    const stored_maximum_age = expiryPolicyMaxAge(policy.expiry_policy);
+    const stored_exception_expected = manifest.valid_until_unix == null and
+        stored_maximum_age != null;
+    if (manifest.observed_release_age_seconds != releaseAgeSeconds(
+        manifest.verification_time_unix,
+        manifest.release_date_unix,
+    ) or
+        manifest.future_date_accepted !=
+            (manifest.release_date_unix > manifest.verification_time_unix) or
+        manifest.maximum_release_age_seconds != stored_maximum_age or
+        manifest.missing_valid_until_exception_exercised != stored_exception_expected)
+        return error.CorruptSnapshot;
+    if (manifest.missing_valid_until_exception_exercised) {
+        const maximum_time = std.math.add(
+            i64,
+            manifest.release_date_unix,
+            @intCast(manifest.maximum_release_age_seconds.?),
+        ) catch return error.CorruptSnapshot;
+        if (manifest.verification_time_unix > maximum_time)
+            return error.CorruptSnapshot;
+    }
     const selected = try selectIndex(&release, repository, policy.compression_order);
     if (!std.mem.eql(u8, selected.entry.path.value, manifest.selected_path) or
         selected.compression != manifest.compression)
@@ -1229,8 +1335,7 @@ fn loadSnapshot(
     );
     errdefer packages.deinit();
     if (manifest.release_date_unix != release_policy.date or
-        manifest.valid_until_unix != release_policy.valid_until or
-        manifest.valid_until_required != (policy.expiry_policy == .require_valid_until))
+        manifest.valid_until_unix != release_policy.valid_until)
         return error.CorruptSnapshot;
     return .{
         .bytes = owned_bytes,
@@ -1261,8 +1366,12 @@ fn loadSnapshot(
             .policy = .{
                 .release_date_unix = release_policy.date,
                 .valid_until_unix = release_policy.valid_until,
+                .verification_time_unix = release_policy.verification_time,
+                .observed_release_age_seconds = release_policy.observed_age_seconds,
+                .expiry_policy = policy.expiry_policy,
+                .maximum_release_age_seconds = release_policy.maximum_release_age_seconds,
+                .missing_valid_until_exception_exercised = release_policy.missing_valid_until_exception_exercised,
                 .future_date_accepted = release_policy.future_date_accepted,
-                .valid_until_required = manifest.valid_until_required,
                 .acquire_by_hash_advertised = manifest.by_hash_advertised,
                 .acquire_by_hash_used = manifest.by_hash_used,
                 .fallback_used = manifest.fallback_used,
@@ -1572,6 +1681,32 @@ fn makeRelease(
         valid_until,
         if (acquire_by_hash) "yes" else "no",
         digest,
+        index_bytes.len,
+        path,
+    });
+}
+
+fn makeReleaseWithoutValidUntil(
+    allocator: std.mem.Allocator,
+    index_bytes: []const u8,
+    path: []const u8,
+    date: []const u8,
+) ![]u8 {
+    var digest_hex: [64]u8 = undefined;
+    cache_module.Digest.of(index_bytes).formatHex(&digest_hex);
+    return std.fmt.allocPrint(allocator,
+        \\Suite: stable
+        \\Codename: bookworm
+        \\Date: {s}
+        \\Architectures: amd64
+        \\Components: main
+        \\Acquire-By-Hash: no
+        \\SHA256:
+        \\ {s} {d} {s}
+        \\
+    , .{
+        date,
+        &digest_hex,
         index_bytes.len,
         path,
     });
@@ -1899,6 +2034,86 @@ test "malformed signed envelope fails explicitly" {
     ));
 }
 
+test "bounded missing Valid-Until policy is explicit and finite" {
+    const allocator = std.testing.allocator;
+    const repository = try testRepository();
+    const inside = try makeReleaseWithoutValidUntil(
+        allocator,
+        test_packages,
+        "main/binary-amd64/Packages",
+        "Fri, 14 Aug 2026 19:58:21 UTC",
+    );
+    defer allocator.free(inside);
+    var inside_metadata = try parseRelease(allocator, inside, .{});
+    defer inside_metadata.deinit();
+
+    var policy = testRefreshPolicy(&.{.uncompressed});
+    try std.testing.expectError(
+        error.ReleaseMissingValidUntil,
+        validateRelease(&inside_metadata, repository, policy, fixedNow(null)),
+    );
+    policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 100,
+    };
+    const accepted = try validateRelease(
+        &inside_metadata,
+        repository,
+        policy,
+        fixedNow(null),
+    );
+    try std.testing.expect(accepted.missing_valid_until_exception_exercised);
+    try std.testing.expectEqual(@as(u64, 99), accepted.observed_age_seconds);
+    try std.testing.expectEqual(@as(?u64, 100), accepted.maximum_release_age_seconds);
+
+    const outside = try makeReleaseWithoutValidUntil(
+        allocator,
+        test_packages,
+        "main/binary-amd64/Packages",
+        "Fri, 14 Aug 2026 19:58:19 UTC",
+    );
+    defer allocator.free(outside);
+    var outside_metadata = try parseRelease(allocator, outside, .{});
+    defer outside_metadata.deinit();
+    try std.testing.expectError(
+        error.ReleaseExpired,
+        validateRelease(&outside_metadata, repository, policy, fixedNow(null)),
+    );
+
+    policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 0,
+    };
+    try std.testing.expect(!validExpiryPolicy(policy.expiry_policy));
+    policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = maximum_missing_valid_until_age_seconds + 1,
+    };
+    try std.testing.expect(!validExpiryPolicy(policy.expiry_policy));
+}
+
+test "Valid-Until remains authoritative under bounded missing-expiry policy" {
+    const allocator = std.testing.allocator;
+    const repository = try testRepository();
+    const release = try makeRelease(
+        allocator,
+        test_packages,
+        "main/binary-amd64/Packages",
+        false,
+        "Thu, 13 Aug 2026 18:00:00 UTC",
+        "Fri, 14 Aug 2026 19:59:59 UTC",
+        null,
+    );
+    defer allocator.free(release);
+    var metadata = try parseRelease(allocator, release, .{});
+    defer metadata.deinit();
+    var policy = testRefreshPolicy(&.{.uncompressed});
+    policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 7 * 24 * 60 * 60,
+    };
+    try std.testing.expectError(
+        error.ReleaseExpired,
+        validateRelease(&metadata, repository, policy, fixedNow(null)),
+    );
+}
+
 test "hermetic file acquisition refreshes a complete snapshot" {
     const allocator = std.testing.allocator;
     const release = try makeRelease(
@@ -1984,6 +2199,18 @@ test "valid compressed refresh is unauthenticated and offline revalidates cache"
     defer cached.deinit();
     try std.testing.expectEqual(MetadataSource.cache, cached.provenance.source);
     try std.testing.expectEqual(@as(usize, 0), offline_fixture.next_response);
+
+    var mismatched_policy = policy;
+    mismatched_policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 7 * 24 * 60 * 60,
+    };
+    try std.testing.expectError(error.CorruptSnapshot, refresh(
+        allocator,
+        repository,
+        testAcquisitionPolicy(),
+        mismatched_policy,
+        testDependencies(&offline_fixture, &cache),
+    ));
 }
 
 test "Acquire-By-Hash and explicit not-found fallback policy" {

@@ -75,12 +75,18 @@ fn decompressGzip(
 ) Error![]u8 {
     if (compressed.len < 2 or compressed[0] != 0x1f or compressed[1] != 0x8b)
         return error.CompressionMismatch;
+    _ = try validateGzipHeader(compressed);
+    if (options.maximum_decoder_memory < std.compress.flate.max_window_len)
+        return error.MemoryLimitExceeded;
 
     var input = std.Io.Reader.fixed(compressed);
-    var decoder: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+    const history = allocator.alloc(u8, std.compress.flate.max_window_len) catch
+        return error.OutOfMemory;
+    defer allocator.free(history);
+    var decoder: std.compress.flate.Decompress = .init(&input, .gzip, history);
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    var scratch: [std.compress.zstd.block_size_max]u8 = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
     while (true) {
         var writer = std.Io.Writer.fixed(&scratch);
         const produced = decoder.reader.stream(
@@ -108,6 +114,38 @@ fn decompressGzip(
         return error.Corrupt;
     if (input.seek != compressed.len) return error.TrailingData;
     return output.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+fn validateGzipHeader(compressed: []const u8) Error!usize {
+    if (compressed.len < 10) return error.Truncated;
+    if (compressed[2] != 8) return error.Unsupported;
+    const flags = compressed[3];
+    if (flags & 0xe0 != 0) return error.Unsupported;
+
+    var offset: usize = 10;
+    if (flags & 0x04 != 0) {
+        if (compressed.len - offset < 2) return error.Truncated;
+        const extra_length = std.mem.readInt(u16, compressed[offset..][0..2], .little);
+        offset += 2;
+        if (extra_length > compressed.len - offset) return error.Truncated;
+        offset += extra_length;
+    }
+    inline for (.{ @as(u8, 0x08), @as(u8, 0x10) }) |flag| {
+        if (flags & flag != 0) {
+            const terminator = std.mem.indexOfScalarPos(u8, compressed, offset, 0) orelse
+                return error.Truncated;
+            offset = terminator + 1;
+        }
+    }
+    if (flags & 0x02 != 0) {
+        if (compressed.len - offset < 2) return error.Truncated;
+        const declared = std.mem.readInt(u16, compressed[offset..][0..2], .little);
+        const computed: u16 = @truncate(std.hash.Crc32.hash(compressed[0..offset]));
+        if (declared != computed) return error.Corrupt;
+        offset += 2;
+    }
+    if (compressed.len - offset < 8) return error.Truncated;
+    return offset;
 }
 
 fn mapFlateError(err: ?std.compress.flate.Decompress.Error) Error {
@@ -242,6 +280,33 @@ const gzip_fixture = [_]u8{
     0x0a, 0x4b, 0x2d, 0x2a, 0xce, 0xcc, 0xcf, 0xb3, 0x52, 0x30, 0xe4, 0x02,
     0x00, 0x83, 0x97, 0xf8, 0x48, 0x19, 0x00, 0x00, 0x00,
 };
+const gzip_named_fixture = [_]u8{
+    0x1f, 0x8b, 0x08, 0x08, 0xe5, 0x70, 0xb1, 0x65, 0x00, 0x03, 0x68, 0x65,
+    0x6c, 0x6c, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0x00, 0xf3, 0x48, 0xcd, 0xc9,
+    0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00, 0xd5, 0xe0,
+    0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00,
+};
+const microsoft_shaped_gzip_fixture = [_]u8{
+    0x1f, 0x8b, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x50, 0x61,
+    0x63, 0x6b, 0x61, 0x67, 0x65, 0x73, 0x00, 0xed, 0xcb, 0x31, 0x0e, 0x82,
+    0x30, 0x00, 0x00, 0xc0, 0xbd, 0xaf, 0xe0, 0x03, 0x12, 0x1a, 0x8d, 0x03,
+    0x9b, 0x3f, 0x60, 0x72, 0x6f, 0x4a, 0xa3, 0xc4, 0xa0, 0xa6, 0xd4, 0x81,
+    0xdf, 0xeb, 0x3b, 0xcc, 0xed, 0x77, 0x53, 0xca, 0x8f, 0x74, 0x2b, 0x63,
+    0xb7, 0xed, 0x6b, 0xae, 0xfb, 0xbb, 0x85, 0x6b, 0xa9, 0xdb, 0xf2, 0x7a,
+    0x8e, 0x5d, 0x1c, 0x8e, 0x7d, 0x8c, 0xfd, 0x70, 0x88, 0xe1, 0x52, 0xf3,
+    0x7d, 0x69, 0x25, 0xb7, 0x4f, 0xfd, 0xd1, 0xb4, 0xce, 0xe7, 0x53, 0x08,
+    0x93, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xea, 0x3f, 0xd7, 0x2f, 0x57, 0xba, 0x40, 0xef, 0x00,
+    0x76, 0x00, 0x00,
+};
+const microsoft_shaped_record =
+    "Package: symcrypt\nVersion: 103.11.0-1\nArchitecture: amd64\n\n";
 const xz_fixture = [_]u8{
     0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46,
     0x02, 0x00, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x74, 0x2f, 0xe5, 0xa3,
@@ -310,6 +375,70 @@ test "deterministic fixtures decompress for every format" {
         defer std.testing.allocator.free(output);
         try std.testing.expectEqualStrings(plain, output);
     }
+}
+
+test "gzip accepts original filenames and preserves history across output chunks" {
+    const named = try decompress(std.testing.allocator, .gzip, &gzip_named_fixture, .{
+        .maximum_compressed_bytes = 256,
+        .maximum_decompressed_bytes = 256,
+    });
+    defer std.testing.allocator.free(named);
+    try std.testing.expectEqualStrings("Hello world\n", named);
+
+    const microsoft = try decompress(
+        std.testing.allocator,
+        .gzip,
+        &microsoft_shaped_gzip_fixture,
+        .{
+            .maximum_compressed_bytes = 1024,
+            .maximum_decompressed_bytes = 64 * 1024,
+            .expected_decompressed_size = microsoft_shaped_record.len * 512,
+        },
+    );
+    defer std.testing.allocator.free(microsoft);
+    try std.testing.expectEqual(@as(usize, microsoft_shaped_record.len * 512), microsoft.len);
+    try std.testing.expectEqualStrings(microsoft_shaped_record, microsoft[0..microsoft_shaped_record.len]);
+    try std.testing.expectEqualStrings(
+        microsoft_shaped_record,
+        microsoft[microsoft.len - microsoft_shaped_record.len ..],
+    );
+}
+
+test "gzip header validation and decoder memory remain bounded" {
+    try std.testing.expectError(error.MemoryLimitExceeded, decompress(
+        std.testing.allocator,
+        .gzip,
+        &gzip_fixture,
+        .{
+            .maximum_compressed_bytes = 256,
+            .maximum_decompressed_bytes = 256,
+            .maximum_decoder_memory = std.compress.flate.max_window_len - 1,
+        },
+    ));
+
+    var reserved = gzip_fixture;
+    reserved[3] |= 0x20;
+    try std.testing.expectError(error.Unsupported, decompress(
+        std.testing.allocator,
+        .gzip,
+        &reserved,
+        .{
+            .maximum_compressed_bytes = 256,
+            .maximum_decompressed_bytes = 256,
+        },
+    ));
+
+    var unterminated_name = gzip_named_fixture;
+    unterminated_name[19] = 'x';
+    try std.testing.expectError(error.Truncated, decompress(
+        std.testing.allocator,
+        .gzip,
+        &unterminated_name,
+        .{
+            .maximum_compressed_bytes = 256,
+            .maximum_decompressed_bytes = 256,
+        },
+    ));
 }
 
 test "limits and expected size reject without partial success" {

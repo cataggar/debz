@@ -17,6 +17,11 @@ on:
         required: true
         type: string
         default: "resolute"
+      live_microsoft_symcrypt:
+        description: "Run the optional live Microsoft Noble SymCrypt acceptance"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -428,6 +433,45 @@ jobs:
           path: .zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}/
           if-no-files-found: ignore
           retention-days: 7
+
+  microsoft-symcrypt-live:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_microsoft_symcrypt
+    name: Live Microsoft SymCrypt (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+      - name: Build debz
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Add Microsoft Noble repository
+        run: |
+          sudo zig-out/bin/debz repo add \
+            --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+      - name: Install SymCrypt OpenSSL integration
+        run: sudo zig-out/bin/debz install symcrypt-openssl --json
+      - name: Verify exact installed packages
+        run: |
+          dpkg-query -W -f='${Package} ${Status}\n' symcrypt symcrypt-openssl |
+            grep -F 'install ok installed'
 
   ubuntu-real-snapshot:
     if: github.event_name == 'workflow_dispatch'

@@ -6,6 +6,7 @@ pub const schema_id = "https://debz.dev/schema/repository-operation-result-v1";
 pub const schema_version: u32 = 1;
 pub const maximum_document_bytes: usize = 1024 * 1024;
 pub const maximum_diagnostics: usize = 8;
+pub const maximum_missing_valid_until_age_seconds: u64 = 31 * 24 * 60 * 60;
 
 pub const Operation = enum {
     add,
@@ -120,6 +121,7 @@ pub const Request = struct {
     descriptor_url: []const u8,
     expected_sha256: ?[32]u8 = null,
     no_refresh: bool = false,
+    missing_valid_until_max_age_seconds: ?u64 = null,
     architecture: ?[]const u8 = null,
     cache: CachePolicy = .{},
     state: StatePolicy = .{},
@@ -289,6 +291,10 @@ pub fn execute(
     }
     if (!validNetworkPolicy(request.network) or
         !validResourcePolicy(request.resources) or
+        (request.missing_valid_until_max_age_seconds != null and
+            (request.missing_valid_until_max_age_seconds.? == 0 or
+                request.missing_valid_until_max_age_seconds.? >
+                    maximum_missing_valid_until_age_seconds)) or
         request.cache.maximum_object_bytes == 0 or
         request.state.lock_wait_ms == 0 or
         request.state.maximum_operation_state_bytes == 0 or
@@ -843,6 +849,34 @@ test "repository API rejects invalid UTF-8 and control-containing absolute paths
         try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
         try std.testing.expectEqual(@as(usize, 0), backend.calls);
     }
+}
+
+test "repository API rejects unbounded missing Valid-Until policy" {
+    var called = false;
+    const Fake = struct {
+        fn run(context: *anyopaque, _: std.mem.Allocator, _: Request) !Result {
+            const flag: *bool = @ptrCast(@alignCast(context));
+            flag.* = true;
+            return complete(.{
+                .exit_status = .success,
+                .summary = "unexpected",
+            });
+        }
+    };
+    const backend: Backend = .{ .context = &called, .executeFn = Fake.run };
+    const zero = try execute(std.testing.allocator, .{
+        .root = "/",
+        .descriptor_url = "https://packages.example/config.deb",
+        .missing_valid_until_max_age_seconds = 0,
+    }, backend);
+    try std.testing.expectEqual(ExitStatus.usage, zero.exit_status);
+    const excessive = try execute(std.testing.allocator, .{
+        .root = "/",
+        .descriptor_url = "https://packages.example/config.deb",
+        .missing_valid_until_max_age_seconds = maximum_missing_valid_until_age_seconds + 1,
+    }, backend);
+    try std.testing.expectEqual(ExitStatus.usage, excessive.exit_status);
+    try std.testing.expect(!called);
 }
 
 test "repository diagnostic enums serialize and exactly match both schemas" {

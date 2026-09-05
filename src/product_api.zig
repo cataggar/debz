@@ -111,6 +111,7 @@ pub const ErrorId = enum {
     planning_failed,
     download_failed,
     transaction_failed,
+    recovery_required,
     recovery_failed,
     lock_verification_failed,
     internal_error,
@@ -128,6 +129,12 @@ pub const Item = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const EvidencePaths = struct {
+    exact_lock: ?[]const u8 = null,
+    provenance: ?[]const u8 = null,
+    recovery: ?[]const u8 = null,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -135,6 +142,7 @@ pub const Result = struct {
     changed: bool = false,
     summary: []const u8,
     items: []const Item = &.{},
+    paths: EvidencePaths = .{},
     diagnostics: [1]Diagnostic = undefined,
     diagnostic_count: usize = 0,
 
@@ -167,7 +175,13 @@ pub const Result = struct {
             if (item.detail) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
             try writer.writeByte('}');
         }
-        try writer.writeAll("],\"diagnostics\":[");
+        try writer.writeAll("],\"paths\":{\"exact_lock\":");
+        if (self.paths.exact_lock) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"provenance\":");
+        if (self.paths.provenance) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"recovery\":");
+        if (self.paths.recovery) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll("},\"diagnostics\":[");
         for (self.diagnostics[0..self.diagnostic_count], 0..) |diagnostic, index| {
             if (index != 0) try writer.writeByte(',');
             try writer.writeAll("{\"id\":");
@@ -193,7 +207,7 @@ pub const Backend = struct {
 pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend) !Result {
     if (request.api_version != api_version)
         return failure(request.operation, .usage, .unsupported_api_version, "unsupported library API version");
-    if (!validAbsolutePath(request.options.install_root) or
+    if (!validInstallRoot(request.options.install_root) or
         !validAbsolutePath(request.options.cache_path) or
         !validAbsolutePath(request.options.state_path) or
         (request.options.status_path != null and !validAbsolutePath(request.options.status_path.?)) or
@@ -207,7 +221,7 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
         !validForeignArchitectures(request.options.architecture, request.options.foreign_architectures) or
         (request.options.deadline_ms != null and request.options.deadline_ms.? == 0))
         return failure(request.operation, .usage, .invalid_request, "invalid explicit path, architecture, or deadline");
-    if (!validPackages(request))
+    if (!validPackageArguments(request))
         return failure(request.operation, .usage, .invalid_request, "invalid package argument count or spelling");
     if (request.options.cache_only and !request.options.offline)
         return failure(request.operation, .usage, .invalid_request, "cache-only requires offline mode");
@@ -231,6 +245,18 @@ pub fn failure(operation: Operation, status: ExitStatus, id: ErrorId, message: [
     };
 }
 
+pub fn failureWithPaths(
+    operation: Operation,
+    status: ExitStatus,
+    id: ErrorId,
+    message: []const u8,
+    paths: EvidencePaths,
+) Result {
+    var result = failure(operation, status, id, message);
+    result.paths = paths;
+    return result;
+}
+
 pub fn redact(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     if (std.Uri.parse(input)) |uri| {
         if (uri.user != null or uri.password != null) {
@@ -241,7 +267,7 @@ pub fn redact(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return allocator.dupe(u8, input);
 }
 
-fn validPackages(request: Request) bool {
+pub fn validPackageArguments(request: Request) bool {
     const count_ok = switch (request.operation) {
         .install, .remove, .reinstall, .download => request.packages.len == 1,
         .info, .provides, .why => request.packages.len != 0,
@@ -266,6 +292,10 @@ fn validAbsolutePath(path: []const u8) bool {
         if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
             return false;
     return true;
+}
+
+fn validInstallRoot(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/") or validAbsolutePath(path);
 }
 
 fn validForeignArchitectures(native: []const u8, foreign: []const []const u8) bool {
@@ -312,7 +342,7 @@ test "canonical result JSON is stable" {
     const json = try result.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"io.github.cataggar.debz.command.v1\",\"api_version\":1,\"operation\":\"info\",\"exit_status\":0,\"changed\":false,\"summary\":\"ok\",\"items\":[{\"package\":\"demo\",\"version\":\"1\",\"architecture\":\"amd64\",\"detail\":null}],\"diagnostics\":[]}\n",
+        "{\"schema\":\"io.github.cataggar.debz.command.v1\",\"api_version\":1,\"operation\":\"info\",\"exit_status\":0,\"changed\":false,\"summary\":\"ok\",\"items\":[{\"package\":\"demo\",\"version\":\"1\",\"architecture\":\"amd64\",\"detail\":null}],\"paths\":{\"exact_lock\":null,\"provenance\":null,\"recovery\":null},\"diagnostics\":[]}\n",
         json,
     );
 }

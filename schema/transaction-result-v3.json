@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/transaction-result-v3",
+  "title": "debz transaction result and repository freshness provenance v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "execution_v2_sha256",
+    "execution",
+    "repository_refresh",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/transaction-result-v3" },
+    "version": { "const": 3 },
+    "execution_v2_sha256": { "$ref": "#/$defs/sha256" },
+    "execution": { "$ref": "transaction-result-v2.json" },
+    "repository_refresh": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_config_id",
+          "snapshot_sha256",
+          "signed_release_date_unix",
+          "valid_until_unix",
+          "verification_time_unix",
+          "observed_release_age_seconds",
+          "expiry_policy",
+          "maximum_release_age_seconds",
+          "missing_valid_until_exception_exercised",
+          "selected_packages_path",
+          "compression"
+        ],
+        "properties": {
+          "source_config_id": { "$ref": "#/$defs/sha256" },
+          "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+          "signed_release_date_unix": { "type": "integer" },
+          "valid_until_unix": { "type": ["integer", "null"] },
+          "verification_time_unix": { "type": "integer" },
+          "observed_release_age_seconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expiry_policy": {
+            "enum": [
+              "require_valid_until",
+              "allow_missing_valid_until_with_max_age_seconds"
+            ]
+          },
+          "maximum_release_age_seconds": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "integer", "minimum": 1, "maximum": 2678400 }
+            ]
+          },
+          "missing_valid_until_exception_exercised": { "type": "boolean" },
+          "selected_packages_path": { "type": "string", "minLength": 1 },
+          "compression": {
+            "enum": ["xz", "gzip", "zstd", "uncompressed"]
+          }
+        }
+      }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

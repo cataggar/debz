@@ -1396,6 +1396,22 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 locked.declared_size != action.package_size.?)
                 return error.PlanLockEvidenceMismatch;
         }
+        if (request.policy.exact_lock_verification == .locked_packages) {
+            for (lock.packages) |locked| {
+                var matched = false;
+                for (request.plan.actions) |action| {
+                    if (action.kind != .remove and
+                        std.mem.eql(u8, action.package, locked.name) and
+                        std.mem.eql(u8, action.version, locked.version) and
+                        std.mem.eql(u8, action.architecture, locked.architecture))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return error.PlanOutsideLockedClosure;
+            }
+        }
     }
     if (request.policy.process_timeout_ms == 0) return error.InvalidProcessTimeout;
     if (request.policy.maximum_diagnostic_bytes > maximum_diagnostic_limit)

@@ -11,6 +11,14 @@ States are `not_started`, `in_progress`, `dpkg_failed`, `interrupted`,
 an existing interrupted transaction. Call `recoverTransaction` explicitly with
 the same plan, root, and policy.
 
+The standalone system workflow stores its journal and recovery intent in the
+per-lock transaction directory. Before refreshing or planning another
+mutation, it checks the root-scoped intent. If mutation began, any install
+request returns typed `recovery_required` with the retained lock/recovery paths
+without network access or construction of another lock. `debz recover` reloads
+that exact persisted lock and request; a nonmatching package request cannot
+consume it. Failed recovery retains the same evidence.
+
 Recovery acquires the same bounded locks, validates journal integrity and
 identity, then runs only:
 

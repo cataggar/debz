@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import hashlib
 import importlib.util
@@ -117,6 +118,15 @@ def package_specs(suite: str, architecture: str):
     suite_version = "1.0-1debian1" if suite == "debian-stable" else "1.0-1ubuntu1"
     return [
         ("ca-certificates", "20240203", "all", {}, {}),
+        ("openssl", "3.0.13-0ubuntu3", architecture, {}, {}),
+        ("symcrypt", "103.11.0-1", architecture, {}, {}),
+        (
+            "symcrypt-openssl",
+            "1.9.6-1~3.0",
+            architecture,
+            {"Depends": "openssl (>= 3.0.0), openssl (<< 3.1.0), symcrypt"},
+            {},
+        ),
         ("base-dep", "1.0-1", architecture, {}, {}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
@@ -157,7 +167,14 @@ def package_specs(suite: str, architecture: str):
     ]
 
 
-def write_repository(output: pathlib.Path, suite: str, architecture: str) -> None:
+def write_repository(
+    output: pathlib.Path,
+    suite: str,
+    architecture: str,
+    *,
+    missing_valid_until: bool = False,
+    release_date_unix: int | None = None,
+) -> None:
     if output.exists():
         shutil.rmtree(output)
     packages_dir = output / "dists" / suite / "main" / f"binary-{architecture}"
@@ -191,18 +208,41 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
     packages_path = packages_dir / "Packages"
     packages_path.write_bytes(packages)
     relative_packages = f"main/binary-{architecture}/Packages"
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        fileobj=compressed,
+        mode="wb",
+        mtime=EPOCH,
+        filename="Packages",
+        compresslevel=9,
+    ) as stream:
+        stream.write(packages)
+    packages_gzip = compressed.getvalue()
+    (packages_dir / "Packages.gz").write_bytes(packages_gzip)
+    release_date = (
+        datetime.datetime.fromtimestamp(release_date_unix, datetime.UTC)
+        if missing_valid_until
+        else datetime.datetime.fromtimestamp(EPOCH, datetime.UTC)
+    ).replace(microsecond=0)
+    date_field = release_date.strftime("%a, %d %b %Y %H:%M:%S +0000")
+    valid_until = (
+        ""
+        if missing_valid_until
+        else "Valid-Until: Thu, 01 Jan 2037 00:00:00 +0000\n"
+    )
     release = (
         f"Origin: debz hermetic {suite}\n"
         f"Label: debz integration fixture\n"
         f"Suite: {suite}\n"
         f"Codename: {suite}\n"
-        "Date: Mon, 01 Jan 2024 00:00:00 +0000\n"
-        "Valid-Until: Thu, 01 Jan 2037 00:00:00 +0000\n"
+        f"Date: {date_field}\n"
+        f"{valid_until}"
         f"Architectures: {architecture}\n"
         "Components: main\n"
         "Acquire-By-Hash: no\n"
         "SHA256:\n"
         f" {hashlib.sha256(packages).hexdigest()} {len(packages)} {relative_packages}\n"
+        f" {hashlib.sha256(packages_gzip).hexdigest()} {len(packages_gzip)} {relative_packages}.gz\n"
     ).encode()
 
     fixture = load_openpgp_fixture_module()
@@ -323,6 +363,8 @@ def main() -> None:
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
+    parser.add_argument("--missing-valid-until", action="store_true")
+    parser.add_argument("--release-date-unix", type=int)
     args = parser.parse_args()
     if not args.output.is_absolute():
         raise SystemExit("--output must be absolute")
@@ -330,7 +372,17 @@ def main() -> None:
         raise SystemExit("--descriptor-output and --descriptor-repository-url must be used together")
     if args.descriptor_output is not None and not args.descriptor_output.is_absolute():
         raise SystemExit("--descriptor-output must be absolute")
-    write_repository(args.output, args.suite, args.architecture)
+    if args.missing_valid_until and args.release_date_unix is None:
+        raise SystemExit("--missing-valid-until requires --release-date-unix")
+    if args.release_date_unix is not None and args.release_date_unix < 0:
+        raise SystemExit("--release-date-unix must be nonnegative")
+    write_repository(
+        args.output,
+        args.suite,
+        args.architecture,
+        missing_valid_until=args.missing_valid_until,
+        release_date_unix=args.release_date_unix,
+    )
     if args.descriptor_output is not None:
         write_repository_descriptor(
             args.descriptor_output,
