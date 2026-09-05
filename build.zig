@@ -301,6 +301,34 @@ pub fn build(b: *std.Build) void {
     b.step("test-exact-lock", "Run exact solved-closure lock tests")
         .dependOn(&run_lock_tests.step);
 
+    const system_workflow_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "production_backend.test.system operation replay",
+            "production_backend.test.journal probe",
+            "production_backend.test.persistent directory",
+            "production_backend.test.system operation guard",
+            "production_backend.test.pre-journal",
+            "production_backend.test.cleanup failure",
+            "production_backend.test.tampered system intent",
+            "production_backend.test.system recovery",
+            "production_backend.test.successful system recovery",
+            "production_backend.test.identical system operations",
+            "production_backend.test.retained freshness",
+            "system_product.test.system active configuration guard",
+            "repository_backend.test.repository add acquires",
+        },
+    });
+    const run_system_workflow_tests = b.addRunArtifact(
+        system_workflow_tests,
+    );
+    const system_workflow_step = b.step(
+        "test-system-workflow",
+        "Run standalone system transaction and recovery tests",
+    );
+    system_workflow_step.dependOn(&run_system_workflow_tests.step);
+    test_step.dependOn(&run_system_workflow_tests.step);
+
     const provenance_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -399,7 +427,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
-        "system-operation-lock-v1.json",
+        "system-operation-lock-v2.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",

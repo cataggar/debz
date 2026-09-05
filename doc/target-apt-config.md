@@ -91,4 +91,6 @@ under the selected debz state root. Alternate-root snapshots cannot select or
 reuse the host-root active record. Native and foreign architectures in that
 record are copied into standalone system planning; active-record replay
 reopens and verifies all named source/keyring bytes before they become solver
-input.
+input. Standalone consumers acquire the shared root operation guard before
+that replay and hold it through planning/execution; repository-add acquires the
+same guard before its repository and transaction locks.

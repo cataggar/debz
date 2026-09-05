@@ -1,7 +1,9 @@
 const std = @import("std");
 const api = @import("product_api.zig");
 const production_backend = @import("production_backend.zig");
+const system_operation_lock = @import("system_operation_lock.zig");
 const target_apt_config = @import("target_apt_config.zig");
+const transaction_executor = @import("transaction_executor.zig");
 
 pub const default_cache_path = "/var/cache/debz";
 pub const default_state_path = "/var/lib/debz";
@@ -61,6 +63,32 @@ pub fn execute(
         "selected install root is unsafe or unavailable",
     );
     defer target_files.deinit();
+    const operation_guard_required = usesRepositories(request.operation);
+    var operation_locks = transaction_executor.SystemLockManager{
+        .allocator = allocator,
+        .io = io,
+    };
+    var operation_guard: ?transaction_executor.LockToken = null;
+    defer if (operation_guard) |token|
+        operation_locks.interface().release(token);
+    if (operation_guard_required) {
+        operation_guard = acquireOperationGuard(
+            allocator,
+            install_root,
+            resolved.options.lock_wait_ms,
+            operation_locks.interface(),
+        ) catch |err| return api.failure(
+            request.operation,
+            .recovery,
+            .recovery_required,
+            try std.fmt.allocPrint(
+                allocator,
+                "system operation lock is unavailable: {s}",
+                .{@errorName(err)},
+            ),
+        );
+    }
+
     var architecture_process = target_apt_config.SystemProcessRunner{ .io = io };
 
     var active_snapshot: ?target_apt_config.Snapshot = null;
@@ -126,6 +154,7 @@ pub fn execute(
         .io = io,
         .system_profile = true,
         .system_snapshot = if (active_snapshot) |*snapshot| snapshot else null,
+        .system_operation_guard_held = operation_guard != null,
         .recovery_architecture_override = if (request.operation == .recover and
             request.options.architecture.len != 0)
             request.options.architecture
@@ -133,6 +162,20 @@ pub fn execute(
             null,
     };
     return api.execute(allocator, resolved, backend.interface());
+}
+
+fn acquireOperationGuard(
+    allocator: std.mem.Allocator,
+    install_root: []const u8,
+    wait_ms: u64,
+    locks: transaction_executor.LockManager,
+) !transaction_executor.LockToken {
+    const path = try system_operation_lock.guardPath(
+        allocator,
+        install_root,
+    );
+    defer allocator.free(path);
+    return locks.acquire(path, wait_ms);
 }
 
 fn resolveActiveArchitectures(
@@ -269,5 +312,44 @@ test "system active configuration preserves foreign architectures" {
     try std.testing.expectError(
         error.ArchitectureMismatch,
         resolveActiveArchitectures(conflict, manifest, &resolved),
+    );
+}
+
+test "system active configuration guard serializes before loading" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root");
+    var real: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try directory.dir.realPath(std.testing.io, &real);
+    const install_root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root",
+        .{real[0..length]},
+    );
+    defer std.testing.allocator.free(install_root);
+    const guard_path = try system_operation_lock.guardPath(
+        std.testing.allocator,
+        install_root,
+    );
+    defer std.testing.allocator.free(guard_path);
+    var first_manager = transaction_executor.SystemLockManager{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const first = first_manager.interface();
+    const token = try first.acquire(guard_path, 100);
+    defer first.release(token);
+    var second_manager = transaction_executor.SystemLockManager{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    try std.testing.expectError(
+        error.LockTimeout,
+        acquireOperationGuard(
+            std.testing.allocator,
+            install_root,
+            1,
+            second_manager.interface(),
+        ),
     );
 }

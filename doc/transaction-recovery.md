@@ -1,10 +1,10 @@
 # Transaction recovery
 
 `executeTransaction` now requires an injected journal store and installed-state
-reader. Before any dpkg mutation it writes a checksummed version-1 journal that
+reader. Before any dpkg mutation it writes a checksummed version-3 journal that
 binds the plan digest, install-root identity, package archive digests, exact
-command digests, and executor policy. Each command is bracketed by atomic,
-durable journal updates.
+command digests, executor policy, and optional system attempt identifier. Each
+command is bracketed by atomic, durable journal updates.
 
 States are `not_started`, `in_progress`, `dpkg_failed`, `interrupted`,
 `verification_failed`, and `complete`. A normal execute never silently resumes
@@ -20,17 +20,21 @@ transaction/dpkg locks, so lock ordering cannot self-deadlock. Before
 refreshing or planning another mutation, it checks the active intent at
 `INSTALL_ROOT/var/lib/debz/recovery-request.json`; that intent points to the
 selected state directory's immutable per-operation evidence. If mutation
-began, any install
-request returns typed `recovery_required` with the retained lock/recovery paths
+began, any install request returns typed `recovery_required` with the retained lock/recovery paths
 without network access or construction of another lock. The intent names the
-canonical transaction-plan-v3, system operation lock, optional package lock,
-and evidence directory. `debz recover` loads those exact files and invokes
+attempt and operation-lock digest only; all paths are derived from the
+root-owned operation lock's validated install/state roots and attempt identity.
+The evidence directory is created exclusively and parent directories are
+fsynced before intent publication. `debz recover` loads the canonical
+transaction-plan-v3 and optional package lock from those derived paths and invokes
 recovery without repository refresh, solver execution, or reconstruction from
 post-failure dpkg state. A nonmatching request, action, request digest, policy
-digest, plan digest, or package-lock digest is rejected. Failed recovery
-retains the same evidence. A failure proven to occur before journal creation
-removes both active intents; a stale no-journal intent is safely cleared by
-explicit recovery.
+digest, state root, attempt, plan digest, or package-lock digest is rejected.
+Failed recovery retains the same evidence. Successful recovery publishes
+attempt-bound transaction-result-v3 provenance before clearing the active
+intent. A failure proven to occur before journal creation removes both active
+intents only after a successful no-journal probe; read, delete, and fsync errors
+retain the recovery requirement.
 
 Recovery acquires the same bounded locks, validates journal integrity and
 identity, then runs only:

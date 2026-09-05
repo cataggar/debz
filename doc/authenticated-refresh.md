@@ -36,11 +36,13 @@ Moving repositories require `Valid-Until` by default. The only missing-expiry
 exception is
 `allow_missing_valid_until_with_max_age_seconds`, which must be nonzero and no
 greater than 31 days. A signed `Date` remains mandatory, the existing future
-date bound remains enforced, and acceptance requires
+date bound is capped at 24 hours and remains enforced with checked arithmetic,
+and acceptance requires
 `verification_clock <= signed Date + configured bound`. If `Valid-Until` is
-present it remains authoritative. Snapshot v3 records and replay-validates the
+present it remains authoritative. Snapshot v4 records and replay-validates the
 selected policy, configured maximum age, signed date, verification time,
-observed age, and whether the exception was exercised.
+maximum future skew, whether future skew was exercised, observed age, and
+whether the missing-expiry exception was exercised.
 
 Gzip decoding uses a bounded retained DEFLATE window so valid long-distance
 matches, including Microsoft's single-member `Packages.gz` with original

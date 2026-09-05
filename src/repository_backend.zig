@@ -17,6 +17,7 @@ const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const system_operation_lock = @import("system_operation_lock.zig");
 const target_apt_config = @import("target_apt_config.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
@@ -78,6 +79,7 @@ pub const Backend = struct {
     io: std.Io,
     executor: Executor = .system,
     process_runner: ?transaction_executor.ProcessRunner = null,
+    root_locks: ?transaction_executor.LockManager = null,
     operation_locks: ?transaction_executor.LockManager = null,
     target_locks: ?transaction_executor.LockManager = null,
     status_reader: ?transaction_recovery.StatusReader = null,
@@ -123,6 +125,49 @@ pub const Backend = struct {
             request.resources,
             request.network.overall_timeout_ms,
             allocator,
+        );
+
+        const root_lock_path = try system_operation_lock.guardPath(
+            allocator,
+            request.root,
+        );
+        defer allocator.free(root_lock_path);
+        var root_lock_manager = transaction_executor.SystemLockManager{
+            .allocator = allocator,
+            .io = self.io,
+        };
+        const root_locks = self.root_locks orelse
+            root_lock_manager.interface();
+        const root_lock_wait = budget.remainingTime() catch |err|
+            return api.failure(
+                .unavailable,
+                .resource_limit_exceeded,
+                "root-lock",
+                @errorName(err),
+            );
+        const root_lock = root_locks.acquire(
+            root_lock_path,
+            @min(request.state.lock_wait_ms, root_lock_wait),
+        ) catch |err| {
+            budget.checkTime() catch |deadline_err| return api.failure(
+                .unavailable,
+                .resource_limit_exceeded,
+                "root-lock",
+                @errorName(deadline_err),
+            );
+            return api.failure(
+                .recovery,
+                .recovery_required,
+                "root-lock",
+                @errorName(err),
+            );
+        };
+        defer root_locks.release(root_lock);
+        budget.checkTime() catch |err| return api.failure(
+            .unavailable,
+            .resource_limit_exceeded,
+            "root-lock",
+            @errorName(err),
         );
 
         var cache_root = openOrCreateAbsoluteDirectory(self.io, paths.cache_physical) catch
@@ -1385,9 +1430,9 @@ pub const Backend = struct {
                 };
                 const target_locks = self.target_locks orelse
                     system_target_locks.interface();
-                // The repository-operation lock is already held. Keep the
-                // established install/recovery order beneath it so repository
-                // paths never invert the target transaction lock hierarchy.
+                // The root operation guard and repository-operation lock are
+                // already held. Keep target transaction locks beneath both so
+                // repository and product paths cannot invert lock ordering.
                 var held_target_locks: [target_lock_paths.len]?transaction_executor.LockToken =
                     @splat(null);
                 defer {
@@ -7001,6 +7046,48 @@ test "repository operation budget enforces exact boundaries and checked overflow
         error.ResourceBudgetExceeded,
         aggregate.validateLock(lock),
     );
+}
+
+test "repository add acquires the shared root guard before repository state" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+    };
+    var root_lock: RepositoryOperationLock = .{
+        .clock_ms = &acquisition.now_ms,
+        .fail = true,
+    };
+    var repository_lock: RepositoryOperationLock = .{
+        .clock_ms = &acquisition.now_ms,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .root_locks = root_lock.interface(),
+        .operation_locks = repository_lock.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+        .state = .{ .lock_wait_ms = 10 },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), root_lock.calls);
+    try std.testing.expectEqual(@as(usize, 0), repository_lock.calls);
+    try std.testing.expectEqual(@as(usize, 0), acquisition.descriptor_reads);
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }
 
 test "repository operation lock wait is capped by the absolute operation budget" {

@@ -14,6 +14,8 @@ pub const RepositoryRefreshEvidence = struct {
     signed_release_date_unix: i64,
     valid_until_unix: ?i64,
     verification_time_unix: i64,
+    maximum_future_seconds: u64,
+    future_date_accepted: bool,
     observed_release_age_seconds: u64,
     expiry_policy: repository_refresh.ExpiryPolicy,
     maximum_release_age_seconds: ?u64,
@@ -23,6 +25,7 @@ pub const RepositoryRefreshEvidence = struct {
 };
 
 pub const Result = struct {
+    attempt_sha256: ?[32]u8,
     execution_v2_json: []const u8,
     execution_v2_sha256: [32]u8,
     repository_refresh: []const RepositoryRefreshEvidence,
@@ -66,6 +69,7 @@ pub const ValidatedDocument = struct {
 
 pub fn create(
     allocator: std.mem.Allocator,
+    attempt_sha256: ?[32]u8,
     execution: transaction_provenance_v2.Result,
     refresh_evidence: []const RepositoryRefreshEvidence,
 ) !OwnedResult {
@@ -84,16 +88,7 @@ pub fn create(
         refresh_evidence.len,
     );
     for (refresh_evidence, 0..) |evidence, index| {
-        try validateRefreshEvidence(evidence);
-        const execution_repository = findExecutionRepository(
-            execution.repositories,
-            evidence.source_config_id,
-        ) orelse return error.RepositoryEvidenceMismatch;
-        if (!std.mem.eql(
-            u8,
-            &execution_repository.snapshot_sha256,
-            &evidence.snapshot_sha256,
-        )) return error.RepositoryEvidenceMismatch;
+        try validateRepositoryRefreshEvidence(evidence);
         repositories[index] = evidence;
         repositories[index].selected_packages_path = try owned.dupe(
             u8,
@@ -113,8 +108,13 @@ pub fn create(
             &repositories[index - 1].source_config_id,
         )) return error.RepositoryEvidenceMismatch;
     }
+    try validateRepositoryCorrespondence(
+        execution.repositories,
+        repositories,
+    );
 
     var result: Result = .{
+        .attempt_sha256 = attempt_sha256,
         .execution_v2_json = try owned.dupe(u8, execution_json),
         .execution_v2_sha256 = sha256(execution_json),
         .repository_refresh = repositories,
@@ -144,7 +144,7 @@ pub fn validateDocument(
         .object => |value| value,
         else => return error.NonCanonicalDocument,
     };
-    if (object.count() != 6 or hasJsonWhitespace(source))
+    if (object.count() != 7 or hasJsonWhitespace(source))
         return error.NonCanonicalDocument;
     const schema = object.get("schema") orelse return error.UnsupportedSchema;
     const version = object.get("version") orelse return error.UnsupportedSchema;
@@ -194,6 +194,13 @@ pub fn validateDocument(
         &expected_execution_digest,
         &actual_execution_digest,
     )) return error.DigestMismatch;
+    const attempt_value = object.get("attempt_sha256") orelse
+        return error.InvalidDigest;
+    const attempt_sha256: ?[32]u8 = switch (attempt_value) {
+        .null => null,
+        .string => |value| try parseDigest(value),
+        else => return error.InvalidDigest,
+    };
 
     const refresh_value = object.get("repository_refresh") orelse
         return error.InvalidRefreshEvidence;
@@ -209,8 +216,8 @@ pub fn validateDocument(
     );
     defer allocator.free(refresh_evidence);
     for (refresh_array, 0..) |value, index| {
-        refresh_evidence[index] = try parseRefreshEvidence(value);
-        try validateRefreshEvidence(refresh_evidence[index]);
+        refresh_evidence[index] = try parseRepositoryRefreshEvidence(value);
+        try validateRepositoryRefreshEvidence(refresh_evidence[index]);
     }
     std.mem.sort(
         RepositoryRefreshEvidence,
@@ -231,6 +238,7 @@ pub fn validateDocument(
         refresh_evidence,
     );
     const canonical_result: Result = .{
+        .attempt_sha256 = attempt_sha256,
         .execution_v2_json = execution,
         .execution_v2_sha256 = actual_execution_digest,
         .repository_refresh = refresh_evidence,
@@ -248,7 +256,9 @@ pub fn validateDocument(
     };
 }
 
-fn validateRefreshEvidence(evidence: RepositoryRefreshEvidence) !void {
+pub fn validateRepositoryRefreshEvidence(
+    evidence: RepositoryRefreshEvidence,
+) !void {
     if (!repository_refresh.validExpiryPolicy(evidence.expiry_policy) or
         repository_refresh.expiryPolicyMaxAge(evidence.expiry_policy) !=
             evidence.maximum_release_age_seconds or
@@ -259,6 +269,13 @@ fn validateRefreshEvidence(evidence: RepositoryRefreshEvidence) !void {
         evidence.selected_packages_path.len == 0 or
         evidence.selected_packages_path.len >
             maximum_selected_path_bytes)
+        return error.InvalidRefreshEvidence;
+    const future_date_accepted = repository_refresh.validateFutureDate(
+        evidence.signed_release_date_unix,
+        evidence.verification_time_unix,
+        evidence.maximum_future_seconds,
+    ) catch return error.InvalidRefreshEvidence;
+    if (future_date_accepted != evidence.future_date_accepted)
         return error.InvalidRefreshEvidence;
     if (evidence.valid_until_unix) |valid_until| {
         if (valid_until < evidence.signed_release_date_unix or
@@ -303,12 +320,14 @@ fn validateRefreshEvidence(evidence: RepositoryRefreshEvidence) !void {
     )) return error.InvalidRefreshEvidence;
 }
 
-fn parseRefreshEvidence(value: std.json.Value) !RepositoryRefreshEvidence {
+pub fn parseRepositoryRefreshEvidence(
+    value: std.json.Value,
+) !RepositoryRefreshEvidence {
     const object = switch (value) {
         .object => |result| result,
         else => return error.InvalidRefreshEvidence,
     };
-    if (object.count() != 11) return error.InvalidRefreshEvidence;
+    if (object.count() != 13) return error.InvalidRefreshEvidence;
     const policy_name = try jsonString(object, "expiry_policy");
     const policy: repository_refresh.ExpiryPolicy =
         if (std.mem.eql(u8, policy_name, "require_valid_until"))
@@ -344,6 +363,14 @@ fn parseRefreshEvidence(value: std.json.Value) !RepositoryRefreshEvidence {
         .verification_time_unix = try jsonI64(
             object,
             "verification_time_unix",
+        ),
+        .maximum_future_seconds = try jsonU64(
+            object,
+            "maximum_future_seconds",
+        ),
+        .future_date_accepted = try jsonBool(
+            object,
+            "future_date_accepted",
         ),
         .observed_release_age_seconds = try jsonU64(
             object,
@@ -391,7 +418,7 @@ fn crossCheckExecutionRepositories(
     };
     if (repositories.len != refresh_evidence.len)
         return error.RepositoryEvidenceMismatch;
-    for (repositories) |value| {
+    for (repositories, refresh_evidence) |value, evidence| {
         const repository = switch (value) {
             .object => |result| result,
             else => return error.RepositoryEvidenceMismatch,
@@ -402,16 +429,35 @@ fn crossCheckExecutionRepositories(
         const snapshot = try parseDigest(
             try jsonString(repository, "snapshot_sha256"),
         );
-        var found = false;
-        for (refresh_evidence) |evidence| {
-            if (!std.mem.eql(u8, &id, &evidence.source_config_id))
-                continue;
-            if (!std.mem.eql(u8, &snapshot, &evidence.snapshot_sha256))
-                return error.RepositoryEvidenceMismatch;
-            found = true;
-            break;
-        }
-        if (!found) return error.RepositoryEvidenceMismatch;
+        if (!std.mem.eql(u8, &id, &evidence.source_config_id) or
+            !std.mem.eql(u8, &snapshot, &evidence.snapshot_sha256))
+            return error.RepositoryEvidenceMismatch;
+    }
+}
+
+fn validateRepositoryCorrespondence(
+    repositories: []const transaction_provenance_v2.RepositoryEvidence,
+    refresh_evidence: []const RepositoryRefreshEvidence,
+) !void {
+    if (repositories.len != refresh_evidence.len)
+        return error.RepositoryEvidenceMismatch;
+    for (repositories, refresh_evidence, 0..) |repository, evidence, index| {
+        if (index != 0 and std.mem.order(
+            u8,
+            &repositories[index - 1].source_config_id,
+            &repository.source_config_id,
+        ) != .lt)
+            return error.RepositoryEvidenceMismatch;
+        if (!std.mem.eql(
+            u8,
+            &repository.source_config_id,
+            &evidence.source_config_id,
+        ) or !std.mem.eql(
+            u8,
+            &repository.snapshot_sha256,
+            &evidence.snapshot_sha256,
+        ))
+            return error.RepositoryEvidenceMismatch;
     }
 }
 
@@ -470,52 +516,66 @@ fn writeDocument(result: Result, writer: *std.Io.Writer) !void {
 fn writePayload(result: Result, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
     try writeString(writer, schema_id);
-    try writer.print(",\"version\":{},\"execution_v2_sha256\":", .{schema_version});
+    try writer.print(",\"version\":{},\"attempt_sha256\":", .{schema_version});
+    if (result.attempt_sha256) |digest|
+        try writeHex(writer, &digest)
+    else
+        try writer.writeAll("null");
+    try writer.writeAll(",\"execution_v2_sha256\":");
     try writeHex(writer, &result.execution_v2_sha256);
     try writer.writeAll(",\"execution\":");
     try writer.writeAll(result.execution_v2_json);
     try writer.writeAll(",\"repository_refresh\":[");
     for (result.repository_refresh, 0..) |repository, index| {
         if (index != 0) try writer.writeByte(',');
-        try writer.writeAll("{\"source_config_id\":");
-        try writeString(writer, &repository.source_config_id);
-        try writer.writeAll(",\"snapshot_sha256\":");
-        try writeHex(writer, &repository.snapshot_sha256);
-        try writer.print(
-            ",\"signed_release_date_unix\":{d},\"valid_until_unix\":",
-            .{repository.signed_release_date_unix},
-        );
-        if (repository.valid_until_unix) |value|
-            try writer.print("{d}", .{value})
-        else
-            try writer.writeAll("null");
-        try writer.print(
-            ",\"verification_time_unix\":{d},\"observed_release_age_seconds\":{d},\"expiry_policy\":",
-            .{
-                repository.verification_time_unix,
-                repository.observed_release_age_seconds,
-            },
-        );
-        try writeString(writer, @tagName(repository.expiry_policy));
-        try writer.writeAll(",\"maximum_release_age_seconds\":");
-        if (repository.maximum_release_age_seconds) |value|
-            try writer.print("{d}", .{value})
-        else
-            try writer.writeAll("null");
-        try writer.writeAll(",\"missing_valid_until_exception_exercised\":");
-        try writer.writeAll(
-            if (repository.missing_valid_until_exception_exercised)
-                "true"
-            else
-                "false",
-        );
-        try writer.writeAll(",\"selected_packages_path\":");
-        try writeString(writer, repository.selected_packages_path);
-        try writer.writeAll(",\"compression\":");
-        try writeString(writer, @tagName(repository.compression));
-        try writer.writeByte('}');
+        try writeRepositoryRefreshEvidence(writer, repository);
     }
     try writer.writeAll("]}");
+}
+
+pub fn writeRepositoryRefreshEvidence(
+    writer: *std.Io.Writer,
+    repository: RepositoryRefreshEvidence,
+) !void {
+    try writer.writeAll("{\"source_config_id\":");
+    try writeString(writer, &repository.source_config_id);
+    try writer.writeAll(",\"snapshot_sha256\":");
+    try writeHex(writer, &repository.snapshot_sha256);
+    try writer.print(
+        ",\"signed_release_date_unix\":{d},\"valid_until_unix\":",
+        .{repository.signed_release_date_unix},
+    );
+    if (repository.valid_until_unix) |value|
+        try writer.print("{d}", .{value})
+    else
+        try writer.writeAll("null");
+    try writer.print(
+        ",\"verification_time_unix\":{d},\"maximum_future_seconds\":{d},\"future_date_accepted\":{s},\"observed_release_age_seconds\":{d},\"expiry_policy\":",
+        .{
+            repository.verification_time_unix,
+            repository.maximum_future_seconds,
+            if (repository.future_date_accepted) "true" else "false",
+            repository.observed_release_age_seconds,
+        },
+    );
+    try writeString(writer, @tagName(repository.expiry_policy));
+    try writer.writeAll(",\"maximum_release_age_seconds\":");
+    if (repository.maximum_release_age_seconds) |value|
+        try writer.print("{d}", .{value})
+    else
+        try writer.writeAll("null");
+    try writer.writeAll(",\"missing_valid_until_exception_exercised\":");
+    try writer.writeAll(
+        if (repository.missing_valid_until_exception_exercised)
+            "true"
+        else
+            "false",
+    );
+    try writer.writeAll(",\"selected_packages_path\":");
+    try writeString(writer, repository.selected_packages_path);
+    try writer.writeAll(",\"compression\":");
+    try writeString(writer, @tagName(repository.compression));
+    try writer.writeByte('}');
 }
 
 fn digestPayload(result: Result) [32]u8 {
@@ -526,18 +586,7 @@ fn digestPayload(result: Result) [32]u8 {
     return sink.hasher.finalResult();
 }
 
-fn findExecutionRepository(
-    repositories: []const transaction_provenance_v2.RepositoryEvidence,
-    id: [64]u8,
-) ?transaction_provenance_v2.RepositoryEvidence {
-    for (repositories) |repository| {
-        if (std.mem.eql(u8, &repository.source_config_id, &id))
-            return repository;
-    }
-    return null;
-}
-
-fn lessRepository(
+pub fn lessRepository(
     _: void,
     left: RepositoryRefreshEvidence,
     right: RepositoryRefreshEvidence,
@@ -728,6 +777,7 @@ test "transaction_provenance_v3 canonically embeds v2 execution evidence" {
     defer execution.deinit();
     var result = try create(
         std.testing.allocator,
+        null,
         execution.result,
         &.{},
     );
@@ -807,6 +857,8 @@ fn validRefreshEvidence() RepositoryRefreshEvidence {
         .signed_release_date_unix = 1_000,
         .valid_until_unix = null,
         .verification_time_unix = 1_050,
+        .maximum_future_seconds = 300,
+        .future_date_accepted = false,
         .observed_release_age_seconds = 50,
         .expiry_policy = .{
             .allow_missing_valid_until_with_max_age_seconds = 100,
@@ -818,6 +870,32 @@ fn validRefreshEvidence() RepositoryRefreshEvidence {
     };
 }
 
+test "transaction_provenance_v3 validates bounded future-date evidence" {
+    var evidence = validRefreshEvidence();
+    evidence.signed_release_date_unix = 1_100;
+    evidence.valid_until_unix = 1_500;
+    evidence.verification_time_unix = 1_000;
+    evidence.maximum_future_seconds = 100;
+    evidence.future_date_accepted = true;
+    evidence.observed_release_age_seconds = 0;
+    evidence.missing_valid_until_exception_exercised = false;
+    try validateRepositoryRefreshEvidence(evidence);
+
+    evidence.signed_release_date_unix = 1_101;
+    try std.testing.expectError(
+        error.InvalidRefreshEvidence,
+        validateRepositoryRefreshEvidence(evidence),
+    );
+
+    evidence.signed_release_date_unix = std.math.maxInt(i64);
+    evidence.verification_time_unix = std.math.maxInt(i64) - 10;
+    evidence.maximum_future_seconds = 300;
+    try std.testing.expectError(
+        error.InvalidRefreshEvidence,
+        validateRepositoryRefreshEvidence(evidence),
+    );
+}
+
 test "transaction_provenance_v3 rejects invalid freshness relationships" {
     var execution = try testExecutionWithRepository(std.testing.allocator);
     defer execution.deinit();
@@ -827,7 +905,7 @@ test "transaction_provenance_v3 rejects invalid freshness relationships" {
     evidence.observed_release_age_seconds = 101;
     try std.testing.expectError(
         error.InvalidRefreshEvidence,
-        create(std.testing.allocator, execution.result, &.{evidence}),
+        create(std.testing.allocator, null, execution.result, &.{evidence}),
     );
 
     evidence = validRefreshEvidence();
@@ -835,7 +913,7 @@ test "transaction_provenance_v3 rejects invalid freshness relationships" {
     evidence.missing_valid_until_exception_exercised = false;
     try std.testing.expectError(
         error.InvalidRefreshEvidence,
-        create(std.testing.allocator, execution.result, &.{evidence}),
+        create(std.testing.allocator, null, execution.result, &.{evidence}),
     );
 
     evidence = validRefreshEvidence();
@@ -844,14 +922,14 @@ test "transaction_provenance_v3 rejects invalid freshness relationships" {
     evidence.missing_valid_until_exception_exercised = false;
     try std.testing.expectError(
         error.InvalidRefreshEvidence,
-        create(std.testing.allocator, execution.result, &.{evidence}),
+        create(std.testing.allocator, null, execution.result, &.{evidence}),
     );
 
     evidence = validRefreshEvidence();
     evidence.snapshot_sha256 = @splat(99);
     try std.testing.expectError(
         error.RepositoryEvidenceMismatch,
-        create(std.testing.allocator, execution.result, &.{evidence}),
+        create(std.testing.allocator, null, execution.result, &.{evidence}),
     );
 }
 
@@ -861,6 +939,7 @@ test "transaction_provenance_v3 validation rejects null bound and is canonical" 
     const evidence = validRefreshEvidence();
     var valid = try create(
         std.testing.allocator,
+        @splat(0xaa),
         execution.result,
         &.{evidence},
     );
@@ -907,5 +986,46 @@ test "transaction_provenance_v3 validation rejects null bound and is canonical" 
             mismatch_json,
             maximum_document_bytes,
         ),
+    );
+}
+
+test "transaction_provenance_v3 cross-checks the maximum repository set linearly" {
+    const repositories = try std.testing.allocator.alloc(
+        transaction_provenance_v2.RepositoryEvidence,
+        maximum_repositories,
+    );
+    defer std.testing.allocator.free(repositories);
+    const refresh = try std.testing.allocator.alloc(
+        RepositoryRefreshEvidence,
+        maximum_repositories,
+    );
+    defer std.testing.allocator.free(refresh);
+    for (repositories, refresh, 0..) |*repository, *evidence, index| {
+        var id: [64]u8 = @splat('0');
+        _ = try std.fmt.bufPrint(
+            id[48..],
+            "{x:0>16}",
+            .{index},
+        );
+        var snapshot: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, snapshot[24..32], index, .big);
+        repository.* = .{
+            .source_config_id = id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(1),
+            .signature_sha256 = null,
+            .metadata_sha256 = @splat(2),
+            .signer_fingerprints = &.{},
+            .signature_verified = true,
+        };
+        evidence.* = validRefreshEvidence();
+        evidence.source_config_id = id;
+        evidence.snapshot_sha256 = snapshot;
+    }
+    try validateRepositoryCorrespondence(repositories, refresh);
+    refresh[maximum_repositories - 1].snapshot_sha256 = @splat(0xff);
+    try std.testing.expectError(
+        error.RepositoryEvidenceMismatch,
+        validateRepositoryCorrespondence(repositories, refresh),
     );
 }

@@ -214,13 +214,18 @@ test -s "$package_lock"
 test -s "$plan_evidence"
 lock_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest_sha256"])' "$package_lock")
 grep -q "^lock	$lock_digest$" "$evidence_dir/transaction.complete"
-grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v1"' "$lock_path"
+grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v2"' "$lock_path"
 grep -q '"kind":"install","package":"symcrypt"' "$lock_path"
 grep -q '"kind":"install","package":"symcrypt-openssl"' "$lock_path"
 grep -q '"schema":"https://debz.dev/schema/exact-closure-lock-v2"' "$package_lock"
 grep -q '"schema":"https://debz.dev/schema/transaction-result-v3"' "$provenance_path"
+attempt_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' "$lock_path")
+test "$(basename "$evidence_dir")" = "$attempt_id"
+grep -q "\"attempt_sha256\":\"$attempt_id\"" "$provenance_path"
 grep -q 'missing_valid_until_exception_exercised' "$provenance_path"
 grep -q 'maximum_release_age_seconds' "$provenance_path"
+grep -q '"maximum_future_seconds":300' "$provenance_path"
+grep -q '"future_date_accepted":false' "$provenance_path"
 grep -q "\"selected_packages_path\":\"main/binary-$architecture/Packages.gz\"" "$provenance_path"
 grep -q '"compression":"gzip"' "$provenance_path"
 grep -q '/usr/bin/dpkg' "$provenance_path"
@@ -244,10 +249,12 @@ failed_lock=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print
 failed_provenance=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["provenance"])')
 test -s "$failed_lock"
 test -s "$failed_provenance"
-plan_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plan_path"])' \
+attempt_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_id"])' \
   "$full_root/var/lib/debz/recovery-request.json")
-package_lock_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_lock_path"])' \
-  "$full_root/var/lib/debz/recovery-request.json")
+failed_evidence_dir=$(dirname "$failed_provenance")
+test "$(basename "$failed_evidence_dir")" = "$attempt_id"
+plan_path="$failed_evidence_dir/transaction-plan-v3.json"
+package_lock_path="$failed_evidence_dir/exact-lock-v2.json"
 test -s "$plan_path"
 test -s "$package_lock_path"
 python3 -c \
@@ -342,7 +349,7 @@ printf '%s' "$remove_output" | grep -q '"exit_status":0'
 printf '%s' "$remove_output" | grep -q '"detail":"remove"'
 remove_lock=$(printf '%s' "$remove_output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["exact_lock"])')
 test -s "$remove_lock"
-grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v1"' "$remove_lock"
+grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v2"' "$remove_lock"
 grep -q '"package_lock_kind":"none"' "$remove_lock"
 grep -q '"kind":"remove","package":"symcrypt"' "$remove_lock"
 python3 - "$core_root/var/lib/dpkg/status" <<'PY'

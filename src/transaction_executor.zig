@@ -62,6 +62,7 @@ pub const Request = struct {
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
+    attempt_sha256: ?[32]u8 = null,
 };
 
 pub const EnvironmentEntry = struct {
@@ -280,6 +281,7 @@ pub const RecoveryRequest = struct {
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
+    attempt_sha256: ?[32]u8 = null,
 };
 
 pub const RecoveryReport = struct {
@@ -429,6 +431,7 @@ pub fn execute(
         .root_identity = state.root_identity,
         .policy_sha256 = state.policy_sha256,
         .lock_sha256 = state.lock_sha256,
+        .attempt_sha256 = request.attempt_sha256,
         .next_command = 0,
         .commands = journal_commands,
     };
@@ -955,9 +958,13 @@ pub fn recover(
     if (!std.mem.eql(u8, &journal.plan_sha256, &plan_sha256) or
         !std.mem.eql(u8, &journal.root_identity, &state.root_identity) or
         !std.mem.eql(u8, &journal.policy_sha256, &state.policy_sha256) or
-        !optionalDigestEqual(journal.lock_sha256, state.lock_sha256))
+        !optionalDigestEqual(journal.lock_sha256, state.lock_sha256) or
+        !optionalDigestEqual(
+            journal.attempt_sha256,
+            request.attempt_sha256,
+        ))
     {
-        state.failure = .{ .code = .journal_mismatch, .diagnostic = "journal plan, root, executor policy, or exact lock does not match" };
+        state.failure = .{ .code = .journal_mismatch, .diagnostic = "journal plan, root, executor policy, exact lock, or attempt does not match" };
         return finishRecovery(allocator, arena_ptr, &state, plan_sha256);
     }
     const root_flag = try std.fmt.allocPrint(arena, "--root={s}", .{request.install_root});
@@ -2482,9 +2489,16 @@ pub const SystemLockManager = struct {
                 // following symlinks; losing the race to a concurrent creator
                 // is fine because the directory is all we need.
                 error.FileNotFound => blk: {
+                    var created = true;
                     current.createDir(self.io, component, .default_dir) catch |create_err| switch (create_err) {
-                        error.PathAlreadyExists => {},
+                        error.PathAlreadyExists => created = false,
                         else => return create_err,
+                    };
+                    if (created) switch (@import("builtin").os.tag) {
+                        .linux => if (std.posix.errno(
+                            std.os.linux.fsync(current.handle),
+                        ) != .SUCCESS) return error.Unexpected,
+                        else => {},
                     };
                     break :blk try current.openDir(self.io, component, .{ .follow_symlinks = false });
                 },
@@ -4154,6 +4168,47 @@ test "transaction_executor.test.schema v2 plan hash and interrupted journal rema
     try std.testing.expect(report.succeeded());
     try std.testing.expectEqualSlices(u8, &released_plan_sha256, &report.plan_sha256);
     try std.testing.expect(harness.journal_archived);
+}
+
+test "transaction_executor.test.recovery rejects a journal from another attempt" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var plan = testPlan(&actions, &ordered);
+    const policy: Policy = .{ .conffile = .keep_existing };
+    const journal: recovery.Journal = .{
+        .state = .interrupted,
+        .boundary = .before_command,
+        .plan_sha256 = hashPlan(plan),
+        .root_identity = recovery.rootIdentity("/target"),
+        .policy_sha256 = hashPolicy(policy),
+        .attempt_sha256 = @splat(0xaa),
+        .next_command = 0,
+        .commands = &.{},
+        .failure = "interrupted attempt",
+    };
+    const fixture = try recovery.encode(std.testing.allocator, journal);
+    defer std.testing.allocator.free(fixture);
+    var harness: TestHarness = .{ .bytes = "", .status_source = "" };
+    try TestHarness.writeJournal(&harness, "/target", fixture);
+
+    var report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = policy,
+        .attempt_sha256 = @splat(0xbb),
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expectEqual(
+        FailureCode.journal_mismatch,
+        report.failure.?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
 }
 
 test "transaction_executor.test.plan hash binds every tagged local origin field" {

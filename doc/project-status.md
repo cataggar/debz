@@ -72,10 +72,11 @@ default root and `--root` for isolated images. See
 [Repository management API](repository-management.md).
 
 The standalone CLI now exposes a system profile that consumes the active
-root-scoped snapshot, derives target defaults and architecture, generates and
-persists a complete system-operation lock, canonical executable plan, and any
-package exact lock before mutation, and retains per-operation recovery and
-transaction-result-v3 evidence. This supports the two-command Microsoft Noble
+root-scoped snapshot under the shared root operation guard, derives target
+defaults and architecture, generates a unique attempt, and durably persists a
+complete system-operation lock, canonical executable plan, freshness evidence,
+and any package exact lock before mutation. It retains per-attempt recovery and
+transaction-result-v3 evidence, including successful recovery provenance. This supports the two-command Microsoft Noble
 SymCrypt workflow while preserving explicit product API and image-building
 paths.
 

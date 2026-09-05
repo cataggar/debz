@@ -8,8 +8,9 @@ const signed_envelope = @import("signed_release_envelope.zig");
 const openpgp = @import("openpgp_verifier.zig");
 const source = @import("source.zig");
 
-const snapshot_magic = "debz-repository-snapshot-v3";
-const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v3" };
+const snapshot_magic = "debz-repository-snapshot-v4";
+const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v4" };
+pub const maximum_future_release_seconds: u64 = 24 * 60 * 60;
 
 pub const Repository = struct {
     id: source.RepositoryId,
@@ -141,6 +142,7 @@ pub const PolicyDecisions = struct {
     release_date_unix: i64,
     valid_until_unix: ?i64,
     verification_time_unix: i64,
+    maximum_future_seconds: u64,
     observed_release_age_seconds: u64,
     expiry_policy: ExpiryPolicy,
     maximum_release_age_seconds: ?u64,
@@ -593,6 +595,7 @@ fn refreshInternal(
         .origin_source = origin_source,
         .compression = selected.compression,
         .future_date_accepted = release_policy.future_date_accepted,
+        .maximum_future_seconds = release_policy.maximum_future_seconds,
         .maximum_release_age_seconds = release_policy.maximum_release_age_seconds,
         .verification_time_unix = release_policy.verification_time,
         .observed_release_age_seconds = release_policy.observed_age_seconds,
@@ -659,6 +662,7 @@ const ReleasePolicyResult = struct {
     date: i64,
     valid_until: ?i64,
     verification_time: i64,
+    maximum_future_seconds: u64,
     observed_age_seconds: u64,
     maximum_release_age_seconds: ?u64,
     missing_valid_until_exception_exercised: bool,
@@ -677,6 +681,8 @@ fn validateConfiguration(
         refresh_policy.maximum_compressed_bytes == 0 or
         refresh_policy.maximum_decompressed_bytes == 0 or
         refresh_policy.maximum_decoder_memory == 0 or
+        refresh_policy.maximum_future_seconds >
+            maximum_future_release_seconds or
         !validExpiryPolicy(refresh_policy.expiry_policy))
         return error.InvalidConfiguration;
     if (!validPathToken(repository.suite, false) or
@@ -808,8 +814,11 @@ fn validateRelease(
         return error.ReleaseIdentityMismatch;
     const located_date = metadata.date orelse return error.ReleaseMissingDate;
     const date = timestampUnix(located_date.value);
-    const future_limit = saturatingAdd(now, policy.maximum_future_seconds);
-    if (date > future_limit) return error.ReleaseDateInFuture;
+    const future_date_accepted = try validateFutureDate(
+        date,
+        now,
+        policy.maximum_future_seconds,
+    );
     const valid_until = if (metadata.valid_until) |value| timestampUnix(value.value) else null;
     var exception_exercised = false;
     const maximum_release_age = expiryPolicyMaxAge(policy.expiry_policy);
@@ -834,11 +843,29 @@ fn validateRelease(
         .date = date,
         .valid_until = valid_until,
         .verification_time = now,
+        .maximum_future_seconds = policy.maximum_future_seconds,
         .observed_age_seconds = releaseAgeSeconds(now, date),
         .maximum_release_age_seconds = maximum_release_age,
         .missing_valid_until_exception_exercised = exception_exercised,
-        .future_date_accepted = date > now,
+        .future_date_accepted = future_date_accepted,
     };
+}
+
+pub fn validateFutureDate(
+    signed_release_date_unix: i64,
+    verification_time_unix: i64,
+    maximum_future_seconds: u64,
+) !bool {
+    if (maximum_future_seconds > maximum_future_release_seconds)
+        return error.InvalidFutureDatePolicy;
+    const maximum = std.math.add(
+        i64,
+        verification_time_unix,
+        @intCast(maximum_future_seconds),
+    ) catch return error.InvalidFutureDatePolicy;
+    if (signed_release_date_unix > maximum)
+        return error.ReleaseDateInFuture;
+    return signed_release_date_unix > verification_time_unix;
 }
 
 fn selectIndex(
@@ -1050,6 +1077,7 @@ const SnapshotManifest = struct {
     origin_source: MetadataSource,
     compression: Compression,
     future_date_accepted: bool,
+    maximum_future_seconds: u64,
     maximum_release_age_seconds: ?u64,
     verification_time_unix: i64,
     observed_release_age_seconds: u64,
@@ -1078,6 +1106,12 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
         allocator,
         u64,
         manifest.maximum_release_age_seconds orelse 0,
+    );
+    try appendInt(
+        &bytes,
+        allocator,
+        u64,
+        manifest.maximum_future_seconds,
     );
     try appendInt(&bytes, allocator, i64, manifest.verification_time_unix);
     try appendInt(&bytes, allocator, u64, manifest.observed_release_age_seconds);
@@ -1158,6 +1192,7 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     const date = reader.int(i64);
     const valid_raw = reader.int(i64);
     const maximum_release_age_raw = reader.int(u64);
+    const maximum_future_seconds = reader.int(u64);
     const policy_verification_time = reader.int(i64);
     const observed_release_age = reader.int(u64);
     const release_len = std.math.cast(usize, reader.int(u64)) orelse
@@ -1249,6 +1284,7 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
         .compression = compression_kind,
         .valid_until_unix = if (flags & 1 != 0) valid_raw else null,
         .future_date_accepted = flags & 2 != 0,
+        .maximum_future_seconds = maximum_future_seconds,
         .maximum_release_age_seconds = if (flags & 4 != 0)
             maximum_release_age_raw
         else
@@ -1301,12 +1337,17 @@ fn loadSnapshot(
     const stored_maximum_age = expiryPolicyMaxAge(policy.expiry_policy);
     const stored_exception_expected = manifest.valid_until_unix == null and
         stored_maximum_age != null;
+    const future_date_accepted = validateFutureDate(
+        manifest.release_date_unix,
+        manifest.verification_time_unix,
+        manifest.maximum_future_seconds,
+    ) catch return error.CorruptSnapshot;
     if (manifest.observed_release_age_seconds != releaseAgeSeconds(
         manifest.verification_time_unix,
         manifest.release_date_unix,
     ) or
-        manifest.future_date_accepted !=
-            (manifest.release_date_unix > manifest.verification_time_unix) or
+        manifest.future_date_accepted != future_date_accepted or
+        manifest.maximum_future_seconds != policy.maximum_future_seconds or
         manifest.maximum_release_age_seconds != stored_maximum_age or
         manifest.missing_valid_until_exception_exercised != stored_exception_expected)
         return error.CorruptSnapshot;
@@ -1367,6 +1408,7 @@ fn loadSnapshot(
                 .release_date_unix = release_policy.date,
                 .valid_until_unix = release_policy.valid_until,
                 .verification_time_unix = release_policy.verification_time,
+                .maximum_future_seconds = release_policy.maximum_future_seconds,
                 .observed_release_age_seconds = release_policy.observed_age_seconds,
                 .expiry_policy = policy.expiry_policy,
                 .maximum_release_age_seconds = release_policy.maximum_release_age_seconds,
@@ -1651,6 +1693,31 @@ fn testRefreshPolicy(order: []const Compression) RefreshPolicy {
         .maximum_decompressed_bytes = 64 * 1024,
         .maximum_decoder_memory = 4 * 1024 * 1024,
     };
+}
+
+test "repository_refresh future-date evidence uses the configured checked bound" {
+    try std.testing.expect(try validateFutureDate(1_300, 1_000, 300));
+    try std.testing.expect(!(try validateFutureDate(1_000, 1_000, 300)));
+    try std.testing.expectError(
+        error.ReleaseDateInFuture,
+        validateFutureDate(1_301, 1_000, 300),
+    );
+    try std.testing.expectError(
+        error.InvalidFutureDatePolicy,
+        validateFutureDate(
+            std.math.maxInt(i64),
+            std.math.maxInt(i64) - 10,
+            300,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidFutureDatePolicy,
+        validateFutureDate(
+            1_000,
+            1_000,
+            maximum_future_release_seconds + 1,
+        ),
+    );
 }
 
 fn makeRelease(

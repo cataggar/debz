@@ -67,10 +67,15 @@ boundary.
 - A system mutation publishes an exact closure lock before the first dpkg
   command. Post-lock failures retain and report lock, provenance, and recovery
   evidence, and retries cannot silently switch transactions.
-- The system-operation lock serializes the active recovery-intent state
-  machine. Recovery consumes the persisted canonical plan and lock identities,
-  not a newly refreshed repository or a plan reconstructed from mutable dpkg
-  state.
+- The root-scoped system-operation lock is acquired before active
+  source/keyring validation by product operations and before repository-add's
+  repository/transaction locks. It serializes active configuration use and
+  the recovery-intent state machine without lock-order inversion.
+- Recovery intents contain no trusted filesystem paths. The root-owned
+  operation lock binds canonical install/state roots and a unique attempt;
+  plan, package-lock, journal, and provenance paths are derived from it.
+  Recovery consumes the persisted canonical plan and freshness evidence, not a
+  newly refreshed repository or a plan reconstructed from mutable dpkg state.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.

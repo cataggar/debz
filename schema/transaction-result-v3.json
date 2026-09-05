@@ -7,6 +7,7 @@
   "required": [
     "schema",
     "version",
+    "attempt_sha256",
     "execution_v2_sha256",
     "execution",
     "repository_refresh",
@@ -15,128 +16,15 @@
   "properties": {
     "schema": { "const": "https://debz.dev/schema/transaction-result-v3" },
     "version": { "const": 3 },
+    "attempt_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
     "execution_v2_sha256": { "$ref": "#/$defs/sha256" },
     "execution": { "$ref": "transaction-result-v2.json" },
     "repository_refresh": {
       "type": "array",
       "maxItems": 16384,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "allOf": [
-          {
-            "if": {
-              "properties": {
-                "expiry_policy": { "const": "require_valid_until" }
-              },
-              "required": ["expiry_policy"]
-            },
-            "then": {
-              "properties": {
-                "valid_until_unix": { "type": "integer" },
-                "maximum_release_age_seconds": { "type": "null" },
-                "missing_valid_until_exception_exercised": { "const": false }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "expiry_policy": {
-                  "const": "allow_missing_valid_until_with_max_age_seconds"
-                }
-              },
-              "required": ["expiry_policy"]
-            },
-            "then": {
-              "properties": {
-                "maximum_release_age_seconds": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 2678400
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "expiry_policy": {
-                  "const": "allow_missing_valid_until_with_max_age_seconds"
-                },
-                "valid_until_unix": { "type": "null" }
-              },
-              "required": ["expiry_policy", "valid_until_unix"]
-            },
-            "then": {
-              "properties": {
-                "missing_valid_until_exception_exercised": { "const": true }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "expiry_policy": {
-                  "const": "allow_missing_valid_until_with_max_age_seconds"
-                },
-                "valid_until_unix": { "type": "integer" }
-              },
-              "required": ["expiry_policy", "valid_until_unix"]
-            },
-            "then": {
-              "properties": {
-                "missing_valid_until_exception_exercised": { "const": false }
-              }
-            }
-          }
-        ],
-        "required": [
-          "source_config_id",
-          "snapshot_sha256",
-          "signed_release_date_unix",
-          "valid_until_unix",
-          "verification_time_unix",
-          "observed_release_age_seconds",
-          "expiry_policy",
-          "maximum_release_age_seconds",
-          "missing_valid_until_exception_exercised",
-          "selected_packages_path",
-          "compression"
-        ],
-        "properties": {
-          "source_config_id": { "$ref": "#/$defs/sha256" },
-          "snapshot_sha256": { "$ref": "#/$defs/sha256" },
-          "signed_release_date_unix": { "type": "integer" },
-          "valid_until_unix": { "type": ["integer", "null"] },
-          "verification_time_unix": { "type": "integer" },
-          "observed_release_age_seconds": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "expiry_policy": {
-            "enum": [
-              "require_valid_until",
-              "allow_missing_valid_until_with_max_age_seconds"
-            ]
-          },
-          "maximum_release_age_seconds": {
-            "oneOf": [
-              { "type": "null" },
-              { "type": "integer", "minimum": 1, "maximum": 2678400 }
-            ]
-          },
-          "missing_valid_until_exception_exercised": { "type": "boolean" },
-          "selected_packages_path": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 4096
-          },
-          "compression": {
-            "enum": ["xz", "gzip", "zstd", "uncompressed"]
-          }
-        }
-      }
+      "items": { "$ref": "#/$defs/repositoryRefresh" }
     },
     "digest_sha256": { "$ref": "#/$defs/sha256" }
   },
@@ -144,6 +32,131 @@
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "repositoryRefresh": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "expiry_policy": { "const": "require_valid_until" }
+            },
+            "required": ["expiry_policy"]
+          },
+          "then": {
+            "properties": {
+              "valid_until_unix": { "type": "integer" },
+              "maximum_release_age_seconds": { "type": "null" },
+              "missing_valid_until_exception_exercised": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expiry_policy": {
+                "const": "allow_missing_valid_until_with_max_age_seconds"
+              }
+            },
+            "required": ["expiry_policy"]
+          },
+          "then": {
+            "properties": {
+              "maximum_release_age_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2678400
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expiry_policy": {
+                "const": "allow_missing_valid_until_with_max_age_seconds"
+              },
+              "valid_until_unix": { "type": "null" }
+            },
+            "required": ["expiry_policy", "valid_until_unix"]
+          },
+          "then": {
+            "properties": {
+              "missing_valid_until_exception_exercised": { "const": true }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expiry_policy": {
+                "const": "allow_missing_valid_until_with_max_age_seconds"
+              },
+              "valid_until_unix": { "type": "integer" }
+            },
+            "required": ["expiry_policy", "valid_until_unix"]
+          },
+          "then": {
+            "properties": {
+              "missing_valid_until_exception_exercised": { "const": false }
+            }
+          }
+        }
+      ],
+      "required": [
+        "source_config_id",
+        "snapshot_sha256",
+        "signed_release_date_unix",
+        "valid_until_unix",
+        "verification_time_unix",
+        "maximum_future_seconds",
+        "future_date_accepted",
+        "observed_release_age_seconds",
+        "expiry_policy",
+        "maximum_release_age_seconds",
+        "missing_valid_until_exception_exercised",
+        "selected_packages_path",
+        "compression"
+      ],
+      "properties": {
+        "source_config_id": { "$ref": "#/$defs/sha256" },
+        "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+        "signed_release_date_unix": { "type": "integer" },
+        "valid_until_unix": { "type": ["integer", "null"] },
+        "verification_time_unix": { "type": "integer" },
+        "maximum_future_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "future_date_accepted": { "type": "boolean" },
+        "observed_release_age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expiry_policy": {
+          "enum": [
+            "require_valid_until",
+            "allow_missing_valid_until_with_max_age_seconds"
+          ]
+        },
+        "maximum_release_age_seconds": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 1, "maximum": 2678400 }
+          ]
+        },
+        "missing_valid_until_exception_exercised": { "type": "boolean" },
+        "selected_packages_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "compression": {
+          "enum": ["xz", "gzip", "zstd", "uncompressed"]
+        }
+      }
     }
   }
 }

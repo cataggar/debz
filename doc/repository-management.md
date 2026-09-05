@@ -146,8 +146,9 @@ authenticated metadata bytes, total package bytes, retained package memory,
 cache growth, and elapsed time. Metadata objects and per-repository/aggregate
 manifests reserve their actual cache growth before publication; retained
 snapshot and aggregate-manifest memory is likewise reserved before it becomes
-an accepted result. One absolute monotonic deadline starts before the repository operation lock is
-acquired and is propagated through
+an accepted result. One absolute monotonic deadline starts before the shared root operation lock,
+which is acquired before the repository operation lock and active
+configuration validation. The deadline is propagated through
 descriptor/repository/package acquisition, dpkg execution, and recovery.
 The repository lock wait is capped by both its configured wait and remaining
 operation time; expiry after or during that wait prevents all acquisition and
