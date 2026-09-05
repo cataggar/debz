@@ -382,13 +382,18 @@ jobs:
         run: zig build test-integration
       - name: Normalize diagnostic ownership
         if: always()
-        run: sudo chown -R "$USER:$USER" ".zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}" || true
+        run: |
+          sudo chown -R "$USER:$USER" \
+            ".zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}" \
+            ".zig-cache/repository-add-integration" 2>/dev/null || true
       - name: Upload root diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: integration-required-${{ matrix.suite }}-${{ matrix.architecture }}
-          path: .zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}/
+          path: |
+            .zig-cache/integration-${{ matrix.suite }}-${{ matrix.architecture }}/
+            .zig-cache/repository-add-integration/
           if-no-files-found: error
           retention-days: 7
 

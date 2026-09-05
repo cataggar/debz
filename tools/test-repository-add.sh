@@ -15,6 +15,7 @@ port_file="$workspace/http.port"
 request_log="$workspace/http.requests"
 server_stderr="$workspace/http.stderr"
 harness_stderr="$workspace/harness.stderr"
+phase=setup
 
 case "$workspace" in
   "$PWD"/.zig-cache/repository-add-integration) ;;
@@ -32,12 +33,22 @@ python3 tools/http-fixture-server.py \
   2>"$server_stderr" &
 server_pid=$!
 cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
   if [ -e "$workspace" ] && [ "$(id -u)" -ne 0 ]; then
     sudo -n chown -R "$(id -u):$(id -g)" "$workspace" 2>/dev/null || true
   fi
-  rm -rf "$workspace"
+  if [ "$status" -eq 0 ]; then
+    rm -rf "$workspace"
+  else
+    echo "repository-add integration failed during phase: $phase" >&2
+    if [ -s "$harness_stderr" ]; then
+      cat "$harness_stderr" >&2
+    fi
+  fi
+  exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -140,6 +151,7 @@ prepare_dpkg_root() {
 }
 
 full_root="$workspace/full-root"
+phase=repository-add
 full_output=$(run_harness "$full_root")
 printf '%s' "$full_output" | grep -q 'FIRST=.*"exit_status":0'
 printf '%s' "$full_output" | grep -q 'FIRST=.*"changed":true'
@@ -163,6 +175,7 @@ if grep -R -a -q 'fixture-query-secret' "$full_root"; then
 fi
 
 if [ "$system_install_integration" = 1 ]; then
+phase=system-install
 prepare_dpkg_root "$full_root"
 set +e
 system_install=$(run_product install \
@@ -209,6 +222,7 @@ grep -q '/usr/bin/dpkg' "$provenance_path"
 grep -q '"status":"exact_match"' "$provenance_path"
 
 set +e
+phase=failure-recovery
 failed_install=$(run_product install \
   --install-root "$full_root" \
   --json \
@@ -270,6 +284,7 @@ recovery_lock=$(printf '%s' "$recovery_output" | python3 -c 'import json,sys; pr
 test "$recovery_lock" = "$failed_lock"
 
 core_root="$workspace/core-root"
+phase=core-install
 core_output=$(run_harness "$core_root")
 printf '%s' "$core_output" | grep -q 'FIRST=.*"exit_status":0'
 prepare_dpkg_root "$core_root"
@@ -298,6 +313,7 @@ if grep -q '^Package: symcrypt-openssl$' "$core_root/var/lib/dpkg/status"; then
 fi
 
 conflict_root="$workspace/conflict-root"
+phase=solver-conflict
 conflict_output=$(run_harness "$conflict_root")
 printf '%s' "$conflict_output" | grep -q 'FIRST=.*"exit_status":0'
 sed -i 's/Version: 3\.0\.13-0ubuntu3/Version: 3.1.0-1/' \
@@ -331,6 +347,7 @@ fi
 fi
 
 in_release_before=$(grep -c '/repository/dists/debian-stable/InRelease' "$request_log")
+phase=no-refresh
 no_refresh_root="$workspace/no-refresh-root"
 no_refresh_output=$(run_harness "$no_refresh_root" --no-refresh)
 printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed_phase":"skipped"'
@@ -340,6 +357,7 @@ test $((in_release_after - in_release_before)) -eq 2
 test ! -e "$no_refresh_root/etc/apt/sources.list.d/host.list"
 
 mismatch_root="$workspace/mismatch-root"
+phase=digest-mismatch
 mkdir -p "$mismatch_root/var/lib/dpkg"
 : >"$mismatch_root/var/lib/dpkg/status"
 set +e
@@ -358,4 +376,5 @@ printf '%s' "$mismatch" | grep -q '"installed":false'
 printf '%s' "$mismatch" | grep -vq 'fixture-query-secret'
 test ! -e "$mismatch_root/etc/apt/sources.list.d/microsoft-prod.list"
 
+phase=complete
 printf 'repository-add integration passed\n'
