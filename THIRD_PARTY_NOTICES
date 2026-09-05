@@ -171,3 +171,11 @@ The checked-in OpenPGP fixture bytes were generated with Python cryptography
 45.0.4 (Apache-2.0 OR BSD-3-Clause). This package is an optional fixture
 regeneration tool only: it is not fetched, linked, imported, or executed by the
 debz build or test graph, and none of its source code is distributed here.
+
+GitHub setup action bundles
+===========================
+
+The first-party JavaScript action under actions/setup has a separately pinned
+npm dependency graph. Its direct dependency summary is in
+actions/setup/THIRD_PARTY_NOTICES.md, and complete bundled license texts are in
+actions/setup/dist/main/licenses.txt and actions/setup/dist/post/licenses.txt.

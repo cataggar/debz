@@ -44,3 +44,10 @@ every `DT_NEEDED` entry, and malformed layouts even when section headers are
 absent. `PT_DYNAMIC` file and virtual ranges must resolve uniquely and
 consistently through the same file-backed `PT_LOAD`, preventing a decoy file
 offset from hiding the dynamic table actually visible to the loader.
+
+The first-party [`actions/setup`](../actions/setup/README.md) action selects
+the exact gzip archive for its normalized runner target. Gzip is the action
+format because Node provides in-process decompression; the action does not
+depend on a target container's tar or xz tools. The release workflow verifies
+the checked-in action against the newly published tag on both native release
+architectures after attestations and publication complete.

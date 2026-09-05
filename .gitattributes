@@ -19,3 +19,6 @@ fuzz/corpus/** -text
 *.gz  binary
 *.xz  binary
 *.zst binary
+
+# JavaScript action bundles are reproducibly generated from actions/setup/src.
+actions/setup/dist/** linguist-generated=true

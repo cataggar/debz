@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -160,6 +161,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:
@@ -183,6 +185,29 @@ jobs:
           zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
           version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+      - name: Install exact release with the first-party setup action
+        id: setup
+        uses: ./actions/setup
+        with:
+          debz-version: ${{ github.ref_name }}
+          cache: 'false'
+      - name: Validate setup action outputs and executable
+        env:
+          DEBZ_PATH: ${{ steps.setup.outputs.debz-path }}
+          DEBZ_VERSION: ${{ steps.setup.outputs.debz-version }}
+          EXPECTED_TARGET: ${{ matrix.platform }}
+          TARGET: ${{ steps.setup.outputs.target }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          test -x "$DEBZ_PATH"
+          test "$DEBZ_VERSION" = "$GITHUB_REF_NAME"
+          test "$TARGET" = "$EXPECTED_TARGET"
+          case "$DEBZ_PATH" in
+            "$RUNNER_TEMP"/debz-tools/*/bin/debz) ;;
+            *) echo "unexpected setup path: $DEBZ_PATH" >&2; exit 1 ;;
+          esac
+          test "$("$DEBZ_PATH" version)" = "$VERSION"
+          "$DEBZ_PATH" --help >/dev/null
       - name: Install smoke tooling
         run: |
           if [ -f /etc/apt/apt-mirrors.txt ]; then

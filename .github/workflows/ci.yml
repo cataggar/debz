@@ -22,8 +22,120 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
+  setup-action-unit:
+    name: Setup action unit and bundle checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+      - name: Test and reproduce setup action bundles
+        run: |
+          npm --prefix actions/setup ci
+          npm --prefix actions/setup audit --audit-level=high
+          npm --prefix actions/setup test
+          npm --prefix actions/setup run bundle
+          git diff --exit-code -- actions/setup/dist
+
+  setup-action-native:
+    name: Setup action native (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64
+            digest: 80c63abc6ba357733440de57b1f93441b1ac32d6a65da7dbfca4ccb78e1935ae
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+            digest: 02833d0967790b309e0381a97f9b8e915549578fa60e0fdd0ff8a2b62ef1db6e
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install v0.2.0 with GitHub provenance
+        id: setup-provenance
+        uses: ./actions/setup
+        with:
+          debz-version: v0.2.0
+          cache: 'true'
+      - name: Validate provenance installation
+        env:
+          CACHE_HIT: ${{ steps.setup-provenance.outputs.cache-hit }}
+          DEBZ_PATH: ${{ steps.setup-provenance.outputs.debz-path }}
+          DEBZ_VERSION: ${{ steps.setup-provenance.outputs.debz-version }}
+          EXPECTED_TARGET: ${{ matrix.target }}
+          TARGET: ${{ steps.setup-provenance.outputs.target }}
+        run: |
+          test -x "$DEBZ_PATH"
+          test "$DEBZ_VERSION" = v0.2.0
+          test "$TARGET" = "$EXPECTED_TARGET"
+          case "$CACHE_HIT" in true|false) ;; *) exit 1 ;; esac
+          test "$("$DEBZ_PATH" --version)" = 0.2.0
+          "$DEBZ_PATH" --help >/dev/null
+      - name: Install v0.2.0 with explicit trusted SHA-256
+        id: setup-sha
+        uses: ./actions/setup
+        with:
+          debz-version: v0.2.0
+          sha256: ${{ matrix.digest }}
+          cache: 'false'
+      - name: Validate trusted-SHA installation
+        env:
+          DEBZ_PATH: ${{ steps.setup-sha.outputs.debz-path }}
+          DEBZ_VERSION: ${{ steps.setup-sha.outputs.debz-version }}
+          EXPECTED_TARGET: ${{ matrix.target }}
+          TARGET: ${{ steps.setup-sha.outputs.target }}
+        run: |
+          test -x "$DEBZ_PATH"
+          test "$DEBZ_VERSION" = v0.2.0
+          test "$TARGET" = "$EXPECTED_TARGET"
+          test "$("$DEBZ_PATH" --version)" = 0.2.0
+
+  setup-action-container:
+    name: Setup action in bare Ubuntu container
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Confirm optional host tools are absent
+        shell: sh
+        run: |
+          ! command -v python3
+          ! command -v pipx
+          ! command -v curl
+          ! command -v gh
+      - name: Install v0.2.0 without host download or archive tools
+        id: setup
+        uses: ./actions/setup
+        with:
+          debz-version: v0.2.0
+          cache: 'false'
+      - name: Validate clean-container installation
+        shell: sh
+        env:
+          DEBZ_PATH: ${{ steps.setup.outputs.debz-path }}
+          DEBZ_VERSION: ${{ steps.setup.outputs.debz-version }}
+          TARGET: ${{ steps.setup.outputs.target }}
+        run: |
+          test -x "$DEBZ_PATH"
+          test "$DEBZ_VERSION" = v0.2.0
+          test "$TARGET" = linux-x64
+          test "$("$DEBZ_PATH" --version)" = 0.2.0
+
   build-and-test:
     name: Build and test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

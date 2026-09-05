@@ -11,6 +11,7 @@ import subprocess
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RELEASE = ROOT / ".github/workflows/release.yml"
 CI = ROOT / ".github/workflows/ci.yml"
+SETUP = ROOT / "actions/setup"
 FAILURES: list[str] = []
 
 
@@ -31,6 +32,137 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
         FAILURES.append(f"{workflow.name}: every checkout must disable persisted credentials")
 
 
+def audit_setup_action(ci: str, release: str) -> None:
+    required_files = (
+        SETUP / "action.yml",
+        SETUP / "package.json",
+        SETUP / "package-lock.json",
+        SETUP / "dist/main/index.js",
+        SETUP / "dist/main/package.json",
+        SETUP / "dist/main/licenses.txt",
+        SETUP / "dist/post/index.js",
+        SETUP / "dist/post/package.json",
+        SETUP / "dist/post/licenses.txt",
+    )
+    for path in required_files:
+        if not path.is_file() or path.stat().st_size == 0:
+            FAILURES.append(f"setup action file is missing or empty: {path.relative_to(ROOT)}")
+
+    action_path = SETUP / "action.yml"
+    if action_path.is_file():
+        action = action_path.read_text()
+        for token in (
+            "using: node24",
+            "main: dist/main/index.js",
+            "post: dist/post/index.js",
+            "post-if: success()",
+            "debz-version:",
+            "sha256:",
+            "token:",
+            "cache:",
+            "debz-path:",
+            "debz-version:",
+            "target:",
+            "cache-hit:",
+        ):
+            if token not in action:
+                FAILURES.append(f"setup action metadata is missing policy token: {token}")
+    source_tokens = {
+        "src/action.ts": (
+            "delete process.env.INPUT_TOKEN",
+            "verifyInstallation(",
+            "io.setOutput('debz-path'",
+        ),
+        "src/cache.ts": (
+            "restore_keys: []",
+            "'x-ms-blob-type': 'BlockBlob'",
+            "exact cache archive size mismatch",
+        ),
+        "src/post.ts": (
+            "delete process.env.INPUT_TOKEN",
+            "verifyCachedInstallation(",
+            "sha256Bytes(archive)",
+        ),
+    }
+    for relative, tokens in source_tokens.items():
+        source_path = SETUP / relative
+        if not source_path.is_file():
+            FAILURES.append(f"setup action source is missing: actions/setup/{relative}")
+            continue
+        source = source_path.read_text()
+        for token in tokens:
+            if token not in source:
+                FAILURES.append(f"setup action {relative} is missing policy token: {token}")
+
+    package_path = SETUP / "package.json"
+    lock_path = SETUP / "package-lock.json"
+    if package_path.is_file() and lock_path.is_file():
+        package = json.loads(package_path.read_text())
+        lock = json.loads(lock_path.read_text())
+        for group in ("dependencies", "devDependencies"):
+            dependencies = package.get(group)
+            if not isinstance(dependencies, dict) or not dependencies:
+                FAILURES.append(f"setup action {group} are missing")
+                continue
+            for name, version in dependencies.items():
+                if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
+                    FAILURES.append(f"setup action dependency {name} is not exactly pinned: {version!r}")
+        if lock.get("lockfileVersion") != 3:
+            FAILURES.append("setup action package-lock.json must use lockfileVersion 3")
+        root_package = lock.get("packages", {}).get("")
+        if not isinstance(root_package, dict):
+            FAILURES.append("setup action lockfile has no root package")
+        else:
+            for group in ("dependencies", "devDependencies"):
+                if root_package.get(group) != package.get(group):
+                    FAILURES.append(f"setup action lockfile {group} differ from package.json")
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "actions/setup/node_modules"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if tracked.strip():
+        FAILURES.append("setup action node_modules must not be tracked")
+
+    for token in (
+        "Setup action unit and bundle checks",
+        "npm --prefix actions/setup ci",
+        "npm --prefix actions/setup audit --audit-level=high",
+        "npm --prefix actions/setup test",
+        "npm --prefix actions/setup run bundle",
+        "git diff --exit-code -- actions/setup/dist",
+        "Setup action native (${{ matrix.target }})",
+        "Setup action in bare Ubuntu container",
+        "uses: ./actions/setup",
+        "debz-version: v0.2.0",
+        "sha256: ${{ matrix.digest }}",
+    ):
+        if token not in ci:
+            FAILURES.append(f"CI setup action coverage is missing policy token: {token}")
+    for token in (
+        "Install exact release with the first-party setup action",
+        "uses: ./actions/setup",
+        "debz-version: ${{ github.ref_name }}",
+        'test "$("$DEBZ_PATH" version)" = "$VERSION"',
+        '"$DEBZ_PATH" --help',
+    ):
+        if token not in release:
+            FAILURES.append(f"release setup smoke is missing policy token: {token}")
+    if not re.search(
+        r"(?ms)^  smoke:\n.*?^\s{4}permissions:\n\s{6}contents: read\n\s{6}attestations: read$",
+        release,
+    ):
+        FAILURES.append("release setup smoke must have contents and attestations read permissions")
+    if not re.search(
+        r"(?m)^permissions:\n  contents: read\n  attestations: read$",
+        ci,
+    ):
+        FAILURES.append("CI setup jobs require top-level attestations: read permission")
+
+
 def main() -> None:
     release = RELEASE.read_text()
     ci = CI.read_text()
@@ -45,6 +177,7 @@ def main() -> None:
     )
     audit_actions(release, RELEASE)
     audit_actions(ci, CI)
+    audit_setup_action(ci, release)
 
     required_release_tokens = (
         "ubuntu-24.04",
