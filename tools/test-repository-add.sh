@@ -208,11 +208,16 @@ test -s "$lock_path"
 test -s "$provenance_path"
 evidence_dir=$(dirname "$provenance_path")
 test -s "$evidence_dir/transaction.complete"
-lock_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest_sha256"])' "$lock_path")
+package_lock="$evidence_dir/exact-lock-v2.json"
+plan_evidence="$evidence_dir/transaction-plan-v3.json"
+test -s "$package_lock"
+test -s "$plan_evidence"
+lock_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest_sha256"])' "$package_lock")
 grep -q "^lock	$lock_digest$" "$evidence_dir/transaction.complete"
-grep -q '"schema":"https://debz.dev/schema/exact-closure-lock-v2"' "$lock_path"
-grep -q '"name":"symcrypt"' "$lock_path"
-grep -q '"name":"symcrypt-openssl"' "$lock_path"
+grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v1"' "$lock_path"
+grep -q '"kind":"install","package":"symcrypt"' "$lock_path"
+grep -q '"kind":"install","package":"symcrypt-openssl"' "$lock_path"
+grep -q '"schema":"https://debz.dev/schema/exact-closure-lock-v2"' "$package_lock"
 grep -q '"schema":"https://debz.dev/schema/transaction-result-v3"' "$provenance_path"
 grep -q 'missing_valid_until_exception_exercised' "$provenance_path"
 grep -q 'maximum_release_age_seconds' "$provenance_path"
@@ -239,6 +244,12 @@ failed_lock=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print
 failed_provenance=$(printf '%s' "$failed_install" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["provenance"])')
 test -s "$failed_lock"
 test -s "$failed_provenance"
+plan_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plan_path"])' \
+  "$full_root/var/lib/debz/recovery-request.json")
+package_lock_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_lock_path"])' \
+  "$full_root/var/lib/debz/recovery-request.json")
+test -s "$plan_path"
+test -s "$package_lock_path"
 python3 -c \
   'import json,sys; assert json.load(open(sys.argv[1]))["execution"]["outcome"] == "recovery_required"' \
   "$failed_provenance"
@@ -270,6 +281,11 @@ test ! -s "$harness_stderr"
 printf '%s' "$mismatched_retry" | grep -q '"id":"recovery_required"'
 test "$(wc -l <"$request_log")" -eq "$requests_before_retry"
 
+rm -f \
+  "$full_root/etc/apt/sources.list.d/microsoft-prod.list" \
+  "$full_root/usr/share/keyrings/microsoft-prod.gpg"
+rm -rf "$full_root/var/cache/debz/metadata-v1"
+requests_before_recovery=$(wc -l <"$request_log")
 set +e
 recovery_output=$(run_product recover \
   --install-root "$full_root" \
@@ -284,6 +300,7 @@ test ! -s "$harness_stderr"
 printf '%s' "$recovery_output" | grep -q '"id":"recovery_failed"'
 recovery_lock=$(printf '%s' "$recovery_output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["exact_lock"])')
 test "$recovery_lock" = "$failed_lock"
+test "$(wc -l <"$request_log")" -eq "$requests_before_recovery"
 
 core_root="$workspace/core-root"
 phase=core-install
@@ -313,6 +330,30 @@ if grep -q '^Package: symcrypt-openssl$' "$core_root/var/lib/dpkg/status"; then
   echo "core-only workflow installed symcrypt-openssl" >&2
   exit 1
 fi
+remove_output=$(run_product remove \
+  --install-root "$core_root" \
+  --json \
+  symcrypt 2>"$harness_stderr")
+if [ "$(id -u)" -ne 0 ]; then
+  sudo chown -R "$(id -u):$(id -g)" "$core_root"
+fi
+test ! -s "$harness_stderr"
+printf '%s' "$remove_output" | grep -q '"exit_status":0'
+printf '%s' "$remove_output" | grep -q '"detail":"remove"'
+remove_lock=$(printf '%s' "$remove_output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["exact_lock"])')
+test -s "$remove_lock"
+grep -q '"schema":"https://debz.dev/schema/system-operation-lock-v1"' "$remove_lock"
+grep -q '"package_lock_kind":"none"' "$remove_lock"
+grep -q '"kind":"remove","package":"symcrypt"' "$remove_lock"
+python3 - "$core_root/var/lib/dpkg/status" <<'PY'
+import pathlib, sys
+paragraphs = pathlib.Path(sys.argv[1]).read_text().split("\n\n")
+assert not any(
+    "Package: symcrypt\n" in paragraph
+    and "Status: install ok installed\n" in paragraph + "\n"
+    for paragraph in paragraphs
+)
+PY
 
 conflict_root="$workspace/conflict-root"
 phase=solver-conflict

@@ -88,4 +88,7 @@ file sync, rename, and directory sync.
 
 `repo add` retains an operation copy and publishes a well-known active v2 copy
 under the selected debz state root. Alternate-root snapshots cannot select or
-reuse the host-root active record.
+reuse the host-root active record. Native and foreign architectures in that
+record are copied into standalone system planning; active-record replay
+reopens and verifies all named source/keyring bytes before they become solver
+input.

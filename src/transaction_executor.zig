@@ -1282,15 +1282,26 @@ fn verifyFinal(
             status,
             64 * 1024 * 1024,
         ),
-        .locked_packages => recovery.verifyExactLockV2LockedPackagesWithEvidence(
-            allocator,
-            closure.*,
-            plan,
-            journal,
-            root,
-            status,
-            64 * 1024 * 1024,
-        ),
+        .locked_packages => blk: {
+            const plan_verification = try recovery.verify(
+                allocator,
+                plan,
+                root,
+                status,
+                .{},
+            );
+            if (!plan_verification.succeeded())
+                break :blk plan_verification;
+            break :blk recovery.verifyExactLockV2LockedPackagesWithEvidence(
+                allocator,
+                closure.*,
+                plan,
+                journal,
+                root,
+                status,
+                64 * 1024 * 1024,
+            );
+        },
     };
     return recovery.verify(allocator, plan, root, status, .{});
 }

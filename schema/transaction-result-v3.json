@@ -19,9 +19,78 @@
     "execution": { "$ref": "transaction-result-v2.json" },
     "repository_refresh": {
       "type": "array",
+      "maxItems": 16384,
       "items": {
         "type": "object",
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "expiry_policy": { "const": "require_valid_until" }
+              },
+              "required": ["expiry_policy"]
+            },
+            "then": {
+              "properties": {
+                "valid_until_unix": { "type": "integer" },
+                "maximum_release_age_seconds": { "type": "null" },
+                "missing_valid_until_exception_exercised": { "const": false }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "expiry_policy": {
+                  "const": "allow_missing_valid_until_with_max_age_seconds"
+                }
+              },
+              "required": ["expiry_policy"]
+            },
+            "then": {
+              "properties": {
+                "maximum_release_age_seconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 2678400
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "expiry_policy": {
+                  "const": "allow_missing_valid_until_with_max_age_seconds"
+                },
+                "valid_until_unix": { "type": "null" }
+              },
+              "required": ["expiry_policy", "valid_until_unix"]
+            },
+            "then": {
+              "properties": {
+                "missing_valid_until_exception_exercised": { "const": true }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "expiry_policy": {
+                  "const": "allow_missing_valid_until_with_max_age_seconds"
+                },
+                "valid_until_unix": { "type": "integer" }
+              },
+              "required": ["expiry_policy", "valid_until_unix"]
+            },
+            "then": {
+              "properties": {
+                "missing_valid_until_exception_exercised": { "const": false }
+              }
+            }
+          }
+        ],
         "required": [
           "source_config_id",
           "snapshot_sha256",
@@ -58,7 +127,11 @@
             ]
           },
           "missing_valid_until_exception_exercised": { "type": "boolean" },
-          "selected_packages_path": { "type": "string", "minLength": 1 },
+          "selected_packages_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
           "compression": {
             "enum": ["xz", "gzip", "zstd", "uncompressed"]
           }

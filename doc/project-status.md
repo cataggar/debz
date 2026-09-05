@@ -73,7 +73,8 @@ default root and `--root` for isolated images. See
 
 The standalone CLI now exposes a system profile that consumes the active
 root-scoped snapshot, derives target defaults and architecture, generates and
-persists an exact lock before mutation, and retains per-lock recovery and
+persists a complete system-operation lock, canonical executable plan, and any
+package exact lock before mutation, and retains per-operation recovery and
 transaction-result-v3 evidence. This supports the two-command Microsoft Noble
 SymCrypt workflow while preserving explicit product API and image-building
 paths.

@@ -78,12 +78,25 @@ is retained at `STATE/locks/<digest>.json`, copied into the unique
 `STATE/transactions/<digest>/` evidence directory, and never replaced on a
 digest collision without canonical equality.
 
+Every system mutation also publishes
+[`system-operation-lock-v1`](../schema/system-operation-lock-v1.json). This
+lock binds the complete action list (including removals), canonical persisted
+plan digest, request digest, solver policy, executor policy, and optional v1/v2
+package-lock digest. Remove-only operations therefore retain an authorized
+zero-archive mutation closure without weakening exact-lock v1/v2's nonempty
+package invariants. Mixed install/remove operations enforce both the complete
+plan and the archive package lock.
+
 `transaction-result-v3` embeds the complete v2 execution result and adds, for
 each repository used by the lock, the signed Release date, optional
 `Valid-Until`, verification time, observed age, exact bounded missing-expiry
 policy, whether that exception was exercised, selected Packages path, and
 compression. Failure provenance is retained after dpkg has begun as well as on
-success.
+success. Creation and validation enforce required-expiry presence,
+noninverted signed intervals, bounded observed age for a missing-expiry
+exception, exception consistency, repository/snapshot correspondence with the
+embedded execution result, bounded repository counts, and canonical
+reserialization.
 
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
@@ -95,6 +108,7 @@ Schemas:
 
 - [`schema/exact-closure-lock-v1.json`](../schema/exact-closure-lock-v1.json)
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
+- [`schema/system-operation-lock-v1.json`](../schema/system-operation-lock-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
 - [`schema/transaction-result-v3.json`](../schema/transaction-result-v3.json)

@@ -134,6 +134,13 @@ descriptor repositories unless
 lock-validating execution/recovery constructors. Missing or mismatched executor
 lock digests cannot be replaced by caller-supplied provenance fields.
 
+When another descriptor is added, repository management first loads and
+revalidates the prior active manifest. Freshness policy is preserved for
+unchanged source path-and-digest identities, newly reviewed source policy is
+merged, and replaced source bytes do not inherit the old exception. The
+combined replacement is then published atomically, so adding an unrelated
+repository cannot erase an existing Microsoft compatibility decision.
+
 Operation-wide limits bound normalized repositories, solver actions,
 authenticated metadata bytes, total package bytes, retained package memory,
 cache growth, and elapsed time. Metadata objects and per-repository/aggregate

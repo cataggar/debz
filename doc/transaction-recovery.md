@@ -12,12 +12,25 @@ an existing interrupted transaction. Call `recoverTransaction` explicitly with
 the same plan, root, and policy.
 
 The standalone system workflow stores its journal and recovery intent in the
-per-lock transaction directory. Before refreshing or planning another
-mutation, it checks the root-scoped intent. If mutation began, any install
+per-operation transaction directory. A root-scoped system-operation advisory
+lock at `INSTALL_ROOT/var/lib/debz/system-operation.lock` serializes intent
+inspection, publication, execution, and cleanup even when callers select
+different state directories. It is distinct from the executor's
+transaction/dpkg locks, so lock ordering cannot self-deadlock. Before
+refreshing or planning another mutation, it checks the active intent at
+`INSTALL_ROOT/var/lib/debz/recovery-request.json`; that intent points to the
+selected state directory's immutable per-operation evidence. If mutation
+began, any install
 request returns typed `recovery_required` with the retained lock/recovery paths
-without network access or construction of another lock. `debz recover` reloads
-that exact persisted lock and request; a nonmatching package request cannot
-consume it. Failed recovery retains the same evidence.
+without network access or construction of another lock. The intent names the
+canonical transaction-plan-v3, system operation lock, optional package lock,
+and evidence directory. `debz recover` loads those exact files and invokes
+recovery without repository refresh, solver execution, or reconstruction from
+post-failure dpkg state. A nonmatching request, action, request digest, policy
+digest, plan digest, or package-lock digest is rejected. Failed recovery
+retains the same evidence. A failure proven to occur before journal creation
+removes both active intents; a stale no-journal intent is safely cleared by
+explicit recovery.
 
 Recovery acquires the same bounded locks, validates journal integrity and
 identity, then runs only:

@@ -65,7 +65,12 @@ pub fn execute(
 
     var active_snapshot: ?target_apt_config.Snapshot = null;
     defer if (active_snapshot) |*snapshot| snapshot.deinit();
-    if (usesRepositories(request.operation)) {
+    if (request.operation == .recover) {
+        resolved.options.architecture = if (request.options.architecture.len != 0)
+            request.options.architecture
+        else
+            "recovery";
+    } else if (usesRepositories(request.operation)) {
         active_snapshot = loadActiveSnapshot(
             allocator,
             io,
@@ -81,16 +86,17 @@ pub fn execute(
             .configuration_required,
             "active repository configuration is missing, unsafe, or no longer matches target files; run 'debz repo add' again",
         );
-        const recorded = active_snapshot.?.manifest.manifest.native_architecture;
-        if (request.options.architecture.len != 0 and
-            !std.mem.eql(u8, request.options.architecture, recorded))
+        resolveActiveArchitectures(
+            request.options,
+            active_snapshot.?.manifest.manifest,
+            &resolved.options,
+        ) catch
             return api.failure(
                 request.operation,
                 .usage,
                 .invalid_request,
                 "explicit architecture does not match the active target configuration",
             );
-        resolved.options.architecture = recorded;
     } else if (request.options.architecture.len == 0) {
         resolved.options.architecture = target_apt_config.discoverNativeArchitecture(
             allocator,
@@ -120,8 +126,29 @@ pub fn execute(
         .io = io,
         .system_profile = true,
         .system_snapshot = if (active_snapshot) |*snapshot| snapshot else null,
+        .recovery_architecture_override = if (request.operation == .recover and
+            request.options.architecture.len != 0)
+            request.options.architecture
+        else
+            null,
     };
     return api.execute(allocator, resolved, backend.interface());
+}
+
+fn resolveActiveArchitectures(
+    requested: api.CommonOptions,
+    manifest: target_apt_config.Manifest,
+    resolved: *api.CommonOptions,
+) !void {
+    if (requested.architecture.len != 0 and
+        !std.mem.eql(
+            u8,
+            requested.architecture,
+            manifest.native_architecture,
+        ))
+        return error.ArchitectureMismatch;
+    resolved.architecture = manifest.native_architecture;
+    resolved.foreign_architectures = manifest.foreign_architectures;
 }
 
 fn hasExplicitRepositories(options: api.CommonOptions) bool {
@@ -208,4 +235,39 @@ test "system defaults stay rooted in the selected target" {
     );
     defer std.testing.allocator.free(image_state);
     try std.testing.expectEqualStrings("/image/var/lib/debz", image_state);
+}
+
+test "system active configuration preserves foreign architectures" {
+    const foreign = [_][]const u8{ "arm64", "i386" };
+    const manifest: target_apt_config.Manifest = .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &foreign,
+        .sources = &.{},
+        .configuration_id = @splat('a'),
+        .repository_ids = &.{},
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+        .digest_sha256 = @splat(0),
+    };
+    const requested: api.CommonOptions = .{
+        .install_root = "/",
+        .cache_path = "/var/cache/debz",
+        .state_path = "/var/lib/debz",
+        .architecture = "",
+    };
+    var resolved = requested;
+    try resolveActiveArchitectures(requested, manifest, &resolved);
+    try std.testing.expectEqualStrings("amd64", resolved.architecture);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &foreign,
+        resolved.foreign_architectures,
+    );
+    var conflict = requested;
+    conflict.architecture = "arm64";
+    try std.testing.expectError(
+        error.ArchitectureMismatch,
+        resolveActiveArchitectures(conflict, manifest, &resolved),
+    );
 }

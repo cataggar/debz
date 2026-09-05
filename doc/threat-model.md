@@ -67,6 +67,10 @@ boundary.
 - A system mutation publishes an exact closure lock before the first dpkg
   command. Post-lock failures retain and report lock, provenance, and recovery
   evidence, and retries cannot silently switch transactions.
+- The system-operation lock serializes the active recovery-intent state
+  machine. Recovery consumes the persisted canonical plan and lock identities,
+  not a newly refreshed repository or a plan reconstructed from mutable dpkg
+  state.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.

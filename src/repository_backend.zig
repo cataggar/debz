@@ -199,23 +199,78 @@ pub const Backend = struct {
             return api.failure(.usage, .invalid_root, "target", "target root is unsafe or unavailable");
         defer target_files.deinit();
         var architecture_process = target_apt_config.SystemProcessRunner{ .io = self.io };
-        var before_snapshot = target_apt_config.snapshot(allocator, .{
-            .root_path = request.root,
-            .architecture_override = request.architecture,
-            .limits = targetLimits(request.resources),
-            .dependencies = .{
-                .filesystem = target_files.interface(),
-                .process = architecture_process.interface(),
-            },
-        }) catch |err| return api.failure(
-            .usage,
-            if (err == error.NativeArchitectureUnavailable)
-                .architecture_unavailable
-            else
-                .target_configuration_failed,
-            "target",
-            @errorName(err),
+        const active_store = try target_apt_config.Store.init(
+            self.io,
+            repository_dir,
+            active_manifest_name,
         );
+        var active_manifest: ?target_apt_config.OwnedManifest = active_store.read(
+            allocator,
+            target_apt_config.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return api.failure(
+                .recovery,
+                .state_corrupt,
+                "active-configuration",
+                @errorName(err),
+            ),
+        };
+        defer if (active_manifest) |*value| value.deinit();
+        if (active_manifest != null and request.architecture != null and
+            !std.mem.eql(
+                u8,
+                request.architecture.?,
+                active_manifest.?.manifest.native_architecture,
+            ))
+            return api.failure(
+                .usage,
+                .invalid_request,
+                "active-configuration",
+                "explicit architecture does not match the active target configuration",
+            );
+        var before_snapshot = (if (active_manifest) |*manifest|
+            target_apt_config.loadRecordedSnapshot(allocator, .{
+                .root_path = request.root,
+                .manifest = manifest.manifest,
+                .limits = targetLimits(request.resources),
+                .dependencies = .{
+                    .filesystem = target_files.interface(),
+                    .process = architecture_process.interface(),
+                },
+            })
+        else
+            target_apt_config.snapshot(allocator, .{
+                .root_path = request.root,
+                .architecture_override = request.architecture,
+                .limits = targetLimits(request.resources),
+                .dependencies = .{
+                    .filesystem = target_files.interface(),
+                    .process = architecture_process.interface(),
+                },
+            })) catch |err| {
+            if (active_manifest != null) return api.failure(
+                .planning,
+                switch (err) {
+                    error.SourceDigestMismatch,
+                    error.KeyringDigestMismatch,
+                    error.KeyringFingerprintMismatch,
+                    => .managed_file_conflict,
+                    else => .target_configuration_failed,
+                },
+                "active-configuration",
+                @errorName(err),
+            );
+            return api.failure(
+                .usage,
+                if (err == error.NativeArchitectureUnavailable)
+                    .architecture_unavailable
+                else
+                    .target_configuration_failed,
+                "target",
+                @errorName(err),
+            );
+        };
         defer before_snapshot.deinit();
         const architecture = before_snapshot.manifest.manifest.native_architecture;
         if (prior_state) |*prior| {
@@ -1676,10 +1731,16 @@ pub const Backend = struct {
             @errorName(err),
         );
 
+        const combined_source_policies = try mergeSourcePolicies(
+            allocator,
+            before_snapshot.manifest.manifest,
+            material,
+        );
+        defer allocator.free(combined_source_policies);
         var after_snapshot = target_apt_config.snapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = architecture,
-            .source_policies = material.source_policies,
+            .source_policies = combined_source_policies,
             .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
@@ -2714,6 +2775,71 @@ const DescriptorMaterial = struct {
         return .require_valid_until;
     }
 };
+
+fn mergeSourcePolicies(
+    allocator: std.mem.Allocator,
+    prior: target_apt_config.Manifest,
+    material: DescriptorMaterial,
+) ![]target_apt_config.SourcePolicy {
+    var policies: std.ArrayList(target_apt_config.SourcePolicy) = .empty;
+    defer policies.deinit(allocator);
+    for (prior.sources) |source_record| {
+        var replaced = false;
+        for (material.files) |file| {
+            if (file.kind != .source or
+                !std.mem.eql(
+                    u8,
+                    file.logical_path,
+                    source_record.logical_path,
+                ))
+                continue;
+            replaced = !std.mem.eql(
+                u8,
+                &file.sha256,
+                &source_record.sha256,
+            );
+            break;
+        }
+        if (!replaced) try policies.append(allocator, .{
+            .logical_path = source_record.logical_path,
+            .freshness = source_record.freshness,
+        });
+    }
+    for (material.source_policies) |new_policy| {
+        var replaced = false;
+        for (policies.items) |*policy| {
+            if (!std.mem.eql(
+                u8,
+                policy.logical_path,
+                new_policy.logical_path,
+            ))
+                continue;
+            policy.* = new_policy;
+            replaced = true;
+            break;
+        }
+        if (!replaced) try policies.append(allocator, new_policy);
+    }
+    std.mem.sort(
+        target_apt_config.SourcePolicy,
+        policies.items,
+        {},
+        struct {
+            fn less(
+                _: void,
+                left: target_apt_config.SourcePolicy,
+                right: target_apt_config.SourcePolicy,
+            ) bool {
+                return std.mem.order(
+                    u8,
+                    left.logical_path,
+                    right.logical_path,
+                ) == .lt;
+            }
+        }.less,
+    );
+    return policies.toOwnedSlice(allocator);
+}
 
 fn inspectDescriptorMaterial(
     allocator: std.mem.Allocator,
@@ -4585,6 +4711,129 @@ test "repository backend binds Microsoft freshness profile to full identity" {
         &files,
         &.{microsoft_signing_fingerprint},
     ));
+}
+
+test "repository backend preserves prior freshness while adding a repository" {
+    const microsoft_digest: [32]u8 = @splat(1);
+    const vendor_digest: [32]u8 = @splat(2);
+    const vendor_source_path =
+        "/etc" ++ "/apt/sources.list.d/vendor.list";
+    const prior_sources = [_]target_apt_config.SourceRecord{.{
+        .logical_path = microsoft_source_path,
+        .sha256 = microsoft_digest,
+        .format = .legacy,
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+        },
+    }};
+    const prior: target_apt_config.Manifest = .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &prior_sources,
+        .configuration_id = @splat('a'),
+        .repository_ids = &.{},
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+        .digest_sha256 = @splat(0),
+    };
+    const files = [_]MaterialFile{.{
+        .logical_path = @constCast(vendor_source_path),
+        .bytes = "deb https://vendor.invalid stable main\n",
+        .sha256 = vendor_digest,
+        .kind = .source,
+    }};
+    const new_policies = [_]target_apt_config.SourcePolicy{.{
+        .logical_path = vendor_source_path,
+        .freshness = .require_valid_until,
+    }};
+    const material: DescriptorMaterial = .{
+        .allocator = std.testing.allocator,
+        .configuration = undefined,
+        .files = @constCast(&files),
+        .evidence = &.{},
+        .source_policies = @constCast(&new_policies),
+    };
+    const merged = try mergeSourcePolicies(
+        std.testing.allocator,
+        prior,
+        material,
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    var found_microsoft = false;
+    var found_vendor = false;
+    for (merged) |policy| {
+        if (std.mem.eql(u8, policy.logical_path, microsoft_source_path)) {
+            found_microsoft = repository_refresh.expiryPoliciesEqual(
+                policy.freshness,
+                .{
+                    .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+                },
+            );
+        }
+        if (std.mem.eql(
+            u8,
+            policy.logical_path,
+            vendor_source_path,
+        )) {
+            found_vendor = repository_refresh.expiryPoliciesEqual(
+                policy.freshness,
+                .require_valid_until,
+            );
+        }
+    }
+    try std.testing.expect(found_microsoft);
+    try std.testing.expect(found_vendor);
+
+    const microsoft_source =
+        "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+        "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+    const vendor_source =
+        "deb [arch=amd64 signed-by=/usr/share/keyrings/vendor.gpg] " ++
+        "https://vendor.invalid stable main\n";
+    const documents = [_]repository_policy.SourceDocument{
+        .{
+            .bytes = microsoft_source,
+            .format = .legacy,
+            .policy = .{ .freshness = merged[0].freshness },
+        },
+        .{
+            .bytes = vendor_source,
+            .format = .legacy,
+            .policy = .{ .freshness = merged[1].freshness },
+        },
+    };
+    const normalized = try repository_policy.normalizeBinaryRefresh(
+        std.testing.allocator,
+        &documents,
+        "amd64",
+        .{},
+    );
+    var configuration = switch (normalized) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    try std.testing.expectEqual(@as(usize, 2), configuration.repositories.len);
+    var normalized_microsoft = false;
+    var normalized_vendor = false;
+    for (configuration.repositories) |repository| {
+        if (std.mem.eql(u8, repository.uri, microsoft_repository_uri))
+            normalized_microsoft = repository_refresh.expiryPoliciesEqual(
+                repository.freshness,
+                .{
+                    .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+                },
+            );
+        if (std.mem.eql(u8, repository.uri, "https://vendor.invalid"))
+            normalized_vendor = repository_refresh.expiryPoliciesEqual(
+                repository.freshness,
+                .require_valid_until,
+            );
+    }
+    try std.testing.expect(normalized_microsoft);
+    try std.testing.expect(normalized_vendor);
 }
 
 test "repository backend uses installed dependencies before requesting refresh" {

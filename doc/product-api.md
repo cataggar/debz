@@ -82,13 +82,21 @@ typed errors for the affected command; there is no global backend-unavailable
 result. Exact-lock input is enforced by planning, acquisition, and execution.
 When both lock options are supplied, the validated input is atomically
 published at the output path. For a system install without `--lock-input`, the backend creates an exact-lock
-v2 containing the complete mutation closure, atomically publishes it beneath
-`STATE/locks/<digest>.json` before dpkg, and executes acquisition, dpkg, and
-verification against that same lock. Per-lock evidence is retained under
-`STATE/transactions/<digest>/`. The additive v1 result `paths` object reports
-the exact lock, transaction-result-v3 provenance, and recovery path on success
-and on failures after lock publication. Explicit `plan --lock-output` followed
-by `install --lock-input` remains unchanged.
+v2 for every archive-producing action plus a system-operation-lock v1 that
+binds the complete canonical plan, including removals, request digest, solver
+policy, executor policy, and optional package-lock digest. The operation lock
+is atomically published beneath `STATE/locks/<digest>.json` before dpkg.
+Per-operation evidence under `STATE/transactions/<digest>/` retains the
+canonical transaction-plan-v3, package lock when present, journal, recovery
+intent, and provenance. The additive v1 result `paths` object reports the
+operation lock, available transaction-result-v3 provenance, and recovery path
+on success and on failures after lock publication. Explicit
+`plan --lock-output` followed by `install --lock-input` remains unchanged.
+
+The active configuration's validated foreign architectures are passed to the
+solver together with its native architecture. Callers cannot mix standalone
+active-configuration resolution with an unrelated explicit foreign-
+architecture list.
 
 ## JSON and compatibility
 

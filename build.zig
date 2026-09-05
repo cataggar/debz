@@ -291,7 +291,11 @@ pub fn build(b: *std.Build) void {
 
     const lock_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
+        .filters = &.{
+            "exact_lock.test.",
+            "exact_lock_v2.test.",
+            "system_operation_lock.test.",
+        },
     });
     const run_lock_tests = b.addRunArtifact(lock_tests);
     b.step("test-exact-lock", "Run exact solved-closure lock tests")
@@ -395,6 +399,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
+        "system-operation-lock-v1.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",

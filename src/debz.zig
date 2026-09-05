@@ -40,6 +40,7 @@ pub const executeProductRequest = product_api.execute;
 pub const production_backend = @import("production_backend.zig");
 pub const ProductionBackend = production_backend.Backend;
 pub const system_product = @import("system_product.zig");
+pub const system_operation_lock = @import("system_operation_lock.zig");
 pub const executeSystemProductRequest = system_product.execute;
 pub const package_family_backend = @import("package_family_backend.zig");
 pub const PackageFamilyBackend = package_family_backend.Backend;
@@ -292,4 +293,5 @@ test {
     _ = repository_state;
     _ = repository_backend;
     _ = system_product;
+    _ = system_operation_lock;
 }
