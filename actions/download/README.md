@@ -61,6 +61,11 @@ The download action itself calls no GitHub content or attestation API; the
 runner-provided cache service token is used only by the bounded cache-v2 client
 and exact-version Azure blob dependency in the checked-in bundle.
 
+When this runtime is invoked by [`actions/install`](../install/README.md), the
+parent supplies setup's already verified absolute executable through a private
+handoff and the download runtime does not search `PATH`. This is not an
+additional public action input and cannot weaken standalone setup guidance.
+
 ## Inputs
 
 Required:

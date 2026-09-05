@@ -187,3 +187,12 @@ The first-party JavaScript action under actions/download has a separately
 pinned npm dependency graph and a path-independent opaque cache-service format.
 Its direct dependency summary is in actions/download/THIRD_PARTY_NOTICES.md,
 and complete bundled license texts are in actions/download/dist/licenses.txt.
+
+GitHub install action bundle
+============================
+
+The first-party JavaScript action under actions/install has a separately
+pinned npm dependency graph and invokes the checked-in setup/download bundles
+from the same immutable revision. Its direct dependency summary is in
+actions/install/THIRD_PARTY_NOTICES.md, and complete bundled license texts are
+in actions/install/dist/licenses.txt.

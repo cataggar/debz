@@ -13,6 +13,13 @@ downloads one opaque cache blob into a private `RUNNER_TEMP` staging directory,
 imports only verified package objects through debz, authenticates the explicit
 repository configuration and keyrings, and prepares every package in the lock.
 
+[`actions/install`](../actions/install/README.md) composes those exact
+boundaries and then performs the mutation. It validates all typed inputs before
+setup or cache activity, hands the exact setup executable directly to the
+download runtime, and always invokes one normal `debz install --cache-only`
+transaction with the same lock, repository/keyring inputs, architecture,
+solver policy, cache root, and explicit alternate root.
+
 An exact or partial cache hit supplies only untrusted candidate bytes. Every
 current-lock object is reopened and checked for regular-file shape, declared
 size, SHA-256, authenticated repository/snapshot identity, and Debian payload
@@ -28,11 +35,12 @@ lock. The Node 24 action downloads/uploads that single bounded blob through the
 cache v2 and signed Azure endpoints; its service version is independent of
 absolute runner paths.
 
-Neither action installs packages. In particular, `cache-hit: 'true'` does not
-represent an installed root or permit a later transaction to skip normal lock,
-repository, payload, dpkg, journal, or post-state checks. Repository metadata,
-credentials, keyrings, roots, dpkg state, and journals are never included in
-the package object cache.
+The setup and download actions do not install packages. In particular, a
+download `cache-hit: 'true'` does not represent an installed root. The install
+action treats it only as a transfer optimization and still performs normal
+lock, repository, payload, dpkg, journal, and post-state checks. Repository
+metadata, credentials, keyrings, roots, dpkg state, and journals are never
+included in the package object cache.
 
 The action README is the normative reference for:
 
@@ -43,3 +51,8 @@ The action README is the normative reference for:
 - archive and redirect defenses;
 - exact cache keys and cache-hit reverification; and
 - inputs, outputs, failure behavior, and examples.
+
+The install action additionally documents alternate-root confinement,
+explicit `sudo -n`, conffile/force policy, recovery-state preservation,
+fail-closed offline behavior, and validation of the combined canonical
+transaction-result/provenance document before success outputs are published.

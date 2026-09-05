@@ -111,6 +111,14 @@ writer lock. Its public JSON schemas and offline limitations are documented in
 [GitHub Actions](github-actions.md) and
 [Exact closure locks and transaction provenance](exact-locks-and-provenance.md).
 
+`actions/install` composes the exact setup and package-cache boundaries with a
+normal `debz install --cache-only` transaction. It denies host `/`, requires
+explicit mutation/noninteractive/conffile policy, preserves recovery state,
+and publishes installation outputs only after the canonical combined
+transaction result is reopened no-follow and matched to the lock. Cache-only
+repository replay is read-only so an explicitly elevated install does not
+replace an unprivileged runner's authenticated metadata with root-owned files.
+
 `debz.package_cache_archive` is the cache-service transport boundary. It
 exports and imports a canonical path-free binary stream containing sorted
 digest, size, and package-byte records plus an archive digest. It has no path,

@@ -47,6 +47,24 @@ set -e
 test "$status_code" -eq 2
 grep -q "unknown package-cache command 'unknown'" cli-test-stderr
 
+set +e
+"$debz" transaction-result verify --state-path relative \
+    --lock-input /missing --architecture amd64 --json \
+    >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+grep -q "invalid explicit path or architecture" cli-test-stderr
+
+set +e
+"$debz" transaction-result verify --state-path "$state" \
+    --lock-input /missing --architecture amd64 --json \
+    >/dev/null 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 7
+grep -q "transaction result verification failed" cli-test-stderr
+
 for arguments in \
     "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64" \
     "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline" \

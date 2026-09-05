@@ -25,14 +25,17 @@ Release/Packages, signed envelopes and OpenPGP packets, gzip/xz/zstd
 decompression, ar/deb/tar payloads, exact locks, provenance JSON and journals.
 Harnesses call production bounded APIs directly and never shell out.
 
-GitHub Actions lanes reproduce both JavaScript bundles, audit their locked
-dependencies, run native x64/arm64 package preparation, exercise cold,
-compatible-prefix, and exact cache semantics with run-unique CLI versions, and
-run `actions/download` in a bare Ubuntu container without installing Python,
-curl, `gh`, or APT tooling there. Hermetic signed-repository integration tests
-cover corruption, explicit repair, offline metadata requirements, moving
-repository failure, retained-closure GC, hostile tar-shaped cache blobs,
-relocation, and executable-replacement attempts.
+GitHub Actions lanes reproduce all three JavaScript bundles, audit their locked
+dependencies, run native x64/arm64 package preparation and alternate-root
+installation, exercise cold, compatible-prefix, exact-hit/fresh-root, offline,
+and same-root semantics, and run the non-mutating action in a bare Ubuntu
+container without installing Python, curl, `gh`, or APT tooling there.
+Post-release smoke runs the complete setup/download/install composition on
+both native architectures with explicit `sudo -n`. Hermetic signed-repository
+integration tests cover corruption, explicit repair, offline metadata
+requirements, moving repository failure, retained-closure GC, hostile
+tar-shaped cache blobs, relocation, executable-replacement attempts,
+maintainer-script failure, and explicit recovery.
 
 `zig build security-audit` is network-free and rejects:
 

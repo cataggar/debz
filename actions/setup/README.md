@@ -4,6 +4,11 @@ This first-party JavaScript action installs one exact static `debz` release on
 Linux x64 or arm64. It downloads no package-manager state and needs no Python,
 `pipx`, `curl`, `gh`, APT, or host archive utility.
 
+For a single typed setup, package-cache, and alternate-root transaction
+boundary, use [`actions/install`](../install/README.md). That action invokes
+this checked-in setup runtime from the same immutable repository revision and
+continues to use the exact returned executable path.
+
 ## Recommended usage
 
 Pin the action implementation to a reviewed commit and pin the CLI separately:

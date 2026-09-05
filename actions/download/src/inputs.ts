@@ -122,9 +122,9 @@ export async function readInputs(
     );
   }
   const cacheEnabled = booleanInput(environment, 'CACHE');
-  const offline =
-    booleanInput(environment, 'OFFLINE') ||
-    booleanInput(environment, 'CACHE_ONLY');
+  const offlineInput = booleanInput(environment, 'OFFLINE');
+  const cacheOnlyInput = booleanInput(environment, 'CACHE_ONLY');
+  const offline = offlineInput || cacheOnlyInput;
   const repairCorruptCache = booleanInput(environment, 'REPAIR_CORRUPT_CACHE');
   if (offline && repairCorruptCache) {
     throw new DownloadActionError(
@@ -284,6 +284,34 @@ function validateRunner(
 export async function findDebz(
   environment: RuntimeEnvironment = process.env,
 ): Promise<string> {
+  const explicit = environment.DEBZ_DOWNLOAD_EXECUTABLE ?? '';
+  if (explicit.length !== 0) {
+    if (
+      explicit !== explicit.trim() ||
+      explicit.includes('\0') ||
+      explicit.includes('\r') ||
+      explicit.includes('\n') ||
+      !path.isAbsolute(explicit)
+    ) {
+      throw new DownloadActionError(
+        'internal debz executable handoff must be one absolute path',
+      );
+    }
+    try {
+      const candidate = path.resolve(explicit);
+      const candidateStat = await stat(candidate);
+      await access(candidate, fsConstants.X_OK);
+      const resolved = await realpath(candidate);
+      if (!candidateStat.isFile() || resolved !== candidate) {
+        throw new Error('not a canonical regular executable');
+      }
+      return resolved;
+    } catch {
+      throw new DownloadActionError(
+        'internal debz executable handoff is not a canonical regular executable',
+      );
+    }
+  }
   const pathValue = environment.PATH ?? '';
   for (const entry of pathValue.split(path.delimiter)) {
     if (entry.length === 0 || !path.isAbsolute(entry)) continue;

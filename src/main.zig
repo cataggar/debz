@@ -13,6 +13,7 @@ const root_help =
     \\Commands:
     \\  repo                         Manage repository descriptors
     \\  package-cache                Prepare an exact-lock package CAS
+    \\  transaction-result           Verify a completed transaction result
     \\  refresh                      Refresh authenticated repository metadata
     \\  install                      Install one package
     \\  remove                       Remove one package
@@ -226,6 +227,18 @@ const package_cache_prepare_help =
     \\
 ;
 
+const transaction_result_help =
+    \\debz transaction-result - verify a completed transaction result
+    \\
+    \\Usage:
+    \\  debz transaction-result verify --state-path PATH --lock-input PATH --architecture ARCH --json
+    \\
+    \\The verifier opens the canonical result without following symbolic links,
+    \\checks its digest and complete exact-lock evidence, and emits a bounded
+    \\machine-readable success summary. It never mutates transaction state.
+    \\
+;
+
 const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory };
 const SingleOption = enum {
     install_root,
@@ -252,6 +265,7 @@ const HelpTopic = union(enum) {
     package_cache,
     package_cache_fingerprint,
     package_cache_prepare,
+    transaction_result,
     package_family_capabilities,
     version,
 };
@@ -309,6 +323,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "package-cache")) {
         try runPackageCache(init, &args, stdout, stderr);
+        return;
+    }
+    if (std.mem.eql(u8, command, "transaction-result")) {
+        try runTransactionResult(init, &args, stdout, stderr);
         return;
     }
     const operation = debz.parseOperation(command) orelse {
@@ -377,6 +395,17 @@ fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpT
         if (std.mem.eql(u8, subcommand, "prepare")) return .package_cache_prepare;
         return null;
     }
+    if (std.mem.eql(u8, command, "transaction-result")) {
+        const subcommand = args.next() orelse return null;
+        var has_help = isHelpFlag(subcommand);
+        while (args.next()) |argument| {
+            if (isHelpFlag(argument)) has_help = true;
+        }
+        if (!has_help) return null;
+        if (isHelpFlag(subcommand) or std.mem.eql(u8, subcommand, "verify"))
+            return .transaction_result;
+        return null;
+    }
 
     var has_help = false;
     while (args.next()) |argument| {
@@ -404,6 +433,7 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
         .package_cache => try stdout.writeAll(package_cache_help),
         .package_cache_fingerprint => try stdout.writeAll(package_cache_fingerprint_help),
         .package_cache_prepare => try stdout.writeAll(package_cache_prepare_help),
+        .transaction_result => try stdout.writeAll(transaction_result_help),
         .package_family_capabilities => try stdout.writeAll(
             \\debz package-family-capabilities - print package-family capabilities as JSON
             \\
@@ -425,6 +455,168 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\
         ),
     }
+}
+
+const TransactionResultSingleOption = enum {
+    state_path,
+    lock_input,
+    architecture,
+};
+
+fn runTransactionResult(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const subcommand = args.next() orelse {
+        try stderr.writeAll("debz: missing command for 'debz transaction-result'\n");
+        try stderr.writeAll(transaction_result_help);
+        try stderr.flush();
+        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+    };
+    if (!std.mem.eql(u8, subcommand, "verify")) {
+        try stderr.print("debz: unknown transaction-result command '{s}'\n", .{subcommand});
+        try stderr.writeAll(transaction_result_help);
+        try stderr.flush();
+        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+    }
+
+    var state_path: ?[]const u8 = null;
+    var lock_input: ?[]const u8 = null;
+    var architecture: ?[]const u8 = null;
+    var requested_json = false;
+    var seen: std.EnumSet(TransactionResultSingleOption) = .initEmpty();
+    while (args.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--json")) {
+            requested_json = true;
+        } else if (std.mem.eql(u8, argument, "--state-path")) {
+            setOnceTransactionResult(&seen, .state_path) catch
+                return transactionResultUsage(stderr, "duplicate --state-path");
+            state_path = args.next() orelse
+                return transactionResultUsage(stderr, "missing --state-path value");
+        } else if (std.mem.eql(u8, argument, "--lock-input")) {
+            setOnceTransactionResult(&seen, .lock_input) catch
+                return transactionResultUsage(stderr, "duplicate --lock-input");
+            lock_input = args.next() orelse
+                return transactionResultUsage(stderr, "missing --lock-input value");
+        } else if (std.mem.eql(u8, argument, "--architecture")) {
+            setOnceTransactionResult(&seen, .architecture) catch
+                return transactionResultUsage(stderr, "duplicate --architecture");
+            architecture = args.next() orelse
+                return transactionResultUsage(stderr, "missing --architecture value");
+        } else {
+            return transactionResultUsage(stderr, "invalid transaction-result argument");
+        }
+    }
+    const state = state_path orelse
+        return transactionResultUsage(stderr, "--state-path is required");
+    const lock_path = lock_input orelse
+        return transactionResultUsage(stderr, "--lock-input is required");
+    const target = architecture orelse
+        return transactionResultUsage(stderr, "--architecture is required");
+    if (!requested_json)
+        return transactionResultUsage(stderr, "--json is required");
+    if (!validCliAbsolutePath(state) or !validCliAbsolutePath(lock_path) or
+        !validCliArchitecture(target))
+        return transactionResultUsage(stderr, "invalid explicit path or architecture");
+
+    const result = verifyTransactionResult(
+        init.arena.allocator(),
+        init.io,
+        state,
+        lock_path,
+        target,
+    ) catch |err| {
+        try stderr.print("debz: transaction result verification failed: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        std.process.exit(@intFromEnum(api.ExitStatus.transaction));
+    };
+    const json = try result.canonicalJson(init.arena.allocator());
+    try stdout.writeAll(json);
+}
+
+fn setOnceTransactionResult(
+    seen: *std.EnumSet(TransactionResultSingleOption),
+    option: TransactionResultSingleOption,
+) !void {
+    if (seen.contains(option)) return error.DuplicateOption;
+    seen.insert(option);
+}
+
+fn transactionResultUsage(stderr: *std.Io.Writer, message: []const u8) noreturn {
+    stderr.print("debz: {s}\n", .{message}) catch {};
+    stderr.writeAll("Try 'debz transaction-result --help'.\n") catch {};
+    stderr.flush() catch {};
+    std.process.exit(@intFromEnum(api.ExitStatus.usage));
+}
+
+fn verifyTransactionResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    lock_path: []const u8,
+    architecture: []const u8,
+) !debz.transaction_result_summary.Summary {
+    var state_dir = try openAbsoluteDirectoryNoFollow(io, state_path);
+    defer state_dir.close(io);
+    const result_store = try debz.TransactionProvenanceStore.init(
+        io,
+        state_dir,
+        "transaction-result.json",
+    );
+    var document = try result_store.read(
+        allocator,
+        debz.transaction_provenance.maximum_document_bytes,
+    );
+    defer document.deinit();
+
+    const lock_parent = std.fs.path.dirname(lock_path) orelse
+        return error.InvalidAbsolutePath;
+    const lock_name = std.fs.path.basename(lock_path);
+    var lock_dir = try openAbsoluteDirectoryNoFollow(io, lock_parent);
+    defer lock_dir.close(io);
+    const lock_store = try debz.ExactClosureLockStore.init(io, lock_dir, lock_name);
+    var lock = try lock_store.read(allocator, debz.exact_lock.maximum_document_bytes);
+    defer lock.deinit();
+    return debz.transaction_result_summary.verify(
+        allocator,
+        document.bytes,
+        lock.lock,
+        architecture,
+    );
+}
+
+fn openAbsoluteDirectoryNoFollow(io: std.Io, path: []const u8) !std.Io.Dir {
+    if (std.mem.eql(u8, path, "/"))
+        return std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    if (!validCliAbsolutePath(path)) return error.InvalidAbsolutePath;
+    var current = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    errdefer current.close(io);
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component| {
+        const next_dir = try current.openDir(io, component, .{ .follow_symlinks = false });
+        current.close(io);
+        current = next_dir;
+    }
+    return current;
+}
+
+fn validCliAbsolutePath(path: []const u8) bool {
+    if (path.len <= 1 or path[0] != '/' or path[path.len - 1] == '/') return false;
+    var components = std.mem.splitScalar(u8, path[1..], '/');
+    while (components.next()) |component|
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return false;
+    return true;
+}
+
+fn validCliArchitecture(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    for (value) |character| if (!(std.ascii.isAlphanumeric(character) or character == '-'))
+        return false;
+    return true;
 }
 
 const PackageCacheOperation = enum { fingerprint, prepare };

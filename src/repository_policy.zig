@@ -893,52 +893,57 @@ pub fn refreshAll(
         state_slice,
     );
     errdefer allocator.free(manifest);
-    var retained_token: ?*anyopaque = null;
-    var retained_committed: u64 = 0;
-    if (request.retained_reservation) |reservation|
-        retained_token = try reservation.reserve(@intCast(manifest.len));
-    defer if (retained_token) |token|
-        request.retained_reservation.?.finish(token, retained_committed);
+    // Cache-only consumers must remain read-only. In particular, a privileged
+    // installation may read metadata prepared by an unprivileged Actions
+    // process without replacing its manifests with root-owned files.
+    if (request.mode == .online) {
+        var retained_token: ?*anyopaque = null;
+        var retained_committed: u64 = 0;
+        if (request.retained_reservation) |reservation|
+            retained_token = try reservation.reserve(@intCast(manifest.len));
+        defer if (retained_token) |token|
+            request.retained_reservation.?.finish(token, retained_committed);
 
-    for (state_slice) |state| {
-        const repository_manifest = try encodeRepositoryManifest(allocator, state);
-        defer allocator.free(repository_manifest);
-        const repository_identity: cache_module.ObjectIdentity = .{
-            .digest = cache_module.Digest.of(repository_manifest),
-            .size = repository_manifest.len,
+        for (state_slice) |state| {
+            const repository_manifest = try encodeRepositoryManifest(allocator, state);
+            defer allocator.free(repository_manifest);
+            const repository_identity: cache_module.ObjectIdentity = .{
+                .digest = cache_module.Digest.of(repository_manifest),
+                .size = repository_manifest.len,
+            };
+            try request.dependencies.cache.publish(
+                .{ .value = state.repository_id.slice() },
+                repository_policy_snapshot,
+                .{
+                    .verification = .trusted_snapshot,
+                    .verified_at_unix = request.dependencies.clock.nowUnix(),
+                    .verifier_input = state.release_digest,
+                },
+                repository_identity,
+                repository_manifest,
+                request.aggregate_publish,
+            );
+        }
+        const identity: cache_module.ObjectIdentity = .{
+            .digest = cache_module.Digest.of(manifest),
+            .size = manifest.len,
         };
-        try request.dependencies.cache.publish(
-            .{ .value = state.repository_id.slice() },
-            repository_policy_snapshot,
+        request.dependencies.cache.publish(
+            .{ .value = request.configuration.identity.slice() },
+            aggregate_snapshot,
             .{
                 .verification = .trusted_snapshot,
                 .verified_at_unix = request.dependencies.clock.nowUnix(),
-                .verifier_input = state.release_digest,
+                .verifier_input = identity.digest,
             },
-            repository_identity,
-            repository_manifest,
+            identity,
+            manifest,
             request.aggregate_publish,
-        );
+        ) catch {
+            return error.AggregatePublicationFailed;
+        };
+        retained_committed = @intCast(manifest.len);
     }
-    const identity: cache_module.ObjectIdentity = .{
-        .digest = cache_module.Digest.of(manifest),
-        .size = manifest.len,
-    };
-    request.dependencies.cache.publish(
-        .{ .value = request.configuration.identity.slice() },
-        aggregate_snapshot,
-        .{
-            .verification = .trusted_snapshot,
-            .verified_at_unix = request.dependencies.clock.nowUnix(),
-            .verifier_input = identity.digest,
-        },
-        identity,
-        manifest,
-        request.aggregate_publish,
-    ) catch {
-        return error.AggregatePublicationFailed;
-    };
-    retained_committed = @intCast(manifest.len);
 
     return .{ .published = .{
         .snapshots = snapshot_slice,

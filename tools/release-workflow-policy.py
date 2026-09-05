@@ -13,6 +13,7 @@ RELEASE = ROOT / ".github/workflows/release.yml"
 CI = ROOT / ".github/workflows/ci.yml"
 SETUP = ROOT / "actions/setup"
 DOWNLOAD = ROOT / "actions/download"
+INSTALL = ROOT / "actions/install"
 FAILURES: list[str] = []
 
 
@@ -272,6 +273,46 @@ def audit_download_action(ci: str, release: str) -> None:
             FAILURES.append(f"release download smoke is missing policy token: {token}")
 
 
+def audit_install_action(ci: str, release: str) -> None:
+    required_files = (
+        INSTALL / "action.yml",
+        INSTALL / "package.json",
+        INSTALL / "package-lock.json",
+        INSTALL / "THIRD_PARTY_NOTICES.md",
+        INSTALL / "dist/index.js",
+        INSTALL / "dist/package.json",
+        INSTALL / "dist/licenses.txt",
+        ROOT / "schema/transaction-result-summary-v1.json",
+    )
+    for path in required_files:
+        if not path.is_file() or path.stat().st_size == 0:
+            FAILURES.append(f"install action file is missing or empty: {path.relative_to(ROOT)}")
+
+    for token in (
+        "Install action unit and bundle checks",
+        "npm --prefix actions/install ci",
+        "npm --prefix actions/install audit --audit-level=high",
+        "npm --prefix actions/install test",
+        "npm --prefix actions/install run bundle",
+        "git diff --exit-code -- actions/install/dist",
+        "Install action native transaction (${{ matrix.architecture }})",
+        "Exercise cold, warm, offline, and same-root installs",
+    ):
+        if token not in ci:
+            FAILURES.append(f"CI install action coverage is missing policy token: {token}")
+    for token in (
+        "Install exact release into a cold alternate root",
+        "Install exact cache hit into a different fresh root",
+        "uses: ./actions/install",
+        "package-cache-hit",
+        "installed-count",
+        'test "$WARM_CACHE_HIT" = true',
+        'test "$WARM_DOWNLOADED" -eq 0',
+    ):
+        if token not in release:
+            FAILURES.append(f"release install smoke is missing policy token: {token}")
+
+
 def main() -> None:
     release = RELEASE.read_text()
     ci = CI.read_text()
@@ -288,6 +329,7 @@ def main() -> None:
     audit_actions(ci, CI)
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
+    audit_install_action(ci, release)
 
     required_release_tokens = (
         "ubuntu-24.04",
