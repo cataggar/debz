@@ -394,8 +394,19 @@ pub fn prepare(
     validated.deinit();
     var writer_lock = try request.cache.acquireWriter(request.policy.lock_wait_ms);
     defer writer_lock.release();
+    const initial_cleanup = try cleanupStagingForPrepare(
+        allocator,
+        request.cache,
+        request.policy,
+        &writer_lock,
+    );
     _ = try preflight(allocator, request.lock.*, request.cache, request.policy, &writer_lock);
-    return prepareWithWriterLock(allocator, request, &writer_lock);
+    return prepareWithWriterLockAfterCleanup(
+        allocator,
+        request,
+        &writer_lock,
+        initial_cleanup,
+    );
 }
 
 pub fn preflight(
@@ -448,9 +459,47 @@ pub fn prepareWithWriterLock(
     request: PrepareRequest,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !PrepareResult {
+    const initial_cleanup = try cleanupStagingForPrepare(
+        allocator,
+        request.cache,
+        request.policy,
+        writer_lock,
+    );
+    return prepareWithWriterLockAfterCleanup(
+        allocator,
+        request,
+        writer_lock,
+        initial_cleanup,
+    );
+}
+
+pub fn cleanupStagingForPrepare(
+    allocator: std.mem.Allocator,
+    cache: *package_acquisition.Cache,
+    policy: Policy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !package_acquisition.CleanupResult {
+    if (writer_lock.cache != cache or writer_lock.file == null)
+        return error.InvalidRequest;
+    const cleanup = try cache.cleanupStaging(
+        allocator,
+        policy.limits.maximum_staging_entries,
+        .{ .held = writer_lock },
+    );
+    if (!cleanup.complete) return error.CleanupIncomplete;
+    return cleanup;
+}
+
+pub fn prepareWithWriterLockAfterCleanup(
+    allocator: std.mem.Allocator,
+    request: PrepareRequest,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    initial_cleanup: package_acquisition.CleanupResult,
+) !PrepareResult {
     if (writer_lock.cache != request.cache or writer_lock.file == null or
         request.cache.limits.maximum_object_bytes != request.policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
+    if (!initial_cleanup.complete) return error.CleanupIncomplete;
     var fingerprint = try createFingerprint(
         allocator,
         request.lock.*,
@@ -474,13 +523,6 @@ pub fn prepareWithWriterLock(
     for (request.lock.packages, 0..) |package, index|
         retained[index] = .{ .bytes = package.sha256 };
     std.mem.sort(package_acquisition.Digest, retained, {}, lessDigest);
-
-    const initial_staging = try request.cache.cleanupStaging(
-        allocator,
-        request.policy.limits.maximum_staging_entries,
-        .{ .held = writer_lock },
-    );
-    if (!initial_staging.complete) return error.CleanupIncomplete;
 
     var downloaded_count: usize = 0;
     var reused_count: usize = 0;
@@ -555,12 +597,6 @@ pub fn prepareWithWriterLock(
         }
     }
 
-    const final_staging = try request.cache.cleanupStaging(
-        allocator,
-        request.policy.limits.maximum_staging_entries,
-        .{ .held = writer_lock },
-    );
-    if (!final_staging.complete) return error.CleanupIncomplete;
     const gc = try request.cache.garbageCollect(allocator, .{
         .retained = retained,
         .maximum_directory_entries = request.policy.limits.maximum_gc_directory_entries,
@@ -584,8 +620,8 @@ pub fn prepareWithWriterLock(
         .cache_path = owned_path,
         .downloaded_count = downloaded_count,
         .reused_count = reused_count,
-        .staging_scanned = initial_staging.scanned + final_staging.scanned,
-        .staging_deleted = initial_staging.deleted + final_staging.deleted,
+        .staging_scanned = initial_cleanup.scanned,
+        .staging_deleted = initial_cleanup.deleted,
         .gc_scanned = gc.scanned,
         .gc_deleted = gc.deleted,
         .gc_bytes_deleted = gc.bytes_deleted,

@@ -180,6 +180,12 @@ pub const Backend = struct {
         defer package_cache.deinit();
         var package_writer = try package_cache.acquireWriter(request.lock_wait_ms);
         defer package_writer.release();
+        const initial_cleanup = try package_cache_workflow.cleanupStagingForPrepare(
+            allocator,
+            &package_cache,
+            request.policy(),
+            &package_writer,
+        );
         if (request.archive_input_path) |path| {
             var archive = try openRegularFileAbsoluteNoFollow(self.io, path);
             defer archive.close(self.io);
@@ -277,7 +283,7 @@ pub const Backend = struct {
             };
         }
 
-        var result = try package_cache_workflow.prepareWithWriterLock(allocator, .{
+        var result = try package_cache_workflow.prepareWithWriterLockAfterCleanup(allocator, .{
             .lock = &lock.lock,
             .cache = &package_cache,
             .repositories = views,
@@ -288,7 +294,7 @@ pub const Backend = struct {
             .proxy = try proxyPolicy(request.proxy),
             .credentials = credentials,
             .acquisition = acquisition.dependencies(),
-        }, &package_writer);
+        }, &package_writer, initial_cleanup);
         errdefer result.deinit();
         if (request.archive_output_path) |path| {
             const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;

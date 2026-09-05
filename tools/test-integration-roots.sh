@@ -143,6 +143,46 @@ python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloade
 $cold
 EOF
 
+retry_cache="$workspace/package-cache-retry"
+python3 - "$resolved_lock" "$retry_cache" <<'PY'
+import json
+import pathlib
+import sys
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text())
+digest = lock["packages"][0]["sha256"]
+name = f"package-{digest[:8]}-0000000000000000.tmp"
+name += "_" * (96 - len(name))
+staging = pathlib.Path(sys.argv[2]) / "packages-v1" / "staging"
+staging.mkdir(parents=True)
+(staging / name).write_bytes(b"abandoned")
+PY
+retried=$(run_json package-cache prepare \
+  --lock-input "$resolved_lock" --cache-path "$retry_cache" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$package_cache_archives/base.dbzcache" \
+  --restored-cache exact --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]; assert value["staging"]["deleted"] >= 1' <<EOF
+$retried
+EOF
+test -z "$(find "$retry_cache/packages-v1/staging" -mindepth 1 -print -quit)"
+
+limited_cache="$workspace/package-cache-cleanup-limit"
+mkdir -p "$limited_cache/packages-v1/staging"
+printf partial >"$limited_cache/packages-v1/staging/one"
+printf partial >"$limited_cache/packages-v1/staging/two"
+set +e
+cleanup_limited=$("$debz" package-cache prepare \
+  --lock-input "$resolved_lock" --cache-path "$limited_cache" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$package_cache_archives/base.dbzcache" \
+  --restored-cache exact --maximum-staging-entries 1 --json 2>"$stderr_file")
+cleanup_limited_status=$?
+set -e
+test "$cleanup_limited_status" -eq 3
+test ! -s "$stderr_file"
+printf '%s' "$cleanup_limited" | grep -q '"id":"staging_cleanup_incomplete"'
+test -z "$(find "$limited_cache/packages-v1/objects" -mindepth 1 -type f -print -quit)"
+
 exact=$(run_json package-cache prepare $package_cache_common \
   --source "$source_file" --keyring "$keyring" --offline --json)
 python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]' <<EOF

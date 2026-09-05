@@ -21,13 +21,15 @@ failure. Digest-indexed matching scans authenticated `Packages` records once
 and rejects an explicitly bounded record count instead of performing
 lock-by-index quadratic work.
 
-Before repository I/O, preparation holds that writer lock and preflights every
-present current-lock object against the lock's size and SHA-256. Missing online
-objects proceed to authenticated acquisition; missing offline objects and
-default-policy corruption fail immediately. A caller-declared exact restore
-also treats a missing current-lock object as corruption; partial/miss restores
-may download it. Payload identity is checked after the authenticated package
-record is matched.
+Immediately after acquiring the writer lock, preparation performs bounded
+staging cleanup before importing a restored opaque archive. It then preflights
+every present current-lock object against the lock's size and SHA-256 before
+repository I/O. Missing online objects proceed to authenticated acquisition;
+missing offline objects and default-policy corruption fail immediately. A
+caller-declared exact restore also treats a missing current-lock object as
+corruption; partial/miss restores may download it. Payload identity is checked
+after the authenticated package record is matched. Successful publication
+removes its own staging file, so the workflow does not repeat the initial scan.
 
 ## Trust and ownership
 
