@@ -156,6 +156,101 @@ jobs:
           npm --prefix actions/download run bundle
           git diff --exit-code -- actions/download/dist
 
+  install-action-unit:
+    name: Install action unit and bundle checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+      - name: Test and reproduce install action bundle
+        run: |
+          npm --prefix actions/install ci
+          npm --prefix actions/install audit --audit-level=high
+          npm --prefix actions/install test
+          npm --prefix actions/install run bundle
+          git diff --exit-code -- actions/install/dist
+
+  install-action-native:
+    name: Install action native transaction (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Install Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+      - name: Build CLI and action test runtime
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          npm --prefix actions/install ci
+          npm --prefix actions/install run build
+      - name: Create signed exact-lock fixture
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          workspace="$PWD/.zig-cache/install-action-native"
+          mkdir -p "$workspace/plan-root" "$workspace/plan-cache" "$workspace/plan-state"
+          python3 tools/generate-integration-repository.py \
+            --output "$workspace/repository" --suite debian-stable \
+            --architecture "$ARCHITECTURE"
+          cat >"$workspace/fixture.sources" <<EOF
+          Types: deb
+          URIs: file://$workspace/repository
+          Suites: debian-stable
+          Components: main
+          Architectures: $ARCHITECTURE
+          Signed-By: $workspace/repository/fixture-keyring.gpg
+          EOF
+          zig-out/bin/debz plan \
+            --install-root "$workspace/plan-root" \
+            --cache-path "$workspace/plan-cache" \
+            --state-path "$workspace/plan-state" \
+            --architecture "$ARCHITECTURE" \
+            --source "$workspace/fixture.sources" \
+            --keyring "$workspace/repository/fixture-keyring.gpg" \
+            --lock-output "$workspace/lock.json" scenario-main --json >/dev/null
+          zig-out/bin/debz plan \
+            --install-root "$workspace/plan-root" \
+            --cache-path "$workspace/plan-cache" \
+            --state-path "$workspace/plan-state" \
+            --architecture "$ARCHITECTURE" \
+            --source "$workspace/fixture.sources" \
+            --keyring "$workspace/repository/fixture-keyring.gpg" \
+            --lock-output "$workspace/fail.lock.json" fail-script --json >/dev/null
+      - name: Exercise cold, warm, offline, and same-root installs
+        env:
+          DEBZ_INSTALL_INTEGRATION: '1'
+          DEBZ_INSTALL_INTEGRATION_SUDO: '1'
+          DEBZ_INSTALL_FIXTURE_ROOT: ${{ github.workspace }}/.zig-cache/install-action-native
+          DEBZ_INSTALL_CLI: ${{ github.workspace }}/zig-out/bin/debz
+          DEBZ_INSTALL_ARCHITECTURE: ${{ matrix.architecture }}
+        run: node --test --test-concurrency=1 actions/install/lib/__tests__/integration.test.js
+      - name: Normalize install diagnostics
+        if: always()
+        run: sudo chown -R "$USER:$USER" .zig-cache/install-action-native || true
+
   download-action-cache:
     name: Download action cache semantics
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -408,6 +503,34 @@ jobs:
           test "$CACHE_HIT" = false
           test "$DOWNLOADED" -gt 0
           test "$REUSED" -eq 0
+      - name: Execute cache-only transaction directly as container root
+        shell: sh
+        env:
+          CACHE_ROOT: ${{ steps.download.outputs.cache-root }}
+          LOCK: ${{ steps.fixture.outputs.lock }}
+          SOURCE: ${{ steps.fixture.outputs.source }}
+          KEYRING: ${{ steps.fixture.outputs.keyring }}
+        run: |
+          workspace="$PWD/out/download-container"
+          mkdir -p "$workspace/install-root" "$workspace/install-state"
+          "$workspace/release/bin/debz" install \
+            --install-root "$workspace/install-root" \
+            --cache-path "$CACHE_ROOT" \
+            --state-path "$workspace/install-state" \
+            --architecture amd64 \
+            --source "$SOURCE" \
+            --keyring "$KEYRING" \
+            --lock-input "$LOCK" \
+            --repository-policy strict-priority \
+            --cache-only --assume-yes --noninteractive \
+            --conffile keep-existing --json scenario-main \
+            >"$workspace/install-command.json"
+          "$workspace/release/bin/debz" transaction-result verify \
+            --state-path "$workspace/install-state" \
+            --lock-input "$LOCK" --architecture amd64 --json \
+            >"$workspace/install-summary.json"
+          grep -q '"exit_status":0' "$workspace/install-command.json"
+          grep -q '"outcome":"succeeded"' "$workspace/install-summary.json"
 
   build-and-test:
     name: Build and test (${{ matrix.name }})

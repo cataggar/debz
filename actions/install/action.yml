@@ -1,0 +1,192 @@
+name: Install an exact debz package closure
+description: Verify one debz release and package CAS, then execute and audit a locked alternate-root installation
+author: cataggar/debz contributors
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  package:
+    description: One explicit debz install selector (name[:architecture][=version])
+    required: true
+  lock-input:
+    description: Workspace-relative or absolute path to a reviewed canonical exact-lock v1 document
+    required: true
+  architecture:
+    description: Native Debian architecture (amd64 on Linux X64 or arm64 on Linux ARM64)
+    required: true
+  install-root:
+    description: Explicit alternate installation root; host / is always rejected
+    required: true
+  conffile:
+    description: Noninteractive conffile policy (keep-existing or use-package-version)
+    required: true
+  assume-yes:
+    description: Explicit mutation authorization; must be exactly 'true'
+    required: true
+  noninteractive:
+    description: Required noninteractive mode; must be exactly 'true'
+    required: true
+  force:
+    description: Newline-delimited closed-set dpkg force policies
+    required: false
+    default: ''
+  state-path:
+    description: Optional absolute or workspace-relative recovery state directory
+    required: false
+    default: ''
+  use-sudo:
+    description: Invoke only the verified debz executable through sudo -n --
+    required: false
+    default: 'false'
+  source:
+    description: Newline-delimited explicit Debian source files
+    required: false
+    default: ''
+  config:
+    description: Newline-delimited explicit debz repository config files
+    required: false
+    default: ''
+  keyring:
+    description: Newline-delimited explicit repository keyring files
+    required: true
+  foreign-architecture:
+    description: Newline-delimited allowed foreign Debian architectures
+    required: false
+    default: ''
+  default-release:
+    description: Optional default release/codename policy
+    required: false
+    default: ''
+  repository-policy:
+    description: Repository selection policy (strict-priority or best-version)
+    required: false
+    default: strict-priority
+  recommends:
+    description: Require the lock solver policy to include recommendations
+    required: false
+    default: 'false'
+  allow-downgrade:
+    description: Require the lock solver policy to allow downgrades
+    required: false
+    default: 'false'
+  proxy:
+    description: Explicit proxy URI without embedded credentials
+    required: false
+    default: ''
+  credential-reference:
+    description: Explicit credential file used only by debz for the declared repository origin
+    required: false
+    default: ''
+  deadline-ms:
+    description: Optional positive repository/package deadline in milliseconds
+    required: false
+    default: ''
+  lock-wait-ms:
+    description: Bounded package-CAS and transaction lock wait in milliseconds
+    required: false
+    default: '30000'
+  maximum-package-bytes:
+    description: Maximum bytes accepted for one package object
+    required: false
+    default: '1073741824'
+  maximum-total-package-bytes:
+    description: Maximum total bytes represented or downloaded by the lock
+    required: false
+    default: '8589934592'
+  maximum-lock-packages:
+    description: Maximum package count accepted from the exact lock
+    required: false
+    default: '100000'
+  maximum-repository-records:
+    description: Maximum authenticated Packages records scanned during exact matching
+    required: false
+    default: '1000000'
+  maximum-staging-entries:
+    description: Maximum abandoned package staging entries cleaned before save
+    required: false
+    default: '100000'
+  maximum-gc-directory-entries:
+    description: Maximum package object directory entries inspected by GC
+    required: false
+    default: '100000'
+  maximum-gc-objects-scanned:
+    description: Maximum package objects scanned by GC
+    required: false
+    default: '100000'
+  maximum-gc-objects-deleted:
+    description: Maximum unretained package objects deleted by GC
+    required: false
+    default: '100000'
+  maximum-gc-bytes-deleted:
+    description: Maximum unretained package bytes deleted by GC
+    required: false
+    default: '8589934592'
+  cache:
+    description: Restore and save only the verified immutable package CAS
+    required: false
+    default: 'true'
+  cache-root:
+    description: Optional absolute package cache root below RUNNER_TEMP
+    required: false
+    default: ''
+  offline:
+    description: Forbid package and metadata network acquisition
+    required: false
+    default: 'false'
+  cache-only:
+    description: Alias for offline package-cache preparation; final installation is always cache-only
+    required: false
+    default: 'false'
+  repair-corrupt-cache:
+    description: Explicitly reacquire corrupt package objects online
+    required: false
+    default: 'false'
+  debz-version:
+    description: Exact debz release tag or version implementing the install-action contract
+    required: true
+  sha256:
+    description: Optional independently trusted release archive SHA-256
+    required: false
+    default: ''
+  token:
+    description: Token used only by the bundled setup runtime for release and attestation API requests
+    required: false
+    default: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+  cli-cache:
+    description: Cache the exact verified debz CLI archive and installation
+    required: false
+    default: 'true'
+
+outputs:
+  debz-path:
+    description: Absolute path to the exact verified debz executable
+  debz-version:
+    description: Canonical exact release tag including the leading v
+  target:
+    description: Native release target (linux-x64 or linux-arm64)
+  cli-cache-hit:
+    description: "'true' only when the exact CLI cache was restored and reverified"
+  package-cache-hit:
+    description: "'true' only when the exact CLI-provided package cache key was restored"
+  package-cache-path:
+    description: Absolute verified packages-v1/objects directory
+  package-cache-root:
+    description: Absolute cache root passed to the final debz transaction
+  lock-digest:
+    description: Canonical exact-lock SHA-256 verified by debz
+  downloaded-count:
+    description: Package objects acquired during package-cache preparation
+  reused-count:
+    description: Package objects fully reverified from the CAS
+  transaction-result:
+    description: Absolute path to the canonical transaction-result.json
+  provenance:
+    description: Alias of transaction-result for the current combined result/provenance schema
+  installed-count:
+    description: Exact final closure package count from the verified transaction result
+
+runs:
+  using: node24
+  main: dist/index.js

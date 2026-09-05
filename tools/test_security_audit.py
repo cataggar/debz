@@ -159,6 +159,24 @@ class SecurityAuditTests(unittest.TestCase):
             archive_source,
         )
 
+    def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
+        package = json.loads((ROOT / "actions/install/package.json").read_text())
+        self.assertEqual(package["dependencies"], {"@actions/core": "3.0.1"})
+        subprocess_source = (ROOT / "actions/install/src/subprocess.ts").read_text()
+        self.assertIn("setup', 'dist', 'main', 'index.js", subprocess_source)
+        self.assertIn("download', 'dist', 'index.js", subprocess_source)
+        self.assertIn("DEBZ_DOWNLOAD_EXECUTABLE", subprocess_source)
+        self.assertNotIn("shell: true", subprocess_source)
+        action_source = (ROOT / "actions/install/src/action.ts").read_text()
+        self.assertLess(
+            action_source.index("const download = await composition.download"),
+            action_source.index("buildInstallArguments(inputs)"),
+        )
+        self.assertLess(
+            action_source.index("validateTransactionSummary("),
+            action_source.index("io.setOutput('transaction-result'"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

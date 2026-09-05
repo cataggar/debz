@@ -102,6 +102,16 @@ When both lock options are supplied, the validated input is atomically
 published at the output path. Successful locked transactions atomically publish
 `transaction-result.json` under the explicit state path.
 
+`debz transaction-result verify --state-path PATH --lock-input PATH
+--architecture ARCH --json` is the read-only action handoff for that combined
+document. It opens the state directory and result without following symbolic
+links, validates canonical encoding and digest, requires a successful exact
+final verification, compares repository/package/request/policy evidence with
+the canonical lock, and emits the bounded
+`io.github.cataggar.debz.transaction-result-summary.v1` summary. This allows an
+unprivileged action process to verify a result written by an explicitly
+elevated `debz` process without granting a second program sudo access.
+
 ## JSON and compatibility
 
 `--json` writes exactly one canonical result object to stdout. Diagnostics and

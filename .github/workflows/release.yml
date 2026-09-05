@@ -269,6 +269,60 @@ jobs:
           test -d "$CACHE_PATH"
           test "$DOWNLOADED" -gt 0
           test "$REUSED" -eq 0
+      - name: Install exact release into a cold alternate root
+        id: install-cold
+        uses: ./actions/install
+        with:
+          debz-version: ${{ github.ref_name }}
+          package: scenario-main
+          lock-input: ${{ steps.download-fixture.outputs.lock }}
+          source: ${{ steps.download-fixture.outputs.source }}
+          keyring: ${{ steps.download-fixture.outputs.keyring }}
+          architecture: ${{ matrix.architecture }}
+          install-root: ${{ runner.temp }}/debz-install-cold-root
+          state-path: ${{ runner.temp }}/debz-install-cold-state
+          cache-root: ${{ runner.temp }}/debz-install-cold-cache
+          assume-yes: 'true'
+          noninteractive: 'true'
+          conffile: keep-existing
+          use-sudo: 'true'
+          cache: 'true'
+          cli-cache: 'false'
+      - name: Install exact cache hit into a different fresh root
+        id: install-warm
+        uses: ./actions/install
+        with:
+          debz-version: ${{ github.ref_name }}
+          package: scenario-main
+          lock-input: ${{ steps.download-fixture.outputs.lock }}
+          source: ${{ steps.download-fixture.outputs.source }}
+          keyring: ${{ steps.download-fixture.outputs.keyring }}
+          architecture: ${{ matrix.architecture }}
+          install-root: ${{ runner.temp }}/debz-install-warm-root
+          state-path: ${{ runner.temp }}/debz-install-warm-state
+          cache-root: ${{ runner.temp }}/debz-install-warm-cache
+          assume-yes: 'true'
+          noninteractive: 'true'
+          conffile: use-package-version
+          use-sudo: 'true'
+          cache: 'true'
+          cli-cache: 'false'
+      - name: Validate install transaction outputs
+        env:
+          COLD_COUNT: ${{ steps.install-cold.outputs.installed-count }}
+          COLD_RESULT: ${{ steps.install-cold.outputs.transaction-result }}
+          WARM_CACHE_HIT: ${{ steps.install-warm.outputs.package-cache-hit }}
+          WARM_DOWNLOADED: ${{ steps.install-warm.outputs.downloaded-count }}
+          WARM_RESULT: ${{ steps.install-warm.outputs.transaction-result }}
+          WARM_COUNT: ${{ steps.install-warm.outputs.installed-count }}
+        run: |
+          test "$COLD_COUNT" -gt 0
+          test -f "$COLD_RESULT"
+          test "$WARM_CACHE_HIT" = true
+          test "$WARM_DOWNLOADED" -eq 0
+          test "$WARM_COUNT" -eq "$COLD_COUNT"
+          test -f "$WARM_RESULT"
+          test "$WARM_RESULT" != "$COLD_RESULT"
       - name: Audit published archive and install exact release with ghr
         env:
           GH_TOKEN: ${{ github.token }}

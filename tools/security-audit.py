@@ -600,6 +600,7 @@ def audit_download_action() -> None:
             "requires the maintained Node 24 runtime",
             "delete process.env.DEBZ_DOWNLOAD_CREDENTIAL_REFERENCE",
             "delete process.env['INPUT_CREDENTIAL-REFERENCE']",
+            "delete process.env.DEBZ_DOWNLOAD_EXECUTABLE",
             "verifyExecutableIdentity(executableIdentity)",
             "cache.save(exportArchive, fingerprint.primary_key, archiveLimit)",
             "core.setOutput('cache-hit'",
@@ -722,6 +723,164 @@ def audit_download_action() -> None:
                 fail(f"package cache archive is missing policy token: {token}")
 
 
+def audit_install_action() -> None:
+    action = ROOT / "actions/install"
+    required = (
+        action / "action.yml",
+        action / "package.json",
+        action / "package-lock.json",
+        action / "THIRD_PARTY_NOTICES.md",
+        action / "dist/index.js",
+        action / "dist/package.json",
+        action / "dist/licenses.txt",
+    )
+    for path in required:
+        if not path.is_file() or path.stat().st_size == 0:
+            fail(f"install action file is missing or empty: {path.relative_to(ROOT)}")
+    if any(not path.is_file() for path in required):
+        return
+
+    manifest = (action / "action.yml").read_text()
+    for token in (
+        "using: node24",
+        "main: dist/index.js",
+        "package:",
+        "lock-input:",
+        "install-root:",
+        "assume-yes:",
+        "noninteractive:",
+        "conffile:",
+        "use-sudo:",
+        "package-cache-hit:",
+        "transaction-result:",
+        "installed-count:",
+    ):
+        if token not in manifest:
+            fail(f"install action metadata is missing policy token: {token}")
+    for forbidden in ("\n  args:", "status-path:", "allow-host-root:"):
+        if forbidden in manifest:
+            fail(f"install action exposes forbidden input: {forbidden.strip()}")
+
+    source_requirements = {
+        "src/inputs.ts": (
+            "assume-yes must be exactly 'true'",
+            "install-root must not be the host root",
+            "must not overlap",
+            "must not traverse a symbolic link",
+            "architecture must match the native",
+        ),
+        "src/subprocess.ts": (
+            "setup', 'dist', 'main', 'index.js",
+            "download', 'dist', 'index.js",
+            "DEBZ_DOWNLOAD_EXECUTABLE",
+            "['-n', '--', executable",
+            "spawn(",
+        ),
+        "src/runner.ts": (
+            "'--cache-only'",
+            "'transaction-result'",
+            "'verify'",
+            "lock_evidence",
+        ),
+        "src/action.ts": (
+            "const download = await composition.download",
+            "buildInstallArguments(inputs)",
+            "requireFreshResult",
+            "validateTransactionSummary",
+            "await composition.saveSetupCache()",
+            "io.setOutput('transaction-result'",
+        ),
+    }
+    for relative, tokens in source_requirements.items():
+        path = action / relative
+        if not path.is_file():
+            fail(f"install action source is missing: actions/install/{relative}")
+            continue
+        text = path.read_text()
+        for token in tokens:
+            if token not in text:
+                fail(f"install action {relative} is missing policy token: {token}")
+    source_text = "\n".join(
+        path.read_text() for path in sorted((action / "src").glob("*.ts"))
+    )
+    for forbidden in (
+        "shell: true",
+        "execFile(",
+        "eval(",
+        "status-path",
+        "allow-host-root",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    ):
+        if forbidden in source_text:
+            fail(f"install action source contains forbidden mechanism: {forbidden}")
+    action_source = (action / "src/action.ts").read_text()
+    download_index = action_source.find("const download = await composition.download")
+    install_index = action_source.find("buildInstallArguments(inputs)")
+    summary_index = action_source.find("validateTransactionSummary(")
+    output_index = action_source.find("io.setOutput('transaction-result'")
+    if min(download_index, install_index, summary_index, output_index) < 0 or not (
+        download_index < install_index < summary_index < output_index
+    ):
+        fail(
+            "install action must download, always install, verify the result, and only then publish outputs"
+        )
+
+    package = json.loads((action / "package.json").read_text())
+    lock = json.loads((action / "package-lock.json").read_text())
+    if package.get("dependencies") != {"@actions/core": "3.0.1"}:
+        fail("install action runtime dependencies differ from the reviewed allowlist")
+    for group in ("dependencies", "devDependencies"):
+        values = package.get(group)
+        if not isinstance(values, dict) or not values:
+            fail(f"install action {group} are missing")
+            continue
+        for name, version in values.items():
+            if not isinstance(version, str) or not re.fullmatch(
+                r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version
+            ):
+                fail(f"install action dependency {name} is not exactly pinned: {version!r}")
+    if lock.get("lockfileVersion") != 3:
+        fail("install action package-lock.json must use lockfileVersion 3")
+    root_package = lock.get("packages", {}).get("")
+    if not isinstance(root_package, dict):
+        fail("install action lockfile has no root package")
+    else:
+        for group in ("dependencies", "devDependencies"):
+            if root_package.get(group) != package.get(group):
+                fail(f"install action lockfile {group} differ from package.json")
+    allowed_licenses = {"0BSD", "Apache-2.0", "ISC", "MIT"}
+    for name, metadata in lock.get("packages", {}).items():
+        if not name:
+            continue
+        if not isinstance(metadata, dict):
+            fail(f"install action lock entry is malformed: {name}")
+            continue
+        if metadata.get("license") not in allowed_licenses:
+            fail(f"install action dependency has an unreviewed license: {name}")
+        if metadata.get("hasInstallScript"):
+            fail(f"install action dependency has an install script: {name}")
+        if not str(metadata.get("resolved", "")).startswith("https://registry.npmjs.org/"):
+            fail(f"install action dependency is not resolved from the npm registry: {name}")
+        if not str(metadata.get("integrity", "")).startswith("sha512-"):
+            fail(f"install action dependency lacks SHA-512 lock integrity: {name}")
+    notices = (action / "THIRD_PARTY_NOTICES.md").read_text()
+    if "@actions/core" not in notices:
+        fail("install action notices omit direct dependency @actions/core")
+    tracked = subprocess.run(
+        ["git", "ls-files", "actions/install/node_modules"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if tracked.strip():
+        fail("install action node_modules must not be tracked")
+    summary_schema = ROOT / "schema/transaction-result-summary-v1.json"
+    if not summary_schema.is_file():
+        fail("transaction-result summary schema is missing")
+
+
 def audit_docs() -> None:
     if (ROOT / "docs").exists():
         fail("stale docs/ directory exists; documentation belongs under doc/")
@@ -795,6 +954,7 @@ def main() -> int:
     audit_composite_action_pins()
     audit_setup_action_dependencies()
     audit_download_action()
+    audit_install_action()
     audit_docs()
     audit_secrets_and_artifacts(files)
     if FAILURES:

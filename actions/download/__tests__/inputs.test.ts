@@ -84,6 +84,14 @@ test('rejects contradictory and unbounded policy values before cache restore', a
   invalidBoolean.DEBZ_DOWNLOAD_CACHE = 'yes';
   await assert.rejects(readInputs(invalidBoolean), /exactly 'true' or 'false'/);
 
+  const invalidShortCircuitedBoolean = environment(workspace, runnerTemp);
+  invalidShortCircuitedBoolean.DEBZ_DOWNLOAD_OFFLINE = 'true';
+  invalidShortCircuitedBoolean.DEBZ_DOWNLOAD_CACHE_ONLY = 'yes';
+  await assert.rejects(
+    readInputs(invalidShortCircuitedBoolean),
+    /exactly 'true' or 'false'/,
+  );
+
   const unbounded = environment(workspace, runnerTemp);
   unbounded.DEBZ_DOWNLOAD_MAXIMUM_LOCK_PACKAGES = '1000001';
   await assert.rejects(readInputs(unbounded), /bounded maximum/);
@@ -112,4 +120,30 @@ test('accepts only a regular executable debz from absolute PATH entries', async 
   await symlink('/bin/true', executable);
   await assert.rejects(findDebz({ PATH: bin }), /was not found/);
   await assert.rejects(findDebz({ PATH: `relative${path.delimiter}${bin}` }), /was not found/);
+});
+
+test('prefers the exact internal executable handoff without searching PATH', async () => {
+  const bin = path.join(testRoot, 'bin');
+  await mkdir(bin);
+  const executable = path.join(bin, 'debz');
+  await writeFile(executable, '#!/bin/sh\nexit 0\n');
+  await chmod(executable, 0o755);
+  assert.equal(
+    await findDebz({
+      DEBZ_DOWNLOAD_EXECUTABLE: executable,
+      PATH: '/does/not/exist',
+    }),
+    executable,
+  );
+
+  await assert.rejects(
+    findDebz({ DEBZ_DOWNLOAD_EXECUTABLE: 'debz', PATH: bin }),
+    /one absolute path/,
+  );
+  await rm(executable);
+  await symlink('/bin/true', executable);
+  await assert.rejects(
+    findDebz({ DEBZ_DOWNLOAD_EXECUTABLE: executable, PATH: bin }),
+    /canonical regular executable/,
+  );
 });

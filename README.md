@@ -52,6 +52,31 @@ journals are excluded. A cache hit is not installed state. See
 [`actions/download/README.md`](actions/download/README.md) for the complete
 input/output, offline, repair, and trust contract.
 
+Install and audit a reviewed lock into an explicit alternate root:
+
+```yaml
+- uses: cataggar/debz/actions/install@<reviewed-commit-sha>
+  id: install
+  with:
+    debz-version: v0.3.0
+    package: scenario-main
+    lock-input: .github/debz/noble-amd64.lock.json
+    config: .github/debz/noble.json
+    keyring: .github/debz/ubuntu-archive-keyring.gpg
+    architecture: amd64
+    install-root: ${{ runner.temp }}/debz-root
+    assume-yes: 'true'
+    noninteractive: 'true'
+    conffile: keep-existing
+    use-sudo: 'true'
+```
+
+The install action reuses the exact setup/download implementations and always
+runs `debz install --cache-only`, including on an exact package-cache hit.
+Only the immutable package CAS is cached; roots, dpkg state, metadata,
+journals, and success markers are not. See
+[`actions/install/README.md`](actions/install/README.md).
+
 ## Build
 
 ```sh

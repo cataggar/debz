@@ -86,6 +86,12 @@ size checked, and SHA-256 revalidated. Corruption fails closed unless online
 repair is explicitly enabled. Cache-only mode performs no acquisition call.
 Failed verification and interrupted publication remove staging data.
 
+Repository refresh in cache-only mode is also read-only: authenticated cached
+objects and manifests are verified and returned in memory but are not
+republished. An explicitly elevated transaction therefore cannot replace
+metadata prepared by an unprivileged Actions process with root-owned files,
+and a later warm-cache verification remains usable.
+
 Handles own their bytes, so garbage collection cannot invalidate active
 readers. Writers, repair, staging cleanup, and GC share the explicit cache
 lock. `garbageCollect` accepts retained digests and hard directory, scan,

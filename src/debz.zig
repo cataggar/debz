@@ -156,6 +156,7 @@ pub const exact_lock = @import("exact_lock.zig");
 pub const exact_lock_v2 = @import("exact_lock_v2.zig");
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
+pub const transaction_result_summary = @import("transaction_result_summary.zig");
 pub const ExactClosureLock = exact_lock.Lock;
 pub const OwnedExactClosureLock = exact_lock.OwnedLock;
 pub const ExactClosureLockInput = exact_lock.Input;

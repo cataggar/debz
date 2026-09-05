@@ -115,6 +115,8 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{"package-cache"}, .usage = "debz package-cache <command> [options]" },
         .{ .args = &.{ "package-cache", "fingerprint" }, .usage = "debz package-cache fingerprint --lock-input PATH" },
         .{ .args = &.{ "package-cache", "prepare" }, .usage = "debz package-cache prepare --lock-input PATH" },
+        .{ .args = &.{"transaction-result"}, .usage = "debz transaction-result verify --state-path PATH" },
+        .{ .args = &.{ "transaction-result", "verify" }, .usage = "debz transaction-result verify --state-path PATH" },
         .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
         .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
         .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
@@ -414,6 +416,7 @@ fn installReleaseFiles(
         "authenticated-refresh.md",
         "deb-payload-validation.md",
         "exact-locks-and-provenance.md",
+        "github-actions.md",
         "integration-roots.md",
         "multi-repository-policy.md",
         "openpgp-verifier.md",
@@ -447,6 +450,7 @@ fn installReleaseFiles(
         "transaction-plan-v3.json",
         "transaction-result-v1.json",
         "transaction-result-v2.json",
+        "transaction-result-summary-v1.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },

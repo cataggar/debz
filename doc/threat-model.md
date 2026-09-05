@@ -27,6 +27,16 @@ booleans, filenames, and prior workflow success are not trust evidence.
 Exact-lock and current authenticated repository evidence still authorize every
 object before use.
 
+The first-party install action treats setup, package transfer, and root
+mutation as separate trust boundaries. It validates typed inputs before any of
+them, passes the setup action's exact executable directly rather than searching
+`PATH`, hashes file inputs around each phase, and invokes no shell. Package
+cache hits never authorize installed state. Root, cache, and transaction state
+must not overlap; `/` and symbolic-link components are rejected. Escalation is
+opt-in and limited to `/usr/bin/sudo -n --` followed by the exact verified
+`debz` path. Success outputs require a fresh canonical result whose lock,
+policy, architecture, package evidence, and final exact audit all match.
+
 Production parsing, verification, decompression and archive inspection are
 in-process and never invoke a shell. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb`
 are the only production child processes started directly by debz. These
@@ -50,6 +60,10 @@ boundary.
   opened descriptor is a regular file before reading, and treats directories,
   links, FIFOs, sockets, devices, and related shape errors as corruption.
 - Repository and package publication is digest-bound and fail-closed.
+- Cache-only repository replay does not republish metadata. This keeps the
+  setup/download cache usable across an unprivileged preparation followed by
+  an explicitly elevated transaction and prevents a read-only replay from
+  changing cache ownership or freshness state.
 - Package-cache preparation holds the CAS writer lock across verification,
   publication, bounded staging cleanup, and retained-closure GC. Cache restore
   races cannot expose partial objects, and incomplete cleanup prevents save.

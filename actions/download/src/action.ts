@@ -41,6 +41,7 @@ export async function runAction(cache: CacheAdapter = defaultCache): Promise<voi
   delete process.env.DEBZ_DOWNLOAD_CREDENTIAL_REFERENCE;
   delete process.env['INPUT_CREDENTIAL-REFERENCE'];
   const executable = await findDebz();
+  delete process.env.DEBZ_DOWNLOAD_EXECUTABLE;
   const executableIdentity = await captureExecutableIdentity(executable);
   const version = await readDebzVersion(executable);
   const fingerprint = await fingerprintCache(executable, version, inputs);

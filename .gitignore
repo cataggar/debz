@@ -3,6 +3,8 @@
 /actions/setup/node_modules/
 /actions/download/lib/
 /actions/download/node_modules/
+/actions/install/lib/
+/actions/install/node_modules/
 /.cache/
 /.tmp/
 /.tools/

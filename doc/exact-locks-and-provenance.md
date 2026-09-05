@@ -105,3 +105,10 @@ Schemas:
 - [`schema/package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
+- [`schema/transaction-result-summary-v1.json`](../schema/transaction-result-summary-v1.json)
+
+`debz transaction-result verify` is the no-follow read boundary used after an
+Actions installation, including when the mutating process ran under explicit
+sudo. It verifies canonical transaction-result v1 bytes and digest, successful
+exact final state, and complete repository/package evidence against the
+supplied canonical lock before emitting the bounded summary schema above.

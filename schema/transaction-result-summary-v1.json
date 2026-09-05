@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/transaction-result-summary-v1.json",
+  "title": "debz verified transaction-result summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "api_version",
+    "transaction_schema",
+    "transaction_schema_version",
+    "target_architecture",
+    "request_sha256",
+    "solver_policy_sha256",
+    "lock_sha256",
+    "transaction_digest_sha256",
+    "package_count",
+    "outcome",
+    "final_verification_status",
+    "lock_evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "io.github.cataggar.debz.transaction-result-summary.v1"
+    },
+    "api_version": { "const": 1 },
+    "transaction_schema": {
+      "const": "https://debz.dev/schema/transaction-result-v1"
+    },
+    "transaction_schema_version": { "const": 1 },
+    "target_architecture": { "type": "string", "minLength": 1 },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "lock_sha256": { "$ref": "#/$defs/sha256" },
+    "transaction_digest_sha256": { "$ref": "#/$defs/sha256" },
+    "package_count": { "type": "integer", "minimum": 1 },
+    "outcome": { "const": "succeeded" },
+    "final_verification_status": { "const": "exact_match" },
+    "lock_evidence": { "const": "exact_match" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}
