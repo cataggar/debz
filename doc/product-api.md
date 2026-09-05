@@ -18,8 +18,7 @@ placeholder. Tests can inject the same backend used by production callers.
 ## CLI
 
 ```
-debz COMMAND --install-root ROOT --cache-path CACHE --state-path STATE \
-  --architecture ARCH [OPTIONS] [PACKAGES...]
+debz COMMAND [TARGET OPTIONS] [OPTIONS] [PACKAGES...]
 ```
 
 Commands are `refresh`, `install`, `remove`, `upgrade`, `upgrade-all`,
@@ -42,7 +41,16 @@ Version `0.3.0` replaces the `debz --version` flag with the `debz version`
 subcommand. The removed flag is rejected as an unknown command rather than
 retained as a compatibility alias.
 
-Inputs are explicit: `--source`, `--config`, `--keyring`, `--status-path`,
+The embeddable product API v1 remains fully explicit. The standalone CLI adds
+a typed system profile: omitted target options select `/`,
+`/var/cache/debz`, `/var/lib/debz`, `/var/lib/debz/locks`, target dpkg native
+architecture, and the active root-scoped repository snapshot written by
+`debz repo add`. Explicit `--source`/`--config`/`--keyring` inputs continue to
+select the legacy explicit path; they are never merged with the active
+snapshot. Alternate roots resolve defaults beneath that root and never import
+configuration from `/`.
+
+Explicit inputs include `--source`, `--config`, `--keyring`, `--status-path`,
 `--default-release`,
 `--repository-policy`, `--lock-input`, `--lock-output`, `--offline`,
 `--proxy`, `--credential-reference`, `--cache-only`, `--recommends`,
@@ -56,7 +64,10 @@ selector; `plan` accepts zero or one. Supplying unsupported extra selectors is
 a typed usage error rather than silently ignoring them. Singleton options
 cannot be repeated.
 
-Every mutating command requires `--assume-yes`. Noninteractive transaction
+Explicit/embedding mutations require `--assume-yes`. A standalone system
+mutation treats the subcommand itself as authorization, uses fixed
+noninteractive execution and `keep-existing` conffile handling, and permits
+host `/` only through this typed profile. Noninteractive explicit transaction
 commands additionally require `--conffile keep-existing` or
 `--conffile use-package-version`. `plan` and `download` are non-executing.
 
@@ -70,8 +81,24 @@ keyring, status, confirmation, conffile, or exact-lock inputs are reported as
 typed errors for the affected command; there is no global backend-unavailable
 result. Exact-lock input is enforced by planning, acquisition, and execution.
 When both lock options are supplied, the validated input is atomically
-published at the output path. Successful locked transactions atomically publish
-`transaction-result.json` under the explicit state path.
+published at the output path. For a system install without `--lock-input`, the backend creates an exact-lock
+v2 for every archive-producing action plus a system-operation-lock v2 that
+binds the complete canonical plan, including removals, request digest, solver
+policy, executor policy, canonical install/state roots, attempt identity,
+repository freshness evidence, and optional package-lock digest. The operation
+lock is atomically published beneath
+`INSTALL_ROOT/var/lib/debz/locks/<digest>.json` before dpkg.
+Per-operation evidence under `STATE/transactions/<attempt-id>/` retains the
+canonical transaction-plan-v3, package lock when present, journal, recovery
+intent, and provenance. The additive v1 result `paths` object reports the
+operation lock, available transaction-result-v3 provenance, and recovery path
+on success and on failures after lock publication. Explicit
+`plan --lock-output` followed by `install --lock-input` remains unchanged.
+
+The active configuration's validated foreign architectures are passed to the
+solver together with its native architecture. Callers cannot mix standalone
+active-configuration resolution with an unrelated explicit foreign-
+architecture list.
 
 ## JSON and compatibility
 

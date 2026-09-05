@@ -16,7 +16,9 @@ APT sources, referenced keyrings, and dpkg architecture from the selected
 target root. This is operation-scoped input, not ambient inheritance. `/` is
 enabled only inside the typed repository-add backend; alternate roots never
 fall back to host source, keyring, architecture, cache, state, or lock paths.
-Generic product operations continue to deny `/`.
+The typed standalone system-product resolver may authorize `/` only after
+loading and revalidating the active root-scoped configuration. Generic product
+API calls and alternate-root workflows do not gain ambient host trust.
 
 Production parsing, verification, decompression and archive inspection are
 in-process and never invoke a shell. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb`
@@ -32,6 +34,8 @@ boundary.
 - Every allocating parser has caller-visible byte/count limits. Fuzz harnesses
   use tighter limits (32 KiB input, bounded records/packets/tar entries).
 - Decompression limits compressed bytes, output bytes and decoder memory.
+  Gzip retains a bounded 32 KiB DEFLATE history across output chunks and still
+  verifies header structure, CRC32, ISIZE, truncation, and trailing data.
 - Archive validation rejects absolute/traversing paths, unsafe links,
   extensions, special files, duplicate paths, bombs and incomplete archives.
 - Cache and journal publication use explicit roots, no-follow traversal,
@@ -56,6 +60,22 @@ boundary.
 - Repository operation journals are integrity-decoded and matched to plan,
   root, executor policy, and exact lock before recovery. Unrelated completed
   archives do not select recovery; mismatched incomplete evidence blocks.
+- Moving repositories without `Valid-Until` remain rejected by default. A
+  repository-specific persisted exception is finite (maximum 31 days), bound
+  to signed `Date`, verification time, configuration identity, cache snapshot,
+  exact lock, and transaction provenance.
+- A system mutation publishes an exact closure lock before the first dpkg
+  command. Post-lock failures retain and report lock, provenance, and recovery
+  evidence, and retries cannot silently switch transactions.
+- The root-scoped system-operation lock is acquired before active
+  source/keyring validation by product operations and before repository-add's
+  repository/transaction locks. It serializes active configuration use and
+  the recovery-intent state machine without lock-order inversion.
+- Recovery intents contain no trusted filesystem paths. The root-owned
+  operation lock binds canonical install/state roots and a unique attempt;
+  plan, package-lock, journal, and provenance paths are derived from it.
+  Recovery consumes the persisted canonical plan and freshness evidence, not a
+  newly refreshed repository or a plan reconstructed from mutable dpkg state.
 - Diagnostics and provenance retain redacted URIs and fixed audited
   environment values; authenticated URLs and supplied credentials are not
   serialized.

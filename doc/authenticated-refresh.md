@@ -11,7 +11,7 @@ after all of these steps succeed:
 2. verify the exact canonical-text or detached signed bytes;
 3. enforce verification-time policy and, when supplied, the accepted-primary-
    fingerprint allowlist;
-4. validate Release identity, Date, Valid-Until, and selected index checksum;
+4. validate Release identity, Date, expiry policy, and selected index checksum;
 5. boundedly decompress and parse Packages;
 6. atomically publish the authenticated snapshot.
 
@@ -31,6 +31,24 @@ hash algorithm identifiers, and signature creation/expiration. Cache snapshots
 bind that evidence, the signed Release digest, policy decisions, and index
 objects. Cache-only loading rechecks object integrity and reruns authentication
 with the current caller policy; missing or incompatible evidence fails closed.
+
+Moving repositories require `Valid-Until` by default. The only missing-expiry
+exception is
+`allow_missing_valid_until_with_max_age_seconds`, which must be nonzero and no
+greater than 31 days. A signed `Date` remains mandatory, the existing future
+date bound is capped at 24 hours and remains enforced with checked arithmetic,
+and acceptance requires
+`verification_clock <= signed Date + configured bound`. If `Valid-Until` is
+present it remains authoritative. Snapshot v4 records and replay-validates the
+selected policy, configured maximum age, signed date, verification time,
+maximum future skew, whether future skew was exercised, observed age, and
+whether the missing-expiry exception was exercised.
+
+Gzip decoding uses a bounded retained DEFLATE window so valid long-distance
+matches, including Microsoft's single-member `Packages.gz` with original
+filename `Packages`, work across output chunks. Header variants, CRC32, ISIZE,
+truncation, trailing bytes, concatenated members, and all input/output/memory
+limits remain fail-closed.
 
 The supported algorithms are exactly those documented in
 [`openpgp-verifier.md`](openpgp-verifier.md): OpenPGP v4 RSA (algorithms 1 and

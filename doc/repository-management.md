@@ -20,6 +20,8 @@ sudo debz repo add \
 logical `/var/cache/debz` and `/var/lib/debz` defaults beneath the selected
 root. `--architecture` overrides target dpkg architecture discovery,
 `--sha256` pins descriptor bytes, `--no-refresh` skips only the final refresh,
+`--missing-valid-until-max-age-seconds` applies an explicit finite policy to
+the descriptor's source files,
 and `--json` emits canonical
 [`repository-operation-result-v1`](../schema/repository-operation-result-v1.json).
 Explicit logical cache/state paths, proxy policy, timeouts, retry/redirect
@@ -72,10 +74,20 @@ Architecture comes only from an explicit request or target-root dpkg
 configuration. Host `uname`, host APT configuration, environment proxies,
 netrc, prompts, and TTY input are not used.
 
+The production descriptor handler recognizes the reviewed Microsoft Ubuntu
+24.04 `packages-microsoft-prod` identity only when the package name, exact
+HTTPS repository path, `noble`/`main` target, supported architecture, declared
+keyring path, and Microsoft primary signing fingerprint all match. That profile
+persists a seven-day maximum signed-Release age for the repository's missing
+`Valid-Until`; it is not inferred later from a hostname. Other moving
+repositories remain fail-closed unless the caller explicitly supplies a
+bounded maximum age.
+
 The CLI default `/` is intentionally safe only because it enters this typed
 operation, whose executor policy enables host-root mutation for repository add
-alone. Product API v1 and every generic product command continue to reject
-host root. An alternate `--root` resolves source files, keyrings, architecture,
+alone. The standalone typed system-product path may subsequently use host root with
+the persisted active configuration; product API v1 itself remains explicit and
+continues to deny generic host-root execution. An alternate `--root` resolves source files, keyrings, architecture,
 cache, state, locks, and evidence only within that root; it never falls back
 to `/`.
 
@@ -104,25 +116,39 @@ verification scope. Under that scope every locked mutation package must have
 the exact installed identity, plan origin, digest, size, and completed journal
 artifact digest, while unrelated healthy packages already present on the
 target are allowed to remain or change. The executor's default full-closure
-exact-lock semantics remain unchanged for product operations. The executor uses a fixed
-noninteractive, keep-existing-conffile policy. Only this typed backend may opt
-into host-root execution, and only when the requested root is `/`; product API
-v1 continues to deny host-root execution for every operation.
+exact-lock semantics remain unchanged for explicit product operations. The
+executor uses a fixed noninteractive, keep-existing-conffile policy. Repository
+add and the standalone system profile may opt into host-root execution only
+through their typed paths; product API v1 and the ordinary production backend
+continue to deny generic host-root execution.
 
 After dpkg, the backend verifies descriptor package identity and exact static
 source/keyring bytes, imports the resulting target APT configuration, writes
-its manifest, refreshes only new or changed descriptor repositories unless
+its operation manifest, and atomically publishes
+`/var/lib/debz/repository/active-apt-config-snapshot-v2.json`. The active
+record is published only after re-importing and verifying installed source and
+keyring bytes. Product commands reopen those exact no-follow paths and verify
+their digests before planning. The backend refreshes only new or changed
+descriptor repositories unless
 `no_refresh`, and publishes transaction provenance v2 through the
 lock-validating execution/recovery constructors. Missing or mismatched executor
 lock digests cannot be replaced by caller-supplied provenance fields.
+
+When another descriptor is added, repository management first loads and
+revalidates the prior active manifest. Freshness policy is preserved for
+unchanged source path-and-digest identities, newly reviewed source policy is
+merged, and replaced source bytes do not inherit the old exception. The
+combined replacement is then published atomically, so adding an unrelated
+repository cannot erase an existing Microsoft compatibility decision.
 
 Operation-wide limits bound normalized repositories, solver actions,
 authenticated metadata bytes, total package bytes, retained package memory,
 cache growth, and elapsed time. Metadata objects and per-repository/aggregate
 manifests reserve their actual cache growth before publication; retained
 snapshot and aggregate-manifest memory is likewise reserved before it becomes
-an accepted result. One absolute monotonic deadline starts before the repository operation lock is
-acquired and is propagated through
+an accepted result. One absolute monotonic deadline starts before the shared root operation lock,
+which is acquired before the repository operation lock and active
+configuration validation. The deadline is propagated through
 descriptor/repository/package acquisition, dpkg execution, and recovery.
 The repository lock wait is capped by both its configured wait and remaining
 operation time; expiry after or during that wait prevents all acquisition and

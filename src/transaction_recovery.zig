@@ -5,7 +5,7 @@ const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const package_origin = @import("package_origin.zig");
 
-pub const journal_version: u32 = 2;
+pub const journal_version: u32 = 3;
 pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
 
 pub const State = enum {
@@ -34,6 +34,7 @@ pub const Journal = struct {
     root_identity: [32]u8,
     policy_sha256: [32]u8,
     lock_sha256: ?[32]u8 = null,
+    attempt_sha256: ?[32]u8 = null,
     next_command: usize,
     commands: []const Command,
     failure: ?[]const u8 = null,
@@ -203,10 +204,12 @@ fn openOrCreateDirectoryPath(io: std.Io, path: []const u8) !std.Io.Dir {
     while (components.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
             return error.AmbiguousPath;
+        var created = true;
         current.createDir(io, component, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
+            error.PathAlreadyExists => created = false,
             else => return err,
         };
+        if (created) try syncDirectory(io, current);
         const next = try current.openDir(io, component, .{ .follow_symlinks = false });
         current.close(io);
         current = next;
@@ -364,6 +367,10 @@ pub fn archive(allocator: std.mem.Allocator, store: Store, root: []const u8, jou
 }
 
 pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
+    if (journal.version != 2 and journal.version != journal_version)
+        return error.UnsupportedJournalVersion;
+    if (journal.version == 2 and journal.attempt_sha256 != null)
+        return error.UnsupportedJournalVersion;
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
     const writer = &payload.writer;
@@ -378,6 +385,11 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
     try writer.writeAll("lock\t");
     if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
     try writer.writeByte('\n');
+    if (journal.version >= 3) {
+        try writer.writeAll("attempt\t");
+        if (journal.attempt_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
+        try writer.writeByte('\n');
+    }
     try writer.print("next\t{d}\ncommands\t{d}\n", .{ journal.next_command, journal.commands.len });
     for (journal.commands) |command| {
         try writer.writeAll("command\t");
@@ -443,7 +455,8 @@ pub fn decodeBounded(
     var header_fields = std.mem.splitScalar(u8, header, '\t');
     if (!std.mem.eql(u8, header_fields.next() orelse "", "DEBZ-TXN")) return error.MalformedJournal;
     const version = try std.fmt.parseInt(u32, header_fields.next() orelse return error.MalformedJournal, 10);
-    if (version != journal_version) return error.UnsupportedJournalVersion;
+    if (version != 2 and version != journal_version)
+        return error.UnsupportedJournalVersion;
 
     const state = try parseEnumLine(State, lines.next(), "state");
     const boundary = try parseEnumLine(Boundary, lines.next(), "boundary");
@@ -451,6 +464,10 @@ pub fn decodeBounded(
     const root = try parseDigestLine(lines.next(), "root");
     const policy = try parseDigestLine(lines.next(), "policy");
     const lock = try parseOptionalDigestLine(lines.next(), "lock");
+    const attempt = if (version >= 3)
+        try parseOptionalDigestLine(lines.next(), "attempt")
+    else
+        null;
     const next = try parseIntLine(lines.next(), "next");
     const count = try parseIntLine(lines.next(), "commands");
     if (count > 300_001 or next > count) return error.ContradictoryJournal;
@@ -493,6 +510,7 @@ pub fn decodeBounded(
             .root_identity = root,
             .policy_sha256 = policy,
             .lock_sha256 = lock,
+            .attempt_sha256 = attempt,
             .next_command = next,
             .commands = commands,
             .failure = failure,
@@ -824,7 +842,13 @@ fn verifyExactLockV2LockedPackageEvidence(
     plan: solver.Plan,
     journal: Journal,
 ) !Verification {
-    if (plan.schema_version != 3 or
+    var repository_only = true;
+    for (lock.packages) |package| switch (package.origin) {
+        .authenticated_repository => {},
+        .local_artifact => repository_only = false,
+    };
+    if ((plan.schema_version != 3 and
+        !(plan.schema_version == 2 and repository_only)) or
         !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
         journal.lock_sha256 == null or
         !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or
@@ -1679,6 +1703,7 @@ test "transaction_recovery journal integrity and contradictions" {
         .plan_sha256 = @splat(3),
         .root_identity = @splat(4),
         .policy_sha256 = @splat(5),
+        .attempt_sha256 = @splat(6),
         .next_command = 0,
         .commands = &commands,
     };
@@ -1687,6 +1712,24 @@ test "transaction_recovery journal integrity and contradictions" {
     var decoded = try decode(std.testing.allocator, bytes);
     defer decoded.deinit();
     try std.testing.expectEqual(State.in_progress, decoded.journal.state);
+    try std.testing.expectEqualSlices(
+        u8,
+        &journal.attempt_sha256.?,
+        &decoded.journal.attempt_sha256.?,
+    );
+
+    var legacy = journal;
+    legacy.version = 2;
+    legacy.attempt_sha256 = null;
+    const legacy_bytes = try encode(std.testing.allocator, legacy);
+    defer std.testing.allocator.free(legacy_bytes);
+    var legacy_decoded = try decode(
+        std.testing.allocator,
+        legacy_bytes,
+    );
+    defer legacy_decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 2), legacy_decoded.journal.version);
+    try std.testing.expect(legacy_decoded.journal.attempt_sha256 == null);
     try std.testing.expectEqualStrings("demo", decoded.journal.commands[0].package.?);
 
     const corrupt = try std.testing.allocator.dupe(u8, bytes);

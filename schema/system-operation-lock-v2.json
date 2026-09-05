@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-operation-lock-v2",
+  "title": "debz standalone system operation lock v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "operation",
+    "install_root",
+    "state_path",
+    "target_architecture",
+    "request_sha256",
+    "solver_policy_sha256",
+    "executor_policy_sha256",
+    "plan_sha256",
+    "package_lock_kind",
+    "package_lock_sha256",
+    "actions",
+    "repository_refresh",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/system-operation-lock-v2" },
+    "version": { "const": 2 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "operation": {
+      "enum": ["install", "remove", "upgrade", "upgrade-all", "reinstall"]
+    },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "state_path": { "$ref": "#/$defs/nonRootAbsolutePath" },
+    "target_architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "executor_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "package_lock_kind": { "enum": ["none", "exact_v1", "exact_v2"] },
+    "package_lock_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "package", "version", "architecture"],
+        "properties": {
+          "kind": {
+            "enum": ["install", "remove", "upgrade", "downgrade", "reinstall"]
+          },
+          "package": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "version": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "architecture": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      }
+    },
+    "repository_refresh": {
+      "type": "array",
+      "maxItems": 16384,
+      "items": { "$ref": "transaction-result-v3.json#/$defs/repositoryRefresh" }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "package_lock_kind": { "const": "none" } }
+      },
+      "then": {
+        "properties": { "package_lock_sha256": { "type": "null" } }
+      },
+      "else": {
+        "properties": {
+          "package_lock_sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "package_lock_kind": {
+            "enum": ["none", "exact_v1"]
+          }
+        },
+        "required": ["package_lock_kind"]
+      },
+      "then": {
+        "properties": {
+          "repository_refresh": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "nonRootAbsolutePath": {
+      "type": "string",
+      "pattern": "^/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*$"
+    }
+  }
+}

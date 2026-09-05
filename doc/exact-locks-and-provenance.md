@@ -70,6 +70,39 @@ package-origin digest exactly equal to the bound lock digest. Package,
 repository, and signer verification is count-bounded and uses sorted/indexed
 matching rather than nested scans.
 
+The simple system install creates an exact-lock v2 before dpkg and uses the
+policy-digested `locked_packages` verification scope because the lock contains
+the complete mutation closure rather than unrelated packages already present
+on the system. Acquisition receives the same locked package evidence. The lock
+is retained at `INSTALL_ROOT/var/lib/debz/locks/<digest>.json`, copied into the
+unique `STATE/transactions/<attempt-id>/` evidence directory, and never
+replaced on a digest collision without canonical equality.
+
+Every system mutation also publishes
+[`system-operation-lock-v2`](../schema/system-operation-lock-v2.json). This
+lock binds the complete action list (including removals), canonical persisted
+plan digest, request digest, solver policy, executor policy, and optional v1/v2
+package-lock digest. It also binds the canonical install/state roots, unique
+attempt identifier, and repository freshness evidence needed to reconstruct
+recovery provenance without refreshing. Remove-only operations therefore
+retain an authorized zero-archive mutation closure without weakening
+exact-lock v1/v2's nonempty package invariants. Mixed install/remove operations
+enforce both the complete plan and the archive package lock.
+
+`transaction-result-v3` embeds the complete v2 execution result and adds, for
+each repository used by the lock, the signed Release date, optional
+`Valid-Until`, verification time, maximum accepted future skew, whether that
+skew was exercised, observed age, exact bounded missing-expiry policy, whether
+that exception was exercised, selected Packages path, and compression.
+System results also bind the unique attempt identifier. Failure provenance is
+retained after dpkg has begun; successful recovery atomically replaces it with
+a success result before clearing the active intent. Creation and validation enforce required-expiry presence,
+noninverted signed intervals, bounded observed age for a missing-expiry
+exception, checked future-date bounds, exception consistency,
+repository/snapshot correspondence with the embedded execution result,
+bounded repository counts, linear sorted-list comparison, and canonical
+reserialization.
+
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
 provenance can be bounded and digest-validated with
@@ -80,5 +113,7 @@ Schemas:
 
 - [`schema/exact-closure-lock-v1.json`](../schema/exact-closure-lock-v1.json)
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
+- [`schema/system-operation-lock-v2.json`](../schema/system-operation-lock-v2.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
+- [`schema/transaction-result-v3.json`](../schema/transaction-result-v3.json)

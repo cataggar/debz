@@ -59,6 +59,28 @@ Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
 metadata refresh. See
 [`doc/repository-management.md`](doc/repository-management.md).
 
+## Install SymCrypt on Ubuntu 24.04
+
+For the Microsoft Noble repository, the supported system workflow is:
+
+```sh
+sudo debz repo add \
+  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+sudo debz install symcrypt-openssl
+```
+
+The second command resolves and installs both `symcrypt-openssl` and its
+declared `symcrypt` dependency. `sudo debz install symcrypt` installs only the
+core package closure. System product commands default to `/`,
+`/var/cache/debz`, `/var/lib/debz`, `/var/lib/debz/locks`, the target dpkg
+architecture, and the active repository configuration published by
+`repo add`. A durable exact lock is published before dpkg and its path, plus
+the retained provenance/recovery paths, is reported in human and JSON output.
+
+The packages provide system-wide SymCrypt and the OpenSSL integration. They do
+not replace `zig-symcrypt` pinned build inputs: the Microsoft packages provide
+SymCrypt 103.11.0, no static archives, and no `libsymcrypt_plus.a`.
+
 `-Dversion` must be a SemVer value and defaults to the package version in `build.zig.zon`. An ordinary install places the target-selected CLI in `bin/`, documentation under `share/doc/debz/`, and schemas under `share/debz/`. The dedicated static-musl `release-install` graph additionally installs reviewed release runtime metadata.
 
 See [`doc/README.md`](doc/README.md) for the CLI, library, JSON, security, and implementation reference. Licensed under [Apache-2.0](LICENSE).

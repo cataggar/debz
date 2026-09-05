@@ -17,6 +17,7 @@ const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const system_operation_lock = @import("system_operation_lock.zig");
 const target_apt_config = @import("target_apt_config.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
@@ -29,7 +30,8 @@ const operation_lock_name = "repo-add.lock";
 const exact_lock_name = "exact-lock-v2.json";
 const exact_plan_name = "transaction-plan-v3.json";
 const provenance_name = "transaction-result-v2.json";
-const manifest_name = "apt-config-snapshot-v1.json";
+const manifest_name = "apt-config-snapshot-v2.json";
+pub const active_manifest_name = "active-apt-config-snapshot-v2.json";
 
 pub const Executor = struct {
     context: *anyopaque,
@@ -77,6 +79,7 @@ pub const Backend = struct {
     io: std.Io,
     executor: Executor = .system,
     process_runner: ?transaction_executor.ProcessRunner = null,
+    root_locks: ?transaction_executor.LockManager = null,
     operation_locks: ?transaction_executor.LockManager = null,
     target_locks: ?transaction_executor.LockManager = null,
     status_reader: ?transaction_recovery.StatusReader = null,
@@ -122,6 +125,49 @@ pub const Backend = struct {
             request.resources,
             request.network.overall_timeout_ms,
             allocator,
+        );
+
+        const root_lock_path = try system_operation_lock.guardPath(
+            allocator,
+            request.root,
+        );
+        defer allocator.free(root_lock_path);
+        var root_lock_manager = transaction_executor.SystemLockManager{
+            .allocator = allocator,
+            .io = self.io,
+        };
+        const root_locks = self.root_locks orelse
+            root_lock_manager.interface();
+        const root_lock_wait = budget.remainingTime() catch |err|
+            return api.failure(
+                .unavailable,
+                .resource_limit_exceeded,
+                "root-lock",
+                @errorName(err),
+            );
+        const root_lock = root_locks.acquire(
+            root_lock_path,
+            @min(request.state.lock_wait_ms, root_lock_wait),
+        ) catch |err| {
+            budget.checkTime() catch |deadline_err| return api.failure(
+                .unavailable,
+                .resource_limit_exceeded,
+                "root-lock",
+                @errorName(deadline_err),
+            );
+            return api.failure(
+                .recovery,
+                .recovery_required,
+                "root-lock",
+                @errorName(err),
+            );
+        };
+        defer root_locks.release(root_lock);
+        budget.checkTime() catch |err| return api.failure(
+            .unavailable,
+            .resource_limit_exceeded,
+            "root-lock",
+            @errorName(err),
         );
 
         var cache_root = openOrCreateAbsoluteDirectory(self.io, paths.cache_physical) catch
@@ -198,23 +244,78 @@ pub const Backend = struct {
             return api.failure(.usage, .invalid_root, "target", "target root is unsafe or unavailable");
         defer target_files.deinit();
         var architecture_process = target_apt_config.SystemProcessRunner{ .io = self.io };
-        var before_snapshot = target_apt_config.snapshot(allocator, .{
-            .root_path = request.root,
-            .architecture_override = request.architecture,
-            .limits = targetLimits(request.resources),
-            .dependencies = .{
-                .filesystem = target_files.interface(),
-                .process = architecture_process.interface(),
-            },
-        }) catch |err| return api.failure(
-            .usage,
-            if (err == error.NativeArchitectureUnavailable)
-                .architecture_unavailable
-            else
-                .target_configuration_failed,
-            "target",
-            @errorName(err),
+        const active_store = try target_apt_config.Store.init(
+            self.io,
+            repository_dir,
+            active_manifest_name,
         );
+        var active_manifest: ?target_apt_config.OwnedManifest = active_store.read(
+            allocator,
+            target_apt_config.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return api.failure(
+                .recovery,
+                .state_corrupt,
+                "active-configuration",
+                @errorName(err),
+            ),
+        };
+        defer if (active_manifest) |*value| value.deinit();
+        if (active_manifest != null and request.architecture != null and
+            !std.mem.eql(
+                u8,
+                request.architecture.?,
+                active_manifest.?.manifest.native_architecture,
+            ))
+            return api.failure(
+                .usage,
+                .invalid_request,
+                "active-configuration",
+                "explicit architecture does not match the active target configuration",
+            );
+        var before_snapshot = (if (active_manifest) |*manifest|
+            target_apt_config.loadRecordedSnapshot(allocator, .{
+                .root_path = request.root,
+                .manifest = manifest.manifest,
+                .limits = targetLimits(request.resources),
+                .dependencies = .{
+                    .filesystem = target_files.interface(),
+                    .process = architecture_process.interface(),
+                },
+            })
+        else
+            target_apt_config.snapshot(allocator, .{
+                .root_path = request.root,
+                .architecture_override = request.architecture,
+                .limits = targetLimits(request.resources),
+                .dependencies = .{
+                    .filesystem = target_files.interface(),
+                    .process = architecture_process.interface(),
+                },
+            })) catch |err| {
+            if (active_manifest != null) return api.failure(
+                .planning,
+                switch (err) {
+                    error.SourceDigestMismatch,
+                    error.KeyringDigestMismatch,
+                    error.KeyringFingerprintMismatch,
+                    => .managed_file_conflict,
+                    else => .target_configuration_failed,
+                },
+                "active-configuration",
+                @errorName(err),
+            );
+            return api.failure(
+                .usage,
+                if (err == error.NativeArchitectureUnavailable)
+                    .architecture_unavailable
+                else
+                    .target_configuration_failed,
+                "target",
+                @errorName(err),
+            );
+        };
         defer before_snapshot.deinit();
         const architecture = before_snapshot.manifest.manifest.native_architecture;
         if (prior_state) |*prior| {
@@ -527,6 +628,7 @@ pub const Backend = struct {
             architecture,
             request.network,
             request.resources,
+            request.missing_valid_until_max_age_seconds,
         ) catch |err| return progress.fail(
             state_store,
             allocator,
@@ -1328,9 +1430,9 @@ pub const Backend = struct {
                 };
                 const target_locks = self.target_locks orelse
                     system_target_locks.interface();
-                // The repository-operation lock is already held. Keep the
-                // established install/recovery order beneath it so repository
-                // paths never invert the target transaction lock hierarchy.
+                // The root operation guard and repository-operation lock are
+                // already held. Keep target transaction locks beneath both so
+                // repository and product paths cannot invert lock ordering.
                 var held_target_locks: [target_lock_paths.len]?transaction_executor.LockToken =
                     @splat(null);
                 defer {
@@ -1674,9 +1776,16 @@ pub const Backend = struct {
             @errorName(err),
         );
 
+        const combined_source_policies = try mergeSourcePolicies(
+            allocator,
+            before_snapshot.manifest.manifest,
+            material,
+        );
+        defer allocator.free(combined_source_policies);
         var after_snapshot = target_apt_config.snapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = architecture,
+            .source_policies = combined_source_policies,
             .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
@@ -1854,6 +1963,30 @@ pub const Backend = struct {
         } else {
             progress.refreshed_phase = .skipped;
         }
+
+        const active_manifest_store = target_apt_config.Store.init(
+            self.io,
+            repository_dir,
+            active_manifest_name,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .state_persistence_failed,
+            "active-configuration",
+            @errorName(err),
+        );
+        active_manifest_store.writeAtomic(
+            allocator,
+            after_snapshot.manifest.manifest,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .state_persistence_failed,
+            "active-configuration",
+            @errorName(err),
+        );
 
         budget.checkTime() catch |err| return progress.fail(
             state_store,
@@ -2226,6 +2359,10 @@ fn requestOperationId(request: api.Request) [64]u8 {
         hash.update("\x00");
     }
     hash.update(if (request.no_refresh) "\x01" else "\x00");
+    if (request.missing_valid_until_max_age_seconds) |seconds| {
+        hash.update("\x01");
+        hashInt(&hash, seconds);
+    } else hash.update("\x00");
     var result: [64]u8 = undefined;
     const digest = hash.finalResult();
     formatHex(&result, &digest);
@@ -2248,6 +2385,10 @@ fn operationRequestDigest(
         hash.update(&digest);
     } else hash.update("\x00");
     hash.update(if (request.no_refresh) "\x01" else "\x00");
+    if (request.missing_valid_until_max_age_seconds) |seconds| {
+        hash.update("\x01");
+        hashInt(&hash, seconds);
+    } else hash.update("\x00");
     hashOptionalField(&hash, request.architecture);
     hashOptionalField(&hash, request.cache.path);
     hashInt(&hash, request.cache.maximum_object_bytes);
@@ -2635,17 +2776,29 @@ const MaterialFile = struct {
     kind: enum { source, keyring },
 };
 
+const microsoft_noble_max_release_age_seconds: u64 = 7 * 24 * 60 * 60;
+const microsoft_source_path = "/etc" ++ "/apt/sources.list.d/microsoft-prod.list";
+const microsoft_keyring_path = "/usr/share/keyrings/microsoft-prod.gpg";
+const microsoft_repository_uri = "https://packages.microsoft.com/ubuntu/24.04/prod";
+const microsoft_signing_fingerprint = [20]u8{
+    0xbc, 0x52, 0x86, 0x86, 0xb5, 0x0d, 0x79, 0xe3, 0x39, 0xd3,
+    0x72, 0x1c, 0xeb, 0x3e, 0x94, 0xad, 0xbe, 0x12, 0x29, 0xcf,
+};
+
 const DescriptorMaterial = struct {
     allocator: std.mem.Allocator,
     configuration: repository_policy.Configuration,
     files: []MaterialFile,
     evidence: []state_module.FileEvidence,
+    source_policies: []target_apt_config.SourcePolicy = &.{},
 
     fn deinit(self: *DescriptorMaterial) void {
         self.configuration.deinit();
         for (self.files) |file| self.allocator.free(file.logical_path);
         self.allocator.free(self.files);
         self.allocator.free(self.evidence);
+        if (self.source_policies.len != 0)
+            self.allocator.free(self.source_policies);
         self.* = undefined;
     }
 
@@ -2655,7 +2808,83 @@ const DescriptorMaterial = struct {
         }
         return null;
     }
+
+    fn freshnessFor(
+        self: DescriptorMaterial,
+        path: []const u8,
+    ) repository_refresh.ExpiryPolicy {
+        for (self.source_policies) |policy| {
+            if (std.mem.eql(u8, policy.logical_path, path))
+                return policy.freshness;
+        }
+        return .require_valid_until;
+    }
 };
+
+fn mergeSourcePolicies(
+    allocator: std.mem.Allocator,
+    prior: target_apt_config.Manifest,
+    material: DescriptorMaterial,
+) ![]target_apt_config.SourcePolicy {
+    var policies: std.ArrayList(target_apt_config.SourcePolicy) = .empty;
+    defer policies.deinit(allocator);
+    for (prior.sources) |source_record| {
+        var replaced = false;
+        for (material.files) |file| {
+            if (file.kind != .source or
+                !std.mem.eql(
+                    u8,
+                    file.logical_path,
+                    source_record.logical_path,
+                ))
+                continue;
+            replaced = !std.mem.eql(
+                u8,
+                &file.sha256,
+                &source_record.sha256,
+            );
+            break;
+        }
+        if (!replaced) try policies.append(allocator, .{
+            .logical_path = source_record.logical_path,
+            .freshness = source_record.freshness,
+        });
+    }
+    for (material.source_policies) |new_policy| {
+        var replaced = false;
+        for (policies.items) |*policy| {
+            if (!std.mem.eql(
+                u8,
+                policy.logical_path,
+                new_policy.logical_path,
+            ))
+                continue;
+            policy.* = new_policy;
+            replaced = true;
+            break;
+        }
+        if (!replaced) try policies.append(allocator, new_policy);
+    }
+    std.mem.sort(
+        target_apt_config.SourcePolicy,
+        policies.items,
+        {},
+        struct {
+            fn less(
+                _: void,
+                left: target_apt_config.SourcePolicy,
+                right: target_apt_config.SourcePolicy,
+            ) bool {
+                return std.mem.order(
+                    u8,
+                    left.logical_path,
+                    right.logical_path,
+                ) == .lt;
+            }
+        }.less,
+    );
+    return policies.toOwnedSlice(allocator);
+}
 
 fn inspectDescriptorMaterial(
     allocator: std.mem.Allocator,
@@ -2663,6 +2892,7 @@ fn inspectDescriptorMaterial(
     architecture: []const u8,
     network: api.NetworkPolicy,
     resources: api.ResourcePolicy,
+    explicit_maximum_release_age_seconds: ?u64,
 ) !DescriptorMaterial {
     var source_files: std.ArrayList(MaterialFile) = .empty;
     defer {
@@ -2771,6 +3001,48 @@ fn inspectDescriptorMaterial(
         for (owned_files) |file| allocator.free(file.logical_path);
         allocator.free(owned_files);
     }
+    const profile_maximum_age = explicit_maximum_release_age_seconds orelse
+        if (try isSupportedMicrosoftDescriptor(
+            allocator,
+            validation.package,
+            architecture,
+            configuration.repositories,
+            owned_files,
+        ))
+            microsoft_noble_max_release_age_seconds
+        else
+            null;
+    var source_policies: std.ArrayList(target_apt_config.SourcePolicy) = .empty;
+    defer source_policies.deinit(allocator);
+    if (profile_maximum_age) |maximum_age| {
+        if (maximum_age == 0 or
+            maximum_age > repository_refresh.maximum_missing_valid_until_age_seconds)
+            return error.InvalidFreshnessPolicy;
+        for (documents) |*document| document.policy.freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = maximum_age,
+        };
+        const renormalized = try repository_policy.normalizeBinaryRefresh(
+            allocator,
+            documents,
+            architecture,
+            repositoryLimits(resources),
+        );
+        const replacement = switch (renormalized) {
+            .diagnostic => return error.MalformedRepositorySource,
+            .configuration => |value| value,
+        };
+        configuration.deinit();
+        configuration = replacement;
+        for (owned_files) |file| {
+            if (file.kind != .source) continue;
+            try source_policies.append(allocator, .{
+                .logical_path = file.logical_path,
+                .freshness = .{
+                    .allow_missing_valid_until_with_max_age_seconds = maximum_age,
+                },
+            });
+        }
+    }
     const evidence = try allocator.alloc(state_module.FileEvidence, owned_files.len);
     for (owned_files, 0..) |file, index| evidence[index] = .{
         .logical_path = file.logical_path,
@@ -2782,7 +3054,80 @@ fn inspectDescriptorMaterial(
         .configuration = configuration,
         .files = owned_files,
         .evidence = evidence,
+        .source_policies = try source_policies.toOwnedSlice(allocator),
     };
+}
+
+fn isSupportedMicrosoftDescriptor(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    architecture: []const u8,
+    repositories: []const repository_policy.NormalizedRepository,
+    files: []const MaterialFile,
+) !bool {
+    var keyring: ?MaterialFile = null;
+    for (files) |file| switch (file.kind) {
+        .source => {},
+        .keyring => {
+            if (std.mem.eql(u8, file.logical_path, microsoft_keyring_path))
+                keyring = file;
+        },
+    };
+    if (keyring == null) return false;
+    var inspected = openpgp.inspectKeyring(allocator, keyring.?.bytes, .{}) catch
+        return false;
+    defer inspected.deinit(allocator);
+    return supportedMicrosoftIdentity(
+        package,
+        architecture,
+        repositories,
+        files,
+        inspected.primary_fingerprints,
+    );
+}
+
+fn supportedMicrosoftIdentity(
+    package: []const u8,
+    architecture: []const u8,
+    repositories: []const repository_policy.NormalizedRepository,
+    files: []const MaterialFile,
+    primary_fingerprints: []const [20]u8,
+) bool {
+    if (!std.mem.eql(u8, package, "packages-microsoft-prod") or
+        (!std.mem.eql(u8, architecture, "amd64") and
+            !std.mem.eql(u8, architecture, "arm64")) or
+        repositories.len == 0)
+        return false;
+    var source_count: usize = 0;
+    var found_keyring = false;
+    for (files) |file| switch (file.kind) {
+        .source => {
+            source_count += 1;
+            if (!std.mem.eql(u8, file.logical_path, microsoft_source_path))
+                return false;
+        },
+        .keyring => {
+            if (std.mem.eql(u8, file.logical_path, microsoft_keyring_path))
+                found_keyring = true;
+        },
+    };
+    if (source_count != 1 or !found_keyring) return false;
+    for (repositories) |repository| {
+        if (!std.mem.eql(u8, repository.uri, microsoft_repository_uri) or
+            !std.mem.eql(u8, repository.suite, "noble") or
+            !std.mem.eql(u8, repository.component, "main") or
+            (!std.mem.eql(u8, repository.architecture, "amd64") and
+                !std.mem.eql(u8, repository.architecture, "arm64") and
+                !std.mem.eql(u8, repository.architecture, "armhf")) or
+            repository.signed_by.len != 1 or
+            !std.mem.eql(u8, repository.signed_by[0], microsoft_keyring_path))
+            return false;
+    }
+    for (primary_fingerprints) |fingerprint| {
+        if (std.mem.eql(u8, &fingerprint, &microsoft_signing_fingerprint))
+            return true;
+    }
+    return false;
 }
 
 fn refreshDescriptor(
@@ -2863,6 +3208,7 @@ fn changedDescriptorConfiguration(
             else
                 .legacy,
             .policy = .{
+                .freshness = material.freshnessFor(file.logical_path),
                 .proxy = if (network.proxy_url != null)
                     .{ .declared = .{ .id = "repository-api-proxy" } }
                 else
@@ -3026,10 +3372,7 @@ fn runtimeForRepository(
             .compression_order = &.{ .xz, .gzip, .zstd, .uncompressed },
             .by_hash_fallback = .not_found_only,
             .maximum_future_seconds = 300,
-            .expiry_policy = if (repository.immutability.kind == .moving)
-                .require_valid_until
-            else
-                .allow_missing_valid_until,
+            .expiry_policy = repository.freshness,
             .maximum_compressed_bytes = network.maximum_compressed_index_bytes,
             .maximum_decompressed_bytes = network.maximum_decompressed_index_bytes,
             .maximum_decoder_memory = network.maximum_decoder_memory,
@@ -4268,6 +4611,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         "amd64",
         .{},
         .{},
+        null,
     );
     defer material.deinit();
     try std.testing.expectEqual(@as(usize, 1), material.configuration.repositories.len);
@@ -4317,6 +4661,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
                 "amd64",
                 .{},
                 .{},
+                null,
             ),
         );
     }
@@ -4341,6 +4686,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             "amd64",
             .{},
             .{},
+            null,
         ),
     );
     entries[0].path = @constCast("usr/share/doc/microsoft-prod.list");
@@ -4352,8 +4698,187 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             "amd64",
             .{},
             .{},
+            null,
         ),
     );
+}
+
+test "repository backend binds Microsoft freshness profile to full identity" {
+    const source_bytes =
+        "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+        "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+    const normalized = try repository_policy.normalizeBinaryRefresh(
+        std.testing.allocator,
+        &.{.{
+            .bytes = source_bytes,
+            .format = .legacy,
+        }},
+        "amd64",
+        .{},
+    );
+    var configuration = switch (normalized) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    const files = [_]MaterialFile{
+        .{
+            .logical_path = @constCast(microsoft_source_path),
+            .bytes = source_bytes,
+            .sha256 = sha256(source_bytes),
+            .kind = .source,
+        },
+        .{
+            .logical_path = @constCast(microsoft_keyring_path),
+            .bytes = &.{},
+            .sha256 = @splat(0),
+            .kind = .keyring,
+        },
+    };
+    try std.testing.expect(supportedMicrosoftIdentity(
+        "packages-microsoft-prod",
+        "amd64",
+        configuration.repositories,
+        &files,
+        &.{microsoft_signing_fingerprint},
+    ));
+    try std.testing.expect(!supportedMicrosoftIdentity(
+        "packages-microsoft-prod",
+        "amd64",
+        configuration.repositories,
+        &files,
+        &.{@splat(0xaa)},
+    ));
+    try std.testing.expect(!supportedMicrosoftIdentity(
+        "different-descriptor",
+        "amd64",
+        configuration.repositories,
+        &files,
+        &.{microsoft_signing_fingerprint},
+    ));
+}
+
+test "repository backend preserves prior freshness while adding a repository" {
+    const microsoft_digest: [32]u8 = @splat(1);
+    const vendor_digest: [32]u8 = @splat(2);
+    const vendor_source_path =
+        "/etc" ++ "/apt/sources.list.d/vendor.list";
+    const prior_sources = [_]target_apt_config.SourceRecord{.{
+        .logical_path = microsoft_source_path,
+        .sha256 = microsoft_digest,
+        .format = .legacy,
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+        },
+    }};
+    const prior: target_apt_config.Manifest = .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &prior_sources,
+        .configuration_id = @splat('a'),
+        .repository_ids = &.{},
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+        .digest_sha256 = @splat(0),
+    };
+    const files = [_]MaterialFile{.{
+        .logical_path = @constCast(vendor_source_path),
+        .bytes = "deb https://vendor.invalid stable main\n",
+        .sha256 = vendor_digest,
+        .kind = .source,
+    }};
+    const new_policies = [_]target_apt_config.SourcePolicy{.{
+        .logical_path = vendor_source_path,
+        .freshness = .require_valid_until,
+    }};
+    const material: DescriptorMaterial = .{
+        .allocator = std.testing.allocator,
+        .configuration = undefined,
+        .files = @constCast(&files),
+        .evidence = &.{},
+        .source_policies = @constCast(&new_policies),
+    };
+    const merged = try mergeSourcePolicies(
+        std.testing.allocator,
+        prior,
+        material,
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    var found_microsoft = false;
+    var found_vendor = false;
+    for (merged) |policy| {
+        if (std.mem.eql(u8, policy.logical_path, microsoft_source_path)) {
+            found_microsoft = repository_refresh.expiryPoliciesEqual(
+                policy.freshness,
+                .{
+                    .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+                },
+            );
+        }
+        if (std.mem.eql(
+            u8,
+            policy.logical_path,
+            vendor_source_path,
+        )) {
+            found_vendor = repository_refresh.expiryPoliciesEqual(
+                policy.freshness,
+                .require_valid_until,
+            );
+        }
+    }
+    try std.testing.expect(found_microsoft);
+    try std.testing.expect(found_vendor);
+
+    const microsoft_source =
+        "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+        "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+    const vendor_source =
+        "deb [arch=amd64 signed-by=/usr/share/keyrings/vendor.gpg] " ++
+        "https://vendor.invalid stable main\n";
+    const documents = [_]repository_policy.SourceDocument{
+        .{
+            .bytes = microsoft_source,
+            .format = .legacy,
+            .policy = .{ .freshness = merged[0].freshness },
+        },
+        .{
+            .bytes = vendor_source,
+            .format = .legacy,
+            .policy = .{ .freshness = merged[1].freshness },
+        },
+    };
+    const normalized = try repository_policy.normalizeBinaryRefresh(
+        std.testing.allocator,
+        &documents,
+        "amd64",
+        .{},
+    );
+    var configuration = switch (normalized) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    try std.testing.expectEqual(@as(usize, 2), configuration.repositories.len);
+    var normalized_microsoft = false;
+    var normalized_vendor = false;
+    for (configuration.repositories) |repository| {
+        if (std.mem.eql(u8, repository.uri, microsoft_repository_uri))
+            normalized_microsoft = repository_refresh.expiryPoliciesEqual(
+                repository.freshness,
+                .{
+                    .allow_missing_valid_until_with_max_age_seconds = microsoft_noble_max_release_age_seconds,
+                },
+            );
+        if (std.mem.eql(u8, repository.uri, "https://vendor.invalid"))
+            normalized_vendor = repository_refresh.expiryPoliciesEqual(
+                repository.freshness,
+                .require_valid_until,
+            );
+    }
+    try std.testing.expect(normalized_microsoft);
+    try std.testing.expect(normalized_vendor);
 }
 
 test "repository backend uses installed dependencies before requesting refresh" {
@@ -6521,6 +7046,48 @@ test "repository operation budget enforces exact boundaries and checked overflow
         error.ResourceBudgetExceeded,
         aggregate.validateLock(lock),
     );
+}
+
+test "repository add acquires the shared root guard before repository state" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+    };
+    var root_lock: RepositoryOperationLock = .{
+        .clock_ms = &acquisition.now_ms,
+        .fail = true,
+    };
+    var repository_lock: RepositoryOperationLock = .{
+        .clock_ms = &acquisition.now_ms,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .root_locks = root_lock.interface(),
+        .operation_locks = repository_lock.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+        .state = .{ .lock_wait_ms = 10 },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), root_lock.calls);
+    try std.testing.expectEqual(@as(usize, 0), repository_lock.calls);
+    try std.testing.expectEqual(@as(usize, 0), acquisition.descriptor_reads);
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }
 
 test "repository operation lock wait is capped by the absolute operation budget" {

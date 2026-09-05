@@ -8,6 +8,7 @@ const transaction_executor = debz.transaction_executor;
 const SimulatedDpkg = struct {
     io: std.Io,
     root: []const u8,
+    architecture: []const u8,
     source: []const u8,
     keyring: []const u8,
     calls: usize = 0,
@@ -73,18 +74,40 @@ const SimulatedDpkg = struct {
         try root.createDirPath(self.io, "var/lib/dpkg");
         try root.writeFile(self.io, .{
             .sub_path = "var/lib/dpkg/status",
-            .data = "Package: ca-certificates\n" ++
-                "Status: install ok installed\n" ++
-                "Architecture: all\n" ++
-                "Version: 20240203\n\n" ++
-                "Package: essential-core\n" ++
-                "Status: install ok installed\n" ++
-                "Architecture: amd64\n" ++
-                "Version: 1.0-1\n\n" ++
-                "Package: packages-microsoft-prod\n" ++
-                "Status: install ok installed\n" ++
-                "Architecture: all\n" ++
-                "Version: 1.2-fixture\n",
+            .data = if (std.mem.eql(u8, self.architecture, "arm64"))
+                "Package: ca-certificates\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 20240203\n\n" ++
+                    "Package: essential-core\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: arm64\n" ++
+                    "Version: 1.0-1\n\n" ++
+                    "Package: openssl\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: arm64\n" ++
+                    "Version: 3.0.13-0ubuntu3\n\n" ++
+                    "Package: packages-microsoft-prod\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 1.2-fixture\n"
+            else
+                "Package: ca-certificates\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 20240203\n\n" ++
+                    "Package: essential-core\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: amd64\n" ++
+                    "Version: 1.0-1\n\n" ++
+                    "Package: openssl\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: amd64\n" ++
+                    "Version: 3.0.13-0ubuntu3\n\n" ++
+                    "Package: packages-microsoft-prod\n" ++
+                    "Status: install ok installed\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 1.2-fixture\n",
         });
     }
 };
@@ -116,6 +139,7 @@ pub fn main(init: std.process.Init) !void {
     var simulated_dpkg: SimulatedDpkg = .{
         .io = init.io,
         .root = parsed.request.root,
+        .architecture = parsed.request.architecture.?,
         .source = source,
         .keyring = keyring,
     };

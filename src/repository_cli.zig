@@ -28,6 +28,7 @@ const Option = enum {
     root,
     sha256,
     no_refresh,
+    missing_valid_until_max_age_seconds,
     json,
     architecture,
     cache_path,
@@ -88,6 +89,14 @@ pub fn parseAdd(arguments: []const []const u8) ParseError!ParsedAdd {
         } else if (std.mem.eql(u8, argument, "--no-refresh")) {
             try setOnce(&seen, .no_refresh);
             parsed.request.no_refresh = true;
+        } else if (std.mem.eql(
+            u8,
+            argument,
+            "--missing-valid-until-max-age-seconds",
+        )) {
+            try setOnce(&seen, .missing_valid_until_max_age_seconds);
+            parsed.request.missing_valid_until_max_age_seconds =
+                try number(u64, try next(arguments, &index));
         } else if (std.mem.eql(u8, argument, "--json")) {
             try setOnce(&seen, .json);
             parsed.output = .json;
@@ -244,6 +253,8 @@ test "repo add parser applies host defaults and explicit overrides" {
         "--proxy",
         "https://proxy.test",
         "--no-refresh",
+        "--missing-valid-until-max-age-seconds",
+        "604800",
         "--json",
         "--connect-timeout-ms",
         "11",
@@ -294,6 +305,10 @@ test "repo add parser applies host defaults and explicit overrides" {
     try std.testing.expectEqualStrings("/custom/state", overridden.request.state.path.?);
     try std.testing.expect(overridden.request.expected_sha256 != null);
     try std.testing.expect(overridden.request.no_refresh);
+    try std.testing.expectEqual(
+        @as(?u64, 604800),
+        overridden.request.missing_valid_until_max_age_seconds,
+    );
     try std.testing.expectEqual(OutputFormat.json, overridden.output);
     try std.testing.expectEqual(@as(u64, 13), overridden.request.network.overall_timeout_ms);
     try std.testing.expectEqual(@as(usize, 107), overridden.request.cache.maximum_object_bytes);

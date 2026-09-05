@@ -291,15 +291,51 @@ pub fn build(b: *std.Build) void {
 
     const lock_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
+        .filters = &.{
+            "exact_lock.test.",
+            "exact_lock_v2.test.",
+            "system_operation_lock.test.",
+        },
     });
     const run_lock_tests = b.addRunArtifact(lock_tests);
     b.step("test-exact-lock", "Run exact solved-closure lock tests")
         .dependOn(&run_lock_tests.step);
 
+    const system_workflow_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "production_backend.test.system operation replay",
+            "production_backend.test.journal probe",
+            "production_backend.test.persistent directory",
+            "production_backend.test.system operation guard",
+            "production_backend.test.pre-journal",
+            "production_backend.test.cleanup failure",
+            "production_backend.test.tampered system intent",
+            "production_backend.test.system recovery",
+            "production_backend.test.successful system recovery",
+            "production_backend.test.identical system operations",
+            "production_backend.test.retained freshness",
+            "system_product.test.system active configuration guard",
+            "repository_backend.test.repository add acquires",
+        },
+    });
+    const run_system_workflow_tests = b.addRunArtifact(
+        system_workflow_tests,
+    );
+    const system_workflow_step = b.step(
+        "test-system-workflow",
+        "Run standalone system transaction and recovery tests",
+    );
+    system_workflow_step.dependOn(&run_system_workflow_tests.step);
+    test_step.dependOn(&run_system_workflow_tests.step);
+
     const provenance_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "transaction_provenance.test.", "transaction_provenance_v2.test." },
+        .filters = &.{
+            "transaction_provenance.test.",
+            "transaction_provenance_v2.test.",
+            "transaction_provenance_v3.test.",
+        },
     });
     const run_provenance_tests = b.addRunArtifact(provenance_tests);
     b.step("test-transaction-provenance", "Run transaction provenance tests")
@@ -385,16 +421,19 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-config-snapshot-v2.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
+        "system-operation-lock-v2.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",
         "transaction-result-v1.json",
         "transaction-result-v2.json",
+        "transaction-result-v3.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
