@@ -15,6 +15,7 @@
     "abi",
     "debz_version",
     "cas_layout",
+    "archive_format",
     "payload_policy",
     "origin_mode",
     "acceptance_policy_digest",
@@ -22,7 +23,8 @@
     "primary_key",
     "restore_prefix",
     "cache_root",
-    "cache_path"
+    "cache_path",
+    "maximum_archive_bytes"
   ],
   "properties": {
     "schema": { "const": "io.github.cataggar.debz.package-cache-fingerprint.v1" },
@@ -35,6 +37,7 @@
     "abi": { "const": "debian-package-archive-v1" },
     "debz_version": { "type": "string", "minLength": 1 },
     "cas_layout": { "const": "packages-v1" },
+    "archive_format": { "const": "debz-package-cache-archive-v1" },
     "payload_policy": { "const": "deb-payload-default-limits-v1" },
     "origin_mode": { "const": "exact-lock-v1-authenticated-repository" },
     "acceptance_policy_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -42,6 +45,7 @@
     "primary_key": { "type": "string", "pattern": "^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$" },
     "restore_prefix": { "type": "string", "pattern": "^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-$" },
     "cache_root": { "type": "string", "pattern": "^/" },
-    "cache_path": { "type": "string", "pattern": "/packages-v1/objects$" }
+    "cache_path": { "type": "string", "pattern": "/packages-v1/objects$" },
+    "maximum_archive_bytes": { "type": "integer", "minimum": 1 }
   }
 }

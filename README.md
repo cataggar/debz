@@ -44,10 +44,11 @@ installing it:
     architecture: amd64
 ```
 
-The download action caches only verified `packages-v1/objects`. Exact and
-compatible-prefix restores are always revalidated by `debz`; repository
-metadata, credentials, keyrings, roots, dpkg state, and transaction journals
-are excluded. A cache hit is not installed state. See
+The download action caches only a path-free opaque serialization of verified
+`packages-v1/objects`. Restores are staged outside the workspace/CAS and
+imported by `debz`; exact and compatible-prefix objects are always revalidated.
+Repository metadata, credentials, keyrings, roots, dpkg state, and transaction
+journals are excluded. A cache hit is not installed state. See
 [`actions/download/README.md`](actions/download/README.md) for the complete
 input/output, offline, repair, and trust contract.
 

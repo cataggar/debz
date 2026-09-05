@@ -97,7 +97,7 @@ inputs:
     required: false
     default: '8589934592'
   cache:
-    description: Restore and save the verified package object directory
+    description: Restore and save a CLI-validated opaque archive of package objects
     required: false
     default: 'true'
   cache-root:
@@ -123,7 +123,7 @@ outputs:
   cache-matched-key:
     description: Exact or compatible-prefix key restored, or empty when no cache was restored
   cache-path:
-    description: Absolute packages-v1/objects path; this is the only externally cached path
+    description: Absolute verified packages-v1/objects path used by later debz operations
   cache-root:
     description: Absolute parent cache root accepted by debz --cache-path
   lock-digest:

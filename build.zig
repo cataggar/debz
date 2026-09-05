@@ -288,8 +288,31 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"package_cache_workflow.test."},
     });
     const run_package_cache_tests = b.addRunArtifact(package_cache_tests);
-    b.step("test-package-cache", "Run exact-lock package cache workflow tests")
-        .dependOn(&run_package_cache_tests.step);
+    const package_cache_archive_test_module = b.createModule(.{
+        .root_source_file = b.path("src/package_cache_archive.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    package_cache_archive_test_module.addIncludePath(libsolv_dependency.path("src"));
+    package_cache_archive_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    package_cache_archive_test_module.addIncludePath(zstd_dependency.path("lib"));
+    package_cache_archive_test_module.addCMacro("LZMA_API_STATIC", "1");
+    package_cache_archive_test_module.linkLibrary(libsolv);
+    package_cache_archive_test_module.linkLibrary(liblzma);
+    package_cache_archive_test_module.linkLibrary(zstd);
+    package_cache_archive_test_module.link_libc = true;
+    const package_cache_archive_tests = b.addTest(.{
+        .root_module = package_cache_archive_test_module,
+        .filters = &.{"package_cache_archive.test."},
+    });
+    const run_package_cache_archive_tests = b.addRunArtifact(package_cache_archive_tests);
+    const package_cache_test_step = b.step(
+        "test-package-cache",
+        "Run exact-lock package cache workflow and archive tests",
+    );
+    package_cache_test_step.dependOn(&run_package_cache_tests.step);
+    package_cache_test_step.dependOn(&run_package_cache_archive_tests.step);
+    test_step.dependOn(&run_package_cache_archive_tests.step);
 
     const policy_tests = b.addTest(.{
         .root_module = debz,

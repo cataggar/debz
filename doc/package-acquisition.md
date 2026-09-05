@@ -90,9 +90,21 @@ lock. `garbageCollect` accepts retained digests and hard directory, scan,
 object, and byte limits; names are sorted before deletion for deterministic
 results. `cleanupStaging` provides bounded crash recovery.
 
-External caches must contain only `packages-v1/objects`. `metadata-v1`,
-`staging`, `locks`, exact locks, keyrings, credentials, installation roots,
-dpkg state, and transaction/recovery records are outside this boundary.
+External caches contain one opaque, path-free archive exported from the
+verified current-lock objects. The cache service writes that blob only into a
+fresh private transfer directory; `debz.package_cache_archive` validates its
+framing, canonical digest ordering, object and expanded-byte limits, payload
+digests, and current-lock sizes before publishing lowercase-SHA256 objects
+under the CAS writer lock. It never interprets tar paths, links, devices, or
+special entries. `metadata-v1`, `staging`, `locks`, exact locks, keyrings,
+credentials, installation roots, dpkg state, and transaction/recovery records
+are outside this boundary.
+
+The opaque v1 stream is `debz-package-cache-archive-v1\n`, a big-endian object
+count, then strictly digest-sorted records of 32 raw SHA-256 bytes, an unsigned
+64-bit size, and exactly that many package bytes. A final SHA-256 covers all
+preceding bytes, and trailing data is rejected. The format intentionally has
+no pathname, ownership, mode, link, or special-file fields.
 
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the

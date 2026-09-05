@@ -4,6 +4,7 @@ const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const package_acquisition = @import("package_acquisition.zig");
+const package_cache_archive = @import("package_cache_archive.zig");
 const package_cache_workflow = @import("package_cache_workflow.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
@@ -179,6 +180,27 @@ pub const Backend = struct {
         defer package_cache.deinit();
         var package_writer = try package_cache.acquireWriter(request.lock_wait_ms);
         defer package_writer.release();
+        if (request.archive_input_path) |path| {
+            var archive = try openRegularFileAbsoluteNoFollow(self.io, path);
+            defer archive.close(self.io);
+            _ = try package_cache_archive.importFile(
+                allocator,
+                self.io,
+                archive,
+                &package_cache,
+                lock.lock,
+                .{
+                    .maximum_objects = request.limits.maximum_lock_packages,
+                    .maximum_object_bytes = request.limits.maximum_package_bytes,
+                    .maximum_total_object_bytes = request.limits.maximum_total_package_bytes,
+                },
+                .{
+                    .repair_corrupt = request.corrupt_cache == .repair_online,
+                    .require_exact_closure = request.restored_cache == .exact,
+                },
+                &package_writer,
+            );
+        }
         _ = try package_cache_workflow.preflight(
             allocator,
             lock.lock,
@@ -255,7 +277,7 @@ pub const Backend = struct {
             };
         }
 
-        return package_cache_workflow.prepareWithWriterLock(allocator, .{
+        var result = try package_cache_workflow.prepareWithWriterLock(allocator, .{
             .lock = &lock.lock,
             .cache = &package_cache,
             .repositories = views,
@@ -267,6 +289,37 @@ pub const Backend = struct {
             .credentials = credentials,
             .acquisition = acquisition.dependencies(),
         }, &package_writer);
+        errdefer result.deinit();
+        if (request.archive_output_path) |path| {
+            const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+            const leaf = std.fs.path.basename(path);
+            var output_dir = try openAbsoluteDirectory(self.io, parent);
+            defer output_dir.close(self.io);
+            var output = try output_dir.createFile(self.io, leaf, .{
+                .exclusive = true,
+                .permissions = if (@import("builtin").os.tag == .windows)
+                    .default_file
+                else
+                    .fromMode(0o600),
+                .resolve_beneath = true,
+            });
+            errdefer output_dir.deleteFile(self.io, leaf) catch {};
+            defer output.close(self.io);
+            _ = try package_cache_archive.exportFile(
+                allocator,
+                self.io,
+                output,
+                &package_cache,
+                lock.lock,
+                .{
+                    .maximum_objects = request.limits.maximum_lock_packages,
+                    .maximum_object_bytes = request.limits.maximum_package_bytes,
+                    .maximum_total_object_bytes = request.limits.maximum_total_package_bytes,
+                },
+                &package_writer,
+            );
+        }
+        return result;
     }
 
     fn route(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
@@ -1387,18 +1440,34 @@ fn readFile(
 }
 
 fn validateRegularFile(io: std.Io, path: []const u8) !void {
+    var file = try openRegularFileAbsoluteNoFollow(io, path);
+    defer file.close(io);
+}
+
+fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
     const leaf = std.fs.path.basename(path);
     var dir = try openAbsoluteDirectory(io, parent);
     defer dir.close(io);
-    var file = try dir.openFile(io, leaf, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
-    defer file.close(io);
-    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
+    const file = package_acquisition.openRegularFileNoFollow(dir, io, leaf) catch |err|
+        return switch (err) {
+            error.IsDir,
+            error.SymLinkLoop,
+            error.NotDir,
+            error.NotRegularFile,
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.PipeBusy,
+            error.NoDevice,
+            error.DeviceBusy,
+            error.WouldBlock,
+            => error.NotRegularFile,
+            else => |other| other,
+        };
+    errdefer file.close(io);
+    const stat = file.stat(io) catch return error.NotRegularFile;
+    if (stat.kind != .file) return error.NotRegularFile;
+    return file;
 }
 
 fn readLock(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !exact_lock.OwnedLock {

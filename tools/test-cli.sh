@@ -50,7 +50,9 @@ grep -q "unknown package-cache command 'unknown'" cli-test-stderr
 for arguments in \
     "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64" \
     "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline" \
+    "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --archive-input /archive" \
     "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --repair-corrupt-cache --offline" \
+    "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --restored-cache exact" \
     "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64"
 do
     set +e

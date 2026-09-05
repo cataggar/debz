@@ -207,6 +207,7 @@ const package_cache_prepare_help =
     \\Policy options:
     \\  --recommends --allow-downgrade --repair-corrupt-cache
     \\  --restored-cache none|partial|exact
+    \\  --archive-input PATH --archive-output PATH
     \\  --deadline-ms N --lock-wait-ms N
     \\
     \\Resource options:
@@ -448,6 +449,8 @@ const PackageCacheSingleOption = enum {
     maximum_gc_objects_deleted,
     maximum_gc_bytes_deleted,
     restored_cache,
+    archive_input,
+    archive_output,
 };
 
 fn runPackageCache(
@@ -637,6 +640,12 @@ fn parsePackageCache(
                 .exact
             else
                 return error.InvalidArguments;
+        } else if (std.mem.eql(u8, argument, "--archive-input")) {
+            try setPackageCacheOnce(&seen, .archive_input);
+            request.archive_input_path = try next(args);
+        } else if (std.mem.eql(u8, argument, "--archive-output")) {
+            try setPackageCacheOnce(&seen, .archive_output);
+            request.archive_output_path = try next(args);
         } else if (std.mem.eql(u8, argument, "--recommends")) {
             request.recommends = true;
         } else if (std.mem.eql(u8, argument, "--allow-downgrade")) {
@@ -695,6 +704,8 @@ fn parsePackageCache(
             seen.contains(.maximum_gc_objects_scanned) or
             seen.contains(.maximum_gc_objects_deleted) or
             seen.contains(.maximum_gc_bytes_deleted) or
+            request.archive_input_path != null or
+            request.archive_output_path != null or
             request.restored_cache != .none))
         return error.InvalidArguments;
     return request;
@@ -747,6 +758,7 @@ fn packageCacheFailure(err: anyerror) PackageCacheFailure {
         error.NotDir,
         error.NotRegularFile,
         error.AccessDenied,
+        error.PathAlreadyExists,
         => .{ .status = @intFromEnum(api.ExitStatus.usage), .id = "invalid_request" },
         error.UnsupportedLockSchema => .{
             .status = @intFromEnum(api.ExitStatus.planning),
@@ -776,6 +788,23 @@ fn packageCacheFailure(err: anyerror) PackageCacheFailure {
         error.CorruptObject => .{
             .status = @intFromEnum(api.ExitStatus.download),
             .id = "corrupt_cache_object",
+        },
+        error.InvalidArchive,
+        error.InvalidArchiveFile,
+        error.ArchiveTooLarge,
+        error.TooManyObjects,
+        error.ObjectTooLarge,
+        error.TotalObjectBytesExceeded,
+        error.DuplicateObject,
+        error.NonCanonicalOrder,
+        error.TruncatedArchive,
+        error.TrailingArchiveData,
+        error.ArchiveDigestMismatch,
+        error.ObjectDigestMismatch,
+        error.LockObjectMismatch,
+        => .{
+            .status = @intFromEnum(api.ExitStatus.download),
+            .id = "corrupt_cache_archive",
         },
         error.InvalidPackagePayload => .{
             .status = @intFromEnum(api.ExitStatus.download),

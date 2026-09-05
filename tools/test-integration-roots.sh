@@ -97,6 +97,8 @@ run_json plan $common --lock-input "$resolved_lock" --lock-output "$workspace/ba
 cmp "$resolved_lock" "$workspace/base-dep.copy.lock.json"
 
 package_cache_root="$workspace/package-cache"
+package_cache_archives="$workspace/package-cache-archives"
+mkdir -p "$package_cache_archives"
 package_cache_common="--lock-input $resolved_lock --cache-path $package_cache_root --architecture $architecture"
 fingerprint=$(run_json package-cache fingerprint $package_cache_common --json)
 printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v1"'
@@ -133,18 +135,9 @@ test "$wrong_architecture_status" -eq 2
 test ! -s "$stderr_file"
 printf '%s' "$wrong_architecture" | grep -q '"id":"invalid_request"'
 
-set +e
-incomplete_exact=$("$debz" package-cache prepare $package_cache_common \
-  --source "$source_file" --keyring "$keyring" \
-  --restored-cache exact --json 2>"$stderr_file")
-incomplete_exact_status=$?
-set -e
-test "$incomplete_exact_status" -eq 6
-test ! -s "$stderr_file"
-printf '%s' "$incomplete_exact" | grep -q '"id":"corrupt_cache_object"'
-
 cold=$(run_json package-cache prepare $package_cache_common \
-  --source "$source_file" --keyring "$keyring" --json)
+  --source "$source_file" --keyring "$keyring" \
+  --archive-output "$package_cache_archives/base.dbzcache" --json)
 printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v1"'
 python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == value["verified_count"]; assert value["reused_count"] == 0' <<EOF
 $cold
@@ -158,6 +151,39 @@ EOF
 
 scenario_lock="$workspace/scenario-main.lock.json"
 run_json plan $common --lock-output "$scenario_lock" scenario-main | grep -q '"exit_status":0'
+archive_partial=$(run_json package-cache prepare \
+  --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-relocated" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$package_cache_archives/base.dbzcache" \
+  --archive-output "$package_cache_archives/scenario.dbzcache" \
+  --restored-cache partial --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] > 0; assert value["reused_count"] > 0' <<EOF
+$archive_partial
+EOF
+
+archive_exact=$(run_json package-cache prepare \
+  --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-relocated-exact" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$package_cache_archives/scenario.dbzcache" \
+  --restored-cache exact --json)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]' <<EOF
+$archive_exact
+EOF
+
+cp "$package_cache_archives/base.dbzcache" "$package_cache_archives/corrupt.dbzcache"
+printf 'corrupt' >>"$package_cache_archives/corrupt.dbzcache"
+set +e
+corrupt_archive=$("$debz" package-cache prepare \
+  --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-corrupt-archive" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$package_cache_archives/corrupt.dbzcache" \
+  --restored-cache partial --json 2>"$stderr_file")
+corrupt_archive_status=$?
+set -e
+test "$corrupt_archive_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$corrupt_archive" | grep -q '"id":"corrupt_cache_archive"'
+
 partial=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$package_cache_root" \
   --architecture "$architecture" --source "$source_file" --keyring "$keyring" --json)

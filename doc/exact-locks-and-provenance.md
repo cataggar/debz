@@ -59,12 +59,14 @@ path.
 
 The package-cache fingerprint is domain-separated and covers the lock digest,
 schema, target and foreign architectures, exact runtime version, package-CAS
-layout, corruption mode, package size/total bounds, origin mode, and payload
-validation policy version. Its compatible restore prefix omits only the exact
-lock digest. Prefix-restored objects remain untrusted until complete
-revalidation. The action reports whether the service matched the exact key or
-only the prefix; an exact restore missing any current-lock object is corruption
-unless explicit online repair is selected.
+layout, opaque cache-archive format, corruption mode, package size/total
+bounds, origin mode, and payload validation policy version. Its compatible
+restore prefix omits only the exact lock digest. Prefix-restored objects remain
+untrusted until complete revalidation. The action reports whether the service
+matched the exact key or only the prefix; an exact restore missing any
+current-lock object is corruption unless explicit online repair is selected.
+The fingerprint result also supplies the CLI-derived maximum opaque archive
+size used to bound cache-service downloads before import.
 
 `debz.transaction_provenance` defines transaction-result schema version 1. It
 binds request and policy digests, architecture, source configuration IDs,

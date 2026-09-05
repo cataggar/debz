@@ -1,7 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const deb_payload = @import("deb_payload.zig");
 const exact_lock = @import("exact_lock.zig");
 const package_acquisition = @import("package_acquisition.zig");
+const package_cache_archive = @import("package_cache_archive.zig");
 const packages_index = @import("packages_index.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const solver = @import("solver.zig");
@@ -82,6 +84,8 @@ pub const Request = struct {
     allow_downgrade: bool = false,
     proxy: ?[]const u8 = null,
     credential_reference: ?[]const u8 = null,
+    archive_input_path: ?[]const u8 = null,
+    archive_output_path: ?[]const u8 = null,
     offline: bool = false,
     corrupt_cache: CorruptCachePolicy = .fail,
     restored_cache: RestoredCache = .none,
@@ -115,6 +119,7 @@ pub const Fingerprint = struct {
     restore_prefix: []u8,
     cache_root: []u8,
     cache_path: []u8,
+    maximum_archive_bytes: u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Fingerprint) void {
@@ -147,6 +152,8 @@ pub const Fingerprint = struct {
         try writeJsonString(writer, self.debz_version);
         try writer.writeAll(",\"cas_layout\":");
         try writeJsonString(writer, package_acquisition.namespace);
+        try writer.writeAll(",\"archive_format\":");
+        try writeJsonString(writer, package_cache_archive.format_id);
         try writer.writeAll(",\"payload_policy\":");
         try writeJsonString(writer, payload_policy);
         try writer.writeAll(",\"origin_mode\":");
@@ -163,6 +170,7 @@ pub const Fingerprint = struct {
         try writeJsonString(writer, self.cache_root);
         try writer.writeAll(",\"cache_path\":");
         try writeJsonString(writer, self.cache_path);
+        try writer.print(",\"maximum_archive_bytes\":{}", .{self.maximum_archive_bytes});
         try writer.writeAll("}\n");
         return output.toOwnedSlice();
     }
@@ -283,6 +291,14 @@ pub fn validateRequest(request: Request, require_repositories: bool) Error!void 
         !validPaths(request.keyring_paths) or
         (request.credential_reference != null and !validAbsolutePath(request.credential_reference.?)))
         return error.InvalidRequest;
+    if ((request.archive_input_path != null and !validAbsolutePath(request.archive_input_path.?)) or
+        (request.archive_output_path != null and !validAbsolutePath(request.archive_output_path.?)) or
+        (request.archive_input_path != null and request.archive_output_path != null and
+            std.mem.eql(u8, request.archive_input_path.?, request.archive_output_path.?)) or
+        (request.archive_input_path != null and pathWithin(request.cache_root, request.archive_input_path.?)) or
+        (request.archive_output_path != null and pathWithin(request.cache_root, request.archive_output_path.?)) or
+        ((request.restored_cache == .none) != (request.archive_input_path == null)))
+        return error.InvalidRequest;
     try validatePolicy(request.architecture, request.policy());
     if (request.proxy) |value| {
         const uri = repository_acquisition.Uri.parse(value) catch return error.InvalidRequest;
@@ -341,6 +357,11 @@ pub fn createFingerprint(
     const version = try allocator.dupe(u8, debz_version);
     errdefer allocator.free(version);
     const owned_root = try allocator.dupe(u8, cache_root);
+    const maximum_archive_bytes = try package_cache_archive.maximumArchiveBytes(.{
+        .maximum_objects = policy.limits.maximum_lock_packages,
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+        .maximum_total_object_bytes = policy.limits.maximum_total_package_bytes,
+    });
     return .{
         .lock_digest = lock_hex,
         .acceptance_policy_digest = policy_hex,
@@ -351,6 +372,7 @@ pub fn createFingerprint(
         .restore_prefix = restore_prefix,
         .cache_root = owned_root,
         .cache_path = cache_path,
+        .maximum_archive_bytes = maximum_archive_bytes,
         .allocator = allocator,
     };
 }
@@ -765,6 +787,7 @@ fn acceptancePolicyDigest(
     for (foreign) |value| hashField(&hash, value);
     hashField(&hash, debz_version);
     hashField(&hash, package_acquisition.namespace);
+    hashField(&hash, package_cache_archive.format_id);
     hashField(&hash, abi_identity);
     hashField(&hash, payload_policy);
     hashField(&hash, supported_origin_mode);
@@ -850,6 +873,13 @@ fn validAbsolutePath(path: []const u8) bool {
 
 fn validArchitecture(value: []const u8) bool {
     return std.mem.eql(u8, value, "amd64") or std.mem.eql(u8, value, "arm64");
+}
+
+fn pathWithin(root: []const u8, candidate: []const u8) bool {
+    return std.mem.eql(u8, root, candidate) or
+        (candidate.len > root.len and
+            std.mem.startsWith(u8, candidate, root) and
+            candidate[root.len] == '/');
 }
 
 fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
@@ -1558,4 +1588,68 @@ test "package_cache_workflow.test.prepare rejects digest-valid invalid Debian pa
         .acquisition = transport.dependencies(),
     }));
     try std.testing.expectEqual(@as(usize, 1), transport.calls);
+}
+
+test "package_cache_workflow.test.preflight rejects directory symlink and FIFO objects" {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepository(std.testing.allocator, payload);
+    defer repository.deinit(std.testing.allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = 1024 * 1024,
+    });
+    defer cache.deinit();
+    const digest: package_acquisition.Digest = .{
+        .bytes = repository.lock.lock.packages[0].sha256,
+    };
+    var name: [64]u8 = undefined;
+    digest.formatHex(&name);
+    var policy: Policy = .{
+        .offline = true,
+        .restored_cache = .exact,
+    };
+    policy.limits.maximum_package_bytes = 1024 * 1024;
+    var writer = try cache.acquireWriter(10);
+    defer writer.release();
+
+    try cache.objects.createDir(std.testing.io, &name, .default_dir);
+    try std.testing.expectError(error.CorruptObject, preflight(
+        std.testing.allocator,
+        repository.lock.lock,
+        &cache,
+        policy,
+        &writer,
+    ));
+    try cache.objects.deleteDir(std.testing.io, &name);
+
+    try cache.objects.symLink(std.testing.io, "../../writer.lock", &name, .{});
+    try std.testing.expectError(error.CorruptObject, preflight(
+        std.testing.allocator,
+        repository.lock.lock,
+        &cache,
+        policy,
+        &writer,
+    ));
+    try cache.objects.deleteFile(std.testing.io, &name);
+
+    if (builtin.os.tag == .linux) {
+        var name_z: [65:0]u8 = undefined;
+        @memcpy(name_z[0..64], &name);
+        name_z[64] = 0;
+        const result = std.os.linux.mknodat(
+            cache.objects.handle,
+            &name_z,
+            std.os.linux.S.IFIFO | 0o600,
+            0,
+        );
+        if (std.posix.errno(result) != .SUCCESS) return error.Unexpected;
+        try std.testing.expectError(error.CorruptObject, preflight(
+            std.testing.allocator,
+            repository.lock.lock,
+            &cache,
+            policy,
+            &writer,
+        ));
+    }
 }

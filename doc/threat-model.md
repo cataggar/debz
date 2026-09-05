@@ -18,11 +18,14 @@ enabled only inside the typed repository-add backend; alternate roots never
 fall back to host source, keyring, architecture, cache, state, or lock paths.
 Generic product operations continue to deny `/`.
 
-GitHub Actions cache archives are untrusted package-byte transport. The
-first-party download action restores and saves only `packages-v1/objects`;
-cache keys, cache-hit booleans, filenames, and prior workflow success are not
-trust evidence. Exact-lock and current authenticated repository evidence still
-authorize every object before use.
+GitHub Actions cache blobs are untrusted package-byte transport. The
+first-party download action downloads one opaque blob to a private transfer
+directory and never lets the cache service extract paths into the workspace,
+tool directory, or CAS. Debz parses a path-free format and imports only
+size/SHA-256-verified objects under its writer lock. Cache keys, cache-hit
+booleans, filenames, and prior workflow success are not trust evidence.
+Exact-lock and current authenticated repository evidence still authorize every
+object before use.
 
 Production parsing, verification, decompression and archive inspection are
 in-process and never invoke a shell. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb`
@@ -43,6 +46,9 @@ boundary.
 - Cache and journal publication use explicit roots, no-follow traversal,
   staging, fsync and atomic rename. Lock waits and garbage collection are
   bounded; interrupted state remains non-success evidence.
+- CAS lookup opens digest entries no-follow and nonblocking, verifies the
+  opened descriptor is a regular file before reading, and treats directories,
+  links, FIFOs, sockets, devices, and related shape errors as corruption.
 - Repository and package publication is digest-bound and fail-closed.
 - Package-cache preparation holds the CAS writer lock across verification,
   publication, bounded staging cleanup, and retained-closure GC. Cache restore

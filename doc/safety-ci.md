@@ -31,7 +31,8 @@ compatible-prefix, and exact cache semantics with run-unique CLI versions, and
 run `actions/download` in a bare Ubuntu container without installing Python,
 curl, `gh`, or APT tooling there. Hermetic signed-repository integration tests
 cover corruption, explicit repair, offline metadata requirements, moving
-repository failure, and retained-closure GC.
+repository failure, retained-closure GC, hostile tar-shaped cache blobs,
+relocation, and executable-replacement attempts.
 
 `zig build security-audit` is network-free and rejects:
 

@@ -4,11 +4,11 @@ The checked-in JavaScript bundle includes the pinned dependencies and
 transitive versions recorded in `package-lock.json`. Complete license texts
 emitted by the bundler are committed as `dist/licenses.txt`.
 
-Direct runtime dependency:
+Direct runtime dependencies:
 
 | Package | License |
 | --- | --- |
-| `@actions/cache` | MIT |
 | `@actions/core` | MIT |
+| `@azure/storage-blob` | MIT |
 
 The action itself is licensed under the repository's Apache-2.0 license.

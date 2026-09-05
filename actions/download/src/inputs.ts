@@ -28,6 +28,7 @@ export interface Limits {
 }
 
 export interface Inputs {
+  runnerTemp: string;
   lockInput: string;
   architecture: string;
   sources: string[];
@@ -143,7 +144,7 @@ export async function readInputs(
     maximumTotalPackageBytes: positiveInteger(
       environment,
       'MAXIMUM_TOTAL_PACKAGE_BYTES',
-      10 * 1024 * 1024 * 1024,
+      9 * 1024 * 1024 * 1024,
     ),
     maximumLockPackages: positiveInteger(
       environment,
@@ -238,6 +239,7 @@ export async function readInputs(
   }
 
   return {
+    runnerTemp,
     lockInput,
     architecture,
     sources,

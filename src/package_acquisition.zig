@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const acquisition = @import("repository_acquisition.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const packages_index = @import("packages_index.zig");
@@ -327,15 +328,31 @@ pub const Cache = struct {
         if (expected_size > self.limits.maximum_object_bytes) return error.PackageTooLarge;
         var name: [64]u8 = undefined;
         digest.formatHex(&name);
+        var file = openRegularFileNoFollow(self.objects, self.io, &name) catch |err| switch (err) {
+            error.FileNotFound => return error.CacheMiss,
+            error.IsDir,
+            error.SymLinkLoop,
+            error.NotDir,
+            error.NotRegularFile,
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.PipeBusy,
+            error.NoDevice,
+            error.DeviceBusy,
+            error.WouldBlock,
+            => return error.CorruptObject,
+            else => |e| return e,
+        };
+        defer file.close(self.io);
+        const stat = file.stat(self.io) catch return error.CorruptObject;
+        if (stat.kind != .file or stat.size != expected_size) return error.CorruptObject;
         const bytes = secureReadAlloc(
-            self.objects,
+            file,
             self.io,
-            &name,
             allocator,
             .limited(@intCast(expected_size +| 1)),
         ) catch |err| switch (err) {
-            error.FileNotFound => return error.CacheMiss,
-            error.StreamTooLong, error.SymLinkLoop, error.NotDir, error.AccessDenied => return error.CorruptObject,
+            error.StreamTooLong => return error.CorruptObject,
             else => |e| return e,
         };
         errdefer allocator.free(bytes);
@@ -346,18 +363,23 @@ pub const Cache = struct {
     pub fn objectSize(self: *Cache, digest: Digest) !?u64 {
         var name: [64]u8 = undefined;
         digest.formatHex(&name);
-        var file = self.objects.openFile(self.io, &name, .{
-            .mode = .read_only,
-            .allow_directory = false,
-            .follow_symlinks = false,
-            .resolve_beneath = true,
-        }) catch |err| switch (err) {
+        var file = openRegularFileNoFollow(self.objects, self.io, &name) catch |err| switch (err) {
             error.FileNotFound => return null,
-            error.SymLinkLoop, error.NotDir, error.AccessDenied => return error.CorruptObject,
+            error.IsDir,
+            error.SymLinkLoop,
+            error.NotDir,
+            error.NotRegularFile,
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.PipeBusy,
+            error.NoDevice,
+            error.DeviceBusy,
+            error.WouldBlock,
+            => return error.CorruptObject,
             else => |other| return other,
         };
         defer file.close(self.io);
-        const stat = try file.stat(self.io);
+        const stat = file.stat(self.io) catch return error.CorruptObject;
         if (stat.kind != .file) return error.CorruptObject;
         return stat.size;
     }
@@ -386,10 +408,7 @@ pub const Cache = struct {
             return;
         } else |err| switch (err) {
             error.CacheMiss => {},
-            error.CorruptObject => self.objects.deleteFile(self.io, &name) catch |delete_err| switch (delete_err) {
-                error.FileNotFound => {},
-                else => |e| return e,
-            },
+            error.CorruptObject => try self.removeCorruptObject(&name),
             else => |e| return e,
         }
 
@@ -479,15 +498,7 @@ pub const Cache = struct {
                 result.complete = false;
                 continue;
             };
-            if (containsDigest(retained, digest)) continue;
-            if (result.deleted == options.maximum_objects_deleted) {
-                result.complete = false;
-                continue;
-            }
-            var file = self.objects.openFile(self.io, name, .{
-                .follow_symlinks = false,
-                .resolve_beneath = true,
-            }) catch {
+            var file = openRegularFileNoFollow(self.objects, self.io, name) catch {
                 result.complete = false;
                 continue;
             };
@@ -497,6 +508,15 @@ pub const Cache = struct {
                 continue;
             };
             file.close(self.io);
+            if (stat.kind != .file) {
+                result.complete = false;
+                continue;
+            }
+            if (containsDigest(retained, digest)) continue;
+            if (result.deleted == options.maximum_objects_deleted) {
+                result.complete = false;
+                continue;
+            }
             if (stat.size > options.maximum_bytes_deleted -| result.bytes_deleted) {
                 result.complete = false;
                 continue;
@@ -506,6 +526,19 @@ pub const Cache = struct {
             result.bytes_deleted += stat.size;
         }
         return result;
+    }
+
+    fn removeCorruptObject(self: *Cache, name: []const u8) !void {
+        self.objects.deleteFile(self.io, name) catch |err| switch (err) {
+            error.FileNotFound => return,
+            error.IsDir, error.AccessDenied => {
+                self.objects.deleteDir(self.io, name) catch |delete_err| switch (delete_err) {
+                    error.FileNotFound => return,
+                    else => return error.CorruptObject,
+                };
+            },
+            else => return error.CorruptObject,
+        };
     }
 
     const HeldLock = union(enum) {
@@ -761,15 +794,45 @@ fn syncDirectory(io: std.Io, dir: Dir) !void {
     }
 }
 
-fn secureReadAlloc(
+pub fn openRegularFileNoFollow(
     dir: Dir,
     io: std.Io,
     path: []const u8,
+) !File {
+    if (path.len == 0 or std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "..") or
+        std.mem.indexOfAny(u8, path, "/\\") != null)
+        return error.AccessDenied;
+    const file: File = switch (builtin.os.tag) {
+        .linux => blk: {
+            const fd = try std.posix.openat(dir.handle, path, .{
+                .NONBLOCK = true,
+                .NOFOLLOW = true,
+                .CLOEXEC = true,
+            }, 0);
+            break :blk .{
+                .handle = fd,
+                .flags = .{ .nonblocking = true },
+            };
+        },
+        else => dir.openFile(io, path, .{
+            .mode = .read_only,
+            .allow_directory = true,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }),
+    };
+    errdefer file.close(io);
+    const stat = file.stat(io) catch return error.NotRegularFile;
+    if (stat.kind != .file) return error.NotRegularFile;
+    return file;
+}
+
+fn secureReadAlloc(
+    file: File,
+    io: std.Io,
     allocator: std.mem.Allocator,
     limit: std.Io.Limit,
 ) ![]u8 {
-    var file = try dir.openFile(io, path, .{ .follow_symlinks = false, .resolve_beneath = true });
-    defer file.close(io);
     var reader = file.reader(io, &.{});
     return reader.interface.allocRemaining(allocator, limit) catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
@@ -1469,12 +1532,114 @@ test "cache rejects object symlinks and bounds non-object garbage entries" {
         error.CorruptObject,
         cache.lookup(std.testing.allocator, digest, "outside".len, .verify_sha256),
     );
+    try std.testing.expectError(error.CorruptObject, cache.objectSize(digest));
     const bounded = try cache.garbageCollect(std.testing.allocator, .{
-        .maximum_directory_entries = 0,
+        .retained = &.{digest},
+        .maximum_directory_entries = 1,
         .maximum_objects_scanned = 1,
         .maximum_objects_deleted = 1,
         .maximum_bytes_deleted = 1024,
     });
     try std.testing.expect(!bounded.complete);
-    try std.testing.expectEqual(@as(usize, 0), bounded.scanned);
+    try std.testing.expectEqual(@as(usize, 1), bounded.scanned);
+
+    var selection = try testSelection(std.testing.allocator, "outside");
+    defer selection.deinit(std.testing.allocator);
+    var transport: TestTransport = .{ .responses = &.{.{ .body = "outside" }} };
+    var policy = testPolicy(.online);
+    policy.corrupt_cache = .repair_online;
+    var repaired = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = policy,
+    }, transport.dependencies());
+    defer repaired.deinit();
+    try std.testing.expectEqual(Outcome.downloaded, repaired.provenance.outcome);
+}
+
+test "package_acquisition.test.directory objects fail closed and repair only when empty" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    var selection = try testSelection(std.testing.allocator, "directory replacement");
+    defer selection.deinit(std.testing.allocator);
+    const digest = Digest.of("directory replacement");
+    var name: [64]u8 = undefined;
+    digest.formatHex(&name);
+    try cache.objects.createDir(std.testing.io, &name, .default_dir);
+    try std.testing.expectError(
+        error.CorruptObject,
+        cache.lookup(std.testing.allocator, digest, "directory replacement".len, .verify_sha256),
+    );
+    try std.testing.expectError(error.CorruptObject, cache.objectSize(digest));
+    const retained_gc = try cache.garbageCollect(std.testing.allocator, .{
+        .retained = &.{digest},
+        .maximum_directory_entries = 1,
+        .maximum_objects_scanned = 1,
+        .maximum_objects_deleted = 1,
+        .maximum_bytes_deleted = 1024,
+    });
+    try std.testing.expect(!retained_gc.complete);
+
+    var offline_transport: TestTransport = .{};
+    try std.testing.expectError(error.CorruptObject, acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = testPolicy(.cache_only),
+    }, offline_transport.dependencies()));
+    try std.testing.expectEqual(@as(usize, 0), offline_transport.count);
+
+    var transport: TestTransport = .{ .responses = &.{.{ .body = "directory replacement" }} };
+    var policy = testPolicy(.online);
+    policy.corrupt_cache = .repair_online;
+    var repaired = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = policy,
+    }, transport.dependencies());
+    defer repaired.deinit();
+    try std.testing.expectEqual(Outcome.downloaded, repaired.provenance.outcome);
+}
+
+test "package_acquisition.test.FIFO objects are opened nonblocking and safely repaired" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    var selection = try testSelection(std.testing.allocator, "fifo replacement");
+    defer selection.deinit(std.testing.allocator);
+    const digest = Digest.of("fifo replacement");
+    var name: [64]u8 = undefined;
+    digest.formatHex(&name);
+    var name_z: [65:0]u8 = undefined;
+    @memcpy(name_z[0..64], &name);
+    name_z[64] = 0;
+    const result = std.os.linux.mknodat(
+        cache.objects.handle,
+        &name_z,
+        std.os.linux.S.IFIFO | 0o600,
+        0,
+    );
+    if (std.posix.errno(result) != .SUCCESS) return error.Unexpected;
+    try std.testing.expectError(
+        error.CorruptObject,
+        cache.lookup(std.testing.allocator, digest, "fifo replacement".len, .verify_sha256),
+    );
+    try std.testing.expectError(error.CorruptObject, cache.objectSize(digest));
+
+    var offline_transport: TestTransport = .{};
+    try std.testing.expectError(error.CorruptObject, acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = testPolicy(.cache_only),
+    }, offline_transport.dependencies()));
+    try std.testing.expectEqual(@as(usize, 0), offline_transport.count);
+
+    var transport: TestTransport = .{ .responses = &.{.{ .body = "fifo replacement" }} };
+    var policy = testPolicy(.online);
+    policy.corrupt_cache = .repair_online;
+    var repaired = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = policy,
+    }, transport.dependencies());
+    defer repaired.deinit();
+    try std.testing.expectEqual(Outcome.downloaded, repaired.provenance.outcome);
 }

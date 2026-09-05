@@ -14,6 +14,7 @@ import {
 } from '../src/runner.js';
 
 const inputs: Inputs = {
+  runnerTemp: '/runner',
   lockInput: '/workspace/lock.json',
   architecture: 'amd64',
   sources: ['/workspace/repo.sources'],
@@ -75,6 +76,10 @@ test('invokes debz without a shell and strictly validates both result schemas', 
         matchedKey: `${expected.restore_prefix}${'d'.repeat(64)}`,
         kind: 'partial',
       },
+      {
+        input: '/runner/restored.dbzcache',
+        output: '/runner/export.dbzcache',
+      },
       runner,
     ),
     prepared,
@@ -86,6 +91,8 @@ test('invokes debz without a shell and strictly validates both result schemas', 
   assert.ok(calls[2].includes('/workspace/keyring.gpg'));
   const restoreIndex = calls[2].indexOf('--restored-cache');
   assert.equal(calls[2][restoreIndex + 1], 'partial');
+  assert.ok(calls[2].includes('/runner/restored.dbzcache'));
+  assert.ok(calls[2].includes('/runner/export.dbzcache'));
 });
 
 test('builds only typed arguments and excludes secrets from fingerprint material', () => {
@@ -186,6 +193,7 @@ test('rejects malformed version, multiline JSON, and inconsistent counts', async
       inputs,
       expected,
       { cacheHit: false, matchedKey: '', kind: 'none' },
+      {},
       {
         async run() {
           return `${JSON.stringify(invalid)}\n`;

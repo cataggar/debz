@@ -582,21 +582,26 @@ def audit_download_action() -> None:
             "fingerprint",
             "prepare",
             "--restored-cache",
+            "--archive-input",
+            "--archive-output",
             "outside the CLI-provided restore prefix",
         ),
         "src/cache.ts": (
-            "cache.restoreCache(",
-            "[restorePrefix]",
-            "cache.saveCache(",
-            "process.chdir(parent)",
-            "immutable key already exists",
+            "debz-package-cache-opaque-archive-v1",
+            "GetCacheEntryDownloadURL",
+            "BlockBlobClient",
+            "downloadToFile(",
+            "uploadFile(",
+            "createTransferArea(",
+            "matched cache blob could not be safely staged",
         ),
         "src/action.ts": (
             "fingerprintCache(",
             "requires the maintained Node 24 runtime",
             "delete process.env.DEBZ_DOWNLOAD_CREDENTIAL_REFERENCE",
             "delete process.env['INPUT_CREDENTIAL-REFERENCE']",
-            "cache.save(fingerprint.cache_path, fingerprint.primary_key)",
+            "verifyExecutableIdentity(executableIdentity)",
+            "cache.save(exportArchive, fingerprint.primary_key, archiveLimit)",
             "core.setOutput('cache-hit'",
             "core.setOutput('downloaded-count'",
         ),
@@ -613,22 +618,36 @@ def audit_download_action() -> None:
     source_text = "\n".join(
         path.read_text() for path in sorted((action / "src").glob("*.ts"))
     )
-    for forbidden in ("HTTP_PROXY", "HTTPS_PROXY", "GH_TOKEN", "GITHUB_TOKEN", ".npmrc"):
+    for forbidden in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        ".npmrc",
+        "@actions/cache",
+        "extractTar(",
+        "createTar(",
+        "process.chdir(",
+    ):
         if forbidden in source_text:
             fail(f"download action source reads forbidden ambient input: {forbidden}")
     action_source = (action / "src/action.ts").read_text()
     prepare_index = action_source.find("const prepared = await prepareCache(")
     save_index = action_source.find("await cache.save(")
+    cleanup_index = action_source.find("await transfer?.cleanup()")
     output_index = action_source.find("core.setOutput('cache-hit'")
-    if min(prepare_index, save_index, output_index) < 0 or not (
-        prepare_index < save_index < output_index
+    if min(prepare_index, save_index, cleanup_index, output_index) < 0 or not (
+        prepare_index < save_index < cleanup_index < output_index
     ):
-        fail("download action must prepare, save best-effort, and only then publish outputs")
+        fail("download action must prepare, save, clean staging, and only then publish outputs")
 
     package = json.loads((action / "package.json").read_text())
     lock = json.loads((action / "package-lock.json").read_text())
     dependencies = package.get("dependencies")
-    if dependencies != {"@actions/cache": "6.2.0", "@actions/core": "3.0.1"}:
+    if dependencies != {
+        "@actions/core": "3.0.1",
+        "@azure/storage-blob": "12.31.0",
+    }:
         fail("download action runtime dependencies differ from the reviewed allowlist")
     for group in ("dependencies", "devDependencies"):
         values = package.get(group)
@@ -673,7 +692,7 @@ def audit_download_action() -> None:
             fail(f"download action dependency lacks SHA-512 lock integrity: {name}")
 
     notices = (action / "THIRD_PARTY_NOTICES.md").read_text()
-    for name in ("@actions/cache", "@actions/core"):
+    for name in ("@actions/core", "@azure/storage-blob"):
         if name not in notices:
             fail(f"download action notices omit direct dependency {name}")
     tracked = subprocess.run(
@@ -685,6 +704,22 @@ def audit_download_action() -> None:
     ).stdout
     if tracked.strip():
         fail("download action node_modules must not be tracked")
+
+    archive_path = ROOT / "src/package_cache_archive.zig"
+    if not archive_path.is_file():
+        fail("CLI-owned package cache archive implementation is missing")
+    else:
+        archive = archive_path.read_text()
+        for token in (
+            'pub const format_id = "debz-package-cache-archive-v1"',
+            "error.NonCanonicalOrder",
+            "error.DuplicateObject",
+            "error.ArchiveDigestMismatch",
+            "maximum_total_object_bytes",
+            "cache.publish(",
+        ):
+            if token not in archive:
+                fail(f"package cache archive is missing policy token: {token}")
 
 
 def audit_docs() -> None:

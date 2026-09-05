@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
-import { runMain } from '../src/action.js';
+import { runAction, runMain } from '../src/action.js';
 import type { CacheAdapter } from '../src/cache.js';
 import { readInputs } from '../src/inputs.js';
 import { environment, fingerprint, preparation } from './helpers.js';
@@ -27,6 +27,8 @@ test.after(async () => {
 
 async function fakeDebz(values: ReturnType<typeof environment>): Promise<{
   bin: string;
+  executable: string;
+  log: string;
   expected: ReturnType<typeof fingerprint>;
   prepared: ReturnType<typeof preparation>;
 }> {
@@ -36,9 +38,12 @@ async function fakeDebz(values: ReturnType<typeof environment>): Promise<{
   const bin = path.join(testRoot, 'bin');
   await mkdir(bin);
   const executable = path.join(bin, 'debz');
+  const log = path.join(testRoot, 'debz.log');
+  await writeFile(log, '');
   await writeFile(
     executable,
     `#!/bin/sh
+printf '%s\\n' "$2" >>'${log}'
 if [ "$1" = version ]; then
   printf '0.3.0\\n'
 elif [ "$2" = fingerprint ]; then
@@ -51,7 +56,7 @@ fi
 `,
   );
   await chmod(executable, 0o755);
-  return { bin, expected, prepared };
+  return { bin, executable, log, expected, prepared };
 }
 
 function installEnvironment(
@@ -85,21 +90,32 @@ test('restores, prepares, saves a partial cache, and publishes outputs last', as
   const previous = installEnvironment(values, bin, outputPath);
   let restored = false;
   let saved = false;
+  let restoredPath = '';
+  let savedPath = '';
   const cache: CacheAdapter = {
     isFeatureAvailable() {
       return true;
     },
-    async restore(cachePath, primaryKey, restorePrefix) {
+    async restore(destination, primaryKey, restorePrefix, maximumBytes) {
       restored = true;
-      assert.equal(cachePath, inputs.cachePath);
+      restoredPath = destination;
+      assert.notEqual(destination, inputs.cachePath);
+      assert.equal(path.basename(destination), 'restored.dbzcache');
+      assert.ok(destination.startsWith(`${runnerTemp}${path.sep}`));
       assert.equal(primaryKey, expected.primary_key);
       assert.equal(restorePrefix, expected.restore_prefix);
+      assert.ok(maximumBytes > inputs.limits.maximumTotalPackageBytes);
+      await writeFile(destination, 'opaque cache bytes');
       return `${restorePrefix}${'d'.repeat(64)}`;
     },
-    async save(cachePath, primaryKey) {
+    async save(source, primaryKey, maximumBytes) {
       saved = true;
-      assert.equal(cachePath, inputs.cachePath);
+      savedPath = source;
+      assert.notEqual(source, inputs.cachePath);
+      assert.equal(path.basename(source), 'export.dbzcache');
+      assert.ok(source.startsWith(`${runnerTemp}${path.sep}`));
       assert.equal(primaryKey, expected.primary_key);
+      assert.ok(maximumBytes > inputs.limits.maximumTotalPackageBytes);
     },
   };
 
@@ -109,6 +125,8 @@ test('restores, prepares, saves a partial cache, and publishes outputs last', as
     assert.equal(process.exitCode, undefined);
     assert.equal(restored, true);
     assert.equal(saved, true);
+    await assert.rejects(lstat(restoredPath));
+    await assert.rejects(lstat(savedPath));
     const output = await readFile(outputPath, 'utf8');
     assert.match(output, /cache-hit<<[^\n]+\nfalse\n/);
     assert.match(output, /cache-matched-key<<[^\n]+\ndebz-package-cas-v1-/);
@@ -130,7 +148,8 @@ test('an exact cache match still prepares and never saves', async () => {
     isFeatureAvailable() {
       return true;
     },
-    async restore() {
+    async restore(destination) {
+      await writeFile(destination, 'opaque cache bytes');
       return expected.primary_key;
     },
     async save() {
@@ -146,6 +165,46 @@ test('an exact cache match still prepares and never saves', async () => {
     const output = await readFile(outputPath, 'utf8');
     assert.match(output, /cache-hit<<[^\n]+\ntrue\n/);
     assert.match(output, /downloaded-count<<[^\n]+\n1\n/);
+  } finally {
+    restoreEnvironment(previous);
+  }
+});
+
+test('a cache restore cannot replace debz before prepare', async () => {
+  const values = environment(workspace, runnerTemp);
+  const { bin, executable, log, expected } = await fakeDebz(values);
+  const outputPath = path.join(testRoot, 'github-output');
+  await writeFile(outputPath, '');
+  const previous = installEnvironment(values, bin, outputPath);
+  const cache: CacheAdapter = {
+    isFeatureAvailable() {
+      return true;
+    },
+    async restore(destination) {
+      await writeFile(destination, 'opaque cache bytes');
+      await writeFile(
+        executable,
+        '#!/bin/sh\nprintf \"replacement executed\\n\" >>\"' + log + '\"\nexit 1\n',
+      );
+      await chmod(executable, 0o755);
+      return `${expected.restore_prefix}${'d'.repeat(64)}`;
+    },
+    async save() {
+      assert.fail('save must not run after executable replacement');
+    },
+  };
+
+  try {
+    process.exitCode = undefined;
+    await assert.rejects(
+      runAction(cache),
+      /executable changed after its package-cache fingerprint/,
+    );
+    assert.equal(await readFile(outputPath, 'utf8'), '');
+    const invocations = (await readFile(log, 'utf8')).trim().split('\n');
+    assert.ok(invocations.includes('fingerprint'));
+    assert.ok(!invocations.includes('prepare'));
+    assert.ok(!invocations.includes('replacement executed'));
   } finally {
     restoreEnvironment(previous);
   }

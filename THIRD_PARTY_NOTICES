@@ -184,6 +184,6 @@ GitHub download action bundle
 =============================
 
 The first-party JavaScript action under actions/download has a separately
-pinned npm dependency graph. Its direct dependency summary is in
-actions/download/THIRD_PARTY_NOTICES.md, and complete bundled license texts are
-in actions/download/dist/licenses.txt.
+pinned npm dependency graph and a path-independent opaque cache-service format.
+Its direct dependency summary is in actions/download/THIRD_PARTY_NOTICES.md,
+and complete bundled license texts are in actions/download/dist/licenses.txt.

@@ -11,8 +11,8 @@
     "bundle": "ncc build src/main.ts -o dist --minify --license licenses.txt"
   },
   "dependencies": {
-    "@actions/cache": "6.2.0",
-    "@actions/core": "3.0.1"
+    "@actions/core": "3.0.1",
+    "@azure/storage-blob": "12.31.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

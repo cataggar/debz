@@ -46,7 +46,8 @@ steps:
 `debz` must already be a regular executable on `PATH`; use
 [`actions/setup`](../setup/README.md). The action invokes no `apt`, `dpkg`,
 `curl`, `gh`, Python, shell-generated argument string, or caller-provided
-command. GitHub-hosted Linux runners and compatible container/self-hosted
+command, and the cache path invokes no host tar or extraction utility.
+GitHub-hosted Linux runners and compatible container/self-hosted
 runners that provide the maintained Node 24 action runtime are supported;
 older runners are rejected rather than given a shell/Python fallback.
 Pinning the download action selects its orchestration code; pinning
@@ -57,8 +58,8 @@ The executable must implement the `package-cache-v1` capability (introduced in
 `contents: read` is sufficient for checkout and public repository files;
 `attestations: read` is needed by the default setup-action provenance path.
 The download action itself calls no GitHub content or attestation API; the
-runner-provided cache service token is used only by the exact-version,
-lockfile-integrity-pinned `@actions/cache` client in the checked-in bundle.
+runner-provided cache service token is used only by the bounded cache-v2 client
+and exact-version Azure blob dependency in the checked-in bundle.
 
 ## Inputs
 
@@ -111,7 +112,7 @@ ambient trusted-key directories.
 | --- | --- |
 | `cache-hit` | `true` only when the Actions cache service restored the exact primary key. Preparation and verification still ran. |
 | `cache-matched-key` | Exact key, compatible prefix key, or empty when no cache was restored. |
-| `cache-path` | Absolute `packages-v1/objects` directory. This is the only path saved by the action. |
+| `cache-path` | Absolute verified `packages-v1/objects` directory used by later debz operations. |
 | `cache-root` | Parent cache root accepted by `debz --cache-path`, for a later cache-only transaction. |
 | `lock-digest` | Canonical exact-lock digest verified and reported by `debz`. |
 | `downloaded-count` | Current-lock objects acquired from package transport. |
@@ -144,14 +145,24 @@ after an exact-key restore is corruption and fails by default; only explicit
 online repair may reacquire it. Missing objects are expected after a prefix
 restore or cold miss.
 
-The checked-in Node 24 bundle uses an exact-version, integrity-locked
-`@actions/cache` client for the same cache service used by the official cache
-action. Restore keys come only from the CLI result; JavaScript does not append
-repository paths, secrets, or ad hoc policy fragments. The client archives the
-relative `objects` directory from its verified parent, so the cache service's
-internal version does not bind a runner-specific absolute path.
+The checked-in Node 24 bundle uses the Actions cache v2 service as an opaque
+blob store. It never invokes the cache action's tar extraction path. A restored
+blob is written only to a fresh private directory below `RUNNER_TEMP`, then
+`debz` parses a path-free, length-delimited archive, rejects malformed,
+duplicate, out-of-order, oversized, or digest-invalid entries, and imports only
+current-lock objects into the CAS under the writer lock. Exact-key archives
+must contain exactly the current closure; compatible-prefix archives may
+contain a verified subset plus unrelated objects, which are not imported. The
+executable is descriptor- and SHA-256-revalidated before and after this
+sequence.
 
-Only `packages-v1/objects` is restored and saved. The action never caches:
+The opaque format and cache-service version are path-independent, so the same
+entry can be restored into a different safe cache root. Restore keys come only
+from the CLI result; JavaScript does not append repository paths, secrets, or
+ad hoc policy fragments.
+
+Only objects from `packages-v1/objects` are serialized into the opaque cache
+blob. The action never caches:
 
 - repository metadata or freshness state;
 - lock/config/source files or keyrings;
@@ -166,9 +177,13 @@ bounded writer lock. Concurrent publishers remain atomic. A concurrent
 GitHub cache save for the same immutable key is benign; a verification,
 cleanup, or repository error is not.
 
-The GitHub cache is an optimization: an unavailable restore is treated as a
+The GitHub cache is an optimization: an unavailable lookup is treated as a
 miss, and an unavailable save does not invalidate an already verified local
-CAS. Offline mode still fails if the restored/local evidence is incomplete.
+CAS. Once the service reports a matching entry, an invalid URL, oversized or
+truncated blob, or invalid inner archive fails closed instead of being
+downgraded to a miss. Offline mode still fails if restored/local evidence is
+incomplete. Cache integration requires the GitHub Actions cache v2 service;
+unsupported GHES/cache-service environments run as cache misses.
 
 ## Repository and offline behavior
 

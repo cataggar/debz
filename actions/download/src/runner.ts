@@ -1,4 +1,7 @@
+import { createHash } from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 import { CliDiagnosticError, DownloadActionError } from './errors.js';
@@ -66,6 +69,7 @@ export interface FingerprintDocument {
   abi: 'debian-package-archive-v1';
   debz_version: string;
   cas_layout: 'packages-v1';
+  archive_format: 'debz-package-cache-archive-v1';
   payload_policy: 'deb-payload-default-limits-v1';
   origin_mode: 'exact-lock-v1-authenticated-repository';
   acceptance_policy_digest: string;
@@ -74,6 +78,7 @@ export interface FingerprintDocument {
   restore_prefix: string;
   cache_root: string;
   cache_path: string;
+  maximum_archive_bytes: number;
 }
 
 export interface PrepareDocument {
@@ -97,6 +102,20 @@ export interface RestoredCacheState {
   cacheHit: boolean;
   matchedKey: string;
   kind: 'none' | 'partial' | 'exact';
+}
+
+export interface CacheArchivePaths {
+  input?: string;
+  output?: string;
+}
+
+export interface ExecutableIdentity {
+  path: string;
+  device: bigint;
+  inode: bigint;
+  size: bigint;
+  mode: bigint;
+  sha256: string;
 }
 
 interface CleanupDocument {
@@ -158,6 +177,7 @@ export async function prepareCache(
   inputs: Inputs,
   expected: FingerprintDocument,
   restored: RestoredCacheState,
+  archives: CacheArchivePaths,
   runner: CommandRunner = systemRunner,
 ): Promise<PrepareDocument> {
   const arguments_ = [
@@ -181,12 +201,19 @@ export async function prepareCache(
     '--restored-cache',
     restored.kind,
   ];
+  if (archives.input !== undefined) {
+    arguments_.push('--archive-input', archives.input);
+  }
+  if (archives.output !== undefined) {
+    arguments_.push('--archive-output', archives.output);
+  }
   for (const value of inputs.sources) arguments_.push('--source', value);
   for (const value of inputs.configs) arguments_.push('--config', value);
   for (const value of inputs.keyrings) arguments_.push('--keyring', value);
   if (inputs.defaultRelease !== undefined) {
     arguments_.push('--default-release', inputs.defaultRelease);
   }
+
   if (inputs.proxy !== undefined) arguments_.push('--proxy', inputs.proxy);
   if (inputs.credentialReference !== undefined) {
     arguments_.push('--credential-reference', inputs.credentialReference);
@@ -209,6 +236,61 @@ export async function prepareCache(
     throw new DownloadActionError('debz executable changed between action phases');
   }
   return document;
+}
+
+export async function captureExecutableIdentity(
+  executable: string,
+): Promise<ExecutableIdentity> {
+  const resolved = await realpath(executable);
+  if (resolved !== executable) {
+    throw new DownloadActionError('debz executable path changed or became a symbolic link');
+  }
+  const handle = await open(
+    executable,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const details = await handle.stat({ bigint: true });
+    if (
+      !details.isFile() ||
+      details.size <= 0 ||
+      details.size > 256n * 1024n * 1024n ||
+      (details.mode & 0o111n) === 0n
+    ) {
+      throw new DownloadActionError('debz executable is not a bounded regular executable');
+    }
+    const bytes = await handle.readFile();
+    if (BigInt(bytes.length) !== details.size) {
+      throw new DownloadActionError('debz executable changed while it was hashed');
+    }
+    return {
+      path: executable,
+      device: details.dev,
+      inode: details.ino,
+      size: details.size,
+      mode: details.mode,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function verifyExecutableIdentity(
+  expected: ExecutableIdentity,
+): Promise<void> {
+  const current = await captureExecutableIdentity(expected.path);
+  if (
+    current.device !== expected.device ||
+    current.inode !== expected.inode ||
+    current.size !== expected.size ||
+    current.mode !== expected.mode ||
+    current.sha256 !== expected.sha256
+  ) {
+    throw new DownloadActionError(
+      'debz executable changed after its package-cache fingerprint was computed',
+    );
+  }
 }
 
 export function fingerprintArguments(inputs: Inputs): string[] {
@@ -254,6 +336,7 @@ export function validateFingerprint(
     'abi',
     'debz_version',
     'cas_layout',
+    'archive_format',
     'payload_policy',
     'origin_mode',
     'acceptance_policy_digest',
@@ -262,6 +345,7 @@ export function validateFingerprint(
     'restore_prefix',
     'cache_root',
     'cache_path',
+    'maximum_archive_bytes',
   ]);
   literal(document.schema, 'io.github.cataggar.debz.package-cache-fingerprint.v1', 'schema');
   literal(document.api_version, 1, 'api_version');
@@ -272,10 +356,21 @@ export function validateFingerprint(
   literal(document.abi, 'debian-package-archive-v1', 'abi');
   literal(document.debz_version, version, 'debz_version');
   literal(document.cas_layout, 'packages-v1', 'cas_layout');
+  literal(document.archive_format, 'debz-package-cache-archive-v1', 'archive_format');
   literal(document.payload_policy, 'deb-payload-default-limits-v1', 'payload_policy');
   literal(document.origin_mode, 'exact-lock-v1-authenticated-repository', 'origin_mode');
   literal(document.cache_root, inputs.cacheRoot, 'cache_root');
   literal(document.cache_path, inputs.cachePath, 'cache_path');
+  count(document.maximum_archive_bytes, 'maximum_archive_bytes');
+  if (
+    (document.maximum_archive_bytes as number) <=
+      inputs.limits.maximumTotalPackageBytes ||
+    (document.maximum_archive_bytes as number) > 10 * 1024 ** 3
+  ) {
+    throw new DownloadActionError(
+      "debz JSON field 'maximum_archive_bytes' is outside the cache-service bound",
+    );
+  }
   stringPattern(document.lock_digest, hex64, 'lock_digest');
   stringPattern(document.acceptance_policy_digest, hex64, 'acceptance_policy_digest');
   stringPattern(document.fingerprint, hex64, 'fingerprint');

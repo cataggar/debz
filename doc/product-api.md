@@ -54,6 +54,12 @@ first-party action computes it from the cache service response; it is not
 caller-provided action input. An exact restore makes any missing lock object a
 corruption failure unless explicit online repair is enabled.
 
+The action pairs that hint with private `--archive-input`/`--archive-output`
+paths below `RUNNER_TEMP`. The CLI owns both import and export of the
+path-free `debz-package-cache-archive-v1` format. These archive paths must be
+absolute, distinct, and outside the cache root; they are orchestration files,
+not cache keys or public action outputs.
+
 `debz -h` and `debz --help` print root help. Every command accepts `-h` and
 `--help` after the command name and prints command-specific help without
 performing validation, filesystem access, repository access, or other backend
@@ -118,8 +124,9 @@ Package-cache JSON schemas are:
 
 Their successful outputs include the canonical lock digest, CLI-owned
 fingerprint, exact/compatible cache keys or verified preparation counts, and
-the exact `packages-v1/objects` path. Error documents contain no cache key or
-success-shaped path.
+the exact `packages-v1/objects` path. Fingerprint output also supplies the
+maximum opaque archive byte count for a bounded pre-import download. Error
+documents contain no cache key or success-shaped path.
 
 Credentials must not be placed in diagnostics. `product_api.redact` removes
 URI user information before provenance or output is constructed.

@@ -58,6 +58,7 @@ export function fingerprint(inputs: Inputs): FingerprintDocument {
     abi: 'debian-package-archive-v1',
     debz_version: '0.3.0',
     cas_layout: 'packages-v1',
+    archive_format: 'debz-package-cache-archive-v1',
     payload_policy: 'deb-payload-default-limits-v1',
     origin_mode: 'exact-lock-v1-authenticated-repository',
     acceptance_policy_digest: policy,
@@ -66,6 +67,12 @@ export function fingerprint(inputs: Inputs): FingerprintDocument {
     restore_prefix: `debz-package-cas-v1-amd64-${policy}-`,
     cache_root: inputs.cacheRoot,
     cache_path: inputs.cachePath,
+    maximum_archive_bytes:
+      Buffer.byteLength('debz-package-cache-archive-v1\n') +
+      4 +
+      inputs.limits.maximumLockPackages * 40 +
+      inputs.limits.maximumTotalPackageBytes +
+      32,
   };
 }
 

@@ -216,7 +216,7 @@ jobs:
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
-          cache-root: ${{ runner.temp }}/debz-download-cache
+          cache-root: ${{ runner.temp }}/debz-download-cold
       - name: Validate cold result
         env:
           CACHE_HIT: ${{ steps.cold.outputs.cache-hit }}
@@ -228,7 +228,6 @@ jobs:
           test -z "$MATCHED"
           test "$DOWNLOADED" -gt 0
           test "$REUSED" -eq 0
-          rm -rf "$RUNNER_TEMP/debz-download-cache"
       - name: Restore compatible partial cache
         id: partial
         uses: ./actions/download
@@ -237,7 +236,7 @@ jobs:
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
-          cache-root: ${{ runner.temp }}/debz-download-cache
+          cache-root: ${{ runner.temp }}/debz-download-partial
       - name: Validate partial result
         env:
           CACHE_HIT: ${{ steps.partial.outputs.cache-hit }}
@@ -249,7 +248,6 @@ jobs:
           test -n "$MATCHED"
           test "$DOWNLOADED" -gt 0
           test "$REUSED" -gt 0
-          rm -rf "$RUNNER_TEMP/debz-download-cache"
       - name: Restore exact completed cache
         id: exact
         uses: ./actions/download
@@ -258,7 +256,7 @@ jobs:
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
-          cache-root: ${{ runner.temp }}/debz-download-cache
+          cache-root: ${{ runner.temp }}/debz-download-exact
       - name: Validate exact result
         env:
           CACHE_HIT: ${{ steps.exact.outputs.cache-hit }}
@@ -272,7 +270,7 @@ jobs:
           test "$REUSED" -gt 0
       - name: Corrupt one exact-restored object
         run: |
-          object=$(find "$RUNNER_TEMP/debz-download-cache/packages-v1/objects" \
+          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v1/objects" \
             -maxdepth 1 -type f -print -quit)
           test -n "$object"
           printf 'corrupt\n' >"$object"
@@ -285,7 +283,7 @@ jobs:
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
-          cache-root: ${{ runner.temp }}/debz-download-cache
+          cache-root: ${{ runner.temp }}/debz-download-exact
           cache: 'false'
           offline: 'true'
       - name: Validate corrupt-object failure
@@ -295,7 +293,7 @@ jobs:
         run: |
           test "$OUTCOME" = failure
           test -z "$CACHE_PATH"
-          rm -rf "$RUNNER_TEMP/debz-download-cache"
+          rm -rf "$RUNNER_TEMP/debz-download-exact"
       - name: Reject package-only offline restore
         id: offline
         continue-on-error: true
@@ -305,7 +303,7 @@ jobs:
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
-          cache-root: ${{ runner.temp }}/debz-download-cache
+          cache-root: ${{ runner.temp }}/debz-download-offline
           offline: 'true'
       - name: Validate offline metadata failure
         env:

@@ -173,6 +173,7 @@ def audit_download_action(ci: str, release: str) -> None:
         DOWNLOAD / "dist/index.js",
         DOWNLOAD / "dist/package.json",
         DOWNLOAD / "dist/licenses.txt",
+        ROOT / "src/package_cache_archive.zig",
     )
     for path in required_files:
         if not path.is_file() or path.stat().st_size == 0:
@@ -204,8 +205,8 @@ def audit_download_action(ci: str, release: str) -> None:
         package = json.loads(package_path.read_text())
         lock = json.loads(lock_path.read_text())
         if package.get("dependencies") != {
-            "@actions/cache": "6.2.0",
             "@actions/core": "3.0.1",
+            "@azure/storage-blob": "12.31.0",
         }:
             FAILURES.append("download action runtime dependencies differ from policy")
         for group in ("dependencies", "devDependencies"):
