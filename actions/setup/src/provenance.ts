@@ -71,6 +71,14 @@ export function certificateIdentity(tag: string): string {
   return `${RELEASE_REPOSITORY_URL}/${RELEASE_WORKFLOW_PATH}@refs/tags/${tag}`;
 }
 
+function escapeRegularExpression(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function certificateIdentityPattern(tag: string): RegExp {
+  return new RegExp(`^${escapeRegularExpression(certificateIdentity(tag))}$`);
+}
+
 export function validateProvenanceStatement(
   rawBundle: unknown,
   expected: ProvenanceExpectation,
@@ -167,7 +175,7 @@ export function verifySigstoreBundle(
     ctlogThreshold: 1,
   });
   verifier.verify(toSignedEntity(bundle), {
-    subjectAlternativeName: certificateIdentity(expected.tag),
+    subjectAlternativeName: certificateIdentityPattern(expected.tag),
     extensions: { issuer: GITHUB_OIDC_ISSUER },
     oids: [
       {

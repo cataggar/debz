@@ -5,6 +5,8 @@ import test from 'node:test';
 import { TrustedRoot } from '@sigstore/protobuf-specs';
 
 import {
+  certificateIdentity,
+  certificateIdentityPattern,
   validateProvenanceStatement,
   verifyProvenance,
   verifySigstoreBundle,
@@ -52,6 +54,29 @@ test('captured multi-subject GitHub provenance verifies cryptographically and by
   const fixtures = await loadFixtures();
   verifySigstoreBundle(fixtures.bundle, fixtures.root, expected);
   validateProvenanceStatement(fixtures.bundle, expected);
+});
+
+test('certificate identity policy matches only the exact escaped SAN', () => {
+  const identity = certificateIdentity(expected.tag);
+  const pattern = certificateIdentityPattern(expected.tag);
+  assert.match(identity, pattern);
+  for (const candidate of [
+    identity.replace('release.yml', 'releaseXyml'),
+    identity.replace('/.github/', '/Xgithub/'),
+    `prefix-${identity}`,
+    `${identity}-suffix`,
+  ]) {
+    assert.doesNotMatch(candidate, pattern);
+  }
+
+  const metadataTag = 'v1.2.3+build.1';
+  const metadataIdentity = certificateIdentity(metadataTag);
+  const metadataPattern = certificateIdentityPattern(metadataTag);
+  assert.match(metadataIdentity, metadataPattern);
+  assert.doesNotMatch(
+    metadataIdentity.replace('v1.2.3+build.1', 'v1x2x3-buildX1'),
+    metadataPattern,
+  );
 });
 
 test('tampering with a signed provenance payload invalidates its signature', async () => {
