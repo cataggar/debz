@@ -181,6 +181,16 @@ pub fn build(b: *std.Build) void {
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
+    const native_differential_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_differential.py" },
+    );
+    const native_differential_step = b.step(
+        "test-native-differential",
+        "Validate the native transaction compatibility corpus and comparator",
+    );
+    native_differential_step.dependOn(&native_differential_tests.step);
+    test_step.dependOn(&native_differential_tests.step);
+
     const repository_add_module = b.createModule(.{
         .root_source_file = b.path("test/repository-add-integration.zig"),
         .target = target,
@@ -419,6 +429,7 @@ fn installReleaseFiles(
         "github-actions.md",
         "integration-roots.md",
         "multi-repository-policy.md",
+        "native-transaction-engine-v1.md",
         "openpgp-verifier.md",
         "package-acquisition.md",
         "product-api.md",
