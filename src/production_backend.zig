@@ -11,35 +11,14 @@ const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
-pub const Executor = struct {
-    context: *anyopaque,
-    executeFn: *const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        transaction_executor.Request,
-        transaction_executor.Dependencies,
-    ) anyerror!transaction_executor.Report,
-    recoverFn: *const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        transaction_executor.RecoveryRequest,
-        transaction_executor.Dependencies,
-    ) anyerror!transaction_executor.RecoveryReport,
-
-    pub const system: Executor = .{
-        .context = @ptrCast(@constCast(&system_executor_context)),
-        .executeFn = systemExecute,
-        .recoverFn = systemRecover,
-    };
-};
-
-var system_executor_context: u8 = 0;
+pub const Executor = transaction_engine.Executor;
 
 const RepositoryOptions = struct {
     source_paths: []const []const u8,
@@ -52,27 +31,11 @@ const RepositoryOptions = struct {
     offline: bool,
 };
 
-fn systemExecute(
-    _: *anyopaque,
-    allocator: std.mem.Allocator,
-    request: transaction_executor.Request,
-    dependencies: transaction_executor.Dependencies,
-) !transaction_executor.Report {
-    return transaction_executor.execute(allocator, request, dependencies);
-}
-
-fn systemRecover(
-    _: *anyopaque,
-    allocator: std.mem.Allocator,
-    request: transaction_executor.RecoveryRequest,
-    dependencies: transaction_executor.Dependencies,
-) !transaction_executor.RecoveryReport {
-    return transaction_executor.recover(allocator, request, dependencies);
-}
-
 pub const Backend = struct {
     io: std.Io,
-    executor: Executor = .system,
+    transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    executor: Executor = .legacy_dpkg,
+    native_executor: ?Executor = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
     now_unix: ?i64 = null,
 
@@ -329,6 +292,14 @@ pub const Backend = struct {
     }
 
     fn route(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
+        if (usesPackageTransaction(request.operation)) {
+            _ = self.selectedExecutor() catch return api.failure(
+                request.operation,
+                .unavailable,
+                .transaction_backend_unavailable,
+                "selected transaction backend is unavailable",
+            );
+        }
         if ((request.options.lock_input_path != null or request.options.lock_output_path != null) and
             switch (request.operation) {
                 .install, .remove, .upgrade, .upgrade_all, .reinstall, .download, .plan, .recover => false,
@@ -341,6 +312,14 @@ pub const Backend = struct {
             .clean => self.clean(allocator, request),
             else => self.withRepositories(allocator, request),
         };
+    }
+
+    fn selectedExecutor(self: *const Backend) transaction_engine.SelectionError!Executor {
+        return transaction_engine.select(
+            self.transaction_backend,
+            self.executor,
+            self.native_executor,
+        );
     }
 
     fn listInstalled(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
@@ -753,7 +732,8 @@ pub const Backend = struct {
             .status = status_reader.interface(),
         };
         if (request.operation == .recover) {
-            var report = try self.executor.recoverFn(self.executor.context, allocator, .{
+            const executor = self.selectedExecutor() catch unreachable;
+            var report = try executor.recover(allocator, .{
                 .plan = plan,
                 .install_root = request.options.install_root,
                 .policy = executor_policy,
@@ -769,7 +749,8 @@ pub const Backend = struct {
             return success(request.operation, true, "transaction recovery completed", &.{});
         }
         try writeRecoveryIntent(allocator, self.io, request.options.state_path, effective_request);
-        var report = try self.executor.executeFn(self.executor.context, allocator, .{
+        const executor = self.selectedExecutor() catch unreachable;
+        var report = try executor.execute(allocator, .{
             .plan = plan,
             .install_root = request.options.install_root,
             .artifacts = artifacts.items,
@@ -1872,9 +1853,52 @@ fn mapRuntimeError(operation: api.Operation, err: anyerror) api.Result {
     };
 }
 
+test "production backend rejects unavailable native transaction before repository work" {
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+    };
+    const result = try api.execute(std.testing.allocator, .{
+        .operation = .install,
+        .packages = &.{"demo"},
+        .options = .{
+            .install_root = "/native-backend-unavailable-root",
+            .cache_path = "/native-backend-unavailable-cache",
+            .state_path = "/native-backend-unavailable-state",
+            .architecture = "amd64",
+            .assume_yes = true,
+            .noninteractive = true,
+            .conffile = .keep_existing,
+        },
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostic_count);
+    try std.testing.expectEqual(
+        api.ErrorId.transaction_backend_unavailable,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expect(!result.changed);
+}
+
 fn containsString(values: []const []const u8, target: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, target)) return true;
     return false;
+}
+
+fn usesPackageTransaction(operation: api.Operation) bool {
+    return switch (operation) {
+        .install, .remove, .upgrade, .upgrade_all, .reinstall, .recover => true,
+        .refresh,
+        .download,
+        .plan,
+        .list_installed,
+        .list_available,
+        .info,
+        .provides,
+        .why,
+        .clean,
+        => false,
+    };
 }
 
 fn containsSelector(values: []const []const u8, target: []const u8) bool {

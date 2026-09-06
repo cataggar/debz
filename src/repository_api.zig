@@ -57,6 +57,7 @@ pub const DiagnosticId = enum {
     existing_descriptor_conflict,
     managed_file_conflict,
     lock_publication_failed,
+    transaction_backend_unavailable,
     transaction_failed,
     installed_verification_failed,
     target_import_failed,
