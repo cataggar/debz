@@ -229,3 +229,21 @@ native executor for development, but selecting `native` without one returns a
 typed unavailable result before repository acquisition, journal access,
 database access, or root mutation. Selection never falls back to
 `legacy_dpkg`.
+
+## Native transaction authorization
+
+Native execution is authorized, never implied. `debz.native_authorization`
+version 1 is the canonical contract described in
+[exact locks and provenance](exact-locks-and-provenance.md), and
+`transaction_engine.executeAuthorized` requires one bound to the exact request
+before it selects a backend. The authorization pins the backend, the exact
+closure lock v2 generation, request/solver-policy/executor-policy/plan digests,
+the install root and its identity, the target and foreign architectures, the
+conffile and force policy, every ordered action with its authenticated artifact
+evidence, and the exact intended final closure. Legacy locks and legacy
+execution are never authorized by this contract.
+
+The plan layer represents `purge` as a distinct action kind and ordered phase so
+authorizations can express complete removal. The legacy `dpkg` executor rejects
+purge actions in preflight before any mutation, so present legacy behavior is
+unchanged; only the native engine will execute them.

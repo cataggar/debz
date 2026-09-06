@@ -26,6 +26,7 @@ const archive_corpus = &.{
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
+    @embedFile("corpus/state/authorization.json"),
     @embedFile("corpus/state/provenance.json"),
     @embedFile("corpus/state/provenance-v2.json"),
     @embedFile("corpus/state/journal"),
@@ -370,6 +371,10 @@ fn exerciseState(bytes: []const u8) !void {
     if (debz.exact_lock_v2.decode(std.testing.allocator, bytes, max_input)) |value| {
         var lock = value;
         lock.deinit();
+    } else |_| {}
+    if (debz.native_authorization.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var authorization = value;
+        authorization.deinit();
     } else |_| {}
     if (debz.transaction_provenance.validateDocument(std.testing.allocator, bytes, max_input)) |value| {
         var document = value;
