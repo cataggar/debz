@@ -59,6 +59,10 @@ Import rejects, before any change can be planned:
 - non-DEB822 status syntax, duplicate fields, and bound violations;
 - invalid package names, architectures, versions, states, flags, priorities,
   `Multi-Arch` values, installed sizes, and conffile records;
+- repeated field names and field values that would not survive canonical
+  serialization unchanged: newlines, carriage returns, NUL, other C0 controls,
+  `DEL`, and leading whitespace on a field's first line. Tabs inside a value
+  and indented continuation lines remain ordinary content;
 - repeated `Package`/`Architecture` identities and co-installed instances that
   are not `Multi-Arch: same` at one identical version;
 - architectures that are neither native, `all`, nor listed in `arch`;
@@ -124,8 +128,8 @@ The resulting model is validated with exactly the same rules import uses, so a
 plan can never publish a database that would fail to import. Trigger state,
 foreign architectures, ownership, checksums, conffiles, and declarations are
 validated once, in that shared model validation, rather than separately per
-entry point. Every produced file is then checked against the importer's size
-and line bounds before a plan is returned. Planning fails
+entry point. Every produced file is then checked
+against the importer's own bounds before a plan is returned. Planning fails
 closed on unknown packages, more than one change per subject, impossible state
 transitions, unsafe or non-executable scripts, invalid paths, checksums outside
 the inventory, bound violations, interrupted publication in `updates/`, and any
@@ -136,6 +140,16 @@ A change that would move a package's info files between the `name` and
 `name:architecture` spellings also fails closed when the package still owns
 retained unmodeled info files, because their bytes are not part of the model
 and renaming them would orphan or discard them.
+
+Because a status field value comes from the caller in a staged record, it is
+validated as serializable before it can reach the model or a writer: a value
+containing a newline could otherwise close the paragraph and append forged
+package records to the published status file. The produced `status` document is
+additionally re-parsed with the importer's DEB822 limits and must contain
+exactly the intended number of package records. Status files are bounded that
+way rather than by the line bound used for `info` and trigger files, so any
+status that imports - including fields far longer than one database line - can
+always be republished.
 
 Write order is deterministic: `status-old` is copied from the current `status`
 first, then info files sorted by path, then `arch`, `triggers/File`,

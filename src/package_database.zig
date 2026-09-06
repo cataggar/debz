@@ -524,6 +524,9 @@ pub const Code = enum {
     unknown_architecture,
     invalid_version,
     multiline_scalar,
+    invalid_field_value,
+    duplicate_field,
+    status_record_mismatch,
     malformed_status_field,
     invalid_state,
     invalid_boolean,
@@ -618,6 +621,9 @@ pub const Diagnostic = struct {
             .unknown_architecture => "architecture is neither native, all, nor a listed foreign architecture",
             .invalid_version => "version is not a valid Debian version",
             .multiline_scalar => "scalar status field must not use continuation lines",
+            .invalid_field_value => "status field value cannot be serialized without changing it",
+            .duplicate_field => "status paragraph repeats a field name",
+            .status_record_mismatch => "serialized status does not contain exactly the intended records",
             .malformed_status_field => "Status must contain want, error, and current-state tokens",
             .invalid_state => "status contains an unknown state token",
             .invalid_boolean => "boolean status field must be 'yes' or 'no'",
@@ -884,8 +890,24 @@ const FieldInterpreter = struct {
         if (self.fields.len > self.options.limits.max_fields_per_package) {
             return self.fail(.field_limit, null, "");
         }
-        for (self.fields) |entry| {
+        for (self.fields, 0..) |entry, index| {
             if (!validFieldName(entry.name)) return self.fail(.status_syntax, entry.name, "");
+            for (self.fields[0..index]) |earlier| {
+                if (std.ascii.eqlIgnoreCase(earlier.name, entry.name)) {
+                    return self.fail(.duplicate_field, entry.name, "");
+                }
+            }
+            var size = entry.name.len;
+            for (entry.value_lines, 0..) |line, line_index| {
+                if (line_index != 0) size += 1;
+                size += line.len;
+                if (!serializableFieldLine(line, line_index == 0)) {
+                    return self.fail(.invalid_field_value, entry.name, "");
+                }
+            }
+            if (size > self.options.limits.max_field_bytes) {
+                return self.fail(.field_limit, entry.name, "");
+            }
         }
         const name = try self.required("Package", "");
         if (name.len > self.options.limits.max_package_name_bytes or !validPackageName(name)) {
@@ -1116,6 +1138,22 @@ fn validQualifiedPackage(text: []const u8) bool {
         return validPackageName(text[0..colon]) and validArchitecture(text[colon + 1 ..]);
     }
     return validPackageName(text);
+}
+
+/// A field value line may only contain bytes that survive canonical
+/// serialization and re-parsing unchanged. Newlines, carriage returns, NUL,
+/// and the other C0 controls would end the line, the paragraph, or the record,
+/// so a caller-supplied value could otherwise append forged package records to
+/// the published status file. A leading space or tab on the first line is
+/// rejected because DEB822 absorbs it after the colon, which would silently
+/// change the value on the next import.
+pub fn serializableFieldLine(line: []const u8, first: bool) bool {
+    for (line) |byte| {
+        if (byte == '\t') continue;
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    if (first and line.len != 0 and (line[0] == ' ' or line[0] == '\t')) return false;
+    return true;
 }
 
 fn validFieldName(name: []const u8) bool {
@@ -2681,6 +2719,52 @@ fn containsPath(paths: []const []const u8, path: []const u8) bool {
     return false;
 }
 
+/// Parse serialized status bytes with exactly the constraints import applies
+/// and confirm they contain exactly `expected_records` package paragraphs.
+/// Publication uses this so a produced status file is bounded and framed the
+/// same way an imported one is, rather than by an unrelated line bound.
+pub fn verifySerializedStatus(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected_records: usize,
+    options: Options,
+    surface: Surface,
+) std.mem.Allocator.Error!?Diagnostic {
+    const limits = options.limits;
+    const path = surface.path();
+    if (bytes.len > limits.max_status_bytes) {
+        return .{ .surface = surface, .code = .file_too_large, .path = path };
+    }
+    const outcome = try deb822.parseBorrowed(allocator, bytes, .{
+        .limits = .{
+            .max_total_bytes = limits.max_status_bytes,
+            .max_paragraphs = limits.max_packages,
+            .max_fields_per_paragraph = limits.max_fields_per_package,
+            .max_field_bytes = limits.max_field_bytes,
+        },
+        .duplicate_policy = .reject,
+    });
+    var document = switch (outcome) {
+        .failure => |failure| return Diagnostic{
+            .surface = surface,
+            .code = switch (failure.kind) {
+                .total_bytes_limit, .paragraph_limit => .status_limit,
+                .fields_limit, .field_size_limit => .field_limit,
+                else => .status_syntax,
+            },
+            .path = path,
+            .line = failure.position.line,
+            .status_syntax = failure.kind,
+        },
+        .document => |value| value,
+    };
+    defer document.deinit();
+    if (document.paragraphs.len != expected_records) {
+        return .{ .surface = surface, .code = .status_record_mismatch, .path = path };
+    }
+    return null;
+}
+
 /// Cross-file semantic validation shared by import and change staging.
 pub fn validateModel(
     allocator: std.mem.Allocator,
@@ -3982,4 +4066,128 @@ test "package_database.test.generation digest covers entry kind and mode" {
         database,
         test_fixtures.snapshot(),
     ) == null);
+}
+
+test "package_database.test.status field values must survive serialization unchanged" {
+    const allocator = testing.allocator;
+
+    // A NUL inside an imported field would end the value when republished.
+    const poisoned = try std.fmt.allocPrint(
+        allocator,
+        "Package: solo\nStatus: purge ok not-installed\nArchitecture: amd64\nVersion: 1\n" ++
+            "Description: broken{c}value\n\n",
+        .{0},
+    );
+    defer allocator.free(poisoned);
+    try expectImportFailure(minimalSnapshot(poisoned, &.{}), .invalid_field_value);
+
+    const control = "Package: solo\nStatus: purge ok not-installed\nArchitecture: amd64\n" ++
+        "Version: 1\nDescription: broken\x1bvalue\n\n";
+    try expectImportFailure(minimalSnapshot(control, &.{}), .invalid_field_value);
+
+    // Tabs are ordinary value bytes and must keep importing.
+    const tabbed = "Package: solo\nStatus: purge ok not-installed\nArchitecture: amd64\n" ++
+        "Version: 1\nDescription: tab\there\n\n";
+    const result = try importSnapshot(
+        allocator,
+        .{ .native_architecture = "amd64", .snapshot = minimalSnapshot(tabbed, &.{}) },
+        .{},
+    );
+    var database = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer database.deinit();
+    const written = try writeStatusDocument(allocator, database.model.packages);
+    defer allocator.free(written);
+    try testing.expectEqualStrings(tabbed, written);
+}
+
+test "package_database.test.serializable field line rules are exact" {
+    try testing.expect(serializableFieldLine("plain value", true));
+    try testing.expect(serializableFieldLine("tab\tinside", true));
+    try testing.expect(serializableFieldLine("", true));
+    try testing.expect(serializableFieldLine("", false));
+    try testing.expect(serializableFieldLine(" indented continuation", false));
+    try testing.expect(!serializableFieldLine(" leading space", true));
+    try testing.expect(!serializableFieldLine("\tleading tab", true));
+    try testing.expect(!serializableFieldLine("line\nbreak", true));
+    try testing.expect(!serializableFieldLine("carriage\rreturn", false));
+    try testing.expect(!serializableFieldLine("nul\x00byte", false));
+    try testing.expect(!serializableFieldLine("delete\x7fbyte", true));
+}
+
+test "package_database.test.serialized status is verified with importer constraints" {
+    const document =
+        \\Package: solo
+        \\Status: purge ok not-installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+        \\
+    ;
+    try testing.expect(try verifySerializedStatus(
+        testing.allocator,
+        document,
+        1,
+        .{},
+        .status,
+    ) == null);
+
+    const mismatch = (try verifySerializedStatus(
+        testing.allocator,
+        document,
+        2,
+        .{},
+        .status,
+    )).?;
+    try testing.expectEqual(Code.status_record_mismatch, mismatch.code);
+
+    const oversized = (try verifySerializedStatus(
+        testing.allocator,
+        document,
+        1,
+        .{ .limits = .{ .max_status_bytes = 8 } },
+        .status,
+    )).?;
+    try testing.expectEqual(Code.file_too_large, oversized.code);
+
+    const malformed = (try verifySerializedStatus(
+        testing.allocator,
+        "Package solo\n",
+        1,
+        .{},
+        .status,
+    )).?;
+    try testing.expectEqual(Code.status_syntax, malformed.code);
+}
+
+test "package_database.test.long status fields import and republish unchanged" {
+    const allocator = testing.allocator;
+    const long_value = try allocator.alloc(u8, 20_000);
+    defer allocator.free(long_value);
+    @memset(long_value, 'd');
+
+    const document = try std.fmt.allocPrint(
+        allocator,
+        "Package: solo\nStatus: purge ok not-installed\nArchitecture: amd64\nVersion: 1\n" ++
+            "Description: {s}\n\n",
+        .{long_value},
+    );
+    defer allocator.free(document);
+
+    const result = try importSnapshot(
+        allocator,
+        .{ .native_architecture = "amd64", .snapshot = minimalSnapshot(document, &.{}) },
+        .{},
+    );
+    var database = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer database.deinit();
+    const republished = try writeStatusDocument(allocator, database.model.packages);
+    defer allocator.free(republished);
+    try testing.expectEqualStrings(document, republished);
+    try testing.expect(try verifySerializedStatus(allocator, republished, 1, .{}, .status) == null);
 }

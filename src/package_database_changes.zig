@@ -224,6 +224,7 @@ const Builder = struct {
     overridden_paths: database.MembershipIndex,
     opaque_owners: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
     coverage_ready: bool = false,
+    live_count: usize = 0,
     trigger_state_changed: bool = false,
     architectures_changed: bool = false,
     diagnostic: ?Diagnostic = null,
@@ -923,14 +924,33 @@ const Builder = struct {
         const limits = self.options.database.limits;
         for (writes) |write| {
             if (write.kind != .replace) continue;
+            const status = std.mem.eql(u8, write.path, database.status_path) or
+                std.mem.eql(u8, write.path, database.status_old_path);
+            if (status) {
+                // Status files are DEB822 documents, not line-bounded database
+                // text. They are checked with the importer's own parser and
+                // field constraints so any status that imports can be
+                // republished, and so no produced document can contain more
+                // records than the plan intends.
+                if (try database.verifySerializedStatus(
+                    self.scratch,
+                    write.bytes,
+                    self.live_count,
+                    self.options.database,
+                    .change_set,
+                )) |diagnostic| {
+                    var located = diagnostic;
+                    located.path = write.path;
+                    self.diagnostic = located;
+                    return error.Invalid;
+                }
+                continue;
+            }
             const script = isScriptPath(write.path);
             const max_bytes: usize = if (script)
                 limits.max_maintainer_script_bytes
             else if (std.mem.startsWith(u8, write.path, database.info_directory ++ "/"))
                 limits.max_info_file_bytes
-            else if (std.mem.eql(u8, write.path, database.status_path) or
-                std.mem.eql(u8, write.path, database.status_old_path))
-                limits.max_status_bytes
             else
                 limits.max_database_file_bytes;
             if (write.bytes.len > max_bytes) {
@@ -1075,6 +1095,7 @@ fn build(
     for (changes) |change| try builder.apply(change);
 
     const packages = try builder.livePackages();
+    builder.live_count = packages.len;
     const status_bytes = try database.writeStatusDocument(builder.arena, packages);
     const model = try builder.resultingModel(packages, status_bytes);
     if (try database.validateModel(builder.scratch, model, builder.options.database)) |diagnostic| {
@@ -2002,4 +2023,203 @@ test "package_database_changes.test.large staged packages plan without quadratic
         .paths = paths,
         .md5sums = sums,
     } }}, .{}), .duplicate_path);
+}
+
+fn injectedFields(value: []const u8) [5]database.StatusField {
+    return .{
+        .{ .name = "Package", .value_lines = &.{"newpkg"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"3.1"} },
+        .{ .name = "Description", .value_lines = &.{value} },
+    };
+}
+
+test "package_database_changes.test.staged field values cannot forge status records" {
+    var source = try importFixture();
+    defer source.deinit();
+
+    const forged = "benign\n\nPackage: evil\nStatus: install ok installed\n" ++
+        "Architecture: amd64\nVersion: 9\nEssential: yes";
+    const cases = [_][]const u8{
+        forged,
+        "carriage\rreturn",
+        "nul\x00byte",
+        " leading space",
+        "\tleading tab",
+        "escape\x1bsequence",
+    };
+    for (cases) |value| {
+        const fields = injectedFields(value);
+        try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+            .{ .put_package = .{ .fields = &fields, .paths = &new_package_paths } },
+        }, .{}), .invalid_field_value);
+    }
+
+    const continuation = [_]database.StatusField{
+        .{ .name = "Package", .value_lines = &.{"newpkg"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"3.1"} },
+        .{ .name = "Description", .value_lines = &.{
+            "summary",
+            "detail\n\nPackage: evil",
+        } },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .put_package = .{ .fields = &continuation, .paths = &new_package_paths } },
+    }, .{}), .invalid_field_value);
+
+    const repeated = [_]database.StatusField{
+        .{ .name = "Package", .value_lines = &.{"newpkg"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"3.1"} },
+        .{ .name = "version", .value_lines = &.{"9.9"} },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .put_package = .{ .fields = &repeated, .paths = &new_package_paths } },
+    }, .{}), .duplicate_field);
+
+    const bulky = injectedFields("padding value");
+    try expectPlanDiagnostic(try plan(
+        testing.allocator,
+        source,
+        &.{.{ .put_package = .{ .fields = &bulky, .paths = &new_package_paths } }},
+        .{ .database = .{ .limits = .{ .max_field_bytes = 8 } } },
+    ), .field_limit);
+
+    // The forged text must also be unimportable if it ever reached a root.
+    const forged_status = "Package: newpkg\nStatus: install ok unpacked\nArchitecture: amd64\n" ++
+        "Version: 3.1\nDescription: benign\n\nPackage: evil\nStatus: install ok installed\n" ++
+        "Architecture: amd64\nVersion: 9\nEssential: yes\n\n";
+    const entries = [_]database.InfoEntry{
+        .{ .name = "newpkg.list", .bytes = "/.\n" },
+        .{ .name = "evil.list", .bytes = "/.\n" },
+    };
+    const published = try database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = .{
+            .status = database.regularFile(forged_status),
+            .info = &entries,
+        } },
+        .{},
+    );
+    switch (published) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| {
+            var owned = value;
+            defer owned.deinit();
+            // Two records is exactly what the forged document would add, which
+            // is why the staged value is refused before it can be written.
+            try testing.expectEqual(@as(usize, 2), owned.model.packages.len);
+        },
+    }
+}
+
+test "package_database_changes.test.multiline unknown fields round trip through a plan" {
+    var source = try importFixture();
+    defer source.deinit();
+
+    const fields = [_]database.StatusField{
+        .{ .name = "Package", .value_lines = &.{"newpkg"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"3.1"} },
+        .{ .name = "X-Vendor-Notes", .value_lines = &.{ "first", "second line", ".", "  indented" } },
+        .{ .name = "Description", .value_lines = &.{ "summary", "detail with\ttab", "." } },
+    };
+    const result = try plan(testing.allocator, source, &.{
+        .{ .put_package = .{ .fields = &fields, .paths = &new_package_paths } },
+    }, .{});
+    var staged = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .plan => |value| value,
+    };
+    defer staged.deinit();
+
+    var root = try SimulatedRoot.init(testing.allocator, database.test_fixtures.snapshot());
+    defer root.deinit();
+    try root.apply(staged);
+    const republished = try database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = root.snapshot() },
+        .{},
+    );
+    var reimported = switch (republished) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer reimported.deinit();
+
+    try testing.expectEqual(@as(usize, 5), reimported.model.packages.len);
+    const record = reimported.model.find("newpkg", "amd64").?;
+    const notes = record.field("X-Vendor-Notes").?;
+    try testing.expectEqual(@as(usize, 4), notes.value_lines.len);
+    try testing.expectEqualStrings("first", notes.value_lines[0]);
+    try testing.expectEqualStrings("second line", notes.value_lines[1]);
+    try testing.expectEqualStrings(".", notes.value_lines[2]);
+    try testing.expectEqualStrings("  indented", notes.value_lines[3]);
+    const description = record.field("Description").?;
+    try testing.expectEqualStrings("detail with\ttab", description.value_lines[1]);
+    // The fixture packages are untouched by the new record.
+    try testing.expectEqualStrings(
+        "retained unknown field",
+        reimported.model.find("libfoo", "amd64").?.field("X-Vendor-Note").?.value_lines[0],
+    );
+}
+
+test "package_database_changes.test.long status fields stay plannable" {
+    const allocator = testing.allocator;
+    const long_value = try allocator.alloc(u8, 20_000);
+    defer allocator.free(long_value);
+    @memset(long_value, 'd');
+    const status = try std.fmt.allocPrint(
+        allocator,
+        "Package: solo\nStatus: purge ok not-installed\nArchitecture: amd64\nVersion: 1\n" ++
+            "Description: {s}\n\n",
+        .{long_value},
+    );
+    defer allocator.free(status);
+
+    const imported = try database.importSnapshot(
+        allocator,
+        .{ .native_architecture = "amd64", .snapshot = .{ .status = database.regularFile(status) } },
+        .{},
+    );
+    var source = switch (imported) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer source.deinit();
+
+    // A status line far longer than the info-file line bound is ordinary
+    // DEB822 content, so republishing it must remain possible.
+    const default_limits: database.Limits = .{};
+    try testing.expect(20_000 > default_limits.max_line_bytes);
+    const result = try plan(allocator, source, &.{}, .{});
+    var staged = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .plan => |value| value,
+    };
+    defer staged.deinit();
+    try testing.expectEqualStrings(status, staged.find("status").?.bytes);
+
+    var root = try SimulatedRoot.init(allocator, .{ .status = database.regularFile(status) });
+    defer root.deinit();
+    try root.apply(staged);
+    const republished = try database.importSnapshot(
+        allocator,
+        .{ .native_architecture = "amd64", .snapshot = root.snapshot() },
+        .{},
+    );
+    var reimported = switch (republished) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer reimported.deinit();
+    try testing.expectEqual(
+        @as(usize, 20_000),
+        reimported.model.find("solo", "amd64").?.field("Description").?.value_lines[0].len,
+    );
 }
