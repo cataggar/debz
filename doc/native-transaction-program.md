@@ -206,7 +206,13 @@ that authorized the mutation.
 `transaction_engine.authorizeProgram` requires the compiled program for native
 execution, rejects one supplied to the legacy backend, and verifies the schema,
 the authorization binding, the mutation policy, the executor-policy digest, and
-every artifact against the request the backend would run. It also accepts an
+every artifact against the request the backend would run. The mutation policy
+is bound field by field, not by cardinality: the conffile policy and host-root
+flag must equal both the authorization and the request, the compiled force list
+must equal the authorization's canonical list element for element, and it must
+describe the same canonical risk set as the request. Duplicate risks are
+refused rather than collapsed, so a substitution that keeps the same number of
+risks cannot pass. It also accepts an
 independently recorded expected program digest, which durable recovery evidence
 will use to require the exact program that the interrupted attempt published.
 `executeAuthorizedProgram` performs all of that before backend selection can

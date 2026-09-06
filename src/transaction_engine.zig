@@ -153,6 +153,21 @@ pub fn authorize(
     }
 }
 
+const ForceSet = std.EnumSet(transaction_executor.ForceRisk);
+
+/// Canonical form of a force policy. A duplicate risk has no meaning and would
+/// let a same-cardinality substitution (`{overwrite, overwrite}` for
+/// `{overwrite, depends}`) pass any length or membership comparison, so it is
+/// refused instead of collapsed.
+fn forceSet(force: []const transaction_executor.ForceRisk) ?ForceSet {
+    var set: ForceSet = .initEmpty();
+    for (force) |risk| {
+        if (set.contains(risk)) return null;
+        set.insert(risk);
+    }
+    return set;
+}
+
 fn authorizePolicy(
     authorized: native_authorization.Authorization,
     policy: transaction_executor.Policy,
@@ -161,16 +176,11 @@ fn authorizePolicy(
         authorized.policy.allow_host_root != policy.risk.allow_host_root or
         authorized.policy.force.len != policy.risk.force.len)
         return error.AuthorizationPolicyMismatch;
-    for (policy.risk.force) |risk| {
-        var authorized_risk = false;
-        for (authorized.policy.force) |candidate| {
-            if (candidate == risk) {
-                authorized_risk = true;
-                break;
-            }
-        }
-        if (!authorized_risk) return error.AuthorizationPolicyMismatch;
-    }
+    const requested = forceSet(policy.risk.force) orelse
+        return error.AuthorizationPolicyMismatch;
+    const granted = forceSet(authorized.policy.force) orelse
+        return error.AuthorizationPolicyMismatch;
+    if (!requested.eql(granted)) return error.AuthorizationPolicyMismatch;
     if (!std.mem.eql(
         u8,
         &authorized.executor_policy_sha256,
@@ -303,15 +313,7 @@ pub fn authorizeProgram(
             if (compiled.steps.len == 0) return error.EmptyProgram;
             if (!compiled.matchesAuthorization(authorized.*))
                 return error.ProgramAuthorizationMismatch;
-            if (compiled.policy.conffile != request.policy.conffile or
-                compiled.policy.allow_host_root != request.policy.risk.allow_host_root or
-                compiled.policy.force.len != request.policy.risk.force.len)
-                return error.ProgramPolicyMismatch;
-            if (!std.mem.eql(
-                u8,
-                &compiled.executor_policy_sha256,
-                &hex32(transaction_executor.policyDigest(request.policy)),
-            )) return error.ProgramPolicyMismatch;
+            try authorizeProgramPolicy(authorized.*, compiled.*, request.policy);
             try authorizeProgramArtifacts(authorized.*, compiled.*);
             if (expected_program_sha256) |expected| {
                 if (!std.mem.eql(u8, &expected, &compiled.digest_sha256))
@@ -319,6 +321,39 @@ pub fn authorizeProgram(
             }
         },
     }
+}
+
+/// Binds the compiled mutation policy to both sides it must agree with: the
+/// authorization that reviewed it, element for element, because the program
+/// copies the reviewed force list verbatim, and the request the backend would
+/// execute, as canonical risk sets. Comparing cardinality alone would accept a
+/// program that authorizes a different risk of the same length, so every field
+/// is compared by value and duplicates are refused.
+fn authorizeProgramPolicy(
+    authorized: native_authorization.Authorization,
+    compiled: native_program.Program,
+    policy: transaction_executor.Policy,
+) ProgramError!void {
+    if (compiled.policy.conffile != policy.conffile or
+        compiled.policy.conffile != authorized.policy.conffile or
+        compiled.policy.allow_host_root != policy.risk.allow_host_root or
+        compiled.policy.allow_host_root != authorized.policy.allow_host_root or
+        compiled.policy.force.len != policy.risk.force.len or
+        compiled.policy.force.len != authorized.policy.force.len)
+        return error.ProgramPolicyMismatch;
+    for (compiled.policy.force, authorized.policy.force) |compiled_risk, authorized_risk| {
+        if (compiled_risk != authorized_risk) return error.ProgramPolicyMismatch;
+    }
+    const compiled_force = forceSet(compiled.policy.force) orelse
+        return error.ProgramPolicyMismatch;
+    const requested_force = forceSet(policy.risk.force) orelse
+        return error.ProgramPolicyMismatch;
+    if (!compiled_force.eql(requested_force)) return error.ProgramPolicyMismatch;
+    if (!std.mem.eql(
+        u8,
+        &compiled.executor_policy_sha256,
+        &hex32(transaction_executor.policyDigest(policy)),
+    )) return error.ProgramPolicyMismatch;
 }
 
 /// Authorized actions and compiled artifacts share one dense order, so the
@@ -438,17 +473,28 @@ const AuthorizationFixture = struct {
     plan: solver.Plan,
     lock: exact_lock_v2.OwnedLock,
     authorization: native_authorization.OwnedAuthorization,
+    policy: transaction_executor.Policy,
 
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(0x22);
     const archive_sha256: [32]u8 = @splat(0x31);
     const archive_size: u64 = 100;
-    const policy: transaction_executor.Policy = .{ .conffile = .keep_existing };
+    const default_policy: transaction_executor.Policy = .{ .conffile = .keep_existing };
     const install_root = "/srv/root";
 
     fn init(allocator: std.mem.Allocator) !*AuthorizationFixture {
+        return initWithPolicy(allocator, default_policy);
+    }
+
+    /// The reviewed policy is a fixture parameter so a test can bind a request,
+    /// an authorization, and a compiled program to the same nonempty force set.
+    fn initWithPolicy(
+        allocator: std.mem.Allocator,
+        reviewed: transaction_executor.Policy,
+    ) !*AuthorizationFixture {
         const self = try allocator.create(AuthorizationFixture);
         errdefer allocator.destroy(self);
+        self.policy = reviewed;
         self.actions = .{
             .{
                 .kind = .install,
@@ -564,14 +610,18 @@ const AuthorizationFixture = struct {
             .install_root = install_root,
             .request_sha256 = self.lock.lock.request_sha256,
             .solver_policy_sha256 = self.lock.lock.policy_sha256,
-            .executor_policy_sha256 = transaction_executor.policyDigest(policy),
+            .executor_policy_sha256 = transaction_executor.policyDigest(self.policy),
             .plan_sha256 = transaction_executor.planDigest(self.plan),
             .exact_lock = .{
                 .schema = exact_lock_v2.schema_id,
                 .version = exact_lock_v2.schema_version,
                 .digest_sha256 = self.lock.lock.digest_sha256,
             },
-            .policy = .{ .conffile = policy.conffile },
+            .policy = .{
+                .conffile = self.policy.conffile,
+                .force = self.policy.risk.force,
+                .allow_host_root = self.policy.risk.allow_host_root,
+            },
             .actions = &.{
                 .{
                     .sequence = 0,
@@ -623,7 +673,7 @@ const AuthorizationFixture = struct {
             .plan = &self.plan,
             .install_root = install_root,
             .artifacts = &.{},
-            .policy = policy,
+            .policy = self.policy,
             .exact_lock_v2 = &self.lock.lock,
         };
     }
@@ -1052,6 +1102,144 @@ test "transaction_engine.test.native execution requires the compiled native prog
             authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
         );
     }
+}
+
+// The compiled program is the document the native executor obeys, so its
+// mutation policy is bound field by field to both the authorization that
+// reviewed it and the request the backend would run. Comparing cardinality
+// alone would let a program that authorizes a different risk of the same
+// length through, so every field is mutated here and must be refused before
+// any executor is selected or invoked.
+test "transaction_engine.test.program policy binds every reviewed field" {
+    const reviewed: transaction_executor.Policy = .{
+        .conffile = .keep_existing,
+        .risk = .{ .allow_host_root = false, .force = &.{ .overwrite, .depends } },
+    };
+    const fixture = try AuthorizationFixture.initWithPolicy(std.testing.allocator, reviewed);
+    defer fixture.deinit(std.testing.allocator);
+    const programs = try ProgramFixture.init(std.testing.allocator, fixture);
+    defer programs.deinit(std.testing.allocator);
+    const authorization = &fixture.authorization.authorization;
+    const program = &programs.program.program;
+
+    // The authorization canonicalizes the reviewed risks and the program
+    // copies that list verbatim, so the compiled order is the canonical one.
+    try std.testing.expectEqual(@as(usize, 2), program.policy.force.len);
+    try std.testing.expectEqual(
+        transaction_executor.ForceRisk.depends,
+        program.policy.force[0],
+    );
+    try authorizeProgram(.native, fixture.request(), authorization, program, null);
+
+    var legacy: SelectionHarness = .{};
+    var native: SelectionHarness = .{};
+    const dependencies: transaction_executor.Dependencies = undefined;
+
+    const Case = struct {
+        name: []const u8,
+        force: ?[]const transaction_executor.ForceRisk = null,
+        conffile: ?transaction_executor.ConffilePolicy = null,
+        allow_host_root: ?bool = null,
+    };
+    const cases = [_]Case{
+        .{ .name = "swapped risk of equal length", .force = &.{ .depends, .overwrite_dir } },
+        .{ .name = "non canonical order", .force = &.{ .overwrite, .depends } },
+        .{ .name = "duplicated risk of equal length", .force = &.{ .depends, .depends } },
+        .{ .name = "dropped risk", .force = &.{.depends} },
+        .{ .name = "added risk", .force = &.{ .depends, .overwrite, .overwrite_dir } },
+        .{ .name = "conffile policy", .conffile = .use_package_version },
+        .{ .name = "host root policy", .allow_host_root = true },
+    };
+    for (cases) |case| {
+        var tampered = program.*;
+        if (case.force) |force| tampered.policy.force = force;
+        if (case.conffile) |conffile| tampered.policy.conffile = conffile;
+        if (case.allow_host_root) |allow| tampered.policy.allow_host_root = allow;
+        authorizeProgram(
+            .native,
+            fixture.request(),
+            authorization,
+            &tampered,
+            null,
+        ) catch |err| {
+            try std.testing.expectEqual(error.ProgramPolicyMismatch, err);
+            try std.testing.expectError(
+                error.ProgramPolicyMismatch,
+                executeAuthorizedProgram(
+                    std.testing.allocator,
+                    .native,
+                    legacy.executor(),
+                    native.executor(),
+                    fixture.request(),
+                    authorization,
+                    &tampered,
+                    null,
+                    dependencies,
+                ),
+            );
+            continue;
+        };
+        std.debug.print("program policy mutation '{s}' was authorized\n", .{case.name});
+        return error.TestUnexpectedResult;
+    }
+
+    // A request whose reviewed risks are reordered or substituted, with the
+    // program left untouched, is refused for the same reason.
+    var reordered = fixture.request();
+    reordered.policy.risk.force = &.{ .depends, .overwrite };
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorizeProgram(.native, reordered, authorization, program, null),
+    );
+    var duplicated = fixture.request();
+    duplicated.policy.risk.force = &.{ .overwrite, .overwrite };
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorizeProgram(.native, duplicated, authorization, program, null),
+    );
+    var host_root = fixture.request();
+    host_root.policy.risk.allow_host_root = true;
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorizeProgram(.native, host_root, authorization, program, null),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
+}
+
+// A same-cardinality substitution must never satisfy the authorization either:
+// duplicates are refused instead of collapsed, so `{overwrite, overwrite}`
+// cannot stand in for `{overwrite, depends}`.
+test "transaction_engine.test.force policy is compared as a canonical risk set" {
+    const reviewed: transaction_executor.Policy = .{
+        .conffile = .keep_existing,
+        .risk = .{ .force = &.{ .overwrite, .depends } },
+    };
+    const fixture = try AuthorizationFixture.initWithPolicy(std.testing.allocator, reviewed);
+    defer fixture.deinit(std.testing.allocator);
+    const authorization = &fixture.authorization.authorization;
+
+    try authorize(.native, fixture.request(), authorization);
+
+    var duplicated = authorization.*;
+    duplicated.policy.force = &.{ .overwrite, .overwrite };
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorize(.native, fixture.request(), &duplicated),
+    );
+    var substituted = authorization.*;
+    substituted.policy.force = &.{ .overwrite, .remove_reinstreq };
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorize(.native, fixture.request(), &substituted),
+    );
+    var host_root = authorization.*;
+    host_root.policy.allow_host_root = true;
+    try std.testing.expectError(
+        error.AuthorizationPolicyMismatch,
+        authorize(.native, fixture.request(), &host_root),
+    );
 }
 
 test "transaction_engine.test.an unauthorized program never reaches the executor" {
