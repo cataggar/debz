@@ -31,6 +31,13 @@ Archive-producing plan actions retain a typed `selected_origin` that can be
 matched back to the authenticated repository record by the package acquisition
 API.
 
+`debz.root_fs` is the traversal-safe filesystem layer for the native
+transaction engine. It anchors bounded, typed, root-relative operations to an
+already opened root descriptor, never resolves a component through a symbolic
+link, refuses absolute, traversing, and control-byte paths before any syscall,
+creates only exclusively, and replaces existing paths only through fsynced
+staged publication. See [Root-anchored filesystem primitives](root-filesystem.md).
+
 ## Typed metadata and archives
 
 The project exposes typed configuration and request APIs, a CLI command vocabulary, and bounded parsers for DEB822, Debian versions, binary package relations, control records, repository `Release` metadata, repository source configuration, and Debian binary package outer archives.
