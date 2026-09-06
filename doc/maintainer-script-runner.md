@@ -59,18 +59,31 @@ A spawned script runs with:
 - **No shell.** The script is executed with `execve` on an absolute in-root
   path and an exact argv; no `sh -c` string is ever constructed.
 - **Stdin.** Standard input is `/dev/null`, so scripts cannot block on input.
+- **Standard descriptors.** Every descriptor the child still needs is first
+  moved above the standard range, so installing stdin, stdout, and stderr is
+  always a real `dup2` that clears CLOEXEC. A runner invoked with fd 0, 1, or 2
+  already closed therefore still hands the script the intended streams instead
+  of losing them at `execve`.
 - **Bounded output.** Combined or separate stdout/stderr capture is bounded by
   `limits.maximum_output_bytes`; exceeding it is the distinct
   `output_limit_exceeded` outcome, not a truncated success.
 - **Bounded runtime and cancellation.** The wall-clock budget is
   `limits.timeout_ms`; an injected `Cancellation` is polled at
-  `limits.poll_interval_ms`.
+  `limits.poll_interval_ms`. Supervision continues until the child is observed
+  to have exited, so a script that closes or redirects its own stdout and
+  stderr is still bounded by the deadline and the cancellation token rather
+  than being waited on indefinitely.
 - **Process-tree termination.** The child creates its own session and process
-  group. Timeout, cancellation, and the output limit terminate the whole group
-  with `SIGTERM`, then escalate to `SIGKILL` after
-  `limits.termination_grace_ms`, and reap the child. `descendants = .detach`
-  keeps surviving descendants (dpkg-compatible daemon behavior);
-  `.terminate` sweeps them.
+  group. Timeout, cancellation, and the output limit terminate it with
+  `SIGTERM`, then escalate to `SIGKILL` after `limits.termination_grace_ms`.
+  `descendants = .terminate` signals and finally sweeps the whole process
+  group; `descendants = .detach` signals only the script itself and leaves
+  survivors running, preserving dpkg's daemon behavior.
+- **Signal ordering.** Exit is observed with a non-destructive `waitid`
+  (`WNOWAIT`) probe, so the leader stays an unreaped zombie and its pid — and
+  therefore its process-group id — cannot be recycled while the runner is still
+  signalling. Every `SIGTERM`/`SIGKILL`, including the final descendant sweep,
+  is issued before the reap, and the reap is always the last operation.
 
 ## Outcome taxonomy
 
@@ -88,7 +101,9 @@ code 0.
 
 The report records the script identity, isolation, absolute in-root program
 path, complete argv, the exact environment, capture and descendant policy,
-bounded output, whether the group was terminated or escalated to `SIGKILL`, and
+bounded output, `terminated_process_group` (the still-running script had to be
+terminated), `escalated_to_kill`, `swept_descendants` (a group-wide `SIGKILL`
+sweep removed survivors under the `terminate` policy), and
 domain-separated length-prefixed SHA-256 digests of the script, argv,
 environment, policy, invocation, stdout, stderr, and combined output. The
 invocation digest binds root, isolation, program, argv, environment, and limits
@@ -103,8 +118,13 @@ binding, the outcome taxonomy, and launcher failure mapping without spawning
 anything. Real-execution tests run the system launcher against fixture scripts
 in a temporary directory under explicit host-root policy and cover the
 sanitized child environment, `/dev/null` stdin, bounded and combined capture,
-signals, timeout with descendant-tree termination, cancellation, and the output
-limit.
+signals, timeout with descendant-tree termination, cancellation, the output
+limit, timeout and cancellation of a script that closed its own captured
+streams, and — from a forked helper whose own fd 0, 1, and 2 are closed — the
+correct installation of the child's standard descriptors. Termination ordering
+is checked deterministically through a recording process-group seam that
+asserts the reap is the last operation and that the detach policy never signals
+descendants.
 
 The strongest alternate-root test this repository's infrastructure supports
 asserts the chroot boundary directly: unprivileged runners observe

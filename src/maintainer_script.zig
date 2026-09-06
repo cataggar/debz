@@ -266,8 +266,8 @@ pub const Execution = struct {
     /// The runner had to terminate the still-running script's process group.
     terminated_process_group: bool = false,
     escalated_to_kill: bool = false,
-    /// The `terminate` descendant policy swept the group after the script
-    /// itself had already been reaped.
+    /// The `terminate` descendant policy removed survivors with a final
+    /// group-wide `SIGKILL`, issued before the script was reaped.
     swept_descendants: bool = false,
 
     pub fn deinit(self: *Execution, allocator: std.mem.Allocator) void {
@@ -916,20 +916,34 @@ fn childMain(child: ChildDescriptor) noreturn {
         if (grouped != .SUCCESS) childFail(child.status_write, .session, grouped);
     }
 
+    var streams: ChildStreams = .{
+        .input = child.null_fd,
+        .output = child.output_write,
+        .errors = child.error_write,
+        .status = child.status_write,
+    };
+    // A parent with closed standard descriptors leaves fd 0, 1, or 2 free, so
+    // the runner's own pipes can land there. `dup2(fd, fd)` is a no-op that
+    // keeps CLOEXEC set, which would silently close the stream at execve, and
+    // an aliased source could also be clobbered by an earlier mapping. Lift
+    // every still-needed descriptor out of the standard range first.
+    if (liftReservedDescriptors(&streams)) |err|
+        childFail(child.status_write, .standard_streams, err);
+
     for ([_][2]i32{
-        .{ child.null_fd, 0 },
-        .{ child.output_write, 1 },
-        .{ child.error_write, 2 },
+        .{ streams.input, 0 },
+        .{ streams.output, 1 },
+        .{ streams.errors, 2 },
     }) |mapping| {
         const duplicated = linux.errno(linux.dup2(mapping[0], mapping[1]));
         if (duplicated != .SUCCESS)
-            childFail(child.status_write, .standard_streams, duplicated);
+            childFail(streams.status, .standard_streams, duplicated);
     }
 
     for ([_]i32{
-        child.null_fd,
-        child.output_write,
-        child.error_write,
+        streams.input,
+        streams.output,
+        streams.errors,
         child.output_read,
         child.error_read,
     }) |fd| {
@@ -952,17 +966,49 @@ fn childMain(child: ChildDescriptor) noreturn {
             // chdir first so the chroot target and the post-chroot working
             // directory cannot be raced through the inherited cwd.
             const entered = linux.errno(linux.chdir(child.root.ptr));
-            if (entered != .SUCCESS) childFail(child.status_write, .working_directory, entered);
+            if (entered != .SUCCESS) childFail(streams.status, .working_directory, entered);
             const isolated = linux.errno(linux.chroot("."));
-            if (isolated != .SUCCESS) childFail(child.status_write, .root_isolation, isolated);
+            if (isolated != .SUCCESS) childFail(streams.status, .root_isolation, isolated);
         },
         .host_root => {},
     }
     const working = linux.errno(linux.chdir("/"));
-    if (working != .SUCCESS) childFail(child.status_write, .working_directory, working);
+    if (working != .SUCCESS) childFail(streams.status, .working_directory, working);
 
     const executed = linux.errno(linux.execve(child.program.ptr, child.argv, child.envp));
-    childFail(child.status_write, .execute, executed);
+    childFail(streams.status, .execute, executed);
+}
+
+const ChildStreams = struct {
+    input: i32,
+    output: i32,
+    errors: i32,
+    status: i32,
+};
+
+/// Moves every descriptor the child still needs above the standard range so
+/// each later `dup2` into 0, 1, and 2 really duplicates the descriptor, which
+/// also clears CLOEXEC, instead of aliasing or no-op'ing on it. Returns the
+/// exact error when a descriptor cannot be moved.
+fn liftReservedDescriptors(streams: *ChildStreams) ?linux.E {
+    const slots = [_]*i32{ &streams.input, &streams.output, &streams.errors, &streams.status };
+    for (slots) |slot| {
+        while (slot.* >= 0 and slot.* < 3) {
+            const rc = linux.fcntl(slot.*, linux.F.DUPFD_CLOEXEC, 3);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => |err| return err,
+            }
+            const moved: i32 = @intCast(rc);
+            const previous = slot.*;
+            // Streams may share one descriptor, so every alias moves together.
+            for (slots) |alias| {
+                if (alias.* == previous) alias.* = moved;
+            }
+        }
+    }
+    return null;
 }
 
 fn childFail(status_write: i32, stage: SetupStage, err: linux.E) noreturn {
@@ -1006,9 +1052,7 @@ fn supervise(
     var captured: usize = 0;
     var limit_exceeded = false;
     var setup: ?SetupFailure = null;
-    var reaped: ?u32 = null;
-    var terminated = false;
-    var escalated = false;
+    var child_exited = false;
     var timed_out = false;
     var cancelled = false;
 
@@ -1016,7 +1060,11 @@ fn supervise(
     var drain_deadline: ?u64 = null;
     var buffer: [4096]u8 = undefined;
 
-    while (fds.output >= 0 or fds.errors >= 0 or fds.status >= 0) {
+    // The loop never ends merely because the captured streams closed: a script
+    // that closes or redirects its own stdio keeps running, so the deadline and
+    // the cancellation token stay authoritative until the child is observed to
+    // have exited.
+    while (true) {
         if (invocation.cancellation.cancelled()) {
             cancelled = true;
             break;
@@ -1029,6 +1077,8 @@ fn supervise(
         if (drain_deadline) |deadline| {
             if (monotonicMs() >= deadline) break;
         }
+        const streaming = fds.output >= 0 or fds.errors >= 0 or fds.status >= 0;
+        if (child_exited and !streaming) break;
 
         var poll_fds: [3]linux.pollfd = undefined;
         var slots: [3]*i32 = undefined;
@@ -1091,30 +1141,26 @@ fn supervise(
         }
         if (limit_exceeded) break;
 
-        if (reaped == null) {
-            if (try reapChild(pid, true)) |status| reaped = status;
-        }
-        // A reaped script whose descendants still hold the pipes only gets a
+        // The exit probe never reaps: the pid stays pinned by its zombie so the
+        // process group remains safe to signal during finalization.
+        if (!child_exited) child_exited = probeExited(pid);
+        // An exited script whose descendants still hold the pipes only gets a
         // bounded drain window before the group is terminated.
-        if (reaped != null and !progressed and drain_deadline == null)
+        if (child_exited and !progressed and drain_deadline == null)
             drain_deadline = monotonicMs() + invocation.limits.descendant_drain_ms;
     }
 
-    const terminate_now = timed_out or cancelled or limit_exceeded or setup != null or
-        (reaped == null and (fds.output >= 0 or fds.errors >= 0 or fds.status >= 0));
-    if (reaped == null and terminate_now) {
-        const result = terminateGroup(pid, invocation.limits.termination_grace_ms);
-        reaped = result.status;
-        terminated = true;
-        escalated = result.escalated;
-    } else if (reaped == null) {
-        reaped = try reapChild(pid, false);
-    }
-    var swept = false;
-    if (invocation.descendants == .terminate and !terminated) {
-        _ = linux.kill(-pid, .KILL);
-        swept = true;
-    }
+    var operations: SystemGroupOperations = .{ .pid = pid };
+    const finalized = finalizeGroup(&operations, .{
+        .leader_exited = child_exited,
+        .sweep = invocation.descendants == .terminate,
+        .grace_ms = invocation.limits.termination_grace_ms,
+        .poll_ms = group_poll_interval_ms,
+    });
+    const reaped = finalized.status;
+    const terminated = finalized.terminated;
+    const escalated = finalized.escalated;
+    const swept = finalized.swept;
 
     const outcome: LaunchOutcome = if (setup) |failure|
         .{ .setup_failed = failure }
@@ -1153,26 +1199,114 @@ fn terminationOf(status: u32) LaunchOutcome {
     return .{ .signaled = status };
 }
 
-const TerminationResult = struct {
-    status: ?u32,
-    escalated: bool,
+const group_poll_interval_ms = 5;
+
+const SignalScope = enum { leader, group };
+
+const TerminationSignal = enum { term, kill };
+
+const Finalization = struct {
+    /// Whether the leader was already observed to have exited without reaping.
+    leader_exited: bool,
+    /// Whether the descendant policy removes survivors with the whole group.
+    sweep: bool,
+    grace_ms: u64,
+    poll_ms: u64,
 };
 
-fn terminateGroup(pid: i32, grace_ms: u64) TerminationResult {
-    _ = linux.kill(-pid, .TERM);
-    const deadline = monotonicMs() + grace_ms;
-    while (monotonicMs() < deadline) {
-        if (reapChild(pid, true) catch null) |status| {
-            // Descendants that survived the script are removed with the group.
-            _ = linux.kill(-pid, .KILL);
-            return .{ .status = status, .escalated = false };
+const FinalizeResult = struct {
+    status: ?u32 = null,
+    terminated: bool = false,
+    escalated: bool = false,
+    swept: bool = false,
+};
+
+/// Ordering-critical shutdown. Every signal is delivered while the leader pid
+/// is still pinned by an unreaped child, and the reap is the final operation,
+/// so neither a recycled pid nor a recycled process group can ever be
+/// signalled by this runner.
+fn finalizeGroup(operations: anytype, plan: Finalization) FinalizeResult {
+    var result: FinalizeResult = .{};
+    var exited = plan.leader_exited;
+    const scope: SignalScope = if (plan.sweep) .group else .leader;
+    if (!exited) {
+        operations.signal(scope, .term);
+        result.terminated = true;
+        exited = awaitExit(operations, plan);
+        if (!exited) {
+            operations.signal(scope, .kill);
+            result.escalated = true;
+            exited = awaitExit(operations, plan);
         }
-        sleepMs(5);
     }
-    _ = linux.kill(-pid, .KILL);
-    const status = reapChild(pid, false) catch null;
-    _ = linux.kill(-pid, .KILL);
-    return .{ .status = status, .escalated = true };
+    if (plan.sweep) {
+        // Survivors are removed before the reap, while the pid is still pinned.
+        operations.signal(.group, .kill);
+        result.swept = true;
+    }
+    result.status = operations.reap(exited);
+    return result;
+}
+
+fn awaitExit(operations: anytype, plan: Finalization) bool {
+    const deadline = operations.now() + plan.grace_ms;
+    while (true) {
+        if (operations.exited()) return true;
+        if (operations.now() >= deadline) return false;
+        operations.sleep(plan.poll_ms);
+    }
+}
+
+const SystemGroupOperations = struct {
+    pid: i32,
+
+    fn signal(self: *SystemGroupOperations, scope: SignalScope, number: TerminationSignal) void {
+        const target: i32 = switch (scope) {
+            .leader => self.pid,
+            .group => -self.pid,
+        };
+        _ = linux.kill(target, switch (number) {
+            .term => .TERM,
+            .kill => .KILL,
+        });
+    }
+
+    fn exited(self: *SystemGroupOperations) bool {
+        return probeExited(self.pid);
+    }
+
+    fn reap(self: *SystemGroupOperations, known_exited: bool) ?u32 {
+        return reapChild(self.pid, !known_exited) catch null;
+    }
+
+    fn now(_: *SystemGroupOperations) u64 {
+        return monotonicMs();
+    }
+
+    fn sleep(_: *SystemGroupOperations, milliseconds: u64) void {
+        sleepMs(milliseconds);
+    }
+};
+
+/// Non-destructive exit probe. `WNOWAIT` leaves the zombie in place, so the
+/// leader pid keeps its process-group identity reserved until the final reap.
+fn probeExited(pid: i32) bool {
+    while (true) {
+        var info: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
+        const rc = linux.waitid(
+            .PID,
+            pid,
+            &info,
+            linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT,
+            null,
+        );
+        switch (linux.errno(rc)) {
+            .SUCCESS => return info.fields.common.first.piduid.pid == pid,
+            .INTR => continue,
+            // No such child left to wait for: it can no longer be running.
+            else => return true,
+        }
+    }
 }
 
 fn reapChild(pid: i32, nohang: bool) !?u32 {
@@ -1850,6 +1984,191 @@ test "maintainer_script.test.system launcher cancels a running script" {
     try testing.expect(!report.succeeded());
 }
 
+test "maintainer_script.test.system launcher bounds a script that closed its own streams" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    // Redirecting the captured streams closes every pipe the supervisor holds
+    // while the script keeps running, so only the deadline can end the run.
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\exec >/dev/null 2>&1
+        \\sleep 300
+        \\
+    );
+    defer script.deinit(testing.allocator);
+
+    var request = script.request(&.{"configure"});
+    request.policy.limits.timeout_ms = 500;
+    request.policy.limits.termination_grace_ms = 200;
+
+    var launcher: SystemLauncher = .{};
+    const started = monotonicMs();
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+
+    try testing.expectEqualStrings("timed_out", @tagName(report.outcome));
+    try testing.expect(report.terminated_process_group);
+    try testing.expect(!report.succeeded());
+    try testing.expect(monotonicMs() - started < 20_000);
+}
+
+test "maintainer_script.test.system launcher cancels a script that closed its own streams" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\exec >/dev/null 2>&1
+        \\sleep 300
+        \\
+    );
+    defer script.deinit(testing.allocator);
+
+    var request = script.request(&.{"configure"});
+    request.policy.limits.termination_grace_ms = 200;
+
+    var cancellation: CountingCancellation = .{ .cancel_after = 3 };
+    var launcher: SystemLauncher = .{};
+    const started = monotonicMs();
+    var report = try run(testing.allocator, request, .{
+        .launcher = launcher.interface(),
+        .cancellation = cancellation.interface(),
+    });
+    defer report.deinit();
+
+    try testing.expectEqualStrings("cancelled", @tagName(report.outcome));
+    try testing.expect(report.terminated_process_group);
+    try testing.expect(monotonicMs() - started < 20_000);
+}
+
+const TraceEvent = enum {
+    term_leader,
+    term_group,
+    kill_leader,
+    kill_group,
+    reap,
+};
+
+/// Deterministic stand-in for the child process group. It records the exact
+/// order of signalling and reaping without depending on pid reuse.
+const RecordingGroupOperations = struct {
+    events: [8]TraceEvent = undefined,
+    count: usize = 0,
+    probes: usize = 0,
+    /// Number of exit probes answered with "still running".
+    running_probes: usize = 0,
+    clock: u64 = 0,
+    status: u32 = 0,
+    reaped_at: ?usize = null,
+    blocking_reap: ?bool = null,
+
+    fn signal(self: *RecordingGroupOperations, scope: SignalScope, number: TerminationSignal) void {
+        self.record(switch (scope) {
+            .leader => switch (number) {
+                .term => .term_leader,
+                .kill => .kill_leader,
+            },
+            .group => switch (number) {
+                .term => .term_group,
+                .kill => .kill_group,
+            },
+        });
+    }
+
+    fn exited(self: *RecordingGroupOperations) bool {
+        self.probes += 1;
+        return self.probes > self.running_probes;
+    }
+
+    fn reap(self: *RecordingGroupOperations, known_exited: bool) ?u32 {
+        self.blocking_reap = known_exited;
+        self.reaped_at = self.count;
+        self.record(.reap);
+        return self.status;
+    }
+
+    fn now(self: *RecordingGroupOperations) u64 {
+        return self.clock;
+    }
+
+    fn sleep(self: *RecordingGroupOperations, milliseconds: u64) void {
+        self.clock += milliseconds;
+    }
+
+    fn record(self: *RecordingGroupOperations, event: TraceEvent) void {
+        self.events[self.count] = event;
+        self.count += 1;
+    }
+
+    fn trace(self: *const RecordingGroupOperations) []const TraceEvent {
+        return self.events[0..self.count];
+    }
+};
+
+fn expectTrace(expected: []const TraceEvent, operations: *const RecordingGroupOperations) !void {
+    try testing.expectEqualSlices(TraceEvent, expected, operations.trace());
+    // The reap must be the last operation: signalling afterwards could reach a
+    // recycled pid or process group.
+    try testing.expectEqual(operations.count - 1, operations.reaped_at.?);
+}
+
+test "maintainer_script.test.finalization never signals a group after reaping it" {
+    const plan: Finalization = .{
+        .leader_exited = false,
+        .sweep = true,
+        .grace_ms = 50,
+        .poll_ms = 10,
+    };
+
+    var exited_cleanly: RecordingGroupOperations = .{ .status = 0 };
+    const clean = finalizeGroup(&exited_cleanly, .{
+        .leader_exited = true,
+        .sweep = true,
+        .grace_ms = plan.grace_ms,
+        .poll_ms = plan.poll_ms,
+    });
+    try expectTrace(&.{ .kill_group, .reap }, &exited_cleanly);
+    try testing.expect(!clean.terminated);
+    try testing.expect(!clean.escalated);
+    try testing.expect(clean.swept);
+    try testing.expectEqual(true, exited_cleanly.blocking_reap.?);
+
+    var detached: RecordingGroupOperations = .{ .status = 0 };
+    const kept = finalizeGroup(&detached, .{
+        .leader_exited = true,
+        .sweep = false,
+        .grace_ms = plan.grace_ms,
+        .poll_ms = plan.poll_ms,
+    });
+    try expectTrace(&.{.reap}, &detached);
+    try testing.expect(!kept.swept);
+
+    var polite: RecordingGroupOperations = .{ .running_probes = 2 };
+    const terminated = finalizeGroup(&polite, plan);
+    try expectTrace(&.{ .term_group, .kill_group, .reap }, &polite);
+    try testing.expect(terminated.terminated);
+    try testing.expect(!terminated.escalated);
+    try testing.expect(terminated.swept);
+
+    var stubborn: RecordingGroupOperations = .{ .running_probes = 1_000 };
+    const escalated = finalizeGroup(&stubborn, plan);
+    try expectTrace(&.{ .term_group, .kill_group, .kill_group, .reap }, &stubborn);
+    try testing.expect(escalated.terminated);
+    try testing.expect(escalated.escalated);
+    try testing.expectEqual(false, stubborn.blocking_reap.?);
+
+    var detached_running: RecordingGroupOperations = .{ .running_probes = 1_000 };
+    _ = finalizeGroup(&detached_running, .{
+        .leader_exited = false,
+        .sweep = false,
+        .grace_ms = plan.grace_ms,
+        .poll_ms = plan.poll_ms,
+    });
+    // The detach policy must never signal descendants.
+    try expectTrace(&.{ .term_leader, .kill_leader, .reap }, &detached_running);
+}
+
 test "maintainer_script.test.system launcher fails closed when output exceeds the limit" {
     try skipUnlessPosixShell();
     var directory = testing.tmpDir(.{});
@@ -1876,6 +2195,92 @@ test "maintainer_script.test.system launcher fails closed when output exceeds th
     try testing.expectEqual(@as(usize, 64), report.output_bytes);
     try testing.expectEqual(@as(usize, 64), report.output_limit);
     try testing.expect(report.terminated_process_group);
+}
+
+/// Runs the script with fd 0, 1, and 2 closed and reports the result through
+/// `channel`. It runs in a forked child so the test harness keeps its own
+/// standard descriptors, and it never returns to the test runner.
+fn reportWithoutStandardStreams(script: *const HostScript, channel: [2]i32) noreturn {
+    _ = linux.close(channel[0]);
+    for ([_]i32{ 0, 1, 2 }) |fd| _ = linux.close(fd);
+
+    var launcher: SystemLauncher = .{};
+    const report = run(
+        std.heap.page_allocator,
+        script.request(&.{"configure"}),
+        .{ .launcher = launcher.interface() },
+    ) catch linux.exit(91);
+
+    const code: u8 = switch (report.outcome) {
+        .exited => |value| value,
+        else => 200,
+    };
+    writeAllRaw(channel[1], &[_]u8{code});
+    writeAllRaw(channel[1], report.stdout);
+    writeAllRaw(channel[1], "|");
+    writeAllRaw(channel[1], report.stderr);
+    _ = linux.close(channel[1]);
+    linux.exit(0);
+}
+
+fn writeAllRaw(fd: i32, bytes: []const u8) void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = linux.write(fd, bytes[written..].ptr, bytes.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => written += rc,
+            .INTR => {},
+            else => return,
+        }
+    }
+}
+
+test "maintainer_script.test.system launcher installs standard streams the parent had closed" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\printf 'stdin=[%s]\n' "$(cat)"
+        \\printf 'diagnostic\n' >&2
+        \\exit 7
+        \\
+    );
+    defer script.deinit(testing.allocator);
+
+    const created = createPipe();
+    try testing.expectEqual(@as(u32, 0), created.errno);
+    var channel = created.fds;
+    defer closePipe(&channel);
+
+    const forked = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(forked));
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) reportWithoutStandardStreams(&script, channel);
+    closeFd(&channel[1]);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(testing.allocator);
+    var buffer: [512]u8 = undefined;
+    while (true) {
+        const rc = linux.read(channel[0], &buffer, buffer.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => break,
+        }
+        if (rc == 0) break;
+        try payload.appendSlice(testing.allocator, buffer[0..rc]);
+    }
+    const status = (try reapChild(pid, false)).?;
+    try testing.expect(linux.W.IFEXITED(status));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+
+    // The script still saw an empty /dev/null stdin and both captured streams,
+    // so the runner's pipes were installed on 0, 1, and 2 with CLOEXEC cleared.
+    try testing.expect(payload.items.len > 1);
+    try testing.expectEqual(@as(u8, 7), payload.items[0]);
+    try testing.expectEqualStrings("stdin=[]\n|diagnostic\n", payload.items[1..]);
 }
 
 test "maintainer_script.test.system launcher combines interleaved output when requested" {
