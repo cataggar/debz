@@ -229,10 +229,13 @@ pub const StagedFile = struct {
         try self.file.writeStreamingAll(self.io, bytes);
     }
 
-    /// Streaming writer for payload-sized content. The caller must flush
-    /// before `commit`.
-    pub fn writer(self: *StagedFile, buffer: []u8) File.Writer {
-        return self.file.writer(self.io, buffer);
+    /// Streaming writer for payload-sized content. It appends at the
+    /// descriptor's current offset, so it composes with `writeAll` and with
+    /// earlier writers instead of restarting at offset zero. The caller must
+    /// flush before `commit`.
+    pub fn writer(self: *StagedFile, buffer: []u8) !File.Writer {
+        if (!self.file_open) return error.StagedFileClosed;
+        return self.file.writerStreaming(self.io, buffer);
     }
 
     pub fn commit(self: *StagedFile) !void {
@@ -376,6 +379,10 @@ pub const Root = struct {
         ) catch |err| return mapRegularFileError(err);
     }
 
+    /// Reads the whole file when it is at most `maximum_bytes` long and fails
+    /// with `error.FileTooLarge` otherwise. The saturating probe limit keeps a
+    /// file of exactly `maximum_bytes` readable, because `allocRemaining`
+    /// fails once its own limit is reached.
     pub fn readFileAlloc(
         self: Root,
         allocator: std.mem.Allocator,
@@ -385,7 +392,7 @@ pub const Root = struct {
         var file = try self.openRegularFile(path);
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes)) catch |err|
+        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes +| 1)) catch |err|
             switch (err) {
                 error.StreamTooLong => error.FileTooLarge,
                 error.ReadFailed => reader.err.?,
@@ -788,11 +795,68 @@ test "root_fs.test.reads are bounded by the caller limit" {
     const root = testRoot(&tmp);
 
     const path = try testPath("payload");
-    try root.publishFile(path, "0123456789", .{});
+    const contents = "0123456789";
+    try root.publishFile(path, contents, .{});
     try testing.expectError(
         error.FileTooLarge,
         root.readFileAlloc(testing.allocator, path, 4),
     );
+
+    const exact = try root.readFileAlloc(testing.allocator, path, contents.len);
+    defer testing.allocator.free(exact);
+    try testing.expectEqualStrings(contents, exact);
+
+    const spare = try root.readFileAlloc(testing.allocator, path, contents.len + 1);
+    defer testing.allocator.free(spare);
+    try testing.expectEqualStrings(contents, spare);
+
+    try testing.expectError(
+        error.FileTooLarge,
+        root.readFileAlloc(testing.allocator, path, contents.len - 1),
+    );
+
+    const empty = try testPath("empty");
+    try root.publishFile(empty, "", .{});
+    const nothing = try root.readFileAlloc(testing.allocator, empty, 0);
+    defer testing.allocator.free(nothing);
+    try testing.expectEqualStrings("", nothing);
+}
+
+test "root_fs.test.staged writers append at the descriptor offset" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    const path = try testPath("var/lib/dpkg/status");
+    try root.createDirectoryPath(path.parent().?, default_directory_permissions);
+    {
+        var staged = try root.stageFile(path, .{});
+        defer staged.deinit();
+        try staged.writeAll("Package: debz\n");
+        {
+            var buffer: [8]u8 = undefined;
+            var sink = try staged.writer(&buffer);
+            try sink.interface.writeAll("Status: install ok installed\n");
+            try sink.interface.flush();
+        }
+        try staged.writeAll("Architecture: amd64\n");
+        {
+            var buffer: [4]u8 = undefined;
+            var sink = try staged.writer(&buffer);
+            try sink.interface.writeAll("Version: 0.3.0\n");
+            try sink.interface.flush();
+        }
+        try staged.commit();
+        try testing.expectError(error.StagedFileClosed, staged.writer(&.{}));
+    }
+
+    const bytes = try root.readFileAlloc(testing.allocator, path, 4096);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings(
+        "Package: debz\nStatus: install ok installed\nArchitecture: amd64\nVersion: 0.3.0\n",
+        bytes,
+    );
+    try testing.expectEqual(@as(u64, bytes.len), (try root.metadata(path)).size);
 }
 
 test "root_fs.test.final symbolic links are never followed" {
