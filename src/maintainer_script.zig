@@ -266,9 +266,11 @@ pub const Execution = struct {
     /// The runner had to terminate the still-running script's process group.
     terminated_process_group: bool = false,
     escalated_to_kill: bool = false,
-    /// The `terminate` descendant policy removed survivors with a final
-    /// group-wide `SIGKILL`, issued before the script was reaped.
-    swept_descendants: bool = false,
+    /// A final group-wide `SIGKILL` sweep was issued under the `terminate`
+    /// descendant policy before the script was reaped. It records that the
+    /// sweep was delivered to the process group, not that survivors existed:
+    /// whether any descendant was still alive is not observable here.
+    issued_descendant_sweep: bool = false,
 
     pub fn deinit(self: *Execution, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
@@ -328,7 +330,9 @@ pub const Report = struct {
     output_limit: usize,
     terminated_process_group: bool,
     escalated_to_kill: bool,
-    swept_descendants: bool,
+    /// A group-wide `SIGKILL` sweep was issued under the `terminate`
+    /// descendant policy. It never claims that descendants existed.
+    issued_descendant_sweep: bool,
     evidence: Evidence,
 
     pub fn succeeded(self: Report) bool {
@@ -391,7 +395,7 @@ pub fn run(
             .output_limit = owned.policy.limits.maximum_output_bytes,
             .terminated_process_group = false,
             .escalated_to_kill = false,
-            .swept_descendants = false,
+            .issued_descendant_sweep = false,
             .evidence = evidenceWithOutput(evidence_base, "", "", ""),
         };
     }
@@ -435,7 +439,7 @@ pub fn run(
         .output_limit = owned.policy.limits.maximum_output_bytes,
         .terminated_process_group = execution.terminated_process_group,
         .escalated_to_kill = execution.escalated_to_kill,
-        .swept_descendants = execution.swept_descendants,
+        .issued_descendant_sweep = execution.issued_descendant_sweep,
         .evidence = evidenceWithOutput(
             evidence_base,
             captured_stdout,
@@ -1160,7 +1164,7 @@ fn supervise(
     const reaped = finalized.status;
     const terminated = finalized.terminated;
     const escalated = finalized.escalated;
-    const swept = finalized.swept;
+    const issued_sweep = finalized.issued_sweep;
 
     const outcome: LaunchOutcome = if (setup) |failure|
         .{ .setup_failed = failure }
@@ -1179,7 +1183,7 @@ fn supervise(
         .outcome = outcome,
         .terminated_process_group = terminated,
         .escalated_to_kill = escalated,
-        .swept_descendants = swept,
+        .issued_descendant_sweep = issued_sweep,
     };
     switch (invocation.capture) {
         .separate => {
@@ -1208,7 +1212,8 @@ const TerminationSignal = enum { term, kill };
 const Finalization = struct {
     /// Whether the leader was already observed to have exited without reaping.
     leader_exited: bool,
-    /// Whether the descendant policy removes survivors with the whole group.
+    /// Whether the descendant policy signals the whole process group instead
+    /// of the leader alone and issues a final group-wide sweep.
     sweep: bool,
     grace_ms: u64,
     poll_ms: u64,
@@ -1218,7 +1223,10 @@ const FinalizeResult = struct {
     status: ?u32 = null,
     terminated: bool = false,
     escalated: bool = false,
-    swept: bool = false,
+    /// The group-wide `SIGKILL` sweep was issued. Survivorship is unknowable:
+    /// `kill` on the group cannot distinguish "no descendant was left" from
+    /// "descendants were killed", so this only records the attempt.
+    issued_sweep: bool = false,
 };
 
 /// Ordering-critical shutdown. Every signal is delivered while the leader pid
@@ -1240,9 +1248,12 @@ fn finalizeGroup(operations: anytype, plan: Finalization) FinalizeResult {
         }
     }
     if (plan.sweep) {
-        // Survivors are removed before the reap, while the pid is still pinned.
+        // Any survivor is removed before the reap, while the pid is still
+        // pinned. The signal is issued unconditionally because a live
+        // descendant cannot be observed without racing it; the recorded
+        // evidence is therefore the sweep attempt, not a survivor count.
         operations.signal(.group, .kill);
-        result.swept = true;
+        result.issued_sweep = true;
     }
     result.status = operations.reap(exited);
     return result;
@@ -1375,6 +1386,9 @@ const RecordingLauncher = struct {
     stderr: []const u8 = "",
     combined: []const u8 = "",
     failure: ?anyerror = null,
+    terminated_process_group: bool = false,
+    escalated_to_kill: bool = false,
+    issued_descendant_sweep: bool = false,
     launches: usize = 0,
     invocation: ?Invocation = null,
 
@@ -1401,6 +1415,9 @@ const RecordingLauncher = struct {
             .stdout = captured_stdout,
             .stderr = captured_stderr,
             .combined = captured_combined,
+            .terminated_process_group = self.terminated_process_group,
+            .escalated_to_kill = self.escalated_to_kill,
+            .issued_descendant_sweep = self.issued_descendant_sweep,
         };
     }
 };
@@ -1738,6 +1755,59 @@ test "maintainer_script.test.report owns every reported string" {
     try testing.expectEqualStrings("demo", environmentValue(report.environment, "DPKG_MAINTSCRIPT_PACKAGE").?);
 }
 
+test "maintainer_script.test.sweep evidence records the attempt, not survivors" {
+    // A rejected request never spawns, so no signal of any kind was issued.
+    var rejecting: RecordingLauncher = .{};
+    var rejected_request = testRequest();
+    rejected_request.identity.script_path = "etc/demo.postinst";
+    var rejected = try run(testing.allocator, rejected_request, .{
+        .launcher = rejecting.interface(),
+    });
+    defer rejected.deinit();
+    try testing.expectEqual(@as(usize, 0), rejecting.launches);
+    try testing.expect(!rejected.issued_descendant_sweep);
+    try testing.expect(!rejected.terminated_process_group);
+
+    // A script that exited on its own still gets the group-wide sweep under the
+    // `terminate` policy. The report must say the sweep was issued without
+    // claiming a descendant was alive, so termination stays false.
+    var swept: RecordingLauncher = .{
+        .outcome = .{ .exited = 0 },
+        .issued_descendant_sweep = true,
+    };
+    var clean = try run(testing.allocator, testRequest(), .{ .launcher = swept.interface() });
+    defer clean.deinit();
+    try testing.expect(clean.succeeded());
+    try testing.expect(clean.issued_descendant_sweep);
+    try testing.expect(!clean.terminated_process_group);
+    try testing.expect(!clean.escalated_to_kill);
+
+    // An actually terminated process group is distinguishable from the sweep.
+    var forced: RecordingLauncher = .{
+        .outcome = .timed_out,
+        .terminated_process_group = true,
+        .escalated_to_kill = true,
+        .issued_descendant_sweep = true,
+    };
+    var terminated = try run(testing.allocator, testRequest(), .{ .launcher = forced.interface() });
+    defer terminated.deinit();
+    try testing.expectEqualStrings("timed_out", @tagName(terminated.outcome));
+    try testing.expect(terminated.terminated_process_group);
+    try testing.expect(terminated.escalated_to_kill);
+    try testing.expect(terminated.issued_descendant_sweep);
+
+    // The `detach` policy never signals the group, so no sweep is issued.
+    var detached_launcher: RecordingLauncher = .{ .outcome = .{ .exited = 0 } };
+    var detached_request = testRequest();
+    detached_request.policy.descendants = .detach;
+    var detached = try run(testing.allocator, detached_request, .{
+        .launcher = detached_launcher.interface(),
+    });
+    defer detached.deinit();
+    try testing.expectEqual(DescendantPolicy.detach, detached_launcher.invocation.?.descendants);
+    try testing.expect(!detached.issued_descendant_sweep);
+}
+
 test "maintainer_script.test.launcher failures become typed setup evidence" {
     var failing: RecordingLauncher = .{ .failure = error.AccessDenied };
     var report = try run(testing.allocator, testRequest(), .{ .launcher = failing.interface() });
@@ -1883,7 +1953,34 @@ test "maintainer_script.test.system launcher captures bounded output from a sani
     try testing.expectEqualSlices(u8, &hashBytes(report.stdout), &report.evidence.stdout_sha256);
     try testing.expect(!report.terminated_process_group);
     try testing.expect(!report.escalated_to_kill);
-    try testing.expect(report.swept_descendants);
+    // The script exited on its own, so nothing was terminated. The sweep is
+    // still issued under the `terminate` policy, and the flag reports only
+    // that: it never asserts that a descendant survived.
+    try testing.expect(report.issued_descendant_sweep);
+}
+
+test "maintainer_script.test.system launcher issues no sweep under the detach policy" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\exit 0
+        \\
+    );
+    defer script.deinit(testing.allocator);
+
+    var request = script.request(&.{"configure"});
+    request.policy.descendants = .detach;
+
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try testing.expect(!report.terminated_process_group);
+    try testing.expect(!report.escalated_to_kill);
+    try testing.expect(!report.issued_descendant_sweep);
 }
 
 test "maintainer_script.test.system launcher reports a script terminated by a signal" {
@@ -1935,6 +2032,7 @@ test "maintainer_script.test.system launcher terminates the script process tree 
 
     try testing.expectEqualStrings("timed_out", @tagName(report.outcome));
     try testing.expect(report.terminated_process_group);
+    try testing.expect(report.issued_descendant_sweep);
 
     const recorded = try directory.dir.readFileAlloc(
         testing.io,
@@ -2131,7 +2229,7 @@ test "maintainer_script.test.finalization never signals a group after reaping it
     try expectTrace(&.{ .kill_group, .reap }, &exited_cleanly);
     try testing.expect(!clean.terminated);
     try testing.expect(!clean.escalated);
-    try testing.expect(clean.swept);
+    try testing.expect(clean.issued_sweep);
     try testing.expectEqual(true, exited_cleanly.blocking_reap.?);
 
     var detached: RecordingGroupOperations = .{ .status = 0 };
@@ -2142,14 +2240,14 @@ test "maintainer_script.test.finalization never signals a group after reaping it
         .poll_ms = plan.poll_ms,
     });
     try expectTrace(&.{.reap}, &detached);
-    try testing.expect(!kept.swept);
+    try testing.expect(!kept.issued_sweep);
 
     var polite: RecordingGroupOperations = .{ .running_probes = 2 };
     const terminated = finalizeGroup(&polite, plan);
     try expectTrace(&.{ .term_group, .kill_group, .reap }, &polite);
     try testing.expect(terminated.terminated);
     try testing.expect(!terminated.escalated);
-    try testing.expect(terminated.swept);
+    try testing.expect(terminated.issued_sweep);
 
     var stubborn: RecordingGroupOperations = .{ .running_probes = 1_000 };
     const escalated = finalizeGroup(&stubborn, plan);

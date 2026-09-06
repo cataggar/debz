@@ -12,6 +12,7 @@ import json
 import lzma
 import os
 import pathlib
+import re
 import struct
 import tarfile
 import tempfile
@@ -518,6 +519,20 @@ class ReleaseTests(unittest.TestCase):
                         )()
                     )
                 path.unlink()
+
+    def test_release_install_ships_every_document(self) -> None:
+        build = (ROOT / "build.zig").read_text()
+        match = re.search(
+            r"const docs = \[_\]\[\]const u8\{(.*?)\};", build, re.DOTALL
+        )
+        assert match
+        installed = sorted(re.findall(r'"([^"]+\.md)"', match.group(1)))
+        tracked = sorted(path.name for path in (ROOT / "doc").glob("*.md"))
+        # Every tracked document ships: a document that is linked but never
+        # installed would leave the released documentation set incomplete.
+        self.assertEqual(tracked, installed)
+        layout = (ROOT / "tools/test-release-install.sh").read_text()
+        self.assertIn("installed documents differ from doc/*.md", layout)
 
     @staticmethod
     def info(

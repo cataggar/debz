@@ -76,9 +76,11 @@ A spawned script runs with:
 - **Process-tree termination.** The child creates its own session and process
   group. Timeout, cancellation, and the output limit terminate it with
   `SIGTERM`, then escalate to `SIGKILL` after `limits.termination_grace_ms`.
-  `descendants = .terminate` signals and finally sweeps the whole process
-  group; `descendants = .detach` signals only the script itself and leaves
-  survivors running, preserving dpkg's daemon behavior.
+  `descendants = .terminate` signals the whole process group and always issues
+  one final group-wide `SIGKILL` sweep before the reap, so any descendant that
+  is still in the group is removed; `descendants = .detach` signals only the
+  script itself and leaves survivors running, preserving dpkg's daemon
+  behavior.
 - **Signal ordering.** Exit is observed with a non-destructive `waitid`
   (`WNOWAIT`) probe, so the leader stays an unreaped zombie and its pid — and
   therefore its process-group id — cannot be recycled while the runner is still
@@ -102,12 +104,17 @@ code 0.
 The report records the script identity, isolation, absolute in-root program
 path, complete argv, the exact environment, capture and descendant policy,
 bounded output, `terminated_process_group` (the still-running script had to be
-terminated), `escalated_to_kill`, `swept_descendants` (a group-wide `SIGKILL`
-sweep removed survivors under the `terminate` policy), and
-domain-separated length-prefixed SHA-256 digests of the script, argv,
+terminated), `escalated_to_kill`, `issued_descendant_sweep` (the final
+group-wide `SIGKILL` sweep was issued under the `terminate` policy, including
+after a clean exit), and domain-separated length-prefixed SHA-256 digests of the script, argv,
 environment, policy, invocation, stdout, stderr, and combined output. The
 invocation digest binds root, isolation, program, argv, environment, and limits
-into one value suitable for later transaction provenance.
+into one value suitable for later transaction provenance. Supervision flags are
+deliberately exact about what is observable: `issued_descendant_sweep` records
+that the sweep signal was delivered to the process group, never that a
+descendant existed, because a group-wide `kill` cannot distinguish an empty
+group from a killed survivor. Evidence digests cover the request and the
+output, so renaming or extending these flags does not change any digest.
 
 ## Injection seam and tests
 
@@ -124,7 +131,11 @@ streams, and — from a forked helper whose own fd 0, 1, and 2 are closed — th
 correct installation of the child's standard descriptors. Termination ordering
 is checked deterministically through a recording process-group seam that
 asserts the reap is the last operation and that the detach policy never signals
-descendants.
+descendants. Sweep evidence is tested on both seams: a clean exit under the
+`terminate` policy reports `issued_descendant_sweep` without reporting
+termination, an actually terminated tree reports both, the `detach` policy
+reports neither, and a rejected request reports neither because no process ever
+existed.
 
 The strongest alternate-root test this repository's infrastructure supports
 asserts the chroot boundary directly: unprivileged runners observe

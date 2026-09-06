@@ -38,13 +38,30 @@ opt-in and limited to `/usr/bin/sudo -n --` followed by the exact verified
 policy, architecture, package evidence, and final exact audit all match.
 
 Production parsing, verification, decompression and archive inspection are
-in-process and never invoke a shell. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb`
-are the only production child processes started directly by debz. These
-fixed-path host tools are trusted dependencies; debz supplies explicit argv
-and a replacement environment and bounds captured output and runtime. Debz
-never directly invokes a shell, apt, or another ambient package manager; dpkg
-may in turn run package maintainer scripts within the package-execution trust
-boundary.
+in-process and never invoke a shell. Debz starts child processes at exactly two
+audited boundaries. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb` remain the legacy
+transition boundary while dpkg still performs root mutation: these fixed-path
+host tools are trusted dependencies; debz supplies explicit argv and a
+replacement environment and bounds captured output and runtime. The native
+transaction engine adds the audited maintainer-script runner
+([Audited maintainer-script runner](maintainer-script-runner.md),
+`src/maintainer_script.zig`, the only production source permitted to call
+`fork`, `execve` or `chroot`, which `tools/security-audit.py` pins), which
+executes exactly one validated maintainer script per request: unsafe roots,
+script paths, names, identities, arguments, variables and limits are rejected
+before any process exists; the child enters the selected root with a
+chroot-equivalent setup and working directory `/`, a fixed allowlisted and
+sorted environment, `/dev/null` stdin, no shell command construction, bounded
+combined or separate output, an explicit timeout and injected cancellation, and
+its own session and process group that is terminated with SIGTERM/SIGKILL
+escalation, optionally swept group-wide, and reaped last. Debz never directly
+invokes a shell, apt, or another ambient package manager; dpkg and the native
+runner both run package maintainer scripts within the package-execution trust
+boundary. Residual risk: maintainer scripts are arbitrary package-supplied
+code, so their side effects inside the selected root cannot be generically
+rolled back, a `detach` descendant policy deliberately leaves survivors
+running, and process-group termination cannot reach descendants that already
+left the group.
 
 ## Security properties
 
@@ -90,7 +107,10 @@ boundary.
   serialized.
 - Repository-add CLI parsing is noninteractive: there are no prompts, stdin or
   TTY branches, consent flags, or apt subprocesses. The direct process boundary
-  remains fixed-environment dpkg/dpkg-deb execution.
+  remains fixed-environment dpkg/dpkg-deb execution plus the audited native
+  maintainer-script runner, which spawns only validated scripts with a fixed
+  allowlisted environment, `/dev/null` stdin, bounded output and runtime, and
+  process-group termination.
 
 Defaults are part of the public API and remain stable within a major version.
 Overrides may lower limits or raise them deliberately; callers remain
