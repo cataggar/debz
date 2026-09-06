@@ -1111,6 +1111,9 @@ const RootOperationGuard = struct {
                 .state = .mutation_pending,
                 .phase = .mutation,
             }) catch |err| return mapRootOperationError(operation, err),
+            // The bridge an earlier run published stays exactly as it is. It
+            // is inherited rather than republished, so this run's own executor
+            // evidence can never discharge it as never having started.
             .mutation_pending => {},
             // An adopted attempt already carries mutation evidence. Recovery
             // resumes it through the durable recovery boundary instead of
@@ -1134,6 +1137,12 @@ const RootOperationGuard = struct {
     /// the executor records a command only after it completed, so a first
     /// command that timed out, hit the deadline, or failed to spawn reports
     /// zero commands while `dpkg` may already have mutated the root.
+    ///
+    /// This run's evidence only ever speaks for this run's hand-over, so the
+    /// attempt itself decides which witness may be applied: a bridge inherited
+    /// from an earlier run is resolved as observed mutation no matter what
+    /// this executor reports, and the applied witness — never the reported one
+    /// — decides whether the attempt is durably abandoned.
     fn observe(
         self: *RootOperationGuard,
         allocator: std.mem.Allocator,
@@ -1145,11 +1154,12 @@ const RootOperationGuard = struct {
         // Already finished; `finish` still owes its provenance.
         if (attempt.record().state == .completed) return null;
         if (attempt.record().state == .mutation_pending) {
-            attempt.witness(allocator, observed) catch |err|
+            const applied = attempt.witness(allocator, observed) catch |err|
                 return mapRootOperationError(operation, err);
-            // Nothing ran, so the attempt is durably abandoned before any
-            // mutation and needs no further boundary.
-            if (observed == .proved_not_started) return null;
+            // Nothing ran under a bridge this invocation published, so the
+            // attempt is durably abandoned before any mutation and needs no
+            // further boundary.
+            if (applied == .proved_not_started) return null;
         }
         if (!attempt.record().mutation_started) return null;
         switch (completion) {

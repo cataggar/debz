@@ -187,6 +187,30 @@ unrelated leftover that proves nothing was touched never locks a root out.
 Adoption keeps the original attempt identifier and generation sequence, so the
 compare-and-set still rejects a stale writer that resumed from an older view.
 
+### Settled records are never adopted
+
+A record that is `completed` with its provenance obligation discharged —
+`clearable` — is durable evidence that an operation is *over*. No intent
+adopts it, not even a rerun of exactly the same request and not an explicit
+recovery. Continuing under it would run a second mutation with no reserved
+attempt, no executor bridge, and a terminal outcome already published: a crash
+mid-rerun would leave durable evidence claiming the opposite of what happened,
+and `clear` would remove the record on the way out.
+
+`acquire` therefore settles it before any adoption decision, with the same rule
+every intent already uses for a resolved leftover:
+
+- `existing = reclaim_resolved` reclaims it into a fresh attempt — a new
+  attempt identifier, `generation + 1`, `reserved` (or `preflight` for a
+  recovery), outcome and provenance pending, no mutation evidence;
+- `existing = fail` reports it as `error.ResolvedAttemptPresent` rather than
+  silently continuing under it.
+
+A `completed` record that still owes its provenance is *not* settled: it is
+adopted by a matching `same_operation` rerun, which publishes the owed
+provenance and clears it, and refused with `error.AttemptMismatch` when the
+rerun binds a different operation.
+
 ### The command-oriented executor bridge
 
 The current production executor drives `dpkg` commands, so the moment control
@@ -201,6 +225,39 @@ never touched. `mutation_pending` is the explicit bridge for exactly this:
   evidence that no command ran and completes the attempt as
   `abandoned_before_mutation`; `mutation_observed` moves to `mutating` and sets
   the sticky mutation flag.
+
+### A witness only speaks for its own hand-over
+
+`proved_not_started` is evidence about the hand-over the *observing* invocation
+performed. A rerun or a recovery can adopt a record that is already at
+`mutation_pending`, and that bridge belongs to an earlier run which handed
+control to `dpkg` and never came back. Nothing this run's executor reports can
+speak for it: this run's expired deadline, refused preflight, unavailable lock,
+or undecodable journal all report `not_started` with no commands, which is
+exactly the shape of a report that proves nothing ran.
+
+`Attempt` therefore tracks where its bridge came from, as process state rather
+than durable evidence — no record can carry across a crash the fact of who
+performed the hand-over:
+
+| `BridgeOrigin` | Set when | `proved_not_started` is |
+| --- | --- | --- |
+| `none` | the record carries no bridge | not applicable; `witness` refuses outside `mutation_pending` |
+| `published_here` | this invocation advanced into `mutation_pending` | applied as reported |
+| `inherited` | the adopted record already sat at `mutation_pending` | coerced to `mutation_observed` |
+
+The coercion lives in `Attempt.witness`, which returns the witness it actually
+applied, so an observation site that faithfully passes the witness its own
+executor justified still cannot discharge another run's hand-over. Both guards
+branch on the returned witness, never on the reported one. Re-publishing an
+inherited bridge does not make it this run's; only advancing into
+`mutation_pending` from another state does.
+
+The result is conservative in the safe direction: an inherited bridge resolves
+as observed mutation, the attempt keeps its mutation evidence, and the guard's
+failure path leaves it `recovery_required` with its provenance still owed. A
+bridge this invocation published itself is unaffected, so a transaction that
+really failed before any spawn still releases the root.
 
 ### Deriving the witness
 
@@ -229,6 +286,18 @@ is the one case that really proves nothing was handed over. Everything else is
 classified conservatively, which can only block a root that was not touched —
 never clear one that was. `transaction_executor.test.an unfinished first
 command reports started evidence without commands` pins that contract.
+
+A recovery report carries a transaction state only *after* the journal has been
+decoded, so `recoveryReportWitness` classifies two failures ahead of the state:
+
+| Recovery failure | Witness | Why |
+| --- | --- | --- |
+| `journal_io` | `mutation_observed` | the journal could not be read at all, so its state is unknown |
+| `journal_corrupt` | `mutation_observed` | a journal exists and is durable evidence a transaction reached this root |
+| `journal_missing` | from the state | no journal was ever found, which really is proof nothing started |
+
+Everything else keeps the state-based classification: a decoded journal has
+already published its own state into the report.
 
 When the executor returns no report at all — an error propagated out of the
 engine — the attempt simply stays at `mutation_pending`. It is not
@@ -270,7 +339,11 @@ Boundaries published for one product mutation:
 
 A failure after mutation stays at `recovery_required`. `debz recover` takes the
 attempt with `Intent.recovery`, which adopts existing evidence instead of
-blocking, and reserves a bridge record when a legacy root has none.
+blocking, and reserves a bridge record when a legacy root has none. A recovery
+that adopts a record already at `mutation_pending` inherits that bridge: its
+own report — a journal it could not find a state for, a lock it could not take,
+a deadline that expired — never discharges it, so the record stays
+`recovery_required` with its provenance owed.
 
 ### Repository bootstrap
 
@@ -300,15 +373,21 @@ at:
 | Adopted state | Before the executor | On success |
 | --- | --- | --- |
 | `reserved`, `preflight` | publish `mutation_pending` | `completed` as `abandoned_before_mutation` when nothing ran |
-| `mutation_pending` | keep the bridge | witness `mutation_observed`, then `verifying` and `completed` |
+| `mutation_pending` | keep the inherited bridge | witness `mutation_observed`, then `verifying` and `completed` |
 | `mutating`, `verifying` | `beginRecovery` walks the exact recovery edges | `verifying`, then `completed` as `succeeded` |
 | `recovery_required`, `recovering` | `beginRecovery` | `recovering`, then `completed` as `recovered` |
-| `completed` | nothing is owed but provenance | provenance published, then cleared |
+| `completed` owing provenance | nothing is owed but provenance | provenance published, then cleared |
+
+A `completed` record whose provenance is already published is settled instead
+of adopted: the rerun reserves its own attempt over it, so a crash during the
+rerun leaves evidence of the rerun rather than of the operation it replaced.
 
 Mutation evidence is never cleared to make a rerun possible: an unresolved
 attempt that belongs to a different descriptor, architecture, policy, request,
 or package operation is still refused, and the record it could not adopt is
-left exactly as it was published.
+left exactly as it was published. Neither is it cleared by a rerun that failed
+before its own first command: the bridge it adopted belongs to the run that
+handed control over, so it resolves as observed mutation.
 
 ## Deferred to later native-engine work
 

@@ -2014,6 +2014,9 @@ const RootOperationGuard = struct {
                 .state = .mutation_pending,
                 .phase = .mutation,
             }) catch |err| return mapRootOperationError(err),
+            // The bridge an earlier run published stays exactly as it is, so
+            // this run's own executor evidence can never discharge another
+            // run's hand-over as never having started.
             .mutation_pending => {},
             // An adopted attempt already carries mutation evidence. Resuming
             // it walks the exact recovery edges instead of moving backwards
@@ -2035,7 +2038,11 @@ const RootOperationGuard = struct {
     }
 
     /// Resolves the bridge from the executor's own transaction evidence. The
-    /// witness is derived by `root_operation`, never from a command count.
+    /// witness is derived by `root_operation`, never from a command count, and
+    /// the attempt itself decides which witness may be applied: evidence that
+    /// this run started nothing says nothing about a bridge an earlier run
+    /// published, so an inherited bridge resolves as observed mutation and
+    /// keeps the root blocked until it is recovered.
     fn observe(
         self: *RootOperationGuard,
         observed: root_operation.Witness,
@@ -2045,9 +2052,9 @@ const RootOperationGuard = struct {
         // Already finished; `finish` still owes its provenance.
         if (attempt.record().state == .completed) return null;
         if (attempt.record().state == .mutation_pending) {
-            attempt.witness(self.allocator, observed) catch |err|
+            const applied = attempt.witness(self.allocator, observed) catch |err|
                 return mapRootOperationError(err);
-            if (observed == .proved_not_started) return null;
+            if (applied == .proved_not_started) return null;
         }
         if (!attempt.record().mutation_started) return null;
         if (!succeeded) {
@@ -2079,7 +2086,7 @@ const RootOperationGuard = struct {
             // prove the root was untouched, so the conservative witness is
             // taken and the attempt is finished with its evidence intact.
             .mutation_pending => {
-                attempt.witness(self.allocator, .mutation_observed) catch |err|
+                _ = attempt.witness(self.allocator, .mutation_observed) catch |err|
                     return mapRootOperationError(err);
                 if (self.completeMutated(.succeeded)) |failure| return failure;
             },
@@ -5032,6 +5039,17 @@ const RepositoryTestExecutor = struct {
     /// verification fails after the executor already changed the root, without
     /// disturbing the target's apt configuration.
     half_configure_descriptor: bool = false,
+    /// Reports the exact shape of a failure before any spawn: no command
+    /// completed and the transaction state never left `not_started`. An
+    /// expired deadline, a refused preflight, a lock that could not be taken,
+    /// and a journal that could not be decoded all look like this.
+    no_start_failure: ?transaction_executor.FailureCode = null,
+    /// Refuses the transaction as needing explicit recovery without touching
+    /// the root, which is how the backend is driven into its recovery path.
+    recovery_transition_first: bool = false,
+    /// The same pre-spawn failure shape for the recovery path, where the
+    /// transaction state is published only once the journal has decoded.
+    no_start_recovery_failure: ?transaction_executor.FailureCode = null,
 
     fn interface(self: *RepositoryTestExecutor) Executor {
         return .{
@@ -5098,6 +5116,33 @@ const RepositoryTestExecutor = struct {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
         arena.* = .init(allocator);
+        // Nothing is installed and nothing is recorded: the report is
+        // indistinguishable from an untouched root through its command count.
+        if (self.no_start_failure) |code| return .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = plan_sha256,
+            .transaction_state = .not_started,
+            .root_identity = @splat(0x22),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = exact_lock.digest_sha256,
+            .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
+        };
+        if (self.recovery_transition_first) return .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = plan_sha256,
+            .transaction_state = .interrupted,
+            .root_identity = @splat(0x22),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = exact_lock.digest_sha256,
+            .failure = .{
+                .code = .invalid_recovery_transition,
+                .diagnostic = "injected recovery requirement",
+            },
+        };
         const interrupted = self.interrupt_first and self.calls == 1;
         const recovery_required = self.interrupt_first and self.calls > 1;
         if ((!interrupted or !self.interrupt_before_install) and !recovery_required) {
@@ -5163,6 +5208,24 @@ const RepositoryTestExecutor = struct {
         const exact_lock = request.exact_lock_v2 orelse
             return error.MissingExactLock;
         self.recovered_exact_lock = true;
+        if (self.no_start_recovery_failure) |code| {
+            const failed_arena = try allocator.create(std.heap.ArenaAllocator);
+            errdefer allocator.destroy(failed_arena);
+            failed_arena.* = .init(allocator);
+            // The journal never decoded, so the report carries the state it
+            // was initialized with rather than the journal's own.
+            return .{
+                .allocator = allocator,
+                .arena = failed_arena,
+                .state = .not_started,
+                .commands = &.{},
+                .plan_sha256 = transaction_executor.planDigest(request.plan.*),
+                .root_identity = @splat(0x22),
+                .policy_sha256 = transaction_executor.policyDigest(request.policy),
+                .lock_sha256 = exact_lock.digest_sha256,
+                .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
+            };
+        }
         try self.installDescriptor();
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
@@ -7828,6 +7891,261 @@ test "repository backend adopts a crashed attempt at every durable boundary" {
         try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
         // A record that already claimed the bootstrap was completed keeps its
         // outcome; every other boundary is finished by running the bootstrap.
+        try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+        try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// A rerun adopts the record its own interrupted run left behind, including one
+// left at the executor bridge. That run handed control to dpkg and never came
+// back, so this run's executor evidence says nothing about it: a deadline that
+// expired, a preflight that was refused, a lock that could not be taken, or a
+// journal that could not be decoded all report `not_started` with no commands.
+// Resolving the inherited bridge from that report discharged another run's
+// hand-over as never started and cleared the only evidence blocking the root.
+test "repository backend never discharges an inherited bridge with its own no-start report" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const Case = struct {
+        code: transaction_executor.FailureCode,
+        /// Whether the failure is reported by the executor's recovery path,
+        /// which is reached when the transaction refuses to run without one.
+        recovery: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .code = .process_timeout },
+        .{ .code = .invalid_root },
+        .{ .code = .lock_timeout },
+        .{ .code = .journal_corrupt },
+        // The recovery path reports the same shape, including the journal it
+        // never found a state for.
+        .{ .code = .journal_missing, .recovery = true },
+        .{ .code = .journal_corrupt, .recovery = true },
+        .{ .code = .lock_timeout, .recovery = true },
+    };
+    for (cases) |case| {
+        const code = case.code;
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        errdefer std.debug.print(
+            "failure code: {t} recovery: {}\n",
+            .{ code, case.recovery },
+        );
+
+        // The interrupted run of exactly this request stopped at the
+        // hand-over, with no witness ever published.
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var stranded = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7d),
+            .generation = 4,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = .mutation_pending,
+            .phase = .mutation,
+            .step = 3,
+            .mutation_started = false,
+            .outcome = .pending,
+            .provenance = .pending,
+            .request_sha256 = repositoryRequestDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer stranded.deinit();
+        try store.writeAtomic(std.testing.allocator, stranded.record);
+        root_dir.close(std.testing.io);
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            .no_start_failure = if (case.recovery) null else code,
+            .recovery_transition_first = case.recovery,
+            .no_start_recovery_failure = if (case.recovery) code else null,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var result = try api.execute(std.testing.allocator, request, backend.interface());
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        try std.testing.expectEqual(
+            @as(usize, if (case.recovery) 1 else 0),
+            executor.recover_calls,
+        );
+
+        // The inherited hand-over is still unresolved: the record blocks, it
+        // carries mutation evidence, and its provenance obligation was not
+        // waived by completing it as abandoned.
+        var observed = (try readRootAttempt(directory.dir)).?;
+        defer observed.deinit();
+        try std.testing.expectEqual(
+            root_operation.State.recovery_required,
+            observed.record.state,
+        );
+        try std.testing.expect(observed.record.state.blocksMutation());
+        try std.testing.expect(observed.record.mutation_started);
+        try std.testing.expectEqual(
+            root_operation.ProvenanceState.pending,
+            observed.record.provenance,
+        );
+        try std.testing.expectEqual(root_operation.Outcome.pending, observed.record.outcome);
+        try std.testing.expect(!observed.record.clearable());
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// The conservative rule only applies to a hand-over this run did not perform.
+// A bridge this very run published, whose executor really did report that
+// nothing started, still releases the root instead of blocking it.
+test "repository backend still clears a bridge it published itself when nothing started" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+        .no_start_failure = .lock_timeout,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+    try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+}
+
+// A record that is completed with its provenance discharged is evidence that
+// an operation finished. Adopting it — matching request or not — let a rerun
+// execute under a record that already said the mutation was over, so a crash
+// mid-rerun left durable evidence claiming the opposite. The rerun therefore
+// reserves its own attempt instead.
+test "repository backend reserves a new attempt instead of adopting a settled record" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    for ([_]bool{ true, false }) |same_request| {
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        errdefer std.debug.print("same request: {}\n", .{same_request});
+
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var settled = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7e),
+            .generation = 9,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = .completed,
+            .phase = .provenance,
+            .step = 8,
+            .mutation_started = true,
+            .outcome = .succeeded,
+            .provenance = .published,
+            .provenance_sha256 = @splat(0xcd),
+            .request_sha256 = if (same_request)
+                repositoryRequestDigest(request)
+            else
+                @splat(0x14),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer settled.deinit();
+        try std.testing.expect(settled.record.clearable());
+        try store.writeAtomic(std.testing.allocator, settled.record);
+        root_dir.close(std.testing.io);
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            // Crash right after the executor mutated the root, before the
+            // rerun could publish its own provenance.
+            .collide_after_install = provenance_name,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var interrupted = try api.execute(std.testing.allocator, request, backend.interface());
+        try std.testing.expect(interrupted.exit_status != .success);
+        // The rerun really executed rather than resting on settled evidence.
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        interrupted.deinit();
+
+        // A fresh attempt: a new identifier, a strictly higher generation, and
+        // durable evidence of the rerun's own mutation.
+        var reserved = (try readRootAttempt(directory.dir)).?;
+        defer reserved.deinit();
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &settled.record.attempt_id,
+            &reserved.record.attempt_id,
+        ));
+        try std.testing.expect(reserved.record.generation > settled.record.generation);
+        try std.testing.expect(reserved.record.mutation_started);
+        try std.testing.expect(
+            reserved.record.state.blocksMutation() or
+                reserved.record.provenance == .pending,
+        );
+        try std.testing.expect(!reserved.record.clearable());
+        // No package transaction may start while the rerun is unresolved.
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        // Clearing the injection lets the same rerun finish and discharge it.
+        executor.collide_after_install = null;
+        var operation = try executor.openOperationDirectory();
+        try operation.deleteTree(std.testing.io, provenance_name);
+        operation.close(std.testing.io);
+        var resumed = try api.execute(std.testing.allocator, request, backend.interface());
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
         try std.testing.expect((try readRootAttempt(directory.dir)) == null);
         try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
     }

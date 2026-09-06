@@ -15,6 +15,13 @@
 //! leaves either proof that nothing was mutated (safely abandoned) or a typed
 //! recovery requirement that blocks the next mutation until it is resolved.
 //!
+//! Evidence is only ever read as evidence about the run that produced it. A
+//! record that already sits at the executor bridge was handed over by an
+//! earlier run, so a later run may adopt it but can never prove what that
+//! hand-over did, and a record whose provenance is already published describes
+//! an operation that is over, so it is reclaimed into a fresh attempt rather
+//! than continued.
+//!
 //! Advancing is monotonic and compare-and-set: a writer must present the
 //! attempt identifier, generation, and digest it last published, and the
 //! generation and step must strictly increase. A stale writer that resumed
@@ -1022,6 +1029,39 @@ pub const Transition = struct {
 /// rather than from a command count, which is never proof on its own.
 pub const Witness = enum { proved_not_started, mutation_observed };
 
+/// Where the executor bridge in the record an attempt owns came from.
+///
+/// This is deliberately not part of the durable record: it is a fact about the
+/// hand-over *this* process performed, and no record can carry it across a
+/// crash. A `proved_not_started` witness is evidence about that hand-over
+/// only, so it may discharge a bridge this invocation published and nothing
+/// else.
+pub const BridgeOrigin = enum {
+    /// The record carries no executor bridge.
+    none,
+    /// This invocation published the bridge, so its executor's own report
+    /// describes exactly the hand-over the record refers to.
+    published_here,
+    /// The bridge was already durable when this attempt adopted the record.
+    /// Some earlier run handed control to an engine that may have mutated the
+    /// root, and nothing this run observes can speak for what that engine did.
+    inherited,
+};
+
+/// The witness that may actually be acted on for a bridge of this origin. A
+/// no-start report is conservatively downgraded to observed mutation for a
+/// bridge this invocation did not publish, which can only keep a root blocked
+/// — never clear one that was mutated.
+pub fn witnessForBridge(bridge: BridgeOrigin, observed: Witness) Witness {
+    return switch (observed) {
+        .mutation_observed => .mutation_observed,
+        .proved_not_started => switch (bridge) {
+            .published_here => .proved_not_started,
+            .none, .inherited => .mutation_observed,
+        },
+    };
+}
+
 /// Conservative classification of the command-oriented executor's own
 /// evidence.
 ///
@@ -1057,7 +1097,18 @@ pub fn reportWitness(report: transaction_executor.Report) Witness {
 /// The witness a recovery report justifies. A recovery that decoded a journal
 /// at all has durable evidence that an earlier transaction reached the root,
 /// so only a recovery that never found one can be proven not to have started.
+///
+/// A recovery that could not read the journal, or read it and could not decode
+/// it, never learned that transaction's state at all: its report still says
+/// `not_started` because the decoded state was never published, not because
+/// nothing ran. Those two failures are therefore classified as observed
+/// mutation, so the evidence recovery exists to resolve is never discharged by
+/// the failure to read it.
 pub fn recoveryReportWitness(report: transaction_executor.RecoveryReport) Witness {
+    if (report.failure) |failure| switch (failure.code) {
+        .journal_io, .journal_corrupt => return .mutation_observed,
+        else => {},
+    };
     return observedMutation(report.state, report.commands.len);
 }
 
@@ -1146,6 +1197,25 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
+        // A durably settled record — completed with its provenance obligation
+        // discharged — describes an operation that is over. No intent may
+        // adopt it: continuing under a record that already says the mutation
+        // finished would run a second mutation with no reserved attempt, no
+        // executor bridge, and a terminal outcome that a crash would leave
+        // behind as proof the rerun never happened. Settling it here, before
+        // any adoption, keeps one rule for every intent: reclaim it into a
+        // fresh attempt, or report it, exactly as the plain mutation rules do.
+        var reclaimed: ?u64 = null;
+        if (prior) |*value| {
+            if (value.record.clearable()) {
+                if (request.existing == .fail) return error.ResolvedAttemptPresent;
+                reclaimed = std.math.add(u64, value.record.generation, 1) catch
+                    return error.InvalidGeneration;
+                value.deinit();
+                prior = null;
+            }
+        }
+
         if (request.intent == .recovery) {
             if (prior) |*value| {
                 const adopted = value.*;
@@ -1157,13 +1227,14 @@ pub const Coordinator = struct {
                     .entered = .initEmpty(),
                     .highest = .root_operation,
                     .adopted = true,
+                    .bridge = adoptedBridge(adopted.record.state),
                 };
             }
             // A recovery that finds no evidence still reserves the root, but
             // it starts pre-mutation. The executor bridge is published only
             // when control is actually handed over, so an early return on a
             // healthy root cannot strand it.
-            const created = try self.publishNew(allocator, request, 1, .{
+            const created = try self.publishNew(allocator, request, reclaimed orelse 1, .{
                 .state = .preflight,
                 .phase = .preflight,
             });
@@ -1174,6 +1245,7 @@ pub const Coordinator = struct {
                 .entered = .initEmpty(),
                 .highest = .root_operation,
                 .adopted = false,
+                .bridge = .none,
             };
         }
 
@@ -1194,6 +1266,7 @@ pub const Coordinator = struct {
                         .entered = .initEmpty(),
                         .highest = .root_operation,
                         .adopted = true,
+                        .bridge = adoptedBridge(adopted.record.state),
                     };
                 }
                 // A record that still carries mutation evidence belongs to
@@ -1210,7 +1283,7 @@ pub const Coordinator = struct {
             }
         }
 
-        var generation: u64 = 1;
+        var generation: u64 = reclaimed orelse 1;
         if (prior) |*value| {
             const record = value.record;
             if (record.state.blocksMutation()) return error.RecoveryRequired;
@@ -1236,6 +1309,7 @@ pub const Coordinator = struct {
             .entered = .initEmpty(),
             .highest = .root_operation,
             .adopted = false,
+            .bridge = .none,
         };
     }
 
@@ -1291,6 +1365,10 @@ pub const Attempt = struct {
     /// True when this attempt continued a previous durable record instead of
     /// reserving a new one.
     adopted: bool,
+    /// Where the executor bridge in the owned record came from. It is process
+    /// state, never durable evidence: only this invocation can know whether it
+    /// performed the hand-over the record refers to.
+    bridge: BridgeOrigin,
 
     pub fn record(self: *const Attempt) Record {
         return self.owned.record;
@@ -1298,6 +1376,18 @@ pub const Attempt = struct {
 
     pub fn attemptId(self: *const Attempt) [32]u8 {
         return self.owned.record.attempt_id;
+    }
+
+    pub fn bridgeOrigin(self: *const Attempt) BridgeOrigin {
+        return self.bridge;
+    }
+
+    /// The witness this attempt may act on for the evidence it was given. A
+    /// report that proves *this* run started nothing says nothing about a
+    /// bridge an earlier run published, so no-start evidence against an
+    /// inherited bridge is downgraded to observed mutation.
+    pub fn effectiveWitness(self: *const Attempt, observed: Witness) Witness {
+        return witnessForBridge(self.bridge, observed);
     }
 
     /// True while the root mutation lock is still owned. A lost lock must
@@ -1387,6 +1477,11 @@ pub const Attempt = struct {
         });
         errdefer next.deinit();
         try self.compareAndSet(allocator, next.record);
+        // The hand-over the bridge stands for is this invocation's exactly
+        // when this invocation published it. Re-publishing a bridge that was
+        // already durable never makes another run's hand-over ours.
+        if (transition.state == .mutation_pending and current.state != .mutation_pending)
+            self.bridge = .published_here;
         self.owned.deinit();
         self.owned = next;
     }
@@ -1401,14 +1496,23 @@ pub const Attempt = struct {
         try self.advance(allocator, .{ .state = .mutating, .phase = phase });
     }
 
-    /// Resolves the command-oriented executor bridge from explicit evidence.
+    /// Resolves the command-oriented executor bridge from explicit evidence
+    /// and returns the witness that was actually applied.
+    ///
+    /// The caller's evidence describes what its own executor did, so it can
+    /// only discharge a bridge this invocation published. A no-start report
+    /// against a bridge inherited from an earlier run is coerced to
+    /// `mutation_observed` here — not at the call site — so no observation
+    /// path can discharge another run's hand-over by passing the witness its
+    /// own executor justified.
     pub fn witness(
         self: *Attempt,
         allocator: std.mem.Allocator,
         observed: Witness,
-    ) Error!void {
+    ) Error!Witness {
         if (self.owned.record.state != .mutation_pending) return error.InvalidTransition;
-        switch (observed) {
+        const applied = self.effectiveWitness(observed);
+        switch (applied) {
             .mutation_observed => try self.advance(allocator, .{
                 .state = .mutating,
                 .phase = .mutation,
@@ -1420,6 +1524,7 @@ pub const Attempt = struct {
                 .provenance = .not_required,
             }),
         }
+        return applied;
     }
 
     /// Durably requires recovery. A second mutation cannot start until the
@@ -1578,6 +1683,13 @@ fn startsMutation(state: State) bool {
         .mutating, .verifying, .recovery_required, .recovering => true,
         .reserved, .preflight, .mutation_pending, .completed => false,
     };
+}
+
+/// The bridge origin an adopted record implies. A record that already sits at
+/// the executor bridge was handed over by some earlier run, so this one
+/// inherits it and can never prove what that hand-over did.
+fn adoptedBridge(state: State) BridgeOrigin {
+    return if (state == .mutation_pending) .inherited else .none;
 }
 
 /// A crash between publishing a boundary and continuing leaves the caller
@@ -2331,6 +2443,7 @@ test "root_operation.test.the legacy bridge resolves pending mutation from an ex
         var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
 
         var attempt = try coordinator.acquire(testing.allocator, packageRequest());
+        try testing.expectEqual(BridgeOrigin.none, attempt.bridgeOrigin());
         try attempt.advance(testing.allocator, .{
             .state = .mutation_pending,
             .phase = .mutation,
@@ -2338,7 +2451,11 @@ test "root_operation.test.the legacy bridge resolves pending mutation from an ex
         // A pending bridge is never treated as safely abandoned.
         try testing.expect(attempt.record().state.blocksMutation());
         try testing.expect(!attempt.record().mutation_started);
-        try attempt.witness(testing.allocator, observed);
+        // This invocation performed the hand-over, so its own executor's
+        // evidence is the evidence about it and is applied as reported.
+        try testing.expectEqual(BridgeOrigin.published_here, attempt.bridgeOrigin());
+        try testing.expectEqual(observed, attempt.effectiveWitness(observed));
+        try testing.expectEqual(observed, try attempt.witness(testing.allocator, observed));
         switch (observed) {
             .proved_not_started => {
                 try testing.expectEqual(State.completed, attempt.record().state);
@@ -2359,6 +2476,249 @@ test "root_operation.test.the legacy bridge resolves pending mutation from an ex
             },
         }
         attempt.release();
+    }
+}
+
+test "root_operation.test.an inherited bridge is never discharged by this run's evidence" {
+    // A rerun of the same operation, and an explicit recovery, may adopt a
+    // record an earlier run left at the executor bridge. That run handed
+    // control to an engine that may already have mutated the root and never
+    // came back, so nothing this run's executor reports is evidence about it.
+    // Before the bridge's origin was tracked, this run's own pre-spawn failure
+    // — an expired deadline, a refused preflight, a lock it could not take, a
+    // journal it could not decode — reported `not_started` with no commands,
+    // discharged the inherited bridge as proved-not-started, and cleared the
+    // only record that was blocking the root.
+    for ([_]Intent{ .same_operation, .recovery }) |intent| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var locks: TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+        var stranded = try coordinator.acquire(testing.allocator, repositoryRequest());
+        try stranded.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+        try stranded.advance(testing.allocator, .{
+            .state = .mutation_pending,
+            .phase = .mutation,
+        });
+        // Power loss between the hand-over and any witness.
+        stranded.release();
+
+        var request = repositoryRequest();
+        request.intent = intent;
+        request.existing = .reclaim_resolved;
+        var resumed = try coordinator.acquire(testing.allocator, request);
+        try testing.expect(resumed.adopted);
+        try testing.expectEqual(State.mutation_pending, resumed.record().state);
+        try testing.expectEqual(BridgeOrigin.inherited, resumed.bridgeOrigin());
+        try testing.expectEqual(
+            Witness.mutation_observed,
+            resumed.effectiveWitness(.proved_not_started),
+        );
+
+        // The coercion lives in the attempt, so an observation site that
+        // faithfully passes the witness its own executor justified still
+        // cannot discharge another run's hand-over.
+        try testing.expectEqual(
+            Witness.mutation_observed,
+            try resumed.witness(testing.allocator, .proved_not_started),
+        );
+        try testing.expectEqual(State.mutating, resumed.record().state);
+        try testing.expect(resumed.record().mutation_started);
+        try testing.expect(!resumed.record().clearable());
+        try testing.expectError(
+            error.MutationEvidenceRequired,
+            resumed.abandonIfPreMutation(testing.allocator),
+        );
+        try testing.expectError(error.InvalidTransition, resumed.clear());
+        try resumed.requireRecovery(testing.allocator, .mutation);
+        resumed.release();
+
+        // The record still blocks the root and still owes its provenance:
+        // nothing about the inherited hand-over was waived.
+        var observed = (try coordinator.inspect(testing.allocator)).?;
+        defer observed.deinit();
+        try testing.expectEqual(State.recovery_required, observed.record.state);
+        try testing.expect(observed.record.state.blocksMutation());
+        try testing.expect(observed.record.mutation_started);
+        try testing.expectEqual(ProvenanceState.pending, observed.record.provenance);
+        try testing.expectEqual(Outcome.pending, observed.record.outcome);
+        try testing.expect(!observed.record.clearable());
+        try testing.expectError(
+            error.RecoveryRequired,
+            coordinator.acquire(testing.allocator, packageRequest()),
+        );
+    }
+}
+
+test "root_operation.test.a bridge published by this run still clears on proven no-start" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    // The earlier run stopped before the hand-over, which is durable proof
+    // that it mutated nothing.
+    var interrupted = try coordinator.acquire(testing.allocator, repositoryRequest());
+    try interrupted.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+    interrupted.release();
+
+    var request = repositoryRequest();
+    request.intent = .same_operation;
+    request.existing = .reclaim_resolved;
+    var resumed = try coordinator.acquire(testing.allocator, request);
+    try testing.expect(resumed.adopted);
+    try testing.expectEqual(BridgeOrigin.none, resumed.bridgeOrigin());
+
+    // This run performs the hand-over itself, so this run's executor evidence
+    // really is evidence about it and the root is released rather than blocked.
+    try resumed.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    try testing.expectEqual(BridgeOrigin.published_here, resumed.bridgeOrigin());
+    try testing.expectEqual(
+        Witness.proved_not_started,
+        try resumed.witness(testing.allocator, .proved_not_started),
+    );
+    try testing.expectEqual(Outcome.abandoned_before_mutation, resumed.record().outcome);
+    try testing.expectEqual(ProvenanceState.not_required, resumed.record().provenance);
+    try resumed.clear();
+    resumed.release();
+    try testing.expect((try coordinator.inspect(testing.allocator)) == null);
+}
+
+test "root_operation.test.a settled record is reclaimed as a new attempt, never adopted" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    // A bootstrap that ran to the end and crashed between publishing its
+    // provenance and clearing the intent. The record is durable evidence that
+    // the operation is over.
+    var first = try coordinator.acquire(testing.allocator, repositoryRequest());
+    try first.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+    try first.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    _ = try first.witness(testing.allocator, .mutation_observed);
+    try first.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+    try first.complete(testing.allocator, .succeeded);
+    try first.publishProvenance(testing.allocator, @splat(0xab));
+    const settled = first.record();
+    try testing.expect(settled.clearable());
+    first.release();
+
+    // Adopting it would let the rerun mutate the root under a record that
+    // already says the mutation finished, so the rerun reserves its own
+    // attempt instead.
+    var request = repositoryRequest();
+    request.intent = .same_operation;
+    request.existing = .reclaim_resolved;
+    request.attempt_id = @splat(0x6b);
+    var rerun = try coordinator.acquire(testing.allocator, request);
+    try testing.expect(!rerun.adopted);
+    try testing.expectEqual(State.reserved, rerun.record().state);
+    try testing.expectEqual(Phase.reserved, rerun.record().phase);
+    try testing.expectEqual(BridgeOrigin.none, rerun.bridgeOrigin());
+    try testing.expectEqual(Outcome.pending, rerun.record().outcome);
+    try testing.expectEqual(ProvenanceState.pending, rerun.record().provenance);
+    try testing.expect(!rerun.record().mutation_started);
+    // A fresh identifier and a strictly higher generation, so the settled
+    // attempt's evidence can never be confused with the rerun's and a stale
+    // writer still loses the compare-and-set.
+    try testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x6b)), &rerun.attemptId());
+    try testing.expect(!std.mem.eql(u8, &settled.attempt_id, &rerun.attemptId()));
+    try testing.expectEqual(settled.generation + 1, rerun.record().generation);
+
+    // While the rerun is active nothing else may mutate this root.
+    var alias_dir = try tmp.dir.openDir(testing.io, ".", .{ .iterate = true });
+    defer alias_dir.close(testing.io);
+    var other_coordinator = try Coordinator.open(
+        testing.io,
+        .init(testing.io, alias_dir),
+        test_root,
+        locks.interface(),
+    );
+    other_coordinator.now_unix = 1_700_000_000;
+    try testing.expectError(
+        error.LockTimeout,
+        other_coordinator.acquire(testing.allocator, packageRequest()),
+    );
+
+    // Crash after the fresh reserve: the rerun's own record is what the next
+    // package mutation reports, rather than the settled one it replaced.
+    rerun.release();
+    try testing.expectError(
+        error.OperationInProgress,
+        coordinator.acquire(testing.allocator, packageRequest()),
+    );
+    var observed = (try coordinator.inspect(testing.allocator)).?;
+    defer observed.deinit();
+    try testing.expectEqual(State.reserved, observed.record.state);
+    try testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x6b)), &observed.record.attempt_id);
+}
+
+test "root_operation.test.settled evidence stays reportable for every intent" {
+    // Whether the settled record binds this very operation or an unrelated
+    // one, it is never adopted. `reclaim_resolved` takes the root over with a
+    // new attempt; `fail` reports it instead of silently continuing under it.
+    const operations = [_]Operation{
+        .{ .repository_bootstrap = .add },
+        .{ .package_transaction = .install },
+    };
+    for (operations) |settled_operation| {
+        for ([_]Intent{ .mutation, .same_operation, .recovery }) |intent| {
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            var locks: TestLockBackend = .{ .allocator = testing.allocator };
+            defer locks.deinit();
+            var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+            var input = testInput();
+            input.operation = settled_operation;
+            input.generation = 7;
+            input.state = .completed;
+            input.phase = .provenance;
+            input.step = 5;
+            input.mutation_started = true;
+            input.outcome = .succeeded;
+            input.provenance = .published;
+            input.provenance_sha256 = @splat(0xcd);
+            var staged = try create(testing.allocator, input);
+            defer staged.deinit();
+            try testing.expect(staged.record.clearable());
+            try coordinator.store().writeAtomic(testing.allocator, staged.record);
+
+            var reported = repositoryRequest();
+            reported.intent = intent;
+            try testing.expectError(
+                error.ResolvedAttemptPresent,
+                coordinator.acquire(testing.allocator, reported),
+            );
+
+            var request = repositoryRequest();
+            request.intent = intent;
+            request.existing = .reclaim_resolved;
+            request.attempt_id = @splat(0x6c);
+            var reclaimed = try coordinator.acquire(testing.allocator, request);
+            defer reclaimed.release();
+            try testing.expect(!reclaimed.adopted);
+            try testing.expectEqual(BridgeOrigin.none, reclaimed.bridgeOrigin());
+            // A recovery still starts at its own pre-mutation boundary; every
+            // other intent reserves.
+            try testing.expectEqual(
+                @as(State, if (intent == .recovery) .preflight else .reserved),
+                reclaimed.record().state,
+            );
+            try testing.expectEqual(@as(u64, 8), reclaimed.record().generation);
+            try testing.expectEqualSlices(
+                u8,
+                &@as([32]u8, @splat(0x6c)),
+                &reclaimed.attemptId(),
+            );
+            try testing.expectEqual(Outcome.pending, reclaimed.record().outcome);
+            try testing.expect(!reclaimed.record().mutation_started);
+        }
     }
 }
 
@@ -2383,7 +2743,10 @@ test "root_operation.test.recovery reserves a bridge record when no evidence exi
         error.MutationEvidenceRequired,
         attempt.complete(testing.allocator, .abandoned_before_mutation),
     );
-    try attempt.witness(testing.allocator, .proved_not_started);
+    try testing.expectEqual(
+        Witness.proved_not_started,
+        try attempt.witness(testing.allocator, .proved_not_started),
+    );
     try attempt.clear();
     try testing.expect((try coordinator.inspect(testing.allocator)) == null);
 }
@@ -2443,6 +2806,48 @@ test "root_operation.test.the witness never trusts a command count alone" {
     }
 }
 
+test "root_operation.test.a recovery that cannot read its journal never proves no start" {
+    // The recovery report only carries a transaction state once the journal
+    // has been decoded. A journal that cannot be loaded, or that loads and
+    // cannot be decoded, therefore reports `not_started` with no commands
+    // while a durable journal — the very evidence recovery exists to resolve —
+    // says an earlier transaction already reached this root. Only a recovery
+    // that found no journal at all really proves that nothing started.
+    const cases = [_]struct {
+        code: transaction_executor.FailureCode,
+        expected: Witness,
+    }{
+        .{ .code = .journal_io, .expected = .mutation_observed },
+        .{ .code = .journal_corrupt, .expected = .mutation_observed },
+        .{ .code = .journal_missing, .expected = .proved_not_started },
+        .{ .code = .lock_timeout, .expected = .proved_not_started },
+        .{ .code = .invalid_root, .expected = .proved_not_started },
+    };
+    for (cases) |case| {
+        const arena = try testing.allocator.create(std.heap.ArenaAllocator);
+        arena.* = .init(testing.allocator);
+        var report: transaction_executor.RecoveryReport = .{
+            .allocator = testing.allocator,
+            .arena = arena,
+            .state = .not_started,
+            .commands = &.{},
+            .plan_sha256 = @splat(0),
+            .root_identity = @splat(0),
+            .policy_sha256 = @splat(0),
+            .lock_sha256 = null,
+            .failure = .{ .code = case.code, .diagnostic = "injected" },
+        };
+        defer report.deinit();
+        try testing.expectEqual(case.expected, recoveryReportWitness(report));
+        // Whatever the failure code says, none of it may discharge a bridge
+        // this run did not publish.
+        try testing.expectEqual(
+            Witness.mutation_observed,
+            witnessForBridge(.inherited, recoveryReportWitness(report)),
+        );
+    }
+}
+
 test "root_operation.test.an unwitnessed hand-over is never cleared as abandoned" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2485,7 +2890,7 @@ test "root_operation.test.only the same operation may adopt an unresolved attemp
     var first = try coordinator.acquire(testing.allocator, repositoryRequest());
     try first.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
     try first.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
-    try first.witness(testing.allocator, .mutation_observed);
+    _ = try first.witness(testing.allocator, .mutation_observed);
     try first.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
     const stranded = first.record();
     first.release();
@@ -2619,7 +3024,7 @@ test "root_operation.test.a stale same-operation writer cannot overwrite newer e
 
     // The rerun adopts the record and moves it forward.
     var second = try coordinator.acquire(testing.allocator, request);
-    try second.witness(testing.allocator, .mutation_observed);
+    _ = try second.witness(testing.allocator, .mutation_observed);
     try second.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
     second.release();
 

@@ -112,7 +112,11 @@ that must decide whether the root may have been mutated therefore reads both:
 zero commands with a `not_started` transaction state is the only combination
 that proves nothing started, and
 [root-scoped operation coordination](root-operation.md) derives its witness
-from exactly that pairing.
+from exactly that pairing. A recovery report is read with one extra rule: the
+transaction state is published only after the journal decodes, so a recovery
+that failed with `journal_io` or `journal_corrupt` reports `not_started`
+without ever having learned what the journal said, and is classified as
+observed mutation instead.
 
 Durable journal recovery is implemented and exported as `recoverTransaction`:
 it integrity-decodes the journal, requires the supplied plan, root, executor

@@ -949,3 +949,107 @@ test "production recovery adopts durable mutation evidence instead of failing cl
     try std.testing.expect(observed.record.mutation_started);
     try std.testing.expect(observed.record.state.blocksMutation());
 }
+
+// A recovery adopts whatever the root already carries, so a record an earlier
+// run left at the executor bridge becomes this run's record. That run handed
+// control to dpkg and never came back; nothing this run observes is evidence
+// about it. A recovery that finds no journal, or cannot decode the one it
+// finds, reports `not_started` with no commands — the exact shape of a report
+// that proves nothing ran — and resolving the inherited bridge from it cleared
+// the only durable evidence blocking the root.
+test "recovery never discharges a bridge inherited from an earlier run" {
+    const Journal = enum { missing, corrupt };
+    for (std.enums.values(Journal)) |journal| {
+        var staged = try stageRoot();
+        defer staged.deinit();
+        errdefer std.debug.print("journal: {t}\n", .{journal});
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var backend: debz.ProductionBackend = .{
+            .io = std.testing.io,
+            .now_unix = fixture.created + 30,
+        };
+        const source_paths = [_][]const u8{staged.source_path};
+        const keyring_paths = [_][]const u8{staged.keyring_path};
+        const options = staged.options(&source_paths, &keyring_paths);
+
+        // The recovery refresh is cache-only, so the cache has to exist before
+        // the flow can reach the executor at all.
+        const refreshed = try api.execute(arena.allocator(), .{
+            .operation = .refresh,
+            .options = options,
+        }, backend.interface());
+        try std.testing.expectEqual(api.ExitStatus.success, refreshed.exit_status);
+
+        try staged.directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "state/recovery-request.json",
+            .data = "{\"operation\":\"remove\",\"packages\":[\"removable\"]," ++
+                "\"recommends\":false,\"allow_downgrade\":false," ++
+                "\"repository_policy\":\"strict_priority\",\"conffile\":\"unspecified\"," ++
+                "\"force\":[],\"lock_wait_ms\":1000}\n",
+        });
+        // A journal that exists and cannot be decoded is durable evidence that
+        // a transaction already reached this root, which is precisely what the
+        // recovery report cannot say once decoding failed.
+        if (journal == .corrupt) try staged.directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "state/transaction.journal",
+            .data = "{\"schema\":",
+        });
+
+        var root_dir = try staged.directory.dir.openDir(
+            std.testing.io,
+            "root",
+            .{ .iterate = true },
+        );
+        defer root_dir.close(std.testing.io);
+        // The interrupted run stopped at the hand-over with no witness.
+        try writeBlockingRootAttempt(
+            root_dir,
+            staged.install_root,
+            .{ .package_transaction = .install },
+            .mutation_pending,
+        );
+
+        const recovered = try api.execute(arena.allocator(), .{
+            .operation = .recover,
+            .options = options,
+        }, backend.interface());
+        // The recovery reached the executor and failed on the journal rather
+        // than being refused by its own adopted record.
+        try std.testing.expectEqual(api.ErrorId.recovery_failed, recovered.diagnostics[0].id);
+
+        // The inherited hand-over is still unresolved: the record blocks, it
+        // carries mutation evidence, and its provenance obligation was not
+        // waived by completing it as abandoned.
+        var observed = (try readRootAttempt(staged.install_root)).?;
+        defer observed.deinit();
+        try std.testing.expectEqual(
+            debz.root_operation.State.recovery_required,
+            observed.record.state,
+        );
+        try std.testing.expect(observed.record.state.blocksMutation());
+        try std.testing.expect(observed.record.mutation_started);
+        try std.testing.expectEqual(
+            debz.root_operation.ProvenanceState.pending,
+            observed.record.provenance,
+        );
+        try std.testing.expectEqual(
+            debz.root_operation.Outcome.pending,
+            observed.record.outcome,
+        );
+        try std.testing.expect(!observed.record.clearable());
+
+        // The next mutation of this root is still refused.
+        const blocked = try api.execute(arena.allocator(), .{
+            .operation = .remove,
+            .packages = &.{"removable"},
+            .options = options,
+        }, backend.interface());
+        try std.testing.expectEqual(api.ExitStatus.recovery, blocked.exit_status);
+        try std.testing.expectEqual(
+            api.ErrorId.root_operation_recovery_required,
+            blocked.diagnostics[0].id,
+        );
+    }
+}

@@ -73,10 +73,13 @@ active intent is cleared only after provenance is published. The
 command-oriented executor bridge is resolved from the executor's own
 transaction state rather than a command count, so a first command that timed
 out, hit the deadline, or failed to spawn leaves recovery evidence instead of
-clearing a root nobody can prove was untouched. Repository bootstrap binds its
-attempt to a stable request digest before acquisition, so a rerun of the same
-request adopts its own evidence and finishes it while an unrelated operation,
-descriptor, or request is still refused. See
+clearing a root nobody can prove was untouched, and a bridge inherited from an
+earlier run is never discharged by this run's own no-start evidence.
+Repository bootstrap binds its attempt to a stable request digest before
+acquisition, so a rerun of the same request adopts its own evidence and
+finishes it while an unrelated operation, descriptor, or request is still
+refused; a record that already published its provenance is settled, so the
+rerun reserves a new attempt over it rather than executing under it. See
 [Root-scoped operation coordination](root-operation.md).
 
 ## Typed metadata and archives
