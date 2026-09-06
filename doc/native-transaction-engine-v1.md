@@ -217,3 +217,12 @@ The native backend may become the default only when all of the following pass:
 
 Reference `dpkg` remains permitted only in differential test tooling after
 cutover.
+
+## Incremental backend boundary
+
+`transaction_engine` owns explicit backend selection. `legacy_dpkg` remains
+the default while native work is incomplete. Library backends may inject a
+native executor for development, but selecting `native` without one returns a
+typed unavailable result before repository acquisition, journal access,
+database access, or root mutation. Selection never falls back to
+`legacy_dpkg`.

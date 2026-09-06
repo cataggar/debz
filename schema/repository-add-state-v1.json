@@ -255,7 +255,7 @@
         "dependency_planning_failed", "dependency_refresh_failed",
         "dependency_acquisition_failed", "existing_descriptor_conflict",
         "managed_file_conflict", "lock_publication_failed",
-        "transaction_failed", "installed_verification_failed",
+        "transaction_backend_unavailable", "transaction_failed", "installed_verification_failed",
         "target_import_failed", "refresh_failed",
         "provenance_publication_failed", "resource_limit_exceeded",
         "state_persistence_failed", "state_corrupt",

@@ -18,6 +18,7 @@ const repository_refresh = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const target_apt_config = @import("target_apt_config.zig");
+const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
@@ -31,51 +32,13 @@ const exact_plan_name = "transaction-plan-v3.json";
 const provenance_name = "transaction-result-v2.json";
 const manifest_name = "apt-config-snapshot-v1.json";
 
-pub const Executor = struct {
-    context: *anyopaque,
-    executeFn: *const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        transaction_executor.Request,
-        transaction_executor.Dependencies,
-    ) anyerror!transaction_executor.Report,
-    recoverFn: *const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        transaction_executor.RecoveryRequest,
-        transaction_executor.Dependencies,
-    ) anyerror!transaction_executor.RecoveryReport,
-
-    pub const system: Executor = .{
-        .context = @ptrCast(@constCast(&system_executor_context)),
-        .executeFn = systemExecute,
-        .recoverFn = systemRecover,
-    };
-};
-
-var system_executor_context: u8 = 0;
-
-fn systemExecute(
-    _: *anyopaque,
-    allocator: std.mem.Allocator,
-    request: transaction_executor.Request,
-    dependencies: transaction_executor.Dependencies,
-) !transaction_executor.Report {
-    return transaction_executor.execute(allocator, request, dependencies);
-}
-
-fn systemRecover(
-    _: *anyopaque,
-    allocator: std.mem.Allocator,
-    request: transaction_executor.RecoveryRequest,
-    dependencies: transaction_executor.Dependencies,
-) !transaction_executor.RecoveryReport {
-    return transaction_executor.recover(allocator, request, dependencies);
-}
+pub const Executor = transaction_engine.Executor;
 
 pub const Backend = struct {
     io: std.Io,
-    executor: Executor = .system,
+    transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    executor: Executor = .legacy_dpkg,
+    native_executor: ?Executor = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
     operation_locks: ?transaction_executor.LockManager = null,
     target_locks: ?transaction_executor.LockManager = null,
@@ -111,6 +74,16 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: api.Request,
     ) !api.Result {
+        const executor = transaction_engine.select(
+            self.transaction_backend,
+            self.executor,
+            self.native_executor,
+        ) catch return api.failure(
+            .unavailable,
+            .transaction_backend_unavailable,
+            "transaction",
+            "selected transaction backend is unavailable",
+        );
         var paths = try ResolvedPaths.init(allocator, request);
         defer paths.deinit();
 
@@ -146,6 +119,7 @@ pub const Backend = struct {
             .allocator = allocator,
             .io = self.io,
         };
+
         const operation_locks = self.operation_locks orelse
             operation_lock_manager.interface();
         const operation_lock_wait = budget.remainingTime() catch |err|
@@ -1483,8 +1457,7 @@ pub const Backend = struct {
                 },
             };
             if (recovery_needed) {
-                recovery_report = self.executor.recoverFn(
-                    self.executor.context,
+                recovery_report = executor.recover(
                     allocator,
                     .{
                         .plan = &plan,
@@ -1502,7 +1475,7 @@ pub const Backend = struct {
                     @errorName(err),
                 );
             } else {
-                report = self.executor.executeFn(self.executor.context, allocator, .{
+                report = executor.execute(allocator, .{
                     .plan = &plan,
                     .install_root = request.root,
                     .artifacts = artifacts.items,
@@ -1522,8 +1495,7 @@ pub const Backend = struct {
                 {
                     report.?.deinit();
                     report = null;
-                    recovery_report = self.executor.recoverFn(
-                        self.executor.context,
+                    recovery_report = executor.recover(
                         allocator,
                         .{
                             .plan = &plan,
@@ -7133,4 +7105,23 @@ test "repository backend refreshes imported repositories only for missing depend
     try std.testing.expectEqual(api.ExitStatus.recovery, resumed.exit_status);
     try std.testing.expectEqual(api.DiagnosticId.recovery_required, resumed.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 0), executor.calls);
+}
+
+test "repository backend rejects unavailable native transaction before root access" {
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+    };
+    const result = try api.execute(std.testing.allocator, .{
+        .root = "/native-repository-backend-unavailable-root",
+        .descriptor_url = "https://example.invalid/repository.deb",
+        .expected_sha256 = @splat(0x86),
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostic_count);
+    try std.testing.expectEqual(
+        api.DiagnosticId.transaction_backend_unavailable,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expect(!result.changed);
 }

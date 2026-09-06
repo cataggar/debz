@@ -110,6 +110,7 @@ pub const ErrorId = enum {
     offline_cache_miss,
     planning_failed,
     download_failed,
+    transaction_backend_unavailable,
     transaction_failed,
     recovery_failed,
     lock_verification_failed,
