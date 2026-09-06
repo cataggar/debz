@@ -22,6 +22,7 @@
 - [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
 - [Native transaction engine v1 compatibility contract](native-transaction-engine-v1.md) defines the package, database, lifecycle, durability, and differential-test boundary required before replacing dpkg.
 - [Root-anchored filesystem primitives](root-filesystem.md) documents the traversal-safe path grammar, no-follow resolution, exclusive creation, atomic publication, and durability rules used by the native engine.
+- [Audited maintainer-script runner](maintainer-script-runner.md) documents the native maintainer-script contract: pre-spawn rejection, root isolation, environment allowlist, bounded output and runtime, process-tree termination, outcome taxonomy, and provenance evidence.
 - [Hermetic integration roots](integration-roots.md) documents deterministic signed fixtures, disposable native/foreign roots, CI lanes, and local prerequisites.
 - [zvmi Debian-family backend](zvmi-package-family.md) defines the versioned Ubuntu/Debian image-builder boundary, explicit inputs, locks, provenance, cache policy, and failure contract.
 - [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.

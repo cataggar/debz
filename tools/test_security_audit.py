@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -122,6 +123,22 @@ class SecurityAuditTests(unittest.TestCase):
             'const global_keyring_directory_path = "/etc/apt/trusted.gpg.d";',
             source,
         )
+
+    def test_maintainer_script_owns_the_native_child_process_boundary(self) -> None:
+        sources = {
+            path.relative_to(ROOT).as_posix(): path.read_text()
+            for path in sorted((ROOT / "src").rglob("*.zig"))
+        }
+        owners = sorted(
+            relative
+            for relative, text in sources.items()
+            if re.search(r"\blinux\.(?:fork|execve|chroot)\s*\(", text)
+        )
+        self.assertEqual(["src/maintainer_script.zig"], owners)
+        runner = sources["src/maintainer_script.zig"]
+        self.assertNotIn("std.process.run(", runner)
+        self.assertIn('linux.open("/dev/null"', runner)
+        self.assertIn('linux.chroot(".")', runner)
 
     def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
         self.assertEqual(
