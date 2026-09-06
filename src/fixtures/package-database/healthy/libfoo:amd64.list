@@ -1,0 +1,11 @@
+/.
+/etc
+/etc/foo
+/etc/foo/foo.conf
+/usr
+/usr/lib
+/usr/lib/libfoo.so.1
+/usr/share
+/usr/share/doc
+/usr/share/doc/libfoo
+/usr/share/doc/libfoo/copyright

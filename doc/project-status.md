@@ -107,6 +107,17 @@ can enforce a narrow repository-descriptor profile. See
 
 `debz.dpkg_status` parses only caller-supplied status bytes or explicit paths. It preserves source diagnostics and models package identity, exact Debian versions, installation states, package flags, dependency relations, and installed size without implicitly reading the host dpkg database.
 
+`debz.package_database` imports a caller-captured `var/lib/dpkg` generation
+into a bounded typed model covering status, status-old, updates fragments,
+architectures, ownership lists, checksums, conffiles, triggers, maintainer
+scripts, diversions, and statoverrides. It retains unknown status fields and
+record order, republishes every surface through canonical writers, and hashes
+the consumed generation as authorization evidence.
+`debz.package_database_changes` compiles typed edits into one deterministic,
+validated publication plan of file intents. Neither module performs filesystem
+IO; durable publication belongs to the mutation layer. See
+[Native package database](package-database.md).
+
 Repository sources can be supplied explicitly as canonical `.sources` stanzas or legacy `deb` and `deb-src` lines; parsing never consults host APT configuration. Parsed sources preserve spans, enforce caller-configurable bounds, and receive deterministic IDs from normalized declared values.
 
 `debz.target_apt_config` provides an explicit, injectable target-root import

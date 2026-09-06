@@ -1,0 +1,40 @@
+Package: libfoo
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 128
+Maintainer: Example Maintainer <maintainer@example.invalid>
+Architecture: amd64
+Multi-Arch: same
+Source: foo
+Version: 1.2-3
+Depends: libc6 (>= 2.36)
+Conffiles:
+ /etc/foo/foo.conf 5d41402abc4b2a76b9719d911017c592
+Description: example library
+ Long description continuation.
+X-Vendor-Note: retained unknown field
+
+Package: libfoo
+Status: install ok installed
+Priority: optional
+Architecture: i386
+Multi-Arch: same
+Version: 1.2-3
+Description: example library
+
+Package: toolz
+Status: install ok triggers-pending
+Architecture: amd64
+Version: 2.0
+Triggers-Pending: /usr/share/toolz
+Description: example tool
+
+Package: oldpkg
+Status: deinstall ok config-files
+Architecture: amd64
+Version: 0.9
+Conffiles:
+ /etc/oldpkg.conf 7d793037a0760186574b0282f2f435e7
+Description: removed package
+
