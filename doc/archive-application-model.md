@@ -157,6 +157,11 @@ payload entries, control members and their bytes, `md5sums` bytes and entries,
 and trigger bytes, declarations, and target length. Every limit failure is a
 typed `resource_limit` diagnostic.
 
+Preflight cost stays linear in the archive it accepts. Checksum duplicates are
+detected in constant time through the per-file checksum slot rather than by
+rescanning accepted entries, and each distinct payload content entry is hashed
+at most once no matter how many hard links name it.
+
 `archive_application.fuzzOne` is the side-effect-free fuzz boundary; it models
 one archive, exercises the binding check and diagnostic classification, and
 releases every successful result immediately.

@@ -688,9 +688,11 @@ const Builder = struct {
     checksums: std.ArrayList(Checksum) = .empty,
     triggers: std.ArrayList(Trigger) = .empty,
     index: std.StringHashMapUnmanaged(usize) = .empty,
+    content_digests: std.AutoHashMapUnmanaged(usize, [16]u8) = .empty,
     features: Features,
 
     fn deinit(self: *Builder) void {
+        self.content_digests.deinit(self.allocator);
         self.files.deinit(self.allocator);
         self.scripts.deinit(self.allocator);
         self.metadata.deinit(self.allocator);
@@ -1053,12 +1055,12 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
         }
         if (builder.checksums.items.len >= builder.limits.max_checksum_entries)
             return reject(diagnostic, .checksums, .checksum_limit, record_offset, null);
-        for (builder.checksums.items) |existing| {
-            if (std.mem.eql(u8, existing.path, path))
-                return reject(diagnostic, .checksums, .duplicate_checksum, record_offset, null);
-        }
         const file_index = builder.index.get(path) orelse
             return reject(diagnostic, .checksums, .checksum_target_missing, record_offset, null);
+        // Inventory paths are unique, so an already populated checksum slot is
+        // an exact duplicate declaration and is detected without scanning.
+        if (builder.files.items[file_index].md5 != null)
+            return reject(diagnostic, .checksums, .duplicate_checksum, record_offset, file_index);
         const content_index = switch (builder.files.items[file_index].kind) {
             .regular => file_index,
             // dpkg records a checksum for every hard-linked payload path; the
@@ -1074,10 +1076,17 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
             },
             .directory, .symlink => return reject(diagnostic, .checksums, .checksum_target_missing, record_offset, file_index),
         };
-        const content_location = builder.files.items[content_index].content.?;
-        const bytes = validation.data_bytes[content_location.offset..][0..content_location.length];
-        var computed: [16]u8 = undefined;
-        std.crypto.hash.Md5.hash(bytes, &computed, .{});
+        // Hard links share payload bytes, so each distinct content entry is
+        // hashed at most once regardless of how many paths name it.
+        const computed = builder.content_digests.get(content_index) orelse compute: {
+            const location = builder.files.items[content_index].content.?;
+            const bytes = validation.data_bytes[location.offset..][0..location.length];
+            var digest: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(bytes, &digest, .{});
+            builder.content_digests.put(builder.allocator, content_index, digest) catch
+                return reject(diagnostic, .checksums, .out_of_memory, record_offset, null);
+            break :compute digest;
+        };
         if (!std.mem.eql(u8, &computed, &md5))
             return reject(diagnostic, .checksums, .checksum_mismatch, record_offset, file_index);
         const file = &builder.files.items[file_index];
@@ -1865,6 +1874,114 @@ test "archive_application.test.hard-linked payload checksums verify the linked b
     defer model.deinit();
     try testing.expectEqual(@as(usize, 2), model.checksums.len);
     try testing.expect(model.findFile("usr/share/demo/hard").?.md5 != null);
+}
+
+test "archive_application.test.duplicate checksums are rejected through the indexed slot" {
+    const payload = "shared payload\n";
+    const regular = try md5Line(testing.allocator, payload, "usr/share/demo/file");
+    defer testing.allocator.free(regular);
+    const hard = try md5Line(testing.allocator, payload, "usr/share/demo/hard");
+    defer testing.allocator.free(hard);
+
+    const repeated_regular = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}{s}{s}",
+        .{ regular, hard, regular },
+    );
+    defer testing.allocator.free(repeated_regular);
+    const repeated_hardlink = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}{s}{s}",
+        .{ regular, hard, hard },
+    );
+    defer testing.allocator.free(repeated_hardlink);
+
+    const data = [_]TestEntry{
+        .{ .path = "usr/share/demo/file", .content = payload },
+        .{ .path = "usr/share/demo/hard", .kind = '1', .link = "./usr/share/demo/file" },
+    };
+    for ([_][]const u8{ repeated_regular, repeated_hardlink }) |manifest| {
+        try expectRejected(.{
+            .control = &.{.{ .path = "md5sums", .content = manifest }},
+            .data = &data,
+        }, .duplicate_checksum, .checksum_manifest);
+    }
+
+    // A repeated path that names nothing in the inventory still reports the
+    // missing target first, exactly as before indexed detection.
+    const missing = try md5Line(testing.allocator, payload, "usr/share/demo/absent");
+    defer testing.allocator.free(missing);
+    const repeated_missing = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}{s}",
+        .{ missing, missing },
+    );
+    defer testing.allocator.free(repeated_missing);
+    try expectRejected(.{
+        .control = &.{.{ .path = "md5sums", .content = repeated_missing }},
+        .data = &data,
+    }, .checksum_target_missing, .checksum_manifest);
+}
+
+test "archive_application.test.large checksum manifests stay bounded and linear" {
+    const payload = "shared payload\n";
+    const file_count = 1024;
+    const hardlink_count = 256;
+
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    var data: std.ArrayList(TestEntry) = .empty;
+    var manifest: std.ArrayList(u8) = .empty;
+    try data.append(arena, .{ .path = "usr/share/demo/file", .content = payload });
+    {
+        const line = try md5Line(arena, payload, "usr/share/demo/file");
+        try manifest.appendSlice(arena, line);
+    }
+    for (0..file_count) |index| {
+        const path = try std.fmt.allocPrint(arena, "usr/share/demo/regular-{d}", .{index});
+        try data.append(arena, .{ .path = path, .content = payload });
+        try manifest.appendSlice(arena, try md5Line(arena, payload, path));
+    }
+    for (0..hardlink_count) |index| {
+        const path = try std.fmt.allocPrint(arena, "usr/share/demo/hard-{d}", .{index});
+        try data.append(arena, .{
+            .path = path,
+            .kind = '1',
+            .link = "./usr/share/demo/file",
+        });
+        try manifest.appendSlice(arena, try md5Line(arena, payload, path));
+    }
+
+    const accepted = try prepareArchive(.{
+        .control = &.{.{ .path = "md5sums", .content = manifest.items }},
+        .data = data.items,
+    });
+    var model = switch (accepted) {
+        .model => |value| value,
+        .diagnostic => |diagnostic| {
+            std.debug.print("unexpected diagnostic: {s}\n", .{diagnostic.message()});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer model.deinit();
+    try testing.expectEqual(
+        @as(usize, file_count + hardlink_count + 1),
+        model.checksums.len,
+    );
+    try testing.expect(model.findFile("usr/share/demo/hard-255").?.md5 != null);
+
+    // The duplicate at the end of a long manifest is still rejected.
+    const trailing_duplicate = try std.fmt.allocPrint(
+        arena,
+        "{s}{s}",
+        .{ manifest.items, try md5Line(arena, payload, "usr/share/demo/regular-0") },
+    );
+    try expectRejected(.{
+        .control = &.{.{ .path = "md5sums", .content = trailing_duplicate }},
+        .data = data.items,
+    }, .duplicate_checksum, .checksum_manifest);
 }
 
 test "archive_application.test.debconf config script is modeled but not a lifecycle script" {
