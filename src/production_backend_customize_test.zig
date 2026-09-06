@@ -132,6 +132,7 @@ fn stageRoot() !Fixture {
 const SuccessfulProcess = struct {
     io: std.Io,
     dir: std.Io.Dir,
+    invocations: usize = 0,
 
     fn interface(self: *SuccessfulProcess) transaction_executor.ProcessRunner {
         return .{ .context = self, .runFn = run };
@@ -139,6 +140,7 @@ const SuccessfulProcess = struct {
 
     fn run(context: *anyopaque, invocation: transaction_executor.Invocation) !transaction_executor.ProcessResult {
         const self: *SuccessfulProcess = @ptrCast(@alignCast(context));
+        self.invocations += 1;
         if (invocation.phase == .remove) try self.dir.writeFile(self.io, .{
             .sub_path = "root/var/lib/dpkg/status",
             .data = "",
@@ -158,6 +160,167 @@ const FailingProcess = struct {
         return .{ .termination = .{ .exited = 1 } };
     }
 };
+
+// Reproduces every way the very first dpkg command can end without the
+// executor being able to append its provenance. In all of them `dpkg` was
+// already handed control, so the report is indistinguishable from an untouched
+// root through a command count alone.
+const UnfinishedFirstCommand = struct {
+    error_value: anyerror,
+    invocations: usize = 0,
+
+    fn interface(self: *UnfinishedFirstCommand) transaction_executor.ProcessRunner {
+        return .{ .context = self, .runFn = run };
+    }
+
+    fn run(
+        context: *anyopaque,
+        _: transaction_executor.Invocation,
+    ) !transaction_executor.ProcessResult {
+        const self: *UnfinishedFirstCommand = @ptrCast(@alignCast(context));
+        self.invocations += 1;
+        return self.error_value;
+    }
+};
+
+// Reads the durable root-operation record straight out of the selected root,
+// exactly as the next debz invocation would.
+fn readRootAttempt(install_root: []const u8) !?debz.root_operation.OwnedRecord {
+    var owned = try debz.root_fs.openAbsoluteRoot(std.testing.io, install_root);
+    defer owned.close();
+    const store = debz.root_operation.Store.init(owned.root);
+    return store.read(std.testing.allocator);
+}
+
+test "an unfinished first dpkg command leaves recovery evidence instead of clearing the root" {
+    // The executor records a command only after it completed, so a first
+    // command that timed out or failed to spawn reports zero commands while
+    // dpkg may already have unpacked, configured, or removed something.
+    // Resolving the root-operation bridge from that count cleared the active
+    // intent and let the next mutation run on a root nobody could prove was
+    // intact.
+    for ([_]anyerror{ error.Timeout, error.AccessDenied }) |injected| {
+        var staged = try stageRoot();
+        defer staged.deinit();
+
+        var process = UnfinishedFirstCommand{ .error_value = injected };
+        var backend: debz.ProductionBackend = .{
+            .io = std.testing.io,
+            .now_unix = fixture.created + 30,
+            .process_runner = process.interface(),
+        };
+        const source_paths = [_][]const u8{staged.source_path};
+        const keyring_paths = [_][]const u8{staged.keyring_path};
+        const request: api.Request = .{
+            .operation = .remove,
+            .packages = &.{"removable"},
+            .options = staged.options(&source_paths, &keyring_paths),
+        };
+        const result = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        defer std.testing.allocator.free(result.summary);
+        try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+        // dpkg really was started, which is precisely what the command count
+        // cannot say.
+        try std.testing.expectEqual(@as(usize, 1), process.invocations);
+
+        var record = (try readRootAttempt(staged.install_root)).?;
+        defer record.deinit();
+        // The attempt is durable recovery evidence, not an abandoned one.
+        try std.testing.expectEqual(
+            debz.root_operation.State.recovery_required,
+            record.record.state,
+        );
+        try std.testing.expect(record.record.mutation_started);
+        try std.testing.expect(record.record.state.blocksMutation());
+
+        // A second mutation of the same root is refused until it is recovered.
+        const blocked = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        try std.testing.expectEqual(api.ExitStatus.recovery, blocked.exit_status);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            blocked.summary,
+            "requires recovery",
+        ) != null);
+
+        // Non-mutating operations stay usable while the root is blocked. The
+        // query path returns caller-owned, arena-managed items exactly like
+        // the embedder uses them.
+        var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer query_arena.deinit();
+        var query_options = staged.options(&source_paths, &keyring_paths);
+        query_options.lock_wait_ms = 0;
+        const listed = try api.execute(query_arena.allocator(), .{
+            .operation = .list_installed,
+            .packages = &.{},
+            .options = query_options,
+        }, backend.interface());
+        try std.testing.expectEqual(api.ExitStatus.success, listed.exit_status);
+    }
+}
+
+// Holds one of the executor's own target locks so the transaction fails during
+// pre-spawn validation, which is the only shape of failure that really proves
+// no command was ever handed to dpkg.
+test "a transaction that fails before any spawn clears the root attempt" {
+    var staged = try stageRoot();
+    defer staged.deinit();
+
+    var manager = transaction_executor.SystemLockManager{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/var/lib/debz/transaction.lock",
+        .{staged.install_root},
+    );
+    defer std.testing.allocator.free(lock_path);
+    const locks = manager.interface();
+    // Contend with the executor's first target lock so the transaction fails
+    // in pre-spawn validation without ever reaching a dpkg invocation.
+    var token: ?transaction_executor.LockToken = try locks.acquire(lock_path, 1_000);
+    defer if (token) |value| locks.release(value);
+
+    var process = SuccessfulProcess{ .io = std.testing.io, .dir = staged.directory.dir };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const source_paths = [_][]const u8{staged.source_path};
+    const keyring_paths = [_][]const u8{staged.keyring_path};
+    var options = staged.options(&source_paths, &keyring_paths);
+    options.lock_wait_ms = 25;
+    const request: api.Request = .{
+        .operation = .remove,
+        .packages = &.{"removable"},
+        .options = options,
+    };
+    const result = try api.execute(std.testing.allocator, request, backend.interface());
+    defer std.testing.allocator.free(result.summary);
+    try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary, "code=lock_timeout") != null);
+    try std.testing.expectEqual(@as(usize, 0), process.invocations);
+
+    // Nothing was handed to dpkg, so the root is released rather than blocked.
+    try std.testing.expect((try readRootAttempt(staged.install_root)) == null);
+
+    locks.release(token.?);
+    token = null;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const retried = try api.execute(arena.allocator(), request, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, retried.exit_status);
+    try std.testing.expect((try readRootAttempt(staged.install_root)) == null);
+}
 
 test "production customize provisions a missing var/lib/debz lock root" {
     var staged = try stageRoot();

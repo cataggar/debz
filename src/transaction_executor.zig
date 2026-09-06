@@ -3183,6 +3183,146 @@ test "transaction_executor.test.absolute deadline cancels a running dpkg command
     try std.testing.expect(harness.saw_running_cancellation);
 }
 
+// The command list is provenance for *completed* commands: an entry is appended
+// only after `dpkg` returned and the deadline was re-checked. Every way the
+// first command can end without completing therefore reports zero commands
+// while `dpkg` may already have mutated the root, so a caller that resolves the
+// root-operation bridge from a command count alone would clear a root it could
+// not prove untouched. `transaction_state` is the field that separates the two:
+// it is durably `in_progress` before the first spawn and only stays
+// `not_started` when nothing was ever handed to `dpkg`. `root_operation`
+// derives its witness from exactly this pairing, so these expectations are the
+// contract that makes the conservative classification sound.
+test "transaction_executor.test.an unfinished first command reports started evidence without commands" {
+    const Case = struct {
+        name: []const u8,
+        run_error: ?anyerror = null,
+        advance_ms_per_run: u64 = 0,
+        lock_fail_at: ?usize = null,
+        deadline_ms: ?u64 = null,
+        expected_state: recovery.State,
+        expected_invocations: usize,
+    };
+    const cases = [_]Case{
+        // The process ran and timed out: dpkg was started and may have mutated.
+        .{
+            .name = "first command timeout",
+            .run_error = error.Timeout,
+            .expected_state = .interrupted,
+            .expected_invocations = 1,
+        },
+        // The spawn itself failed. Whether the child reached execve is not
+        // observable here, so the durable state must not claim nothing ran.
+        .{
+            .name = "first command spawn failure",
+            .run_error = error.AccessDenied,
+            .expected_state = .dpkg_failed,
+            .expected_invocations = 1,
+        },
+        // The command completed but the operation deadline expired before its
+        // provenance was appended, so a successful dpkg reports no command.
+        .{
+            .name = "deadline expires during the first command",
+            .advance_ms_per_run = 21,
+            .deadline_ms = 20,
+            .expected_state = .interrupted,
+            .expected_invocations = 1,
+        },
+        // Pre-spawn validation: the target locks were never taken, so nothing
+        // was handed over and `not_started` is real proof.
+        .{
+            .name = "pre-spawn lock validation failure",
+            .lock_fail_at = 0,
+            .expected_state = .not_started,
+            .expected_invocations = 0,
+        },
+    };
+    for (cases) |case| {
+        var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+        var ordered = [_]solver.OrderedAction{.{
+            .sequence = 0,
+            .kind = .remove,
+            .package = "demo",
+            .version = "1.0",
+            .architecture = "amd64",
+        }};
+        var plan = testPlan(&actions, &ordered);
+        var harness: TestHarness = .{
+            .bytes = "",
+            .run_error = case.run_error,
+            .advance_ms_per_run = case.advance_ms_per_run,
+            .lock_fail_at = case.lock_fail_at,
+        };
+        var dependencies = harness.dependencies();
+        if (case.deadline_ms) |expires| dependencies.deadline = .{
+            .context = &harness,
+            .nowMsFn = TestHarness.nowMilliseconds,
+            .expires_at_ms = expires,
+        };
+        var report = try execute(std.testing.allocator, .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{},
+            .policy = .{ .conffile = .keep_existing, .process_timeout_ms = 1_000 },
+        }, dependencies);
+        defer report.deinit();
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try std.testing.expect(!report.succeeded());
+        // Every case looks identical through a command count.
+        try std.testing.expectEqual(@as(usize, 0), report.commands.len);
+        try std.testing.expectEqual(case.expected_state, report.transaction_state);
+        try std.testing.expectEqual(case.expected_invocations, harness.invocation_count);
+    }
+}
+
+// A recovery that decoded a journal has durable evidence that an earlier
+// transaction reached this root, and it publishes that state before it runs its
+// own first command. Only a recovery that never found a journal keeps
+// `not_started`, which is the single case a caller may treat as proof.
+test "transaction_executor.test.recovery reports journal evidence before its first command" {
+    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var plan = testPlan(&actions, &ordered);
+
+    var missing: TestHarness = .{ .bytes = "" };
+    var missing_report = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+    }, missing.dependencies());
+    defer missing_report.deinit();
+    try std.testing.expectEqual(FailureCode.journal_missing, missing_report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 0), missing_report.commands.len);
+    try std.testing.expectEqual(recovery.State.not_started, missing_report.state);
+
+    var interrupted: TestHarness = .{ .bytes = "", .run_error = error.Timeout };
+    var first = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, interrupted.dependencies());
+    first.deinit();
+    // The interrupted journal survives, so recovery's own first command failing
+    // still reports the durable evidence rather than an untouched root.
+    interrupted.run_error = error.AccessDenied;
+    var recovered = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+    }, interrupted.dependencies());
+    defer recovered.deinit();
+    try std.testing.expect(!recovered.succeeded());
+    try std.testing.expectEqual(@as(usize, 0), recovered.commands.len);
+    try std.testing.expect(recovered.state != .not_started);
+}
+
 test "transaction_executor.test.provenance is stable redacted and interruption is recovery ready" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{

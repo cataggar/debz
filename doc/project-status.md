@@ -69,7 +69,14 @@ base generation, artifact evidence, architectures, durable phase and step,
 sticky mutation evidence, and provenance publication state. Transitions are
 monotonic, idempotent, and compare-and-set, an interrupted attempt is
 classified as safely abandoned before mutation or recovery required, and the
-active intent is cleared only after provenance is published. See
+active intent is cleared only after provenance is published. The
+command-oriented executor bridge is resolved from the executor's own
+transaction state rather than a command count, so a first command that timed
+out, hit the deadline, or failed to spawn leaves recovery evidence instead of
+clearing a root nobody can prove was untouched. Repository bootstrap binds its
+attempt to a stable request digest before acquisition, so a rerun of the same
+request adopts its own evidence and finishes it while an unrelated operation,
+descriptor, or request is still refused. See
 [Root-scoped operation coordination](root-operation.md).
 
 ## Typed metadata and archives

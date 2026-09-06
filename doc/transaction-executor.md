@@ -101,6 +101,19 @@ diagnostics, completed-command count, plan digest, and command/artifact
 digests. Root safety and lock ownership are rechecked at command boundaries. A report is
 successful only after every ordered command makes its required state transition,
 the final trigger command exits zero, and exact post-state verification passes.
+
+`Report.commands` and `RecoveryReport.commands` are provenance for *completed*
+commands: an entry is appended only after the command returned and the
+operation deadline was re-checked. `transaction_state` is the field that says
+whether anything was handed to `dpkg` at all — it is set to `in_progress` and
+the command boundary is persisted before the first spawn, and a recovery
+publishes the decoded journal's state before its own first command. A caller
+that must decide whether the root may have been mutated therefore reads both:
+zero commands with a `not_started` transaction state is the only combination
+that proves nothing started, and
+[root-scoped operation coordination](root-operation.md) derives its witness
+from exactly that pairing.
+
 Durable journal recovery is implemented and exported as `recoverTransaction`:
 it integrity-decodes the journal, requires the supplied plan, root, executor
 policy, and exact lock to match its bindings, and runs the bounded dpkg

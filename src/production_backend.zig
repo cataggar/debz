@@ -774,7 +774,7 @@ pub const Backend = struct {
                 if (try guard.observe(
                     allocator,
                     request.operation,
-                    report.commands.len != 0 or report.state != .not_started,
+                    root_operation.recoveryReportWitness(report),
                     .failed,
                 )) |failure| return failure;
                 return api.failure(request.operation, .recovery, .recovery_failed, if (report.failure) |failure|
@@ -785,7 +785,7 @@ pub const Backend = struct {
             if (try guard.observe(
                 allocator,
                 request.operation,
-                report.commands.len != 0,
+                root_operation.recoveryReportWitness(report),
                 .recovered,
             )) |failure| return failure;
             try deleteRecoveryIntent(self.io, request.options.state_path);
@@ -811,7 +811,7 @@ pub const Backend = struct {
             if (try guard.observe(
                 allocator,
                 request.operation,
-                report.commands.len != 0,
+                root_operation.reportWitness(report),
                 .failed,
             )) |failure| return failure;
             return api.failure(request.operation, .transaction, .transaction_failed, if (report.failure) |failure|
@@ -822,7 +822,7 @@ pub const Backend = struct {
         if (try guard.observe(
             allocator,
             request.operation,
-            report.commands.len != 0,
+            root_operation.reportWitness(report),
             .succeeded,
         )) |failure| return failure;
         try deleteRecoveryIntent(self.io, request.options.state_path);
@@ -1129,27 +1129,27 @@ const RootOperationGuard = struct {
         return null;
     }
 
-    /// Resolves the bridge from the executor's command evidence. No command
-    /// means no dpkg invocation, which is the only way this backend can prove
-    /// that nothing was mutated.
+    /// Resolves the bridge from the executor's own transaction evidence. The
+    /// witness is derived by `root_operation`, never from a command count:
+    /// the executor records a command only after it completed, so a first
+    /// command that timed out, hit the deadline, or failed to spawn reports
+    /// zero commands while `dpkg` may already have mutated the root.
     fn observe(
         self: *RootOperationGuard,
         allocator: std.mem.Allocator,
         operation: api.Operation,
-        mutation_observed: bool,
+        observed: root_operation.Witness,
         completion: Completion,
     ) !?api.Result {
         var attempt = self.active() orelse return null;
         // Already finished; `finish` still owes its provenance.
         if (attempt.record().state == .completed) return null;
         if (attempt.record().state == .mutation_pending) {
-            attempt.witness(
-                allocator,
-                if (mutation_observed) .mutation_observed else .proved_not_started,
-            ) catch |err| return mapRootOperationError(operation, err);
-            // No command ran, so the attempt is durably abandoned before any
+            attempt.witness(allocator, observed) catch |err|
+                return mapRootOperationError(operation, err);
+            // Nothing ran, so the attempt is durably abandoned before any
             // mutation and needs no further boundary.
-            if (!mutation_observed) return null;
+            if (observed == .proved_not_started) return null;
         }
         if (!attempt.record().mutation_started) return null;
         switch (completion) {
@@ -1230,7 +1230,7 @@ fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
             .root_operation_conflict,
             "root mutation lock acquisition was cancelled",
         ),
-        error.OperationInProgress, error.ResolvedAttemptPresent => api.failure(
+        error.OperationInProgress, error.ResolvedAttemptPresent, error.AttemptMismatch => api.failure(
             operation,
             .recovery,
             .root_operation_conflict,

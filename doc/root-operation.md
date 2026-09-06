@@ -158,7 +158,34 @@ blocked.
 
 Everything from `mutation_pending` onwards is recovery evidence. A later
 mutation attempt is refused with `error.RecoveryRequired`; only an explicit
-recovery (`Intent.recovery`) may adopt the record and finish it.
+recovery (`Intent.recovery`) or a rerun of the very same operation
+(`Intent.same_operation`) may adopt the record and finish it.
+
+### Intents
+
+`Intent` says what the caller wants to do with whatever the root already
+carries. Every intent takes the same rank-0 lock first, so the choice only
+decides how existing evidence is treated.
+
+| Intent | Existing evidence | Used by |
+| --- | --- | --- |
+| `mutation` | blocks; recovery evidence is refused with `error.RecoveryRequired`, an owed provenance with `error.ProvenancePending` | package transactions |
+| `same_operation` | adopted when the record binds exactly this operation, otherwise treated as `mutation` and refused with `error.AttemptMismatch` when it carries evidence | repository bootstrap |
+| `recovery` | adopted unconditionally; a root with no record gets a fresh pre-mutation bridge | `debz recover` |
+
+`same_operation` compares the backend, the mutation surface and exact
+operation, the request digest, the policy digest, the target architecture, the
+foreign-architecture set, and the write-once evidence digests. The root
+identity is compared before any of them, for every intent. A record that
+matches on all of these is the caller's own interrupted attempt, so adopting it
+continues one operation rather than starting a second; anything else is a
+different operation and may neither adopt nor overwrite the evidence. When the
+mismatched record is durably settled — proven pre-mutation, or completed with
+its provenance discharged — the plain `mutation` rules apply instead, so an
+unrelated leftover that proves nothing was touched never locks a root out.
+
+Adoption keeps the original attempt identifier and generation sequence, so the
+compare-and-set still rejects a stale writer that resumed from an older view.
 
 ### The command-oriented executor bridge
 
@@ -171,9 +198,42 @@ never touched. `mutation_pending` is the explicit bridge for exactly this:
 - it never counts as safely abandoned, so an interrupted attempt still blocks
   the next mutation;
 - it is resolved only by an explicit `Witness`. `proved_not_started` requires
-  evidence that no command ran (the executor reported zero commands) and
-  completes the attempt as `abandoned_before_mutation`; `mutation_observed`
-  moves to `mutating` and sets the sticky mutation flag.
+  evidence that no command ran and completes the attempt as
+  `abandoned_before_mutation`; `mutation_observed` moves to `mutating` and sets
+  the sticky mutation flag.
+
+### Deriving the witness
+
+A command count is never that evidence on its own. The executor appends a
+command's provenance only *after* the command completed and the operation
+deadline was re-checked, so a first command that timed out, hit the deadline,
+lost its lock, or failed to spawn returns zero commands while `dpkg` may
+already have unpacked, configured, or removed something. A success-shaped
+report is no better: a plan the executor drove to `complete` can still report
+no commands.
+
+`observedMutation(state, commands)` is therefore the only supported
+derivation, and `reportWitness`/`recoveryReportWitness` are the only two call
+shapes:
+
+| Executor evidence | Witness |
+| --- | --- |
+| any completed command | `mutation_observed` |
+| no command, `transaction_state = not_started` | `proved_not_started` |
+| no command, any other `transaction_state` | `mutation_observed` |
+
+The executor sets `transaction_state` to `in_progress` and persists the
+command boundary *before* the first spawn, and a recovery publishes the decoded
+journal's state before its own first command, so `not_started` with no commands
+is the one case that really proves nothing was handed over. Everything else is
+classified conservatively, which can only block a root that was not touched —
+never clear one that was. `transaction_executor.test.an unfinished first
+command reports started evidence without commands` pins that contract.
+
+When the executor returns no report at all — an error propagated out of the
+engine — the attempt simply stays at `mutation_pending`. It is not
+`provenPreMutation` and not `clearable`, so neither guard's `deinit` clears it
+and the next mutation is refused until it is explicitly recovered.
 
 ## Provenance before clearing
 
@@ -203,8 +263,8 @@ Boundaries published for one product mutation:
 1. `reserved` when the attempt is taken;
 2. `preflight` once the reviewed plan digest and exact-lock binding exist;
 3. `mutation_pending` immediately before the executor call;
-4. `mutating` or `abandoned_before_mutation`, decided by whether the executor
-   reported any command;
+4. `mutating` or `abandoned_before_mutation`, decided by the witness the
+   executor's own transaction state justifies;
 5. `verifying`, then `completed` with the outcome;
 6. provenance published, then the active intent cleared.
 
@@ -217,11 +277,38 @@ blocking, and reserves a bridge record when a legacy root has none.
 `repository_backend.executeAdd` reserves the root at rank 0 immediately after
 the transaction backend is selected and before the repository operation lock at
 rank 1. It publishes `preflight` once the target snapshot is validated, enters
-the bridge before the executor block, resolves it from the executor's command
-evidence, and publishes provenance bound to the `transaction-result-v2.json`
-document digest before clearing the active intent. The idempotent re-run path,
-which verifies an already-installed descriptor without mutating, ends as
-`abandoned_before_mutation` and clears normally.
+the bridge before the executor block, resolves it from the executor's own
+transaction state, and publishes provenance bound to the
+`transaction-result-v2.json` document digest before clearing the active intent.
+The idempotent re-run path, which verifies an already-installed descriptor
+without mutating, ends as `abandoned_before_mutation` and clears normally.
+
+Repository bootstrap is resumable by construction: its own durable operation
+state already replays acquisition, planning, install, import, and refresh. The
+root attempt is bound to the same request digest *before* anything is acquired
+and is taken with `Intent.same_operation`, so a rerun of exactly this request
+adopts its own evidence and finishes it. Without that, every post-executor
+failure — provenance publication, the `installed` checkpoint, installed
+verification, the manifest, the `imported` checkpoint, the final refresh —
+left the record at `verifying` and the rerun opened a generic mutation intent
+that its own evidence refused, so the root could never be finished by debz
+again.
+
+The guard therefore resumes from whichever boundary the adopted record stopped
+at:
+
+| Adopted state | Before the executor | On success |
+| --- | --- | --- |
+| `reserved`, `preflight` | publish `mutation_pending` | `completed` as `abandoned_before_mutation` when nothing ran |
+| `mutation_pending` | keep the bridge | witness `mutation_observed`, then `verifying` and `completed` |
+| `mutating`, `verifying` | `beginRecovery` walks the exact recovery edges | `verifying`, then `completed` as `succeeded` |
+| `recovery_required`, `recovering` | `beginRecovery` | `recovering`, then `completed` as `recovered` |
+| `completed` | nothing is owed but provenance | provenance published, then cleared |
+
+Mutation evidence is never cleared to make a rerun possible: an unresolved
+attempt that belongs to a different descriptor, architecture, policy, request,
+or package operation is still refused, and the record it could not adopt is
+left exactly as it was published.
 
 ## Deferred to later native-engine work
 

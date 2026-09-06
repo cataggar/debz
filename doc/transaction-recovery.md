@@ -56,6 +56,15 @@ publication and the clearing of the active intent.
 The durable record classifies an interrupted operation. `reserved` and
 `preflight` prove no mutation and are cleared automatically. `mutation_pending`
 means control reached the command-oriented executor and is resolved only by an
-explicit witness: zero executed commands proves nothing started, anything else
-records mutation evidence. From `mutating` onwards a second mutation is refused
-until an explicit recovery completes and publishes provenance.
+explicit witness derived from the executor's own transaction state. A command
+count alone is never that witness: command provenance is appended only after a
+command has completed, so a first command that timed out, hit the operation
+deadline, lost a lock, or failed to spawn reports zero commands after `dpkg`
+may already have mutated the root, and a plan the executor drove to `complete`
+can report none either. Only zero commands together with a `not_started`
+transaction state proves nothing started; every other state records mutation
+evidence. From `mutating` onwards a second mutation is refused until it is
+resolved — by an explicit recovery for package transactions, or by a rerun of
+the very same repository bootstrap request, which adopts its own attempt
+instead of opening a new mutation intent — and provenance is published before
+the active intent is cleared.

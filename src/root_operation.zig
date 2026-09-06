@@ -960,12 +960,20 @@ pub const Error = LockError || ValidationError || error{
     ProvenanceRequired,
     NamespaceUnavailable,
     StoreFailed,
+    AttemptMismatch,
 };
 
 /// What the caller intends to do with the root.
 pub const Intent = enum {
     /// Start a new mutation. Any active or unrecovered evidence blocks it.
     mutation,
+    /// Continue the operation the record already binds. Evidence is adopted
+    /// only when the record binds exactly this backend, surface, operation,
+    /// request, policy, architecture set, and evidence; anything else falls
+    /// back to the plain mutation rules, so an unrelated operation can never
+    /// adopt another attempt's evidence and is still refused whenever that
+    /// evidence requires recovery.
+    same_operation,
     /// Continue or resolve a previous attempt. Existing evidence is adopted
     /// instead of blocking.
     recovery,
@@ -1010,8 +1018,48 @@ pub const Transition = struct {
 /// Witness for the command-oriented executor bridge. `mutation_observed` is
 /// the only way out of `mutation_pending` towards mutation evidence, and
 /// `proved_not_started` is the only way to call an interrupted legacy attempt
-/// safely abandoned.
+/// safely abandoned. Derive it with `reportWitness`/`recoveryReportWitness`
+/// rather than from a command count, which is never proof on its own.
 pub const Witness = enum { proved_not_started, mutation_observed };
+
+/// Conservative classification of the command-oriented executor's own
+/// evidence.
+///
+/// The executor appends a command's provenance only *after* that command has
+/// completed, so a first command that timed out, hit the operation deadline,
+/// lost a lock, or failed to spawn returns zero commands while `dpkg` may
+/// already have been started and may already have mutated the root. A command
+/// count is therefore never proof by itself, and neither is a success-shaped
+/// report: only a durable `not_started` transaction state *together with* an
+/// empty command list proves that nothing ran. Every other transaction state
+/// is treated as observed mutation, which can only ever block a root that was
+/// not touched — never clear one that was.
+pub fn observedMutation(state: transaction_recovery.State, commands: usize) Witness {
+    if (commands != 0) return .mutation_observed;
+    return switch (state) {
+        .not_started => .proved_not_started,
+        .in_progress,
+        .dpkg_failed,
+        .interrupted,
+        .verification_failed,
+        .complete,
+        => .mutation_observed,
+    };
+}
+
+/// The witness a transaction report justifies. Every product and repository
+/// observation site must derive its witness here so no call path can fall back
+/// to a bare command count.
+pub fn reportWitness(report: transaction_executor.Report) Witness {
+    return observedMutation(report.transaction_state, report.commands.len);
+}
+
+/// The witness a recovery report justifies. A recovery that decoded a journal
+/// at all has durable evidence that an earlier transaction reached the root,
+/// so only a recovery that never found one can be proven not to have started.
+pub fn recoveryReportWitness(report: transaction_executor.RecoveryReport) Witness {
+    return observedMutation(report.state, report.commands.len);
+}
 
 /// Owns the root mutation lock and the active record for one root.
 pub const Coordinator = struct {
@@ -1127,6 +1175,39 @@ pub const Coordinator = struct {
                 .highest = .root_operation,
                 .adopted = false,
             };
+        }
+
+        // Continuing the operation the record already binds is the only way a
+        // rerun of one request may pick its own evidence back up. The binding
+        // is compared before anything is adopted, so an unrelated operation,
+        // request, descriptor, or architecture set falls through to the plain
+        // mutation rules below and is refused exactly as before.
+        if (request.intent == .same_operation) {
+            if (prior) |*value| {
+                if (bindsSameOperation(value.record, request)) {
+                    const adopted = value.*;
+                    prior = null;
+                    return .{
+                        .coordinator = self,
+                        .token = token,
+                        .owned = adopted,
+                        .entered = .initEmpty(),
+                        .highest = .root_operation,
+                        .adopted = true,
+                    };
+                }
+                // A record that still carries mutation evidence belongs to
+                // whoever left it. Reporting the mismatch keeps it exactly as
+                // published instead of letting a different request overwrite
+                // it. Anything durably settled — proven pre-mutation, or
+                // completed with its provenance discharged — falls through to
+                // the plain mutation rules, so an unrelated leftover never
+                // locks the root out.
+                if (value.record.state.blocksMutation() or
+                    (value.record.state == .completed and
+                        value.record.provenance == .pending))
+                    return error.AttemptMismatch;
+            }
         }
 
         var generation: u64 = 1;
@@ -1514,6 +1595,40 @@ fn idempotent(
     return current.state == state and current.phase == phase and current.step == step and
         current.mutation_started == mutation_started and current.outcome == outcome and
         current.provenance == provenance;
+}
+
+/// Whether a durable record binds exactly the operation the caller is about to
+/// continue. Adoption is refused unless every identifying field agrees, so an
+/// unrelated operation, request, descriptor, policy, or architecture set can
+/// never pick up — or overwrite — another attempt's evidence. The root
+/// identity is compared before this is reached.
+fn bindsSameOperation(record: Record, request: Request) bool {
+    if (record.backend != request.backend) return false;
+    if (!record.operation.eql(request.operation)) return false;
+    if (!std.mem.eql(u8, &record.request_sha256, &request.request_sha256)) return false;
+    if (!std.mem.eql(u8, &record.policy_sha256, &request.policy_sha256)) return false;
+    if (!std.mem.eql(u8, record.target_architecture, request.target_architecture)) return false;
+    if (!architectureSetEqual(record.foreign_architectures, request.foreign_architectures))
+        return false;
+    // Evidence stays write-once across a resumption: a rerun that already
+    // carries a different plan, authorization, program, lock, database
+    // generation, or artifact digest is a different operation.
+    _ = mergeEvidence(record.evidence(), request.evidence) catch return false;
+    return true;
+}
+
+/// Set equality between the record's canonical architecture list and the
+/// caller's raw one, so ordering and duplicates in the request never decide
+/// whether an attempt may be resumed.
+fn architectureSetEqual(canonical: []const []const u8, requested: []const []const u8) bool {
+    for (requested) |value| if (!containsText(canonical, value)) return false;
+    for (canonical) |value| if (!containsText(requested, value)) return false;
+    return true;
+}
+
+fn containsText(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |value| if (std.mem.eql(u8, value, needle)) return true;
+    return false;
 }
 
 /// Evidence is write-once. Rebinding an attempt to a different authorization,
@@ -2271,6 +2386,252 @@ test "root_operation.test.recovery reserves a bridge record when no evidence exi
     try attempt.witness(testing.allocator, .proved_not_started);
     try attempt.clear();
     try testing.expect((try coordinator.inspect(testing.allocator)) == null);
+}
+
+test "root_operation.test.the witness never trusts a command count alone" {
+    // Every state but `not_started` is durable evidence that control already
+    // reached dpkg, so only an empty command list on a `not_started`
+    // transaction may be called safely abandoned. A success-shaped report with
+    // no commands is still a mutation, and a command list is always evidence.
+    const cases = [_]struct {
+        state: transaction_recovery.State,
+        expected: Witness,
+    }{
+        .{ .state = .not_started, .expected = .proved_not_started },
+        .{ .state = .in_progress, .expected = .mutation_observed },
+        .{ .state = .dpkg_failed, .expected = .mutation_observed },
+        .{ .state = .interrupted, .expected = .mutation_observed },
+        .{ .state = .verification_failed, .expected = .mutation_observed },
+        .{ .state = .complete, .expected = .mutation_observed },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(case.expected, observedMutation(case.state, 0));
+        // A command that did complete is unconditional evidence.
+        try testing.expectEqual(Witness.mutation_observed, observedMutation(case.state, 1));
+
+        const arena = try testing.allocator.create(std.heap.ArenaAllocator);
+        arena.* = .init(testing.allocator);
+        var report: transaction_executor.Report = .{
+            .allocator = testing.allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = @splat(0),
+            .transaction_state = case.state,
+            .root_identity = @splat(0),
+            .policy_sha256 = @splat(0),
+            .lock_sha256 = null,
+            .failure = null,
+        };
+        defer report.deinit();
+        try testing.expectEqual(case.expected, reportWitness(report));
+
+        const recovery_arena = try testing.allocator.create(std.heap.ArenaAllocator);
+        recovery_arena.* = .init(testing.allocator);
+        var recovery_report: transaction_executor.RecoveryReport = .{
+            .allocator = testing.allocator,
+            .arena = recovery_arena,
+            .state = case.state,
+            .commands = &.{},
+            .plan_sha256 = @splat(0),
+            .root_identity = @splat(0),
+            .policy_sha256 = @splat(0),
+            .lock_sha256 = null,
+            .failure = null,
+        };
+        defer recovery_report.deinit();
+        try testing.expectEqual(case.expected, recoveryReportWitness(recovery_report));
+    }
+}
+
+test "root_operation.test.an unwitnessed hand-over is never cleared as abandoned" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    // The executor returned no report at all, which is what an allocation
+    // failure or a propagated error inside the engine looks like.
+    var attempt = try coordinator.acquire(testing.allocator, packageRequest());
+    try attempt.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    try testing.expect(!attempt.record().state.provenPreMutation());
+    try testing.expect(!attempt.record().clearable());
+    try testing.expectError(
+        error.MutationEvidenceRequired,
+        attempt.abandonIfPreMutation(testing.allocator),
+    );
+    try testing.expectError(error.InvalidTransition, attempt.clear());
+    attempt.release();
+
+    // The evidence survives the guard tearing down, so the next mutation is
+    // refused until it is explicitly recovered.
+    try testing.expectError(
+        error.RecoveryRequired,
+        coordinator.acquire(testing.allocator, packageRequest()),
+    );
+    var leftover = (try coordinator.inspect(testing.allocator)).?;
+    defer leftover.deinit();
+    try testing.expectEqual(State.mutation_pending, leftover.record.state);
+}
+
+test "root_operation.test.only the same operation may adopt an unresolved attempt" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    // A bootstrap that mutated the root and then failed after the executor.
+    var first = try coordinator.acquire(testing.allocator, repositoryRequest());
+    try first.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+    try first.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    try first.witness(testing.allocator, .mutation_observed);
+    try first.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+    const stranded = first.record();
+    first.release();
+
+    // A generic mutation intent is still refused: post-executor evidence is
+    // never cleared just because someone asked for the root again.
+    try testing.expectError(
+        error.RecoveryRequired,
+        coordinator.acquire(testing.allocator, repositoryRequest()),
+    );
+
+    // Neither a different surface, a different request, a different policy, a
+    // different backend, nor a different architecture may adopt it, and none
+    // of them overwrite the evidence.
+    const mismatches = [_]Request{
+        blk: {
+            var request = packageRequest();
+            request.intent = .same_operation;
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.request_sha256 = @splat(0x77);
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.policy_sha256 = @splat(0x78);
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.backend = .native;
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.target_architecture = "arm64";
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.foreign_architectures = &.{"i386"};
+            break :blk request;
+        },
+        blk: {
+            var request = repositoryRequest();
+            request.intent = .same_operation;
+            request.evidence = .{ .plan_sha256 = @splat(0x79) };
+            break :blk request;
+        },
+    };
+    for (mismatches) |request| {
+        try testing.expectError(
+            error.AttemptMismatch,
+            coordinator.acquire(testing.allocator, request),
+        );
+        var observed = (try coordinator.inspect(testing.allocator)).?;
+        defer observed.deinit();
+        try testing.expectEqualSlices(
+            u8,
+            &stranded.digest_sha256,
+            &observed.record.digest_sha256,
+        );
+    }
+
+    // The same request adopts its own evidence, resumes through the durable
+    // recovery edges, and only then discharges the intent.
+    var resumed_request = repositoryRequest();
+    resumed_request.intent = .same_operation;
+    resumed_request.attempt_id = @splat(0x5a);
+    var resumed = try coordinator.acquire(testing.allocator, resumed_request);
+    try testing.expect(resumed.adopted);
+    // The adopted attempt keeps the original identifier, so the evidence chain
+    // is continuous rather than restarted.
+    try testing.expectEqualSlices(u8, &stranded.attempt_id, &resumed.attemptId());
+    try testing.expectEqual(State.verifying, resumed.record().state);
+    try resumed.beginRecovery(testing.allocator, .verification);
+    try resumed.complete(testing.allocator, .recovered);
+    try resumed.publishProvenance(testing.allocator, @splat(0xab));
+    try resumed.clear();
+    resumed.release();
+    try testing.expect((try coordinator.inspect(testing.allocator)) == null);
+}
+
+test "root_operation.test.same-operation adoption still reclaims a settled record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    // A leftover pre-mutation record from an unrelated operation is durable
+    // proof that nothing was touched, so a different request is not locked out
+    // by it. Availability never comes at the price of evidence.
+    var abandoned = try coordinator.acquire(testing.allocator, packageRequest());
+    try abandoned.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+    abandoned.release();
+
+    var request = repositoryRequest();
+    request.intent = .same_operation;
+    request.existing = .reclaim_resolved;
+    request.attempt_id = @splat(0x61);
+    var reclaimed = try coordinator.acquire(testing.allocator, request);
+    defer reclaimed.release();
+    try testing.expect(!reclaimed.adopted);
+    try testing.expectEqual(State.reserved, reclaimed.record().state);
+    // The generation keeps climbing, so a stale writer that resumed from the
+    // reclaimed view still loses the compare-and-set.
+    try testing.expectEqual(@as(u64, 3), reclaimed.record().generation);
+}
+
+test "root_operation.test.a stale same-operation writer cannot overwrite newer evidence" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    var request = repositoryRequest();
+    request.intent = .same_operation;
+    var first = try coordinator.acquire(testing.allocator, request);
+    try first.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+    try first.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    first.release();
+
+    // The rerun adopts the record and moves it forward.
+    var second = try coordinator.acquire(testing.allocator, request);
+    try second.witness(testing.allocator, .mutation_observed);
+    try second.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+    second.release();
+
+    // A writer that still holds the older view is refused rather than allowed
+    // to roll the attempt back to the bridge.
+    var stale = try coordinator.acquire(testing.allocator, request);
+    defer stale.release();
+    stale.owned.record.generation -= 2;
+    try testing.expectError(
+        error.StaleAttempt,
+        stale.advance(testing.allocator, .{ .state = .verifying, .phase = .verification }),
+    );
 }
 
 test "root_operation.test.provenance is published before the active intent is cleared" {
