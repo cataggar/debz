@@ -1,0 +1,224 @@
+{
+  "schema": "https://debz.dev/test/native-transaction-corpus-v1",
+  "version": 1,
+  "architectures": ["amd64", "arm64"],
+  "scenarios": [
+    {
+      "id": "fresh-install",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["regular-file", "directory", "md5sums"],
+      "expected": "success"
+    },
+    {
+      "id": "essential-bootstrap",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["essential", "bootstrap", "maintainer-script"],
+      "expected": "success"
+    },
+    {
+      "id": "pre-depends-order",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["pre-depends", "maintainer-script", "ordering"],
+      "expected": "success"
+    },
+    {
+      "id": "dependency-cycle",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["depends", "cycle", "configure-order"],
+      "expected": "success"
+    },
+    {
+      "id": "upgrade",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["old-prerm", "new-preinst", "old-postrm", "new-postinst"],
+      "expected": "success"
+    },
+    {
+      "id": "downgrade",
+      "initial": "healthy",
+      "operations": ["downgrade"],
+      "features": ["version-transition", "maintainer-script"],
+      "expected": "success"
+    },
+    {
+      "id": "reinstall",
+      "initial": "healthy",
+      "operations": ["reinstall"],
+      "features": ["same-version", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "remove",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["prerm", "postrm", "config-files-state"],
+      "expected": "success"
+    },
+    {
+      "id": "purge",
+      "initial": "healthy",
+      "operations": ["purge"],
+      "features": ["postrm-purge", "conffile-delete", "not-installed-state"],
+      "expected": "success"
+    },
+    {
+      "id": "file-ownership-conflict",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "conflict"],
+      "expected": "failure"
+    },
+    {
+      "id": "replaces-owned-file",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "replaces", "breaks"],
+      "expected": "success"
+    },
+    {
+      "id": "directory-symlink-transition",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["directory", "symlink", "path-transition"],
+      "expected": "success"
+    },
+    {
+      "id": "hardlink-payload",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["regular-file", "hardlink"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-unmodified-upgrade",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["conffile", "unmodified"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-keep-existing",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "keep-existing", "dpkg-dist"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-use-package-version",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "use-package-version", "dpkg-old"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-remove-on-upgrade",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["conffile", "remove-on-upgrade"],
+      "expected": "success"
+    },
+    {
+      "id": "preinst-failure",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["preinst", "failure-state"],
+      "expected": "failure"
+    },
+    {
+      "id": "postinst-failure",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["postinst", "half-configured"],
+      "expected": "failure"
+    },
+    {
+      "id": "prerm-failure",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["prerm", "failure-state"],
+      "expected": "failure"
+    },
+    {
+      "id": "postrm-failure",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["postrm", "failure-state"],
+      "expected": "failure"
+    },
+    {
+      "id": "trigger-await",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["interest-await", "activate", "triggers-awaited"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-noawait",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["interest-noawait", "activate-noawait", "triggers-pending"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-failure",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["triggered-postinst", "failure-state", "recovery"],
+      "expected": "recovery-required"
+    },
+    {
+      "id": "trigger-cycle-no-progress",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["trigger-cycle", "no-progress"],
+      "expected": "failure"
+    },
+    {
+      "id": "healthy-root-import",
+      "initial": "imported",
+      "operations": ["install"],
+      "features": ["status", "info", "triggers", "diversions", "statoverride"],
+      "expected": "success"
+    },
+    {
+      "id": "corrupt-root-rejected",
+      "initial": "corrupt",
+      "operations": ["install"],
+      "features": ["database-corruption", "preflight"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "external-database-change",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["database-generation", "concurrency"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "filesystem-interruption",
+      "initial": "healthy",
+      "operations": ["upgrade", "recover"],
+      "features": ["crash-injection", "filesystem", "recovery"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "database-interruption",
+      "initial": "healthy",
+      "operations": ["upgrade", "recover"],
+      "features": ["crash-injection", "database", "recovery"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "script-outcome-unknown",
+      "initial": "healthy",
+      "operations": ["upgrade", "recover"],
+      "features": ["crash-injection", "maintainer-script", "ambiguous-outcome"],
+      "expected": "recovery-required"
+    }
+  ]
+}
