@@ -34,6 +34,7 @@ const state_corpus = &.{
     @embedFile("corpus/state/journal"),
     @embedFile("corpus/state/repository-result.json"),
     @embedFile("corpus/state/repository-add-state.json"),
+    @embedFile("corpus/state/root-operation.json"),
 };
 
 fn input(smith: *std.testing.Smith, storage: *[max_input]u8) []const u8 {
@@ -406,6 +407,10 @@ fn exerciseState(bytes: []const u8) !void {
         var state = value;
         state.deinit();
     } else |_| {}
+    if (debz.root_operation.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var record = value;
+        record.deinit();
+    } else |_| {}
 }
 
 test "fuzz.deterministic bounded mutation smoke" {
@@ -438,6 +443,18 @@ fn smokeCorpus(
             };
         }
     }
+}
+
+test "fuzz.corpus root operation seed stays canonical and self-consistent" {
+    var record = try debz.root_operation.decode(
+        std.testing.allocator,
+        @embedFile("corpus/state/root-operation.json"),
+        debz.root_operation.maximum_document_bytes,
+    );
+    defer record.deinit();
+    try std.testing.expect(record.record.mutation_started);
+    try std.testing.expect(record.record.state.blocksMutation());
+    try std.testing.expect(!record.record.clearable());
 }
 
 test "fuzz.corpus native transaction program seeds stay canonical" {

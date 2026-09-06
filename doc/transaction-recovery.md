@@ -42,3 +42,20 @@ directory and refuses symlinked path components. `SystemStatusFileReader`
 securely walks and reads only the explicit install root.
 Process, filesystem, locks, journal, status, cancellation, and crash points are
 all injectable for host-isolated testing.
+
+## Root operation coordination
+
+The transaction journal remains the command-level recovery authority, but it is
+no longer the only durable evidence. Every mutating product operation and every
+repository bootstrap first reserves the shared root attempt described in
+[root-scoped operation coordination](root-operation.md). The root mutation lock
+is rank 0 of the total lock order and is taken before the journal, the package
+cache, and the executor's target locks; it is held through provenance
+publication and the clearing of the active intent.
+
+The durable record classifies an interrupted operation. `reserved` and
+`preflight` prove no mutation and are cleared automatically. `mutation_pending`
+means control reached the command-oriented executor and is resolved only by an
+explicit witness: zero executed commands proves nothing started, anything else
+records mutation evidence. From `mutating` onwards a second mutation is refused
+until an explicit recovery completes and publishes provenance.

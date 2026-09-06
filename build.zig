@@ -267,6 +267,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-program", "Run native transaction program compiler tests")
         .dependOn(&run_native_program_tests.step);
 
+    const root_operation_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{ "root_operation.test.", "root_fs.test." },
+    });
+    const run_root_operation_tests = b.addRunArtifact(root_operation_tests);
+    b.step("test-root-operation", "Run root operation lock and active-record tests")
+        .dependOn(&run_root_operation_tests.step);
+
     const refresh_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"repository_refresh.test."},
@@ -457,6 +465,7 @@ fn installReleaseFiles(
         "release-tooling.md",
         "releasing.md",
         "root-filesystem.md",
+        "root-operation.md",
         "safety-ci.md",
         "solver-planning.md",
         "threat-model.md",
@@ -477,6 +486,7 @@ fn installReleaseFiles(
         "package-cache-result-v1.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
+        "root-operation-record-v1.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",

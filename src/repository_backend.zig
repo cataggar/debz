@@ -15,6 +15,8 @@ const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
+const root_fs = @import("root_fs.zig");
+const root_operation = @import("root_operation.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const target_apt_config = @import("target_apt_config.zig");
@@ -87,6 +89,15 @@ pub const Backend = struct {
         var paths = try ResolvedPaths.init(allocator, request);
         defer paths.deinit();
 
+        // Rank 0 of the total lock order. Repository bootstrap shares the
+        // root's operation namespace with package transactions, so neither can
+        // start while the other holds an unresolved attempt. The transaction
+        // backend was already selected above, so an unavailable native
+        // selection still fails before any root access.
+        var guard: RootOperationGuard = .{ .io = self.io, .allocator = allocator };
+        defer guard.deinit();
+        if (guard.open(request, self.transaction_backend, self.now_unix)) |failure| return failure;
+
         var production_acquisition = repository_acquisition.Production{ .io = self.io };
         const acquisition_dependencies = self.acquisition_dependencies orelse
             production_acquisition.dependencies();
@@ -122,6 +133,12 @@ pub const Backend = struct {
 
         const operation_locks = self.operation_locks orelse
             operation_lock_manager.interface();
+        guard.enterRank(.repository_operation) catch return api.failure(
+            .internal,
+            .internal_error,
+            "lock",
+            "repository operation lock was requested out of order",
+        );
         const operation_lock_wait = budget.remainingTime() catch |err|
             return api.failure(
                 .unavailable,
@@ -191,6 +208,7 @@ pub const Backend = struct {
         );
         defer before_snapshot.deinit();
         const architecture = before_snapshot.manifest.manifest.native_architecture;
+        if (guard.preflight(architecture)) |failure| return failure;
         if (prior_state) |*prior| {
             if (!std.mem.eql(u8, prior.state.root, request.root) or
                 !std.mem.eql(u8, prior.state.architecture, architecture) or
@@ -1273,6 +1291,15 @@ pub const Backend = struct {
                 recovery_needed = true;
             };
             if (!recovery_needed) {
+                // Verification only. The target locks are still taken beneath
+                // the root operation lock, so the established order holds.
+                guard.enterRank(.target_database) catch return api.failure(
+                    .internal,
+                    .internal_error,
+                    "lock",
+                    "target locks were requested out of order",
+                );
+                defer guard.exitRank(.target_database);
                 const transaction_lock_path = try rootPath(
                     allocator,
                     request.root,
@@ -1414,6 +1441,19 @@ pub const Backend = struct {
             }
         }
         if (!skip_install or recovery_needed) {
+            // Handing control to the command-oriented executor is the point
+            // after which this backend can no longer prove that the root was
+            // untouched. The durable bridge is published before the executor
+            // takes any target lock and is resolved from the executor's own
+            // command evidence below.
+            if (guard.enterExecutor()) |failure| return progress.fail(
+                state_store,
+                allocator,
+                failure.exit_status,
+                failure.diagnostics[0].id,
+                "root-operation",
+                failure.diagnostics[0].message,
+            );
             var system_process = transaction_executor.SystemProcessRunner{
                 .allocator = allocator,
                 .io = self.io,
@@ -1518,6 +1558,18 @@ pub const Backend = struct {
                 value.succeeded()
             else
                 report.?.succeeded();
+            const commands_run = if (recovery_report) |value|
+                value.commands.len != 0
+            else
+                report.?.commands.len != 0;
+            if (guard.observe(commands_run, succeeded)) |failure| return progress.fail(
+                state_store,
+                allocator,
+                failure.exit_status,
+                failure.diagnostics[0].id,
+                "root-operation",
+                failure.diagnostics[0].message,
+            );
             if (!succeeded) {
                 if (descriptorIdentityInstalled(
                     allocator,
@@ -1573,7 +1625,7 @@ pub const Backend = struct {
                 "executor report does not match the persisted plan and verification policy",
             );
 
-            if (recovery_report) |value|
+            progress.provenance_sha256 = if (recovery_report) |value|
                 publishRecoveryProvenance(
                     allocator,
                     self.io,
@@ -1857,9 +1909,239 @@ pub const Backend = struct {
             "complete",
             @errorName(err),
         );
+        if (guard.finish(progress.provenanceDigest())) |failure| return progress.fail(
+            state_store,
+            allocator,
+            failure.exit_status,
+            failure.diagnostics[0].id,
+            "root-operation",
+            failure.diagnostics[0].message,
+        );
         return progress.success(allocator);
     }
 };
+
+/// Owns rank 0 of the total lock order for one repository bootstrap. It
+/// reserves the shared root attempt before the repository operation lock, so
+/// a repository add and a package transaction can never mutate one root at the
+/// same time, and it resolves the command-oriented executor bridge from the
+/// executor's own evidence rather than assuming a mutation happened.
+const RootOperationGuard = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    owned_root: ?root_fs.OwnedRoot = null,
+    locks: root_operation.SystemLockBackend = undefined,
+    coordinator: root_operation.Coordinator = undefined,
+    attempt: ?root_operation.Attempt = null,
+
+    fn open(
+        self: *RootOperationGuard,
+        request: api.Request,
+        backend: transaction_engine.Kind,
+        now_unix: ?i64,
+    ) ?api.Result {
+        self.owned_root = root_fs.openAbsoluteRoot(self.io, request.root) catch
+            return api.failure(
+                .usage,
+                .invalid_root,
+                "target",
+                "target root is unsafe or unavailable",
+            );
+        self.locks = .{ .allocator = self.allocator, .io = self.io };
+        self.coordinator = root_operation.Coordinator.open(
+            self.io,
+            self.owned_root.?.root,
+            request.root,
+            self.locks.interface(),
+        ) catch |err| return mapRootOperationError(err);
+        self.coordinator.now_unix = now_unix;
+        self.attempt = self.coordinator.acquire(self.allocator, .{
+            .intent = .mutation,
+            .existing = .reclaim_resolved,
+            .backend = backend,
+            .operation = .{ .repository_bootstrap = .add },
+            .request_sha256 = repositoryRequestDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = request.architecture orelse "all",
+            .wait_ms = request.state.lock_wait_ms,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    /// Pointer to the live attempt, never a copy: every boundary must be
+    /// published on the record this guard owns.
+    fn active(self: *RootOperationGuard) ?*root_operation.Attempt {
+        if (self.attempt) |*value| return value;
+        return null;
+    }
+
+    fn enterRank(self: *RootOperationGuard, rank: root_operation.Rank) !void {
+        var attempt = self.active() orelse return;
+        try attempt.enterRank(rank);
+    }
+
+    fn preflight(self: *RootOperationGuard, architecture: []const u8) ?api.Result {
+        _ = architecture;
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state != .reserved) return null;
+        attempt.advance(self.allocator, .{
+            .state = .preflight,
+            .phase = .preflight,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    fn enterExecutor(self: *RootOperationGuard) ?api.Result {
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state == .mutation_pending) return null;
+        attempt.advance(self.allocator, .{
+            .state = .mutation_pending,
+            .phase = .mutation,
+        }) catch |err| return mapRootOperationError(err);
+        attempt.enterRank(.target_database) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    fn exitRank(self: *RootOperationGuard, rank: root_operation.Rank) void {
+        var attempt = self.active() orelse return;
+        attempt.exitRank(rank);
+    }
+
+    fn observe(self: *RootOperationGuard, mutation_observed: bool, succeeded: bool) ?api.Result {
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state == .mutation_pending) attempt.witness(
+            self.allocator,
+            if (mutation_observed) .mutation_observed else .proved_not_started,
+        ) catch |err| return mapRootOperationError(err);
+        if (!attempt.record().mutation_started) return null;
+        if (!succeeded) {
+            attempt.requireRecovery(self.allocator, .mutation) catch |err|
+                return mapRootOperationError(err);
+            return null;
+        }
+        if (attempt.record().state == .mutating) attempt.advance(self.allocator, .{
+            .state = .verifying,
+            .phase = .verification,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    fn finish(self: *RootOperationGuard, document_sha256: ?[32]u8) ?api.Result {
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state == .completed) return null;
+        if (attempt.record().state == .verifying) {
+            attempt.complete(self.allocator, .succeeded) catch |err|
+                return mapRootOperationError(err);
+        } else if (attempt.record().state.provenPreMutation()) {
+            attempt.complete(self.allocator, .abandoned_before_mutation) catch |err|
+                return mapRootOperationError(err);
+        } else return null;
+        const record = attempt.record();
+        if (record.provenance == .pending) attempt.publishProvenance(
+            self.allocator,
+            root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .document_sha256 = document_sha256,
+                .journal_archived = true,
+            }),
+        ) catch |err| return mapRootOperationError(err);
+        attempt.clear() catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    fn deinit(self: *RootOperationGuard) void {
+        if (self.attempt) |*value| {
+            // An attempt that is durably proven never to have mutated the root
+            // is released rather than left behind. Anything at or past the
+            // executor bridge stays exactly as published, so the next mutation
+            // is refused until it is explicitly recovered. A failure here
+            // simply leaves the pre-mutation record, which the next attempt
+            // reports as an unresolved attempt.
+            if (value.locked()) {
+                if (value.record().state.provenPreMutation())
+                    value.abandonIfPreMutation(self.allocator) catch {}
+                else if (value.record().clearable()) value.clear() catch {};
+            }
+            value.release();
+        }
+        self.attempt = null;
+        if (self.owned_root) |*value| value.close();
+        self.owned_root = null;
+    }
+};
+
+fn mapRootOperationError(err: anyerror) api.Result {
+    return switch (err) {
+        error.LockTimeout, error.LockUnavailable, error.LockCanceled => api.failure(
+            .unavailable,
+            .recovery_required,
+            "root-operation",
+            "another debz operation holds the root mutation lock",
+        ),
+        error.OperationInProgress, error.ResolvedAttemptPresent => api.failure(
+            .recovery,
+            .recovery_required,
+            "root-operation",
+            "an interrupted debz operation left an unresolved root attempt",
+        ),
+        error.RecoveryRequired, error.ProvenancePending, error.RootIdentityMismatch => api.failure(
+            .recovery,
+            .recovery_required,
+            "root-operation",
+            "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.RecordCorrupt, error.UnsupportedSchema => api.failure(
+            .recovery,
+            .state_corrupt,
+            "root-operation",
+            "the active root attempt record is unreadable",
+        ),
+        error.InvalidRoot, error.RootTooLong, error.NamespaceUnavailable => api.failure(
+            .usage,
+            .invalid_root,
+            "target",
+            "target root cannot host the debz operation namespace",
+        ),
+        else => api.failure(
+            .internal,
+            .internal_error,
+            "root-operation",
+            "root operation coordination failed",
+        ),
+    };
+}
+
+/// Bounded digest of the reviewed repository request.
+fn repositoryRequestDigest(request: api.Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-repository-request-v1\x00");
+    hash.update(@tagName(request.operation));
+    hash.update("\x00");
+    hash.update(request.root);
+    hash.update("\x00");
+    hash.update(request.descriptor_url);
+    hash.update("\x00");
+    hash.update(request.architecture orelse "");
+    hash.update("\x00");
+    if (request.expected_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    hash.update(if (request.no_refresh) "\x01" else "\x00");
+    return hash.finalResult();
+}
+
+fn repositoryPolicyDigest(request: api.Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-repository-policy-v1\x00");
+    hash.update(if (request.no_refresh) "\x01" else "\x00");
+    hash.update(if (request.state.path) |value| value else "");
+    hash.update("\x00");
+    hash.update(if (request.cache.path) |value| value else "");
+    hash.update("\x00");
+    hash.update(if (request.network.proxy_url) |value| value else "");
+    return hash.finalResult();
+}
 
 const Progress = struct {
     root: []const u8,
@@ -1882,11 +2164,18 @@ const Progress = struct {
     plan_sha256: ?[32]u8 = null,
     exact_lock_path: ?[]const u8 = null,
     provenance_path: ?[]const u8 = null,
+    provenance_sha256: ?[32]u8 = null,
     manifest_path: ?[]const u8 = null,
     managed_files: []const state_module.FileEvidence = &.{},
     durable_phase: state_module.Phase = .initialized,
     diagnostic_id: ?api.DiagnosticId = null,
     diagnostic: []const u8 = "",
+
+    /// Digest of the transaction provenance document published for this
+    /// operation, when one exists.
+    fn provenanceDigest(self: *const Progress) ?[32]u8 {
+        return self.provenance_sha256;
+    }
 
     fn persist(
         self: *Progress,
@@ -3395,7 +3684,7 @@ fn publishProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.Report,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     return publishBoundProvenance(
         allocator,
         io,
@@ -3415,7 +3704,7 @@ fn publishRecoveryProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.RecoveryReport,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     return publishBoundProvenance(
         allocator,
         io,
@@ -3440,7 +3729,7 @@ fn publishBoundProvenance(
     lock: *const exact_lock_v2.Lock,
     report: ProvenanceReport,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     _ = refreshed;
     const repositories = try allocator.alloc(
         transaction_provenance_v2.RepositoryEvidence,
@@ -3528,6 +3817,7 @@ fn publishBoundProvenance(
         provenance_name,
     );
     try store.writeAtomic(allocator, provenance.result);
+    return provenance.result.digest_sha256;
 }
 
 fn verifyInstalledDescriptor(
@@ -5227,7 +5517,7 @@ test "repository backend holds bounded target locks for idempotent verification"
                 .failure = null,
             };
             defer report.deinit();
-            try publishProvenance(
+            _ = try publishProvenance(
                 std.testing.allocator,
                 std.testing.io,
                 operation_dir,
@@ -7124,4 +7414,114 @@ test "repository backend rejects unavailable native transaction before root acce
         result.diagnostics[0].id,
     );
     try std.testing.expect(!result.changed);
+}
+
+test "repository backend refuses bootstrap while a package transaction attempt is unresolved" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(root_path);
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const root: root_fs.Root = .init(std.testing.io, root_dir);
+    const store = root_operation.Store.init(root);
+    try store.ensureNamespace();
+    var record = try root_operation.create(std.testing.allocator, .{
+        .attempt_id = @splat(0x5b),
+        .generation = 1,
+        .install_root = root_path,
+        .backend = .legacy_dpkg,
+        .operation = .{ .package_transaction = .install },
+        .state = .mutating,
+        .phase = .database,
+        .step = 5,
+        .mutation_started = true,
+        .outcome = .pending,
+        .provenance = .pending,
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .reserved_unix = 1_700_000_000,
+        .updated_unix = 1_700_000_000,
+    });
+    defer record.deinit();
+    try store.writeAtomic(std.testing.allocator, record.record);
+
+    var backend: Backend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = @splat(0x33),
+        .architecture = "amd64",
+        .cache = .{ .path = "/var/cache/debz" },
+        .state = .{ .path = "/var/lib/debz" },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.recovery_required,
+        result.diagnostics[0].id,
+    );
+
+    // The blocked bootstrap never reached the repository operation lock, so the
+    // durable package-transaction evidence is untouched.
+    var observed = (try store.read(std.testing.allocator)).?;
+    defer observed.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &record.record.digest_sha256,
+        &observed.record.digest_sha256,
+    );
+}
+
+test "repository backend rejects an unavailable native backend before root access" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(root_path);
+
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+        .native_executor = null,
+        .now_unix = 1_700_000_000,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = @splat(0x33),
+        .architecture = "amd64",
+        .cache = .{ .path = "/var/cache/debz" },
+        .state = .{ .path = "/var/lib/debz" },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.transaction_backend_unavailable,
+        result.diagnostics[0].id,
+    );
+
+    // The unavailable selection failed before anything touched the root, so the
+    // shared operation namespace was never provisioned.
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.statFile(std.testing.io, "root/var/lib/debz", .{}),
+    );
 }

@@ -113,6 +113,8 @@ pub const ErrorId = enum {
     transaction_backend_unavailable,
     transaction_failed,
     recovery_failed,
+    root_operation_conflict,
+    root_operation_recovery_required,
     lock_verification_failed,
     internal_error,
 };

@@ -59,6 +59,19 @@ link, refuses absolute, traversing, and control-byte paths before any syscall,
 creates only exclusively, and replaces existing paths only through fsynced
 staged publication. See [Root-anchored filesystem primitives](root-filesystem.md).
 
+`debz.root_operation` is the single mutation gate for a selected root. One root
+mutation lock and one durable, versioned active-attempt record in the root's
+`var/lib/debz` namespace are shared by repository bootstrap and package
+transactions, so two debz operations can never mutate one root at once. The
+record binds the attempt identity, root identity, backend, operation surface,
+authorization/program/plan/request/policy/exact-lock digests, package-database
+base generation, artifact evidence, architectures, durable phase and step,
+sticky mutation evidence, and provenance publication state. Transitions are
+monotonic, idempotent, and compare-and-set, an interrupted attempt is
+classified as safely abandoned before mutation or recovery required, and the
+active intent is cleared only after provenance is published. See
+[Root-scoped operation coordination](root-operation.md).
+
 ## Typed metadata and archives
 
 The project exposes typed configuration and request APIs, a CLI command vocabulary, and bounded parsers for DEB822, Debian versions, binary package relations, control records, repository `Release` metadata, repository source configuration, and Debian binary package outer archives.

@@ -9,6 +9,8 @@ const package_cache_workflow = @import("package_cache_workflow.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
+const root_fs = @import("root_fs.zig");
+const root_operation = @import("root_operation.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const transaction_engine = @import("transaction_engine.zig");
@@ -406,6 +408,19 @@ pub const Backend = struct {
         if (request.options.keyring_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "authenticated repository command requires --keyring");
 
+        // Rank 0 of the total lock order. Every root mutation this backend can
+        // reach — acquisition staging, the transaction journal, and the
+        // executor's own target locks — happens inside this attempt, so a
+        // repository bootstrap or a second package transaction cannot overlap
+        // it. The selected transaction backend was already proven available in
+        // `route`, so an unavailable native selection still fails before any
+        // root access.
+        var guard: RootOperationGuard = .{ .backend = self, .allocator = allocator };
+        defer guard.deinit();
+        if (rootOperationSurface(request.operation)) |operation| {
+            if (guard.open(allocator, request, operation)) |failure| return failure;
+        }
+
         const repository_options: RepositoryOptions = .{
             .source_paths = request.options.source_paths,
             .config_paths = request.options.config_paths,
@@ -600,6 +615,18 @@ pub const Backend = struct {
         }
         if (request.operation == .plan) return planResult(allocator, request.operation, plan.*);
 
+        // The reviewed plan and the exact lock it was resolved against are the
+        // preflight evidence for this attempt. Binding them before acquisition
+        // means a resumed attempt can prove which plan it was reserved for.
+        if (try guard.preflight(allocator, request.operation, .{
+            .plan_sha256 = transaction_executor.planDigest(plan.*),
+            .exact_lock = if (lock) |*value| .{
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = value.lock.digest_sha256,
+            } else null,
+        })) |failure| return failure;
+
         var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
         });
@@ -733,6 +760,9 @@ pub const Backend = struct {
         };
         if (request.operation == .recover) {
             const executor = self.selectedExecutor() catch unreachable;
+            // The journal is command-oriented, so the bridge stays pending
+            // until the executor reports which commands it replayed.
+            if (try guard.enterExecutor(allocator, request.operation)) |failure| return failure;
             var report = try executor.recover(allocator, .{
                 .plan = plan,
                 .install_root = request.options.install_root,
@@ -740,16 +770,35 @@ pub const Backend = struct {
                 .exact_lock = if (lock) |*value| &value.lock else null,
             }, dependencies);
             defer report.deinit();
-            if (!report.succeeded())
+            if (!report.succeeded()) {
+                if (try guard.observe(
+                    allocator,
+                    request.operation,
+                    report.commands.len != 0 or report.state != .not_started,
+                    .failed,
+                )) |failure| return failure;
                 return api.failure(request.operation, .recovery, .recovery_failed, if (report.failure) |failure|
                     try describeExecutorFailure(allocator, "recovery", failure)
                 else
                     "recovery failed");
+            }
+            if (try guard.observe(
+                allocator,
+                request.operation,
+                report.commands.len != 0,
+                .recovered,
+            )) |failure| return failure;
             try deleteRecoveryIntent(self.io, request.options.state_path);
+            if (try guard.finish(allocator, request.operation)) |failure| return failure;
             return success(request.operation, true, "transaction recovery completed", &.{});
         }
         try writeRecoveryIntent(allocator, self.io, request.options.state_path, effective_request);
         const executor = self.selectedExecutor() catch unreachable;
+        // Handing control to the command-oriented executor is the point after
+        // which this backend can no longer prove that nothing was mutated. The
+        // record is durably marked pending here and resolved from the
+        // executor's own command evidence below.
+        if (try guard.enterExecutor(allocator, request.operation)) |failure| return failure;
         var report = try executor.execute(allocator, .{
             .plan = plan,
             .install_root = request.options.install_root,
@@ -758,11 +807,24 @@ pub const Backend = struct {
             .exact_lock = if (lock) |*value| &value.lock else null,
         }, dependencies);
         defer report.deinit();
-        if (!report.succeeded())
+        if (!report.succeeded()) {
+            if (try guard.observe(
+                allocator,
+                request.operation,
+                report.commands.len != 0,
+                .failed,
+            )) |failure| return failure;
             return api.failure(request.operation, .transaction, .transaction_failed, if (report.failure) |failure|
                 try describeExecutorFailure(allocator, "transaction", failure)
             else
                 "transaction failed");
+        }
+        if (try guard.observe(
+            allocator,
+            request.operation,
+            report.commands.len != 0,
+            .succeeded,
+        )) |failure| return failure;
         try deleteRecoveryIntent(self.io, request.options.state_path);
         if (lock) |*value| {
             var verify: transaction_provenance.VerifyDiagnostic = .{};
@@ -792,6 +854,7 @@ pub const Backend = struct {
                 else => return err,
             };
         }
+        if (try guard.finish(allocator, request.operation)) |failure| return failure;
         return planResultChanged(allocator, request.operation, plan.*, true, "transaction completed");
     }
 
@@ -906,6 +969,305 @@ const LoadedDocuments = struct {
         self.* = undefined;
     }
 };
+
+/// Mutation surfaces that share the root operation namespace. Query, plan,
+/// download, refresh, and cache operations never reserve the root, so they
+/// stay usable while another attempt holds it.
+fn rootOperationSurface(operation: api.Operation) ?root_operation.Operation {
+    return switch (operation) {
+        .install, .remove, .upgrade, .upgrade_all, .reinstall, .recover => .{
+            .package_transaction = operation,
+        },
+        .refresh,
+        .download,
+        .plan,
+        .list_installed,
+        .list_available,
+        .info,
+        .provides,
+        .why,
+        .clean,
+        => null,
+    };
+}
+
+/// Bounded digest of the reviewed request. It binds exactly what the caller
+/// asked for, so a resumed attempt can prove it belongs to this request.
+fn productRequestDigest(request: api.Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-product-request-v1\x00");
+    hash.update(@tagName(request.operation));
+    hash.update("\x00");
+    hash.update(request.options.install_root);
+    hash.update("\x00");
+    hash.update(request.options.architecture);
+    hash.update("\x00");
+    hash.update(if (request.options.recommends) "\x01" else "\x00");
+    hash.update(@tagName(request.options.repository_policy));
+    hash.update(@tagName(request.options.conffile));
+    hash.update(if (request.options.allow_downgrade) "\x01" else "\x00");
+    for (request.packages) |package| {
+        hash.update(package);
+        hash.update("\x00");
+    }
+    return hash.finalResult();
+}
+
+/// Owns rank 0 of the lock order for one product mutation. It is deliberately
+/// a thin bridge: it reserves the root, publishes each durable boundary the
+/// current command-oriented executor can justify, and resolves the pending
+/// bridge from the executor's own command evidence rather than assuming that
+/// handing over control mutated anything.
+const RootOperationGuard = struct {
+    backend: *Backend,
+    allocator: std.mem.Allocator,
+    owned_root: ?root_fs.OwnedRoot = null,
+    locks: root_operation.SystemLockBackend = undefined,
+    coordinator: root_operation.Coordinator = undefined,
+    attempt: ?root_operation.Attempt = null,
+
+    const Completion = enum { succeeded, failed, recovered };
+
+    /// Pointer to the live attempt, never a copy: every boundary must be
+    /// published on the record this guard owns.
+    fn active(self: *RootOperationGuard) ?*root_operation.Attempt {
+        if (self.attempt) |*value| return value;
+        return null;
+    }
+
+    fn open(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        operation: root_operation.Operation,
+    ) ?api.Result {
+        self.owned_root = root_fs.openAbsoluteRoot(
+            self.backend.io,
+            request.options.install_root,
+        ) catch return api.failure(
+            request.operation,
+            .usage,
+            .invalid_request,
+            "install root is unsafe or unavailable",
+        );
+        self.locks = .{ .allocator = allocator, .io = self.backend.io };
+        self.coordinator = root_operation.Coordinator.open(
+            self.backend.io,
+            self.owned_root.?.root,
+            request.options.install_root,
+            self.locks.interface(),
+        ) catch |err| return mapRootOperationError(request.operation, err);
+        self.coordinator.now_unix = self.backend.now_unix;
+        self.attempt = self.coordinator.acquire(allocator, .{
+            .intent = if (request.operation == .recover) .recovery else .mutation,
+            // A record that never left the pre-mutation states is durable
+            // proof that nothing was touched, so a crashed attempt does not
+            // strand the root. Anything from the executor bridge onwards is
+            // recovery evidence and still refuses a second mutation.
+            .existing = .reclaim_resolved,
+            .backend = self.backend.transaction_backend,
+            .operation = operation,
+            .request_sha256 = productRequestDigest(request),
+            .policy_sha256 = package_cache_workflow.solverPolicyDigest(
+                request.options.recommends,
+                request.options.allow_downgrade,
+                switch (request.options.repository_policy) {
+                    .strict_priority => .strict_priority,
+                    .best_version => .best_version,
+                },
+            ),
+            .target_architecture = request.options.architecture,
+            .wait_ms = request.options.lock_wait_ms,
+        }) catch |err| return mapRootOperationError(request.operation, err);
+        return null;
+    }
+
+    fn preflight(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        operation: api.Operation,
+        evidence: root_operation.Evidence,
+    ) !?api.Result {
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state != .reserved and attempt.record().state != .preflight)
+            return null;
+        attempt.advance(allocator, .{
+            .state = .preflight,
+            .phase = .preflight,
+            .evidence = evidence,
+        }) catch |err| return mapRootOperationError(operation, err);
+        return null;
+    }
+
+    fn enterExecutor(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        operation: api.Operation,
+    ) !?api.Result {
+        var attempt = self.active() orelse return null;
+        switch (attempt.record().state) {
+            // Nothing was mutated yet, so publish the bridge.
+            .reserved, .preflight => attempt.advance(allocator, .{
+                .state = .mutation_pending,
+                .phase = .mutation,
+            }) catch |err| return mapRootOperationError(operation, err),
+            .mutation_pending => {},
+            // An adopted attempt already carries mutation evidence. Recovery
+            // resumes it through the durable recovery boundary instead of
+            // pretending it is a fresh hand-over.
+            .mutating, .verifying, .recovery_required, .recovering => attempt.beginRecovery(
+                allocator,
+                .mutation,
+            ) catch |err| return mapRootOperationError(operation, err),
+            // The attempt already finished; only its provenance is owed.
+            .completed => {},
+        }
+        // The executor takes the target locks next. Declaring the rank keeps
+        // the total lock order enforced for locks this guard does not own.
+        attempt.enterRank(.target_database) catch |err|
+            return mapRootOperationError(operation, err);
+        return null;
+    }
+
+    /// Resolves the bridge from the executor's command evidence. No command
+    /// means no dpkg invocation, which is the only way this backend can prove
+    /// that nothing was mutated.
+    fn observe(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        operation: api.Operation,
+        mutation_observed: bool,
+        completion: Completion,
+    ) !?api.Result {
+        var attempt = self.active() orelse return null;
+        // Already finished; `finish` still owes its provenance.
+        if (attempt.record().state == .completed) return null;
+        if (attempt.record().state == .mutation_pending) {
+            attempt.witness(
+                allocator,
+                if (mutation_observed) .mutation_observed else .proved_not_started,
+            ) catch |err| return mapRootOperationError(operation, err);
+            // No command ran, so the attempt is durably abandoned before any
+            // mutation and needs no further boundary.
+            if (!mutation_observed) return null;
+        }
+        if (!attempt.record().mutation_started) return null;
+        switch (completion) {
+            .succeeded => {
+                attempt.advance(allocator, .{
+                    .state = .verifying,
+                    .phase = .verification,
+                }) catch |err| return mapRootOperationError(operation, err);
+                attempt.complete(allocator, .succeeded) catch |err|
+                    return mapRootOperationError(operation, err);
+            },
+            .recovered => if (attempt.record().state != .completed) {
+                attempt.beginRecovery(allocator, .database) catch |err|
+                    return mapRootOperationError(operation, err);
+                attempt.complete(allocator, .recovered) catch |err|
+                    return mapRootOperationError(operation, err);
+            },
+            // A failure after mutation stays durably unrecovered: the next
+            // mutation is refused until an explicit recovery resolves it.
+            .failed => attempt.requireRecovery(allocator, .mutation) catch |err|
+                return mapRootOperationError(operation, err),
+        }
+        return null;
+    }
+
+    /// Publishes provenance and only then clears the active intent.
+    fn finish(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        operation: api.Operation,
+    ) !?api.Result {
+        var attempt = self.active() orelse return null;
+        const record = attempt.record();
+        if (record.state != .completed) return null;
+        if (record.provenance == .pending) attempt.publishProvenance(
+            allocator,
+            root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .journal_archived = true,
+            }),
+        ) catch |err| return mapRootOperationError(operation, err);
+        attempt.clear() catch |err| return mapRootOperationError(operation, err);
+        return null;
+    }
+
+    fn deinit(self: *RootOperationGuard) void {
+        if (self.attempt) |*value| {
+            // An attempt durably proven never to have mutated the root is
+            // released rather than left behind, and a finished attempt whose
+            // provenance obligation is discharged is cleared. Anything at or
+            // past the executor bridge stays exactly as published, so the next
+            // mutation is refused until it is explicitly recovered. A failure
+            // here simply leaves the record, which the next attempt reports.
+            if (value.locked()) {
+                if (value.record().state.provenPreMutation())
+                    value.abandonIfPreMutation(self.allocator) catch {}
+                else if (value.record().clearable()) value.clear() catch {};
+            }
+            value.release();
+        }
+        self.attempt = null;
+        if (self.owned_root) |*value| value.close();
+        self.owned_root = null;
+    }
+};
+
+fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
+    return switch (err) {
+        error.LockTimeout, error.LockUnavailable => api.failure(
+            operation,
+            .unavailable,
+            .root_operation_conflict,
+            "another debz operation holds the root mutation lock",
+        ),
+        error.LockCanceled => api.failure(
+            operation,
+            .unavailable,
+            .root_operation_conflict,
+            "root mutation lock acquisition was cancelled",
+        ),
+        error.OperationInProgress, error.ResolvedAttemptPresent => api.failure(
+            operation,
+            .recovery,
+            .root_operation_conflict,
+            "an interrupted debz operation left an unresolved root attempt",
+        ),
+        error.RecoveryRequired, error.ProvenancePending => api.failure(
+            operation,
+            .recovery,
+            .root_operation_recovery_required,
+            "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.RootIdentityMismatch => api.failure(
+            operation,
+            .recovery,
+            .root_operation_recovery_required,
+            "the active root attempt belongs to a different root",
+        ),
+        error.RecordCorrupt, error.UnsupportedSchema => api.failure(
+            operation,
+            .recovery,
+            .root_operation_recovery_required,
+            "the active root attempt record is unreadable",
+        ),
+        error.InvalidRoot, error.RootTooLong, error.NamespaceUnavailable => api.failure(
+            operation,
+            .usage,
+            .invalid_request,
+            "install root cannot host the debz operation namespace",
+        ),
+        else => api.failure(
+            operation,
+            .internal,
+            .internal_error,
+            "root operation coordination failed",
+        ),
+    };
+}
 
 const CredentialContext = struct {
     authorization: []const u8,

@@ -22,6 +22,7 @@
 - [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
 - [Native transaction engine v1 compatibility contract](native-transaction-engine-v1.md) defines the package, database, lifecycle, durability, and differential-test boundary required before replacing dpkg.
 - [Native transaction program v1](native-transaction-program.md) documents the pre-mutation program compiler: its inputs, typed steps, lifecycle expansion, validation, determinism, digest binding, and engine wiring.
+- [Root-scoped operation coordination](root-operation.md) documents the shared root mutation lock, the durable active-attempt record, the total lock order, the state machine, and the recovery contract for repository bootstrap and package transactions.
 - [Root-anchored filesystem primitives](root-filesystem.md) documents the traversal-safe path grammar, no-follow resolution, exclusive creation, atomic publication, and durability rules used by the native engine.
 - [Audited maintainer-script runner](maintainer-script-runner.md) documents the native maintainer-script contract: pre-spawn rejection, root isolation, environment allowlist, bounded output and runtime, process-tree termination, outcome taxonomy, and provenance evidence.
 - [Hermetic integration roots](integration-roots.md) documents deterministic signed fixtures, disposable native/foreign roots, CI lanes, and local prerequisites.

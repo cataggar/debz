@@ -392,3 +392,397 @@ test "production customize failure reports structured diagnostics without leakin
     try std.testing.expect(std.mem.indexOf(u8, result.summary, "phase=") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.summary, "package=removable") != null);
 }
+
+fn writeBlockingRootAttempt(
+    dir: std.Io.Dir,
+    install_root: []const u8,
+    operation: debz.root_operation.Operation,
+    state: debz.root_operation.State,
+) !void {
+    const root: debz.root_fs.Root = .init(std.testing.io, dir);
+    const store = debz.root_operation.Store.init(root);
+    try store.ensureNamespace();
+    var record = try debz.root_operation.create(std.testing.allocator, .{
+        .attempt_id = @splat(0x5a),
+        .generation = 1,
+        .install_root = install_root,
+        .backend = .legacy_dpkg,
+        .operation = operation,
+        .state = state,
+        .phase = if (state == .mutation_pending) .mutation else .mutation,
+        .step = 3,
+        .mutation_started = state != .mutation_pending,
+        .outcome = .pending,
+        .provenance = .pending,
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .reserved_unix = 1_700_000_000,
+        .updated_unix = 1_700_000_000,
+    });
+    defer record.deinit();
+    try store.writeAtomic(std.testing.allocator, record.record);
+}
+
+test "production package mutation is refused while a repository attempt is unresolved" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.gpg", .data = "" });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "",
+    });
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const base = real_buffer[0..real_length];
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{base});
+    defer std.testing.allocator.free(install_root);
+    const keyring_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/keyring.gpg", .{base});
+    defer std.testing.allocator.free(keyring_path);
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sources.list", .{base});
+    defer std.testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cache", .{base});
+    defer std.testing.allocator.free(cache_path);
+    const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state", .{base});
+    defer std.testing.allocator.free(state_path);
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s}/repo stable main\n",
+        .{ keyring_path, base },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = source_bytes,
+    });
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    // A repository bootstrap that mutated this root and never completed is the
+    // same durable evidence a package transaction would have left.
+    try writeBlockingRootAttempt(
+        root_dir,
+        install_root,
+        .{ .repository_bootstrap = .add },
+        .mutating,
+    );
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    const options: api.CommonOptions = .{
+        .install_root = install_root,
+        .source_paths = &.{source_path},
+        .keyring_paths = &.{keyring_path},
+        .cache_path = cache_path,
+        .state_path = state_path,
+        .architecture = "amd64",
+        .assume_yes = true,
+    };
+    const blocked = try api.execute(arena.allocator(), .{
+        .operation = .install,
+        .packages = &.{"anything"},
+        .options = options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.recovery, blocked.exit_status);
+    try std.testing.expectEqual(
+        api.ErrorId.root_operation_recovery_required,
+        blocked.diagnostics[0].id,
+    );
+
+    // Non-mutating operations stay usable while the root attempt is unresolved.
+    const listed = try api.execute(arena.allocator(), .{
+        .operation = .list_installed,
+        .options = options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, listed.exit_status);
+}
+
+test "production mutation clears its root attempt and leaves no active intent" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/InRelease",
+        .data = &fixture.repository_in_release,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/main/binary-amd64/Packages",
+        .data = &fixture.repository_packages,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "keyring.gpg",
+        .data = &fixture.keyring,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data =
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+        ,
+    });
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const base = real_buffer[0..real_length];
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sources.list", .{base});
+    defer std.testing.allocator.free(source_path);
+    const keyring_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/keyring.gpg", .{base});
+    defer std.testing.allocator.free(keyring_path);
+    const repository_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/repo", .{base});
+    defer std.testing.allocator.free(repository_path);
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s} stable main\n",
+        .{ keyring_path, repository_path },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = source_bytes,
+    });
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{base});
+    defer std.testing.allocator.free(install_root);
+    const cache_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cache", .{base});
+    defer std.testing.allocator.free(cache_path);
+    const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state", .{base});
+    defer std.testing.allocator.free(state_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake = SuccessfulProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .process_runner = fake.interface(),
+    };
+    const result = try api.execute(arena.allocator(), .{
+        .operation = .remove,
+        .packages = &.{"removable"},
+        .options = .{
+            .install_root = install_root,
+            .source_paths = &.{source_path},
+            .keyring_paths = &.{keyring_path},
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .architecture = "amd64",
+            .assume_yes = true,
+        },
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const root: debz.root_fs.Root = .init(std.testing.io, root_dir);
+    const store = debz.root_operation.Store.init(root);
+    // Provenance was published and the active intent was cleared, so the next
+    // mutation is free to start.
+    try std.testing.expect((try store.read(std.testing.allocator)) == null);
+    const lock_metadata = try root.metadata(try debz.root_fs.Path.init(debz.root_operation.lock_path));
+    try std.testing.expect(lock_metadata.isRegularFile());
+}
+
+test "production recovery on an untouched root never strands the root attempt" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
+    try directory.dir.createDirPath(std.testing.io, "cache");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.gpg", .data = "" });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "",
+    });
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const base = real_buffer[0..real_length];
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{base});
+    defer std.testing.allocator.free(install_root);
+    const keyring_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/keyring.gpg", .{base});
+    defer std.testing.allocator.free(keyring_path);
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sources.list", .{base});
+    defer std.testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cache", .{base});
+    defer std.testing.allocator.free(cache_path);
+    const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state", .{base});
+    defer std.testing.allocator.free(state_path);
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s}/missing-repo stable main\n",
+        .{ keyring_path, base },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = source_bytes,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    const options: api.CommonOptions = .{
+        .install_root = install_root,
+        .source_paths = &.{source_path},
+        .keyring_paths = &.{keyring_path},
+        .cache_path = cache_path,
+        .state_path = state_path,
+        .architecture = "amd64",
+        .assume_yes = true,
+    };
+    // `recover` reserves the root before it discovers there is nothing to
+    // recover. The attempt is pre-mutation, so giving up must release it.
+    const recovered = try api.execute(arena.allocator(), .{
+        .operation = .recover,
+        .options = options,
+    }, backend.interface());
+    try std.testing.expect(recovered.exit_status != api.ExitStatus.success);
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const store = debz.root_operation.Store.init(.init(std.testing.io, root_dir));
+    try std.testing.expect((try store.read(std.testing.allocator)) == null);
+
+    // The root is still usable: the next mutation fails for its own reason,
+    // never because a stranded attempt blocks it.
+    const next = try api.execute(arena.allocator(), .{
+        .operation = .install,
+        .packages = &.{"anything"},
+        .options = options,
+    }, backend.interface());
+    try std.testing.expect(next.diagnostics[0].id != api.ErrorId.root_operation_recovery_required);
+    try std.testing.expect(next.diagnostics[0].id != api.ErrorId.root_operation_conflict);
+    try std.testing.expect((try store.read(std.testing.allocator)) == null);
+}
+
+test "production recovery adopts durable mutation evidence instead of failing closed" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/InRelease",
+        .data = &fixture.repository_in_release,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/main/binary-amd64/Packages",
+        .data = &fixture.repository_packages,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "keyring.gpg",
+        .data = &fixture.keyring,
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = removable_status,
+    });
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const base = real_buffer[0..real_length];
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{base});
+    defer std.testing.allocator.free(install_root);
+    const keyring_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/keyring.gpg", .{base});
+    defer std.testing.allocator.free(keyring_path);
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sources.list", .{base});
+    defer std.testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cache", .{base});
+    defer std.testing.allocator.free(cache_path);
+    const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state", .{base});
+    defer std.testing.allocator.free(state_path);
+    const source_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "deb [arch=amd64 signed-by={s}] file://{s}/repo stable main\n",
+        .{ keyring_path, base },
+    );
+    defer std.testing.allocator.free(source_bytes);
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = source_bytes,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = fixture.created + 30 };
+    const options: api.CommonOptions = .{
+        .install_root = install_root,
+        .source_paths = &.{source_path},
+        .keyring_paths = &.{keyring_path},
+        .cache_path = cache_path,
+        .state_path = state_path,
+        .architecture = "amd64",
+        .assume_yes = true,
+    };
+    // Populate the metadata cache so the cache-only recovery refresh succeeds
+    // and the flow reaches the executor bridge.
+    const refreshed = try api.execute(arena.allocator(), .{
+        .operation = .refresh,
+        .options = options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.success, refreshed.exit_status);
+
+    var state_dir = try directory.dir.openDir(std.testing.io, "state", .{ .iterate = true });
+    defer state_dir.close(std.testing.io);
+    try state_dir.writeFile(std.testing.io, .{
+        .sub_path = "recovery-request.json",
+        .data = "{\"operation\":\"remove\",\"packages\":[\"removable\"]," ++
+            "\"recommends\":false,\"allow_downgrade\":false," ++
+            "\"repository_policy\":\"strict_priority\",\"conffile\":\"unspecified\"," ++
+            "\"force\":[],\"lock_wait_ms\":1000}\n",
+    });
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    try writeBlockingRootAttempt(
+        root_dir,
+        install_root,
+        .{ .package_transaction = .install },
+        .mutating,
+    );
+
+    const store = debz.root_operation.Store.init(.init(std.testing.io, root_dir));
+    // A plain mutation is refused while the evidence stands.
+    const blocked = try api.execute(arena.allocator(), .{
+        .operation = .remove,
+        .packages = &.{"removable"},
+        .options = options,
+    }, backend.interface());
+    try std.testing.expectEqual(
+        api.ErrorId.root_operation_recovery_required,
+        blocked.diagnostics[0].id,
+    );
+
+    // Recovery is the one intent allowed to adopt that evidence. It must reach
+    // the executor instead of failing closed on its own record.
+    const recovered = try api.execute(arena.allocator(), .{
+        .operation = .recover,
+        .options = options,
+    }, backend.interface());
+    // Recovery must reach the executor, which then reports the missing
+    // journal. Anything root-operation-shaped here means the coordinator
+    // refused its own adopted evidence.
+    try std.testing.expectEqual(api.ErrorId.recovery_failed, recovered.diagnostics[0].id);
+    try std.testing.expect(
+        recovered.diagnostics[0].id != api.ErrorId.root_operation_recovery_required,
+    );
+    try std.testing.expect(recovered.diagnostics[0].id != api.ErrorId.internal_error);
+    try std.testing.expect(
+        recovered.diagnostics[0].id != api.ErrorId.root_operation_conflict,
+    );
+
+    // No journal exists, so recovery fails and the durable evidence survives.
+    var observed = (try store.read(std.testing.allocator)).?;
+    defer observed.deinit();
+    try std.testing.expect(observed.record.mutation_started);
+    try std.testing.expect(observed.record.state.blocksMutation());
+}

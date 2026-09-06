@@ -9,6 +9,9 @@ Before mutation, the executor validates the complete action/ordering shape,
 identities, artifact mappings, paths, conffile policy, and typed force policy.
 It then acquires, in fixed order, the debz transaction lock,
 `var/lib/dpkg/lock-frontend`, and `var/lib/dpkg/lock`, using bounded waits.
+Those are ranks 4 of the total lock order defined in
+[root-scoped operation coordination](root-operation.md); callers hold the root
+mutation lock (rank 0) around them.
 On Linux, the production adapter uses `F_OFD_SETLK` open-file-description write
 locks. They conflict with dpkg's POSIX record locks, preserving cross-process
 exclusion, while making independent same-process manager instances serialize

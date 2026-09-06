@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/root-operation-record-v1",
+  "title": "debz root operation record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "generation",
+    "install_root",
+    "root_identity_sha256",
+    "backend",
+    "surface",
+    "operation",
+    "state",
+    "phase",
+    "step",
+    "mutation_started",
+    "outcome",
+    "provenance",
+    "provenance_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "database_generation_sha256",
+    "artifact_evidence_sha256",
+    "request_sha256",
+    "policy_sha256",
+    "target_architecture",
+    "foreign_architectures",
+    "reserved_unix",
+    "updated_unix",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/root-operation-record-v1" },
+    "version": { "const": 1 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "generation": { "type": "integer", "minimum": 1 },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "backend": { "enum": ["legacy_dpkg", "native"] },
+    "surface": { "enum": ["package_transaction", "repository_bootstrap"] },
+    "operation": { "type": "string", "minLength": 1 },
+    "state": {
+      "enum": [
+        "reserved",
+        "preflight",
+        "mutation_pending",
+        "mutating",
+        "verifying",
+        "recovery_required",
+        "recovering",
+        "completed"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "reserved",
+        "authorization",
+        "preflight",
+        "mutation",
+        "script",
+        "trigger",
+        "database",
+        "verification",
+        "provenance"
+      ]
+    },
+    "step": { "type": "integer", "minimum": 0 },
+    "mutation_started": { "type": "boolean" },
+    "outcome": {
+      "enum": [
+        "pending",
+        "succeeded",
+        "abandoned_before_mutation",
+        "failed_after_mutation",
+        "recovered"
+      ]
+    },
+    "provenance": { "enum": ["pending", "not_required", "published"] },
+    "provenance_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "authorization_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "program_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "plan_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "exact_lock": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/lockBinding" }]
+    },
+    "database_generation_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "artifact_evidence_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "target_architecture": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9-]+$" },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9-]+$" }
+    },
+    "reserved_unix": { "type": "integer" },
+    "updated_unix": { "type": "integer" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "completed" } }, "required": ["state"] },
+      "then": { "properties": { "outcome": { "not": { "const": "pending" } } } },
+      "else": { "properties": { "outcome": { "const": "pending" } } }
+    },
+    {
+      "if": {
+        "properties": { "mutation_started": { "const": false } },
+        "required": ["mutation_started"]
+      },
+      "then": {
+        "properties": {
+          "state": {
+            "enum": ["reserved", "preflight", "mutation_pending", "completed"]
+          },
+          "outcome": { "enum": ["pending", "succeeded", "abandoned_before_mutation"] }
+        }
+      },
+      "else": {
+        "properties": {
+          "state": {
+            "enum": ["mutating", "verifying", "recovery_required", "recovering", "completed"]
+          },
+          "provenance": { "enum": ["pending", "published"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "provenance": { "const": "published" } },
+        "required": ["provenance"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "completed" },
+          "provenance_sha256": { "$ref": "#/$defs/sha256" }
+        }
+      },
+      "else": { "properties": { "provenance_sha256": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "optionalSha256": {
+      "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }]
+    },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "lockBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "digest_sha256"],
+      "properties": {
+        "schema": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
