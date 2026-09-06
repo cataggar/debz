@@ -22,6 +22,7 @@
 - [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
 - [Native package database](package-database.md) documents the bounded typed model, import validation, canonical writers, generation evidence, and staged change-set plans for `var/lib/dpkg`.
 - [Native transaction engine v1 compatibility contract](native-transaction-engine-v1.md) defines the package, database, lifecycle, durability, and differential-test boundary required before replacing dpkg.
+- [Native archive application model](archive-application-model.md) documents the application-ready payload, checksum, lifecycle-script, conffile, trigger, and relationship model, its deterministic digest, and the explicit v1 feature classification.
 - [Native transaction program v1](native-transaction-program.md) documents the pre-mutation program compiler: its inputs, typed steps, lifecycle expansion, validation, determinism, digest binding, and engine wiring.
 - [Root-scoped operation coordination](root-operation.md) documents the shared root mutation lock, the durable active-attempt record, the total lock order, the state machine, and the recovery contract for repository bootstrap and package transactions.
 - [Root-anchored filesystem primitives](root-filesystem.md) documents the traversal-safe path grammar, no-follow resolution, exclusive creation, atomic publication, and durability rules used by the native engine.

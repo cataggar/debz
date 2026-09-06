@@ -389,6 +389,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-maintainer-script", "Run audited maintainer-script runner tests")
         .dependOn(&run_maintainer_script_tests.step);
 
+    const archive_application_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"archive_application.test."},
+    });
+    const run_archive_application_tests = b.addRunArtifact(archive_application_tests);
+    b.step("test-archive-application", "Run native archive application model tests")
+        .dependOn(&run_archive_application_tests.step);
+
     const lock_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
@@ -462,6 +470,7 @@ fn installReleaseFiles(
 ) void {
     const docs = [_][]const u8{
         "README.md",
+        "archive-application-model.md",
         "authenticated-refresh.md",
         "deb-payload-validation.md",
         "exact-locks-and-provenance.md",

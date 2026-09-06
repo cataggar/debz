@@ -100,6 +100,7 @@ pub const deb822 = @import("deb822.zig");
 pub const relation = @import("relation.zig");
 pub const deb_archive = @import("deb_archive.zig");
 pub const deb_payload = @import("deb_payload.zig");
+pub const archive_application = @import("archive_application.zig");
 pub const dpkg_status = @import("dpkg_status.zig");
 pub const package_database = @import("package_database.zig");
 pub const package_database_changes = @import("package_database_changes.zig");
@@ -220,6 +221,14 @@ pub const MaintainerScriptDependencies = maintainer_script.Dependencies;
 pub const SystemMaintainerScriptLauncher = maintainer_script.SystemLauncher;
 pub const runMaintainerScript = maintainer_script.run;
 pub const validateMaintainerScriptRequest = maintainer_script.validate;
+pub const ArchiveApplicationModel = archive_application.Model;
+pub const ArchiveApplicationRequest = archive_application.Request;
+pub const ArchiveApplicationLimits = archive_application.Limits;
+pub const ArchiveApplicationResult = archive_application.Result;
+pub const ArchiveApplicationDiagnostic = archive_application.Diagnostic;
+pub const ArchiveApplicationUnsupportedFeature = archive_application.UnsupportedFeature;
+pub const prepareArchiveApplication = archive_application.prepare;
+pub const revalidateArchiveApplication = archive_application.revalidate;
 pub const TransactionEngineKind = transaction_engine.Kind;
 pub const TransactionEngineExecutor = transaction_engine.Executor;
 pub const RootFilesystem = root_fs.Root;
@@ -439,6 +448,7 @@ test "empty solver context can be created and destroyed" {
 
 test {
     _ = deb_payload;
+    _ = archive_application;
     _ = deb822;
     _ = relation;
     _ = dpkg_status;

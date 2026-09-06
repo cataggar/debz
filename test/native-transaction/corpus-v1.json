@@ -235,6 +235,46 @@
       "expected": "success"
     },
     {
+      "id": "archive-application-model",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": [
+        "archive-model",
+        "symlink",
+        "hardlink",
+        "directory",
+        "mode-metadata",
+        "mtime"
+      ],
+      "expected": "success"
+    },
+    {
+      "id": "archive-checksum-verification",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["md5sums", "archive-model", "preflight"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "archive-unsupported-feature",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": [
+        "pax-header",
+        "special-file",
+        "unsupported-control-member",
+        "preflight"
+      ],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "archive-revalidation-mismatch",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["archive-digest", "revalidation", "preflight"],
+      "expected": "failure-before-mutation"
+    },
+    {
       "id": "corrupt-root-rejected",
       "initial": "corrupt",
       "operations": ["install"],
