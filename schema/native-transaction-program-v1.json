@@ -1,0 +1,1394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-transaction-program-v1",
+  "title": "debz native transaction program v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "backend",
+    "install_root",
+    "root_identity_sha256",
+    "target_architecture",
+    "foreign_architectures",
+    "request_sha256",
+    "solver_policy_sha256",
+    "executor_policy_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "authorization_sha256",
+    "final_state_sha256",
+    "policy",
+    "script_policy_sha256",
+    "installed_database",
+    "artifacts",
+    "artifacts_sha256",
+    "steps",
+    "steps_sha256",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-transaction-program-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "backend": {
+      "const": "native"
+    },
+    "install_root": {
+      "$ref": "#/$defs/absolutePath"
+    },
+    "root_identity_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "target_architecture": {
+      "type": "string",
+      "minLength": 1
+    },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "request_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "solver_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "executor_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "plan_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "exact_lock": {
+      "$ref": "#/$defs/lockBinding"
+    },
+    "authorization_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "final_state_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "script_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "installed_database": {
+      "$ref": "#/$defs/databaseBinding"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "artifacts_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "steps_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "md5": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "repositoryId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "architecture"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "packageRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "architecture"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "lockBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "version",
+        "digest_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "https://debz.dev/schema/exact-closure-lock-v2"
+        },
+        "version": {
+          "const": 2
+        },
+        "digest_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "conffile",
+        "force",
+        "allow_host_root"
+      ],
+      "properties": {
+        "conffile": {
+          "enum": [
+            "keep_existing",
+            "use_package_version"
+          ]
+        },
+        "force": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "depends",
+              "depends_version",
+              "break_replaces",
+              "overwrite",
+              "overwrite_dir",
+              "remove_reinstreq"
+            ]
+          }
+        },
+        "allow_host_root": {
+          "type": "boolean"
+        }
+      }
+    },
+    "databaseBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation_sha256",
+        "evidence_sha256",
+        "package_count"
+      ],
+      "properties": {
+        "generation_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "package_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "repositoryOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "repository_snapshot_sha256"
+      ],
+      "properties": {
+        "repository_id": {
+          "$ref": "#/$defs/repositoryId"
+        },
+        "repository_snapshot_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "localOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "sha256",
+        "size",
+        "package",
+        "acquisition_url",
+        "trust_mode"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/repositoryId"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "package": {
+          "$ref": "#/$defs/identity"
+        },
+        "acquisition_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trust_mode": {
+          "enum": [
+            "pinned_sha256",
+            "verified_https"
+          ]
+        }
+      }
+    },
+    "origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "authenticated_repository"
+          ],
+          "properties": {
+            "authenticated_repository": {
+              "$ref": "#/$defs/repositoryOrigin"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "local_artifact"
+          ],
+          "properties": {
+            "local_artifact": {
+              "$ref": "#/$defs/localOrigin"
+            }
+          }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "package",
+        "sha256",
+        "size",
+        "application_sha256",
+        "origin"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "package": {
+          "$ref": "#/$defs/identity"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "application_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "origin": {
+          "$ref": "#/$defs/origin"
+        }
+      }
+    },
+    "triggerDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "interest",
+            "interest_await",
+            "interest_noawait",
+            "activate",
+            "activate_await",
+            "activate_noawait"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "pendingTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "triggers",
+        "awaiting"
+      ],
+      "properties": {
+        "package": {
+          "$ref": "#/$defs/packageRef"
+        },
+        "triggers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "awaiting": {
+          "type": "boolean"
+        }
+      }
+    },
+    "unwind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "source",
+        "script_sha256",
+        "arguments"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "preinst",
+            "postinst",
+            "prerm",
+            "postrm"
+          ]
+        },
+        "source": {
+          "enum": [
+            "installed_package",
+            "new_package"
+          ]
+        },
+        "script_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "arguments": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      }
+    },
+    "scriptFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "unwind",
+        "recovery_required"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "not_installed",
+            "config_files",
+            "half_installed",
+            "unpacked",
+            "half_configured",
+            "triggers_awaited",
+            "triggers_pending",
+            "installed"
+          ]
+        },
+        "unwind": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/unwind"
+            }
+          ]
+        },
+        "recovery_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_authorization"
+          ],
+          "properties": {
+            "assert_authorization": {
+              "$ref": "#/$defs/operations/assert_authorization"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_root_state"
+          ],
+          "properties": {
+            "assert_root_state": {
+              "$ref": "#/$defs/operations/assert_root_state"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_database_generation"
+          ],
+          "properties": {
+            "assert_database_generation": {
+              "$ref": "#/$defs/operations/assert_database_generation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_installed_package"
+          ],
+          "properties": {
+            "assert_installed_package": {
+              "$ref": "#/$defs/operations/assert_installed_package"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_package_absent"
+          ],
+          "properties": {
+            "assert_package_absent": {
+              "$ref": "#/$defs/operations/assert_package_absent"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assert_path_ownership"
+          ],
+          "properties": {
+            "assert_path_ownership": {
+              "$ref": "#/$defs/operations/assert_path_ownership"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "revalidate_artifact"
+          ],
+          "properties": {
+            "revalidate_artifact": {
+              "$ref": "#/$defs/operations/revalidate_artifact"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "materialize_bootstrap_payload"
+          ],
+          "properties": {
+            "materialize_bootstrap_payload": {
+              "$ref": "#/$defs/operations/materialize_bootstrap_payload"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unpack_package"
+          ],
+          "properties": {
+            "unpack_package": {
+              "$ref": "#/$defs/operations/unpack_package"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "remove_package_files"
+          ],
+          "properties": {
+            "remove_package_files": {
+              "$ref": "#/$defs/operations/remove_package_files"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "purge_package_files"
+          ],
+          "properties": {
+            "purge_package_files": {
+              "$ref": "#/$defs/operations/purge_package_files"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run_maintainer_script"
+          ],
+          "properties": {
+            "run_maintainer_script": {
+              "$ref": "#/$defs/operations/run_maintainer_script"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "apply_conffile_decision"
+          ],
+          "properties": {
+            "apply_conffile_decision": {
+              "$ref": "#/$defs/operations/apply_conffile_decision"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "record_trigger_interests"
+          ],
+          "properties": {
+            "record_trigger_interests": {
+              "$ref": "#/$defs/operations/record_trigger_interests"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "activate_trigger"
+          ],
+          "properties": {
+            "activate_trigger": {
+              "$ref": "#/$defs/operations/activate_trigger"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "configure_barrier"
+          ],
+          "properties": {
+            "configure_barrier": {
+              "$ref": "#/$defs/operations/configure_barrier"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "process_deferred_triggers"
+          ],
+          "properties": {
+            "process_deferred_triggers": {
+              "$ref": "#/$defs/operations/process_deferred_triggers"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "record_package_state"
+          ],
+          "properties": {
+            "record_package_state": {
+              "$ref": "#/$defs/operations/record_package_state"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "publish_database_generation"
+          ],
+          "properties": {
+            "publish_database_generation": {
+              "$ref": "#/$defs/operations/publish_database_generation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verify_final_state"
+          ],
+          "properties": {
+            "verify_final_state": {
+              "$ref": "#/$defs/operations/verify_final_state"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "publish_provenance"
+          ],
+          "properties": {
+            "publish_provenance": {
+              "$ref": "#/$defs/operations/publish_provenance"
+            }
+          }
+        }
+      ]
+    },
+    "operations": {
+      "assert_authorization": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization_sha256",
+          "plan_sha256",
+          "request_sha256",
+          "exact_lock_sha256",
+          "final_state_sha256"
+        ],
+        "properties": {
+          "authorization_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "plan_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "request_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "exact_lock_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "final_state_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "assert_root_state": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "install_root",
+          "root_identity_sha256",
+          "target_architecture",
+          "foreign_architectures"
+        ],
+        "properties": {
+          "install_root": {
+            "$ref": "#/$defs/absolutePath"
+          },
+          "root_identity_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "target_architecture": {
+            "type": "string",
+            "minLength": 1
+          },
+          "foreign_architectures": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "assert_database_generation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "generation_sha256",
+          "evidence_sha256",
+          "package_count",
+          "updates_pending"
+        ],
+        "properties": {
+          "generation_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "evidence_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "package_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "updates_pending": {
+            "const": false
+          }
+        }
+      },
+      "assert_installed_package": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "state",
+          "hold",
+          "essential",
+          "owned_paths_sha256",
+          "conffiles_sha256",
+          "scripts_sha256"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "state": {
+            "enum": [
+              "not_installed",
+              "config_files",
+              "half_installed",
+              "unpacked",
+              "half_configured",
+              "triggers_awaited",
+              "triggers_pending",
+              "installed"
+            ]
+          },
+          "hold": {
+            "type": "boolean"
+          },
+          "essential": {
+            "type": "boolean"
+          },
+          "owned_paths_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "conffiles_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "scripts_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "assert_package_absent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/packageRef"
+          }
+        }
+      },
+      "assert_path_ownership": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "holder",
+          "claimant",
+          "resolution"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/absolutePath"
+          },
+          "holder": {
+            "$ref": "#/$defs/packageRef"
+          },
+          "claimant": {
+            "$ref": "#/$defs/packageRef"
+          },
+          "resolution": {
+            "enum": [
+              "same_package",
+              "replaces",
+              "forced_overwrite"
+            ]
+          }
+        }
+      },
+      "revalidate_artifact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact",
+          "package",
+          "sha256",
+          "size",
+          "application_sha256"
+        ],
+        "properties": {
+          "artifact": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "application_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "materialize_bootstrap_payload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "artifact",
+          "application_sha256"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "artifact": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "application_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "unpack_package": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "prior_version",
+          "artifact",
+          "application_sha256",
+          "bootstrapped",
+          "prior_owned_paths_sha256"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "prior_version": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "minLength": 1
+              }
+            ]
+          },
+          "artifact": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "application_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "bootstrapped": {
+            "type": "boolean"
+          },
+          "prior_owned_paths_sha256": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/sha256"
+              }
+            ]
+          }
+        }
+      },
+      "remove_package_files": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "owned_paths_sha256",
+          "retain_conffiles"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "owned_paths_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "retain_conffiles": {
+            "type": "boolean"
+          }
+        }
+      },
+      "purge_package_files": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "conffiles_sha256"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "conffiles_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "run_maintainer_script": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "kind",
+          "source",
+          "script_sha256",
+          "arguments",
+          "environment_policy_sha256",
+          "failure"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "kind": {
+            "enum": [
+              "preinst",
+              "postinst",
+              "prerm",
+              "postrm"
+            ]
+          },
+          "source": {
+            "enum": [
+              "installed_package",
+              "new_package"
+            ]
+          },
+          "script_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "arguments": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          "environment_policy_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "failure": {
+            "$ref": "#/$defs/scriptFailure"
+          }
+        }
+      },
+      "apply_conffile_decision": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "path",
+          "policy",
+          "action",
+          "packaged_md5",
+          "recorded_md5",
+          "on_disk_md5"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "path": {
+            "$ref": "#/$defs/absolutePath"
+          },
+          "policy": {
+            "enum": [
+              "keep_existing",
+              "use_package_version"
+            ]
+          },
+          "action": {
+            "enum": [
+              "install_new",
+              "restore_missing",
+              "replace_unmodified",
+              "keep_existing_stage_dist",
+              "install_stage_old",
+              "remove_on_upgrade",
+              "mark_obsolete",
+              "retain_on_remove",
+              "delete_on_purge"
+            ]
+          },
+          "packaged_md5": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/md5"
+              }
+            ]
+          },
+          "recorded_md5": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/md5"
+              }
+            ]
+          },
+          "on_disk_md5": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/md5"
+              }
+            ]
+          }
+        }
+      },
+      "record_trigger_interests": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "declarations",
+          "declarations_sha256"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "declarations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/triggerDeclaration"
+            }
+          },
+          "declarations_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "activate_trigger": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "trigger",
+          "kind",
+          "awaiting",
+          "interested"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/$defs/packageRef"
+          },
+          "trigger": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "interest",
+              "interest_await",
+              "interest_noawait",
+              "activate",
+              "activate_await",
+              "activate_noawait"
+            ]
+          },
+          "awaiting": {
+            "type": "boolean"
+          },
+          "interested": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/packageRef"
+            }
+          }
+        }
+      },
+      "configure_barrier": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "packages"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "pre_depends",
+              "final"
+            ]
+          },
+          "packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/packageRef"
+            }
+          }
+        }
+      },
+      "process_deferred_triggers": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "pending",
+          "pending_sha256"
+        ],
+        "properties": {
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/pendingTrigger"
+            }
+          },
+          "pending_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "record_package_state": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package",
+          "state",
+          "hold",
+          "remove_entry"
+        ],
+        "properties": {
+          "package": {
+            "$ref": "#/$defs/identity"
+          },
+          "state": {
+            "enum": [
+              "not_installed",
+              "config_files",
+              "half_installed",
+              "unpacked",
+              "half_configured",
+              "triggers_awaited",
+              "triggers_pending",
+              "installed"
+            ]
+          },
+          "hold": {
+            "type": "boolean"
+          },
+          "remove_entry": {
+            "type": "boolean"
+          }
+        }
+      },
+      "publish_database_generation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "final_state_sha256",
+          "package_count"
+        ],
+        "properties": {
+          "final_state_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "package_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "verify_final_state": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "final_state_sha256",
+          "installed_count",
+          "config_files_count"
+        ],
+        "properties": {
+          "final_state_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "installed_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "config_files_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "publish_provenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization_sha256",
+          "database_generation_sha256",
+          "record_script_outcome_unknown"
+        ],
+        "properties": {
+          "authorization_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "database_generation_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "record_script_outcome_unknown": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "phase",
+        "requires",
+        "operation"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "phase": {
+          "enum": [
+            "preflight",
+            "bootstrap",
+            "remove",
+            "unpack",
+            "configure",
+            "trigger",
+            "verify"
+          ]
+        },
+        "requires": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        }
+      }
+    }
+  }
+}

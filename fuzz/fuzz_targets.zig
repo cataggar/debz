@@ -27,6 +27,8 @@ const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
     @embedFile("corpus/state/authorization.json"),
+    @embedFile("corpus/state/program.json"),
+    @embedFile("corpus/state/program-wide.json"),
     @embedFile("corpus/state/provenance.json"),
     @embedFile("corpus/state/provenance-v2.json"),
     @embedFile("corpus/state/journal"),
@@ -376,6 +378,10 @@ fn exerciseState(bytes: []const u8) !void {
         var authorization = value;
         authorization.deinit();
     } else |_| {}
+    if (debz.native_program.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var program = value;
+        program.deinit();
+    } else |_| {}
     if (debz.transaction_provenance.validateDocument(std.testing.allocator, bytes, max_input)) |value| {
         var document = value;
         document.deinit();
@@ -431,5 +437,20 @@ fn smokeCorpus(
                 return err;
             };
         }
+    }
+}
+
+test "fuzz.corpus native transaction program seeds stay canonical" {
+    for ([_][]const u8{
+        @embedFile("corpus/state/program.json"),
+        @embedFile("corpus/state/program-wide.json"),
+    }) |seed| {
+        var program = try debz.native_program.decode(
+            std.testing.allocator,
+            seed,
+            debz.native_program.maximum_document_bytes,
+        );
+        defer program.deinit();
+        try std.testing.expect(program.program.steps.len != 0);
     }
 }

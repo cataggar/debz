@@ -40,6 +40,18 @@ Archive-producing plan actions retain a typed `selected_origin` that can be
 matched back to the authenticated repository record by the package acquisition
 API.
 
+`debz.native_program` compiles the reviewed native transaction authorization,
+the plan's ordered lifecycle, the consumed installed-database generation, and
+the validated archives into one deterministic pre-mutation program with a
+stable digest. Steps are dense, phased, typed, and dependency-ordered; they
+carry preflight assertions, artifact revalidation, filesystem and database
+intents, exact maintainer-script calls with failure and unwind semantics,
+conffile decisions, trigger work, and final verification and provenance
+requirements. Compilation is pure and either returns a complete program or one
+typed diagnostic, and `transaction_engine.authorizeProgram` requires a matching
+program before native execution. See
+[Native transaction program v1](native-transaction-program.md).
+
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
 already opened root descriptor, never resolves a component through a symbolic

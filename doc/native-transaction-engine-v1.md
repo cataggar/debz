@@ -98,7 +98,9 @@ operations:
 including the `reinstreq` error flag.
 
 The native program compiler expands the reviewed solver plan into deterministic
-state transitions before mutation. The compiled program includes:
+state transitions before mutation and publishes them as the durable
+[native transaction program v1](native-transaction-program.md) document. The
+compiled program includes:
 
 - Essential bootstrap materialization needed to make script interpreters and
   runtime dependencies available in a fresh root;
@@ -242,6 +244,14 @@ the install root and its identity, the target and foreign architectures, the
 conffile and force policy, every ordered action with its authenticated artifact
 evidence, and the exact intended final closure. Legacy locks and legacy
 execution are never authorized by this contract.
+
+Native execution additionally requires the compiled program the authorization
+was expanded into. `transaction_engine.authorizeProgram` binds the program to
+the authorization, the request, the reviewed policy, and every artifact, and
+optionally to an independently recorded program digest, before
+`executeAuthorizedProgram` may select a backend. Because no native executor is
+registered, a correct program still cannot start a native transaction; the
+typed unavailable result is returned and selection never falls back.
 
 The plan layer represents `purge` as a distinct action kind and ordered phase so
 authorizations can express complete removal. The legacy `dpkg` executor rejects

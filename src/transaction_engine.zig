@@ -2,6 +2,7 @@ const std = @import("std");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const native_authorization = @import("native_authorization.zig");
+const native_program = @import("native_program.zig");
 const solver = @import("solver.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
@@ -262,6 +263,106 @@ fn hex32(bytes: [32]u8) [64]u8 {
     return result;
 }
 
+/// Native execution additionally requires the compiled low-level program the
+/// authorization was expanded into. The program is the durable execution and
+/// recovery authority, so it is bound by digest here before a backend is
+/// allowed to observe the request. Legacy execution never accepts one.
+pub const ProgramError = error{
+    ProgramRequired,
+    ProgramNotSupported,
+    ProgramSchemaMismatch,
+    ProgramAuthorizationMismatch,
+    ProgramPolicyMismatch,
+    ProgramArtifactMismatch,
+    ProgramDigestMismatch,
+    EmptyProgram,
+};
+
+/// Verifies the compiled program against the same request and authorization
+/// the backend would execute. `expected_program_sha256` is the independently
+/// recorded program digest a caller (for example durable recovery evidence)
+/// requires; when it is absent the program is still bound to the
+/// authorization, request, and policy.
+pub fn authorizeProgram(
+    kind: Kind,
+    request: transaction_executor.Request,
+    authorization: ?*const native_authorization.Authorization,
+    program: ?*const native_program.Program,
+    expected_program_sha256: ?[64]u8,
+) (AuthorizationError || ProgramError)!void {
+    try authorize(kind, request, authorization);
+    switch (kind) {
+        .legacy_dpkg => if (program != null) return error.ProgramNotSupported,
+        .native => {
+            const compiled = program orelse return error.ProgramRequired;
+            const authorized = authorization.?;
+            if (!std.mem.eql(u8, compiled.schema, native_program.schema_id) or
+                compiled.version != native_program.schema_version or
+                compiled.backend != .native)
+                return error.ProgramSchemaMismatch;
+            if (compiled.steps.len == 0) return error.EmptyProgram;
+            if (!compiled.matchesAuthorization(authorized.*))
+                return error.ProgramAuthorizationMismatch;
+            if (compiled.policy.conffile != request.policy.conffile or
+                compiled.policy.allow_host_root != request.policy.risk.allow_host_root or
+                compiled.policy.force.len != request.policy.risk.force.len)
+                return error.ProgramPolicyMismatch;
+            if (!std.mem.eql(
+                u8,
+                &compiled.executor_policy_sha256,
+                &hex32(transaction_executor.policyDigest(request.policy)),
+            )) return error.ProgramPolicyMismatch;
+            try authorizeProgramArtifacts(authorized.*, compiled.*);
+            if (expected_program_sha256) |expected| {
+                if (!std.mem.eql(u8, &expected, &compiled.digest_sha256))
+                    return error.ProgramDigestMismatch;
+            }
+        },
+    }
+}
+
+/// Authorized actions and compiled artifacts share one dense order, so the
+/// comparison is linear rather than a scan per action.
+fn authorizeProgramArtifacts(
+    authorized: native_authorization.Authorization,
+    compiled: native_program.Program,
+) ProgramError!void {
+    var cursor: usize = 0;
+    for (authorized.actions) |action| {
+        const evidence = action.artifact orelse continue;
+        if (cursor >= compiled.artifacts.len) return error.ProgramArtifactMismatch;
+        const artifact = compiled.artifacts[cursor];
+        cursor += 1;
+        if (artifact.index != cursor - 1 or
+            !std.mem.eql(u8, artifact.package.name, action.package) or
+            !std.mem.eql(u8, artifact.package.version, action.version) or
+            !std.mem.eql(u8, artifact.package.architecture, action.architecture) or
+            !std.mem.eql(u8, &artifact.sha256, &hex32(evidence.sha256)) or
+            artifact.size != evidence.size)
+            return error.ProgramArtifactMismatch;
+    }
+    if (cursor != compiled.artifacts.len) return error.ProgramArtifactMismatch;
+}
+
+/// Selects, authorizes the request and its compiled program, and only then
+/// executes. Every failure happens before the selected executor observes the
+/// request, and selection still never falls back.
+pub fn executeAuthorizedProgram(
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    legacy_dpkg: Executor,
+    native: ?Executor,
+    request: transaction_executor.Request,
+    authorization: ?*const native_authorization.Authorization,
+    program: ?*const native_program.Program,
+    expected_program_sha256: ?[64]u8,
+    dependencies: transaction_executor.Dependencies,
+) !transaction_executor.Report {
+    const executor = try select(kind, legacy_dpkg, native);
+    try authorizeProgram(kind, request, authorization, program, expected_program_sha256);
+    return executor.execute(allocator, request, dependencies);
+}
+
 /// Selects, authorizes, and only then executes. Authorization failures happen
 /// before the selected executor observes the request.
 pub fn executeAuthorized(
@@ -333,7 +434,7 @@ test "transaction_engine.test.selection is explicit and never falls back" {
 
 const AuthorizationFixture = struct {
     actions: [2]solver.PlanAction,
-    ordered: [2]solver.OrderedAction,
+    ordered: [3]solver.OrderedAction,
     plan: solver.Plan,
     lock: exact_lock_v2.OwnedLock,
     authorization: native_authorization.OwnedAuthorization,
@@ -400,6 +501,13 @@ const AuthorizationFixture = struct {
             .{
                 .sequence = 1,
                 .kind = .unpack,
+                .package = "app",
+                .version = "1.2",
+                .architecture = "amd64",
+            },
+            .{
+                .sequence = 2,
+                .kind = .configure_pending,
                 .package = "app",
                 .version = "1.2",
                 .architecture = "amd64",
@@ -810,4 +918,192 @@ test "transaction_engine.test.unauthorized native execution never reaches the ex
     ));
     try std.testing.expectEqual(@as(usize, 1), native.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
+}
+
+const ProgramFixture = struct {
+    installed: [1]native_program.InstalledPackage,
+    archives: [1]native_program.Archive,
+    program: native_program.OwnedProgram,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        fixture: *AuthorizationFixture,
+    ) !*ProgramFixture {
+        const self = try allocator.create(ProgramFixture);
+        errdefer allocator.destroy(self);
+        self.installed = .{.{
+            .name = "legacy",
+            .version = "2.0",
+            .architecture = "amd64",
+            .state = .installed,
+            .scripts = &.{
+                .{ .kind = .prerm, .sha256 = @splat(0x94) },
+                .{ .kind = .postrm, .sha256 = @splat(0x95) },
+            },
+        }};
+        self.archives = .{.{
+            .package = "app",
+            .version = "1.2",
+            .architecture = "amd64",
+            .sha256 = AuthorizationFixture.archive_sha256,
+            .size = AuthorizationFixture.archive_size,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = AuthorizationFixture.repository_id,
+                .repository_snapshot_sha256 = AuthorizationFixture.snapshot,
+            } },
+            .application_sha256 = @splat(0x41),
+            .scripts = &.{.{ .kind = .postinst, .sha256 = @splat(0x51) }},
+        }};
+        switch (native_program.compile(allocator, .{
+            .authorization = &fixture.authorization.authorization,
+            .ordered_actions = &fixture.ordered,
+            .installed = .{
+                .generation_sha256 = @splat(0x71),
+                .packages = &self.installed,
+            },
+            .archives = &self.archives,
+        })) {
+            .program => |value| self.program = value,
+            .diagnostic => |diagnostic| {
+                std.debug.print("program compilation failed: {s} ({s})\n", .{
+                    @tagName(diagnostic.code),
+                    diagnostic.detail,
+                });
+                return error.TestUnexpectedResult;
+            },
+        }
+        return self;
+    }
+
+    fn deinit(self: *ProgramFixture, allocator: std.mem.Allocator) void {
+        self.program.deinit();
+        allocator.destroy(self);
+    }
+};
+
+test "transaction_engine.test.native execution requires the compiled native program" {
+    const fixture = try AuthorizationFixture.init(std.testing.allocator);
+    defer fixture.deinit(std.testing.allocator);
+    const programs = try ProgramFixture.init(std.testing.allocator, fixture);
+    defer programs.deinit(std.testing.allocator);
+    const authorization = &fixture.authorization.authorization;
+    const program = &programs.program.program;
+
+    try authorizeProgram(.native, fixture.request(), authorization, program, null);
+    try authorizeProgram(
+        .native,
+        fixture.request(),
+        authorization,
+        program,
+        program.digest_sha256,
+    );
+    try authorizeProgram(.legacy_dpkg, fixture.request(), null, null, null);
+    try std.testing.expectError(
+        error.ProgramRequired,
+        authorizeProgram(.native, fixture.request(), authorization, null, null),
+    );
+    try std.testing.expectError(
+        error.ProgramNotSupported,
+        authorizeProgram(.legacy_dpkg, fixture.request(), null, program, null),
+    );
+    var wrong_digest = program.digest_sha256;
+    wrong_digest[0] = if (wrong_digest[0] == 'a') 'b' else 'a';
+    try std.testing.expectError(
+        error.ProgramDigestMismatch,
+        authorizeProgram(.native, fixture.request(), authorization, program, wrong_digest),
+    );
+    {
+        var tampered = program.*;
+        tampered.authorization_sha256 = wrong_digest;
+        try std.testing.expectError(
+            error.ProgramAuthorizationMismatch,
+            authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
+        );
+    }
+    {
+        var tampered = program.*;
+        tampered.policy.conffile = .use_package_version;
+        try std.testing.expectError(
+            error.ProgramPolicyMismatch,
+            authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
+        );
+    }
+    {
+        var tampered = program.*;
+        tampered.artifacts = &.{};
+        try std.testing.expectError(
+            error.ProgramArtifactMismatch,
+            authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
+        );
+    }
+    {
+        var tampered = program.*;
+        tampered.steps = &.{};
+        try std.testing.expectError(
+            error.EmptyProgram,
+            authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
+        );
+    }
+    {
+        var tampered = program.*;
+        tampered.version = 2;
+        try std.testing.expectError(
+            error.ProgramSchemaMismatch,
+            authorizeProgram(.native, fixture.request(), authorization, &tampered, null),
+        );
+    }
+}
+
+test "transaction_engine.test.an unauthorized program never reaches the executor" {
+    const fixture = try AuthorizationFixture.init(std.testing.allocator);
+    defer fixture.deinit(std.testing.allocator);
+    const programs = try ProgramFixture.init(std.testing.allocator, fixture);
+    defer programs.deinit(std.testing.allocator);
+    const authorization = &fixture.authorization.authorization;
+    const program = &programs.program.program;
+    var legacy: SelectionHarness = .{};
+    var native: SelectionHarness = .{};
+    const dependencies: transaction_executor.Dependencies = undefined;
+
+    try std.testing.expectError(error.ProgramRequired, executeAuthorizedProgram(
+        std.testing.allocator,
+        .native,
+        legacy.executor(),
+        native.executor(),
+        fixture.request(),
+        authorization,
+        null,
+        null,
+        dependencies,
+    ));
+    var wrong_digest = program.digest_sha256;
+    wrong_digest[0] = if (wrong_digest[0] == 'a') 'b' else 'a';
+    try std.testing.expectError(error.ProgramDigestMismatch, executeAuthorizedProgram(
+        std.testing.allocator,
+        .native,
+        legacy.executor(),
+        native.executor(),
+        fixture.request(),
+        authorization,
+        program,
+        wrong_digest,
+        dependencies,
+    ));
+    // The native backend stays unavailable until native execution is complete,
+    // so a correct program still cannot start a native transaction.
+    try std.testing.expectError(error.BackendUnavailable, executeAuthorizedProgram(
+        std.testing.allocator,
+        .native,
+        legacy.executor(),
+        null,
+        fixture.request(),
+        authorization,
+        program,
+        program.digest_sha256,
+        dependencies,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), legacy.recover_calls);
+    try std.testing.expectEqual(@as(usize, 0), native.recover_calls);
 }
