@@ -122,6 +122,21 @@ serialized, digest-bound over payload and final state, parsed with bounded
 strict JSON that rejects unknown fields and non-canonical bytes, and can be
 persisted through the no-follow `NativeTransactionAuthorizationStore`.
 
+`debz.native_program` compiles one authorization, the reviewed ordered
+lifecycle, the consumed installed-database generation, and the validated
+archives into native transaction program schema version 1: the deterministic
+low-level transaction the engine executes and a later recovery replays or
+refuses. The program binds the authorization digest and every binding the
+authorization carries, the database generation plus an evidence digest over the
+complete installed state, every artifact's identity, origin, digest, size, and
+application digest, the maintainer-script environment-policy identity, and the
+intended final closure digest. Its steps are dense, phased, typed, and
+dependency-ordered, and its digest covers the whole document.
+`transaction_engine.authorizeProgram` and `executeAuthorizedProgram` require a
+matching program before native execution, and can require an independently
+recorded program digest. See
+[native transaction program v1](native-transaction-program.md).
+
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
 provenance can be bounded and digest-validated with

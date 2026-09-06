@@ -259,6 +259,14 @@ pub fn build(b: *std.Build) void {
     const run_solver_tests = b.addRunArtifact(solver_tests);
     b.step("test-solver", "Run solver adapter tests").dependOn(&run_solver_tests.step);
 
+    const native_program_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{ "native_program.test.", "transaction_engine.test." },
+    });
+    const run_native_program_tests = b.addRunArtifact(native_program_tests);
+    b.step("test-native-program", "Run native transaction program compiler tests")
+        .dependOn(&run_native_program_tests.step);
+
     const refresh_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"repository_refresh.test."},
@@ -439,6 +447,7 @@ fn installReleaseFiles(
         "maintainer-script-runner.md",
         "multi-repository-policy.md",
         "native-transaction-engine-v1.md",
+        "native-transaction-program.md",
         "openpgp-verifier.md",
         "package-acquisition.md",
         "product-api.md",
@@ -462,6 +471,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
         "native-transaction-authorization-v1.json",
+        "native-transaction-program-v1.json",
         "package-cache-error-v1.json",
         "package-cache-fingerprint-v1.json",
         "package-cache-result-v1.json",

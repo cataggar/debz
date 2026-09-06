@@ -98,7 +98,9 @@ operations:
 including the `reinstreq` error flag.
 
 The native program compiler expands the reviewed solver plan into deterministic
-state transitions before mutation. The compiled program includes:
+state transitions before mutation and publishes them as the durable
+[native transaction program v1](native-transaction-program.md) document. The
+compiled program includes:
 
 - Essential bootstrap materialization needed to make script interpreters and
   runtime dependencies available in a fresh root;
@@ -137,18 +139,26 @@ completed outcome.
 
 ## Conffiles
 
-The selected noninteractive policy is authorization input:
+Decisions follow dpkg's two-dimensional table over three digests: the digest
+the package ships, the digest the status database recorded for the installed
+version, and the digest observed in the root. The selected noninteractive
+policy is authorization input, and it only decides the case dpkg would prompt
+for, when the administrator and the maintainer both changed the file:
 
-- `keep_existing` preserves a locally modified file and publishes the package
-  version using compatible `.dpkg-dist` behavior;
+- `keep_existing` preserves the local state and publishes the package version
+  using compatible `.dpkg-dist` behavior;
 - `use_package_version` installs the package version and preserves a locally
   modified predecessor using compatible `.dpkg-old` behavior.
 
-Unmodified conffiles update without a conflict artifact. Remove retains
-conffiles and their status metadata; purge removes them and the package status
-record. V1 also covers newly introduced, renamed, removed, obsolete, missing,
-and `remove-on-upgrade` conffiles. Every decision and before/after digest is
-recorded.
+Every other case is decided by the digests alone. A file that already holds the
+packaged bytes is a no-op, an unmodified file is replaced without a conflict
+artifact, and a conffile the maintainer did not change keeps the local edit —
+or the local deletion — under either policy, with no conflict artifact. Remove
+retains conffiles and their status metadata; purge removes them and the package
+status record. V1 also covers newly introduced, renamed, removed, obsolete, and
+missing conffiles, and `remove-on-upgrade`, which ships no file: it deletes an
+unmodified recorded file, preserves a modified one as `.dpkg-old`, and does
+nothing on a fresh install. Every decision and before/after digest is recorded.
 
 ## Triggers
 
@@ -242,6 +252,14 @@ the install root and its identity, the target and foreign architectures, the
 conffile and force policy, every ordered action with its authenticated artifact
 evidence, and the exact intended final closure. Legacy locks and legacy
 execution are never authorized by this contract.
+
+Native execution additionally requires the compiled program the authorization
+was expanded into. `transaction_engine.authorizeProgram` binds the program to
+the authorization, the request, the reviewed policy, and every artifact, and
+optionally to an independently recorded program digest, before
+`executeAuthorizedProgram` may select a backend. Because no native executor is
+registered, a correct program still cannot start a native transaction; the
+typed unavailable result is returned and selection never falls back.
 
 The plan layer represents `purge` as a distinct action kind and ordered phase so
 authorizations can express complete removal. The legacy `dpkg` executor rejects
