@@ -209,11 +209,21 @@ const Builder = struct {
     scratch: std.mem.Allocator,
     options: PlanOptions,
     base: database.Model,
-    records: std.ArrayList(database.PackageRecord) = .empty,
+    /// Slots keep their index for the whole plan; a removed package becomes
+    /// `null` so the identity index never has to be rebuilt.
+    records: std.ArrayList(?database.PackageRecord) = .empty,
+    identities: database.MembershipIndex,
+    positions: std.StringHashMapUnmanaged(usize) = .empty,
     foreign: []const []const u8 = &.{},
     triggers: database.TriggerState = .{},
     writes: std.ArrayList(PlannedWrite) = .empty,
-    targets: std.StringHashMapUnmanaged(void) = .empty,
+    targets: database.MembershipIndex,
+    scratch_index: database.MembershipIndex,
+    diverted_paths: database.MembershipIndex,
+    diverted_packages: database.MembershipIndex,
+    overridden_paths: database.MembershipIndex,
+    opaque_owners: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
+    coverage_ready: bool = false,
     trigger_state_changed: bool = false,
     architectures_changed: bool = false,
     diagnostic: ?Diagnostic = null,
@@ -221,9 +231,45 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         self.records.deinit(self.scratch);
         self.writes.deinit(self.scratch);
-        var keys = self.targets.keyIterator();
-        while (keys.next()) |key| self.scratch.free(key.*);
-        self.targets.deinit(self.scratch);
+        self.targets.deinit();
+        self.identities.deinit();
+        self.scratch_index.deinit();
+        self.diverted_paths.deinit();
+        self.diverted_packages.deinit();
+        self.overridden_paths.deinit();
+        var owners = self.opaque_owners.iterator();
+        while (owners.next()) |entry| {
+            self.scratch.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.scratch);
+        }
+        self.opaque_owners.deinit(self.scratch);
+        var slots = self.positions.keyIterator();
+        while (slots.next()) |key| self.scratch.free(key.*);
+        self.positions.deinit(self.scratch);
+    }
+
+    fn identityKey(self: *Builder, identity: Identity) PlanError![]const u8 {
+        self.identities.beginKey();
+        try self.identities.appendKey(identity.name);
+        try self.identities.appendKey(identity.architecture);
+        return self.identities.key.items;
+    }
+
+    fn setPosition(self: *Builder, identity: Identity, position: usize) PlanError!void {
+        const key = try self.identityKey(identity);
+        const entry = try self.positions.getOrPut(self.scratch, key);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.scratch.dupe(u8, key) catch |err| {
+                _ = self.positions.remove(key);
+                return err;
+            };
+        }
+        entry.value_ptr.* = position;
+    }
+
+    fn positionOf(self: *Builder, identity: Identity) PlanError!?usize {
+        const key = try self.identityKey(identity);
+        return self.positions.get(key);
     }
 
     fn fail(
@@ -240,33 +286,84 @@ const Builder = struct {
         return error.Invalid;
     }
 
-    fn claim(self: *Builder, subject: []const u8) PlanError!void {
-        const key = self.scratch.dupe(u8, subject) catch return error.OutOfMemory;
-        const entry = self.targets.getOrPut(self.scratch, key) catch |err| {
-            self.scratch.free(key);
-            return err;
+    fn failPath(self: *Builder, code: database.Code, path: []const u8) error{Invalid} {
+        self.diagnostic = .{
+            .surface = .change_set,
+            .code = code,
+            .path = path,
         };
-        if (entry.found_existing) {
-            self.scratch.free(key);
-            return self.fail(.conflicting_change, subject);
-        }
+        return error.Invalid;
+    }
+
+    fn claim(self: *Builder, subject: []const u8) PlanError!void {
+        self.targets.beginKey();
+        try self.targets.appendKey(subject);
+        if (!try self.targets.insertKey()) return self.fail(.conflicting_change, subject);
     }
 
     fn claimIdentity(self: *Builder, identity: Identity) PlanError!void {
-        const subject = try std.fmt.allocPrint(
-            self.scratch,
-            "{s}:{s}",
-            .{ identity.name, identity.architecture },
-        );
-        defer self.scratch.free(subject);
-        try self.claim(subject);
+        self.targets.beginKey();
+        try self.targets.appendKey(identity.name);
+        try self.targets.appendKey(identity.architecture);
+        if (!try self.targets.insertKey()) return self.fail(.conflicting_change, identity.name);
     }
 
     fn indexOf(self: *Builder, identity: Identity) PlanError!usize {
-        for (self.records.items, 0..) |record, index| {
-            if (record.identity().eql(identity)) return index;
+        const index = try self.positionOf(identity) orelse
+            return self.fail(.unknown_package, identity.name);
+        if (self.records.items[index] == null) {
+            return self.fail(.unknown_package, identity.name);
         }
-        return self.fail(.unknown_package, identity.name);
+        return index;
+    }
+
+    fn recordAt(self: *Builder, index: usize) database.PackageRecord {
+        return self.records.items[index].?;
+    }
+
+    /// Index the diversion and statoverride coverage once, so guarding a
+    /// change costs one pass over the changed package's own paths.
+    fn prepareCoverage(self: *Builder) PlanError!void {
+        if (self.coverage_ready) return;
+        self.coverage_ready = true;
+        for (self.base.diversions) |diversion| {
+            _ = try self.diverted_paths.insert(diversion.from);
+            _ = try self.diverted_paths.insert(diversion.to);
+            const owner = diversion.package orelse continue;
+            const name = if (std.mem.indexOfScalar(u8, owner, ':')) |colon|
+                owner[0..colon]
+            else
+                owner;
+            _ = try self.diverted_packages.insert(name);
+        }
+        for (self.base.stat_overrides) |override| {
+            _ = try self.overridden_paths.insert(override.path);
+        }
+        for (self.base.opaque_info, 0..) |entry, index| {
+            const owner = entry.owner orelse continue;
+            self.identities.beginKey();
+            try self.identities.appendKey(owner.name);
+            try self.identities.appendKey(owner.architecture);
+            const key = self.identities.key.items;
+            const slot = try self.opaque_owners.getOrPut(self.scratch, key);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = self.scratch.dupe(u8, key) catch |err| {
+                    _ = self.opaque_owners.remove(key);
+                    return err;
+                };
+                slot.value_ptr.* = .empty;
+            }
+            try slot.value_ptr.append(self.scratch, index);
+        }
+    }
+
+    fn opaqueFilesOf(self: *Builder, identity: Identity) PlanError![]const usize {
+        try self.prepareCoverage();
+        self.identities.beginKey();
+        try self.identities.appendKey(identity.name);
+        try self.identities.appendKey(identity.architecture);
+        const slot = self.opaque_owners.get(self.identities.key.items) orelse return &.{};
+        return slot.items;
     }
 
     fn stage(self: *Builder, write: PlannedWrite) PlanError!void {
@@ -308,13 +405,12 @@ const Builder = struct {
     fn validatePaths(self: *Builder, paths: []const []const u8, package: []const u8) PlanError!void {
         const limits = self.options.database.limits;
         if (paths.len > limits.max_paths_per_package) return self.fail(.path_limit, package);
-        for (paths, 0..) |path, index| {
+        self.scratch_index.reset();
+        for (paths) |path| {
             if (path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validListPath(path)) return self.fail(.invalid_path, package);
-            for (paths[0..index]) |earlier| {
-                if (std.mem.eql(u8, database.logicalListPath(earlier), database.logicalListPath(path))) {
-                    return self.fail(.duplicate_path, package);
-                }
+            if (!try self.scratch_index.insert(database.logicalListPath(path))) {
+                return self.fail(.duplicate_path, package);
             }
         }
     }
@@ -326,13 +422,12 @@ const Builder = struct {
     ) PlanError!void {
         const limits = self.options.database.limits;
         if (entries.len > limits.max_md5sums_per_package) return self.fail(.checksum_limit, package);
-        for (entries, 0..) |entry, index| {
+        self.scratch_index.reset();
+        for (entries) |entry| {
             if (entry.path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validRelativePath(entry.path)) return self.fail(.invalid_path, package);
-            for (entries[0..index]) |earlier| {
-                if (std.mem.eql(u8, earlier.path, entry.path)) {
-                    return self.fail(.duplicate_checksum, package);
-                }
+            if (!try self.scratch_index.insert(entry.path)) {
+                return self.fail(.duplicate_checksum, package);
             }
         }
     }
@@ -344,11 +439,12 @@ const Builder = struct {
     ) PlanError!void {
         const limits = self.options.database.limits;
         if (paths.len > limits.max_conffiles_per_package) return self.fail(.conffile_limit, package);
-        for (paths, 0..) |path, index| {
+        self.scratch_index.reset();
+        for (paths) |path| {
             if (path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validAbsolutePath(path)) return self.fail(.invalid_path, package);
-            for (paths[0..index]) |earlier| {
-                if (std.mem.eql(u8, earlier, path)) return self.fail(.duplicate_conffile, package);
+            if (!try self.scratch_index.insert(path)) {
+                return self.fail(.duplicate_conffile, package);
             }
         }
     }
@@ -362,41 +458,35 @@ const Builder = struct {
         if (declarations.len > limits.max_trigger_declarations_per_package) {
             return self.fail(.trigger_limit, package);
         }
-        for (declarations, 0..) |declaration, index| {
+        self.scratch_index.reset();
+        for (declarations) |declaration| {
             if (declaration.name.len > limits.max_trigger_name_bytes or
                 !database.validTriggerName(declaration.name))
             {
                 return self.fail(.invalid_trigger_name, package);
             }
-            for (declarations[0..index]) |earlier| {
-                if (earlier.kind == declaration.kind and
-                    std.mem.eql(u8, earlier.name, declaration.name))
-                {
-                    return self.fail(.duplicate_trigger_declaration, package);
-                }
+            self.scratch_index.beginKey();
+            try self.scratch_index.appendKey(declaration.kind.spelling());
+            try self.scratch_index.appendKey(declaration.name);
+            if (!try self.scratch_index.insertKey()) {
+                return self.fail(.duplicate_trigger_declaration, package);
             }
         }
     }
 
-    fn guardCoverage(self: *Builder, record: database.PackageRecord) PlanError!void {
-        for (self.base.diversions) |diversion| {
-            if (diversion.package) |owner| {
-                if (std.mem.eql(u8, owner, record.name)) {
-                    return self.fail(.unsupported_diversion, record.name);
-                }
-                if (std.mem.startsWith(u8, owner, record.name) and
-                    owner.len > record.name.len and owner[record.name.len] == ':')
-                {
-                    return self.fail(.unsupported_diversion, record.name);
-                }
-            }
-            if (record.ownsPath(diversion.from) or record.ownsPath(diversion.to)) {
-                return self.fail(.unsupported_diversion, record.name);
-            }
+    fn guardCoverage(self: *Builder, subject: database.PackageRecord) PlanError!void {
+        try self.prepareCoverage();
+        if (self.diverted_packages.contains(subject.name)) {
+            return self.fail(.unsupported_diversion, subject.name);
         }
-        for (self.base.stat_overrides) |override| {
-            if (record.ownsPath(override.path)) {
-                return self.fail(.unsupported_statoverride, record.name);
+        const paths = subject.paths orelse return;
+        for (paths) |path| {
+            const logical = database.logicalListPath(path);
+            if (self.diverted_paths.contains(logical)) {
+                return self.fail(.unsupported_diversion, subject.name);
+            }
+            if (self.overridden_paths.contains(logical)) {
+                return self.fail(.unsupported_statoverride, subject.name);
             }
         }
     }
@@ -434,14 +524,13 @@ const Builder = struct {
             }
             try self.stageRemove(try self.infoPath(record.info_stem, script.kind.suffix()));
         }
-        for (self.base.opaque_info) |entry| {
-            const owner = entry.owner orelse continue;
-            if (!owner.eql(record.identity())) continue;
-            if (keep != null) continue;
-            try self.stageRemove(try std.fmt.allocPrint(self.arena, "{s}/{s}", .{
-                database.info_directory,
-                entry.name,
-            }));
+        if (keep == null) {
+            for (try self.opaqueFilesOf(record.identity())) |index| {
+                try self.stageRemove(try std.fmt.allocPrint(self.arena, "{s}/{s}", .{
+                    database.info_directory,
+                    self.base.opaque_info[index].name,
+                }));
+            }
         }
     }
 
@@ -479,9 +568,12 @@ const Builder = struct {
             );
         }
         for (scripts) |script| {
+            // Script bytes come from the caller; the plan owns its intent
+            // bytes, so a later mutation or free of the caller's buffer can
+            // never change what the plan publishes or what its digest covers.
             try self.stageReplace(
                 try self.infoPath(record.info_stem, script.kind.suffix()),
-                script.bytes,
+                try self.arena.dupe(u8, script.bytes),
                 script.mode,
             );
         }
@@ -540,14 +632,11 @@ const Builder = struct {
         record.scripts = scripts;
         try self.guardCoverage(record);
 
-        var existing: ?database.PackageRecord = null;
-        var position: ?usize = null;
-        for (self.records.items, 0..) |candidate, index| {
-            if (!candidate.identity().eql(record.identity())) continue;
-            existing = candidate;
-            position = index;
-            break;
-        }
+        const slot = try self.positionOf(record.identity());
+        const existing: ?database.PackageRecord = if (slot) |index|
+            self.records.items[index]
+        else
+            null;
         if (existing) |old| {
             if (!transitionAllowed(old.status.current, record.status.current)) {
                 return self.fail(.invalid_transition, record.name);
@@ -556,29 +645,27 @@ const Builder = struct {
             // scripts are republished under the new stem, but the bytes of
             // retained unmodeled info files are not part of the model, so
             // renaming them would either lose or orphan them.
-            if (!std.mem.eql(u8, old.info_stem, record.info_stem)) {
-                for (self.base.opaque_info) |entry| {
-                    const owner = entry.owner orelse continue;
-                    if (owner.eql(record.identity())) {
-                        return self.fail(.unsupported_info_rename, record.name);
-                    }
-                }
+            if (!std.mem.eql(u8, old.info_stem, record.info_stem) and
+                (try self.opaqueFilesOf(record.identity())).len != 0)
+            {
+                return self.fail(.unsupported_info_rename, record.name);
             }
             try self.guardCoverage(old);
         }
         try self.stagePackageInfo(record, staged.scripts);
         if (existing) |old| {
             try self.removeInfoFiles(old, record);
-            self.records.items[position.?] = record;
+            self.records.items[slot.?] = record;
         } else {
             try self.records.append(self.scratch, record);
+            try self.setPosition(record.identity(), self.records.items.len - 1);
         }
     }
 
     fn applySetState(self: *Builder, change: StateChange) PlanError!void {
         try self.claimIdentity(change.identity);
         const index = try self.indexOf(change.identity);
-        const old = self.records.items[index];
+        const old = self.recordAt(index);
         if (!transitionAllowed(old.status.current, change.current)) {
             return self.fail(.invalid_transition, change.identity.name);
         }
@@ -616,7 +703,7 @@ const Builder = struct {
         try self.claimIdentity(change.identity);
         const index = try self.indexOf(change.identity);
         try self.validatePaths(change.paths, change.identity.name);
-        var record = self.records.items[index];
+        var record = self.recordAt(index);
         try self.guardCoverage(record);
         record.paths = change.paths;
         try self.guardCoverage(record);
@@ -632,7 +719,7 @@ const Builder = struct {
         try self.claimIdentity(change.identity);
         const index = try self.indexOf(change.identity);
         try self.validateMd5sums(change.entries, change.identity.name);
-        var record = self.records.items[index];
+        var record = self.recordAt(index);
         record.md5sums = change.entries;
         self.records.items[index] = record;
         try self.stageReplace(
@@ -649,7 +736,7 @@ const Builder = struct {
         try self.claimIdentity(change.identity);
         const index = try self.indexOf(change.identity);
         try self.validateDeclarations(change.declarations, change.identity.name);
-        var record = self.records.items[index];
+        var record = self.recordAt(index);
         record.trigger_declarations = change.declarations;
         self.records.items[index] = record;
         try self.stageReplace(
@@ -662,7 +749,7 @@ const Builder = struct {
     fn applyRemoveInfo(self: *Builder, change: InfoRemoval) PlanError!void {
         try self.claimIdentity(change.identity);
         const index = try self.indexOf(change.identity);
-        var record = self.records.items[index];
+        var record = self.recordAt(index);
         switch (change.kind) {
             .list => record.paths = null,
             .md5sums => record.md5sums = null,
@@ -676,57 +763,23 @@ const Builder = struct {
     fn applyRemovePackage(self: *Builder, identity: Identity) PlanError!void {
         try self.claimIdentity(identity);
         const index = try self.indexOf(identity);
-        const record = self.records.items[index];
-        try self.guardCoverage(record);
-        try self.removeInfoFiles(record, null);
-        _ = self.records.orderedRemove(index);
+        const removed = self.recordAt(index);
+        try self.guardCoverage(removed);
+        try self.removeInfoFiles(removed, null);
+        self.records.items[index] = null;
     }
 
+    /// Trigger and architecture state is validated once, by the shared model
+    /// validation that also gates import, so a staged root and an imported
+    /// root are held to exactly the same semantics.
     fn applySetTriggerState(self: *Builder, state: database.TriggerState) PlanError!void {
         try self.claim("triggers");
-        const limits = self.options.database.limits;
-        if (state.interests.len > limits.max_trigger_interests or
-            state.pending.len > limits.max_pending_triggers)
-        {
-            return self.fail(.trigger_limit, "");
-        }
-        for (state.interests) |interest| {
-            if (interest.trigger.len == 0 or interest.trigger[0] != '/' or
-                !database.validTriggerName(interest.trigger))
-            {
-                return self.fail(.invalid_trigger_name, interest.package.name);
-            }
-        }
-        for (state.pending) |entry| {
-            if (!database.validTriggerName(entry.trigger) or entry.packages.len == 0) {
-                return self.fail(.invalid_trigger_record, "");
-            }
-        }
         self.triggers = state;
         self.trigger_state_changed = true;
     }
 
     fn applySetForeignArchitectures(self: *Builder, architectures: []const []const u8) PlanError!void {
         try self.claim("arch");
-        const limits = self.options.database.limits;
-        if (architectures.len > limits.max_foreign_architectures) {
-            return self.fail(.architecture_limit, "");
-        }
-        for (architectures, 0..) |architecture, index| {
-            if (architecture.len > limits.max_architecture_bytes or
-                !database.validArchitecture(architecture))
-            {
-                return self.fail(.invalid_architecture_record, "");
-            }
-            if (std.mem.eql(u8, architecture, self.base.native_architecture)) {
-                return self.fail(.native_architecture_listed, "");
-            }
-            for (architectures[0..index]) |earlier| {
-                if (std.mem.eql(u8, earlier, architecture)) {
-                    return self.fail(.duplicate_architecture, "");
-                }
-            }
-        }
         self.foreign = architectures;
         self.architectures_changed = true;
     }
@@ -745,8 +798,26 @@ const Builder = struct {
         }
     }
 
-    fn resultingModel(self: *Builder, status_bytes: []const u8) PlanError!database.Model {
-        const packages = try self.arena.dupe(database.PackageRecord, self.records.items);
+    fn livePackages(self: *Builder) PlanError![]database.PackageRecord {
+        var live: usize = 0;
+        for (self.records.items) |slot| {
+            if (slot != null) live += 1;
+        }
+        const packages = try self.arena.alloc(database.PackageRecord, live);
+        var index: usize = 0;
+        for (self.records.items) |slot| {
+            const value = slot orelse continue;
+            packages[index] = value;
+            index += 1;
+        }
+        return packages;
+    }
+
+    fn resultingModel(
+        self: *Builder,
+        packages: []const database.PackageRecord,
+        status_bytes: []const u8,
+    ) PlanError!database.Model {
         var retained: std.ArrayList(database.OpaqueInfoFile) = .empty;
         defer retained.deinit(self.scratch);
         for (self.base.opaque_info) |entry| {
@@ -754,12 +825,9 @@ const Builder = struct {
                 try retained.append(self.scratch, entry);
                 continue;
             };
-            for (packages) |record| {
-                if (record.identity().eql(owner)) {
-                    try retained.append(self.scratch, entry);
-                    break;
-                }
-            }
+            const slot = try self.positionOf(owner) orelse continue;
+            if (self.records.items[slot] == null) continue;
+            try retained.append(self.scratch, entry);
         }
         var digest: [32]u8 = undefined;
         Sha256.hash(status_bytes, &digest, .{});
@@ -843,9 +911,53 @@ const Builder = struct {
             .bytes = status_bytes,
             .sha256 = status_digest,
         });
-        return try self.arena.dupe(PlannedWrite, ordered.items);
+        const writes = try self.arena.dupe(PlannedWrite, ordered.items);
+        try self.enforceProducedBounds(writes);
+        return writes;
+    }
+
+    /// Every produced file must satisfy the same bounds the importer applies,
+    /// so a plan can never publish a generation that import would reject for
+    /// size or line length.
+    fn enforceProducedBounds(self: *Builder, writes: []const PlannedWrite) PlanError!void {
+        const limits = self.options.database.limits;
+        for (writes) |write| {
+            if (write.kind != .replace) continue;
+            const script = isScriptPath(write.path);
+            const max_bytes: usize = if (script)
+                limits.max_maintainer_script_bytes
+            else if (std.mem.startsWith(u8, write.path, database.info_directory ++ "/"))
+                limits.max_info_file_bytes
+            else if (std.mem.eql(u8, write.path, database.status_path) or
+                std.mem.eql(u8, write.path, database.status_old_path))
+                limits.max_status_bytes
+            else
+                limits.max_database_file_bytes;
+            if (write.bytes.len > max_bytes) {
+                return self.failPath(.file_too_large, write.path);
+            }
+            // Maintainer scripts are opaque payloads rather than database text.
+            if (script) continue;
+            var rest = write.bytes;
+            while (rest.len != 0) {
+                const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
+                    return self.failPath(.unterminated_line, write.path);
+                };
+                if (end > limits.max_line_bytes) {
+                    return self.failPath(.line_too_long, write.path);
+                }
+                rest = rest[end + 1 ..];
+            }
+        }
     }
 };
+
+fn isScriptPath(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, database.info_directory ++ "/")) return false;
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
+    const suffix = path[dot + 1 ..];
+    return std.meta.stringToEnum(database.ScriptKind, suffix) != null;
+}
 
 fn lessWrite(_: void, left: PlannedWrite, right: PlannedWrite) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
@@ -905,6 +1017,12 @@ pub fn plan(
         .scratch = allocator,
         .options = options,
         .base = source.model,
+        .identities = .{ .allocator = allocator },
+        .targets = .{ .allocator = allocator },
+        .scratch_index = .{ .allocator = allocator },
+        .diverted_paths = .{ .allocator = allocator },
+        .diverted_packages = .{ .allocator = allocator },
+        .overridden_paths = .{ .allocator = allocator },
         .foreign = source.model.foreign_architectures,
         .triggers = source.model.triggers,
     };
@@ -950,12 +1068,15 @@ fn build(
     source: database.Database,
     changes: []const Change,
 ) PlanError!Built {
-    try builder.records.appendSlice(builder.scratch, source.model.packages);
+    for (source.model.packages, 0..) |package, index| {
+        try builder.records.append(builder.scratch, package);
+        try builder.setPosition(package.identity(), index);
+    }
     for (changes) |change| try builder.apply(change);
 
-    const packages = try builder.arena.dupe(database.PackageRecord, builder.records.items);
+    const packages = try builder.livePackages();
     const status_bytes = try database.writeStatusDocument(builder.arena, packages);
-    const model = try builder.resultingModel(status_bytes);
+    const model = try builder.resultingModel(packages, status_bytes);
     if (try database.validateModel(builder.scratch, model, builder.options.database)) |diagnostic| {
         return .{
             .writes = &.{},
@@ -986,11 +1107,11 @@ const SimulatedRoot = struct {
     fn init(allocator: std.mem.Allocator, source: database.Snapshot) !SimulatedRoot {
         var root: SimulatedRoot = .{
             .arena = .init(allocator),
-            .status = source.status,
-            .status_old = source.status_old,
-            .arch = source.arch,
-            .triggers_file = source.triggers_file,
-            .triggers_unincorp = source.triggers_unincorp,
+            .status = source.status.bytes,
+            .status_old = if (source.status_old) |entry| entry.bytes else null,
+            .arch = if (source.arch) |entry| entry.bytes else null,
+            .triggers_file = if (source.triggers_file) |entry| entry.bytes else null,
+            .triggers_unincorp = if (source.triggers_unincorp) |entry| entry.bytes else null,
         };
         try root.info.appendSlice(root.arena.allocator(), source.info);
         return root;
@@ -1058,11 +1179,11 @@ const SimulatedRoot = struct {
 
     fn snapshot(self: *SimulatedRoot) database.Snapshot {
         return .{
-            .status = self.status,
-            .status_old = self.status_old,
-            .arch = self.arch,
-            .triggers_file = self.triggers_file,
-            .triggers_unincorp = self.triggers_unincorp,
+            .status = database.regularFile(self.status),
+            .status_old = database.optionalRegularFile(self.status_old),
+            .arch = database.optionalRegularFile(self.arch),
+            .triggers_file = database.optionalRegularFile(self.triggers_file),
+            .triggers_unincorp = database.optionalRegularFile(self.triggers_unincorp),
             .info = self.info.items,
         };
     }
@@ -1441,7 +1562,9 @@ test "package_database_changes.test.interrupted or diverted state blocks plannin
     );
 
     var diverted_snapshot = database.test_fixtures.snapshot();
-    diverted_snapshot.diversions = "/usr/bin/toolz\n/usr/bin/toolz.real\nother\n";
+    diverted_snapshot.diversions = database.regularFile(
+        "/usr/bin/toolz\n/usr/bin/toolz.real\nother\n",
+    );
     const diverted_result = try database.importSnapshot(
         testing.allocator,
         .{ .native_architecture = "amd64", .snapshot = diverted_snapshot },
@@ -1601,4 +1724,282 @@ test "package_database_changes.test.purge removes retained unmodeled info files"
     };
     defer republished.deinit();
     try testing.expectEqual(@as(usize, 0), republished.model.opaque_info.len);
+}
+
+fn expectImportRejects(snapshot: database.Snapshot, code: database.Code) !void {
+    const result = try database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{},
+    );
+    switch (result) {
+        .database => |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diagnostic| try testing.expectEqual(code, diagnostic.code),
+    }
+}
+
+test "package_database_changes.test.staged trigger state cannot publish an unimportable root" {
+    var source = try importFixture();
+    defer source.deinit();
+    const toolz: Identity = .{ .name = "toolz", .architecture = "amd64" };
+    const interest: database.TriggerInterest = .{
+        .trigger = "/usr/share/toolz",
+        .package = toolz,
+        .await_mode = .awaited,
+    };
+
+    const repeated_interests = [_]database.TriggerInterest{ interest, interest };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{ .interests = &repeated_interests, .pending = &.{} } },
+    }, .{}), .duplicate_trigger_interest);
+    const interest_bytes = try database.writeTriggerInterests(testing.allocator, &repeated_interests);
+    defer testing.allocator.free(interest_bytes);
+    var published = database.test_fixtures.snapshot();
+    published.triggers_file = database.regularFile(interest_bytes);
+    try expectImportRejects(published, .duplicate_trigger_interest);
+
+    const packages = [_]database.PendingPackage{.{ .package = toolz, .await_mode = .awaited }};
+    const repeated_pending = [_]database.PendingTrigger{
+        .{ .trigger = "/usr/share/toolz", .packages = &packages },
+        .{ .trigger = "/usr/share/toolz", .packages = &packages },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{ .interests = &.{interest}, .pending = &repeated_pending } },
+    }, .{}), .duplicate_pending_trigger);
+    const pending_bytes = try database.writePendingTriggers(testing.allocator, &repeated_pending);
+    defer testing.allocator.free(pending_bytes);
+    published = database.test_fixtures.snapshot();
+    published.triggers_unincorp = database.regularFile(pending_bytes);
+    try expectImportRejects(published, .duplicate_pending_trigger);
+
+    const repeated_packages = [_]database.PendingPackage{
+        .{ .package = toolz, .await_mode = .awaited },
+        .{ .package = toolz, .await_mode = .noawait },
+    };
+    const repeated_package_pending = [_]database.PendingTrigger{
+        .{ .trigger = "/usr/share/toolz", .packages = &repeated_packages },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{
+            .interests = &.{interest},
+            .pending = &repeated_package_pending,
+        } },
+    }, .{}), .duplicate_pending_package);
+    const repeated_package_bytes = try database.writePendingTriggers(
+        testing.allocator,
+        &repeated_package_pending,
+    );
+    defer testing.allocator.free(repeated_package_bytes);
+    published = database.test_fixtures.snapshot();
+    published.triggers_unincorp = database.regularFile(repeated_package_bytes);
+    try expectImportRejects(published, .duplicate_pending_package);
+
+    const valid_pending = [_]database.PendingTrigger{
+        .{ .trigger = "/usr/share/toolz", .packages = &packages },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{ .interests = &.{interest}, .pending = &valid_pending } },
+    }, .{ .database = .{ .limits = .{ .max_packages_per_pending_trigger = 0 } } }), .trigger_limit);
+
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{ .interests = &.{.{
+            .trigger = "/usr/share/ghost",
+            .package = .{ .name = "ghost", .architecture = "amd64" },
+            .await_mode = .awaited,
+        }}, .pending = &.{} } },
+    }, .{}), .unknown_trigger_package);
+
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .set_trigger_state = .{ .interests = &.{.{
+            .trigger = "usr/share/toolz",
+            .package = toolz,
+            .await_mode = .awaited,
+        }}, .pending = &.{} } },
+    }, .{}), .invalid_trigger_name);
+}
+
+test "package_database_changes.test.produced files must satisfy importer bounds" {
+    var source = try importFixture();
+    defer source.deinit();
+
+    const long_path = "/usr/share/newpkg/" ++ ("a" ** 300);
+    var long = newPackage();
+    long.paths = &.{ "/.", "/etc", "/etc/newpkg.conf", long_path };
+    long.md5sums = null;
+    try expectPlanDiagnostic(
+        try plan(
+            testing.allocator,
+            source,
+            &.{.{ .put_package = long }},
+            .{ .database = .{ .limits = .{ .max_line_bytes = 64 } } },
+        ),
+        .line_too_long,
+    );
+
+    try expectPlanDiagnostic(
+        try plan(
+            testing.allocator,
+            source,
+            &.{.{ .put_package = newPackage() }},
+            .{ .database = .{ .limits = .{ .max_status_bytes = 128 } } },
+        ),
+        .file_too_large,
+    );
+
+    try expectPlanDiagnostic(
+        try plan(
+            testing.allocator,
+            source,
+            &.{.{ .put_package = newPackage() }},
+            .{ .database = .{ .limits = .{ .max_info_file_bytes = 8 } } },
+        ),
+        .file_too_large,
+    );
+
+    // A published root with an over-long database line is exactly what import
+    // refuses, which is why planning may not produce one.
+    var snapshot = database.test_fixtures.snapshot();
+    const entries = [_]database.InfoEntry{.{
+        .name = "solo.list",
+        .bytes = "/.\n" ++ long_path ++ "\n",
+    }};
+    snapshot = .{
+        .status = database.regularFile(
+            "Package: solo\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n\n",
+        ),
+        .info = &entries,
+    };
+    const bounded = try database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{ .limits = .{ .max_line_bytes = 64 } },
+    );
+    switch (bounded) {
+        .database => |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diagnostic| try testing.expectEqual(
+            database.Code.line_too_long,
+            diagnostic.code,
+        ),
+    }
+}
+
+test "package_database_changes.test.plans own their maintainer script bytes" {
+    var source = try importFixture();
+    defer source.deinit();
+
+    const script_text = "#!/bin/sh\nexit 0\n";
+    const buffer = try testing.allocator.dupe(u8, script_text);
+    var staged_package = newPackage();
+    staged_package.scripts = &.{.{ .kind = .postinst, .bytes = buffer }};
+
+    const result = try plan(
+        testing.allocator,
+        source,
+        &.{.{ .put_package = staged_package }},
+        .{},
+    );
+    var staged = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .plan => |value| value,
+    };
+    defer staged.deinit();
+
+    const write = staged.find("info/newpkg.postinst").?;
+    try testing.expect(write.bytes.ptr != buffer.ptr);
+    const digest = write.sha256;
+    const plan_digest = staged.digest;
+
+    @memset(buffer, 'X');
+    testing.allocator.free(buffer);
+
+    const after = staged.find("info/newpkg.postinst").?;
+    try testing.expectEqualStrings(script_text, after.bytes);
+    try testing.expectEqualSlices(u8, &digest, &after.sha256);
+    try testing.expectEqualSlices(u8, &plan_digest, &staged.digest);
+}
+
+fn planUnderAllocationFailure(allocator: std.mem.Allocator, source: database.Database) !void {
+    const result = try plan(
+        allocator,
+        source,
+        &.{
+            .{ .put_package = newPackage() },
+            .{ .set_foreign_architectures = &.{ "i386", "arm64" } },
+        },
+        .{},
+    );
+    switch (result) {
+        .plan => |value| {
+            var owned = value;
+            owned.deinit();
+        },
+        .diagnostic => |diagnostic| if (diagnostic.code == .out_of_memory) {
+            return error.OutOfMemory;
+        },
+    }
+}
+
+test "package_database_changes.test.planning stays sound when every allocation can fail" {
+    var source = try importFixture();
+    defer source.deinit();
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        planUnderAllocationFailure,
+        .{source},
+    );
+}
+
+test "package_database_changes.test.large staged packages plan without quadratic work" {
+    var source = try importFixture();
+    defer source.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const count = 20_000;
+    var paths = try allocator.alloc([]const u8, count + 1);
+    var sums = try allocator.alloc(database.Md5sumEntry, count);
+    paths[0] = "/.";
+    for (0..count) |index| {
+        paths[index + 1] = try std.fmt.allocPrint(allocator, "/usr/share/bulk/file-{d}", .{index});
+        sums[index] = .{
+            .path = try std.fmt.allocPrint(allocator, "usr/share/bulk/file-{d}", .{index}),
+            .digest = @splat(0),
+        };
+    }
+    const fields = [_]database.StatusField{
+        .{ .name = "Package", .value_lines = &.{"bulk"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"1"} },
+    };
+
+    const result = try plan(testing.allocator, source, &.{.{ .put_package = .{
+        .fields = &fields,
+        .paths = paths,
+        .md5sums = sums,
+    } }}, .{});
+    var staged = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .plan => |value| value,
+    };
+    defer staged.deinit();
+    try testing.expect(staged.find("info/bulk.list") != null);
+    try testing.expect(staged.find("info/bulk.md5sums") != null);
+
+    paths[count] = paths[1];
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{.{ .put_package = .{
+        .fields = &fields,
+        .paths = paths,
+        .md5sums = sums,
+    } }}, .{}), .duplicate_path);
 }

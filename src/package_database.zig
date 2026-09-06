@@ -74,6 +74,7 @@ pub const Limits = struct {
     max_diversions: usize = 100_000,
     max_stat_overrides: usize = 100_000,
     max_line_bytes: usize = 8192,
+    max_database_file_bytes: usize = 64 * 1024 * 1024,
 };
 
 /// Nonempty `updates/` means a previous database publication was interrupted.
@@ -99,30 +100,58 @@ pub const EntryKind = enum {
     other,
 };
 
+/// One captured database file: its exact bytes plus the metadata the reader
+/// observed. Every consumed entry carries kind and mode, so import can reject
+/// non-regular or unsafe entries and the generation digest covers metadata
+/// changes rather than content alone.
+pub const FileEntry = struct {
+    bytes: []const u8 = &.{},
+    kind: EntryKind = .regular,
+    mode: u32 = 0o644,
+};
+
+/// Convenience constructor for the common captured case.
+pub fn regularFile(bytes: []const u8) FileEntry {
+    return .{ .bytes = bytes };
+}
+
+pub fn optionalRegularFile(bytes: ?[]const u8) ?FileEntry {
+    return .{ .bytes = bytes orelse return null };
+}
+
 pub const InfoEntry = struct {
     name: []const u8,
     bytes: []const u8 = &.{},
     kind: EntryKind = .regular,
     mode: u32 = 0o644,
+
+    pub fn file(self: InfoEntry) FileEntry {
+        return .{ .bytes = self.bytes, .kind = self.kind, .mode = self.mode };
+    }
 };
 
 pub const UpdateEntry = struct {
     name: []const u8,
     bytes: []const u8 = &.{},
     kind: EntryKind = .regular,
+    mode: u32 = 0o644,
+
+    pub fn file(self: UpdateEntry) FileEntry {
+        return .{ .bytes = self.bytes, .kind = self.kind, .mode = self.mode };
+    }
 };
 
 /// One captured database generation. Absent optional members mean the file
-/// does not exist in the root; empty slices mean the file or directory exists
+/// does not exist in the root; an entry with empty bytes means the file exists
 /// and is empty.
 pub const Snapshot = struct {
-    status: []const u8,
-    status_old: ?[]const u8 = null,
-    arch: ?[]const u8 = null,
-    diversions: ?[]const u8 = null,
-    statoverride: ?[]const u8 = null,
-    triggers_file: ?[]const u8 = null,
-    triggers_unincorp: ?[]const u8 = null,
+    status: FileEntry,
+    status_old: ?FileEntry = null,
+    arch: ?FileEntry = null,
+    diversions: ?FileEntry = null,
+    statoverride: ?FileEntry = null,
+    triggers_file: ?FileEntry = null,
+    triggers_unincorp: ?FileEntry = null,
     info: []const InfoEntry = &.{},
     updates: []const UpdateEntry = &.{},
 };
@@ -539,6 +568,8 @@ pub const Code = enum {
     unknown_trigger_package,
     trigger_interest_mismatch,
     duplicate_trigger_interest,
+    duplicate_pending_trigger,
+    duplicate_pending_package,
     missing_trigger_state,
     unexpected_trigger_state,
     invalid_architecture_record,
@@ -631,6 +662,8 @@ pub const Diagnostic = struct {
             .unknown_trigger_package => "trigger state names an unknown package",
             .trigger_interest_mismatch => "file trigger interest is not declared by the package",
             .duplicate_trigger_interest => "file trigger interest is repeated",
+            .duplicate_pending_trigger => "deferred trigger activation is repeated",
+            .duplicate_pending_package => "deferred trigger activation repeats a package",
             .missing_trigger_state => "trigger state field is required by the package state",
             .unexpected_trigger_state => "trigger state field contradicts the package state",
             .invalid_architecture_record => "architecture record is malformed",
@@ -962,13 +995,9 @@ const FieldInterpreter = struct {
             if (conffiles.items.len >= self.options.limits.max_conffiles_per_package) {
                 return self.fail(.conffile_limit, "Conffiles", package);
             }
-            const parsed = try self.parseConffileLine(line, package);
-            for (conffiles.items) |existing| {
-                if (std.mem.eql(u8, existing.path, parsed.path)) {
-                    return self.fail(.duplicate_conffile, "Conffiles", package);
-                }
-            }
-            try conffiles.append(self.arena, parsed);
+            // Uniqueness is enforced once, for imported and staged records
+            // alike, by the shared model validation.
+            try conffiles.append(self.arena, try self.parseConffileLine(line, package));
         }
         return try self.arena.dupe(ConffileEntry, conffiles.items);
     }
@@ -1033,11 +1062,6 @@ const FieldInterpreter = struct {
             else
                 validTriggerName(token);
             if (!valid) return self.fail(.invalid_trigger_name, name, package);
-            for (values.items) |existing| {
-                if (std.mem.eql(u8, existing, token)) {
-                    return self.fail(.invalid_trigger_name, name, package);
-                }
-            }
             try values.append(self.arena, token);
         }
         if (values.items.len == 0) return self.fail(.invalid_trigger_name, name, package);
@@ -1230,6 +1254,28 @@ const Importer = struct {
         return line.text;
     }
 
+    /// Validate one captured top-level database file and return its bytes.
+    /// Non-regular entries, unsafe modes, and over-long files fail closed.
+    fn consume(
+        self: *Importer,
+        surface: Surface,
+        path: []const u8,
+        entry: ?FileEntry,
+        max_bytes: usize,
+    ) ImportError!?[]const u8 {
+        const value = entry orelse return null;
+        if (value.kind != .regular) {
+            return self.fail(surface, .unsupported_entry_kind, path, null);
+        }
+        if (!safeMode(value.mode)) {
+            return self.fail(surface, .unsafe_mode, path, null);
+        }
+        if (value.bytes.len > max_bytes) {
+            return self.fail(surface, .file_too_large, path, null);
+        }
+        return value.bytes;
+    }
+
     fn parseStatusDocument(
         self: *Importer,
         surface: Surface,
@@ -1334,8 +1380,8 @@ const Importer = struct {
     ) ImportError![]const []const u8 {
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(self.scratch);
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.info_list, name, line);
@@ -1349,12 +1395,10 @@ const Importer = struct {
             if (!validListPath(value)) {
                 return self.fail(.info_list, .invalid_path, name, line.number);
             }
-            const owned = value;
-            const entry = try seen.getOrPut(self.scratch, logicalListPath(owned));
-            if (entry.found_existing) {
+            if (!try seen.insert(logicalListPath(value))) {
                 return self.fail(.info_list, .duplicate_path, name, line.number);
             }
-            try paths.append(self.scratch, owned);
+            try paths.append(self.scratch, value);
         }
         return try self.arena.dupe([]const u8, paths.items);
     }
@@ -1366,8 +1410,8 @@ const Importer = struct {
     ) ImportError![]const Md5sumEntry {
         var entries: std.ArrayList(Md5sumEntry) = .empty;
         defer entries.deinit(self.scratch);
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.info_md5sums, name, line);
@@ -1387,12 +1431,10 @@ const Importer = struct {
             if (!validRelativePath(path)) {
                 return self.fail(.info_md5sums, .invalid_path, name, line.number);
             }
-            const owned = path;
-            const entry = try seen.getOrPut(self.scratch, owned);
-            if (entry.found_existing) {
+            if (!try seen.insert(path)) {
                 return self.fail(.info_md5sums, .duplicate_checksum, name, line.number);
             }
-            try entries.append(self.scratch, .{ .path = owned, .digest = digest });
+            try entries.append(self.scratch, .{ .path = path, .digest = digest });
         }
         return try self.arena.dupe(Md5sumEntry, entries.items);
     }
@@ -1404,6 +1446,8 @@ const Importer = struct {
     ) ImportError![]const []const u8 {
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.info_conffiles, name, line);
@@ -1417,10 +1461,8 @@ const Importer = struct {
             if (!absolute_path.nonRoot(value)) {
                 return self.fail(.info_conffiles, .invalid_path, name, line.number);
             }
-            for (paths.items) |existing| {
-                if (std.mem.eql(u8, existing, value)) {
-                    return self.fail(.info_conffiles, .duplicate_conffile, name, line.number);
-                }
+            if (!try seen.insert(value)) {
+                return self.fail(.info_conffiles, .duplicate_conffile, name, line.number);
             }
             try paths.append(self.scratch, value);
         }
@@ -1434,6 +1476,8 @@ const Importer = struct {
     ) ImportError![]const TriggerDeclaration {
         var declarations: std.ArrayList(TriggerDeclaration) = .empty;
         defer declarations.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.info_triggers, name, line);
@@ -1454,10 +1498,11 @@ const Importer = struct {
             if (trigger.len > self.options.limits.max_trigger_name_bytes or !validTriggerName(trigger)) {
                 return self.fail(.info_triggers, .invalid_trigger_name, name, line.number);
             }
-            for (declarations.items) |existing| {
-                if (existing.kind == kind and std.mem.eql(u8, existing.name, trigger)) {
-                    return self.fail(.info_triggers, .duplicate_trigger_declaration, name, line.number);
-                }
+            seen.beginKey();
+            try seen.appendKey(kind.spelling());
+            try seen.appendKey(trigger);
+            if (!try seen.insertKey()) {
+                return self.fail(.info_triggers, .duplicate_trigger_declaration, name, line.number);
             }
             try declarations.append(self.scratch, .{
                 .kind = kind,
@@ -1470,6 +1515,8 @@ const Importer = struct {
     fn parseTriggerInterests(self: *Importer, bytes: []const u8) ImportError![]const TriggerInterest {
         var interests: std.ArrayList(TriggerInterest) = .empty;
         defer interests.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.triggers_file, triggers_file_path, line);
@@ -1494,17 +1541,17 @@ const Importer = struct {
             }
             const parsed = self.parsePendingPackage(package_text) orelse
                 return self.fail(.triggers_file, .invalid_trigger_record, triggers_file_path, line.number);
-            for (interests.items) |existing| {
-                if (std.mem.eql(u8, existing.trigger, trigger) and
-                    existing.package.eql(parsed.package))
-                {
-                    return self.fail(
-                        .triggers_file,
-                        .duplicate_trigger_interest,
-                        triggers_file_path,
-                        line.number,
-                    );
-                }
+            seen.beginKey();
+            try seen.appendKey(trigger);
+            try seen.appendKey(parsed.package.name);
+            try seen.appendKey(parsed.package.architecture);
+            if (!try seen.insertKey()) {
+                return self.fail(
+                    .triggers_file,
+                    .duplicate_trigger_interest,
+                    triggers_file_path,
+                    line.number,
+                );
             }
             try interests.append(self.scratch, .{
                 .trigger = trigger,
@@ -1521,6 +1568,10 @@ const Importer = struct {
     fn parsePendingTriggers(self: *Importer, bytes: []const u8) ImportError![]const PendingTrigger {
         var pending: std.ArrayList(PendingTrigger) = .empty;
         defer pending.deinit(self.scratch);
+        var seen_triggers: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen_triggers.deinit();
+        var seen_packages: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen_packages.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.triggers_unincorp, triggers_unincorp_path, line);
@@ -1547,6 +1598,7 @@ const Importer = struct {
             }
             var packages: std.ArrayList(PendingPackage) = .empty;
             defer packages.deinit(self.scratch);
+            seen_packages.reset();
             while (tokens.next()) |package_text| {
                 if (packages.items.len >= self.options.limits.max_packages_per_pending_trigger) {
                     return self.fail(
@@ -1562,15 +1614,16 @@ const Importer = struct {
                     triggers_unincorp_path,
                     line.number,
                 );
-                for (packages.items) |existing| {
-                    if (existing.package.eql(parsed.package)) {
-                        return self.fail(
-                            .triggers_unincorp,
-                            .invalid_trigger_record,
-                            triggers_unincorp_path,
-                            line.number,
-                        );
-                    }
+                seen_packages.beginKey();
+                try seen_packages.appendKey(parsed.package.name);
+                try seen_packages.appendKey(parsed.package.architecture);
+                if (!try seen_packages.insertKey()) {
+                    return self.fail(
+                        .triggers_unincorp,
+                        .duplicate_pending_package,
+                        triggers_unincorp_path,
+                        line.number,
+                    );
                 }
                 try packages.append(self.scratch, .{
                     .package = .{
@@ -1588,15 +1641,13 @@ const Importer = struct {
                     line.number,
                 );
             }
-            for (pending.items) |existing| {
-                if (std.mem.eql(u8, existing.trigger, trigger)) {
-                    return self.fail(
-                        .triggers_unincorp,
-                        .invalid_trigger_record,
-                        triggers_unincorp_path,
-                        line.number,
-                    );
-                }
+            if (!try seen_triggers.insert(trigger)) {
+                return self.fail(
+                    .triggers_unincorp,
+                    .duplicate_pending_trigger,
+                    triggers_unincorp_path,
+                    line.number,
+                );
             }
             try pending.append(self.scratch, .{
                 .trigger = trigger,
@@ -1671,6 +1722,8 @@ const Importer = struct {
     fn parseStatOverrides(self: *Importer, bytes: []const u8) ImportError![]const StatOverrideRecord {
         var records: std.ArrayList(StatOverrideRecord) = .empty;
         defer records.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
             const value = try self.text(.statoverride, statoverride_path, line);
@@ -1697,15 +1750,13 @@ const Importer = struct {
             }
             const mode = std.fmt.parseUnsigned(u32, mode_text, 8) catch
                 return self.fail(.statoverride, .invalid_statoverride, statoverride_path, line.number);
-            for (records.items) |existing| {
-                if (std.mem.eql(u8, existing.path, path)) {
-                    return self.fail(
-                        .statoverride,
-                        .invalid_statoverride,
-                        statoverride_path,
-                        line.number,
-                    );
-                }
+            if (!try seen.insert(path)) {
+                return self.fail(
+                    .statoverride,
+                    .invalid_statoverride,
+                    statoverride_path,
+                    line.number,
+                );
             }
             try records.append(self.scratch, .{
                 .user = user,
@@ -1726,6 +1777,12 @@ const Importer = struct {
             if (entry.kind != .regular) {
                 return self.fail(.updates, .unsupported_entry_kind, entry.name, null);
             }
+            if (!safeMode(entry.mode)) {
+                return self.fail(.updates, .unsafe_mode, entry.name, null);
+            }
+            if (entry.bytes.len > self.options.limits.max_status_bytes) {
+                return self.fail(.updates, .file_too_large, entry.name, null);
+            }
             if (entry.name.len == 0 or entry.name.len > 8) {
                 return self.fail(.updates, .invalid_update_name, entry.name, null);
             }
@@ -1736,11 +1793,6 @@ const Importer = struct {
             }
             const sequence = std.fmt.parseUnsigned(u64, entry.name, 10) catch
                 return self.fail(.updates, .invalid_update_name, entry.name, null);
-            for (fragments[0..index]) |existing| {
-                if (existing.sequence == sequence) {
-                    return self.fail(.updates, .invalid_update_name, entry.name, null);
-                }
-            }
             const parsed = self.parseStatusDocument(.updates, entry.name, entry.bytes) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 error.Invalid => {
@@ -1759,6 +1811,11 @@ const Importer = struct {
             };
         }
         std.mem.sort(PendingUpdate, fragments, {}, lessPendingUpdate);
+        for (fragments, 0..) |fragment, index| {
+            if (index != 0 and fragments[index - 1].sequence == fragment.sequence) {
+                return self.fail(.updates, .invalid_update_name, fragment.name, null);
+            }
+        }
         return fragments;
     }
 
@@ -1789,8 +1846,19 @@ const Importer = struct {
             return self.fail(.cross_file, .invalid_architecture, database_directory, null);
         }
         const snapshot = request.snapshot;
-        const records = try self.parseStatusDocument(.status, status_path, snapshot.status);
-        const foreign: []const []const u8 = if (snapshot.arch) |bytes|
+        const status_bytes = (try self.consume(
+            .status,
+            status_path,
+            snapshot.status,
+            limits.max_status_bytes,
+        )).?;
+        const records = try self.parseStatusDocument(.status, status_path, status_bytes);
+        const foreign: []const []const u8 = if (try self.consume(
+            .architectures,
+            arch_path,
+            snapshot.arch,
+            limits.max_database_file_bytes,
+        )) |bytes|
             try self.parseArchitectures(native, bytes)
         else
             &.{};
@@ -1918,19 +1986,39 @@ const Importer = struct {
             record.scripts = try self.arena.dupe(MaintainerScript, scripts[position].items);
         }
 
-        const interests: []const TriggerInterest = if (snapshot.triggers_file) |bytes|
+        const interests: []const TriggerInterest = if (try self.consume(
+            .triggers_file,
+            triggers_file_path,
+            snapshot.triggers_file,
+            limits.max_database_file_bytes,
+        )) |bytes|
             try self.parseTriggerInterests(bytes)
         else
             &.{};
-        const pending: []const PendingTrigger = if (snapshot.triggers_unincorp) |bytes|
+        const pending: []const PendingTrigger = if (try self.consume(
+            .triggers_unincorp,
+            triggers_unincorp_path,
+            snapshot.triggers_unincorp,
+            limits.max_database_file_bytes,
+        )) |bytes|
             try self.parsePendingTriggers(bytes)
         else
             &.{};
-        const diversions: []const DiversionRecord = if (snapshot.diversions) |bytes|
+        const diversions: []const DiversionRecord = if (try self.consume(
+            .diversions,
+            diversions_path,
+            snapshot.diversions,
+            limits.max_database_file_bytes,
+        )) |bytes|
             try self.parseDiversions(bytes)
         else
             &.{};
-        const stat_overrides: []const StatOverrideRecord = if (snapshot.statoverride) |bytes|
+        const stat_overrides: []const StatOverrideRecord = if (try self.consume(
+            .statoverride,
+            statoverride_path,
+            snapshot.statoverride,
+            limits.max_database_file_bytes,
+        )) |bytes|
             try self.parseStatOverrides(bytes)
         else
             &.{};
@@ -1944,7 +2032,12 @@ const Importer = struct {
         }
 
         var status_old: ?StatusGeneration = null;
-        if (snapshot.status_old) |bytes| {
+        if (try self.consume(
+            .status_old,
+            status_old_path,
+            snapshot.status_old,
+            limits.max_status_bytes,
+        )) |bytes| {
             const previous = try self.parseStatusDocument(.status_old, status_old_path, bytes);
             status_old = .{
                 .sha256 = digestOf(bytes),
@@ -1956,8 +2049,8 @@ const Importer = struct {
         return .{
             .native_architecture = native,
             .status = .{
-                .sha256 = digestOf(snapshot.status),
-                .size = snapshot.status.len,
+                .sha256 = digestOf(status_bytes),
+                .size = status_bytes.len,
                 .package_count = records.len,
             },
             .foreign_architectures = foreign,
@@ -2105,23 +2198,25 @@ pub fn generation(
         entries.deinit(allocator);
     }
 
-    const singles = [_]struct { path: []const u8, bytes: ?[]const u8 }{
-        .{ .path = status_path, .bytes = snapshot.status },
-        .{ .path = status_old_path, .bytes = snapshot.status_old },
-        .{ .path = arch_path, .bytes = snapshot.arch },
-        .{ .path = diversions_path, .bytes = snapshot.diversions },
-        .{ .path = statoverride_path, .bytes = snapshot.statoverride },
-        .{ .path = triggers_file_path, .bytes = snapshot.triggers_file },
-        .{ .path = triggers_unincorp_path, .bytes = snapshot.triggers_unincorp },
+    const singles = [_]struct { path: []const u8, entry: ?FileEntry }{
+        .{ .path = status_path, .entry = snapshot.status },
+        .{ .path = status_old_path, .entry = snapshot.status_old },
+        .{ .path = arch_path, .entry = snapshot.arch },
+        .{ .path = diversions_path, .entry = snapshot.diversions },
+        .{ .path = statoverride_path, .entry = snapshot.statoverride },
+        .{ .path = triggers_file_path, .entry = snapshot.triggers_file },
+        .{ .path = triggers_unincorp_path, .entry = snapshot.triggers_unincorp },
     };
     for (singles) |single| {
-        const bytes = single.bytes orelse continue;
+        const entry = single.entry orelse continue;
+        const path = try allocator.dupe(u8, single.path);
+        errdefer allocator.free(path);
         try entries.append(allocator, .{
-            .path = try allocator.dupe(u8, single.path),
-            .kind = .regular,
-            .mode = 0o644,
-            .size = bytes.len,
-            .sha256 = digestOf(bytes),
+            .path = path,
+            .kind = entry.kind,
+            .mode = entry.mode,
+            .size = entry.bytes.len,
+            .sha256 = digestOf(entry.bytes),
         });
     }
     for (snapshot.info) |entry| {
@@ -2141,7 +2236,7 @@ pub fn generation(
         try entries.append(allocator, .{
             .path = path,
             .kind = entry.kind,
-            .mode = 0o644,
+            .mode = entry.mode,
             .size = entry.bytes.len,
             .sha256 = digestOf(entry.bytes),
         });
@@ -2172,14 +2267,84 @@ pub fn generation(
     };
 }
 
+/// Reusable bounded membership index. Every per-record uniqueness and
+/// ownership question is answered in amortized O(1), so validating a database
+/// stays linear in the number of entries rather than quadratic in it.
+pub const MembershipIndex = struct {
+    allocator: std.mem.Allocator,
+    set: std.StringHashMapUnmanaged(void) = .empty,
+    key: std.ArrayList(u8) = .empty,
+    owned_keys: std.ArrayList([]u8) = .empty,
+
+    pub fn deinit(self: *MembershipIndex) void {
+        self.reset();
+        self.set.deinit(self.allocator);
+        self.key.deinit(self.allocator);
+        self.owned_keys.deinit(self.allocator);
+    }
+
+    pub fn reset(self: *MembershipIndex) void {
+        for (self.owned_keys.items) |key| self.allocator.free(key);
+        self.owned_keys.clearRetainingCapacity();
+        self.set.clearRetainingCapacity();
+    }
+
+    /// Insert a key that borrows caller memory. Returns false when the key was
+    /// already present.
+    pub fn insert(self: *MembershipIndex, value: []const u8) std.mem.Allocator.Error!bool {
+        const entry = try self.set.getOrPut(self.allocator, value);
+        return !entry.found_existing;
+    }
+
+    /// Insert the composite key currently in `key`, which the index copies.
+    pub fn insertKey(self: *MembershipIndex) std.mem.Allocator.Error!bool {
+        if (self.set.contains(self.key.items)) return false;
+        const owned = try self.allocator.dupe(u8, self.key.items);
+        errdefer self.allocator.free(owned);
+        // Reserve the ownership slot first so no failing step can leave the
+        // key either owned twice or owned by nobody.
+        try self.owned_keys.ensureUnusedCapacity(self.allocator, 1);
+        try self.set.put(self.allocator, owned, {});
+        self.owned_keys.appendAssumeCapacity(owned);
+        return true;
+    }
+
+    pub fn beginKey(self: *MembershipIndex) void {
+        self.key.clearRetainingCapacity();
+    }
+
+    pub fn appendKey(self: *MembershipIndex, part: []const u8) std.mem.Allocator.Error!void {
+        try self.key.appendSlice(self.allocator, part);
+        try self.key.append(self.allocator, 0);
+    }
+
+    pub fn contains(self: MembershipIndex, value: []const u8) bool {
+        return self.set.contains(value);
+    }
+
+    /// Membership for a relative payload path against absolute owned paths.
+    pub fn containsRelative(self: *MembershipIndex, relative: []const u8) std.mem.Allocator.Error!bool {
+        self.key.clearRetainingCapacity();
+        try self.key.append(self.allocator, '/');
+        try self.key.appendSlice(self.allocator, relative);
+        return self.set.contains(self.key.items);
+    }
+};
+
 const Validator = struct {
     allocator: std.mem.Allocator,
     model: Model,
     options: Options,
     index: RecordIndex = .{},
+    paths: MembershipIndex,
+    names: MembershipIndex,
+    keys: MembershipIndex,
 
     fn deinit(self: *Validator) void {
         self.index.deinit(self.allocator);
+        self.paths.deinit();
+        self.names.deinit();
+        self.keys.deinit();
     }
 
     fn fail(self: *Validator, surface: Surface, code: Code, package: []const u8) Diagnostic {
@@ -2238,9 +2403,27 @@ const Validator = struct {
             }
         }
 
+        if (self.model.foreign_architectures.len > limits.max_foreign_architectures) {
+            return self.fail(.architectures, .architecture_limit, "");
+        }
+        self.names.reset();
+        for (self.model.foreign_architectures) |architecture| {
+            if (architecture.len > limits.max_architecture_bytes or
+                !validArchitecture(architecture))
+            {
+                return self.fail(.architectures, .invalid_architecture_record, "");
+            }
+            if (std.mem.eql(u8, architecture, self.model.native_architecture)) {
+                return self.fail(.architectures, .native_architecture_listed, "");
+            }
+            if (!try self.names.insert(architecture)) {
+                return self.fail(.architectures, .duplicate_architecture, "");
+            }
+        }
+
         var total_paths: usize = 0;
         for (self.model.packages) |record| {
-            if (validateRecordShape(record, self.options)) |diagnostic| return diagnostic;
+            if (try self.validateRecord(record)) |diagnostic| return diagnostic;
             if (!self.model.knowsArchitecture(record.architecture)) {
                 return self.fail(.cross_file, .unknown_architecture, record.name);
             }
@@ -2266,13 +2449,33 @@ const Validator = struct {
             }
         }
 
+        return self.validateTriggers();
+    }
+
+    fn validateTriggers(self: *Validator) std.mem.Allocator.Error!?Diagnostic {
+        const limits = self.options.limits;
         if (self.model.triggers.interests.len > limits.max_trigger_interests) {
             return self.fail(.triggers_file, .trigger_limit, "");
         }
+        self.names.reset();
         for (self.model.triggers.interests) |interest| {
+            if (interest.trigger.len == 0 or
+                interest.trigger.len > limits.max_trigger_name_bytes or
+                interest.trigger[0] != '/' or
+                !validTriggerName(interest.trigger))
+            {
+                return self.fail(.triggers_file, .invalid_trigger_name, interest.package.name);
+            }
             const position = self.lookup(interest.package.name, interest.package.architecture) orelse
                 return self.fail(.triggers_file, .unknown_trigger_package, interest.package.name);
             const record = self.model.packages[position];
+            self.names.beginKey();
+            try self.names.appendKey(interest.trigger);
+            try self.names.appendKey(record.name);
+            try self.names.appendKey(record.architecture);
+            if (!try self.names.insertKey()) {
+                return self.fail(.triggers_file, .duplicate_trigger_interest, record.name);
+            }
             const declarations = record.trigger_declarations orelse
                 return self.fail(.triggers_file, .trigger_interest_mismatch, record.name);
             var declared = false;
@@ -2287,147 +2490,193 @@ const Validator = struct {
                 return self.fail(.triggers_file, .trigger_interest_mismatch, record.name);
             }
         }
+
+        if (self.model.triggers.pending.len > limits.max_pending_triggers) {
+            return self.fail(.triggers_unincorp, .trigger_limit, "");
+        }
+        self.names.reset();
         for (self.model.triggers.pending) |entry| {
+            if (entry.trigger.len > limits.max_trigger_name_bytes or
+                !validTriggerName(entry.trigger))
+            {
+                return self.fail(.triggers_unincorp, .invalid_trigger_name, "");
+            }
+            if (!try self.names.insert(entry.trigger)) {
+                return self.fail(.triggers_unincorp, .duplicate_pending_trigger, "");
+            }
+            if (entry.packages.len == 0) {
+                return self.fail(.triggers_unincorp, .invalid_trigger_record, "");
+            }
+            if (entry.packages.len > limits.max_packages_per_pending_trigger) {
+                return self.fail(.triggers_unincorp, .trigger_limit, "");
+            }
+            self.paths.reset();
             for (entry.packages) |package| {
-                if (self.lookup(package.package.name, package.package.architecture) == null) {
-                    return self.fail(.triggers_unincorp, .unknown_trigger_package, package.package.name);
+                const position = self.lookup(
+                    package.package.name,
+                    package.package.architecture,
+                ) orelse return self.fail(
+                    .triggers_unincorp,
+                    .unknown_trigger_package,
+                    package.package.name,
+                );
+                const record = self.model.packages[position];
+                self.paths.beginKey();
+                try self.paths.appendKey(record.name);
+                try self.paths.appendKey(record.architecture);
+                if (!try self.paths.insertKey()) {
+                    return self.fail(
+                        .triggers_unincorp,
+                        .duplicate_pending_package,
+                        package.package.name,
+                    );
                 }
+            }
+        }
+        return null;
+    }
+
+    /// Per-record shape, ownership, checksum, conffile, and trigger-field
+    /// consistency. Membership and uniqueness use the reusable indexes, so the
+    /// cost is linear in the record's own entries.
+    fn validateRecord(self: *Validator, record: PackageRecord) std.mem.Allocator.Error!?Diagnostic {
+        const limits = self.options.limits;
+        if (record.conffiles.len > limits.max_conffiles_per_package) {
+            return self.fail(.status, .conffile_limit, record.name);
+        }
+        switch (record.status.current) {
+            .not_installed => {
+                if (record.paths != null or record.md5sums != null) {
+                    return self.fail(.cross_file, .unexpected_file_list, record.name);
+                }
+            },
+            // dpkg retains an ownership list for the conffiles and directories
+            // that survive removal, so `config-files` may or may not have one.
+            .config_files => {},
+            else => {
+                if (record.paths == null) {
+                    return self.fail(.cross_file, .missing_file_list, record.name);
+                }
+            },
+        }
+
+        self.paths.reset();
+        if (record.paths) |paths| {
+            if (paths.len > limits.max_paths_per_package) {
+                return self.fail(.cross_file, .path_limit, record.name);
+            }
+            for (paths) |path| {
+                if (path.len > limits.max_path_bytes) {
+                    return self.fail(.cross_file, .path_too_long, record.name);
+                }
+                if (!validListPath(path)) {
+                    return self.fail(.cross_file, .invalid_path, record.name);
+                }
+                if (!try self.paths.insert(logicalListPath(path))) {
+                    return self.fail(.cross_file, .duplicate_path, record.name);
+                }
+            }
+        }
+
+        self.names.reset();
+        for (record.conffiles) |conffile| {
+            if (!try self.names.insert(conffile.path)) {
+                return self.fail(.status, .duplicate_conffile, record.name);
+            }
+            if (record.paths == null) continue;
+            if (conffile.obsolete or conffile.remove_on_upgrade) continue;
+            if (record.status.current == .not_installed) continue;
+            if (!self.paths.contains(logicalListPath(conffile.path))) {
+                return self.fail(.cross_file, .conffile_not_owned, record.name);
+            }
+        }
+
+        if (record.md5sums) |entries| {
+            if (entries.len > limits.max_md5sums_per_package) {
+                return self.fail(.cross_file, .checksum_limit, record.name);
+            }
+            self.keys.reset();
+            for (entries) |entry| {
+                if (!try self.keys.insert(entry.path)) {
+                    return self.fail(.cross_file, .duplicate_checksum, record.name);
+                }
+                if (record.paths == null) continue;
+                if (!try self.paths.containsRelative(entry.path)) {
+                    return self.fail(.cross_file, .checksum_out_of_inventory, record.name);
+                }
+            }
+        }
+
+        if (record.declared_conffiles) |declared| {
+            if (declared.len > limits.max_conffiles_per_package) {
+                return self.fail(.cross_file, .conffile_limit, record.name);
+            }
+            for (declared) |path| {
+                if (!self.names.contains(path)) {
+                    return self.fail(.cross_file, .declared_conffile_mismatch, record.name);
+                }
+            }
+        }
+
+        if (record.trigger_declarations) |declarations| {
+            if (declarations.len > limits.max_trigger_declarations_per_package) {
+                return self.fail(.info_triggers, .trigger_limit, record.name);
+            }
+            self.names.reset();
+            for (declarations) |declaration| {
+                if (declaration.name.len > limits.max_trigger_name_bytes or
+                    !validTriggerName(declaration.name))
+                {
+                    return self.fail(.info_triggers, .invalid_trigger_name, record.name);
+                }
+                self.names.beginKey();
+                try self.names.appendKey(declaration.kind.spelling());
+                try self.names.appendKey(declaration.name);
+                if (!try self.names.insertKey()) {
+                    return self.fail(.info_triggers, .duplicate_trigger_declaration, record.name);
+                }
+            }
+        }
+
+        if (record.status.current == .triggers_awaited and record.triggers_awaited.len == 0) {
+            return self.fail(.status, .missing_trigger_state, record.name);
+        }
+        if (record.status.current == .triggers_pending and record.triggers_pending.len == 0) {
+            return self.fail(.status, .missing_trigger_state, record.name);
+        }
+        if (record.triggers_awaited.len != 0 and record.status.current != .triggers_awaited) {
+            return self.fail(.status, .unexpected_trigger_state, record.name);
+        }
+        if (record.triggers_pending.len != 0 and
+            record.status.current != .triggers_pending and
+            record.status.current != .triggers_awaited)
+        {
+            return self.fail(.status, .unexpected_trigger_state, record.name);
+        }
+        if (record.triggers_pending.len > limits.max_triggers_per_package or
+            record.triggers_awaited.len > limits.max_triggers_per_package)
+        {
+            return self.fail(.status, .trigger_limit, record.name);
+        }
+        self.names.reset();
+        for (record.triggers_pending) |trigger| {
+            if (!validTriggerName(trigger) or !try self.names.insert(trigger)) {
+                return self.fail(.status, .invalid_trigger_name, record.name);
+            }
+        }
+        self.names.reset();
+        for (record.triggers_awaited) |token| {
+            if (!try self.names.insert(token)) {
+                return self.fail(.status, .invalid_trigger_name, record.name);
             }
         }
         return null;
     }
 };
 
-fn validateRecordShape(record: PackageRecord, options: Options) ?Diagnostic {
-    const limits = options.limits;
-    if (record.conffiles.len > limits.max_conffiles_per_package) {
-        return .{
-            .surface = .status,
-            .code = .conffile_limit,
-            .path = status_path,
-            .package = record.name,
-        };
-    }
-    switch (record.status.current) {
-        .not_installed => {
-            if (record.paths != null) {
-                return .{
-                    .surface = .cross_file,
-                    .code = .unexpected_file_list,
-                    .path = info_directory,
-                    .package = record.name,
-                };
-            }
-            if (record.md5sums != null) {
-                return .{
-                    .surface = .cross_file,
-                    .code = .unexpected_file_list,
-                    .path = info_directory,
-                    .package = record.name,
-                };
-            }
-        },
-        // dpkg retains an ownership list for the conffiles and directories
-        // that survive removal, so `config-files` may or may not have one.
-        .config_files => {},
-        else => {
-            if (record.paths == null) {
-                return .{
-                    .surface = .cross_file,
-                    .code = .missing_file_list,
-                    .path = info_directory,
-                    .package = record.name,
-                };
-            }
-        },
-    }
-    if (record.paths) |paths| {
-        for (record.conffiles) |conffile| {
-            if (conffile.obsolete or conffile.remove_on_upgrade) continue;
-            if (record.status.current == .not_installed) continue;
-            if (!containsPath(paths, conffile.path)) {
-                return .{
-                    .surface = .cross_file,
-                    .code = .conffile_not_owned,
-                    .path = info_directory,
-                    .package = record.name,
-                };
-            }
-        }
-        if (record.md5sums) |entries| {
-            for (entries) |entry| {
-                if (!containsRelativePath(paths, entry.path)) {
-                    return .{
-                        .surface = .cross_file,
-                        .code = .checksum_out_of_inventory,
-                        .path = info_directory,
-                        .package = record.name,
-                    };
-                }
-            }
-        }
-    }
-    if (record.declared_conffiles) |declared| {
-        for (declared) |path| {
-            if (record.conffile(path) == null) {
-                return .{
-                    .surface = .cross_file,
-                    .code = .declared_conffile_mismatch,
-                    .path = info_directory,
-                    .package = record.name,
-                };
-            }
-        }
-    }
-    if (record.status.current == .triggers_awaited and record.triggers_awaited.len == 0) {
-        return .{
-            .surface = .status,
-            .code = .missing_trigger_state,
-            .path = status_path,
-            .package = record.name,
-        };
-    }
-    if (record.status.current == .triggers_pending and record.triggers_pending.len == 0) {
-        return .{
-            .surface = .status,
-            .code = .missing_trigger_state,
-            .path = status_path,
-            .package = record.name,
-        };
-    }
-    if (record.triggers_awaited.len != 0 and record.status.current != .triggers_awaited) {
-        return .{
-            .surface = .status,
-            .code = .unexpected_trigger_state,
-            .path = status_path,
-            .package = record.name,
-        };
-    }
-    if (record.triggers_pending.len != 0 and
-        record.status.current != .triggers_pending and
-        record.status.current != .triggers_awaited)
-    {
-        return .{
-            .surface = .status,
-            .code = .unexpected_trigger_state,
-            .path = status_path,
-            .package = record.name,
-        };
-    }
-    return null;
-}
-
 fn containsPath(paths: []const []const u8, path: []const u8) bool {
     for (paths) |owned| {
         if (std.mem.eql(u8, logicalListPath(owned), logicalListPath(path))) return true;
-    }
-    return false;
-}
-
-fn containsRelativePath(paths: []const []const u8, relative: []const u8) bool {
-    for (paths) |owned| {
-        if (owned.len == relative.len + 1 and owned[0] == '/' and
-            std.mem.eql(u8, owned[1..], relative)) return true;
     }
     return false;
 }
@@ -2442,6 +2691,9 @@ pub fn validateModel(
         .allocator = allocator,
         .model = model,
         .options = options,
+        .paths = .{ .allocator = allocator },
+        .names = .{ .allocator = allocator },
+        .keys = .{ .allocator = allocator },
     };
     defer validator.deinit();
     return validator.run();
@@ -2685,10 +2937,10 @@ pub const test_fixtures = struct {
 
     pub fn snapshot() Snapshot {
         return .{
-            .status = status,
-            .arch = arch,
-            .triggers_file = triggers_file,
-            .triggers_unincorp = triggers_unincorp,
+            .status = regularFile(status),
+            .arch = regularFile(arch),
+            .triggers_file = regularFile(triggers_file),
+            .triggers_unincorp = regularFile(triggers_unincorp),
             .info = info,
         };
     }
@@ -2839,7 +3091,7 @@ test "package_database.test.unknown status fields survive a semantic round trip"
     defer testing.allocator.free(republished);
 
     var snapshot = test_fixtures.snapshot();
-    snapshot.status = republished;
+    snapshot.status = regularFile(republished);
     const second = try importSnapshot(
         testing.allocator,
         .{ .native_architecture = "amd64", .snapshot = snapshot },
@@ -2880,7 +3132,7 @@ test "package_database.test.generation evidence detects external database change
     ) == null);
 
     var changed = test_fixtures.snapshot();
-    changed.arch = "i386\nppc64el\n";
+    changed.arch = regularFile("i386\nppc64el\n");
     const diagnostic = (try verifyGeneration(testing.allocator, database, changed)).?;
     try testing.expectEqual(Code.external_generation_change, diagnostic.code);
 
@@ -2935,7 +3187,7 @@ const minimal_status =
 const minimal_list = "/.\n/usr\n/usr/bin\n/usr/bin/solo\n";
 
 fn minimalSnapshot(status_text: []const u8, entries: []const InfoEntry) Snapshot {
-    return .{ .status = status_text, .info = entries };
+    return .{ .status = regularFile(status_text), .info = entries };
 }
 
 fn minimalInfo() []const InfoEntry {
@@ -3207,7 +3459,7 @@ test "package_database.test.multiarch instances must be consistent" {
     );
     defer allocator.free(status);
     var snapshot = test_fixtures.snapshot();
-    snapshot.status = status;
+    snapshot.status = regularFile(status);
     try expectImportFailure(snapshot, .multiarch_conflict);
 
     const foreign_only = try std.mem.replaceOwned(
@@ -3218,26 +3470,26 @@ test "package_database.test.multiarch instances must be consistent" {
         "Architecture: i386\n",
     );
     defer allocator.free(foreign_only);
-    snapshot.status = foreign_only;
+    snapshot.status = regularFile(foreign_only);
     try expectImportFailure(snapshot, .multiarch_conflict);
 }
 
 test "package_database.test.trigger state must match declared interests and known packages" {
     const allocator = testing.allocator;
     var snapshot = test_fixtures.snapshot();
-    snapshot.triggers_file = "/usr/share/toolz libfoo:amd64\n";
+    snapshot.triggers_file = regularFile("/usr/share/toolz libfoo:amd64\n");
     try expectImportSurface(snapshot, .triggers_file, .trigger_interest_mismatch);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.triggers_file = "usr/share/toolz toolz\n";
+    snapshot.triggers_file = regularFile("usr/share/toolz toolz\n");
     try expectImportSurface(snapshot, .triggers_file, .invalid_trigger_name);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.triggers_unincorp = "/usr/share/toolz ghost\n";
+    snapshot.triggers_unincorp = regularFile("/usr/share/toolz ghost\n");
     try expectImportSurface(snapshot, .triggers_unincorp, .unknown_trigger_package);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.triggers_unincorp = "/usr/share/toolz\n";
+    snapshot.triggers_unincorp = regularFile("/usr/share/toolz\n");
     try expectImportSurface(snapshot, .triggers_unincorp, .invalid_trigger_record);
 
     const declarations = try infoReplacing(allocator, .{
@@ -3288,15 +3540,15 @@ test "package_database.test.interrupted publication and unsupported metadata fai
     try expectDiagnostic(bad_fragment, .invalid_update_fragment);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.diversions = "/usr/bin/toolz\n/usr/bin/toolz.real\n";
+    snapshot.diversions = regularFile("/usr/bin/toolz\n/usr/bin/toolz.real\n");
     try expectImportSurface(snapshot, .diversions, .invalid_diversion);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.statoverride = "root root 07555 /usr/bin/toolz\n";
+    snapshot.statoverride = regularFile("root root 07555 /usr/bin/toolz\n");
     try expectImportSurface(snapshot, .statoverride, .invalid_statoverride);
 
     snapshot = test_fixtures.snapshot();
-    snapshot.status_old = "Package solo\n";
+    snapshot.status_old = regularFile("Package solo\n");
     try expectImportSurface(snapshot, .status_old, .status_syntax);
 
     const invalid_native = try importSnapshot(
@@ -3309,8 +3561,8 @@ test "package_database.test.interrupted publication and unsupported metadata fai
 
 test "package_database.test.supported diversion and statoverride records are typed" {
     var snapshot = test_fixtures.snapshot();
-    snapshot.diversions = "/usr/bin/toolz\n/usr/bin/toolz.real\nother\n";
-    snapshot.statoverride = "root staff 2755 /usr/bin/toolz\n";
+    snapshot.diversions = regularFile("/usr/bin/toolz\n/usr/bin/toolz.real\nother\n");
+    snapshot.statoverride = regularFile("root staff 2755 /usr/bin/toolz\n");
     const result = try importSnapshot(
         testing.allocator,
         .{ .native_architecture = "amd64", .snapshot = snapshot },
@@ -3328,11 +3580,11 @@ test "package_database.test.supported diversion and statoverride records are typ
 
     const diversion_bytes = try writeDiversions(testing.allocator, database.model.diversions);
     defer testing.allocator.free(diversion_bytes);
-    try testing.expectEqualStrings(snapshot.diversions.?, diversion_bytes);
+    try testing.expectEqualStrings(snapshot.diversions.?.bytes, diversion_bytes);
 
     const override_bytes = try writeStatOverrides(testing.allocator, database.model.stat_overrides);
     defer testing.allocator.free(override_bytes);
-    try testing.expectEqualStrings(snapshot.statoverride.?, override_bytes);
+    try testing.expectEqualStrings(snapshot.statoverride.?.bytes, override_bytes);
 }
 
 test "package_database.test.configured bounds are enforced" {
@@ -3357,4 +3609,377 @@ test "package_database.test.configured bounds are enforced" {
         .{ .limits = .{ .max_info_entries = 4 } },
     );
     try expectDiagnostic(bounded_info, .info_limit);
+}
+
+const BulkFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    status: []const u8,
+    list: []const u8,
+    md5sums: []const u8,
+
+    const package_count = 2_000;
+    const path_count = 40_000;
+
+    fn deinit(self: *BulkFixture) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// One package owning `path_count` paths and checksums plus
+    /// `package_count` ordinary records, so validation cost is visible as
+    /// completion rather than as a timing assertion.
+    fn init(allocator: std.mem.Allocator, options: struct {
+        duplicate_path: bool = false,
+        duplicate_checksum: bool = false,
+        unowned_checksum: bool = false,
+    }) !BulkFixture {
+        var fixture: BulkFixture = .{
+            .arena = .init(allocator),
+            .status = "",
+            .list = "",
+            .md5sums = "",
+        };
+        errdefer fixture.arena.deinit();
+        const owned = fixture.arena.allocator();
+
+        var status: std.Io.Writer.Allocating = .init(owned);
+        var list: std.Io.Writer.Allocating = .init(owned);
+        var md5sums: std.Io.Writer.Allocating = .init(owned);
+
+        try status.writer.writeAll(
+            "Package: bulk\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n\n",
+        );
+        try list.writer.writeAll("/.\n/usr\n/usr/share\n/usr/share/bulk\n");
+        for (0..path_count) |index| {
+            try list.writer.print("/usr/share/bulk/file-{d}\n", .{index});
+            try md5sums.writer.print(
+                "0cc175b9c0f1b6a831c399e269772661  usr/share/bulk/file-{d}\n",
+                .{index},
+            );
+        }
+        if (options.duplicate_path) try list.writer.writeAll("/usr/share/bulk/file-7\n");
+        if (options.duplicate_checksum) {
+            try md5sums.writer.writeAll(
+                "0cc175b9c0f1b6a831c399e269772661  usr/share/bulk/file-7\n",
+            );
+        }
+        if (options.unowned_checksum) {
+            try md5sums.writer.writeAll(
+                "0cc175b9c0f1b6a831c399e269772661  usr/share/bulk/absent\n",
+            );
+        }
+        for (0..package_count) |index| {
+            try status.writer.print(
+                "Package: filler-{d}\nStatus: purge ok not-installed\nArchitecture: amd64\nVersion: 1\n\n",
+                .{index},
+            );
+        }
+
+        fixture.status = status.written();
+        fixture.list = list.written();
+        fixture.md5sums = md5sums.written();
+        return fixture;
+    }
+
+    fn snapshot(self: *const BulkFixture, entries: []const InfoEntry) Snapshot {
+        return .{ .status = regularFile(self.status), .info = entries };
+    }
+};
+
+fn importUnderAllocationFailure(allocator: std.mem.Allocator, snapshot: Snapshot) !void {
+    const result = try importSnapshot(
+        allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{},
+    );
+    switch (result) {
+        .database => |value| {
+            var owned = value;
+            owned.deinit();
+        },
+        // Import reports exhaustion as a typed diagnostic; the allocation
+        // failure harness expects the error itself.
+        .diagnostic => |diagnostic| if (diagnostic.code == .out_of_memory) {
+            return error.OutOfMemory;
+        },
+    }
+}
+
+test "package_database.test.import stays sound when every allocation can fail" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        importUnderAllocationFailure,
+        .{test_fixtures.snapshot()},
+    );
+
+    var repeated = test_fixtures.snapshot();
+    repeated.triggers_unincorp = regularFile("/usr/share/toolz toolz toolz:amd64\n");
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        importUnderAllocationFailure,
+        .{repeated},
+    );
+}
+
+test "package_database.test.large generations import and validate without quadratic work" {
+    var fixture = try BulkFixture.init(testing.allocator, .{});
+    defer fixture.deinit();
+    const entries = [_]InfoEntry{
+        .{ .name = "bulk.list", .bytes = fixture.list },
+        .{ .name = "bulk.md5sums", .bytes = fixture.md5sums },
+    };
+
+    const result = try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = fixture.snapshot(&entries) },
+        .{},
+    );
+    var database = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    const bulk = database.model.find("bulk", "amd64").?;
+    try testing.expectEqual(@as(usize, BulkFixture.path_count + 4), bulk.paths.?.len);
+    try testing.expectEqual(@as(usize, BulkFixture.path_count), bulk.md5sums.?.len);
+    try testing.expectEqual(
+        @as(usize, BulkFixture.package_count + 1),
+        database.model.packages.len,
+    );
+
+    // The same bounded indexes must still catch every corruption case.
+    var duplicated = try BulkFixture.init(testing.allocator, .{ .duplicate_path = true });
+    defer duplicated.deinit();
+    const duplicate_entries = [_]InfoEntry{
+        .{ .name = "bulk.list", .bytes = duplicated.list },
+        .{ .name = "bulk.md5sums", .bytes = duplicated.md5sums },
+    };
+    try expectImportSurface(
+        duplicated.snapshot(&duplicate_entries),
+        .info_list,
+        .duplicate_path,
+    );
+
+    var repeated = try BulkFixture.init(testing.allocator, .{ .duplicate_checksum = true });
+    defer repeated.deinit();
+    const repeated_entries = [_]InfoEntry{
+        .{ .name = "bulk.list", .bytes = repeated.list },
+        .{ .name = "bulk.md5sums", .bytes = repeated.md5sums },
+    };
+    try expectImportSurface(
+        repeated.snapshot(&repeated_entries),
+        .info_md5sums,
+        .duplicate_checksum,
+    );
+
+    var missing = try BulkFixture.init(testing.allocator, .{ .unowned_checksum = true });
+    defer missing.deinit();
+    const missing_entries = [_]InfoEntry{
+        .{ .name = "bulk.list", .bytes = missing.list },
+        .{ .name = "bulk.md5sums", .bytes = missing.md5sums },
+    };
+    try expectImportSurface(
+        missing.snapshot(&missing_entries),
+        .cross_file,
+        .checksum_out_of_inventory,
+    );
+}
+
+test "package_database.test.model validation catches duplicates that no parser saw" {
+    const fields = [_]StatusField{
+        .{ .name = "Package", .value_lines = &.{"solo"} },
+        .{ .name = "Status", .value_lines = &.{"install ok installed"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"1"} },
+    };
+    const base: PackageRecord = .{
+        .name = "solo",
+        .architecture = "amd64",
+        .version = "1",
+        .parsed_version = try DebianVersion.parse("1"),
+        .status = .{ .want = .install, .error_state = .ok, .current = .installed },
+        .multi_arch = null,
+        .essential = false,
+        .protected = false,
+        .fields = &fields,
+        .conffiles = &.{},
+        .triggers_pending = &.{},
+        .triggers_awaited = &.{},
+        .info_stem = "solo",
+        .paths = &.{ "/.", "/etc/solo.conf" },
+        .md5sums = null,
+        .declared_conffiles = null,
+        .trigger_declarations = null,
+        .scripts = &.{},
+    };
+
+    var duplicate_conffiles = base;
+    duplicate_conffiles.conffiles = &.{
+        .{ .path = "/etc/solo.conf", .digest = .{ .md5 = @splat(0) } },
+        .{ .path = "/etc/solo.conf", .digest = .{ .md5 = @splat(1) } },
+    };
+    const conffile_model: Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 1 },
+        .packages = &.{duplicate_conffiles},
+    };
+    const conffile_diagnostic = (try validateModel(testing.allocator, conffile_model, .{})).?;
+    try testing.expectEqual(Code.duplicate_conffile, conffile_diagnostic.code);
+
+    var duplicate_checksums = base;
+    duplicate_checksums.md5sums = &.{
+        .{ .path = "etc/solo.conf", .digest = @splat(0) },
+        .{ .path = "etc/solo.conf", .digest = @splat(0) },
+    };
+    const checksum_model: Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 1 },
+        .packages = &.{duplicate_checksums},
+    };
+    const checksum_diagnostic = (try validateModel(testing.allocator, checksum_model, .{})).?;
+    try testing.expectEqual(Code.duplicate_checksum, checksum_diagnostic.code);
+
+    var duplicate_triggers = base;
+    duplicate_triggers.triggers_pending = &.{ "/usr/share/solo", "/usr/share/solo" };
+    duplicate_triggers.status.current = .triggers_pending;
+    const trigger_model: Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 1 },
+        .packages = &.{duplicate_triggers},
+    };
+    const trigger_diagnostic = (try validateModel(testing.allocator, trigger_model, .{})).?;
+    try testing.expectEqual(Code.invalid_trigger_name, trigger_diagnostic.code);
+
+    var declarations = base;
+    declarations.trigger_declarations = &.{
+        .{ .kind = .interest, .name = "/usr/share/solo" },
+        .{ .kind = .interest, .name = "/usr/share/solo" },
+    };
+    const declaration_model: Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 1 },
+        .packages = &.{declarations},
+    };
+    const declaration_diagnostic = (try validateModel(testing.allocator, declaration_model, .{})).?;
+    try testing.expectEqual(Code.duplicate_trigger_declaration, declaration_diagnostic.code);
+
+    const architecture_model: Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 1 },
+        .foreign_architectures = &.{ "i386", "i386" },
+        .packages = &.{base},
+    };
+    const architecture_diagnostic = (try validateModel(
+        testing.allocator,
+        architecture_model,
+        .{},
+    )).?;
+    try testing.expectEqual(Code.duplicate_architecture, architecture_diagnostic.code);
+}
+
+test "package_database.test.repeated trigger records are rejected on import" {
+    var snapshot = test_fixtures.snapshot();
+    snapshot.triggers_file = regularFile(
+        "/usr/share/toolz toolz\n/usr/share/toolz toolz\n",
+    );
+    try expectImportSurface(snapshot, .triggers_file, .duplicate_trigger_interest);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.triggers_unincorp = regularFile(
+        "/usr/share/toolz toolz\n/usr/share/toolz toolz\n",
+    );
+    try expectImportSurface(snapshot, .triggers_unincorp, .duplicate_pending_trigger);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.triggers_unincorp = regularFile("/usr/share/toolz toolz toolz:amd64\n");
+    try expectImportSurface(snapshot, .triggers_unincorp, .duplicate_pending_package);
+
+    snapshot = test_fixtures.snapshot();
+    const result = try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{ .limits = .{ .max_packages_per_pending_trigger = 0 } },
+    );
+    try expectDiagnostic(result, .trigger_limit);
+}
+
+test "package_database.test.captured metadata of every consumed entry is validated and hashed" {
+    var snapshot = test_fixtures.snapshot();
+    snapshot.status = .{ .bytes = test_fixtures.status, .kind = .symlink };
+    try expectImportSurface(snapshot, .status, .unsupported_entry_kind);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.arch = .{ .bytes = test_fixtures.arch, .mode = 0o666 };
+    try expectImportSurface(snapshot, .architectures, .unsafe_mode);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.triggers_file = .{ .bytes = test_fixtures.triggers_file, .kind = .directory };
+    try expectImportSurface(snapshot, .triggers_file, .unsupported_entry_kind);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.diversions = .{ .bytes = "", .mode = 0o4644 };
+    try expectImportSurface(snapshot, .diversions, .unsafe_mode);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.statoverride = .{ .bytes = "", .kind = .other };
+    try expectImportSurface(snapshot, .statoverride, .unsupported_entry_kind);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.status_old = .{ .bytes = test_fixtures.status, .mode = 0o2644 };
+    try expectImportSurface(snapshot, .status_old, .unsafe_mode);
+
+    snapshot = test_fixtures.snapshot();
+    const bounded = try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{ .limits = .{ .max_database_file_bytes = 1 } },
+    );
+    try expectDiagnostic(bounded, .file_too_large);
+
+    snapshot = test_fixtures.snapshot();
+    snapshot.updates = &.{.{ .name = "0001", .bytes = test_fixtures.status, .mode = 0o666 }};
+    const unsafe_update = try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{ .updates_policy = .import_for_recovery },
+    );
+    try expectDiagnostic(unsafe_update, .unsafe_mode);
+}
+
+test "package_database.test.generation digest covers entry kind and mode" {
+    const result = try importSnapshot(testing.allocator, test_fixtures.request(), .{});
+    var database = switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .database => |value| value,
+    };
+    defer database.deinit();
+
+    var mode_changed = test_fixtures.snapshot();
+    mode_changed.arch = .{ .bytes = test_fixtures.arch, .mode = 0o600 };
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, mode_changed)).?.code,
+    );
+
+    var kind_changed = test_fixtures.snapshot();
+    kind_changed.triggers_file = .{ .bytes = test_fixtures.triggers_file, .kind = .symlink };
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, kind_changed)).?.code,
+    );
+
+    var update_mode = test_fixtures.snapshot();
+    update_mode.updates = &.{.{ .name = "0001", .bytes = "", .mode = 0o600 }};
+    var update_default = test_fixtures.snapshot();
+    update_default.updates = &.{.{ .name = "0001", .bytes = "" }};
+    const first = try generation(testing.allocator, update_mode);
+    const second = try generation(testing.allocator, update_default);
+    try testing.expect(!first.eql(second));
+
+    try testing.expect(try verifyGeneration(
+        testing.allocator,
+        database,
+        test_fixtures.snapshot(),
+    ) == null);
 }

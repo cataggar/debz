@@ -13,7 +13,12 @@ The layer does two things and nothing else:
    plan bound to that exact generation.
 
 Neither module opens, reads, or writes a file. Callers supply a captured
-`Snapshot`, and the returned `Plan` is a complete list of file intents. Durable
+`Snapshot` in which every consumed file - `status`, `status-old`, `arch`,
+`diversions`, `statoverride`, both trigger files, every `info` entry, and every
+`updates` fragment - carries the bytes plus the entry kind and mode the reader
+observed. The returned `Plan` is a complete list of file intents that owns its
+own bytes, so a caller mutating or freeing its buffers afterwards cannot change
+what the plan publishes. Durable
 publication - root-anchored no-follow descriptors, staging, fsync, atomic
 rename, parent-directory fsync, `updates/` journalling, and crash recovery -
 belongs to the root-filesystem and mutation layers. Attempting a partial
@@ -70,7 +75,8 @@ Import rejects, before any change can be planned:
 - file-trigger interests that the owning package does not declare, trigger
   records naming unknown packages, and malformed trigger grammar;
 - database entries that are not regular files, setuid, setgid, or
-  world-writable modes, and non-executable maintainer scripts;
+  world-writable modes, and non-executable maintainer scripts, for top-level
+  files, `info` entries, and `updates` fragments alike;
 - nonempty `updates/`, unsupported `info/format`, malformed diversions and
   statoverrides, and any file exceeding a configured bound.
 
@@ -93,7 +99,9 @@ imported generation re-serializes to identical bytes.
 
 `packageDatabaseGeneration` hashes the complete consumed generation: every
 present file path, entry kind, mode, size, and content digest, sorted by path
-under a versioned domain separator. `verifyPackageDatabaseGeneration` compares
+under a versioned domain separator. Because kind and mode are captured rather
+than assumed, a root whose file was replaced by a symbolic link or whose mode
+changed produces a different generation even when the bytes are identical. `verifyPackageDatabaseGeneration` compares
 a freshly captured snapshot against an imported database and reports
 `external_generation_change`, so an authorization can never survive an external
 database change between preflight and mutation.
@@ -113,7 +121,11 @@ database change between preflight and mutation.
   trigger and architecture surfaces.
 
 The resulting model is validated with exactly the same rules import uses, so a
-plan can never publish a database that would fail to import. Planning fails
+plan can never publish a database that would fail to import. Trigger state,
+foreign architectures, ownership, checksums, conffiles, and declarations are
+validated once, in that shared model validation, rather than separately per
+entry point. Every produced file is then checked against the importer's size
+and line bounds before a plan is returned. Planning fails
 closed on unknown packages, more than one change per subject, impossible state
 transitions, unsafe or non-executable scripts, invalid paths, checksums outside
 the inventory, bound violations, interrupted publication in `updates/`, and any
@@ -144,6 +156,15 @@ roadmap items:
   to stage;
 - mutation of `diversions` and `statoverride`, which currently fail closed when
   they cover a changed package or path.
+
+## Cost
+
+Import, validation, and planning are linear in the number of database entries.
+Membership and uniqueness questions - ownership lookups, checksum inventory
+membership, duplicate paths, conffiles, checksums, declarations, interests,
+deferred activations, architectures, and package identities - all use bounded
+reusable hash indexes rather than repeated scans, and diversion or statoverride
+coverage is indexed once per plan instead of per changed package.
 
 ## Tests
 
