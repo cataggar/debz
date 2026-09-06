@@ -123,6 +123,41 @@
       "expected": "success"
     },
     {
+      "id": "conffile-maintainer-unchanged",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "keep-user-modified", "no-conflict-artifact"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-locally-deleted",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "keep-user-deleted", "no-conflict-artifact"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-already-packaged-version",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "identical-no-op"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-remove-on-upgrade-modified",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["conffile", "remove-on-upgrade", "dpkg-old"],
+      "expected": "success"
+    },
+    {
+      "id": "conffile-remove-on-upgrade-fresh-install",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["conffile", "remove-on-upgrade", "not-shipped"],
+      "expected": "success"
+    },
+    {
       "id": "preinst-failure",
       "initial": "fresh",
       "operations": ["install"],
@@ -170,6 +205,20 @@
       "operations": ["install"],
       "features": ["triggered-postinst", "failure-state", "recovery"],
       "expected": "recovery-required"
+    },
+    {
+      "id": "trigger-interest-half-configured",
+      "initial": "corrupt",
+      "operations": ["install"],
+      "features": ["trigger", "half-configured", "fail-closed"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "trigger-interest-pending-recorded",
+      "initial": "corrupt",
+      "operations": ["install"],
+      "features": ["trigger", "triggers-pending", "fail-closed"],
+      "expected": "failure-before-mutation"
     },
     {
       "id": "trigger-cycle-no-progress",

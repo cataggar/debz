@@ -139,18 +139,26 @@ completed outcome.
 
 ## Conffiles
 
-The selected noninteractive policy is authorization input:
+Decisions follow dpkg's two-dimensional table over three digests: the digest
+the package ships, the digest the status database recorded for the installed
+version, and the digest observed in the root. The selected noninteractive
+policy is authorization input, and it only decides the case dpkg would prompt
+for, when the administrator and the maintainer both changed the file:
 
-- `keep_existing` preserves a locally modified file and publishes the package
-  version using compatible `.dpkg-dist` behavior;
+- `keep_existing` preserves the local state and publishes the package version
+  using compatible `.dpkg-dist` behavior;
 - `use_package_version` installs the package version and preserves a locally
   modified predecessor using compatible `.dpkg-old` behavior.
 
-Unmodified conffiles update without a conflict artifact. Remove retains
-conffiles and their status metadata; purge removes them and the package status
-record. V1 also covers newly introduced, renamed, removed, obsolete, missing,
-and `remove-on-upgrade` conffiles. Every decision and before/after digest is
-recorded.
+Every other case is decided by the digests alone. A file that already holds the
+packaged bytes is a no-op, an unmodified file is replaced without a conflict
+artifact, and a conffile the maintainer did not change keeps the local edit —
+or the local deletion — under either policy, with no conflict artifact. Remove
+retains conffiles and their status metadata; purge removes them and the package
+status record. V1 also covers newly introduced, renamed, removed, obsolete, and
+missing conffiles, and `remove-on-upgrade`, which ships no file: it deletes an
+unmodified recorded file, preserves a modified one as `.dpkg-old`, and does
+nothing on a fresh install. Every decision and before/after digest is recorded.
 
 ## Triggers
 

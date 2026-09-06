@@ -1114,11 +1114,16 @@
           "action": {
             "enum": [
               "install_new",
+              "skip_not_shipped",
+              "identical_no_op",
               "restore_missing",
               "replace_unmodified",
+              "keep_user_modified",
+              "keep_user_deleted",
               "keep_existing_stage_dist",
               "install_stage_old",
               "remove_on_upgrade",
+              "remove_on_upgrade_stage_old",
               "mark_obsolete",
               "retain_on_remove",
               "delete_on_purge"

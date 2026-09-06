@@ -17,6 +17,14 @@
 //! identity, argument vector, environment-policy identity, failure state, and
 //! compensating unwind call.
 //!
+//! Conffile decisions reproduce dpkg's two-dimensional table over the packaged,
+//! recorded, and observed digests, so the reviewed policy decides only what
+//! dpkg would prompt for. Deferred trigger work is the only place a package
+//! outside the authorized actions is touched, so it is accepted only for a
+//! completely installed package. Diagnostics never own memory: compilation
+//! frees its arena before returning one, so every reported string references
+//! caller input or static text.
+//!
 //! Filesystem and package-database work that only later modules can enumerate
 //! is expressed as a typed forward reference (an artifact index plus the
 //! application digest of its validated inventory, or the digest of the
@@ -167,21 +175,51 @@ pub const ScriptCall = struct {
     failure: ScriptFailure,
 };
 
+/// One dpkg-compatible conffile outcome. The compiler decides it from three
+/// digests — the digest the package ships, the digest the database recorded
+/// when the installed version was configured, and the digest observed in the
+/// root — plus the reviewed policy, exactly like dpkg's two-dimensional
+/// (user edited x maintainer edited) decision table.
 pub const ConffileAction = enum {
-    /// The package introduces a conffile the database does not record.
+    /// The package introduces a conffile the database does not record, so the
+    /// packaged file is installed. v1 evidence carries an observed digest only
+    /// for recorded conffiles, so a file created locally beforehand cannot be
+    /// distinguished here.
     install_new,
-    /// The recorded conffile is absent from the root and is restored.
+    /// The package no longer ships the conffile because it declares
+    /// `remove-on-upgrade`, and there is nothing recorded or present to
+    /// remove.
+    skip_not_shipped,
+    /// The observed digest already equals the packaged digest, so the file is
+    /// left untouched and only the recorded digest is refreshed.
+    identical_no_op,
+    /// The recorded conffile is absent from the root, the maintainer changed
+    /// it, and `use_package_version` reinstalls it. There is no local file to
+    /// preserve, so no `.dpkg-old` is written.
     restore_missing,
     /// The on-disk file matches the recorded digest and is replaced silently.
     replace_unmodified,
-    /// Locally modified, `keep_existing` policy: package version published as
-    /// `.dpkg-dist`.
+    /// The local file was edited but the packaged digest equals the recorded
+    /// digest, so dpkg keeps the local file and writes no conflict artifact,
+    /// whatever the policy is.
+    keep_user_modified,
+    /// The local file was deleted and the packaged digest equals the recorded
+    /// digest, so the deletion is preserved and no conflict artifact is
+    /// written, whatever the policy is.
+    keep_user_deleted,
+    /// Locally modified or deleted while the maintainer also changed the
+    /// file, `keep_existing` policy: the local state is kept and the package
+    /// version published as `.dpkg-dist`.
     keep_existing_stage_dist,
-    /// Locally modified, `use_package_version` policy: local file preserved as
-    /// `.dpkg-old`.
+    /// Locally modified while the maintainer also changed the file,
+    /// `use_package_version` policy: local file preserved as `.dpkg-old`.
     install_stage_old,
-    /// The package declares `remove-on-upgrade` for the conffile.
+    /// The package declares `remove-on-upgrade` for a recorded, unmodified
+    /// conffile, which is deleted.
     remove_on_upgrade,
+    /// The package declares `remove-on-upgrade` for a recorded conffile the
+    /// administrator modified, which is preserved as `.dpkg-old`.
+    remove_on_upgrade_stage_old,
     /// The database records a conffile the new package no longer ships.
     mark_obsolete,
     /// Remove retains conffiles and their database records.
@@ -606,7 +644,10 @@ pub const ArchiveScript = struct {
 
 pub const ArchiveConffile = struct {
     path: []const u8,
-    md5: [16]u8,
+    /// Digest of the file the package ships. `remove-on-upgrade` conffiles
+    /// must not be shipped, so they carry no digest and every other conffile
+    /// must carry one.
+    md5: ?[16]u8,
     remove_on_upgrade: bool = false,
 };
 
@@ -709,6 +750,12 @@ pub const DiagnosticCode = enum {
 
 /// Diagnostics borrow input strings and static detail text; they never own
 /// memory, so a failed compilation allocates nothing the caller must release.
+///
+/// The invariant is a lifetime requirement, not a convenience: `compile`
+/// destroys the compiler arena before it returns a diagnostic, so any field
+/// that pointed into the arena would be freed memory. Every compiler-internal
+/// view (prepared conffiles, trigger declarations, `Replaces` names) therefore
+/// keeps aliasing caller memory, and only emission copies into the arena.
 pub const Diagnostic = struct {
     code: DiagnosticCode,
     detail: []const u8 = "",
@@ -922,6 +969,25 @@ const Compiler = struct {
             .name = try self.arena.dupe(u8, value.name),
             .architecture = try self.arena.dupe(u8, value.architecture),
         };
+    }
+
+    /// Copies trigger declarations, including their names, into the arena.
+    /// Compiler-internal views alias caller memory so every diagnostic stays
+    /// borrowable; published output must own its bytes, so emission copies.
+    fn declarations(
+        self: *Compiler,
+        values: []const TriggerDeclaration,
+    ) CompileError![]const TriggerDeclaration {
+        const owned = try self.arena.dupe(TriggerDeclaration, values);
+        for (owned) |*declaration|
+            declaration.name = try self.arena.dupe(u8, declaration.name);
+        return owned;
+    }
+
+    fn triggerNames(self: *Compiler, values: []const []const u8) CompileError![]const []const u8 {
+        const owned = try self.arena.alloc([]const u8, values.len);
+        for (values, 0..) |value, index| owned[index] = try self.arena.dupe(u8, value);
+        return owned;
     }
 
     fn arguments(self: *Compiler, values: []const []const u8) CompileError![]const []const u8 {
@@ -1346,10 +1412,11 @@ fn prepareDeclarations(
                 .path = declaration.name,
             });
     }
-    // Diagnostics borrow input memory, so names are copied only after every
-    // rejection path is behind us. The compiled program then owns every byte
-    // it publishes and never aliases evidence the caller may free.
-    for (owned) |*declaration| declaration.name = try self.arena.dupe(u8, declaration.name);
+    // Names keep pointing at caller memory: every diagnostic this module can
+    // return must outlive the compiler arena, and the arena is destroyed
+    // before a rejection reaches the caller. Emission copies each name into
+    // the arena instead, so the compiled program still owns every byte it
+    // publishes and never aliases evidence the caller may free.
     return owned;
 }
 
@@ -1390,6 +1457,20 @@ fn prepareArchiveConffiles(
             return self.reject(.{
                 .code = .invalid_conffile_metadata,
                 .detail = "path",
+                .package = archive.package,
+                .path = conffile.path,
+            });
+        // A `remove-on-upgrade` conffile must not be shipped, so a digest for
+        // one is evidence the archive inventory disagrees with the control
+        // metadata; every other conffile must carry the digest the decision
+        // table compares.
+        if (conffile.remove_on_upgrade != (conffile.md5 == null))
+            return self.reject(.{
+                .code = .invalid_conffile_metadata,
+                .detail = if (conffile.remove_on_upgrade)
+                    "remove-on-upgrade digest"
+                else
+                    "missing packaged digest",
                 .package = archive.package,
                 .path = conffile.path,
             });
@@ -2490,7 +2571,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
     if (prepared.triggers.len != 0) {
         last = try self.addStep(.unpack, &.{last}, .{ .record_trigger_interests = .{
             .package = package_identity,
-            .declarations = try self.arena.dupe(TriggerDeclaration, prepared.triggers),
+            .declarations = try self.declarations(prepared.triggers),
             .declarations_sha256 = hex(32, declarationsDigest(prepared.triggers)),
         } });
     }
@@ -2502,6 +2583,55 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
     } });
     entry.state = .unpacked;
     return entry_index;
+}
+
+/// dpkg's conffile decision table, reproduced from `src/main/configure.c` and
+/// `src/main/unpack.c`. Three digests drive it: the digest the package ships,
+/// the digest the database recorded for the installed version, and the digest
+/// observed in the root (absent when the administrator deleted the file).
+///
+/// | on disk | maintainer | outcome |
+/// |---|---|---|
+/// | equals packaged | any | `identical_no_op` |
+/// | equals recorded | changed | `replace_unmodified` |
+/// | edited | unchanged | `keep_user_modified` |
+/// | deleted | unchanged | `keep_user_deleted` |
+/// | edited or deleted | changed | reviewed policy decides |
+///
+/// A `remove-on-upgrade` conffile is not shipped, so it takes precedence and
+/// never installs anything: it deletes an unmodified recorded file, preserves
+/// a modified one as `.dpkg-old`, and does nothing when nothing is recorded or
+/// nothing is present, including on a fresh install.
+fn conffileDecision(
+    policy: transaction_executor.ConffilePolicy,
+    packaged: ArchiveConffile,
+    recorded: ?InstalledConffile,
+) ConffileAction {
+    if (packaged.remove_on_upgrade) {
+        const record = recorded orelse return .skip_not_shipped;
+        const on_disk = record.on_disk_md5 orelse return .skip_not_shipped;
+        return if (std.mem.eql(u8, &on_disk, &record.recorded_md5))
+            .remove_on_upgrade
+        else
+            .remove_on_upgrade_stage_old;
+    }
+    const record = recorded orelse return .install_new;
+    const shipped = packaged.md5.?;
+    const maintainer_edited = !std.mem.eql(u8, &shipped, &record.recorded_md5);
+    const on_disk = record.on_disk_md5 orelse {
+        if (!maintainer_edited) return .keep_user_deleted;
+        return switch (policy) {
+            .keep_existing => .keep_existing_stage_dist,
+            .use_package_version => .restore_missing,
+        };
+    };
+    if (std.mem.eql(u8, &on_disk, &shipped)) return .identical_no_op;
+    if (std.mem.eql(u8, &on_disk, &record.recorded_md5)) return .replace_unmodified;
+    if (!maintainer_edited) return .keep_user_modified;
+    return switch (policy) {
+        .keep_existing => .keep_existing_stage_dist,
+        .use_package_version => .install_stage_old,
+    };
 }
 
 fn emitConffiles(
@@ -2521,24 +2651,12 @@ fn emitConffiles(
     for (prepared.conffiles) |conffile| {
         try self.charge(1);
         const recorded = findConffile(recorded_conffiles, conffile.path);
-        const decision: ConffileAction = if (recorded == null)
-            .install_new
-        else if (conffile.remove_on_upgrade)
-            .remove_on_upgrade
-        else if (recorded.?.on_disk_md5 == null)
-            .restore_missing
-        else if (std.mem.eql(u8, &recorded.?.on_disk_md5.?, &recorded.?.recorded_md5))
-            .replace_unmodified
-        else switch (policy) {
-            .keep_existing => .keep_existing_stage_dist,
-            .use_package_version => .install_stage_old,
-        };
         last = try self.addStep(.unpack, &.{last}, .{ .apply_conffile_decision = .{
             .package = package_identity,
             .path = try self.arena.dupe(u8, conffile.path),
             .policy = policy,
-            .action = decision,
-            .packaged_md5 = hex(16, conffile.md5),
+            .action = conffileDecision(policy, conffile, recorded),
+            .packaged_md5 = if (conffile.md5) |digest| hex(16, digest) else null,
             .recorded_md5 = if (recorded) |value| hex(16, value.recorded_md5) else null,
             .on_disk_md5 = if (recorded) |value|
                 if (value.on_disk_md5) |digest| hex(16, digest) else null
@@ -2696,6 +2814,30 @@ fn joinTriggers(self: *Compiler, triggers: []const []const u8) CompileError![]co
     return joined;
 }
 
+/// Whether a trigger-interested package may be driven through `triggers-pending`,
+/// `postinst triggered`, and back to `installed`.
+///
+/// dpkg only processes triggers for a package whose installation is complete.
+/// Anything else — `half-installed`, `half-configured`, `unpacked`,
+/// `config-files`, absent — must be repaired first, so accepting it here would
+/// let deferred trigger work promote a broken package to `installed` without
+/// ever configuring it.
+///
+/// A recorded `triggers-pending` or `triggers-awaited` state is refused as
+/// well: that package carries trigger work from an earlier run which the v1
+/// installed-database evidence does not enumerate, so this program cannot
+/// preserve it and would silently drop it when it records `installed`. The
+/// only accepted awaited state is the one this compilation created itself,
+/// when a package activated an awaited trigger while it was configured, and
+/// whose transition back to `installed` this program does contain.
+fn triggerCapable(entry: Modeled) bool {
+    return switch (entry.state) {
+        .installed => true,
+        .triggers_awaited => entry.configured,
+        else => false,
+    };
+}
+
 fn emitTriggerWork(self: *Compiler) CompileError!void {
     var indices: std.ArrayList(u32) = .empty;
     defer indices.deinit(self.arena);
@@ -2708,7 +2850,7 @@ fn emitTriggerWork(self: *Compiler) CompileError!void {
         try indices.append(self.arena, @intCast(index));
         try pending.append(self.arena, .{
             .package = try self.ref(entry.ref()),
-            .triggers = try self.arena.dupe([]const u8, entry.pending_triggers.items),
+            .triggers = try self.triggerNames(entry.pending_triggers.items),
             .awaiting = entry.awaited,
         });
     }
@@ -2730,6 +2872,13 @@ fn emitTriggerWork(self: *Compiler) CompileError!void {
             return self.reject(.{
                 .code = .invalid_trigger_metadata,
                 .detail = "trigger on removed package",
+                .package = entry.name,
+                .architecture = entry.architecture,
+            });
+        if (!triggerCapable(entry.*))
+            return self.reject(.{
+                .code = .invalid_trigger_metadata,
+                .detail = "trigger on unhealthy package",
                 .package = entry.name,
                 .architecture = entry.architecture,
             });
@@ -3662,64 +3811,290 @@ test "native_program.test.upgrade orders old and new scripts with exact unwind c
     try testing.expect(unpack_seen);
 }
 
-test "native_program.test.conffile policy selects the compatible staging decision" {
-    const cases = [_]struct {
-        policy: transaction_executor.ConffilePolicy,
-        expected: ConffileAction,
-    }{
-        .{ .policy = .keep_existing, .expected = .keep_existing_stage_dist },
-        .{ .policy = .use_package_version, .expected = .install_stage_old },
+/// Every conffile decision the compiler can reach, keyed by the three digests
+/// dpkg compares plus the reviewed policy. `null` digests mean "not recorded"
+/// for `recorded` and "deleted from the root" for `on_disk`.
+const ConffileCase = struct {
+    name: []const u8,
+    packaged: ?u8,
+    recorded: ?u8,
+    on_disk: ?u8,
+    remove_on_upgrade: bool = false,
+    keep_existing: ConffileAction,
+    use_package_version: ConffileAction,
+};
+
+const conffile_cases = [_]ConffileCase{
+    .{
+        .name = "fresh install ships a new conffile",
+        .packaged = 0x61,
+        .recorded = null,
+        .on_disk = null,
+        .keep_existing = .install_new,
+        .use_package_version = .install_new,
+    },
+    .{
+        .name = "fresh install does not ship a remove-on-upgrade conffile",
+        .packaged = null,
+        .recorded = null,
+        .on_disk = null,
+        .remove_on_upgrade = true,
+        .keep_existing = .skip_not_shipped,
+        .use_package_version = .skip_not_shipped,
+    },
+    .{
+        .name = "remove-on-upgrade deletes an unmodified recorded conffile",
+        .packaged = null,
+        .recorded = 0x60,
+        .on_disk = 0x60,
+        .remove_on_upgrade = true,
+        .keep_existing = .remove_on_upgrade,
+        .use_package_version = .remove_on_upgrade,
+    },
+    .{
+        .name = "remove-on-upgrade preserves a locally modified conffile",
+        .packaged = null,
+        .recorded = 0x60,
+        .on_disk = 0x6f,
+        .remove_on_upgrade = true,
+        .keep_existing = .remove_on_upgrade_stage_old,
+        .use_package_version = .remove_on_upgrade_stage_old,
+    },
+    .{
+        .name = "remove-on-upgrade has nothing to remove when the file is gone",
+        .packaged = null,
+        .recorded = 0x60,
+        .on_disk = null,
+        .remove_on_upgrade = true,
+        .keep_existing = .skip_not_shipped,
+        .use_package_version = .skip_not_shipped,
+    },
+    .{
+        .name = "nothing changed anywhere",
+        .packaged = 0x60,
+        .recorded = 0x60,
+        .on_disk = 0x60,
+        .keep_existing = .identical_no_op,
+        .use_package_version = .identical_no_op,
+    },
+    .{
+        .name = "the root already holds the packaged bytes",
+        .packaged = 0x61,
+        .recorded = 0x60,
+        .on_disk = 0x61,
+        .keep_existing = .identical_no_op,
+        .use_package_version = .identical_no_op,
+    },
+    .{
+        .name = "unmodified locally, maintainer shipped an update",
+        .packaged = 0x61,
+        .recorded = 0x60,
+        .on_disk = 0x60,
+        .keep_existing = .replace_unmodified,
+        .use_package_version = .replace_unmodified,
+    },
+    .{
+        .name = "modified locally, maintainer changed nothing",
+        .packaged = 0x60,
+        .recorded = 0x60,
+        .on_disk = 0x6f,
+        .keep_existing = .keep_user_modified,
+        .use_package_version = .keep_user_modified,
+    },
+    .{
+        .name = "deleted locally, maintainer changed nothing",
+        .packaged = 0x60,
+        .recorded = 0x60,
+        .on_disk = null,
+        .keep_existing = .keep_user_deleted,
+        .use_package_version = .keep_user_deleted,
+    },
+    .{
+        .name = "modified locally and by the maintainer",
+        .packaged = 0x61,
+        .recorded = 0x60,
+        .on_disk = 0x6f,
+        .keep_existing = .keep_existing_stage_dist,
+        .use_package_version = .install_stage_old,
+    },
+    .{
+        .name = "deleted locally, maintainer shipped an update",
+        .packaged = 0x61,
+        .recorded = 0x60,
+        .on_disk = null,
+        .keep_existing = .keep_existing_stage_dist,
+        .use_package_version = .restore_missing,
+    },
+};
+
+fn conffilePolicies() [2]transaction_executor.ConffilePolicy {
+    return .{ .keep_existing, .use_package_version };
+}
+
+fn expectedConffileAction(
+    case: ConffileCase,
+    policy: transaction_executor.ConffilePolicy,
+) ConffileAction {
+    return switch (policy) {
+        .keep_existing => case.keep_existing,
+        .use_package_version => case.use_package_version,
     };
-    for (cases) |case| {
-        var authorization = try testAuthorizationWithPolicy(
-            testing.allocator,
-            &upgrade_actions,
-            &upgrade_final,
-            .{ .conffile = case.policy, .force = &.{}, .allow_host_root = false },
-        );
-        defer authorization.deinit();
-        const archives = [_]Archive{upgradeArchive()};
-        var owned = try expectProgram(compile(testing.allocator, .{
-            .authorization = &authorization.authorization,
-            .ordered_actions = &install_ordered,
-            .installed = .{
-                .generation_sha256 = @splat(0x71),
-                .packages = upgradeInstalled(),
-            },
-            .archives = &archives,
-        }));
-        defer owned.deinit();
-        try testing.expectEqual(
-            case.expected,
-            conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
-        );
+}
+
+test "native_program.test.conffile decisions follow the dpkg digest table" {
+    for (conffile_cases) |case| {
+        const packaged: ArchiveConffile = .{
+            .path = "/etc/app.conf",
+            .md5 = if (case.packaged) |value| @splat(value) else null,
+            .remove_on_upgrade = case.remove_on_upgrade,
+        };
+        const recorded: ?InstalledConffile = if (case.recorded) |value| .{
+            .path = "/etc/app.conf",
+            .recorded_md5 = @splat(value),
+            .on_disk_md5 = if (case.on_disk) |observed| @splat(observed) else null,
+        } else null;
+        for (conffilePolicies()) |policy| {
+            const decision = conffileDecision(policy, packaged, recorded);
+            const expected = expectedConffileAction(case, policy);
+            if (decision != expected) {
+                std.debug.print("{s} ({s}): expected {s}, found {s}\n", .{
+                    case.name,
+                    @tagName(policy),
+                    @tagName(expected),
+                    @tagName(decision),
+                });
+                return error.TestUnexpectedResult;
+            }
+        }
     }
 }
 
-test "native_program.test.unmodified and missing conffiles resolve without conflict artifacts" {
-    var authorization = try testAuthorization(
-        testing.allocator,
-        &upgrade_actions,
-        &upgrade_final,
-    );
-    defer authorization.deinit();
-    const installed = [_]InstalledPackage{
+// The decision table is only trustworthy if the compiler reaches it with the
+// same evidence, so every case is compiled end to end and the emitted step is
+// compared against the packaged, recorded, and observed digests it decided
+// from.
+test "native_program.test.compiled conffile steps carry the deciding digests" {
+    for (conffile_cases) |case| {
+        for (conffilePolicies()) |policy| {
+            var authorization = try testAuthorizationWithPolicy(
+                testing.allocator,
+                &upgrade_actions,
+                &upgrade_final,
+                .{ .conffile = policy, .force = &.{}, .allow_host_root = false },
+            );
+            defer authorization.deinit();
+            var archive = upgradeArchive();
+            var packaged = [_]ArchiveConffile{.{
+                .path = "/etc/app.conf",
+                .md5 = if (case.packaged) |value| @splat(value) else null,
+                .remove_on_upgrade = case.remove_on_upgrade,
+            }};
+            archive.conffiles = &packaged;
+            const archives = [_]Archive{archive};
+            var recorded = [_]InstalledConffile{.{
+                .path = "/etc/app.conf",
+                .recorded_md5 = if (case.recorded) |value| @splat(value) else @splat(0),
+                .on_disk_md5 = if (case.on_disk) |observed| @splat(observed) else null,
+            }};
+            var installed = [_]InstalledPackage{.{
+                .name = "app",
+                .version = "1.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .conffiles = if (case.recorded == null) &.{} else &recorded,
+            }};
+            var owned = try expectProgram(compile(testing.allocator, .{
+                .authorization = &authorization.authorization,
+                .ordered_actions = &install_ordered,
+                .installed = .{
+                    .generation_sha256 = @splat(0x71),
+                    .packages = &installed,
+                },
+                .archives = &archives,
+            }));
+            defer owned.deinit();
+            const decision = conffileDecisionFor(owned.program, "/etc/app.conf").?;
+            const expected = expectedConffileAction(case, policy);
+            if (decision.action != expected) {
+                std.debug.print("compiled {s} ({s}): expected {s}, found {s}\n", .{
+                    case.name,
+                    @tagName(policy),
+                    @tagName(expected),
+                    @tagName(decision.action),
+                });
+                return error.TestUnexpectedResult;
+            }
+            try testing.expectEqual(policy, decision.policy);
+            try expectOptionalMd5(case.packaged, decision.packaged_md5);
+            try expectOptionalMd5(case.recorded, decision.recorded_md5);
+            try expectOptionalMd5(
+                if (case.recorded == null) null else case.on_disk,
+                decision.on_disk_md5,
+            );
+        }
+    }
+}
+
+fn expectOptionalMd5(expected: ?u8, found: ?Md5Digest) !void {
+    if (expected) |value| {
+        try testing.expectEqualSlices(
+            u8,
+            &hex(16, @as([16]u8, @splat(value))),
+            &(found orelse return error.TestUnexpectedResult),
+        );
+    } else {
+        try testing.expect(found == null);
+    }
+}
+
+// Every digest the decision reads must change the program, otherwise a
+// tampered conffile record could reuse an authorized program digest.
+test "native_program.test.conffile digests change the compiled decision and digest" {
+    const Mutation = struct {
+        packaged: ?u8,
+        recorded: ?u8,
+        on_disk: ?u8,
+        expected: ConffileAction,
+    };
+    const mutations = [_]Mutation{
+        .{ .packaged = 0x61, .recorded = 0x60, .on_disk = 0x60, .expected = .replace_unmodified },
+        .{ .packaged = 0x61, .recorded = 0x60, .on_disk = 0x61, .expected = .identical_no_op },
+        .{ .packaged = 0x60, .recorded = 0x60, .on_disk = 0x6f, .expected = .keep_user_modified },
         .{
+            .packaged = 0x61,
+            .recorded = 0x60,
+            .on_disk = 0x6f,
+            .expected = .keep_existing_stage_dist,
+        },
+    };
+    var digests: std.ArrayList(Digest) = .empty;
+    defer digests.deinit(testing.allocator);
+    for (mutations) |mutation| {
+        var authorization = try testAuthorization(
+            testing.allocator,
+            &upgrade_actions,
+            &upgrade_final,
+        );
+        defer authorization.deinit();
+        var archive = upgradeArchive();
+        var packaged = [_]ArchiveConffile{.{
+            .path = "/etc/app.conf",
+            .md5 = if (mutation.packaged) |value| @splat(value) else null,
+        }};
+        archive.conffiles = &packaged;
+        const archives = [_]Archive{archive};
+        var recorded = [_]InstalledConffile{.{
+            .path = "/etc/app.conf",
+            .recorded_md5 = @splat(mutation.recorded.?),
+            .on_disk_md5 = if (mutation.on_disk) |observed| @splat(observed) else null,
+        }};
+        var installed = [_]InstalledPackage{.{
             .name = "app",
             .version = "1.0",
             .architecture = "amd64",
             .state = .installed,
-            .conffiles = &.{
-                .{
-                    .path = "/etc/app.conf",
-                    .recorded_md5 = @splat(0x60),
-                    .on_disk_md5 = @splat(0x60),
-                },
-            },
-        },
-    };
-    const archives = [_]Archive{upgradeArchive()};
-    {
+            .conffiles = &recorded,
+        }};
         var owned = try expectProgram(compile(testing.allocator, .{
             .authorization = &authorization.authorization,
             .ordered_actions = &install_ordered,
@@ -3728,56 +4103,67 @@ test "native_program.test.unmodified and missing conffiles resolve without confl
         }));
         defer owned.deinit();
         try testing.expectEqual(
-            ConffileAction.replace_unmodified,
+            mutation.expected,
             conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
         );
+        for (digests.items) |seen| {
+            try testing.expect(!std.mem.eql(u8, &seen, &owned.program.digest_sha256));
+        }
+        try digests.append(testing.allocator, owned.program.digest_sha256);
     }
-    var missing = installed;
-    var missing_conffiles = [_]InstalledConffile{
-        .{ .path = "/etc/app.conf", .recorded_md5 = @splat(0x60), .on_disk_md5 = null },
-    };
-    missing[0].conffiles = &missing_conffiles;
-    {
-        var owned = try expectProgram(compile(testing.allocator, .{
-            .authorization = &authorization.authorization,
-            .ordered_actions = &install_ordered,
-            .installed = .{ .generation_sha256 = @splat(0x71), .packages = &missing },
-            .archives = &archives,
-        }));
-        defer owned.deinit();
-        try testing.expectEqual(
-            ConffileAction.restore_missing,
-            conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
-        );
-    }
-    var removed = installed;
-    var removed_conffiles = [_]InstalledConffile{
-        .{
-            .path = "/etc/app.conf",
-            .recorded_md5 = @splat(0x60),
-            .on_disk_md5 = @splat(0x60),
-        },
-    };
-    removed[0].conffiles = &removed_conffiles;
-    var remove_on_upgrade = upgradeArchive();
-    var upgrade_conffiles = [_]ArchiveConffile{
+}
+
+test "native_program.test.packaged conffile digests must match the shipped contract" {
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &install_actions,
+        &install_final,
+    );
+    defer authorization.deinit();
+    const cases = [_]ArchiveConffile{
+        .{ .path = "/etc/app.conf", .md5 = null, .remove_on_upgrade = false },
         .{ .path = "/etc/app.conf", .md5 = @splat(0x61), .remove_on_upgrade = true },
     };
-    remove_on_upgrade.conffiles = &upgrade_conffiles;
-    const removing = [_]Archive{remove_on_upgrade};
-    {
-        var owned = try expectProgram(compile(testing.allocator, .{
+    for (cases) |conffile| {
+        var archive = installArchive();
+        var conffiles = [_]ArchiveConffile{conffile};
+        archive.conffiles = &conffiles;
+        const archives = [_]Archive{archive};
+        try expectDiagnostic(compile(testing.allocator, .{
             .authorization = &authorization.authorization,
             .ordered_actions = &install_ordered,
-            .installed = .{ .generation_sha256 = @splat(0x71), .packages = &removed },
-            .archives = &removing,
-        }));
-        defer owned.deinit();
-        try testing.expectEqual(
-            ConffileAction.remove_on_upgrade,
-            conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
-        );
+            .installed = .{ .generation_sha256 = @splat(0x71) },
+            .archives = &archives,
+        }), .invalid_conffile_metadata);
     }
+}
+
+test "native_program.test.obsolete conffiles stay recorded when the package stops shipping them" {
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &upgrade_actions,
+        &upgrade_final,
+    );
+    defer authorization.deinit();
+    const archives = [_]Archive{upgradeArchive()};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = upgradeInstalled(),
+        },
+        .archives = &archives,
+    }));
+    defer owned.deinit();
+    const obsolete = conffileDecisionFor(owned.program, "/etc/app-obsolete.conf").?;
+    try testing.expectEqual(ConffileAction.mark_obsolete, obsolete.action);
+    try testing.expect(obsolete.packaged_md5 == null);
+    try testing.expectEqualSlices(
+        u8,
+        &hex(16, @as([16]u8, @splat(0x62))),
+        &obsolete.recorded_md5.?,
+    );
 }
 
 const removal_installed = [_]InstalledPackage{
@@ -4217,6 +4603,227 @@ test "native_program.test.triggers defer work and publish awaited processing" {
     try testing.expect(
         program.steps[program.steps.len - 1].operation == .publish_provenance,
     );
+}
+
+// Trigger processing is the one place a package that is not part of the
+// authorized actions still receives a maintainer-script call and a state
+// record, so every state a database can publish is exercised here: only a
+// completely installed package may be driven through `triggers-pending`,
+// `postinst triggered`, and back to `installed`.
+test "native_program.test.deferred triggers refuse every unhealthy interested state" {
+    const listener_states = std.enums.values(PackageState);
+    for (listener_states) |state| {
+        var archive = installArchive();
+        archive.triggers = &.{.{ .kind = .activate_noawait, .name = "update-menus" }};
+        const archives = [_]Archive{archive};
+        const installed = [_]InstalledPackage{
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = state,
+                .scripts = &.{.{ .kind = .postinst, .sha256 = @splat(0x97) }},
+                .triggers = &.{.{ .kind = .interest_noawait, .name = "update-menus" }},
+            },
+        };
+        const final = [_]native_authorization.FinalPackage{
+            .{
+                .name = "app",
+                .version = "1.2",
+                .architecture = "amd64",
+                .state = .installed,
+                .dpkg_selection_hold = false,
+            },
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = if (state == .config_files) .config_files else .installed,
+                .dpkg_selection_hold = false,
+            },
+        };
+        var full = try testAuthorization(testing.allocator, &install_actions, &final);
+        defer full.deinit();
+        const input: Input = .{
+            .authorization = &full.authorization,
+            .ordered_actions = &install_ordered,
+            .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+            .archives = &archives,
+        };
+        if (state == .installed) {
+            var owned = try expectProgram(compile(testing.allocator, input));
+            defer owned.deinit();
+            try testing.expectEqual(
+                @as(usize, 1),
+                owned.program.countSteps(.process_deferred_triggers),
+            );
+            var promoted = false;
+            for (owned.program.steps) |step| switch (step.operation) {
+                .record_package_state => |record| {
+                    if (std.mem.eql(u8, record.package.name, "menu") and
+                        record.state == .installed) promoted = true;
+                },
+                else => {},
+            };
+            try testing.expect(promoted);
+            continue;
+        }
+        switch (compile(testing.allocator, input)) {
+            .program => |value| {
+                var owned = value;
+                owned.deinit();
+                std.debug.print(
+                    "listener state {s} compiled a program\n",
+                    .{@tagName(state)},
+                );
+                return error.TestUnexpectedResult;
+            },
+            .diagnostic => |diagnostic| {
+                try testing.expectEqual(
+                    DiagnosticCode.invalid_trigger_metadata,
+                    diagnostic.code,
+                );
+                try testing.expectEqualStrings("menu", diagnostic.package.?);
+            },
+        }
+    }
+}
+
+// A package whose recorded state is `triggers-pending` or `triggers-awaited`
+// carries trigger work from an earlier run that v1 installed evidence does not
+// enumerate. The transition this program would record is `installed`, which
+// would drop it, so those roots must fail before a program exists at all.
+test "native_program.test.recorded pending trigger work is never promoted to installed" {
+    for ([_]PackageState{ .triggers_pending, .triggers_awaited }) |state| {
+        var archive = installArchive();
+        archive.triggers = &.{.{ .kind = .activate_noawait, .name = "update-menus" }};
+        const archives = [_]Archive{archive};
+        const installed = [_]InstalledPackage{
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = state,
+                .scripts = &.{.{ .kind = .postinst, .sha256 = @splat(0x97) }},
+                .triggers = &.{.{ .kind = .interest_noawait, .name = "update-menus" }},
+            },
+        };
+        const final = [_]native_authorization.FinalPackage{
+            .{
+                .name = "app",
+                .version = "1.2",
+                .architecture = "amd64",
+                .state = .installed,
+                .dpkg_selection_hold = false,
+            },
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .dpkg_selection_hold = false,
+            },
+        };
+        var full = try testAuthorization(testing.allocator, &install_actions, &final);
+        defer full.deinit();
+        switch (compile(testing.allocator, .{
+            .authorization = &full.authorization,
+            .ordered_actions = &install_ordered,
+            .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+            .archives = &archives,
+        })) {
+            .program => |value| {
+                var owned = value;
+                owned.deinit();
+                return error.TestUnexpectedResult;
+            },
+            .diagnostic => |diagnostic| {
+                try testing.expectEqual(
+                    DiagnosticCode.invalid_trigger_metadata,
+                    diagnostic.code,
+                );
+                try testing.expectEqualStrings("trigger on unhealthy package", diagnostic.detail);
+            },
+        }
+    }
+}
+
+// The awaited state this compilation creates itself is the one exception: a
+// package that activated an awaited trigger is parked in `triggers-awaited`
+// while it is configured, and the same program records its return to
+// `installed` after the deferred work runs.
+test "native_program.test.mutual trigger interests keep the awaited flow" {
+    var archive = installArchive();
+    archive.triggers = &.{
+        .{ .kind = .activate_await, .name = "update-menus" },
+        .{ .kind = .interest_await, .name = "refresh-cache" },
+    };
+    const archives = [_]Archive{archive};
+    const installed = [_]InstalledPackage{
+        .{
+            .name = "menu",
+            .version = "3.0",
+            .architecture = "amd64",
+            .state = .installed,
+            .scripts = &.{.{ .kind = .postinst, .sha256 = @splat(0x97) }},
+            .triggers = &.{
+                .{ .kind = .interest_await, .name = "update-menus" },
+                .{ .kind = .activate_await, .name = "refresh-cache" },
+            },
+        },
+    };
+    const final = [_]native_authorization.FinalPackage{
+        .{
+            .name = "app",
+            .version = "1.2",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "menu",
+            .version = "3.0",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+    };
+    var full = try testAuthorization(testing.allocator, &install_actions, &final);
+    defer full.deinit();
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &full.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+        .archives = &archives,
+    }));
+    defer owned.deinit();
+    const program = owned.program;
+    try testing.expectEqual(@as(usize, 1), program.countSteps(.process_deferred_triggers));
+    var app_awaited = false;
+    var app_installed = false;
+    var menu_pending = false;
+    var menu_installed = false;
+    for (program.steps) |step| switch (step.operation) {
+        .record_package_state => |record| {
+            const app = std.mem.eql(u8, record.package.name, "app");
+            switch (record.state) {
+                .triggers_awaited => if (app) {
+                    app_awaited = true;
+                },
+                .triggers_pending => if (!app) {
+                    menu_pending = true;
+                },
+                .installed => if (app) {
+                    app_installed = true;
+                } else {
+                    menu_installed = true;
+                },
+                else => {},
+            }
+        },
+        else => {},
+    };
+    try testing.expect(app_awaited and app_installed and menu_pending and menu_installed);
 }
 
 test "native_program.test.trigger metadata and interested evidence fail closed" {
@@ -5221,7 +5828,10 @@ const WideScenario = struct {
         .{ .kind = .postinst, .sha256 = @splat(0x55) },
     },
     base_conffiles: [1]ArchiveConffile = .{
-        .{ .path = "/etc/base.conf", .md5 = @splat(0x65) },
+        // The maintainer shipped a new version of a locally modified conffile,
+        // so the reviewed policy decides and the scenario keeps exercising the
+        // staging branch of the decision table.
+        .{ .path = "/etc/base.conf", .md5 = @splat(0x68) },
     },
     installed_base_scripts: [3]InstalledScript = .{
         .{ .kind = .prerm, .sha256 = @splat(0x91) },
@@ -5938,6 +6548,434 @@ test "native_program.test.rejects whitespace and control bytes in trigger names"
             .archives = &archives,
         }), .invalid_trigger_metadata);
     }
+}
+
+/// Records every byte range `compile` obtained from its backing allocator.
+/// The compiler allocates only through the arena it destroys before returning
+/// a diagnostic, so any diagnostic field pointing inside a recorded range
+/// would be freed memory by the time the caller reads it.
+const ArenaWatchdog = struct {
+    backing: std.mem.Allocator,
+    ranges: std.ArrayList(Range) = .empty,
+    exhausted: bool = false,
+
+    const Range = struct { start: usize, end: usize };
+
+    fn allocator(self: *ArenaWatchdog) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn deinit(self: *ArenaWatchdog) void {
+        self.ranges.deinit(self.backing);
+    }
+
+    fn record(self: *ArenaWatchdog, pointer: [*]u8, len: usize) void {
+        const start = @intFromPtr(pointer);
+        self.ranges.append(self.backing, .{ .start = start, .end = start + len }) catch {
+            self.exhausted = true;
+        };
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *ArenaWatchdog = @ptrCast(@alignCast(context));
+        const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.record(result, len);
+        return result;
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *ArenaWatchdog = @ptrCast(@alignCast(context));
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.record(memory.ptr, new_len);
+        return true;
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *ArenaWatchdog = @ptrCast(@alignCast(context));
+        const result = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse
+            return null;
+        self.record(result, new_len);
+        return result;
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *ArenaWatchdog = @ptrCast(@alignCast(context));
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    fn owns(self: ArenaWatchdog, text: []const u8) bool {
+        if (text.len == 0) return false;
+        const start = @intFromPtr(text.ptr);
+        for (self.ranges.items) |range| {
+            if (start >= range.start and start < range.end) return true;
+        }
+        return false;
+    }
+
+    fn expectBorrowed(self: ArenaWatchdog, diagnostic: Diagnostic) !void {
+        try testing.expect(!self.exhausted);
+        const fields = [_]?[]const u8{
+            diagnostic.detail,
+            diagnostic.package,
+            diagnostic.architecture,
+            diagnostic.path,
+        };
+        for (fields) |field| {
+            const text = field orelse continue;
+            if (self.owns(text)) {
+                std.debug.print(
+                    "diagnostic {s} returned compiler-owned text '{s}'\n",
+                    .{ @tagName(diagnostic.code), text },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+};
+
+/// Compiles under a watchdog and proves the rejection borrows only memory the
+/// caller still owns.
+fn expectBorrowedDiagnostic(input: Input, code: DiagnosticCode) !void {
+    var watchdog: ArenaWatchdog = .{ .backing = testing.allocator };
+    defer watchdog.deinit();
+    switch (compile(watchdog.allocator(), input)) {
+        .program => |value| {
+            var owned = value;
+            owned.deinit();
+            std.debug.print("expected diagnostic {s}, compiled a program\n", .{@tagName(code)});
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diagnostic| {
+            try testing.expectEqual(code, diagnostic.code);
+            try watchdog.expectBorrowed(diagnostic);
+        },
+    }
+}
+
+// `compile` destroys its arena before it returns, so a diagnostic that names a
+// package, architecture, path, or detail must reference caller input or static
+// text. Every rejection path that reports evidence is audited here.
+test "native_program.test.every rejection borrows only caller owned text" {
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &install_actions,
+        &install_final,
+    );
+    defer authorization.deinit();
+    const base: Input = .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{ .generation_sha256 = @splat(0x71) },
+        .archives = &.{},
+    };
+
+    {
+        var input = base;
+        const features = [_][]const u8{"unsupported-root"};
+        input.unsupported_features = &features;
+        try expectBorrowedDiagnostic(input, .unsupported_feature);
+    }
+    {
+        var archive = installArchive();
+        const triggers = [_]TriggerDeclaration{.{ .kind = .interest, .name = "bad name" }};
+        archive.triggers = &triggers;
+        const archives = [_]Archive{archive};
+        var input = base;
+        input.archives = &archives;
+        try expectBorrowedDiagnostic(input, .invalid_trigger_metadata);
+    }
+    {
+        var archive = installArchive();
+        const triggers = [_]TriggerDeclaration{
+            .{ .kind = .interest, .name = "update-menus" },
+            .{ .kind = .interest_noawait, .name = "update-menus" },
+        };
+        archive.triggers = &triggers;
+        const archives = [_]Archive{archive};
+        var input = base;
+        input.archives = &archives;
+        try expectBorrowedDiagnostic(input, .duplicate_trigger);
+    }
+    {
+        var archive = installArchive();
+        var conffiles = [_]ArchiveConffile{
+            .{ .path = "/etc/app.conf", .md5 = @splat(0x61) },
+            .{ .path = "/etc/app.conf", .md5 = @splat(0x62) },
+        };
+        archive.conffiles = &conffiles;
+        const archives = [_]Archive{archive};
+        var input = base;
+        input.archives = &archives;
+        try expectBorrowedDiagnostic(input, .duplicate_conffile);
+    }
+    {
+        var archive = installArchive();
+        var conffiles = [_]ArchiveConffile{.{ .path = "etc/app.conf", .md5 = @splat(0x61) }};
+        archive.conffiles = &conffiles;
+        const archives = [_]Archive{archive};
+        var input = base;
+        input.archives = &archives;
+        try expectBorrowedDiagnostic(input, .invalid_conffile_metadata);
+    }
+    {
+        var archive = installArchive();
+        var replaces = [_][]const u8{"not a name"};
+        archive.replaces = &replaces;
+        const archives = [_]Archive{archive};
+        var input = base;
+        input.archives = &archives;
+        try expectBorrowedDiagnostic(input, .invalid_archive_metadata);
+    }
+    {
+        const archives = [_]Archive{installArchive()};
+        const installed = [_]InstalledPackage{
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .conffiles = &.{
+                    .{ .path = "/etc/menu.conf", .recorded_md5 = @splat(0x60) },
+                    .{ .path = "/etc/menu.conf", .recorded_md5 = @splat(0x61) },
+                },
+            },
+        };
+        var input = base;
+        input.archives = &archives;
+        input.installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed };
+        try expectBorrowedDiagnostic(input, .duplicate_conffile);
+    }
+    {
+        const archives = [_]Archive{installArchive()};
+        const installed = [_]InstalledPackage{
+            .{
+                .name = "menu",
+                .version = "3.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .triggers = &.{
+                    .{ .kind = .interest, .name = "update menus" },
+                },
+            },
+        };
+        var input = base;
+        input.archives = &archives;
+        input.installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed };
+        try expectBorrowedDiagnostic(input, .invalid_trigger_metadata);
+    }
+    {
+        const conflicts = [_]OwnershipConflict{.{
+            .path = "/usr/bin/app",
+            .holder = .{ .name = "legacy", .architecture = "amd64" },
+            .claimant = .{ .name = "app", .architecture = "amd64" },
+        }};
+        const archives = [_]Archive{installArchive()};
+        var input = base;
+        input.archives = &archives;
+        input.ownership_conflicts = &conflicts;
+        try expectBorrowedDiagnostic(input, .invalid_ownership_conflict);
+    }
+}
+
+/// Builds one activating package plus `listeners` installed packages that all
+/// declare interest in the same trigger, which is the only way to reach the
+/// interested-package ceiling.
+const InterestScenario = struct {
+    allocator: std.mem.Allocator,
+    trigger: []u8,
+    names: [][]u8,
+    installed: []InstalledPackage,
+    final: []native_authorization.FinalPackage,
+    declarations: []TriggerDeclaration,
+    activation: [1]TriggerDeclaration = undefined,
+    archives: [1]Archive = undefined,
+
+    fn init(allocator: std.mem.Allocator, listeners: usize) !InterestScenario {
+        const trigger = try allocator.dupe(u8, "update-menus");
+        errdefer allocator.free(trigger);
+        const names = try allocator.alloc([]u8, listeners);
+        errdefer allocator.free(names);
+        for (names, 0..) |*name, index|
+            name.* = try std.fmt.allocPrint(allocator, "listener-{d}", .{index});
+        const declarations = try allocator.alloc(TriggerDeclaration, listeners);
+        errdefer allocator.free(declarations);
+        const installed = try allocator.alloc(InstalledPackage, listeners);
+        errdefer allocator.free(installed);
+        const final = try allocator.alloc(native_authorization.FinalPackage, listeners + 1);
+        errdefer allocator.free(final);
+        for (names, 0..) |name, index| {
+            declarations[index] = .{ .kind = .interest_noawait, .name = trigger };
+            installed[index] = .{
+                .name = name,
+                .version = "1.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .triggers = declarations[index .. index + 1],
+                .scripts = &.{},
+            };
+            final[index] = .{
+                .name = name,
+                .version = "1.0",
+                .architecture = "amd64",
+                .state = .installed,
+                .dpkg_selection_hold = false,
+            };
+        }
+        final[listeners] = install_final[0];
+        var scenario: InterestScenario = .{
+            .allocator = allocator,
+            .trigger = trigger,
+            .names = names,
+            .installed = installed,
+            .final = final,
+            .declarations = declarations,
+        };
+        scenario.activation = .{.{ .kind = .activate_noawait, .name = trigger }};
+        return scenario;
+    }
+
+    fn deinit(self: *InterestScenario) void {
+        for (self.names) |name| self.allocator.free(name);
+        self.allocator.free(self.names);
+        self.allocator.free(self.declarations);
+        self.allocator.free(self.installed);
+        self.allocator.free(self.final);
+        self.allocator.free(self.trigger);
+    }
+
+    fn input(
+        self: *InterestScenario,
+        authorization: *const native_authorization.Authorization,
+    ) Input {
+        self.archives = .{installArchive()};
+        self.archives[0].triggers = &self.activation;
+        return .{
+            .authorization = authorization,
+            .ordered_actions = &install_ordered,
+            .installed = .{
+                .generation_sha256 = @splat(0x71),
+                .packages = self.installed,
+            },
+            .archives = &self.archives,
+        };
+    }
+};
+
+// The interested-package ceiling is reachable, and the diagnostic it returns
+// names the activating package and the trigger. Both must survive the arena
+// the compiler frees on its way out, so the trigger name is compared by
+// pointer against caller memory and reread after the freed arena has been
+// churned over by unrelated allocations.
+test "native_program.test.the interested package ceiling returns a durable diagnostic" {
+    var scenario = try InterestScenario.init(testing.allocator, maximum_interested_packages + 1);
+    defer scenario.deinit();
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &install_actions,
+        scenario.final,
+    );
+    defer authorization.deinit();
+
+    var watchdog: ArenaWatchdog = .{ .backing = testing.allocator };
+    defer watchdog.deinit();
+    const result = compile(watchdog.allocator(), scenario.input(&authorization.authorization));
+    const diagnostic = switch (result) {
+        .program => |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |value| value,
+    };
+    try testing.expectEqual(DiagnosticCode.limit_exceeded, diagnostic.code);
+    try testing.expectEqualStrings("interested packages", diagnostic.detail);
+    try testing.expectEqualStrings("app", diagnostic.package.?);
+    try testing.expectEqualStrings(scenario.trigger, diagnostic.path.?);
+    try testing.expectEqual(scenario.trigger.ptr, diagnostic.path.?.ptr);
+    try watchdog.expectBorrowed(diagnostic);
+
+    var churn: std.ArrayList([]u8) = .empty;
+    defer {
+        for (churn.items) |block| testing.allocator.free(block);
+        churn.deinit(testing.allocator);
+    }
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        const block = try testing.allocator.alloc(u8, 4096);
+        @memset(block, 0xa5);
+        try churn.append(testing.allocator, block);
+    }
+    try testing.expectEqualStrings("interested packages", diagnostic.detail);
+    try testing.expectEqualStrings("app", diagnostic.package.?);
+    try testing.expectEqualStrings("update-menus", diagnostic.path.?);
+    try testing.expectEqualStrings("app", diagnostic.package.?);
+}
+
+test "native_program.test.the interested package ceiling fails closed without memory" {
+    var scenario = try InterestScenario.init(testing.allocator, maximum_interested_packages + 1);
+    defer scenario.deinit();
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &install_actions,
+        scenario.final,
+    );
+    defer authorization.deinit();
+    const input = scenario.input(&authorization.authorization);
+
+    var index: usize = 0;
+    var rejected = false;
+    while (index < 64) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = index,
+        });
+        switch (compile(failing.allocator(), input)) {
+            .program => |value| {
+                var owned = value;
+                owned.deinit();
+                return error.TestUnexpectedResult;
+            },
+            .diagnostic => |diagnostic| switch (diagnostic.code) {
+                .out_of_memory => {},
+                .limit_exceeded => {
+                    rejected = true;
+                    try testing.expectEqualStrings(scenario.trigger, diagnostic.path.?);
+                    try testing.expectEqual(scenario.trigger.ptr, diagnostic.path.?.ptr);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+        }
+    }
+    try testing.expect(rejected);
 }
 
 test "native_program.test.the compiled program owns every published byte" {

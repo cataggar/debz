@@ -18,7 +18,7 @@ Compilation consumes exactly four kinds of evidence plus explicit policy:
 | `authorization` | The reviewed [native transaction authorization](exact-locks-and-provenance.md), which binds the backend, exact closure lock v2 generation, request/solver-policy/executor-policy/plan digests, install root and root identity, target and foreign architectures, mutation policy, every ordered action, and the exact intended final closure. |
 | `ordered_actions` | The reviewed plan's ordered lifecycle: bootstrap extraction, removals, purges, unpacks, and configure barriers. |
 | `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded and observed digests, and trigger declarations. |
-| `archives` | One validated archive per archive-producing action: identity, digest, size, authenticated origin, application-inventory digest, maintainer-script digests, packaged conffiles, trigger declarations, and `Replaces` names. |
+| `archives` | One validated archive per archive-producing action: identity, digest, size, authenticated origin, application-inventory digest, maintainer-script digests, packaged conffiles with the digest each shipped file carries (absent exactly for `remove-on-upgrade`), trigger declarations, and `Replaces` names. |
 
 Preflight also supplies the ownership conflicts it found and any root feature it
 classified as outside the v1 contract. Both fail closed unless the reviewed
@@ -93,6 +93,49 @@ The compiler expands the authorized actions into dpkg-compatible transitions:
 Maintainer scripts are emitted only when the corresponding evidence proves the
 script exists, so the program never plans a call to a script that is not there.
 
+## Conffile decisions
+
+Each packaged conffile is decided from three digests — the digest the package
+ships, the digest the database recorded for the installed version, and the
+digest observed in the root — plus the reviewed policy, exactly like dpkg's
+two-dimensional (administrator edited x maintainer edited) table:
+
+| Observed in root | Maintainer | Decision |
+|---|---|---|
+| equals the packaged digest | either | `identical_no_op` |
+| equals the recorded digest | changed the file | `replace_unmodified` |
+| edited | did not change the file | `keep_user_modified` |
+| deleted | did not change the file | `keep_user_deleted` |
+| edited | changed the file | `keep_existing_stage_dist` or `install_stage_old` |
+| deleted | changed the file | `keep_existing_stage_dist` or `restore_missing` |
+| not recorded | ships the file | `install_new` |
+
+The reviewed policy therefore decides exactly the case dpkg would prompt for.
+A conffile whose packaged digest still equals the recorded digest keeps the
+local edit, or the local deletion, under either policy and writes no conflict
+artifact, because the maintainer shipped nothing new to reconcile.
+
+`remove-on-upgrade` takes precedence and ships no file at all, so the compiler
+requires the packaged digest to be absent for it and present for every other
+conffile. It deletes a recorded, unmodified file, preserves a locally modified
+one as `.dpkg-old`, and does nothing when nothing is recorded or nothing is
+present, including on a fresh install. A recorded conffile the new package no
+longer ships is marked obsolete rather than removed.
+
+## Trigger processing
+
+Deferred trigger work is the only place a package outside the authorized
+actions receives a maintainer-script call and a state record, so it fails
+closed. A trigger-interested package is driven through `triggers-pending`,
+`postinst triggered`, and back to `installed` only when it is completely
+installed. `half-installed`, `half-configured`, `unpacked`, `config-files`, and
+absent packages are rejected instead of promoted, and so are packages the
+database recorded as `triggers-pending` or `triggers-awaited`, whose earlier
+trigger work v1 evidence does not enumerate and this program could not
+preserve. The one accepted awaited state is the one the compiler creates
+itself, for a package that activated an awaited trigger while it was
+configured and whose return to `installed` the same program records.
+
 ## Validation
 
 Compilation returns either a complete program or exactly one typed diagnostic;
@@ -114,6 +157,11 @@ there is no partial program. It rejects, among others:
   an already configured package;
 - an ownership conflict that neither `Replaces` nor the reviewed force policy
   resolves;
+- a packaged conffile whose digest disagrees with what it ships: absent for a
+  file the package installs, present for a `remove-on-upgrade` entry;
+- deferred trigger work for a package that is not completely installed,
+  including one whose recorded state already carries trigger work from an
+  earlier run;
 - a modeled final state that contradicts the authorized final closure, a
   package missing from it, or a closure entry that is neither installed nor
   authorized;
@@ -121,6 +169,13 @@ there is no partial program. It rejects, among others:
 
 Validation is linear or hash-indexed under large bounds; there are no quadratic
 scans over packages, conffiles, paths, or steps.
+
+A diagnostic never owns memory. Compilation destroys its arena before it
+returns, so every reported detail, package, architecture, and path references
+the caller's input or static text and stays readable for as long as the caller
+keeps the evidence it compiled from. Compiler-internal views of that evidence
+therefore keep aliasing caller memory, and only emission copies into the arena,
+which is what makes the compiled program own every byte it publishes.
 
 ## Determinism and digests
 
@@ -167,3 +222,9 @@ Diversions, statoverride records, and alternatives are preserved by the
 database contract but are not yet expanded into program steps. Live filesystem
 inspection, package-database writes, and script execution remain outside this
 module by design.
+
+Observed digests reach the compiler through the recorded conffile set, so a
+conffile the database does not record yet is decided as newly installed. dpkg
+prompts for the narrow case where such a file was created locally beforehand;
+expressing that requires an observed digest for unrecorded conffiles, which v1
+installed evidence does not carry.
