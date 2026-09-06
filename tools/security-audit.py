@@ -149,6 +149,7 @@ def audit_production_sources() -> None:
         'const global_keyring_directory_path = "/etc/apt/trusted.gpg.d";',
     }
     process_calls: list[str] = []
+    child_calls: list[str] = []
     for path in sorted((ROOT / "src").rglob("*.zig")):
         text = path.read_text(errors="strict")
         relative = str(path.relative_to(ROOT))
@@ -185,12 +186,17 @@ def audit_production_sources() -> None:
                 fail(f"{relative}:{line}: forbidden {reason}")
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
+        for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
+            child_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
     process_paths = [call.rsplit(":", 1)[0] for call in process_calls]
     if sorted(process_paths) != [
         "src/target_apt_config.zig",
         "src/transaction_executor.zig",
     ]:
         fail(f"production process boundary changed: {process_calls!r}")
+    child_paths = sorted({call.rsplit(":", 1)[0] for call in child_calls})
+    if child_paths not in ([], ["src/maintainer_script.zig"]):
+        fail(f"native child-process boundary changed: {child_calls!r}")
 
 
 def audit_dependencies() -> None:

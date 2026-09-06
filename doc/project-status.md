@@ -27,9 +27,25 @@ bindings. Successful execution and recovery perform exact installed-state
 verification before atomically publishing transaction provenance; unhealthy or
 different dpkg state fails closed.
 
+`debz.runMaintainerScript` is the audited native maintainer-script runner used
+by the native transaction engine. It validates and rejects unsafe scripts,
+arguments, and roots before any process exists, executes the script inside the
+selected root with a chroot-equivalent child setup, a fixed allowlisted
+environment, `/dev/null` stdin, bounded output, an explicit timeout and
+cancellation, and process-group termination, and reports exactly distinguishable
+outcomes with provenance-grade evidence. See
+[Audited maintainer-script runner](maintainer-script-runner.md).
+
 Archive-producing plan actions retain a typed `selected_origin` that can be
 matched back to the authenticated repository record by the package acquisition
 API.
+
+`debz.root_fs` is the traversal-safe filesystem layer for the native
+transaction engine. It anchors bounded, typed, root-relative operations to an
+already opened root descriptor, never resolves a component through a symbolic
+link, refuses absolute, traversing, and control-byte paths before any syscall,
+creates only exclusively, and replaces existing paths only through fsynced
+staged publication. See [Root-anchored filesystem primitives](root-filesystem.md).
 
 ## Typed metadata and archives
 

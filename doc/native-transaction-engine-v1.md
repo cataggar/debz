@@ -126,6 +126,9 @@ Scripts remain child processes. They execute directly from the selected root:
 - the interpreter and every executable path resolve inside the selected root;
 - exact argv, environment, output digests, and termination are provenance.
 
+The audited runner implementing this policy is documented in
+[Audited maintainer-script runner](maintainer-script-runner.md).
+
 Arbitrary script side effects cannot be generically rolled back. A crash while
 a script may have been running produces durable `script_outcome_unknown`
 evidence and blocks another mutation. Recovery may continue automatically only

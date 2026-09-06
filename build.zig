@@ -350,6 +350,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-transaction-executor", "Run dpkg transaction executor tests")
         .dependOn(&run_transaction_tests.step);
 
+    const maintainer_script_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"maintainer_script.test."},
+    });
+    const run_maintainer_script_tests = b.addRunArtifact(maintainer_script_tests);
+    b.step("test-maintainer-script", "Run audited maintainer-script runner tests")
+        .dependOn(&run_maintainer_script_tests.step);
+
     const lock_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
@@ -428,6 +436,7 @@ fn installReleaseFiles(
         "exact-locks-and-provenance.md",
         "github-actions.md",
         "integration-roots.md",
+        "maintainer-script-runner.md",
         "multi-repository-policy.md",
         "native-transaction-engine-v1.md",
         "openpgp-verifier.md",
@@ -438,6 +447,7 @@ fn installReleaseFiles(
         "release-installation.md",
         "release-tooling.md",
         "releasing.md",
+        "root-filesystem.md",
         "safety-ci.md",
         "solver-planning.md",
         "threat-model.md",

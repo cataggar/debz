@@ -60,6 +60,21 @@ do
 done
 test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
 test -f "$release_prefix/share/doc/debz/doc/repository-management.md"
+test -f "$release_prefix/share/doc/debz/doc/root-filesystem.md"
+test -f "$release_prefix/share/doc/debz/doc/maintainer-script-runner.md"
+# Every tracked document must ship: a linked document that is never installed
+# would leave the released documentation set silently incomplete.
+for document in doc/*.md
+do
+  test -f "$release_prefix/share/doc/debz/$document"
+done
+installed_documents=$(cd "$release_prefix/share/doc/debz/doc" && ls -- *.md | sort)
+tracked_documents=$(cd doc && ls -- *.md | sort)
+if [ "$installed_documents" != "$tracked_documents" ]
+then
+  echo "installed documents differ from doc/*.md" >&2
+  exit 1
+fi
 python3 - "$release_prefix/share/debz/runtime-dependencies.json" <<'PY'
 import json
 import pathlib
