@@ -69,7 +69,7 @@
       "type": "object",
       "required": ["kind", "package", "version", "architecture", "origin", "sha256", "package_size", "installed_size_delta_bytes", "source_package", "prior_installed", "requested", "reason", "essential", "has_pre_depends"],
       "properties": {
-        "kind": { "enum": ["install", "remove", "upgrade", "downgrade", "reinstall"] },
+        "kind": { "enum": ["install", "remove", "purge", "upgrade", "downgrade", "reinstall"] },
         "package": { "type": "string" },
         "version": { "type": "string" },
         "architecture": { "type": "string" },
@@ -112,7 +112,7 @@
       "required": ["sequence", "kind", "package", "version", "architecture"],
       "properties": {
         "sequence": { "type": "integer", "minimum": 0 },
-        "kind": { "enum": ["bootstrap_extract", "remove", "unpack", "configure_pending"] },
+        "kind": { "enum": ["bootstrap_extract", "remove", "purge", "unpack", "configure_pending"] },
         "package": { "type": "string" },
         "version": { "type": "string" },
         "architecture": { "type": "string" }

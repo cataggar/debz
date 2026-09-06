@@ -461,6 +461,7 @@ fn installReleaseFiles(
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
+        "native-transaction-authorization-v1.json",
         "package-cache-error-v1.json",
         "package-cache-fingerprint-v1.json",
         "package-cache-result-v1.json",

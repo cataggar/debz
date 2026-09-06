@@ -454,7 +454,7 @@ pub fn execute(
             dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
                 state.failure = .{
                     .code = .invalid_root,
-                    .phase = toPhase(ordered.kind),
+                    .phase = try toPhase(ordered.kind),
                     .diagnostic = try arena.dupe(u8, @errorName(err)),
                     .completed_commands = state.commands.items.len,
                 };
@@ -474,7 +474,7 @@ pub fn execute(
         if (!locksHeld(dependencies.locks, &held)) {
             state.failure = .{
                 .code = .lock_lost,
-                .phase = toPhase(ordered.kind),
+                .phase = try toPhase(ordered.kind),
                 .package = if (ordered.kind == .configure_pending) null else try arena.dupe(u8, ordered.package),
                 .diagnostic = "transaction lock ownership was lost",
                 .completed_commands = state.commands.items.len,
@@ -484,7 +484,7 @@ pub fn execute(
         dependencies.filesystem.validateRoot(request.install_root) catch |err| {
             state.failure = .{
                 .code = .invalid_root,
-                .phase = toPhase(ordered.kind),
+                .phase = try toPhase(ordered.kind),
                 .package = try arena.dupe(u8, ordered.package),
                 .diagnostic = try arena.dupe(u8, @errorName(err)),
                 .completed_commands = state.commands.items.len,
@@ -492,7 +492,7 @@ pub fn execute(
             return finish(allocator, arena_ptr, &state, plan_sha256);
         };
 
-        const phase = toPhase(ordered.kind);
+        const phase = try toPhase(ordered.kind);
         const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
@@ -1303,7 +1303,7 @@ fn buildJournalCommands(
 ) ![]recovery.Command {
     var commands: std.ArrayList(recovery.Command) = .empty;
     for (request.plan.ordered_actions) |ordered| {
-        const phase = toPhase(ordered.kind);
+        const phase = try toPhase(ordered.kind);
         const artifact = if (phase == .bootstrap_extract or phase == .unpack)
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
         else
@@ -1357,6 +1357,12 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     if (request.plan.schema_version != 2 and request.plan.schema_version != 3)
         return error.UnsupportedPlanVersion;
     if (request.plan.mode != .plan_only) return error.NonExecutablePlanMode;
+    // Purge is a native-engine transition. The legacy dpkg program has no
+    // authorized representation for it and must fail before any mutation.
+    for (request.plan.actions) |action|
+        if (action.kind == .purge) return error.UnsupportedPurgeAction;
+    for (request.plan.ordered_actions) |ordered|
+        if (ordered.kind == .purge) return error.UnsupportedPurgeAction;
     if (request.plan.actions.len > 100_000 or request.plan.ordered_actions.len > 300_000)
         return error.PlanTooLarge;
     if (request.exact_lock != null and request.exact_lock_v2 != null)
@@ -1413,7 +1419,8 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             return error.OrderedActionMissingPlanAction;
         switch (ordered.kind) {
             .remove => if (action.kind != .remove) return error.InvalidRemoveOrdering,
-            .bootstrap_extract, .unpack, .configure_pending => if (action.kind == .remove) return error.InvalidInstallOrdering,
+            .purge => return error.UnsupportedPurgeAction,
+            .bootstrap_extract, .unpack, .configure_pending => if (solver.isRemoval(action.kind)) return error.InvalidInstallOrdering,
         }
         if ((ordered.kind == .bootstrap_extract or ordered.kind == .unpack) and
             findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture) == null)
@@ -1440,6 +1447,7 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                     unpack_index = ordered_index;
                 },
                 .configure_pending => configure_pending_count += 1,
+                .purge => return error.UnsupportedPurgeAction,
             }
         }
         if (action.kind == .remove) {
@@ -1885,12 +1893,16 @@ fn samePackageArchitecture(
         std.mem.eql(u8, a_architecture, b_architecture);
 }
 
-fn toPhase(kind: solver.OrderedActionKind) Phase {
+/// Legacy dpkg programs have no purge phase. Preflight rejects purge before
+/// execution, and this mapping stays fail-closed rather than reinterpreting it
+/// as a plain removal.
+fn toPhase(kind: solver.OrderedActionKind) error{UnsupportedPurgeAction}!Phase {
     return switch (kind) {
         .bootstrap_extract => .bootstrap_extract,
         .remove => .remove,
         .unpack => .unpack,
         .configure_pending => .configure_pending,
+        .purge => error.UnsupportedPurgeAction,
     };
 }
 
@@ -4227,4 +4239,65 @@ test "transaction_executor.test.plan hash binds every tagged local origin field"
             &hashPlan(changed_plan),
         ));
     }
+}
+
+test "transaction_executor.test.legacy execution rejects native purge actions" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var harness: TestHarness = .{ .bytes = bytes };
+    var actions = [_]solver.PlanAction{testRemoveAction("legacy")};
+    var ordered = [_]solver.OrderedAction{
+        .{
+            .sequence = 0,
+            .kind = .remove,
+            .package = "legacy",
+            .version = "1.0",
+            .architecture = "amd64",
+        },
+    };
+    var plan = testPlan(&actions, &ordered);
+    try preflight(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies().filesystem);
+
+    actions[0].kind = .purge;
+    try std.testing.expectError(error.UnsupportedPurgeAction, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{},
+            .policy = .{ .conffile = .keep_existing },
+        },
+        harness.dependencies().filesystem,
+    ));
+    try std.testing.expectEqual(FailureCode.invalid_plan, preflightCode(error.UnsupportedPurgeAction));
+
+    actions[0].kind = .remove;
+    ordered[0].kind = .purge;
+    try std.testing.expectError(error.UnsupportedPurgeAction, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{},
+            .policy = .{ .conffile = .keep_existing },
+        },
+        harness.dependencies().filesystem,
+    ));
+    try std.testing.expectError(error.UnsupportedPurgeAction, toPhase(.purge));
+
+    var report = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    }, harness.dependencies());
+    defer report.deinit();
+    try std.testing.expect(!report.succeeded());
+    try std.testing.expectEqual(FailureCode.invalid_plan, report.failure.?.code);
+    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
 }

@@ -33,7 +33,7 @@
       "type": "object",
       "required": ["kind", "package", "version", "architecture", "repository", "sha256", "package_size", "installed_size_delta_bytes", "source_package", "prior_installed", "requested", "reason"],
       "properties": {
-        "kind": { "enum": ["install", "remove", "upgrade", "downgrade", "reinstall"] },
+        "kind": { "enum": ["install", "remove", "purge", "upgrade", "downgrade", "reinstall"] },
         "package": { "type": "string" },
         "version": { "type": "string" },
         "architecture": { "type": "string" },

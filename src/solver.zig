@@ -820,7 +820,10 @@ pub const PlanInput = struct {
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
 };
 
-pub const ActionKind = enum { install, remove, upgrade, downgrade, reinstall };
+/// `purge` extends the plan/action layer for the native engine's remove plus
+/// configuration-file removal transition. The libsolv planner never emits it,
+/// and the legacy dpkg executor rejects it before any mutation.
+pub const ActionKind = enum { install, remove, upgrade, downgrade, reinstall, purge };
 pub const ActionReason = enum {
     explicit_request,
     dependency,
@@ -829,7 +832,15 @@ pub const ActionReason = enum {
     upgrade,
 };
 
-pub const OrderedActionKind = enum { bootstrap_extract, remove, unpack, configure_pending };
+/// `purge` is the native program's remove-with-configuration step. Legacy
+/// dpkg programs never contain it.
+pub const OrderedActionKind = enum {
+    bootstrap_extract,
+    remove,
+    unpack,
+    configure_pending,
+    purge,
+};
 
 pub const OrderedAction = struct {
     sequence: usize,
@@ -838,6 +849,14 @@ pub const OrderedAction = struct {
     version: []const u8,
     architecture: []const u8,
 };
+
+/// Removal-shaped actions never produce an archive and never unpack.
+pub fn isRemoval(kind: ActionKind) bool {
+    return switch (kind) {
+        .remove, .purge => true,
+        .install, .upgrade, .downgrade, .reinstall => false,
+    };
+}
 
 pub const PlanSummary = struct {
     installs: usize = 0,
@@ -1274,7 +1293,7 @@ fn planTransactionInternal(
         return .{ .failure = failure };
     if (input.exact_lock) |lock| {
         for (actions.items) |action| {
-            if (action.kind == .remove) continue;
+            if (isRemoval(action.kind)) continue;
             const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
                 return failureOne(allocator, arena_ptr, .lock_closure_drift, action.package, null, "solver selected a package outside the exact locked closure");
             if (action.repository == null or action.sha256 == null or action.package_size == null or
@@ -1286,7 +1305,7 @@ fn planTransactionInternal(
     }
     if (input.exact_lock_v2) |lock| {
         for (actions.items) |action| {
-            if (action.kind == .remove) continue;
+            if (isRemoval(action.kind)) continue;
             const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
                 return failureOne(allocator, arena_ptr, .lock_closure_drift, action.package, null, "solver selected a package outside the exact locked closure");
             if (action.sha256 == null or action.package_size == null or
@@ -2224,7 +2243,7 @@ fn validateNamedInstallAction(
         .architecture = origin.architecture,
     }) != null) return null;
     for (actions) |action| {
-        if (action.kind != .remove and
+        if (!isRemoval(action.kind) and
             std.mem.eql(u8, action.package, origin.package) and
             std.mem.eql(u8, action.version, origin.version) and
             std.mem.eql(u8, action.architecture, origin.architecture))
@@ -2653,7 +2672,7 @@ fn summarizeActions(
     };
     for (actions) |action| switch (action.kind) {
         .install => summary.installs += 1,
-        .remove => summary.removals += 1,
+        .remove, .purge => summary.removals += 1,
         .upgrade => summary.upgrades += 1,
         .downgrade => summary.downgrades += 1,
         .reinstall => summary.reinstalls += 1,
@@ -2669,13 +2688,13 @@ fn materializeOrdering(
     defer ordered.deinit(allocator);
     var bootstrap_root = false;
     for (actions) |action| {
-        if (action.kind != .remove and action.essential and action.prior_installed == null) {
+        if (!isRemoval(action.kind) and action.essential and action.prior_installed == null) {
             bootstrap_root = true;
             break;
         }
     }
     for (actions) |action| {
-        if (!bootstrap_root or action.kind == .remove or action.prior_installed != null) continue;
+        if (!bootstrap_root or isRemoval(action.kind) or action.prior_installed != null) continue;
         try ordered.append(allocator, .{
             .sequence = ordered.items.len,
             .kind = .bootstrap_extract,
@@ -2687,10 +2706,10 @@ fn materializeOrdering(
     var pending_unpacks: usize = 0;
     var last_install: ?PlanAction = null;
     for (actions) |action| {
-        if (action.kind == .remove) {
+        if (isRemoval(action.kind)) {
             try ordered.append(allocator, .{
                 .sequence = ordered.items.len,
-                .kind = .remove,
+                .kind = if (action.kind == .purge) .purge else .remove,
                 .package = action.package,
                 .version = action.version,
                 .architecture = action.architecture,
@@ -3767,7 +3786,7 @@ fn hasSelected(selected: []const TaggedPackageOrigin, name: []const u8) bool {
 
 fn hasAction(actions: []const PlanAction, name: []const u8) bool {
     for (actions) |action| {
-        if (std.mem.eql(u8, action.package, name) and action.kind != .remove) return true;
+        if (std.mem.eql(u8, action.package, name) and !isRemoval(action.kind)) return true;
     }
     return false;
 }

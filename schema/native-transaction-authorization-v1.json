@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-transaction-authorization-v1",
+  "title": "debz native transaction authorization v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "backend",
+    "target_architecture",
+    "foreign_architectures",
+    "install_root",
+    "root_identity_sha256",
+    "request_sha256",
+    "solver_policy_sha256",
+    "executor_policy_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "policy",
+    "actions",
+    "final_state",
+    "final_state_sha256",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/native-transaction-authorization-v1" },
+    "version": { "const": 1 },
+    "backend": { "const": "native" },
+    "target_architecture": { "type": "string", "minLength": 1 },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "executor_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "exact_lock": { "$ref": "#/$defs/lockBinding" },
+    "policy": { "$ref": "#/$defs/policy" },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "final_state": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finalPackage" }
+    },
+    "final_state_sha256": { "$ref": "#/$defs/sha256" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "architecture"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 }
+      }
+    },
+    "lockBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "digest_sha256"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/exact-closure-lock-v2" },
+        "version": { "const": 2 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conffile", "force", "allow_host_root"],
+      "properties": {
+        "conffile": { "enum": ["keep_existing", "use_package_version"] },
+        "force": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "depends",
+              "depends_version",
+              "break_replaces",
+              "overwrite",
+              "overwrite_dir",
+              "remove_reinstreq"
+            ]
+          }
+        },
+        "allow_host_root": { "type": "boolean" }
+      }
+    },
+    "repositoryOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "repository_id", "repository_snapshot_sha256"],
+      "properties": {
+        "type": { "const": "authenticated_repository" },
+        "repository_id": { "$ref": "#/$defs/sha256" },
+        "repository_snapshot_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "localOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "artifact_id", "sha256", "size", "package", "acquisition_url", "trust_mode"],
+      "properties": {
+        "type": { "const": "local_artifact" },
+        "artifact_id": { "$ref": "#/$defs/sha256" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "package": { "$ref": "#/$defs/identity" },
+        "acquisition_url": { "type": "string", "minLength": 1 },
+        "trust_mode": { "enum": ["pinned_sha256", "verified_https"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "size", "origin"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "origin": {
+          "oneOf": [
+            { "$ref": "#/$defs/repositoryOrigin" },
+            { "$ref": "#/$defs/localOrigin" }
+          ]
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "package", "prior_version", "artifact"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "kind": { "enum": ["install", "remove", "upgrade", "downgrade", "reinstall", "purge"] },
+        "package": { "$ref": "#/$defs/identity" },
+        "prior_version": {
+          "oneOf": [{ "type": "null" }, { "type": "string", "minLength": 1 }]
+        },
+        "artifact": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/artifact" }]
+        }
+      }
+    },
+    "finalPackage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "architecture", "state", "dpkg_selection_hold"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "state": { "enum": ["installed", "config_files"] },
+        "dpkg_selection_hold": { "type": "boolean" }
+      }
+    }
+  }
+}

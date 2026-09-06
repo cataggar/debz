@@ -22,7 +22,8 @@ is an explicit toolchain limitation, not a green substitute sanitizer gate.
 
 Targets cover DEB822, Debian versions and relations, sources, control/status,
 Release/Packages, signed envelopes and OpenPGP packets, gzip/xz/zstd
-decompression, ar/deb/tar payloads, exact locks, provenance JSON and journals.
+decompression, ar/deb/tar payloads, exact locks, native transaction
+authorizations, provenance JSON and journals.
 Harnesses call production bounded APIs directly and never shell out.
 
 GitHub Actions lanes reproduce all three JavaScript bundles, audit their locked

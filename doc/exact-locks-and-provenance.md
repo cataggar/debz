@@ -90,6 +90,38 @@ package-origin digest exactly equal to the bound lock digest. Package,
 repository, and signer verification is count-bounded and uses sorted/indexed
 matching rather than nested scans.
 
+`debz.native_authorization` defines native transaction authorization schema
+version 1: the complete contract the native engine must hold before it mutates
+a root. One document binds the selected backend, the exact closure lock
+generation and digest, the request, solver-policy, executor-policy, and plan
+digests, the selected install root plus its derived root identity, the target
+and foreign architectures, the conffile and force policy including explicit
+host-root authorization, every ordered install/remove/purge/reinstall/upgrade/
+downgrade action with its prior installed version, the authenticated origin,
+digest, and size of every archive-producing action, and the exact intended
+final closure with its own digest.
+
+Authorization is native-only. Creating one for `legacy_dpkg` is rejected, and
+only exact-closure-lock v2 may be bound, so previously serialized v1 locks stay
+readable for the legacy backend and can never be silently reinterpreted as
+native authorization. `transaction_engine.authorize` requires an authorization
+for native execution, rejects an authorization supplied to the legacy backend,
+and re-verifies the lock, request, solver-policy, architecture, root, plan,
+executor-policy, action, artifact, and origin bindings against the request the
+executor would actually run; `executeAuthorized` performs that check before
+backend selection, so an unauthorized native transaction never reaches an
+executor.
+
+Actions are canonically ordered by a dense sequence, unique per package
+identity, and semantically validated: version transitions must match the action
+kind, archive evidence is required exactly for archive-producing actions and
+must equal the lock's origin and size for that package, and the final closure
+must list every retained package once with a non-contradictory state. Purged
+packages must be absent from the final closure. Documents are canonically
+serialized, digest-bound over payload and final state, parsed with bounded
+strict JSON that rejects unknown fields and non-canonical bytes, and can be
+persisted through the no-follow `NativeTransactionAuthorizationStore`.
+
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
 provenance can be bounded and digest-validated with
@@ -106,6 +138,7 @@ Schemas:
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
 - [`schema/transaction-result-summary-v1.json`](../schema/transaction-result-summary-v1.json)
+- [`schema/native-transaction-authorization-v1.json`](../schema/native-transaction-authorization-v1.json)
 
 `debz transaction-result verify` is the no-follow read boundary used after an
 Actions installation, including when the mutating process ran under explicit
