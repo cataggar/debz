@@ -205,10 +205,19 @@ attempt identifier, and root identity. Each filesystem, database, script, and
 trigger step has a checksummed write-ahead intent and a durable completion
 record. File and database publication fsyncs content and parent directories.
 
+Filesystem and package-database mutation is implemented by
+[`root_mutation`](root-mutation.md). Its versioned journal records every intent
+with the expected old state and desired new state before the first byte changes,
+and its hash-chained progress log records each durability boundary. Replaceable
+content is preserved in a root-local backup area and released only after the
+whole transaction verifies, so recovery can restore the recorded old state
+without re-supplying content.
+
 Recovery yields exactly one of:
 
 1. proof that no mutation occurred;
-2. deterministic completion of an idempotent step and continued recovery;
+2. deterministic restoration of the recorded old state, or deterministic
+   completion of an idempotent step, and continued recovery;
 3. a durable typed recovery requirement that prevents another mutation.
 
 Successful, failed, interrupted, and recovered provenance is published before

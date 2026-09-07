@@ -88,6 +88,44 @@ Replacing an existing path is possible only through atomic publication:
 Permissions are applied explicitly after creation so that the published mode
 does not depend on the process umask.
 
+## Exact metadata
+
+`applyMetadata` publishes a mode, an ownership, and a modification time on one
+already resolved final component without following it. The three writes are
+issued in exactly one order, and the order is part of the contract:
+
+1. **ownership** (`fchownat` with `AT_SYMLINK_NOFOLLOW`),
+2. **mode** (`fchmodat`),
+3. **modification time** (`utimensat`).
+
+Linux clears the set-user-ID bit of a non-directory on every `chown`, and the
+set-group-ID bit of a group-executable one, and it drops the
+`security.capability` attribute with them. It does so whatever the caller's
+privilege, and even when the ownership does not actually change. A mode written
+before the ownership would therefore be silently downgraded — `04755` would be
+published as `0755` — so ownership goes first. The modification time goes last
+because it is the only component that a later repair of the mode or ownership
+must not disturb: `chmod` and `chown` update `ctime` alone, so once the
+timestamp is written the entry is exactly what the caller asked for and any
+retry leaves it that way.
+
+`hasCapabilityAttribute` reports whether the final component carries a
+`security.capability` attribute, so a caller that is about to change ownership
+in place can refuse rather than destroy a privilege it does not model. An
+attribute that cannot be read is reported as present, because the only safe
+answer to "would this `chown` destroy something" is yes.
+
+## Append-only logs
+
+`readWindowAt` reads a bounded window at exactly the offset the caller supplies
+and always reports the physical length, so a write-ahead log compares its last
+complete record at a proven offset rather than at whatever the physical end
+happens to be after a torn write. `readTail` still reads from the physical end
+for callers that want it. `appendAt` writes at exactly the offset the caller
+proved durable and `fsync`s. `truncateFile` discards everything past a given
+length and `fsync`s the result, which is how a trailing write that provably
+never completed is repaired before anything is appended after it.
+
 `removeFile` unlinks a name, never a link target; `removeDirectory` removes an
 empty directory; `rename` moves within the root under the same explicit
 overwrite policy. `syncDirectory` and `syncRoot` provide parent-directory
@@ -99,5 +137,7 @@ durability where the platform supports it.
 absolute and traversing input, intermediate and final symbolic links, escaping
 link targets, exclusive-creation refusals that leave link targets untouched,
 symlink replacement by publication, directory/file transitions, overwrite
-policy, staging cleanup, unsupported path kinds, and durability calls. They run
-in temporary roots as part of `zig build test`.
+policy, staging cleanup, unsupported path kinds, durability calls, the metadata
+write order proven with `04755`, `02755`, `06755`, and `01755` and no second
+uid or gid required, capability-attribute reporting, and offset windows and
+truncation repair. They run in temporary roots as part of `zig build test`.

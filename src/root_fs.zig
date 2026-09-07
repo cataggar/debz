@@ -69,6 +69,16 @@ pub const LinkError = error{
     InvalidLinkTargetByte,
 };
 
+pub const MetadataError = error{
+    /// The platform cannot express the requested ownership or timestamp
+    /// change without following the final component.
+    NoFollowMetadataUnsupported,
+    /// The entry carries a `security.capability` attribute that a change of
+    /// ownership would silently destroy, or the attribute could not be read,
+    /// so the ownership change is refused instead of made.
+    CapabilityAttributePresent,
+};
+
 /// A validated root-relative path. The text is borrowed; callers own it for
 /// the lifetime of any derived operation.
 pub const Path = struct {
@@ -176,9 +186,62 @@ pub const OverwritePolicy = enum {
     replace,
 };
 
+/// The complete no-follow observation of one path the native mutation layer
+/// needs to state an exact precondition. `std.Io.File.Stat` deliberately omits
+/// ownership and the containing device, so on Linux this is read with a single
+/// `statx`; elsewhere it is derived from the portable stat with the
+/// unavailable fields reported as zero and `modeled` false.
+pub const Entry = struct {
+    kind: File.Kind,
+    size: u64,
+    /// Permission and special mode bits only; the file-type bits are masked
+    /// off so a mode never restates the kind.
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    /// Identifier of the filesystem holding the entry. Two paths with
+    /// different devices can never be linked or atomically renamed onto each
+    /// other.
+    device: u64,
+    inode: u64,
+    link_count: u64,
+    modified_nanoseconds: i128,
+    /// False when the platform could not report ownership and device, so a
+    /// caller never mistakes a zero for an observation.
+    modeled: bool,
+
+    pub fn isRegularFile(self: Entry) bool {
+        return self.kind == .file;
+    }
+
+    pub fn isDirectory(self: Entry) bool {
+        return self.kind == .directory;
+    }
+
+    pub fn isSymbolicLink(self: Entry) bool {
+        return self.kind == .sym_link;
+    }
+
+    pub fn isSupportedKind(self: Entry) bool {
+        return switch (self.kind) {
+            .file, .directory, .sym_link => true,
+            else => false,
+        };
+    }
+};
+
 pub const CreateFileOptions = struct {
     permissions: File.Permissions = default_file_permissions,
     read: bool = false,
+};
+
+/// Exact metadata to publish on an already resolved path without following
+/// its final component. A `null` component is left untouched.
+pub const MetadataUpdate = struct {
+    mode: ?u32 = null,
+    uid: ?u32 = null,
+    gid: ?u32 = null,
+    modified_nanoseconds: ?i128 = null,
 };
 
 pub const PublishOptions = struct {
@@ -446,6 +509,38 @@ pub const Root = struct {
         };
     }
 
+    /// Complete no-follow observation of the final component, including
+    /// ownership and the containing device.
+    pub fn entry(self: Root, path: Path) !Entry {
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        return entryAt(self.io, parent.dir, parent.leaf) catch |err| return mapLeafError(err);
+    }
+
+    /// `null` when the path, or any parent component, does not exist.
+    pub fn entryIfExists(self: Root, path: Path) !?Entry {
+        return self.entry(path) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => err,
+        };
+    }
+
+    /// Observation of the root descriptor itself. Its device is the reference
+    /// a caller compares staging and backup areas against.
+    pub fn rootEntry(self: Root) !Entry {
+        return entryAt(self.io, self.dir, "");
+    }
+
+    /// Device identifier of an existing directory, resolved without following
+    /// any component. Callers use it to refuse cross-device staging before a
+    /// rename can fail halfway through a transaction.
+    pub fn deviceOfDirectory(self: Root, path: Path) !u64 {
+        var dir = try self.openDirectory(path);
+        defer dir.close(self.io);
+        const observed = try entryAt(self.io, dir, "");
+        return observed.device;
+    }
+
     pub fn readSymbolicLink(self: Root, path: Path, buffer: []u8) ![]const u8 {
         var parent = try self.openParent(path);
         defer parent.close(self.io);
@@ -462,6 +557,168 @@ pub const Root = struct {
         defer parent.close(self.io);
         parent.dir.symLink(self.io, target, parent.leaf, .{}) catch |err|
             return mapLeafError(err);
+    }
+
+    /// Creates a hard link at `path` naming the same inode as `existing`.
+    /// Neither final component is followed, so a symbolic link is linked as
+    /// itself and never as its target, and the name must be unused.
+    pub fn createHardLink(self: Root, existing: Path, path: Path) !void {
+        var source = try self.openParent(existing);
+        defer source.close(self.io);
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        Dir.hardLink(
+            source.dir,
+            source.leaf,
+            parent.dir,
+            parent.leaf,
+            self.io,
+            .{ .follow_symlinks = false },
+        ) catch |err| return mapLeafError(err);
+    }
+
+    /// Exclusively creates `path`, writes `bytes`, and optionally fsyncs the
+    /// contents before closing. Exclusive creation never follows an existing
+    /// entry, so a planted symbolic link fails with `error.PathAlreadyExists`
+    /// instead of being written through.
+    pub fn writeNewFile(
+        self: Root,
+        path: Path,
+        bytes: []const u8,
+        options: CreateFileOptions,
+        durable: bool,
+    ) !void {
+        var file = try self.createRegularFile(path, options);
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, bytes);
+        if (durable) try file.sync(self.io);
+    }
+
+    /// Fsyncs an existing regular file so that content and metadata already
+    /// applied to it survive power loss.
+    pub fn syncRegularFile(self: Root, path: Path) !void {
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        try file.sync(self.io);
+    }
+
+    /// Byte length of an existing regular file plus a bounded window of its
+    /// bytes, read without following the final component. A write-ahead log
+    /// uses it to compare its own view against the durable tail before it
+    /// appends.
+    ///
+    /// `size` is always the physical length, which is what proves whether
+    /// anything follows the window, and `bytes` is short only when the file
+    /// ends inside the window.
+    pub const Window = struct {
+        size: u64,
+        bytes: []const u8,
+    };
+
+    /// Reads `buffer.len` bytes starting at exactly `offset`. The offset is
+    /// supplied by the caller rather than derived from the physical end, so a
+    /// torn trailing write can never shift the window and make a complete
+    /// record decode as garbage.
+    pub fn readWindowAt(self: Root, path: Path, offset: u64, buffer: []u8) !Window {
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        if (offset >= size) return .{ .size = size, .bytes = buffer[0..0] };
+        const length: usize = @intCast(@min(size - offset, buffer.len));
+        const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+        return .{ .size = size, .bytes = buffer[0..read] };
+    }
+
+    /// Byte length of an existing regular file plus its last `buffer.len`
+    /// bytes.
+    pub fn readTail(self: Root, path: Path, buffer: []u8) !Window {
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        const length: usize = @intCast(@min(size, buffer.len));
+        const offset = size - length;
+        const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+        return .{ .size = size, .bytes = buffer[0..read] };
+    }
+
+    /// Discards everything after `length` in an existing regular file and
+    /// fsyncs the result. A write-ahead log uses it to repair a trailing
+    /// write that was proven never to have completed, so the repair itself is
+    /// durable before anything is appended after it.
+    pub fn truncateFile(self: Root, path: Path, length: u64, durable: bool) !void {
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        var file = parent.dir.openFile(self.io, parent.leaf, .{
+            .mode = .write_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| return mapRegularFileError(err);
+        defer file.close(self.io);
+        try file.setLength(self.io, length);
+        if (durable) try file.sync(self.io);
+    }
+
+    /// True when the final component carries a `security.capability`
+    /// attribute. Linux drops that attribute together with the set-user-ID
+    /// and set-group-ID bits whenever a non-directory is chowned, so a caller
+    /// that is about to change ownership in place has to know first.
+    ///
+    /// An attribute that cannot be read is reported as present, because the
+    /// only safe answer to "would this chown destroy a privilege the plan
+    /// does not model" is yes.
+    pub fn hasCapabilityAttribute(self: Root, path: Path) !bool {
+        if (builtin.os.tag != .linux) return false;
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        const linux = std.os.linux;
+        var value: [1]u8 = undefined;
+        const result = linux.fgetxattr(file.handle, "security.capability", &value, 0);
+        return switch (linux.errno(result)) {
+            .SUCCESS => true,
+            // No attribute, or a filesystem that cannot store one at all.
+            .NODATA, .OPNOTSUPP => false,
+            // The buffer is deliberately zero-length, so a stored attribute
+            // reports its size rather than being copied out.
+            .RANGE => true,
+            else => true,
+        };
+    }
+
+    /// Appends `bytes` at exactly `offset` in an existing regular file and
+    /// fsyncs it. The offset is supplied by the caller rather than taken from
+    /// the descriptor, so a write-ahead log always lands after the last record
+    /// the caller proved durable and never after a torn trailing one.
+    pub fn appendAt(
+        self: Root,
+        path: Path,
+        offset: u64,
+        bytes: []const u8,
+        durable: bool,
+    ) !void {
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        var file = parent.dir.openFile(self.io, parent.leaf, .{
+            .mode = .write_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| return mapRegularFileError(err);
+        defer file.close(self.io);
+        try file.writePositionalAll(self.io, bytes, offset);
+        if (durable) try file.sync(self.io);
+    }
+
+    /// Applies exact metadata to the final component without following it.
+    /// Every component is already resolved no-follow, so this can never chmod
+    /// or chown a path outside the root through a planted link. Ownership is
+    /// written before the mode and the modification time last, so a `chown`
+    /// can never silently drop a set-user-ID or set-group-ID bit the caller
+    /// asked for.
+    pub fn applyMetadata(self: Root, path: Path, update: MetadataUpdate) !void {
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        try applyMetadataAt(self.io, parent.dir, parent.leaf, update);
     }
 
     /// Atomically publishes a symbolic link, replacing an existing entry
@@ -682,12 +939,178 @@ fn classifyComponentError(io: Io, base: Dir, component: []const u8, err: anyerro
     };
 }
 
+/// `std.posix.errno` is libc's `errno` when libc is linked, which reads the
+/// thread-local variable and expects a `-1` return. A raw Linux syscall
+/// returns the negated error code instead, so every direct syscall in this
+/// file is classified with the linux-specific decoder. Using the wrong one
+/// would silently report every failure as success, which for `fsync` would
+/// mean claiming durability that was never achieved.
 fn syncDir(io: Io, dir: Dir) !void {
     _ = io;
     switch (builtin.os.tag) {
-        .linux => if (std.posix.errno(std.os.linux.fsync(dir.handle)) != .SUCCESS)
-            return error.Unexpected,
+        .linux => switch (std.os.linux.errno(std.os.linux.fsync(dir.handle))) {
+            .SUCCESS => {},
+            // The filesystem cannot flush a directory. Reporting it is the
+            // only honest option: silently succeeding would claim a durability
+            // guarantee the publication never got.
+            .INVAL, .ROFS => return error.OperationUnsupported,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .DQUOT => return error.DiskQuota,
+            else => return error.Unexpected,
+        },
         else => {},
+    }
+}
+
+/// One no-follow observation of `leaf` inside `base`. An empty `leaf` observes
+/// `base` itself. On Linux a single `statx` reports ownership and the
+/// containing device, which `std.Io.File.Stat` does not carry.
+fn entryAt(io: Io, base: Dir, leaf: []const u8) !Entry {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var path_buffer: [maximum_path_bytes + 1]u8 = undefined;
+        if (leaf.len > maximum_path_bytes) return error.PathTooLong;
+        @memcpy(path_buffer[0..leaf.len], leaf);
+        path_buffer[leaf.len] = 0;
+        const request: linux.STATX = .{
+            .TYPE = true,
+            .MODE = true,
+            .NLINK = true,
+            .UID = true,
+            .GID = true,
+            .INO = true,
+            .SIZE = true,
+            .MTIME = true,
+        };
+        const flags: u32 = linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW |
+            @as(u32, if (leaf.len == 0) linux.AT.EMPTY_PATH else 0);
+        var raw = std.mem.zeroes(linux.Statx);
+        const path: [*:0]const u8 = @ptrCast(&path_buffer);
+        switch (linux.errno(linux.statx(base.handle, path, flags, request, &raw))) {
+            .SUCCESS => {},
+            .ACCES => return error.AccessDenied,
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+        const filled: u32 = @bitCast(raw.mask);
+        const wanted: u32 = @bitCast(request);
+        if (filled & wanted != wanted) return error.Unexpected;
+        return .{
+            .kind = statxKind(raw.mode),
+            .size = raw.size,
+            .mode = @as(u32, raw.mode) & 0o7777,
+            .uid = raw.uid,
+            .gid = raw.gid,
+            .device = (@as(u64, raw.dev_major) << 32) | raw.dev_minor,
+            .inode = raw.ino,
+            .link_count = raw.nlink,
+            .modified_nanoseconds = @as(i128, raw.mtime.sec) * std.time.ns_per_s + raw.mtime.nsec,
+            .modeled = true,
+        };
+    }
+    const stat = if (leaf.len == 0)
+        try base.stat(io)
+    else
+        try base.statFile(io, leaf, .{ .follow_symlinks = false });
+    return .{
+        .kind = stat.kind,
+        .size = stat.size,
+        .mode = if (builtin.os.tag == .windows) 0 else @intCast(stat.permissions.toMode() & 0o7777),
+        .uid = 0,
+        .gid = 0,
+        .device = 0,
+        .inode = stat.inode,
+        .link_count = stat.nlink,
+        .modified_nanoseconds = stat.mtime.nanoseconds,
+        .modeled = false,
+    };
+}
+
+fn statxKind(mode: u16) File.Kind {
+    const S = std.os.linux.S;
+    return switch (mode & S.IFMT) {
+        S.IFDIR => .directory,
+        S.IFCHR => .character_device,
+        S.IFBLK => .block_device,
+        S.IFREG => .file,
+        S.IFIFO => .named_pipe,
+        S.IFLNK => .sym_link,
+        S.IFSOCK => .unix_domain_socket,
+        else => .unknown,
+    };
+}
+
+/// Applies exact metadata to one already resolved final component in the only
+/// order that cannot lose a bit the caller asked for.
+///
+/// Linux clears the set-user-ID bit of a non-directory on every `chown`, and
+/// the set-group-ID bit of a group-executable non-directory, and it drops the
+/// `security.capability` attribute with them. It does so regardless of the
+/// caller's privilege. A `chmod` issued before the `chown` would therefore be
+/// silently undone, so ownership is always written first, the mode second, and
+/// the modification time last.
+///
+/// The modification time is written last because it is the only component a
+/// later repair of the mode or ownership must not disturb: `chmod` and `chown`
+/// update `ctime` alone, so once `utimensat` has run the entry is exactly what
+/// the caller asked for and any retry of the earlier components leaves it that
+/// way.
+fn applyMetadataAt(io: Io, base: Dir, leaf: []const u8, update: MetadataUpdate) !void {
+    if (update.uid != null or update.gid != null) {
+        // `std.Io.Dir.setFileOwner` declares an error set narrower than the
+        // one its own dispatch can return, so the no-follow change is issued
+        // directly. Every component is already resolved without following a
+        // link, so this can never reach outside the root.
+        if (builtin.os.tag != .linux) return error.NoFollowMetadataUnsupported;
+        const linux = std.os.linux;
+        var path_buffer: [maximum_path_bytes + 1]u8 = undefined;
+        if (leaf.len > maximum_path_bytes) return error.PathTooLong;
+        @memcpy(path_buffer[0..leaf.len], leaf);
+        path_buffer[leaf.len] = 0;
+        const path: [*:0]const u8 = @ptrCast(&path_buffer);
+        const uid: std.posix.uid_t = if (update.uid) |value| value else std.math.maxInt(u32);
+        const gid: std.posix.gid_t = if (update.gid) |value| value else std.math.maxInt(u32);
+        switch (linux.errno(linux.fchownat(
+            base.handle,
+            path,
+            uid,
+            gid,
+            linux.AT.SYMLINK_NOFOLLOW,
+        ))) {
+            .SUCCESS => {},
+            .ACCES => return error.AccessDenied,
+            .PERM => return error.PermissionDenied,
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDirectory,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .IO => return error.InputOutput,
+            else => return error.Unexpected,
+        }
+    }
+    if (update.mode) |mode| {
+        base.setFilePermissions(io, leaf, .fromMode(@intCast(mode)), .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            // A symbolic link has no independent mode anywhere the native
+            // engine runs, so the caller must not have planned one.
+            error.OperationUnsupported => return error.NoFollowMetadataUnsupported,
+            else => return mapLeafError(err),
+        };
+    }
+    if (update.modified_nanoseconds) |nanoseconds| {
+        // `Io.Timestamp` is 96-bit; a wider value can never be stored, so it
+        // is refused rather than truncated into a different timestamp.
+        const value = std.math.cast(i96, nanoseconds) orelse
+            return error.NoFollowMetadataUnsupported;
+        base.setTimestamps(io, leaf, .{
+            .follow_symlinks = false,
+            .modify_timestamp = .{ .new = .{ .nanoseconds = value } },
+        }) catch |err| return mapLeafError(err);
     }
 }
 
@@ -1207,7 +1630,7 @@ test "root_fs.test.unsupported path kinds fail closed before mutation" {
     const root = testRoot(&tmp);
 
     const fifo = try testPath("fifo");
-    if (std.posix.errno(std.os.linux.mknodat(
+    if (std.os.linux.errno(std.os.linux.mknodat(
         tmp.dir.handle,
         "fifo",
         std.posix.S.IFIFO | 0o600,
@@ -1235,4 +1658,271 @@ fn expectNoStagingResidue(tmp: *std.testing.TmpDir) !void {
         if (std.mem.startsWith(u8, entry.basename, staging_prefix))
             return error.StagingResidue;
     }
+}
+
+test "root_fs.test.entries report kind, mode, ownership, device, and link identity" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.createDirectoryPath(try testPath("usr/bin"), default_directory_permissions);
+    try root.publishFile(try testPath("usr/bin/tool"), "payload", .{});
+    try root.createSymbolicLink(try testPath("usr/bin/alias"), "tool");
+
+    const file = try root.entry(try testPath("usr/bin/tool"));
+    try testing.expect(file.isRegularFile());
+    try testing.expectEqual(@as(u64, 7), file.size);
+    try testing.expectEqual(@as(u64, 1), file.link_count);
+
+    const directory = try root.entry(try testPath("usr/bin"));
+    try testing.expect(directory.isDirectory());
+
+    const link = try root.entry(try testPath("usr/bin/alias"));
+    try testing.expect(link.isSymbolicLink());
+    try testing.expect(link.inode != file.inode);
+
+    if (builtin.os.tag == .linux) {
+        try testing.expect(file.modeled);
+        try testing.expectEqual(@as(u32, 0o644), file.mode);
+        try testing.expectEqual(@as(u32, 0o755), directory.mode);
+        try testing.expectEqual(std.os.linux.getuid(), file.uid);
+        // Everything inside one root shares one filesystem here, which is the
+        // precondition the mutation layer's staging area relies on.
+        const rooted = try root.rootEntry();
+        try testing.expectEqual(rooted.device, file.device);
+        try testing.expectEqual(
+            rooted.device,
+            try root.deviceOfDirectory(try testPath("usr/bin")),
+        );
+    }
+
+    try testing.expect(try root.entryIfExists(try testPath("usr/bin/missing")) == null);
+    try testing.expect(try root.entryIfExists(try testPath("missing/child")) == null);
+    try testing.expectError(
+        error.SymbolicLinkComponent,
+        root.entry(try testPath("usr/bin/alias/child")),
+    );
+}
+
+test "root_fs.test.hard links never follow the final component" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("target"), "payload", .{});
+    try root.createSymbolicLink(try testPath("link"), "target");
+    try root.createHardLink(try testPath("target"), try testPath("clone"));
+
+    const original = try root.entry(try testPath("target"));
+    const clone = try root.entry(try testPath("clone"));
+    try testing.expectEqual(original.inode, clone.inode);
+    try testing.expectEqual(@as(u64, 2), clone.link_count);
+
+    // An existing name is never taken over silently.
+    try testing.expectError(
+        error.PathAlreadyExists,
+        root.createHardLink(try testPath("target"), try testPath("clone")),
+    );
+    try testing.expectError(
+        error.PathAlreadyExists,
+        root.createHardLink(try testPath("target"), try testPath("link")),
+    );
+    // A planted symbolic link in the prefix cannot steer the link out.
+    try testing.expectError(
+        error.SymbolicLinkComponent,
+        root.createHardLink(try testPath("target"), try testPath("link/escape")),
+    );
+}
+
+test "root_fs.test.metadata updates never follow a planted link" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("secret"), "sensitive", .{});
+    try root.createSymbolicLink(try testPath("planted"), "secret");
+    try root.publishFile(try testPath("regular"), "payload", .{});
+
+    try root.applyMetadata(try testPath("regular"), .{
+        .mode = 0o600,
+        .modified_nanoseconds = 1_234_000_000_000,
+    });
+    const updated = try root.entry(try testPath("regular"));
+    try testing.expectEqual(@as(u32, 0o600), updated.mode);
+    try testing.expectEqual(@as(i128, 1_234_000_000_000), updated.modified_nanoseconds);
+
+    // Changing the timestamp of the link changes the link, never its target.
+    try root.applyMetadata(try testPath("planted"), .{
+        .modified_nanoseconds = 5_000_000_000,
+    });
+    const secret = try root.entry(try testPath("secret"));
+    try testing.expectEqual(@as(u32, 0o644), secret.mode);
+    try testing.expect(secret.modified_nanoseconds != 5_000_000_000);
+    const planted = try root.entry(try testPath("planted"));
+    try testing.expectEqual(@as(i128, 5_000_000_000), planted.modified_nanoseconds);
+
+    // A symbolic link has no independent mode, so a mode change is refused
+    // rather than silently applied to the target.
+    try testing.expectError(
+        error.NoFollowMetadataUnsupported,
+        root.applyMetadata(try testPath("planted"), .{ .mode = 0o600 }),
+    );
+    try testing.expectEqual(@as(u32, 0o644), (try root.entry(try testPath("secret"))).mode);
+}
+
+test "root_fs.test.exclusive writes and positional appends stay bounded" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.writeNewFile(try testPath("log"), "first\n", .{}, true);
+    try testing.expectError(
+        error.PathAlreadyExists,
+        root.writeNewFile(try testPath("log"), "again\n", .{}, true),
+    );
+
+    try root.appendAt(try testPath("log"), 6, "second\n", true);
+    const bytes = try root.readFileAlloc(testing.allocator, try testPath("log"), 4096);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("first\nsecond\n", bytes);
+
+    // A torn trailing record is overwritten by the next append at the offset
+    // the caller proved durable.
+    try root.appendAt(try testPath("log"), 6, "third\n\n", true);
+    const rewritten = try root.readFileAlloc(testing.allocator, try testPath("log"), 4096);
+    defer testing.allocator.free(rewritten);
+    try testing.expectEqualStrings("first\nthird\n\n", rewritten);
+
+    try root.createSymbolicLink(try testPath("planted"), "log");
+    try testing.expectError(
+        error.NotRegularFile,
+        root.appendAt(try testPath("planted"), 0, "x", true),
+    );
+    try testing.expectError(
+        error.PathAlreadyExists,
+        root.writeNewFile(try testPath("planted"), "x", .{}, true),
+    );
+    try root.syncRegularFile(try testPath("log"));
+    try expectNoStagingResidue(&tmp);
+}
+
+test "root_fs.test.device identity distinguishes filesystems" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+    const local = try root.rootEntry();
+
+    // Any real second filesystem proves the identity is a mount property and
+    // not a constant. The mutation layer refuses to stage across one, because
+    // a rename between filesystems is not atomic.
+    var other = openAbsoluteRoot(testing.io, "/dev/shm") catch return error.SkipZigTest;
+    defer other.close();
+    const remote = try other.root.rootEntry();
+    if (remote.device == local.device) return error.SkipZigTest;
+    try testing.expect(local.modeled and remote.modeled);
+    try testing.expect(local.device != remote.device);
+}
+
+test "root_fs.test.ownership is written before a mode that carries privileged bits" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("tool"), "payload", .{});
+    const uid = std.os.linux.getuid();
+    const gid = std.os.linux.getgid();
+
+    // Linux clears the set-user-ID bit of a non-directory on every `chown`,
+    // and the set-group-ID bit of a group-executable one, whatever the
+    // caller's privilege and even when the ownership does not actually
+    // change. A mode written before the ownership would therefore be silently
+    // downgraded, so the order is part of the contract and is asserted here
+    // without needing a second uid or gid.
+    for ([_]u32{ 0o4755, 0o2755, 0o6755, 0o1755 }) |mode| {
+        try root.applyMetadata(try testPath("tool"), .{
+            .mode = mode,
+            .uid = uid,
+            .gid = gid,
+            .modified_nanoseconds = 7_000_000_000,
+        });
+        const updated = try root.entry(try testPath("tool"));
+        try testing.expectEqual(mode, updated.mode);
+        try testing.expectEqual(uid, updated.uid);
+        try testing.expectEqual(gid, updated.gid);
+        try testing.expectEqual(@as(i128, 7_000_000_000), updated.modified_nanoseconds);
+    }
+
+    // A directory keeps its set-group-ID bit across a chown, and the same
+    // order still publishes exactly what was asked for.
+    try root.createDirectory(try testPath("group"), default_directory_permissions);
+    try root.applyMetadata(try testPath("group"), .{ .mode = 0o2775, .uid = uid, .gid = gid });
+    try testing.expectEqual(@as(u32, 0o2775), (try root.entry(try testPath("group"))).mode);
+}
+
+test "root_fs.test.capability attributes are reported before an ownership change" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("plain"), "payload", .{});
+    try testing.expect(!try root.hasCapabilityAttribute(try testPath("plain")));
+
+    // An entry that cannot be opened as a regular file cannot be proven free
+    // of a capability attribute, and the caller treats that as present.
+    try root.createDirectory(try testPath("dir"), default_directory_permissions);
+    try testing.expectError(
+        error.NotRegularFile,
+        root.hasCapabilityAttribute(try testPath("dir")),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        root.hasCapabilityAttribute(try testPath("missing")),
+    );
+}
+
+test "root_fs.test.windows read at a proven offset and truncation repairs a tail" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.writeNewFile(try testPath("log"), "aaaa" ++ "bbbb" ++ "cc", .{}, true);
+    var buffer: [4]u8 = undefined;
+
+    // The window is taken at exactly the offset the caller proved durable,
+    // so a torn trailing write never shifts it.
+    const first = try root.readWindowAt(try testPath("log"), 0, &buffer);
+    try testing.expectEqual(@as(u64, 10), first.size);
+    try testing.expectEqualStrings("aaaa", first.bytes);
+    const second = try root.readWindowAt(try testPath("log"), 4, &buffer);
+    try testing.expectEqual(@as(u64, 10), second.size);
+    try testing.expectEqualStrings("bbbb", second.bytes);
+    // A window that runs past the end reports the physical size and the short
+    // read, which is how a partial tail is recognized.
+    const torn = try root.readWindowAt(try testPath("log"), 8, &buffer);
+    try testing.expectEqual(@as(u64, 10), torn.size);
+    try testing.expectEqualStrings("cc", torn.bytes);
+    const past = try root.readWindowAt(try testPath("log"), 10, &buffer);
+    try testing.expectEqual(@as(u64, 10), past.size);
+    try testing.expectEqual(@as(usize, 0), past.bytes.len);
+
+    // The tail helper still reads from the physical end.
+    const tail = try root.readTail(try testPath("log"), &buffer);
+    try testing.expectEqual(@as(u64, 10), tail.size);
+    try testing.expectEqualStrings("bbcc", tail.bytes);
+
+    try root.truncateFile(try testPath("log"), 8, true);
+    const repaired = try root.readWindowAt(try testPath("log"), 4, &buffer);
+    try testing.expectEqual(@as(u64, 8), repaired.size);
+    try testing.expectEqualStrings("bbbb", repaired.bytes);
+
+    // Truncation never follows a planted link and never reaches a directory.
+    try root.createSymbolicLink(try testPath("planted"), "log");
+    try testing.expectError(
+        error.NotRegularFile,
+        root.truncateFile(try testPath("planted"), 0, true),
+    );
 }

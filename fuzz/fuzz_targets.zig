@@ -36,7 +36,21 @@ const state_corpus = &.{
     @embedFile("corpus/state/repository-add-state.json"),
     @embedFile("corpus/state/root-operation.json"),
     @embedFile("corpus/state/root-operation-completion.json"),
+    @embedFile("corpus/state/root-mutation-progress"),
+    @embedFile("corpus/state/root-mutation-journal.json"),
 };
+
+/// The checked-in progress log for the root mutation write-ahead protocol.
+/// It is replayed against the module's own fixed synthetic journal, so a
+/// mutated record exercises the shape, the chain, and the identity rules the
+/// recovery path depends on.
+const mutation_progress_seed = @embedFile("corpus/state/root-mutation-progress");
+
+/// The checked-in mutation journal document. Its install root, its step path,
+/// and its link target are valid non-ASCII UTF-8, so a mutated copy lands
+/// inside a multibyte sequence and drives the decoder across the encoding
+/// boundary the mutation layer refuses to publish malformed.
+const mutation_journal_seed = @embedFile("corpus/state/root-mutation-journal.json");
 
 fn input(smith: *std.testing.Smith, storage: *[max_input]u8) []const u8 {
     @disableInstrumentation();
@@ -448,6 +462,83 @@ fn exerciseState(bytes: []const u8) !void {
         var document = value;
         document.deinit();
     } else |_| {}
+    // The mutation journal and its write-ahead log are the durable inputs the
+    // recovery path parses, and both are reachable on a compromised root.
+    debz.root_mutation.fuzzOne(std.testing.allocator, bytes);
+    if (debz.root_mutation.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var journal = value;
+        defer journal.deinit();
+        debz.root_mutation.fuzzProgress(std.testing.allocator, journal.journal, bytes);
+    } else |_| {}
+    // A progress log is a durable artifact of its own: it is reachable on a
+    // compromised root without the journal document beside it, so it is
+    // replayed against a fixed journal as well.
+    debz.root_mutation.fuzzProgressLog(std.testing.allocator, bytes);
+}
+
+test "fuzz.the mutation progress corpus is the exact write-ahead format" {
+    var buffer: [debz.root_mutation.fuzz_seed_bytes]u8 = undefined;
+    const expected = debz.root_mutation.fuzzSeedLog(&buffer);
+    // Regenerate the seed from `fuzzSeedLog` whenever the record format or
+    // the chain changes; a corpus that no longer parses fuzzes nothing.
+    try std.testing.expectEqualSlices(u8, expected, mutation_progress_seed);
+
+    var progress = try debz.root_mutation.replayProgress(
+        std.testing.allocator,
+        debz.root_mutation.fuzzJournal(),
+        mutation_progress_seed,
+    );
+    defer progress.deinit();
+    try std.testing.expectEqual(mutation_progress_seed.len, progress.accepted_bytes);
+    try std.testing.expectEqual(debz.root_mutation.Stage.completed, progress.stage);
+    // The verified boundary of each step bound the entry it published, and
+    // the second step of the pair inherits its precondition from the first.
+    try std.testing.expect(progress.identity(0).bound());
+    try std.testing.expectEqual(progress.identity(0).inode, progress.identity(1).inode);
+}
+
+test "fuzz.the mutation journal corpus is the exact canonical document" {
+    const expected = try debz.root_mutation.fuzzSeedDocument(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    // Regenerate the seed from `fuzzSeedDocument` whenever the document format
+    // changes; a corpus entry that no longer decodes fuzzes nothing.
+    try std.testing.expectEqualSlices(u8, expected, mutation_journal_seed);
+
+    var decoded = try debz.root_mutation.decode(
+        std.testing.allocator,
+        mutation_journal_seed,
+        max_input,
+    );
+    defer decoded.deinit();
+    // The seed carries text no ASCII-only corpus would reach, so a mutation
+    // of it lands inside a multibyte sequence in a path or a link target.
+    const path = decoded.journal.steps[0].path;
+    try std.testing.expect(!std.unicode.utf8ValidateSlice(path[0 .. path.len - 1]));
+    try std.testing.expect(debz.root_mutation.encodableText(path));
+
+    // Every malformed spelling of the same document is refused, so the
+    // decoder can never hand the recovery path text the encoder could not
+    // write back.
+    for ([_][]const u8{
+        "\x80",
+        "\xc0\xaf",
+        "\xed\xa0\x80",
+        "\xf4\x90\x80\x80",
+        "\xe2\x82",
+    }) |malformed| {
+        const marker = "etc/caf";
+        const index = std.mem.indexOf(u8, mutation_journal_seed, marker).?;
+        const corrupted = try std.mem.concat(std.testing.allocator, u8, &.{
+            mutation_journal_seed[0 .. index + marker.len],
+            malformed,
+            mutation_journal_seed[index + marker.len + 2 ..],
+        });
+        defer std.testing.allocator.free(corrupted);
+        try std.testing.expectError(
+            error.NonCanonicalDocument,
+            debz.root_mutation.decode(std.testing.allocator, corrupted, max_input),
+        );
+    }
 }
 
 test "fuzz.deterministic bounded mutation smoke" {

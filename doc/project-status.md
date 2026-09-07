@@ -59,6 +59,51 @@ link, refuses absolute, traversing, and control-byte paths before any syscall,
 creates only exclusively, and replaces existing paths only through fsynced
 staged publication. See [Root-anchored filesystem primitives](root-filesystem.md).
 
+`debz.root_mutation` is the crash-safe native mutation layer. It resolves a
+caller's ordered typed intents against the current root into exact preconditions
+and desired states, publishes them as a versioned durable journal plus a
+hash-chained write-ahead progress log before the first target byte changes, and
+then walks explicit durability boundaries - staged, backup captured, published,
+metadata applied, parent synced, verified, completed - comparing observed state
+to the recorded expectation at every one. Metadata is published as ownership,
+then mode, then modification time, because Linux drops set-user-ID,
+set-group-ID, and `security.capability` on every `chown` of a non-directory; the
+mode is rewritten even when it already matches whenever an ownership change
+could have cleared a bit it keeps. Because neither that sequence nor directory
+creation is atomic, each step also states the exact closed set of intermediate
+states the transaction itself could have produced from its last durable
+boundary, and accepts nothing outside it, so a half-applied boundary is finished
+or undone deterministically while an external modification is still refused.
+A plan may touch one path more than once, and the second step's precondition is
+then the first step's desired state, which can carry no inode; the verified
+boundary of the producing step therefore binds the device, inode, and link count
+it published inside the same chained progress record, and every dependent
+precondition, directory re-creation, and backup attribution resolves that bound
+entry instead of a zero. A precondition nothing has bound yet is proof the step
+never ran, and a structurally identical entry on a different inode is an
+external replacement rather than the recorded state.
+Root-local staging and backups live in
+a private `var/lib/debz/mutation` workspace, are created exclusively so a planted
+entry can never be followed, and are released only after the whole transaction
+verifies, so recovery can always restore the recorded old state without
+re-supplying content. Preflight refuses special files, symbolic-link components,
+path aliases, ancestor conflicts, hard-link ambiguity, non-empty directory
+transitions, cross-device targets, capacity and overflow, content that does
+not hash to the authorized digest, and an in-place ownership change that would
+silently destroy a file capability. Appending a progress boundary is a
+compare-and-set against the last complete record read at a proven offset: a
+trailing run shorter than one record is a torn write and is truncated and
+`fsync`ed before the append, while a whole extra record is a stale or foreign
+history and is refused. Recovery either restores the old state,
+finishes releasing a verified transaction, or publishes a durable typed recovery
+requirement that blocks every further mutation. `lowerDatabasePlan` is the typed
+adapter that consumes `package_database_changes.Plan` in its own status-old,
+info, arch, triggers, status ordering with its generation binding, and
+`bindArchive` re-proves the archive artifact and application digests immediately
+before content is staged. Maintainer scripts, triggers, package ownership, and
+unpack semantics are deliberately outside this layer and are documented as an
+explicit handoff. See [Crash-safe root mutation layer](root-mutation.md).
+
 `debz.root_operation` is the single mutation gate for a selected root. One root
 mutation lock and one durable, versioned active-attempt record in the root's
 `var/lib/debz` namespace are shared by repository bootstrap and package
@@ -125,8 +170,8 @@ record order, republishes every surface through canonical writers, and hashes
 the consumed generation as authorization evidence.
 `debz.package_database_changes` compiles typed edits into one deterministic,
 validated publication plan of file intents. Neither module performs filesystem
-IO; durable publication belongs to the mutation layer. See
-[Native package database](package-database.md).
+IO; durable publication belongs to `debz.root_mutation`, which consumes the
+plan through a typed adapter. See [Native package database](package-database.md).
 
 Repository sources can be supplied explicitly as canonical `.sources` stanzas or legacy `deb` and `deb-src` lines; parsing never consults host APT configuration. Parsed sources preserve spans, enforce caller-configurable bounds, and receive deterministic IDs from normalized declared values.
 

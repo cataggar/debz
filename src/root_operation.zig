@@ -317,7 +317,12 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (ValidationError || er
         input.provenance_sha256,
     );
     if (input.evidence.exact_lock) |binding| {
+        // The schema identifier is the one record string a caller supplies
+        // verbatim, and the record is a canonical JSON document, so text the
+        // encoder would write but the decoder could not read back is refused
+        // before the record exists rather than after it is durable.
         if (binding.schema.len == 0 or binding.schema.len > maximum_schema_bytes or
+            !std.unicode.utf8ValidateSlice(binding.schema) or
             binding.version == 0) return error.InvalidLockBinding;
     }
 
@@ -2064,6 +2069,28 @@ test "root_operation.test.records reject contradictory lifecycle combinations" {
         error.InvalidArchitecture,
         create(testing.allocator, invalid_architecture),
     );
+
+    // The lock schema is the one record string a caller supplies verbatim, and
+    // the record is canonical JSON: text that is not valid UTF-8 has no JSON
+    // spelling, so a record carrying it could never be decoded again. Every
+    // way UTF-8 can be malformed is refused before the record exists.
+    for ([_][]const u8{
+        "\x80",
+        "\xc0\xaf",
+        "\xed\xa0\x80",
+        "\xf5\x80\x80\x80",
+        "\xe2\x82",
+    }) |schema| {
+        var unencodable = testInput();
+        unencodable.evidence = .{
+            .plan_sha256 = @splat(0x33),
+            .exact_lock = .{ .schema = schema, .version = 1, .digest_sha256 = @splat(0x77) },
+        };
+        try testing.expectError(
+            error.InvalidLockBinding,
+            create(testing.allocator, unencodable),
+        );
+    }
 }
 
 test "root_operation.test.reserving publishes durable pre-mutation evidence" {
