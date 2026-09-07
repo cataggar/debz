@@ -16,6 +16,7 @@ const solver = @import("solver.zig");
 const source = @import("source.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
+const live_root = @import("live_root.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
@@ -2428,6 +2429,8 @@ fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
 }
 
 test "product API operations exhaustively deny host-root execution" {
+    try std.testing.expect(!live_root.host_root_allowed);
+    try std.testing.expect(!std.mem.eql(u8, live_root.logical_root_path, "/"));
     inline for (std.meta.fields(api.Operation)) |field| {
         const operation: api.Operation = @enumFromInt(field.value);
         var request: api.Request = .{
@@ -2442,7 +2445,7 @@ test "product API operations exhaustively deny host-root execution" {
         const policy = try executionPolicy(std.testing.allocator, request);
         defer std.testing.allocator.free(policy.risk.force);
         try std.testing.expect(!policy.risk.allow_host_root);
-        request.options.install_root = "/alternate";
+        request.options.install_root = live_root.logical_root_path;
         const alternate = try executionPolicy(std.testing.allocator, request);
         defer std.testing.allocator.free(alternate.risk.force);
         try std.testing.expect(!alternate.risk.allow_host_root);

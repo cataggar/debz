@@ -296,6 +296,7 @@ pub fn build(b: *std.Build) void {
     const root_operation_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
+            "live_root.test.",
             "root_operation.test.",
             "root_operation_completion.test.",
             "root_fs.test.",
@@ -309,8 +310,33 @@ pub fn build(b: *std.Build) void {
     b.step("test-root-mutation", "Run crash-safe root mutation layer tests")
         .dependOn(&run_root_mutation_tests.step);
     const run_root_operation_tests = b.addRunArtifact(root_operation_tests);
-    b.step("test-root-operation", "Run root operation lock and active-record tests")
+    b.step("test-root-operation", "Run live-root, root operation, and root filesystem tests")
         .dependOn(&run_root_operation_tests.step);
+    const live_root_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"live_root.test."},
+    });
+    const run_live_root_tests = b.addRunArtifact(live_root_tests);
+    b.step("test-live-root", "Run private live-root supervisor tests")
+        .dependOn(&run_live_root_tests.step);
+    const live_root_integration_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "live_root.test.linux integration when namespace capabilities are available",
+        },
+    });
+    const run_live_root_integration_tests = b.addRunArtifact(live_root_integration_tests);
+    b.step("test-live-root-integration", "Run the successful live-root namespace integration")
+        .dependOn(&run_live_root_integration_tests.step);
+    const live_root_shared_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "live_root.test.shared outer run never receives the live-root mount",
+        },
+    });
+    const run_live_root_shared_tests = b.addRunArtifact(live_root_shared_tests);
+    b.step("test-live-root-shared", "Run shared-propagation live-root isolation")
+        .dependOn(&run_live_root_shared_tests.step);
 
     const package_database_tests = b.addTest(.{
         .root_module = debz,

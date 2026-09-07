@@ -124,7 +124,7 @@ class SecurityAuditTests(unittest.TestCase):
             source,
         )
 
-    def test_maintainer_script_owns_the_native_child_process_boundary(self) -> None:
+    def test_native_child_process_boundaries_are_explicit(self) -> None:
         sources = {
             path.relative_to(ROOT).as_posix(): path.read_text()
             for path in sorted((ROOT / "src").rglob("*.zig"))
@@ -134,11 +134,30 @@ class SecurityAuditTests(unittest.TestCase):
             for relative, text in sources.items()
             if re.search(r"\blinux\.(?:fork|execve|chroot)\s*\(", text)
         )
-        self.assertEqual(["src/maintainer_script.zig"], owners)
+        self.assertEqual(
+            ["src/live_root.zig", "src/maintainer_script.zig"],
+            owners,
+        )
         runner = sources["src/maintainer_script.zig"]
         self.assertNotIn("std.process.run(", runner)
         self.assertIn('linux.open("/dev/null"', runner)
         self.assertIn('linux.chroot(".")', runner)
+        live_root = sources["src/live_root.zig"]
+        self.assertNotIn("std.process.run(", live_root)
+        self.assertIn("linux.unshare(linux.CLONE.NEWNS)", live_root)
+        self.assertIn("linux.mount(", live_root)
+        self.assertIn(".open_tree,", live_root)
+        self.assertIn(".mount_setattr,", live_root)
+        self.assertIn("linux.move_mount(", live_root)
+        namespace_owners = sorted(
+            relative
+            for relative, text in sources.items()
+            if re.search(
+                r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
+                text,
+            )
+        )
+        self.assertEqual(["src/live_root.zig"], namespace_owners)
 
     def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
         self.assertEqual(
