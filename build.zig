@@ -307,6 +307,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_apt_system_api_tests = b.addRunArtifact(apt_system_api_tests);
 
+    const apt_system_cli_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const apt_system_cli_tests = b.addTest(.{
+        .root_module = apt_system_cli_test_module,
+        .filters = &.{"apt_system_cli.test."},
+    });
+    const run_apt_system_cli_tests = b.addRunArtifact(apt_system_cli_tests);
+
     const apt_system_state_test_module = b.createModule(.{
         .root_source_file = b.path("src/apt_system_state.zig"),
         .target = target,
@@ -324,9 +335,11 @@ pub fn build(b: *std.Build) void {
     );
     apt_system_test_step.dependOn(&run_system_profile_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     test_step.dependOn(&run_system_profile_tests.step);
     test_step.dependOn(&run_apt_system_api_tests.step);
+    test_step.dependOn(&run_apt_system_cli_tests.step);
     test_step.dependOn(&run_apt_system_state_tests.step);
 
     const native_program_tests = b.addTest(.{

@@ -1,9 +1,10 @@
 # Apt-shaped system facade contracts
 
 `debz.apt_system_api` is a separate versioned orchestration contract for a
-future deliberately limited `debz apt` interface. It preserves product API v1
-unchanged. This change defines data, validation, durable state, and evidence
-boundaries only; it does not add CLI parsing, dependency-solver behavior,
+future deliberately limited `debz apt` interface. `debz.apt_system_cli` now
+defines its pure parsing, help, rendering, and confirmation-decision contract.
+It preserves product API v1 and the existing root CLI unchanged. The module is
+not yet wired into `main.zig` and does not execute dependency-solver behavior,
 mount namespaces, live-root views, or production orchestration.
 
 The interface is **apt-shaped, not apt-compatible**. It promises no apt output,
@@ -11,6 +12,55 @@ wording, exit-code convention, option aliases, configuration discovery, or
 dependency-resolution edge behavior. There is no `apt-get` alias and no
 passthrough to apt or dpkg. Unsupported syntax must become a typed usage
 outcome before repository, root, or package mutation.
+
+## Strict CLI grammar
+
+The accepted grammar, and no other apt spelling, is:
+
+```text
+debz apt update
+debz apt install [-y] PACKAGE...
+debz apt remove [-y] PACKAGE...
+debz apt upgrade [-y]
+debz apt list --installed
+```
+
+The two facade-wide options have one canonical placement:
+
+```text
+debz apt [--profile PATH] [--json] COMMAND ...
+```
+
+They may appear in either order, once each, only after `apt` and before the
+command. The default profile is exactly `/etc/debz/default.json`. `-y` is
+accepted only where shown and must precede package operands. Package tokens
+beginning with `-`, duplicate packages, extra or missing operands, duplicate
+singleton options, other list modes, `apt-get`, `--` passthrough, and every
+undocumented apt command or option are typed usage failures.
+
+`debz apt` and `debz apt -h`/`--help` select root apt help. For a recognized
+subcommand, `-h`/`--help` wins over malformed trailing arguments before any
+parsing work that could lead to I/O. Help attached to an unknown command does
+not turn that command into a valid topic.
+
+The parser has bounded argument, package, path, and token limits. It allocates
+nothing, reads no profile or environment state, and performs no filesystem,
+repository, root, mount, terminal, or backend I/O. Accepted commands contain
+the resolved profile path, human/JSON output choice, `assume_yes`, the
+`apt_system_api.Operation`, package slice, and validated canonical request
+digest. No ambient proxy, configuration, credential, or keyring is injected.
+
+Human rendering identifies itself as apt-shaped and not apt-compatible,
+preserves the complete result summary used for plan/change details, and prints
+all profile and operation evidence paths and digests present in
+`apt_system_api.Result`. Typed human failures go to stderr. JSON rendering
+writes exactly one canonical apt-system result document to stdout and never
+prompts.
+
+The exported confirmation seam deliberately performs no terminal calls.
+Non-`-y` mutation requests wait until a plan exists. A human request may then
+ask later integration for TTY confirmation; a JSON request instead requires a
+typed `confirmation_required` result and can never request a prompt.
 
 ## Trusted system profile
 
