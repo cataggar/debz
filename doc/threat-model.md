@@ -38,15 +38,16 @@ opt-in and limited to `/usr/bin/sudo -n --` followed by the exact verified
 policy, architecture, package evidence, and final exact audit all match.
 
 Production parsing, verification, decompression and archive inspection are
-in-process and never invoke a shell. Debz starts child processes at exactly two
-audited boundaries. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb` remain the legacy
+in-process and never invoke a shell. Debz starts child processes only at
+explicitly audited boundaries. `/usr/bin/dpkg` and `/usr/bin/dpkg-deb` remain the legacy
 transition boundary while dpkg still performs root mutation: these fixed-path
 host tools are trusted dependencies; debz supplies explicit argv and a
 replacement environment and bounds captured output and runtime. The native
 transaction engine adds the audited maintainer-script runner
 ([Audited maintainer-script runner](maintainer-script-runner.md),
 `src/maintainer_script.zig`, the only production source permitted to call
-`fork`, `execve` or `chroot`, which `tools/security-audit.py` pins), which
+`execve` or `chroot`; it and the live-root supervisor are the two reviewed
+`fork` owners pinned by `tools/security-audit.py`), which
 executes exactly one validated maintainer script per request: unsafe roots,
 script paths, names, identities, arguments, variables and limits are rejected
 before any process exists; the child enters the selected root with a
@@ -62,6 +63,21 @@ code, so their side effects inside the selected root cannot be generically
 rolled back, a `detach` descendant policy deliberately leaves survivors
 running, and process-group termination cannot reach descendants that already
 left the group.
+
+The future `debz apt` facade has a separate Linux-only live-root boundary
+(`src/live_root.zig`). It never weakens the product backend's host-root denial:
+the backend still receives `allow_host_root = false` and the stable alternate
+install-root spelling `/run/debz/system-root`. A root-owned mode-0700 runtime
+directory, mode-0600 no-follow lock, and mode-0700 empty mountpoint serialize
+setup. The helper pins and revalidates source and mountpoint device, inode,
+mount, owner, and mode identities; makes a new mount namespace recursively
+private before recursively bind-mounting `/`; and rejects replacement or a
+host-visible pre-existing mount. The callback runs as init of a nested PID
+namespace. Its exit destroys all namespace descendants, after which the
+supervisor unmounts and its own exit destroys the private mount namespace.
+Normal errors and catchable interrupts follow the same cleanup path. Abrupt
+machine failure can leave only the checked empty mountpoint in the host
+namespace, never the private bind mount.
 
 ## Security properties
 

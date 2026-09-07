@@ -296,6 +296,7 @@ pub fn build(b: *std.Build) void {
     const root_operation_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
+            "live_root.test.",
             "root_operation.test.",
             "root_operation_completion.test.",
             "root_fs.test.",
@@ -309,7 +310,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-root-mutation", "Run crash-safe root mutation layer tests")
         .dependOn(&run_root_mutation_tests.step);
     const run_root_operation_tests = b.addRunArtifact(root_operation_tests);
-    b.step("test-root-operation", "Run root operation lock and active-record tests")
+    b.step("test-root-operation", "Run live-root, root operation, and root filesystem tests")
         .dependOn(&run_root_operation_tests.step);
 
     const package_database_tests = b.addTest(.{

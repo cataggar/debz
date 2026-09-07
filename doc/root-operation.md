@@ -510,3 +510,10 @@ handed control over, so it resolves as observed mutation.
   native engine will bind program step sequences once it exists.
 - The legacy journal remains the command-level recovery authority. This module
   brackets it conservatively rather than reinterpreting it.
+- Live-host-root operations do not use `/` as their durable install-root
+  spelling. The Linux live-root supervisor projects the source root at the
+  stable `/run/debz/system-root` path before product code starts. That spelling
+  is deliberately constant across invocations because
+  `transaction_recovery.rootIdentity` hashes install-root text. The ordinary
+  root-operation validation, lock, record, and recovery rules then apply
+  unchanged, and production execution keeps `allow_host_root = false`.
