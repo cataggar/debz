@@ -23,6 +23,7 @@ pub const maximum_path_bytes: usize = 4096;
 pub const maximum_repositories: usize = 32;
 pub const maximum_keyrings: usize = 32;
 pub const maximum_foreign_architectures: usize = 16;
+pub const maximum_path_components: usize = 128;
 pub const maximum_trusted_files: usize =
     1 + maximum_repositories * 2 + maximum_keyrings + 1;
 
@@ -77,6 +78,9 @@ pub const Metadata = struct {
     size: u64,
     mode: u32,
     uid: u32,
+    device: u64 = 0,
+    inode: u64 = 0,
+    modified_nanoseconds: i128 = 0,
     modeled: bool = true,
 };
 
@@ -88,7 +92,8 @@ pub const ReadResult = struct {
 /// Injected filesystem seam used by both production loading and unit tests.
 /// Production implementations must open every component and leaf without
 /// following symbolic links. `readFn` returns bytes and metadata from the same
-/// opened file descriptor.
+/// opened file descriptor. Directory inspection is separate so every ancestor
+/// can be proven root-owned and non-writable before the leaf is trusted.
 pub const FileSystem = struct {
     context: *anyopaque,
     readFn: *const fn (
@@ -97,7 +102,7 @@ pub const FileSystem = struct {
         []const u8,
         usize,
     ) anyerror!ReadResult,
-    inspectFn: *const fn (*anyopaque, []const u8) anyerror!Metadata,
+    inspectDirectoryFn: *const fn (*anyopaque, []const u8) anyerror!Metadata,
 
     pub fn read(
         self: FileSystem,
@@ -108,15 +113,37 @@ pub const FileSystem = struct {
         return self.readFn(self.context, allocator, path, maximum_bytes);
     }
 
-    pub fn inspect(self: FileSystem, path: []const u8) !Metadata {
-        return self.inspectFn(self.context, path);
+    pub fn inspectDirectory(self: FileSystem, path: []const u8) !Metadata {
+        return self.inspectDirectoryFn(self.context, path);
     }
+};
+
+pub const TrustedFileRole = enum {
+    repository_source,
+    repository_config,
+    keyring,
+    credential,
+};
+
+/// Stable evidence for a validated trust-bearing file. Content is never
+/// retained here, so credential values cannot leak into profile/state
+/// documents. Consumers reopen through `readVerified`, which rechecks the
+/// complete ancestor chain, descriptor identity, and content digest.
+pub const TrustedFileEvidence = struct {
+    role: TrustedFileRole,
+    path: []const u8,
+    size: u64,
+    identity_sha256: [32]u8,
+    content_sha256: [32]u8,
 };
 
 pub const LoadedProfile = struct {
     profile: Profile,
     profile_path: []const u8,
     profile_sha256: [32]u8,
+    profile_identity_sha256: [32]u8,
+    reference_evidence_sha256: [32]u8,
+    trusted_files: []const TrustedFileEvidence,
     trusted_file_count: usize,
     arena: *std.heap.ArenaAllocator,
     backing_allocator: std.mem.Allocator,
@@ -125,6 +152,32 @@ pub const LoadedProfile = struct {
         self.arena.deinit();
         self.backing_allocator.destroy(self.arena);
         self.* = undefined;
+    }
+
+    pub fn evidenceForPath(
+        self: LoadedProfile,
+        path: []const u8,
+    ) ?TrustedFileEvidence {
+        for (self.trusted_files) |evidence|
+            if (std.mem.eql(u8, evidence.path, path)) return evidence;
+        return null;
+    }
+
+    pub fn readTrustedFile(
+        self: LoadedProfile,
+        allocator: std.mem.Allocator,
+        file_system: FileSystem,
+        path: []const u8,
+        limits: Limits,
+    ) ![]u8 {
+        const evidence = self.evidenceForPath(path) orelse
+            return error.UntrustedReference;
+        return readVerified(
+            allocator,
+            file_system,
+            evidence,
+            limits.maximum_trusted_file_bytes,
+        );
     }
 };
 
@@ -146,13 +199,17 @@ pub const LoadError = error{
     InvalidLimits,
     InvalidProfilePath,
     InvalidTrustedPath,
+    TooManyPathComponents,
+    InvalidAncestor,
     NotRegularFile,
     OwnershipUnavailable,
     NotRootOwned,
     InsecurePermissions,
     EmptyTrustedFile,
     TrustedFileTooLarge,
-    ProfileChangedWhileReading,
+    FileChangedWhileReading,
+    TrustedFileReplaced,
+    TrustedFileContentChanged,
     InvalidDocument,
     UnsupportedSchema,
     TooManyRepositories,
@@ -182,17 +239,16 @@ pub fn load(
     try validateLimits(limits);
     if (!validTrustedPath(profile_path)) return error.InvalidProfilePath;
 
-    const source = try file_system.read(
+    const profile_capture = try captureTrustedFile(
         allocator,
+        file_system,
         profile_path,
+        null,
         limits.maximum_profile_bytes,
     );
-    defer allocator.free(source.bytes);
-    try validateTrustedMetadata(source.metadata, limits.maximum_profile_bytes);
-    if (source.metadata.size != source.bytes.len)
-        return error.ProfileChangedWhileReading;
+    defer allocator.free(profile_capture.bytes);
 
-    var parsed = std.json.parseFromSlice(WireProfile, allocator, source.bytes, .{
+    var parsed = std.json.parseFromSlice(WireProfile, allocator, profile_capture.bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch return error.InvalidDocument;
@@ -224,18 +280,50 @@ pub fn load(
     if (trusted_file_count > limits.maximum_trusted_files)
         return error.TooManyTrustedFiles;
 
+    const captured = try allocator.alloc(TrustedFileEvidence, trusted_file_count - 1);
+    defer allocator.free(captured);
+    var captured_count: usize = 0;
     for (profile.repositories) |repository| {
-        try validateReference(file_system, repository.source_path, limits);
+        captured[captured_count] = try captureEvidence(
+            allocator,
+            file_system,
+            repository.source_path,
+            .repository_source,
+            limits.maximum_trusted_file_bytes,
+        );
+        captured_count += 1;
         if (repository.config_path) |path| {
-            try validateReference(file_system, path, limits);
+            captured[captured_count] = try captureEvidence(
+                allocator,
+                file_system,
+                path,
+                .repository_config,
+                limits.maximum_trusted_file_bytes,
+            );
+            captured_count += 1;
         }
     }
     for (profile.keyring_paths) |path| {
-        try validateReference(file_system, path, limits);
+        captured[captured_count] = try captureEvidence(
+            allocator,
+            file_system,
+            path,
+            .keyring,
+            limits.maximum_trusted_file_bytes,
+        );
+        captured_count += 1;
     }
     if (profile.network.credential_reference) |path| {
-        try validateReference(file_system, path, limits);
+        captured[captured_count] = try captureEvidence(
+            allocator,
+            file_system,
+            path,
+            .credential,
+            limits.maximum_trusted_file_bytes,
+        );
+        captured_count += 1;
     }
+    std.debug.assert(captured_count == captured.len);
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -252,6 +340,11 @@ pub fn load(
     const keyrings = try dupeStrings(owned, profile.keyring_paths);
     const foreign = try dupeStrings(owned, profile.foreign_architectures);
     const profile_path_owned = try owned.dupe(u8, profile_path);
+    const evidence = try owned.alloc(TrustedFileEvidence, captured.len);
+    for (captured, 0..) |item, index| {
+        evidence[index] = item;
+        evidence[index].path = try owned.dupe(u8, item.path);
+    }
     const owned_profile: Profile = .{
         .repositories = repositories,
         .keyring_paths = keyrings,
@@ -272,7 +365,10 @@ pub fn load(
     return .{
         .profile = owned_profile,
         .profile_path = profile_path_owned,
-        .profile_sha256 = sha256(source.bytes),
+        .profile_sha256 = sha256(profile_capture.bytes),
+        .profile_identity_sha256 = identityDigest(profile_capture.metadata),
+        .reference_evidence_sha256 = evidenceDigest(captured),
+        .trusted_files = evidence,
         .trusted_file_count = trusted_file_count,
         .arena = arena,
         .backing_allocator = allocator,
@@ -355,16 +451,110 @@ fn validateProfile(profile: Profile, limits: Limits) LoadError!void {
         if (!validTrustedPath(path)) return error.InvalidTrustedPath;
 }
 
-fn validateReference(
+const Capture = struct {
+    bytes: []u8,
+    metadata: Metadata,
+    evidence: ?TrustedFileEvidence,
+};
+
+fn captureTrustedFile(
+    allocator: std.mem.Allocator,
     file_system: FileSystem,
     path: []const u8,
-    limits: Limits,
-) !void {
+    role: ?TrustedFileRole,
+    maximum_bytes: u64,
+) !Capture {
     if (!validTrustedPath(path)) return error.InvalidTrustedPath;
-    try validateTrustedMetadata(
-        try file_system.inspect(path),
-        limits.maximum_trusted_file_bytes,
+    try validateAncestors(file_system, path);
+    const source = try file_system.read(
+        allocator,
+        path,
+        std.math.cast(usize, maximum_bytes) orelse return error.InvalidLimits,
     );
+    errdefer allocator.free(source.bytes);
+    try validateTrustedMetadata(source.metadata, maximum_bytes);
+    if (source.metadata.size != source.bytes.len)
+        return error.FileChangedWhileReading;
+    return .{
+        .bytes = source.bytes,
+        .metadata = source.metadata,
+        .evidence = if (role) |value| .{
+            .role = value,
+            .path = path,
+            .size = source.metadata.size,
+            .identity_sha256 = identityDigest(source.metadata),
+            .content_sha256 = sha256(source.bytes),
+        } else null,
+    };
+}
+
+fn captureEvidence(
+    allocator: std.mem.Allocator,
+    file_system: FileSystem,
+    path: []const u8,
+    role: TrustedFileRole,
+    maximum_bytes: u64,
+) !TrustedFileEvidence {
+    const capture = try captureTrustedFile(
+        allocator,
+        file_system,
+        path,
+        role,
+        maximum_bytes,
+    );
+    defer {
+        if (role == .credential) @memset(capture.bytes, 0);
+        allocator.free(capture.bytes);
+    }
+    return capture.evidence.?;
+}
+
+pub fn readVerified(
+    allocator: std.mem.Allocator,
+    file_system: FileSystem,
+    evidence: TrustedFileEvidence,
+    maximum_bytes: u64,
+) ![]u8 {
+    const capture = try captureTrustedFile(
+        allocator,
+        file_system,
+        evidence.path,
+        evidence.role,
+        maximum_bytes,
+    );
+    errdefer allocator.free(capture.bytes);
+    const observed = capture.evidence.?;
+    if (observed.size != evidence.size or
+        !std.mem.eql(u8, &observed.identity_sha256, &evidence.identity_sha256))
+        return error.TrustedFileReplaced;
+    if (!std.mem.eql(u8, &observed.content_sha256, &evidence.content_sha256))
+        return error.TrustedFileContentChanged;
+    return capture.bytes;
+}
+
+fn validateAncestors(file_system: FileSystem, path: []const u8) !void {
+    var components: usize = 0;
+    try validateTrustedDirectory(try file_system.inspectDirectory("/"));
+    var index: usize = 1;
+    while (std.mem.indexOfScalarPos(u8, path, index, '/')) |separator| {
+        components += 1;
+        if (components > maximum_path_components)
+            return error.TooManyPathComponents;
+        try validateTrustedDirectory(
+            try file_system.inspectDirectory(path[0..separator]),
+        );
+        index = separator + 1;
+    }
+    components += 1;
+    if (components > maximum_path_components)
+        return error.TooManyPathComponents;
+}
+
+fn validateTrustedDirectory(metadata: Metadata) LoadError!void {
+    if (metadata.kind != .directory) return error.InvalidAncestor;
+    if (!metadata.modeled) return error.OwnershipUnavailable;
+    if (metadata.uid != 0) return error.NotRootOwned;
+    if (metadata.mode & 0o022 != 0) return error.InsecurePermissions;
 }
 
 pub fn validateTrustedMetadata(metadata: Metadata, maximum_bytes: u64) LoadError!void {
@@ -411,6 +601,43 @@ fn sha256(bytes: []const u8) [32]u8 {
     return digest;
 }
 
+fn identityDigest(metadata: Metadata) [32]u8 {
+    var buffer: [256]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    sink.writer.print(
+        "{s}\x00{}\x00{}\x00{}\x00{}\x00{}\x00{}\x00{}",
+        .{
+            @tagName(metadata.kind),
+            metadata.size,
+            metadata.mode,
+            metadata.uid,
+            metadata.device,
+            metadata.inode,
+            metadata.modified_nanoseconds,
+            metadata.modeled,
+        },
+    ) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn evidenceDigest(evidence: []const TrustedFileEvidence) [32]u8 {
+    var buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    sink.writer.print("{}\x00", .{evidence.len}) catch unreachable;
+    for (evidence) |item| {
+        sink.writer.print("{s}\x00{s}\x00{}\x00", .{
+            @tagName(item.role),
+            item.path,
+            item.size,
+        }) catch unreachable;
+        sink.writer.writeAll(&item.identity_sha256) catch unreachable;
+        sink.writer.writeAll(&item.content_sha256) catch unreachable;
+    }
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
 /// Production no-follow filesystem implementation. It reads uid, mode, kind,
 /// and size from the opened descriptor on Linux.
 pub const SystemFileSystem = struct {
@@ -420,7 +647,7 @@ pub const SystemFileSystem = struct {
         return .{
             .context = self,
             .readFn = read,
-            .inspectFn = inspect,
+            .inspectDirectoryFn = inspectDirectory,
         };
     }
 
@@ -431,10 +658,11 @@ pub const SystemFileSystem = struct {
         maximum_bytes: usize,
     ) !ReadResult {
         const self: *SystemFileSystem = @ptrCast(@alignCast(context));
+        if (builtin.os.tag != .linux) return error.OwnershipUnavailable;
         var file = try openAbsoluteFileNoFollow(self.io, path);
         defer file.close(self.io);
         const metadata = try metadataFromOpenFile(self.io, file);
-        if (metadata.size > maximum_bytes) return error.StreamTooLong;
+        try validateTrustedMetadata(metadata, maximum_bytes);
         var reader = file.reader(self.io, &.{});
         const bytes = try reader.interface.allocRemaining(
             allocator,
@@ -443,11 +671,12 @@ pub const SystemFileSystem = struct {
         return .{ .bytes = bytes, .metadata = metadata };
     }
 
-    fn inspect(context: *anyopaque, path: []const u8) !Metadata {
+    fn inspectDirectory(context: *anyopaque, path: []const u8) !Metadata {
         const self: *SystemFileSystem = @ptrCast(@alignCast(context));
-        var file = try openAbsoluteFileNoFollow(self.io, path);
-        defer file.close(self.io);
-        return metadataFromOpenFile(self.io, file);
+        if (builtin.os.tag != .linux) return error.OwnershipUnavailable;
+        var directory = try openAbsoluteDirectoryNoFollow(self.io, path);
+        defer directory.close(self.io);
+        return metadataFromHandle(directory.handle);
     }
 };
 
@@ -467,12 +696,16 @@ fn openAbsoluteFileNoFollow(io: Io, path: []const u8) !File {
     const leaf = std.fs.path.basename(path);
     var parent = try openAbsoluteDirectoryNoFollow(io, parent_path);
     defer parent.close(io);
-    return parent.openFile(io, leaf, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
+    if (builtin.os.tag != .linux) return error.OwnershipUnavailable;
+    const fd = try std.posix.openat(parent.handle, leaf, .{
+        .NONBLOCK = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0);
+    return .{
+        .handle = fd,
+        .flags = .{ .nonblocking = true },
+    };
 }
 
 fn openAbsoluteDirectoryNoFollow(io: Io, path: []const u8) !Io.Dir {
@@ -493,19 +726,26 @@ fn openAbsoluteDirectoryNoFollow(io: Io, path: []const u8) !Io.Dir {
 }
 
 fn metadataFromOpenFile(io: Io, file: File) !Metadata {
+    _ = io;
+    return metadataFromHandle(file.handle);
+}
+
+fn metadataFromHandle(handle: std.posix.fd_t) !Metadata {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const request: linux.STATX = .{
             .TYPE = true,
             .MODE = true,
             .UID = true,
+            .INO = true,
             .SIZE = true,
+            .MTIME = true,
         };
         var raw = std.mem.zeroes(linux.Statx);
         const empty: [*:0]const u8 = "";
         const flags: u32 = linux.AT.EMPTY_PATH | linux.AT.SYMLINK_NOFOLLOW |
             linux.AT.NO_AUTOMOUNT;
-        switch (linux.errno(linux.statx(file.handle, empty, flags, request, &raw))) {
+        switch (linux.errno(linux.statx(handle, empty, flags, request, &raw))) {
             .SUCCESS => {},
             .ACCES => return error.AccessDenied,
             .NOENT => return error.FileNotFound,
@@ -520,20 +760,14 @@ fn metadataFromOpenFile(io: Io, file: File) !Metadata {
             .size = raw.size,
             .mode = @as(u32, raw.mode) & 0o7777,
             .uid = raw.uid,
+            .device = (@as(u64, raw.dev_major) << 32) | raw.dev_minor,
+            .inode = raw.ino,
+            .modified_nanoseconds = @as(i128, raw.mtime.sec) * std.time.ns_per_s +
+                raw.mtime.nsec,
             .modeled = true,
         };
     }
-    const stat = try file.stat(io);
-    return .{
-        .kind = stat.kind,
-        .size = stat.size,
-        .mode = if (builtin.os.tag == .windows)
-            0
-        else
-            @intCast(stat.permissions.toMode() & 0o7777),
-        .uid = 0,
-        .modeled = false,
-    };
+    return error.OwnershipUnavailable;
 }
 
 fn statxKind(mode: u16) File.Kind {
@@ -556,15 +790,27 @@ const FakeFileSystem = struct {
     profile_uid: u32 = 0,
     profile_kind: File.Kind = .file,
     override_path: ?[]const u8 = null,
+    override_bytes: ?[]const u8 = null,
     override_metadata: Metadata = .{
         .kind = .file,
-        .size = 1,
+        .size = 32,
         .mode = 0o644,
+        .uid = 0,
+    },
+    ancestor_override_path: ?[]const u8 = null,
+    ancestor_override_metadata: Metadata = .{
+        .kind = .directory,
+        .size = 0,
+        .mode = 0o755,
         .uid = 0,
     },
 
     fn interface(self: *FakeFileSystem) FileSystem {
-        return .{ .context = self, .readFn = read, .inspectFn = inspect };
+        return .{
+            .context = self,
+            .readFn = read,
+            .inspectDirectoryFn = inspectDirectory,
+        };
     }
 
     fn read(
@@ -574,24 +820,68 @@ const FakeFileSystem = struct {
         _: usize,
     ) !ReadResult {
         const self: *FakeFileSystem = @ptrCast(@alignCast(context));
-        if (!std.mem.eql(u8, path, default_profile_path)) return error.FileNotFound;
+        if (std.mem.eql(u8, path, default_profile_path)) {
+            return .{
+                .bytes = try allocator.dupe(u8, self.profile_source),
+                .metadata = .{
+                    .kind = self.profile_kind,
+                    .size = self.profile_source.len,
+                    .mode = self.profile_mode,
+                    .uid = self.profile_uid,
+                    .device = 1,
+                    .inode = 1,
+                },
+            };
+        }
+        const metadata = if (self.override_path) |expected|
+            if (std.mem.eql(u8, expected, path))
+                self.override_metadata
+            else
+                Metadata{
+                    .kind = .file,
+                    .size = 32,
+                    .mode = 0o644,
+                    .uid = 0,
+                    .device = 1,
+                    .inode = 2,
+                }
+        else
+            Metadata{
+                .kind = .file,
+                .size = 32,
+                .mode = 0o644,
+                .uid = 0,
+                .device = 1,
+                .inode = 2,
+            };
+        const bytes = if (self.override_path != null and
+            std.mem.eql(u8, self.override_path.?, path) and
+            self.override_bytes != null)
+            try allocator.dupe(u8, self.override_bytes.?)
+        else blk: {
+            const value = try allocator.alloc(u8, @intCast(metadata.size));
+            @memset(value, @truncate(std.hash.Wyhash.hash(0, path)));
+            break :blk value;
+        };
         return .{
-            .bytes = try allocator.dupe(u8, self.profile_source),
-            .metadata = .{
-                .kind = self.profile_kind,
-                .size = self.profile_source.len,
-                .mode = self.profile_mode,
-                .uid = self.profile_uid,
-            },
+            .bytes = bytes,
+            .metadata = metadata,
         };
     }
 
-    fn inspect(context: *anyopaque, path: []const u8) !Metadata {
+    fn inspectDirectory(context: *anyopaque, path: []const u8) !Metadata {
         const self: *FakeFileSystem = @ptrCast(@alignCast(context));
-        if (self.override_path) |expected|
+        if (self.ancestor_override_path) |expected|
             if (std.mem.eql(u8, expected, path))
-                return self.override_metadata;
-        return .{ .kind = .file, .size = 32, .mode = 0o644, .uid = 0 };
+                return self.ancestor_override_metadata;
+        return .{
+            .kind = .directory,
+            .size = 0,
+            .mode = 0o755,
+            .uid = 0,
+            .device = 1,
+            .inode = 1,
+        };
     }
 };
 
@@ -702,6 +992,138 @@ test "system_profile.test.trusted files require root ownership and safe modes" {
     try std.testing.expectError(
         error.NotRegularFile,
         load(std.testing.allocator, fake.interface(), default_profile_path, .{}),
+    );
+}
+
+test "system_profile.test.every ancestor is root owned and non-writable" {
+    var fake: FakeFileSystem = .{
+        .profile_source = valid_profile_json,
+        .ancestor_override_path = "/etc",
+        .ancestor_override_metadata = .{
+            .kind = .directory,
+            .size = 0,
+            .mode = 0o775,
+            .uid = 0,
+        },
+    };
+    try std.testing.expectError(
+        error.InsecurePermissions,
+        load(std.testing.allocator, fake.interface(), default_profile_path, .{}),
+    );
+    fake.ancestor_override_metadata = .{
+        .kind = .sym_link,
+        .size = 0,
+        .mode = 0o755,
+        .uid = 0,
+    };
+    try std.testing.expectError(
+        error.InvalidAncestor,
+        load(std.testing.allocator, fake.interface(), default_profile_path, .{}),
+    );
+}
+
+test "system_profile.test.consumption reverifies identity and content" {
+    const source_path = "/etc/debz/debian.sources";
+    var fake: FakeFileSystem = .{ .profile_source = valid_profile_json };
+    var loaded = try load(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), loaded.trusted_files.len);
+    const initial_reference_digest = loaded.reference_evidence_sha256;
+    const verified = try loaded.readTrustedFile(
+        std.testing.allocator,
+        fake.interface(),
+        source_path,
+        .{},
+    );
+    defer std.testing.allocator.free(verified);
+
+    fake.override_path = source_path;
+    fake.override_metadata = .{
+        .kind = .file,
+        .size = 32,
+        .mode = 0o644,
+        .uid = 0,
+        .device = 1,
+        .inode = 2,
+    };
+    fake.override_bytes = "changed-content-changed-content!!";
+    try std.testing.expectError(
+        error.TrustedFileContentChanged,
+        loaded.readTrustedFile(
+            std.testing.allocator,
+            fake.interface(),
+            source_path,
+            .{},
+        ),
+    );
+    fake.override_bytes = null;
+    fake.override_metadata.inode = 3;
+    try std.testing.expectError(
+        error.TrustedFileReplaced,
+        loaded.readTrustedFile(
+            std.testing.allocator,
+            fake.interface(),
+            source_path,
+            .{},
+        ),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &initial_reference_digest,
+        &loaded.reference_evidence_sha256,
+    );
+    fake.override_path = null;
+    fake.ancestor_override_path = "/etc/debz";
+    fake.ancestor_override_metadata = .{
+        .kind = .directory,
+        .size = 0,
+        .mode = 0o777,
+        .uid = 0,
+    };
+    try std.testing.expectError(
+        error.InsecurePermissions,
+        loaded.readTrustedFile(
+            std.testing.allocator,
+            fake.interface(),
+            source_path,
+            .{},
+        ),
+    );
+}
+
+test "system_profile.test.Linux special files are opened nonblocking before rejection" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name: [*:0]const u8 = "input";
+    const result = std.os.linux.mknodat(
+        tmp.dir.handle,
+        name,
+        std.os.linux.S.IFIFO | 0o600,
+        0,
+    );
+    if (std.posix.errno(result) != .SUCCESS) return error.Unexpected;
+    var path_buffer: [maximum_path_bytes]u8 = undefined;
+    const root_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/input",
+        .{path_buffer[0..root_length]},
+    );
+    defer std.testing.allocator.free(path);
+    var system: SystemFileSystem = .{ .io = std.testing.io };
+    try std.testing.expectError(
+        error.NotRegularFile,
+        system.interface().read(
+            std.testing.allocator,
+            path,
+            maximum_profile_bytes,
+        ),
     );
 }
 

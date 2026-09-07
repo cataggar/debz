@@ -38,6 +38,7 @@
         "mutating",
         "verifying",
         "recovery_required",
+        "recovering",
         "completed"
       ]
     },
@@ -93,6 +94,90 @@
     {
       "if": {
         "properties": {
+          "phase": {
+            "enum": [
+              "reserved",
+              "profile_loaded",
+              "authenticated",
+              "planned",
+              "downloaded"
+            ]
+          }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": { "mutation_started": { "const": false } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "enum": [
+              "mutating",
+              "verifying",
+              "recovery_required",
+              "recovering"
+            ]
+          }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": { "mutation_started": { "const": true } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "completed" },
+          "outcome": { "const": "failed_before_mutation" }
+        },
+        "required": ["phase", "outcome"]
+      },
+      "then": {
+        "properties": {
+          "mutation_started": { "const": false },
+          "transaction_result": { "type": "null" },
+          "root_operation_completion": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "failed_after_mutation" },
+          "operation": { "enum": ["install", "remove", "upgrade"] }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "exact_lock": { "$ref": "#/$defs/documentBinding" },
+          "transaction_result": { "$ref": "#/$defs/documentBinding" },
+          "root_operation_completion": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "completed" },
+          "operation": { "enum": ["install", "remove", "upgrade"] },
+          "outcome": {
+            "enum": ["succeeded", "failed_after_mutation", "recovered"]
+          }
+        },
+        "required": ["phase", "operation", "outcome"]
+      },
+      "then": {
+        "properties": { "mutation_started": { "const": true } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "operation": { "enum": ["update", "list_installed"] }
         },
         "required": ["operation"]
@@ -104,6 +189,104 @@
           "transaction_result": { "type": "null" },
           "root_operation_completion": { "type": "null" }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "completed" },
+          "operation": { "enum": ["update", "list_installed"] }
+        },
+        "required": ["phase", "operation"]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "enum": ["succeeded", "failed_before_mutation"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": { "enum": ["install", "remove", "upgrade"] },
+          "phase": {
+            "enum": ["reserved", "profile_loaded", "authenticated"]
+          }
+        },
+        "required": ["operation", "phase"]
+      },
+      "then": {
+        "properties": { "exact_lock": { "type": "null" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": { "enum": ["install", "remove", "upgrade"] },
+          "phase": {
+            "enum": [
+              "planned",
+              "downloaded",
+              "mutating",
+              "verifying",
+              "recovery_required",
+              "recovering"
+            ]
+          }
+        },
+        "required": ["operation", "phase"]
+      },
+      "then": {
+        "properties": {
+          "exact_lock": { "$ref": "#/$defs/documentBinding" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "enum": [
+              "reserved",
+              "profile_loaded",
+              "authenticated",
+              "planned",
+              "downloaded",
+              "mutating"
+            ]
+          }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": { "transaction_result": { "type": "null" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "phase": { "const": "verifying" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "transaction_result": { "$ref": "#/$defs/documentBinding" }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "phase": { "const": "completed" },
+            "outcome": { "enum": ["succeeded", "recovered"] }
+          },
+          "required": ["phase", "outcome"]
+        }
+      },
+      "then": {
+        "properties": { "root_operation_completion": { "type": "null" } }
       }
     },
     {
@@ -132,6 +315,37 @@
       "then": {
         "properties": {
           "diagnostic": { "minLength": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "succeeded" }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "diagnostic": { "maxLength": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "pending" },
+          "phase": {
+            "not": {
+              "enum": ["recovery_required", "recovering"]
+            }
+          }
+        },
+        "required": ["outcome", "phase"]
+      },
+      "then": {
+        "properties": {
+          "diagnostic": { "maxLength": 0 }
         }
       }
     },
@@ -172,10 +386,11 @@
     "profileBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256"],
+      "required": ["path", "sha256", "reference_evidence_sha256"],
       "properties": {
         "path": { "$ref": "#/$defs/absolutePath" },
-        "sha256": { "$ref": "#/$defs/sha256" }
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "reference_evidence_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "documentBinding": {

@@ -116,6 +116,7 @@ pub const Diagnostic = struct {
 pub const ProfileBinding = struct {
     path: []const u8,
     sha256: [32]u8,
+    reference_evidence_sha256: [32]u8,
 };
 
 pub const DocumentBinding = struct {
@@ -218,7 +219,25 @@ pub fn execute(
                 "invalid apt/system request",
         );
     };
-    return backend.execute(allocator, request);
+    var result = try backend.execute(allocator, request);
+    const expected_request_sha256 = try request.digest();
+    if (result.operation != request.operation) {
+        result.deinit();
+        return error.BackendOperationMismatch;
+    }
+    if (!std.mem.eql(
+        u8,
+        &result.request_sha256,
+        &expected_request_sha256,
+    )) {
+        result.deinit();
+        return error.BackendRequestMismatch;
+    }
+    validateCompleteResult(result) catch {
+        result.deinit();
+        return error.InvalidBackendResult;
+    };
+    return result;
 }
 
 pub fn complete(input: Result) !Result {
@@ -272,6 +291,7 @@ pub fn ownResult(
     if (input.profile) |profile| result.profile = .{
         .path = try owned.dupe(u8, profile.path),
         .sha256 = profile.sha256,
+        .reference_evidence_sha256 = profile.reference_evidence_sha256,
     };
     result.evidence = try ownEvidence(owned, input.evidence);
     for (result.diagnostics[0..result.diagnostic_count]) |*diagnostic| {
@@ -312,6 +332,7 @@ pub fn validateResult(result: Result) !void {
     if (result.profile) |profile| {
         try validateProfileBinding(profile);
     }
+
     try validateEvidence(result.evidence);
     if (!result.operation.mutatesRoot() and
         (result.evidence.exact_lock != null or
@@ -340,6 +361,12 @@ pub fn validateResult(result: Result) !void {
     } else {
         if (result.diagnostic_count == 0) return error.MissingDiagnostic;
     }
+}
+
+pub fn validateCompleteResult(result: Result) !void {
+    try validateResult(result);
+    if (!std.mem.eql(u8, &result.digest_sha256, &digestPayload(result)))
+        return error.DigestMismatch;
 }
 
 pub fn validateProfileBinding(profile: ProfileBinding) !void {
@@ -457,6 +484,8 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
         try writeString(writer, profile.path);
         try writer.writeAll(",\"sha256\":");
         try writeHex(writer, &profile.sha256);
+        try writer.writeAll(",\"reference_evidence_sha256\":");
+        try writeHex(writer, &profile.reference_evidence_sha256);
         try writer.writeByte('}');
     } else try writer.writeAll("null");
     try writer.writeAll(",\"outcome\":");
@@ -609,6 +638,7 @@ fn successfulResult(request: Request) !Result {
         .profile = .{
             .path = request.profile_path,
             .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x23),
         },
         .outcome = .success,
         .exit_status = .success,
@@ -668,6 +698,102 @@ test "apt_system_api.test.facade rejects unsupported package shapes before backe
     try std.testing.expectEqual(Outcome.usage, result.outcome);
     try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
     try std.testing.expect(!called);
+}
+
+test "apt_system_api.test.backend results bind the exact submitted request" {
+    const Fake = struct {
+        fn run(context: *anyopaque, _: std.mem.Allocator, _: Request) !Result {
+            const result: *Result = @ptrCast(@alignCast(context));
+            return result.*;
+        }
+    };
+    const request: Request = .{
+        .operation = .install,
+        .packages = &.{"curl"},
+        .assume_yes = true,
+    };
+    const previous: Request = .{
+        .operation = .install,
+        .packages = &.{"wget"},
+        .assume_yes = true,
+    };
+
+    var stale = failure(
+        previous,
+        .planning,
+        .planning_failed,
+        "plan",
+        "stale result",
+    );
+    try std.testing.expectError(
+        error.BackendRequestMismatch,
+        execute(std.testing.allocator, request, .{
+            .context = &stale,
+            .executeFn = Fake.run,
+        }),
+    );
+
+    var wrong_operation = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "plan",
+        "wrong operation",
+    );
+    wrong_operation.operation = .remove;
+    wrong_operation.digest_sha256 = digestPayload(wrong_operation);
+    try std.testing.expectError(
+        error.BackendOperationMismatch,
+        execute(std.testing.allocator, request, .{
+            .context = &wrong_operation,
+            .executeFn = Fake.run,
+        }),
+    );
+
+    var wrong_digest = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "plan",
+        "wrong digest",
+    );
+    wrong_digest.digest_sha256 = @splat(0xaa);
+    try std.testing.expectError(
+        error.InvalidBackendResult,
+        execute(std.testing.allocator, request, .{
+            .context = &wrong_digest,
+            .executeFn = Fake.run,
+        }),
+    );
+
+    var malformed: Result = .{
+        .operation = request.operation,
+        .request_sha256 = try request.digest(),
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "missing profile and evidence",
+    };
+    malformed.digest_sha256 = digestPayload(malformed);
+    try std.testing.expectError(
+        error.InvalidBackendResult,
+        execute(std.testing.allocator, request, .{
+            .context = &malformed,
+            .executeFn = Fake.run,
+        }),
+    );
+
+    var valid_failure = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "plan",
+        "planning failed",
+    );
+    const returned = try execute(std.testing.allocator, request, .{
+        .context = &valid_failure,
+        .executeFn = Fake.run,
+    });
+    try std.testing.expectEqual(Outcome.planning, returned.outcome);
 }
 
 test "apt_system_api.test.success binds profile lock transaction and completion" {

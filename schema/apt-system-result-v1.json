@@ -162,10 +162,11 @@
     "profileBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256"],
+      "required": ["path", "sha256", "reference_evidence_sha256"],
       "properties": {
         "path": { "$ref": "#/$defs/absolutePath" },
-        "sha256": { "$ref": "#/$defs/sha256" }
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "reference_evidence_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "documentBinding": {
