@@ -213,6 +213,8 @@ def audit_production_sources() -> None:
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
+    if "linux.syscall5(\n        .mount_setattr," not in live_root:
+        fail("live-root detached propagation boundary changed")
 
 
 def audit_dependencies() -> None:

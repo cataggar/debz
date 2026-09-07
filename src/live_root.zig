@@ -48,6 +48,7 @@ pub const SetupStage = enum(u8) {
     mountpoint_validation,
     mount_namespace,
     private_propagation,
+    detached_propagation,
     runtime_pin,
     recursive_bind,
     bind_validation,
@@ -392,9 +393,18 @@ fn supervisorMain(
 
     var runtime_tree = openTreeClone(owned.runtime_fd, false) catch |err|
         childFail(report_pipe[1], .runtime_pin, errorNumber(err));
+    makeDetachedPrivate(runtime_tree) catch |err| {
+        closeFd(&runtime_tree);
+        childFail(report_pipe[1], .detached_propagation, errorNumber(err));
+    };
     var source_tree = openTreeClone(owned.source_fd, true) catch |err| {
         closeFd(&runtime_tree);
         childFail(report_pipe[1], .recursive_bind, errorNumber(err));
+    };
+    makeDetachedPrivate(source_tree) catch |err| {
+        closeFd(&source_tree);
+        closeFd(&runtime_tree);
+        childFail(report_pipe[1], .detached_propagation, errorNumber(err));
     };
     if (!parentAlive(control_pipe[0]))
         parentDied(root_mounted, runtime_pinned);
@@ -742,6 +752,30 @@ fn openTreeClone(fd: i32, recursive: bool) Error!i32 {
     return fdResult(raw);
 }
 
+const MountAttribute = extern struct {
+    attr_set: u64 = 0,
+    attr_clear: u64 = 0,
+    propagation: u64 = linux.MS.PRIVATE,
+    user_namespace_fd: u64 = 0,
+};
+
+fn makeDetachedPrivate(fd: i32) Error!void {
+    const attribute: MountAttribute = .{};
+    const raw = linux.syscall5(
+        .mount_setattr,
+        @bitCast(@as(isize, fd)),
+        @intFromPtr(@as([*:0]const u8, "")),
+        linux.AT.EMPTY_PATH | linux.AT.RECURSIVE,
+        @intFromPtr(&attribute),
+        @sizeOf(MountAttribute),
+    );
+    switch (linux.errno(raw)) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.NotPrivileged,
+        else => return error.SystemCallFailed,
+    }
+}
+
 const descriptor_move: linux.MOVE_MOUNT = .{
     .F_SYMLINKS = false,
     .F_AUTOMOUNTS = false,
@@ -1041,7 +1075,9 @@ fn enter(operations: anytype) !void {
     try operations.validateSource();
     try operations.validateUnpinnedPaths();
     try operations.cloneRuntime();
+    try operations.makeRuntimeTreePrivate();
     try operations.cloneSource();
+    try operations.makeSourceTreePrivate();
     try operations.unshareMount();
     try operations.makePrivate();
     try operations.openNamespaceTargets();
@@ -1059,7 +1095,9 @@ const Event = enum {
     lock,
     mountpoint,
     clone_runtime,
+    private_runtime_tree,
     clone_source,
+    private_source_tree,
     unshare,
     private,
     attach_runtime,
@@ -1126,6 +1164,14 @@ const RecordingOperations = struct {
 
     fn cloneSource(self: *RecordingOperations) !void {
         try self.record(.clone_source);
+    }
+
+    fn makeRuntimeTreePrivate(self: *RecordingOperations) !void {
+        try self.record(.private_runtime_tree);
+    }
+
+    fn makeSourceTreePrivate(self: *RecordingOperations) !void {
+        try self.record(.private_source_tree);
     }
 
     fn openNamespaceTargets(self: *RecordingOperations) !void {
@@ -1315,7 +1361,9 @@ test "live_root.test.namespace setup ordering is fixed" {
             .lock,
             .mountpoint,
             .clone_runtime,
+            .private_runtime_tree,
             .clone_source,
+            .private_source_tree,
             .unshare,
             .private,
             .source,
@@ -1338,10 +1386,10 @@ test "live_root.test.namespace setup ordering is fixed" {
 }
 
 test "live_root.test.cleanup covers every setup failure boundary" {
-    for (1..23) |failure| {
+    for (1..25) |failure| {
         var operations: RecordingOperations = .{ .fail_call = failure };
         try std.testing.expectError(error.Injected, enter(&operations));
-        if (failure >= 18) {
+        if (failure >= 20) {
             try std.testing.expectEqual(
                 Event.unmount_root,
                 operations.events[operations.event_count - 2],
@@ -1350,7 +1398,7 @@ test "live_root.test.cleanup covers every setup failure boundary" {
                 Event.unpin_runtime,
                 operations.events[operations.event_count - 1],
             );
-        } else if (failure >= 14) {
+        } else if (failure >= 16) {
             try std.testing.expectEqual(
                 Event.unpin_runtime,
                 operations.events[operations.event_count - 1],
@@ -1397,7 +1445,9 @@ test "live_root.test.root replacement fails before mounting" {
             .lock,
             .mountpoint,
             .clone_runtime,
+            .private_runtime_tree,
             .clone_source,
+            .private_source_tree,
             .unshare,
             .private,
             .source,
@@ -1537,6 +1587,7 @@ fn expectIntegrationAvailable(result: Result) !void {
         .setup_failed => |failure| switch (failure.stage) {
             .mount_namespace,
             .private_propagation,
+            .detached_propagation,
             .runtime_pin,
             .recursive_bind,
             .pid_namespace,
@@ -1634,6 +1685,120 @@ test "live_root.test.parent death terminates workload and releases lock" {
 
     try std.testing.expect(try waitForPipeEof(lifetime[0], 5_000));
     try std.testing.expect(try waitForLockRelease(5_000));
+}
+
+test "live_root.test.shared outer run never receives the live-root mount" {
+    if (builtin.os.tag != .linux or linux.geteuid() != 0) return error.SkipZigTest;
+    const outer_run = try mountInfoState("/run");
+    if (!outer_run.found or !outer_run.shared) return error.SkipZigTest;
+
+    var ready: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer {
+        closeFd(&ready[0]);
+        closeFd(&ready[1]);
+    }
+    var lifetime: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&lifetime, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer {
+        closeFd(&lifetime[0]);
+        closeFd(&lifetime[1]);
+    }
+
+    const runner_raw = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(runner_raw));
+    const runner: i32 = @intCast(runner_raw);
+    if (runner == 0) {
+        closeRaw(ready[0]);
+        closeRaw(lifetime[0]);
+        var context: ParentDeathContext = .{
+            .ready_fd = ready[1],
+            .lifetime_fd = lifetime[1],
+        };
+        const result = run(.{
+            .context = &context,
+            .child = parentDeathChild,
+            .termination_grace_ms = 50,
+        }) catch linux.exit_group(120);
+        switch (result) {
+            .interrupted => linux.exit_group(0),
+            else => linux.exit_group(121),
+        }
+    }
+
+    closeFd(&ready[1]);
+    closeFd(&lifetime[1]);
+    var runner_live = true;
+    defer if (runner_live) {
+        _ = linux.kill(runner, .KILL);
+        _ = reapBlocking(runner) catch null;
+    };
+    try std.testing.expect(try waitForPipeByte(ready[0], 5_000));
+    const leaked = (try mountInfoState(logical_root_path)).found;
+    _ = linux.kill(runner, .TERM);
+    const status = try reapBlocking(runner);
+    runner_live = false;
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try std.testing.expect(try waitForPipeEof(lifetime[0], 5_000));
+    try std.testing.expect(try waitForLockRelease(5_000));
+    try std.testing.expect(!leaked);
+}
+
+const MountInfoState = struct {
+    found: bool = false,
+    shared: bool = false,
+};
+
+fn mountInfoState(path: []const u8) !MountInfoState {
+    const raw_fd = linux.open("/proc/self/mountinfo", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.MountInfoUnavailable;
+    const fd: i32 = @intCast(raw_fd);
+    defer closeRaw(fd);
+
+    var buffer: [256 * 1024]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const raw = linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
+        switch (linux.errno(raw)) {
+            .SUCCESS => {
+                if (raw == 0) break;
+                filled += raw;
+            },
+            .INTR => continue,
+            else => return error.MountInfoUnavailable,
+        }
+    }
+    if (filled == buffer.len) return error.MountInfoTooLarge;
+
+    var lines = std.mem.splitScalar(u8, buffer[0..filled], '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var index: usize = 0;
+        var mountpoint: ?[]const u8 = null;
+        while (fields.next()) |field| : (index += 1) {
+            if (index == 4) {
+                mountpoint = field;
+                break;
+            }
+        }
+        if (mountpoint) |candidate| {
+            if (std.mem.eql(u8, candidate, path)) return .{
+                .found = true,
+                .shared = std.mem.indexOf(u8, line, " shared:") != null,
+            };
+        }
+    }
+    return .{};
 }
 
 fn waitForPipeByte(fd: i32, timeout_ms: u64) !bool {

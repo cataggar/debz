@@ -147,6 +147,7 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn("linux.unshare(linux.CLONE.NEWNS)", live_root)
         self.assertIn("linux.mount(", live_root)
         self.assertIn(".open_tree,", live_root)
+        self.assertIn(".mount_setattr,", live_root)
         self.assertIn("linux.move_mount(", live_root)
         namespace_owners = sorted(
             relative

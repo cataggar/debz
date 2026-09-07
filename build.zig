@@ -319,6 +319,24 @@ pub fn build(b: *std.Build) void {
     const run_live_root_tests = b.addRunArtifact(live_root_tests);
     b.step("test-live-root", "Run private live-root supervisor tests")
         .dependOn(&run_live_root_tests.step);
+    const live_root_integration_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "live_root.test.linux integration when namespace capabilities are available",
+        },
+    });
+    const run_live_root_integration_tests = b.addRunArtifact(live_root_integration_tests);
+    b.step("test-live-root-integration", "Run the successful live-root namespace integration")
+        .dependOn(&run_live_root_integration_tests.step);
+    const live_root_shared_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "live_root.test.shared outer run never receives the live-root mount",
+        },
+    });
+    const run_live_root_shared_tests = b.addRunArtifact(live_root_shared_tests);
+    b.step("test-live-root-shared", "Run shared-propagation live-root isolation")
+        .dependOn(&run_live_root_shared_tests.step);
 
     const package_database_tests = b.addTest(.{
         .root_module = debz,
