@@ -71,8 +71,14 @@
     "optionalSha256": {
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
     },
-    "absolutePath": { "type": "string", "pattern": "^/", "maxLength": 4096 },
+    "absolutePath": {
+      "description": "Canonical absolute path. A JSON string is text, so a byte sequence that is not valid UTF-8 has no spelling here and is refused during preflight with the invalid_encoding diagnostic, before any journal exists.",
+      "type": "string",
+      "pattern": "^/",
+      "maxLength": 4096
+    },
     "relativePath": {
+      "description": "Canonical root-relative path. A JSON string is text, so a byte sequence that is not valid UTF-8 has no spelling here and is refused during preflight with the invalid_encoding diagnostic, before any journal exists.",
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
@@ -103,6 +109,7 @@
         "size": { "type": "integer", "minimum": 0 },
         "content_sha256": { "$ref": "#/$defs/optionalSha256" },
         "link_target": {
+          "description": "Exact bytes the symbolic link holds. Like every string in this document it is text, so a target that is not valid UTF-8 is refused during preflight, whether the caller supplied it or the root already held it.",
           "oneOf": [
             { "type": "null" },
             { "type": "string", "minLength": 1, "maxLength": 4095 }

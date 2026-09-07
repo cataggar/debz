@@ -90,6 +90,7 @@ Preflight refuses, before anything can change:
 | Diagnostic | Refusal |
 | --- | --- |
 | `invalid_path` | absolute, traversing, empty, control-byte, over-long, or over-deep path |
+| `invalid_encoding` | a path, source, or link target that is not valid UTF-8 |
 | `path_collision` | a target or source inside `var/lib/debz` |
 | `symbolic_link_component` | any prefix component that is a symbolic link |
 | `unsupported_kind` | a device, socket, FIFO, or unknown kind on a target |
@@ -103,6 +104,46 @@ Preflight refuses, before anything can change:
 | `capacity_exceeded` / `numeric_overflow` / `step_limit` | bounded resource accounting |
 | `content_digest_mismatch` | content that does not hash to the digest the caller authorized |
 | `metadata_unsupported` | a mode change on a symbolic link, a mode outside `07777`, or an in-place ownership change on a non-directory carrying `security.capability` |
+
+### Text the journal can carry
+
+The journal is a canonical JSON document, and a JSON string carries text, not
+bytes: `std.json` refuses a string whose bytes are not valid UTF-8, and so does
+this module's decoder, which reads every document back through it. Text that is
+not valid UTF-8 therefore has no journal spelling at all.
+
+Nothing below this layer supplies that guarantee. The path grammar in
+`root_fs.Path` bounds a path's shape — no absolute, traversing, empty,
+control-byte, over-long, or over-deep spelling — but every byte at or above
+`0x80` passes it, the payload grammar accepts the same bytes, and a symbolic
+link the root already holds may point at any of them, because a Debian archive
+and a POSIX filesystem both treat a name as an opaque byte string. Publishing
+one would write a journal that the very next read — `prepare`'s own decode, or
+recovery's after a crash — refuses as corrupt: a transaction whose workspace is
+already durable and whose recovery evidence cannot be parsed.
+
+So every string the document will carry is proven encodable before anything
+durable exists, and the refusal is `invalid_encoding`, a preflight diagnostic
+naming the exact input, never a decode failure discovered after publication.
+Preflight proves each target path, each `copy_file` and `publish_hard_link`
+source, each symbolic-link literal, and the target of every symbolic link it
+observes on the root. `prepare` proves the assembled document once more —
+install root, exact-lock schema, and every step string of the plan it was
+handed — before the attempt record advances and before the journal is written,
+and reports the same typed diagnostic through `Options.refusal`. The store
+proves it once more at the write itself, so no path into it can publish a
+document the decoder would refuse. A refused call leaves no journal, no
+progress log, and no workspace entry.
+
+The strings that reach the document from elsewhere are already proven by their
+own validators: `install_root` by `absolute_path.canonical`, which validates
+UTF-8; the exact-lock schema by `root_operation.create`, which refuses a
+binding whose schema is empty, over-long, or not UTF-8; database paths by
+`package_database.validRelativePath`; and staging and backup names, which are
+derived from a step index and are always eight hexadecimal digits. The
+adapters do not widen this: a database plan path, a database directory, an
+archive path, an archive link literal, and an archive hard-link target are all
+lowered into ordinary intents and meet the same refusal.
 
 A directory's modification time is derived from its own entries, so a later
 step in the same plan would invalidate it as soon as it published a child. It
@@ -594,6 +635,21 @@ identity without rebuilding the chain. The checked-in fuzz corpus carries a
 complete log of the new format and is compared byte for byte against the
 canonical encoding, so a format change is a failing test rather than a corpus
 that quietly stops parsing.
+
+Text the document cannot carry is proven adversarially for every field kind
+and every way UTF-8 can be malformed: an isolated continuation byte, overlong
+two- and three-byte encodings, both ends of the surrogate range, the first code
+point above U+10FFFF, a lead byte no code point uses, and a sequence truncated
+at every width. Each one is driven through a target path of every intent kind,
+a copy source, a hard link source, a symbolic-link literal, a symbolic link the
+root itself holds, a lowered database path, a caller-chosen database directory,
+an archive path, an archive link literal, an archive hard-link target, an
+exact-lock schema, and a plan step assembled outside preflight, and each must
+be `invalid_encoding` with no journal, no log, and no workspace entry left
+behind. Valid non-ASCII text at every sequence width must do the opposite: plan,
+publish, round trip through the canonical document byte for byte, and resolve
+to an entry under the root. The checked-in journal corpus is spelled the same
+way, so a mutated seed lands inside a multibyte sequence.
 
 The suite also covers disk-full, short-write, `fsync`, `rename`, `unlink`, and
 `link` failures, external modification and symbolic-link swaps between

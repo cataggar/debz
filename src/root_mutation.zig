@@ -140,6 +140,7 @@ pub const Code = enum {
     // Preflight refusals. Every one of these happens before a target byte
     // can change.
     invalid_path,
+    invalid_encoding,
     unsupported_kind,
     path_collision,
     path_alias,
@@ -981,6 +982,79 @@ fn writeOptionalHex(writer: *Io.Writer, value: ?[32]u8) !void {
     if (value) |bytes| try writeHexString(writer, &bytes) else try writer.writeAll("null");
 }
 
+/// A canonical journal is a JSON document, and a JSON string carries text, not
+/// bytes: `std.json` refuses a string whose bytes are not valid UTF-8, and so
+/// does this module's decoder, which reads the document back through it. Text
+/// that is not valid UTF-8 therefore has no journal spelling at all.
+///
+/// Nothing below this layer guarantees that encoding. `root_fs.Path` bounds a
+/// path's grammar - no absolute, traversing, empty, control-byte, over-long,
+/// or over-deep spelling - but every byte at or above `0x80` passes it, and
+/// the payload and archive layers above accept the same bytes, because a
+/// Debian archive may legitimately carry a path the kernel treats as an opaque
+/// byte string. Publishing one would write a journal that the very next read -
+/// `prepare`'s own decode, or recovery's after a crash - refuses as corrupt,
+/// which is a transaction whose workspace is already durable and whose
+/// recovery evidence is unreadable. Every such string is proven encodable
+/// before anything durable exists, and the refusal is a typed preflight
+/// diagnostic rather than a decode failure discovered after publication.
+pub fn encodableText(text: []const u8) bool {
+    return std.unicode.utf8ValidateSlice(text);
+}
+
+/// The first string a journal would have to carry that canonical JSON cannot
+/// encode, as the exact refusal, or `null` when the whole document is
+/// encodable. Preflight proves every intent-derived string, and `prepare`
+/// proves the assembled document - evidence included - before the attempt
+/// record or the journal is written.
+pub fn unencodableText(
+    install_root: []const u8,
+    evidence: Evidence,
+    steps: []const Step,
+) ?Diagnostic {
+    if (!encodableText(install_root))
+        return .{ .surface = .preflight, .code = .invalid_encoding, .path = install_root };
+    if (evidence.exact_lock) |binding| {
+        if (!encodableText(binding.schema)) return .{
+            .surface = .preflight,
+            .code = .invalid_encoding,
+            .path = binding.schema,
+        };
+    }
+    for (steps, 0..) |step, index| {
+        if (unencodableStep(step, @intCast(index))) |diagnostic| return diagnostic;
+    }
+    return null;
+}
+
+fn unencodableStep(step: Step, index: u32) ?Diagnostic {
+    const texts = [_]?[]const u8{
+        step.path,
+        step.source,
+        step.staging_entry,
+        step.backup_entry,
+        linkTarget(step.expected),
+        linkTarget(step.desired),
+    };
+    for (texts) |candidate| {
+        const text = candidate orelse continue;
+        if (!encodableText(text)) return .{
+            .surface = .preflight,
+            .code = .invalid_encoding,
+            .step = index,
+            .path = text,
+        };
+    }
+    return null;
+}
+
+fn linkTarget(value: Expectation) ?[]const u8 {
+    return switch (value) {
+        .absent => null,
+        .present => |state| state.link_target,
+    };
+}
+
 /// Stable digest over the ordered intents alone. It lets a caller bind a plan
 /// to provenance without serializing the whole journal.
 pub fn stepsDigest(steps: []const Step) [32]u8 {
@@ -1648,6 +1722,12 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         journal: Journal,
     ) Error!void {
+        // The last gate before the document becomes durable. Preflight and
+        // `prepare` have both proven this already; proving it here as well
+        // means no path into the store can publish a journal that this
+        // module's own decoder would refuse.
+        if (unencodableText(journal.install_root, journal.evidence, journal.steps) != null)
+            return error.Rejected;
         const bytes = try journal.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > self.limits.max_document_bytes) return error.DocumentTooLarge;
@@ -1991,6 +2071,7 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
     const text = intent.path();
     const path = root_fs.Path.init(text) catch
         return builder.fail(.preflight, .invalid_path, text);
+    try requireEncodable(builder, path.text);
     if (withinNamespace(path.text)) return builder.fail(.preflight, .path_collision, text);
 
     const index: u32 = @intCast(builder.steps.items.len);
@@ -2113,6 +2194,13 @@ fn recordAlias(builder: *Builder, model_index: u32, path: []const u8) BuildError
     found.value_ptr.* = model_index;
 }
 
+/// Every string a step will carry into the journal is proven encodable at the
+/// moment it enters the plan, so a refusal is a preflight diagnostic naming
+/// the exact caller input rather than a corrupt document discovered later.
+fn requireEncodable(builder: *Builder, text: []const u8) BuildError!void {
+    if (!encodableText(text)) return builder.fail(.preflight, .invalid_encoding, text);
+}
+
 /// One no-follow observation of a target path, translated into either an
 /// exact state or an explicit absence. Every unsupported kind, symbolic-link
 /// component, and cross-device target fails here.
@@ -2209,10 +2297,17 @@ fn digestFile(builder: *Builder, path: root_fs.Path) BuildError![32]u8 {
     return hash.finalResult();
 }
 
+/// An existing symbolic link's target is recorded as this path's expected old
+/// state, so the root itself can supply text the journal has to carry. A
+/// target the kernel accepted but canonical JSON cannot encode is refused
+/// here, with the link's own path, rather than published inside a document
+/// recovery could not read back.
 fn readLink(builder: *Builder, path: root_fs.Path) BuildError![]const u8 {
     var buffer: [maximum_link_target_bytes]u8 = undefined;
     const target = builder.root.readSymbolicLink(path, &buffer) catch
         return builder.fail(.preflight, .io_failed, path.text);
+    if (!encodableText(target))
+        return builder.fail(.preflight, .invalid_encoding, path.text);
     return builder.arena.dupe(u8, target);
 }
 
@@ -2278,6 +2373,7 @@ fn buildStep(
             try requireOverwrite(builder, expected, value.overwrite, path.text);
             const source = root_fs.Path.init(value.source) catch
                 return builder.fail(.preflight, .invalid_path, value.source);
+            try requireEncodable(builder, source.text);
             const source_state = try resolveSource(builder, source.text, requires);
             const present = switch (source_state) {
                 .absent => return builder.fail(.preflight, .target_absent, value.source),
@@ -2319,6 +2415,7 @@ fn buildStep(
                 if (byte < 0x20 or byte == 0x7f)
                     return builder.fail(.preflight, .invalid_path, value.target);
             }
+            try requireEncodable(builder, value.target);
             step.desired = .{
                 .present = .{
                     .kind = .symlink,
@@ -2346,6 +2443,7 @@ fn buildStep(
             try requireOverwrite(builder, expected, value.overwrite, path.text);
             const source = root_fs.Path.init(value.source) catch
                 return builder.fail(.preflight, .invalid_path, value.source);
+            try requireEncodable(builder, source.text);
             if (std.mem.eql(u8, source.text, path.text))
                 return builder.fail(.preflight, .hard_link_ambiguous, value.source);
             const source_state = try resolveSource(builder, source.text, requires);
@@ -2608,6 +2706,10 @@ pub const Options = struct {
     cancellation: transaction_executor.Cancellation = transaction_executor.Cancellation.never(),
     deadline: ?transaction_executor.Deadline = null,
     limits: Limits = .{},
+    /// Receives the typed refusal when `prepare` fails closed before anything
+    /// durable exists. The diagnostic borrows caller input, never the plan
+    /// arena, so it outlives the refused call.
+    refusal: ?*?Diagnostic = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -2912,6 +3014,18 @@ pub fn prepare(
         var owned = existing;
         owned.deinit();
         return error.JournalPresent;
+    }
+
+    // Preflight proved every string its own intents produced. The evidence and
+    // the install root arrive here instead, and a plan is a public value, so
+    // the assembled document is proven encodable once more before the attempt
+    // record advances and before the journal is written. A refusal here is a
+    // typed diagnostic and leaves no durable state at all; a document that is
+    // written first and refused on read back would leave a workspace whose
+    // recovery evidence cannot be decoded.
+    if (unencodableText(attempt.record().install_root, evidence, plan.steps)) |diagnostic| {
+        if (options.refusal) |slot| slot.* = diagnostic;
+        return error.Rejected;
     }
 
     // The coordinator learns the evidence before the journal binds itself to
@@ -4809,6 +4923,15 @@ pub fn archiveFileIntent(
 pub fn fuzzOne(allocator: std.mem.Allocator, bytes: []const u8) void {
     var decoded = decode(allocator, bytes, maximum_document_bytes) catch return;
     defer decoded.deinit();
+    // A decoded document is text, so every string it carries must be text the
+    // encoder can write back. The decoder inherits that from JSON itself; the
+    // assertion states it so a future decoder that stopped parsing through
+    // JSON could not silently accept a journal it cannot reproduce.
+    std.debug.assert(unencodableText(
+        decoded.journal.install_root,
+        decoded.journal.evidence,
+        decoded.journal.steps,
+    ) == null);
     const canonical = decoded.journal.canonicalJson(allocator) catch return;
     defer allocator.free(canonical);
     std.debug.assert(std.mem.eql(u8, canonical, bytes));
@@ -4884,6 +5007,58 @@ pub fn fuzzJournal() Journal {
     };
     journal.digest_sha256 = journalDigest(journal);
     return journal;
+}
+
+/// A symbolic-link step whose path, link target, and install root are valid
+/// non-ASCII UTF-8. The journal document corpus is built from it, so a
+/// mutation of the checked-in seed lands inside a multibyte sequence and
+/// drives the decoder across exactly the boundary this module refuses to
+/// publish malformed: text that is not valid UTF-8 has no JSON spelling, and
+/// a decoder that accepted one would accept a journal it cannot reproduce.
+const fuzz_text_steps = [_]Step{.{
+    .index = 0,
+    .kind = .publish_symlink,
+    .path = "etc/caf\u{e9}/\u{65e5}\u{672c}",
+    .requires = &.{},
+    .overwrite = .replace,
+    .removal = .require_present,
+    .expected = .absent,
+    .desired = .{ .present = .{
+        .kind = .symlink,
+        .metadata = .{ .mode = 0o777, .uid = 0, .gid = 0, .modified_nanoseconds = 0 },
+        .link_target = "\u{1f680}",
+    } },
+    .staging_entry = "00000000",
+}};
+
+fn fuzzTextJournal() Journal {
+    var journal: Journal = .{
+        .attempt_id = @splat(0x22),
+        .attempt_generation = 1,
+        .attempt_digest_sha256 = @splat(0x33),
+        .install_root = "/\u{e9}",
+        .root_identity_sha256 = @splat(0x44),
+        .evidence = .{ .exact_lock = .{
+            .schema = "https://debz.dev/schema/exact-closure-lock-v2",
+            .version = 2,
+            .digest_sha256 = @splat(0x66),
+        } },
+        .device = 0x55,
+        .staging_bytes = 0,
+        .budget_bytes = 4096,
+        .steps = &fuzz_text_steps,
+        .steps_sha256 = stepsDigest(&fuzz_text_steps),
+        .digest_sha256 = @splat(0),
+    };
+    journal.digest_sha256 = journalDigest(journal);
+    return journal;
+}
+
+/// The exact canonical document the journal corpus seed holds. Regenerate the
+/// seed from this whenever the document format changes; a corpus entry that no
+/// longer decodes fuzzes nothing.
+pub fn fuzzSeedDocument(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    return fuzzTextJournal().canonicalJson(allocator);
 }
 
 /// One boundary of the corpus seed. A journal-scoped record names no step and
@@ -6024,6 +6199,395 @@ test "root_mutation.test.preflight refuses every unsafe or ambiguous intent" {
         .limits = .{ .max_steps = 1 },
     });
     try testing.expectEqual(Code.step_limit, too_many.diagnostic.code);
+}
+
+/// Every way a byte sequence can fail to be UTF-8, one case per class. A JSON
+/// string cannot carry any of them, so a journal that recorded one could never
+/// be decoded again, and the whole class has to be refused before publication
+/// rather than after it.
+const unencodable_texts = [_][]const u8{
+    // An isolated continuation byte, which no sequence may start with.
+    "\x80",
+    // Overlong two- and three-byte encodings of `/` and of `.`, the shape a
+    // decoder that normalized before validating would turn into a separator.
+    "\xc0\xaf",
+    "\xe0\x80\xae",
+    // Both ends of the UTF-16 surrogate range, which UTF-8 never encodes.
+    "\xed\xa0\x80",
+    "\xed\xbf\xbf",
+    // The first code point above U+10FFFF and a lead byte no code point uses.
+    "\xf4\x90\x80\x80",
+    "\xf5\x80\x80\x80",
+    // Multibyte sequences truncated at every width.
+    "\xc3",
+    "\xe2\x82",
+    "\xf0\x9f\x92",
+    // A byte that is not part of the encoding at all.
+    "\xfe",
+};
+
+/// Text that is valid UTF-8 and not ASCII, at every sequence width. A path or
+/// link target spelled this way is ordinary text: it encodes, decodes, and
+/// names an entry under the root exactly like an ASCII one.
+const non_ascii_texts = [_][]const u8{ "café", "日本語", "🚀" };
+
+/// A refusal leaves nothing durable behind: no journal, no write-ahead log,
+/// and no staged or backed-up entry. The private workspace directories
+/// themselves are created by preflight before it inspects anything, so they
+/// may exist, but they must be empty.
+fn expectNoDurableState(root: root_fs.Root) !void {
+    try expectAbsent(root, journal_path);
+    try expectAbsent(root, progress_path);
+    try expectWorkspaceEmpty(root);
+}
+
+/// Modeled archive entries whose text upstream validation permits: a tar path
+/// and a link literal are byte strings, and every byte at or above `0x80`
+/// passes the payload grammar.
+fn archiveEntry(path: []const u8, kind: archive_application.FileKind) archive_application.File {
+    return .{
+        .path = path,
+        .kind = kind,
+        .mode = if (kind == .directory) 0o755 else 0o644,
+        .uid = currentUid(),
+        .gid = currentGid(),
+        .owner_name = null,
+        .group_name = null,
+        .mtime = 0,
+        .size = 0,
+        .content = null,
+        .sha256 = null,
+        .md5 = null,
+        .link_target = null,
+        .link_literal = null,
+        .conffile = false,
+        .entry_index = 0,
+    };
+}
+
+fn archiveDirectory(path: []const u8) archive_application.File {
+    return archiveEntry(path, .directory);
+}
+
+fn archiveSymlink(path: []const u8, literal: []const u8) archive_application.File {
+    var file = archiveEntry(path, .symlink);
+    file.mode = 0o777;
+    file.link_literal = literal;
+    file.link_target = path;
+    return file;
+}
+
+fn archiveHardLink(path: []const u8, target: []const u8) archive_application.File {
+    var file = archiveEntry(path, .hardlink);
+    file.link_target = target;
+    return file;
+}
+
+test "root_mutation.test.preflight refuses text a canonical journal cannot encode" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+    try writeExisting(root, "etc/source", "shared\n");
+
+    var buffer: [64]u8 = undefined;
+    for (unencodable_texts) |text| {
+        const leaf = try std.fmt.bufPrint(&buffer, "etc/{s}", .{text});
+        // The target path of every intent kind. The path grammar accepts all
+        // of these - none of them is a control byte, a separator, or a
+        // traversal - so only the encoding rule refuses them.
+        try testing.expect(root_fs.Path.init(leaf) catch null != null);
+        try expectDiagnostic(&fixture, &.{fileIntent(leaf, "x")}, .invalid_encoding);
+        try expectDiagnostic(&fixture, &.{directoryIntent(leaf)}, .invalid_encoding);
+        try expectDiagnostic(&fixture, &.{symlinkIntent(leaf, "keep")}, .invalid_encoding);
+        try expectDiagnostic(
+            &fixture,
+            &.{.{ .metadata = .{ .path = leaf, .mode = 0o600 } }},
+            .invalid_encoding,
+        );
+        try expectDiagnostic(&fixture, &.{.{ .remove = .{ .path = leaf } }}, .invalid_encoding);
+        try expectDiagnostic(
+            &fixture,
+            &.{.{ .remove_directory = .{ .path = leaf } }},
+            .invalid_encoding,
+        );
+        // A copy source and a hard link source are recorded in the journal
+        // exactly like a target.
+        try expectDiagnostic(&fixture, &.{.{ .copy = .{
+            .path = "etc/copy",
+            .source = leaf,
+            .source_sha256 = @splat(0),
+            .uid = currentUid(),
+            .gid = currentGid(),
+        } }}, .invalid_encoding);
+        try expectDiagnostic(
+            &fixture,
+            &.{.{ .hard_link = .{ .path = "etc/link", .source = leaf } }},
+            .invalid_encoding,
+        );
+        // A symbolic link's literal target is the state the step publishes.
+        try expectDiagnostic(&fixture, &.{symlinkIntent("etc/link", text)}, .invalid_encoding);
+        // A refused plan never reaches the journal, the log, or the workspace.
+        try expectNoDurableState(root);
+    }
+}
+
+test "root_mutation.test.preflight refuses a link target the root itself cannot encode" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const link = try root_fs.Path.init("etc/observed");
+    for (unencodable_texts) |text| {
+        root.removeFile(link) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        root.createSymbolicLink(link, text) catch |err| switch (err) {
+            // A filesystem that refuses the bytes outright has already failed
+            // closed for this case.
+            error.InvalidUtf8, error.BadPathName => continue,
+            else => return err,
+        };
+        // The link's target becomes this path's expected old state, so a
+        // target the kernel accepted but the journal cannot carry is refused
+        // whichever way the plan touches the path.
+        try expectDiagnostic(&fixture, &.{fileIntent(link.text, "x")}, .invalid_encoding);
+        try expectDiagnostic(
+            &fixture,
+            &.{.{ .remove = .{ .path = link.text } }},
+            .invalid_encoding,
+        );
+        try expectDiagnostic(
+            &fixture,
+            &.{.{ .metadata = .{ .path = link.text, .uid = currentUid() } }},
+            .invalid_encoding,
+        );
+        // A source is observed exactly like a target.
+        try expectDiagnostic(&fixture, &.{.{ .hard_link = .{
+            .path = "etc/link",
+            .source = link.text,
+        } }}, .invalid_encoding);
+        try expectNoDurableState(root);
+    }
+}
+
+test "root_mutation.test.database and archive adapters cannot smuggle unencodable text" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    // The database plan's own compiler validates its paths, so this forged
+    // plan states what the mutation layer must refuse on its own: an info
+    // path and a database directory that upstream validation did not prove.
+    var forged: package_database_changes.Plan = .{
+        .base_generation = .{ .sha256 = @splat(0), .file_count = 0, .total_bytes = 0 },
+        .base_status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .resulting_status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .writes = &.{
+            .{ .path = "status-old", .kind = .copy, .source = "status" },
+            .{ .path = "info/demo.\xed\xa0\x80list", .kind = .replace, .bytes = "" },
+            .{ .path = "status", .kind = .replace, .bytes = "" },
+        },
+        .digest = @splat(0),
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    var lowered = switch (try lowerDatabasePlan(testing.allocator, forged, .{
+        .uid = currentUid(),
+        .gid = currentGid(),
+    })) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .intents => |value| value,
+    };
+    defer lowered.deinit();
+    try expectDiagnostic(&fixture, lowered.intents[1..2], .invalid_encoding);
+
+    // A database directory the caller chose is joined onto every path, so it
+    // is refused the same way.
+    forged.writes = &.{
+        .{ .path = "status-old", .kind = .copy, .source = "status" },
+        .{ .path = "status", .kind = .replace, .bytes = "" },
+    };
+    var rooted = switch (try lowerDatabasePlan(testing.allocator, forged, .{
+        .directory = "var/lib/\xc0\xafdpkg",
+        .uid = currentUid(),
+        .gid = currentGid(),
+    })) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .intents => |value| value,
+    };
+    defer rooted.deinit();
+    try expectDiagnostic(&fixture, rooted.intents, .invalid_encoding);
+
+    // A Debian archive may carry any non-control byte in a path, a symbolic
+    // link literal, or a hard link target, so the archive adapter's intents
+    // are refused at the same boundary.
+    // Only a regular file's bytes are read out of the model, and none of
+    // these entries is one, so the adapter never touches it.
+    const model: archive_application.Model = undefined;
+    const binding: ArtifactBinding = .{ .index = 0, .application_sha256 = @splat(0) };
+    const smuggled = try archiveFileIntent(
+        "usr/share/demo/\xf5\x80\x80\x80",
+        &model,
+        archiveDirectory("usr/share/demo/\xf5\x80\x80\x80"),
+        binding,
+    );
+    try expectDiagnostic(&fixture, &.{smuggled}, .invalid_encoding);
+
+    const literal = try archiveFileIntent(
+        "usr/share/demo/link",
+        &model,
+        archiveSymlink("usr/share/demo/link", "\xe2\x82"),
+        binding,
+    );
+    try expectDiagnostic(&fixture, &.{literal}, .invalid_encoding);
+
+    const hardlink = try archiveFileIntent(
+        "usr/share/demo/clone",
+        &model,
+        archiveHardLink("usr/share/demo/clone", "usr/share/demo/\x80"),
+        binding,
+    );
+    try expectDiagnostic(&fixture, &.{hardlink}, .invalid_encoding);
+    try expectNoDurableState(root);
+}
+
+test "root_mutation.test.prepare refuses evidence a canonical journal cannot encode" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    var plan = try planFor(&fixture, &.{fileIntent("etc/keep", "new\n")});
+    defer plan.deinit();
+
+    for (unencodable_texts) |text| {
+        var refusal: ?Diagnostic = null;
+        try testing.expectError(error.Rejected, prepare(
+            testing.allocator,
+            root,
+            &fixture.attempt,
+            &plan,
+            .{ .exact_lock = .{
+                .schema = text,
+                .version = 1,
+                .digest_sha256 = @splat(0x11),
+            } },
+            .{ .refusal = &refusal },
+        ));
+        // The refusal is the typed preflight diagnostic, produced before the
+        // attempt record advanced and before the journal existed, not a
+        // decode failure discovered after publication.
+        try testing.expectEqual(Surface.preflight, refusal.?.surface);
+        try testing.expectEqual(Code.invalid_encoding, refusal.?.code);
+        try testing.expectEqualStrings(text, refusal.?.path);
+        try expectNoDurableState(root);
+    }
+
+    // A step whose text was never proven - a plan value a caller assembled
+    // rather than one preflight produced - is refused at the same boundary.
+    var forged = plan;
+    var steps = try testing.allocator.dupe(Step, plan.steps);
+    defer testing.allocator.free(steps);
+    steps[0].path = "etc/\xed\xa0\x80";
+    forged.steps = steps;
+    var refusal: ?Diagnostic = null;
+    try testing.expectError(error.Rejected, prepare(
+        testing.allocator,
+        root,
+        &fixture.attempt,
+        &forged,
+        .{},
+        .{ .refusal = &refusal },
+    ));
+    try testing.expectEqual(Code.invalid_encoding, refusal.?.code);
+    try testing.expectEqual(@as(?u32, 0), refusal.?.step);
+    try expectNoDurableState(root);
+
+    // The store is the last gate: a document assembled outside preflight and
+    // handed straight to the writer is refused at the write, not published and
+    // then refused on read back.
+    const store: Store = .{ .root = root };
+    var hostile = fuzzJournal();
+    hostile.install_root = "/\xed\xa0\x80";
+    try testing.expectError(error.Rejected, store.writeJournal(testing.allocator, hostile));
+    try expectNoDurableState(root);
+}
+
+test "root_mutation.test.valid non-ASCII text publishes, decodes, and stays rooted" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    var buffer: [64]u8 = undefined;
+    var intents: std.ArrayList(Intent) = .empty;
+    defer intents.deinit(testing.allocator);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |name| testing.allocator.free(name);
+        names.deinit(testing.allocator);
+    }
+    try root.createDirectory(
+        try root_fs.Path.init("etc"),
+        root_fs.default_directory_permissions,
+    );
+    for (non_ascii_texts) |text| {
+        const leaf = try std.fmt.bufPrint(&buffer, "etc/{s}", .{text});
+        // A filesystem that cannot hold these exact bytes in a name is not
+        // what this test is about, so the name itself is what probes it.
+        const probe = try root_fs.Path.init(leaf);
+        root.publishFile(probe, "", .{}) catch return error.SkipZigTest;
+        try root.removeFile(probe);
+        const owned = try testing.allocator.dupe(u8, leaf);
+        try names.append(testing.allocator, owned);
+        try intents.append(testing.allocator, fileIntent(owned, "text\n"));
+        const link = try std.fmt.bufPrint(&buffer, "etc/link-{s}", .{text});
+        const owned_link = try testing.allocator.dupe(u8, link);
+        try names.append(testing.allocator, owned_link);
+        // The link target is the leaf name alone, so a published link resolves
+        // beside the file it names and nowhere else.
+        try intents.append(testing.allocator, symlinkIntent(owned_link, owned["etc/".len..]));
+    }
+
+    var plan = try planFor(&fixture, intents.items);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    // The document round trips through its own canonical encoding with the
+    // exact bytes intact: valid UTF-8 is ordinary text here.
+    const bytes = try engine.journal().canonicalJson(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var decoded = try decode(testing.allocator, bytes, maximum_document_bytes);
+    defer decoded.deinit();
+    for (decoded.journal.steps, engine.journal().steps) |left, right|
+        try testing.expectEqualStrings(right.path, left.path);
+
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    for (non_ascii_texts) |text| {
+        const leaf = try std.fmt.bufPrint(&buffer, "etc/{s}", .{text});
+        try expectContent(root, leaf, "text\n");
+        // The published entry is the one the plan named, resolved through the
+        // root and nowhere else.
+        const found = try root.entry(try root_fs.Path.init(leaf));
+        try testing.expectEqual(Io.File.Kind.file, found.kind);
+        const link = try std.fmt.bufPrint(&buffer, "etc/link-{s}", .{text});
+        var target: [maximum_link_target_bytes]u8 = undefined;
+        try testing.expectEqualStrings(
+            text,
+            try root.readSymbolicLink(try root_fs.Path.init(link), &target),
+        );
+    }
+    try clear(&engine);
 }
 
 test "root_mutation.test.special files fail closed before mutation" {

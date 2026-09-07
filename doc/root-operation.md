@@ -86,6 +86,13 @@ the normative implementation. The record binds:
 - the target and foreign architectures, canonically sorted and deduplicated;
 - `reserved_unix` and `updated_unix` as evidence only.
 
+The `exact_lock` schema identifier is the only record string a caller supplies
+verbatim, so it is validated where the record is built: an empty, over-long, or
+non-UTF-8 identifier is `error.InvalidLockBinding` before the record exists,
+because canonical JSON cannot carry text that is not valid UTF-8 and a record
+carrying it could never be decoded again. The install root is validated the
+same way by `absolute_path.canonical`, and architectures by their own grammar.
+
 Encoding is a fixed canonical JSON byte sequence covered by `digest_sha256`.
 Decoding is bounded (`maximum_document_bytes` = 64 KiB) and strict: unknown
 fields, missing fields, an unsupported schema or version, a mismatched root
