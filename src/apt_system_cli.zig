@@ -49,7 +49,6 @@ pub const UsageDiagnosticId = enum {
 pub const UsageFailure = struct {
     id: UsageDiagnosticId,
     topic: HelpTopic,
-    argument: ?[]const u8 = null,
 };
 
 pub const ParsedCommand = struct {
@@ -164,12 +163,12 @@ pub fn helpText(topic: HelpTopic) []const u8 {
 
 pub fn parse(arguments: []const []const u8) ParseResult {
     if (arguments.len > maximum_arguments) {
-        return failure(.too_many_arguments, .apt, null);
+        return failure(.too_many_arguments, .apt);
     }
     if (detectHelp(arguments)) |topic| return .{ .help = topic };
     for (arguments) |argument| {
         if (argument.len > maximum_argument_bytes) {
-            return failure(.argument_too_long, .apt, null);
+            return failure(.argument_too_long, .apt);
         }
     }
     if (arguments.len == 0) return .{ .help = .apt };
@@ -183,40 +182,40 @@ pub fn parse(arguments: []const []const u8) ParseResult {
         const argument = arguments[index];
         if (std.mem.eql(u8, argument, "--profile")) {
             if (seen_profile) {
-                return failure(.duplicate_option, .apt, argument);
+                return failure(.duplicate_option, .apt);
             }
             seen_profile = true;
             index += 1;
             if (index >= arguments.len) {
-                return failure(.missing_option_value, .apt, "--profile");
+                return failure(.missing_option_value, .apt);
             }
             profile_path = arguments[index];
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, argument, "--json")) {
-            if (seen_json) return failure(.duplicate_option, .apt, argument);
+            if (seen_json) return failure(.duplicate_option, .apt);
             seen_json = true;
             output = .json;
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, argument, "--")) {
-            return failure(.passthrough_not_supported, .apt, argument);
+            return failure(.passthrough_not_supported, .apt);
         }
         if (startsWithDash(argument)) {
-            return failure(.unknown_option, .apt, argument);
+            return failure(.unknown_option, .apt);
         }
         break;
     }
     if (index >= arguments.len) {
-        return failure(.missing_command, .apt, null);
+        return failure(.missing_command, .apt);
     }
 
     const command = arguments[index];
     index += 1;
     const topic = commandTopic(command) orelse {
-        return failure(.unknown_command, .apt, command);
+        return failure(.unknown_command, .apt);
     };
     const trailing = arguments[index..];
     const request: api.Request = switch (topic) {
@@ -383,7 +382,7 @@ fn parseFailure(err: CommandParseError, topic: HelpTopic) ParseResult {
         error.MixedListOptions => .mixed_list_options,
         error.MisplacedFacadeOption => .misplaced_facade_option,
     };
-    return failure(id, topic, null);
+    return failure(id, topic);
 }
 
 fn validationFailure(err: anyerror, topic: HelpTopic) ParseResult {
@@ -394,52 +393,44 @@ fn validationFailure(err: anyerror, topic: HelpTopic) ParseResult {
         error.DuplicatePackage => .duplicate_package,
         else => .invalid_package,
     };
-    return failure(id, topic, null);
+    return failure(id, topic);
 }
 
 fn failure(
     id: UsageDiagnosticId,
     topic: HelpTopic,
-    argument: ?[]const u8,
 ) ParseResult {
     return .{ .failure = .{
         .id = id,
         .topic = topic,
-        .argument = argument,
     } };
 }
 
 fn detectHelp(arguments: []const []const u8) ?HelpTopic {
-    var has_help = false;
+    var topic: HelpTopic = .apt;
+    var command_seen = false;
+    var expect_profile_value = false;
     for (arguments) |argument| {
         if (std.mem.eql(u8, argument, "-h") or
             std.mem.eql(u8, argument, "--help"))
         {
-            has_help = true;
+            return topic;
         }
-    }
-    if (!has_help) return null;
-
-    var index: usize = 0;
-    while (index < arguments.len) {
-        const argument = arguments[index];
+        if (command_seen) continue;
+        if (expect_profile_value) {
+            expect_profile_value = false;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--profile")) {
-            index += @min(@as(usize, 2), arguments.len - index);
+            expect_profile_value = true;
             continue;
         }
-        if (std.mem.eql(u8, argument, "--json")) {
-            index += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, argument, "-h") or
-            std.mem.eql(u8, argument, "--help"))
-        {
-            return .apt;
-        }
-        if (startsWithDash(argument)) return .apt;
-        return commandTopic(argument);
+        if (std.mem.eql(u8, argument, "--json")) continue;
+        if (startsWithDash(argument)) continue;
+        topic = commandTopic(argument) orelse return null;
+        command_seen = true;
     }
-    return .apt;
+    return null;
 }
 
 fn commandTopic(command: []const u8) ?HelpTopic {
@@ -499,9 +490,6 @@ pub fn writeUsageFailure(
             diagnosticMessage(usage_failure.id),
         },
     );
-    if (usage_failure.argument) |argument| {
-        try writer.print(" ('{s}')", .{argument});
-    }
     try writer.writeByte('\n');
     try writer.writeAll(helpText(usage_failure.topic));
 }
@@ -805,6 +793,7 @@ test "apt_system_cli.test.help wins for root and valid commands before parsing" 
         .{ .arguments = &.{ "--unknown", "--help" }, .topic = .apt },
         .{ .arguments = &.{ "--", "--help" }, .topic = .apt },
         .{ .arguments = &.{ "--profile", "--help" }, .topic = .apt },
+        .{ .arguments = &.{ "--profile", "/reviewed.json", "update", "--help" }, .topic = .update },
         .{ .arguments = &.{ "update", "--unknown", "--help" }, .topic = .update },
         .{ .arguments = &.{ "install", "curl", "--bad", "-h" }, .topic = .install },
         .{ .arguments = &.{ "remove", "--profile", "--help" }, .topic = .remove },
@@ -823,6 +812,26 @@ test "apt_system_cli.test.help wins for root and valid commands before parsing" 
         &.{ "unknown-command", "--help" },
         .unknown_command,
     );
+}
+
+test "apt_system_cli.test.help returns before inaccessible trailing bytes" {
+    const inaccessible = @as(
+        [*]const u8,
+        @ptrFromInt(1),
+    )[0..6];
+    const cases = [_]struct {
+        arguments: []const []const u8,
+        topic: HelpTopic,
+    }{
+        .{ .arguments = &.{ "--help", inaccessible }, .topic = .apt },
+        .{ .arguments = &.{ "install", "--help", inaccessible }, .topic = .install },
+    };
+    for (cases) |case| {
+        switch (parse(case.arguments)) {
+            .help => |topic| try std.testing.expectEqual(case.topic, topic),
+            else => return error.ExpectedHelp,
+        }
+    }
 }
 
 test "apt_system_cli.test.parser rejects bounds before traversing rejected input" {
@@ -886,6 +895,48 @@ test "apt_system_cli.test.usage failures render one typed stderr diagnostic" {
             list_help,
         output.written(),
     );
+}
+
+test "apt_system_cli.test.usage rendering never reflects rejected bytes" {
+    const invalid_utf8 = [_]u8{ 'b', 0xff, 'a', 'd' };
+    const credential_option =
+        "--credential=" ++ "example-" ++ "password-value";
+    const cases = [_]struct {
+        arguments: []const []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .arguments = &.{"bad\ncommand"},
+            .expected = "debz apt: usage error [unknown_command]: unknown apt command\n" ++ apt_help,
+        },
+        .{
+            .arguments = &.{credential_option},
+            .expected = "debz apt: usage error [unknown_option]: unknown facade option\n" ++ apt_help,
+        },
+        .{
+            .arguments = &.{"--\x1b[31msecret"},
+            .expected = "debz apt: usage error [unknown_option]: unknown facade option\n" ++ apt_help,
+        },
+        .{
+            .arguments = &.{&invalid_utf8},
+            .expected = "debz apt: usage error [unknown_command]: unknown apt command\n" ++ apt_help,
+        },
+    };
+    for (cases) |case| {
+        const usage_failure = switch (parse(case.arguments)) {
+            .failure => |value| value,
+            else => return error.ExpectedFailure,
+        };
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try writeUsageFailure(&output.writer, usage_failure);
+        try std.testing.expectEqualStrings(case.expected, output.written());
+        try std.testing.expect(std.unicode.utf8ValidateSlice(output.written()));
+        try std.testing.expect(std.mem.indexOfScalar(u8, output.written(), 0x1b) == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "password-value") == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, output.written(), 0xff) == null);
+    }
 }
 
 fn fixtureResult(request: api.Request) !api.Result {

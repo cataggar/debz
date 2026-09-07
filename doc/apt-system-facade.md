@@ -36,7 +36,9 @@ command. The default profile is exactly `/etc/debz/default.json`. `-y` is
 accepted only where shown and must precede package operands. Package tokens
 beginning with `-`, duplicate packages, extra or missing operands, duplicate
 singleton options, other list modes, `apt-get`, `--` passthrough, and every
-undocumented apt command or option are typed usage failures.
+undocumented apt command or option are typed usage failures. Usage rendering
+never reflects rejected command, option, credential, control, or invalid UTF-8
+bytes back to the terminal.
 
 `debz apt` and `debz apt -h`/`--help` select root apt help. For a recognized
 subcommand, `-h`/`--help` wins over malformed trailing arguments before any
