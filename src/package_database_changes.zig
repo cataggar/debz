@@ -2025,13 +2025,15 @@ test "package_database_changes.test.large staged packages plan without quadratic
     } }}, .{}), .duplicate_path);
 }
 
-fn injectedFields(value: []const u8) [5]database.StatusField {
+// The description lines belong to the caller so the returned fields never
+// point at this frame's temporaries.
+fn injectedFields(description: []const []const u8) [5]database.StatusField {
     return .{
         .{ .name = "Package", .value_lines = &.{"newpkg"} },
         .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
         .{ .name = "Architecture", .value_lines = &.{"amd64"} },
         .{ .name = "Version", .value_lines = &.{"3.1"} },
-        .{ .name = "Description", .value_lines = &.{value} },
+        .{ .name = "Description", .value_lines = description },
     };
 }
 
@@ -2050,7 +2052,8 @@ test "package_database_changes.test.staged field values cannot forge status reco
         "escape\x1bsequence",
     };
     for (cases) |value| {
-        const fields = injectedFields(value);
+        const description = [_][]const u8{value};
+        const fields = injectedFields(&description);
         try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
             .{ .put_package = .{ .fields = &fields, .paths = &new_package_paths } },
         }, .{}), .invalid_field_value);
@@ -2081,7 +2084,8 @@ test "package_database_changes.test.staged field values cannot forge status reco
         .{ .put_package = .{ .fields = &repeated, .paths = &new_package_paths } },
     }, .{}), .duplicate_field);
 
-    const bulky = injectedFields("padding value");
+    const padding = [_][]const u8{"padding value"};
+    const bulky = injectedFields(&padding);
     try expectPlanDiagnostic(try plan(
         testing.allocator,
         source,
