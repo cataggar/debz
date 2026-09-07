@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-system-request-v1",
+  "title": "debz apt-shaped system facade request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "api_version",
+    "operation",
+    "profile_path",
+    "packages",
+    "assume_yes"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-system-request-v1" },
+    "version": { "const": 1 },
+    "api_version": { "const": 1 },
+    "operation": {
+      "enum": ["update", "install", "remove", "upgrade", "list_installed"]
+    },
+    "profile_path": { "$ref": "#/$defs/absolutePath" },
+    "packages": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/package" }
+    },
+    "assume_yes": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": { "enum": ["install", "remove"] }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": { "packages": { "minItems": 1 } }
+      },
+      "else": {
+        "properties": { "packages": { "maxItems": 0 } }
+      }
+    }
+  ],
+  "$defs": {
+    "absolutePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$",
+      "not": { "const": "/" }
+    },
+    "package": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^(?!-)[A-Za-z0-9+.:=-]+$"
+    }
+  }
+}

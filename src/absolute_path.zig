@@ -4,6 +4,25 @@ pub const schema_pattern =
     \\^(?:/|/(?!\.{1,2}(?:/|$))[^/\\\u0000-\u001f\u007f]+(?:/(?!\.{1,2}(?:/|$))[^/\\\u0000-\u001f\u007f]+)*)$
 ;
 
+pub const BoundedValidation = enum {
+    valid,
+    too_long,
+    invalid,
+};
+
+pub fn classifyBounded(
+    path: []const u8,
+    allow_root: bool,
+    maximum_bytes: usize,
+) BoundedValidation {
+    if (path.len > maximum_bytes) return .too_long;
+    return if (canonical(path, allow_root)) .valid else .invalid;
+}
+
+pub fn nonRootBounded(path: []const u8, maximum_bytes: usize) bool {
+    return classifyBounded(path, false, maximum_bytes) == .valid;
+}
+
 pub fn canonical(path: []const u8, allow_root: bool) bool {
     if (!std.unicode.utf8ValidateSlice(path) or
         path.len == 0 or
@@ -57,4 +76,16 @@ test "absolute_path.test.canonical grammar rejects invalid unicode and controls"
         "/surrogate\xed\xa0\x80",
     }) |invalid| try std.testing.expect(!root(invalid));
     try std.testing.expect(!nonRoot("/"));
+}
+
+test "absolute_path.test.bounded classification rejects before unicode scanning" {
+    const oversized_invalid = "/\xff\xff\xff\xff";
+    try std.testing.expectEqual(
+        BoundedValidation.too_long,
+        classifyBounded(oversized_invalid, false, 4),
+    );
+    try std.testing.expectEqual(
+        BoundedValidation.invalid,
+        classifyBounded(oversized_invalid, false, oversized_invalid.len),
+    );
 }

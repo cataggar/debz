@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-profile-v1",
+  "title": "debz trusted system profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "repositories",
+    "keyring_paths",
+    "architecture"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/system-profile-v1" },
+    "version": { "const": 1 },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/repository" }
+    },
+    "keyring_paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/absolutePath" }
+    },
+    "architecture": { "$ref": "#/$defs/architecture" },
+    "foreign_architectures": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/architecture" },
+      "default": []
+    },
+    "repository_policy": {
+      "enum": ["strict_priority", "best_version"],
+      "default": "strict_priority"
+    },
+    "cache_path": {
+      "allOf": [{ "$ref": "#/$defs/absolutePath" }],
+      "default": "/var/cache/debz"
+    },
+    "state_path": {
+      "allOf": [{ "$ref": "#/$defs/absolutePath" }],
+      "default": "/var/lib/debz"
+    },
+    "default_conffile": {
+      "enum": ["keep_existing", "use_package_version"],
+      "default": "keep_existing"
+    },
+    "network": {
+      "$ref": "#/$defs/network",
+      "default": {
+        "proxy_url": null,
+        "credential_reference": null
+      }
+    }
+  },
+  "$defs": {
+    "absolutePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$",
+      "not": { "const": "/" }
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path"],
+      "properties": {
+        "source_path": { "$ref": "#/$defs/absolutePath" },
+        "config_path": {
+          "oneOf": [
+            { "$ref": "#/$defs/absolutePath" },
+            { "type": "null" }
+          ],
+          "default": null
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "proxy_url": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^https?://(?![^/?#]*@)[^/?#]+(?:[/?#]|$)"
+            },
+            { "type": "null" }
+          ],
+          "default": null
+        },
+        "credential_reference": {
+          "oneOf": [
+            { "$ref": "#/$defs/absolutePath" },
+            { "type": "null" }
+          ],
+          "default": null
+        }
+      }
+    }
+  }
+}
