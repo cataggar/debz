@@ -21,6 +21,7 @@ only through [`root_fs`](root-filesystem.md):
 | `var/lib/debz/` | shared namespace, provisioned with `createDirectoryPath` |
 | `var/lib/debz/root-operation.lock` | the fixed root mutation lock |
 | `var/lib/debz/root-operation-v1.json` | the versioned active-attempt record |
+| `var/lib/debz/root-operation-completion-v1.json` | the versioned completion provenance statement recovery publishes for an interrupted completion |
 
 Every component is resolved one at a time without following a symbolic link.
 A symlinked `var/lib/debz` fails closed with `error.NamespaceUnavailable`
@@ -29,8 +30,8 @@ a private staging entry, `fsync`ed, renamed over the destination, and the
 destination directory is `fsync`ed, so a successful publication survives power
 loss. Clearing the record removes it and `fsync`s the namespace.
 
-The record is created with mode `0600`. It contains digests and state, never
-secrets.
+The record and the completion statement are created with mode `0600`. They
+contain digests and state, never secrets.
 
 ## Lock order
 
@@ -315,6 +316,74 @@ archived. A crash between completing and publishing leaves a `completed`
 record with provenance owed, which the next mutation reports as
 `error.ProvenancePending`.
 
+## Discharging an interrupted completion
+
+The window between the terminal `completed` record and the cleared active
+intent is the only part of a mutation whose interruption blocks a root that is
+otherwise healthy. The transaction is over: dpkg finished, the executor
+archived its journal, and the record says so — but the record still owes
+provenance, so every later mutation is refused.
+
+The obligation cannot be discharged by running the transaction engine again.
+Re-running `dpkg` would be a second mutation rather than a recovery, and the
+legacy journal can no longer answer for the finished transaction at all: a
+rerun asks the archived journal about a plan it was never written for, so the
+executor reports a failure that could never discharge anything. Before
+`root_operation_completion` existed, `debz recover` did exactly that, its
+`RecoveryReport` never succeeded, `finish` was never reached, and the only way
+back was deleting the record by hand.
+
+`src/root_operation_completion.zig` owns the durable statement that discharges
+it, published at `var/lib/debz/root-operation-completion-v1.json` through the
+same root-anchored, atomic, no-follow, `fsync`ed publication the record uses.
+Republishing an identical statement rewrites nothing, so a recovery that is
+itself interrupted converges on exactly one document.
+
+`schema/root-operation-completion-v1.json` is the canonical schema. The
+statement binds:
+
+- the attempt identifier, and the `record_generation` and `record_digest_sha256`
+  of the active record observed under the root mutation lock;
+- the selected root, `root_identity_sha256`, `backend`, `surface`, and
+  `operation` of the completed attempt;
+- its terminal `phase`, `step`, sticky `mutation_started`, and `outcome`;
+- every evidence digest the record carried: `request_sha256`, `policy_sha256`,
+  `plan_sha256`, `authorization_sha256`, `program_sha256`, the `exact_lock`
+  binding, `database_generation_sha256`, and `artifact_evidence_sha256`;
+- the target and foreign architectures and the record's timestamps;
+- `transaction_provenance`: whether the detailed document was
+  `already_present` (found and verified), `recovered` (rebuilt from durable
+  evidence before this statement), or `unavailable` (never published, because
+  the crash window interrupted publication), with the bound document's schema
+  and digest whenever one exists;
+- `journal`: whether the transaction journal is `archived`, `active`, `absent`,
+  or `unreadable`, with the digest of the bytes that were read;
+- `discharge`: the surface, operation, and request digest of the command that
+  discharged the obligation, kept separate from the completed attempt's own
+  request so a reader can never mistake the recovering command for the command
+  that mutated the root.
+
+Encoding, digesting, and decoding follow the record's rules exactly: one
+canonical byte sequence covered by `digest_sha256`, bounded at 64 KiB, strict
+about unknown or missing fields, and fail-closed on a foreign root identity, a
+mismatched digest, or any non-canonical byte sequence. `create` refuses to
+describe an attempt that is not `completed`, that never mutated, whose outcome
+is `pending` or `abandoned_before_mutation`, or whose evidence contradicts
+itself — an `unavailable` detailed provenance with a document digest, an
+`archived` journal without one, or a discharge operation that is not a real
+operation of its surface. Details are bounded printable ASCII, so a damaged
+root cannot smuggle control bytes into a diagnostic.
+
+Nothing else is restated. The statement never repeats or reconstructs a
+command, script, package, or verification outcome: an `unavailable` detailed
+provenance says only that the transaction completion was durably witnessed and
+that its detailed publication was interrupted.
+
+The statement's digest is what `publishProvenance` binds, so a discharged
+attempt is always traceable to it. A normal, uninterrupted completion is
+unaffected: it publishes its own provenance digest and clears the intent
+without ever writing this document.
+
 ## Integration
 
 ### Package transactions
@@ -344,6 +413,43 @@ that adopts a record already at `mutation_pending` inherits that bridge: its
 own report — a journal it could not find a state for, a lock it could not take,
 a deadline that expired — never discharges it, so the record stays
 `recovery_required` with its provenance owed.
+
+A recovery that adopts a `completed` record whose provenance is still `pending`
+resolves it before any repository, network, journal, or executor work, because
+that attempt's transaction is already over. It refuses immediately unless the
+record binds this backend and the `package_transaction` surface — a repository
+bootstrap's owed provenance is finished by rerunning that bootstrap, never by a
+package recovery. Then it reads back what survived under the explicit state
+path:
+
+| Evidence at `<state>/transaction-result.json` | Result |
+| --- | --- |
+| absent | `transaction_provenance: unavailable`, discharge proceeds |
+| present, canonical, and bound to this attempt's plan, exact lock, architecture, and outcome | `transaction_provenance: already_present` with its digest bound |
+| present but unreadable, non-canonical, digest-mismatched, a symbolic link, or a directory | blocking failure naming the document to inspect |
+| present, valid, but bound to a different plan or exact lock | blocking failure naming the document to inspect |
+
+A blocked discharge publishes nothing and clears nothing, so the interrupted
+attempt's evidence and the unexplained document both survive for an operator to
+look at, and the next mutation is still refused. Once the obstruction is gone
+the same `debz recover` finishes the job, so no debz-owned record ever has to
+be deleted by hand.
+
+On success the statement is published first, the record transitions to
+`published` bound to its digest, and only then is the active intent cleared —
+the same provenance-before-clearing order an uninterrupted completion follows.
+The journal evidence decides the `journal_archived` flag in the provenance
+digest instead of assuming it, and `dpkg` is never run to discharge provenance.
+The recovery intent the crashed run never removed is deleted afterwards,
+because the transaction it described is over; a state directory that refuses
+that removal is reported in the result rather than allowed to re-block a root
+whose obligation is already discharged.
+
+A mutating rerun does not discharge the obligation: it is refused with
+`error.ProvenancePending`, whose diagnostic names `debz recover`. A rerun could
+only either re-execute a transaction that already completed or clear an
+obligation without publishing anything, and both are worse than staying
+blocked with an actionable message.
 
 ### Repository bootstrap
 

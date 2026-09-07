@@ -79,8 +79,14 @@ Repository bootstrap binds its attempt to a stable request digest before
 acquisition, so a rerun of the same request adopts its own evidence and
 finishes it while an unrelated operation, descriptor, or request is still
 refused; a record that already published its provenance is settled, so the
-rerun reserves a new attempt over it rather than executing under it. See
-[Root-scoped operation coordination](root-operation.md).
+rerun reserves a new attempt over it rather than executing under it. A package
+transaction whose completion was interrupted before its provenance was
+published is discharged by `debz recover` through
+`debz.root_operation_completion`, a versioned statement in the same namespace
+that binds the completed record and says whether its detailed transaction
+provenance was already present, recovered, or interrupted, without running the
+transaction engine again and without restating any command, script, or package
+outcome. See [Root-scoped operation coordination](root-operation.md).
 
 ## Typed metadata and archives
 

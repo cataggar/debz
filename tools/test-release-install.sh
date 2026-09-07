@@ -49,6 +49,8 @@ for schema in \
   package-cache-result-v1.json \
   repository-add-state-v1.json \
   repository-operation-result-v1.json \
+  root-operation-completion-v1.json \
+  root-operation-record-v1.json \
   transaction-plan-v1.json \
   transaction-plan-v2.json \
   transaction-plan-v3.json \

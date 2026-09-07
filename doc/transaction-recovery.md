@@ -68,3 +68,15 @@ resolved — by an explicit recovery for package transactions, or by a rerun of
 the very same repository bootstrap request, which adopts its own attempt
 instead of opening a new mutation intent — and provenance is published before
 the active intent is cleared.
+
+A completion that was interrupted after the terminal `completed` record but
+before its provenance was published is the one case the journal cannot resolve.
+That transaction finished and its journal was archived, so a rerun asks the
+archive about a plan it was never written for. `debz recover` therefore
+discharges the obligation directly, without running the engine again: it
+verifies whatever detailed transaction provenance survived, publishes the
+root-operation completion statement described in
+[root-scoped operation coordination](root-operation.md), binds the record to
+it, and only then clears the intent. Any mismatch, corruption, or I/O failure
+around that evidence leaves the record exactly as it was, with a diagnostic
+naming the document to inspect.

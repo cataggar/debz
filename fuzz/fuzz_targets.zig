@@ -35,6 +35,7 @@ const state_corpus = &.{
     @embedFile("corpus/state/repository-result.json"),
     @embedFile("corpus/state/repository-add-state.json"),
     @embedFile("corpus/state/root-operation.json"),
+    @embedFile("corpus/state/root-operation-completion.json"),
 };
 
 fn input(smith: *std.testing.Smith, storage: *[max_input]u8) []const u8 {
@@ -411,6 +412,10 @@ fn exerciseState(bytes: []const u8) !void {
         var record = value;
         record.deinit();
     } else |_| {}
+    if (debz.root_operation_completion.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var document = value;
+        document.deinit();
+    } else |_| {}
 }
 
 test "fuzz.deterministic bounded mutation smoke" {
@@ -455,6 +460,36 @@ test "fuzz.corpus root operation seed stays canonical and self-consistent" {
     try std.testing.expect(record.record.mutation_started);
     try std.testing.expect(record.record.state.blocksMutation());
     try std.testing.expect(!record.record.clearable());
+}
+
+test "fuzz.corpus root operation completion seed stays canonical and self-consistent" {
+    var record = try debz.root_operation.decode(
+        std.testing.allocator,
+        @embedFile("corpus/state/root-operation.json"),
+        debz.root_operation.maximum_document_bytes,
+    );
+    defer record.deinit();
+    var document = try debz.root_operation_completion.decode(
+        std.testing.allocator,
+        @embedFile("corpus/state/root-operation-completion.json"),
+        debz.root_operation_completion.maximum_document_bytes,
+    );
+    defer document.deinit();
+    // The seed describes a completed attempt whose detailed provenance
+    // survived, so it binds a document digest and an archived journal.
+    try std.testing.expectEqual(
+        debz.root_operation_completion.TransactionProvenanceStatus.already_present,
+        document.document.transaction_provenance.status,
+    );
+    try std.testing.expect(document.document.transaction_provenance.document_sha256 != null);
+    try std.testing.expectEqual(
+        debz.root_operation_completion.JournalStatus.archived,
+        document.document.journal.status,
+    );
+    try std.testing.expect(document.document.mutation_started);
+    // It is a statement about another attempt than the record seed, so it must
+    // refuse to bind it.
+    try std.testing.expect(!document.document.bindsRecord(record.record));
 }
 
 test "fuzz.corpus native transaction program seeds stay canonical" {

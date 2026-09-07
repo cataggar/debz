@@ -11,6 +11,7 @@ const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
+const root_operation_completion = @import("root_operation_completion.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const transaction_engine = @import("transaction_engine.zig");
@@ -21,6 +22,40 @@ const exact_lock = @import("exact_lock.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = transaction_engine.Executor;
+
+/// Durable boundary inside the completion sequence of one product mutation.
+///
+/// The window between the terminal `completed` record and the cleared active
+/// intent is the only part of a product transaction that a crash can leave
+/// blocking a healthy root, so every step in it is a named seam. Production
+/// callers leave `Backend.completion_crash` null and each step simply runs.
+pub const CompletionPoint = enum {
+    /// The completed record is durable; nothing else has run.
+    after_completed_record,
+    /// The recovery intent has been removed from the state directory.
+    after_recovery_intent_deleted,
+    /// The detailed transaction provenance document has been published.
+    after_transaction_provenance,
+    /// A recovery published the root-operation completion statement but has
+    /// not yet bound it to the record.
+    after_owed_provenance_document,
+    /// The record carries its provenance digest but the active intent has not
+    /// been cleared yet.
+    after_provenance_published,
+};
+
+/// Test seam that reproduces a process death at a completion boundary. A
+/// non-null error return leaves every durable artifact exactly as the crashed
+/// process would have left it: nothing is completed, cleared, or rolled back
+/// on the way out.
+pub const CompletionCrash = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, CompletionPoint) anyerror!void,
+
+    pub fn hit(self: CompletionCrash, point: CompletionPoint) !void {
+        return self.hitFn(self.context, point);
+    }
+};
 
 const RepositoryOptions = struct {
     source_paths: []const []const u8,
@@ -40,6 +75,9 @@ pub const Backend = struct {
     native_executor: ?Executor = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
     now_unix: ?i64 = null,
+    /// Test seam. Production callers leave it null and every completion
+    /// boundary runs to its durable end.
+    completion_crash: ?CompletionCrash = null,
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -419,6 +457,18 @@ pub const Backend = struct {
         defer guard.deinit();
         if (rootOperationSurface(request.operation)) |operation| {
             if (guard.open(allocator, request, operation)) |failure| return failure;
+        }
+
+        // A completed attempt that still owes provenance is resolved before any
+        // repository, network, journal, or executor work. Its transaction is
+        // over — the mutation was durably witnessed and the record says so —
+        // so the only thing left to do is publish the provenance the crash
+        // interrupted. Running the command-oriented executor first would ask
+        // the legacy journal about a transaction it already archived and
+        // answer with a failure that can never discharge the obligation.
+        if (request.operation == .recover) {
+            if (try self.dischargeOwedProvenance(allocator, &guard, request)) |result|
+                return result;
         }
 
         const repository_options: RepositoryOptions = .{
@@ -825,7 +875,9 @@ pub const Backend = struct {
             root_operation.reportWitness(report),
             .succeeded,
         )) |failure| return failure;
+        try guard.crash(.after_completed_record);
         try deleteRecoveryIntent(self.io, request.options.state_path);
+        try guard.crash(.after_recovery_intent_deleted);
         if (lock) |*value| {
             var verify: transaction_provenance.VerifyDiagnostic = .{};
             writeExecutionProvenance(
@@ -854,8 +906,305 @@ pub const Backend = struct {
                 else => return err,
             };
         }
+        try guard.crash(.after_transaction_provenance);
         if (try guard.finish(allocator, request.operation)) |failure| return failure;
         return planResultChanged(allocator, request.operation, plan.*, true, "transaction completed");
+    }
+
+    /// Discharges the provenance a completed product attempt still owes.
+    ///
+    /// A transaction that crashed between publishing its terminal `completed`
+    /// boundary and publishing its provenance leaves a record that refuses
+    /// every later mutation of the root. That transaction is over: its
+    /// mutation was durably witnessed under the root mutation lock, its
+    /// journal was archived by the executor that finished it, and re-running
+    /// `dpkg` would be a second mutation rather than a recovery. The legacy
+    /// journal can no longer answer for it either — a rerun asks about a plan
+    /// the archived journal was not written for — so the obligation would
+    /// never be discharged and the root would stay blocked forever.
+    ///
+    /// So the obligation is discharged directly and honestly: whatever
+    /// detailed transaction provenance survived is verified against the
+    /// record, a versioned root-operation completion statement that says
+    /// exactly what was witnessed and what the crash interrupted is published
+    /// inside the root, the record is transitioned to `published` bound to
+    /// that statement, and only then is the active intent cleared. Nothing
+    /// about the interrupted transaction's commands, scripts, or packages is
+    /// invented, and any mismatch, corruption, or I/O failure leaves the
+    /// record exactly as it was with an actionable diagnostic.
+    ///
+    /// `null` means nothing is owed, so the ordinary recovery path continues.
+    fn dischargeOwedProvenance(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        guard: *RootOperationGuard,
+        request: api.Request,
+    ) !?api.Result {
+        var attempt = guard.active() orelse return null;
+        const record = attempt.record();
+        if (record.state != .completed or record.provenance != .pending) return null;
+
+        // Only the surface and backend that published the record may finish
+        // it. A package transaction can never speak for a repository
+        // bootstrap's evidence, and a record written for another transaction
+        // backend is not this backend's to discharge.
+        switch (record.operation) {
+            .package_transaction => {},
+            .repository_bootstrap => return blockedRecovery(
+                request.operation,
+                "an interrupted repository bootstrap owes provenance for this root; rerun the same 'debz repo add' request to finish it",
+            ),
+        }
+        if (record.backend != self.transaction_backend) return blockedRecovery(
+            request.operation,
+            "the interrupted root attempt was executed by a different transaction backend",
+        );
+
+        const evidence = try self.collectOwedEvidence(allocator, request, record);
+        if (evidence.blocked) |message| return blockedRecovery(request.operation, message);
+
+        var statement = root_operation_completion.create(allocator, .{
+            .record = record,
+            .transaction_provenance = evidence.transaction,
+            .journal = evidence.journal,
+            .discharge = .{
+                .surface = .package_transaction,
+                .operation = @tagName(request.operation),
+                .request_sha256 = productRequestDigest(request),
+            },
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return blockedRecovery(request.operation, try std.fmt.allocPrint(
+                allocator,
+                "the interrupted root attempt cannot be described honestly: {s}",
+                .{@errorName(err)},
+            )),
+        };
+        defer statement.deinit();
+
+        const store: root_operation_completion.Store = .init(guard.owned_root.?.root);
+        store.publish(allocator, statement.document) catch |err| return blockedRecovery(
+            request.operation,
+            try std.fmt.allocPrint(
+                allocator,
+                "root-operation completion provenance could not be published at {s}/{s}: {s}",
+                .{
+                    request.options.install_root,
+                    root_operation_completion.document_path,
+                    @errorName(err),
+                },
+            ),
+        );
+        try guard.crash(.after_owed_provenance_document);
+
+        // Provenance before clearing, exactly as an uninterrupted completion
+        // does it: the digest binds the attempt to the statement just
+        // published, so the cleared intent always leaves a verifiable link.
+        attempt.publishProvenance(allocator, root_operation.provenanceDigest(record, .{
+            .outcome = record.outcome,
+            .document_sha256 = statement.document.digest_sha256,
+            .journal_archived = evidence.journal.status == .archived,
+        })) catch |err| return mapRootOperationError(request.operation, err);
+        try guard.crash(.after_provenance_published);
+        attempt.clear() catch |err| return mapRootOperationError(request.operation, err);
+
+        // Removing the recovery intent is the last step the crashed run never
+        // reached, and the transaction it described is now definitively over.
+        // A state directory that refuses the removal must not re-block a root
+        // whose obligation is already discharged, so the result reports what
+        // happened instead of failing a completed recovery.
+        const intent_removed = if (deleteRecoveryIntent(self.io, request.options.state_path))
+            true
+        else |_|
+            false;
+
+        const items = try allocator.alloc(api.Item, 1);
+        items[0] = .{
+            .package = "root-operation",
+            .detail = try std.fmt.allocPrint(
+                allocator,
+                "outcome={s} transaction_provenance={s} journal={s} recovery_intent={s} statement_sha256={s}",
+                .{
+                    @tagName(statement.document.outcome),
+                    @tagName(statement.document.transaction_provenance.status),
+                    @tagName(statement.document.journal.status),
+                    if (intent_removed) "removed" else "retained",
+                    &std.fmt.bytesToHex(statement.document.digest_sha256, .lower),
+                },
+            ),
+        };
+        return success(
+            request.operation,
+            true,
+            switch (evidence.transaction.status) {
+                .already_present, .recovered => "interrupted transaction completion recovered; published transaction provenance verified",
+                .unavailable => "interrupted transaction completion recovered; detailed transaction provenance was interrupted",
+            },
+            items,
+        );
+    }
+
+    /// Reads back what survived of a completed attempt's evidence.
+    ///
+    /// Absence is a fact and is reported as such; anything that exists but
+    /// cannot be read, decoded, or bound to this attempt blocks the discharge
+    /// instead of being explained away, because clearing the record while an
+    /// unexplained document sits exactly where this attempt would have
+    /// published one would make the cleared record a lie.
+    fn collectOwedEvidence(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        record: root_operation.Record,
+    ) !OwedEvidence {
+        var dir = openAbsoluteDirectory(self.io, request.options.state_path) catch |err| switch (err) {
+            error.FileNotFound => return .{
+                .transaction = .{
+                    .status = .unavailable,
+                    .detail = "the explicit state path consulted by recovery does not exist",
+                },
+                .journal = .{
+                    .status = .absent,
+                    .detail = "the explicit state path consulted by recovery does not exist",
+                },
+            },
+            else => return blockedEvidence(try std.fmt.allocPrint(
+                allocator,
+                "the explicit state path {s} could not be opened to verify the interrupted transaction: {s}",
+                .{ request.options.state_path, @errorName(err) },
+            )),
+        };
+        defer dir.close(self.io);
+
+        var transaction: root_operation_completion.TransactionProvenance = .{
+            .status = .unavailable,
+            .detail = "no detailed transaction provenance exists under the explicit state path consulted by recovery",
+        };
+        const provenance_store = transaction_provenance.Store.init(
+            self.io,
+            dir,
+            transaction_result_name,
+        ) catch |err| return blockedEvidence(try std.fmt.allocPrint(
+            allocator,
+            "the transaction provenance path is unusable: {s}",
+            .{@errorName(err)},
+        ));
+        if (provenance_store.read(allocator, transaction_provenance.maximum_document_bytes)) |read| {
+            var validated = read;
+            defer validated.deinit();
+            const binding = transaction_provenance.readBinding(
+                allocator,
+                validated.bytes,
+                transaction_provenance.maximum_document_bytes,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedEvidence(try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s} is not a readable transaction provenance document ({s}); inspect it before recovering this root",
+                    .{ request.options.state_path, transaction_result_name, @errorName(err) },
+                )),
+            };
+            if (transactionProvenanceMismatch(record, binding)) |reason|
+                return blockedEvidence(try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s} does not describe the interrupted transaction ({s}); inspect it before recovering this root",
+                    .{ request.options.state_path, transaction_result_name, reason },
+                ));
+            transaction = .{
+                .status = .already_present,
+                .schema = transaction_provenance.schema_id,
+                .document_sha256 = binding.digest_sha256,
+                .detail = "published transaction provenance verified against the completed attempt",
+            };
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return blockedEvidence(try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s} could not be read as a regular file ({s}); inspect it before recovering this root",
+                .{ request.options.state_path, transaction_result_name, @errorName(err) },
+            )),
+        }
+
+        return .{
+            .transaction = transaction,
+            .journal = try self.collectJournalEvidence(allocator, dir),
+        };
+    }
+
+    /// The transaction journal as it stands now. It is evidence about the
+    /// interrupted transaction, never authority over it, so a journal that
+    /// cannot be read is reported rather than treated as proof of anything.
+    fn collectJournalEvidence(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        dir: std.Io.Dir,
+    ) !root_operation_completion.Journal {
+        const candidates = [_]struct {
+            name: []const u8,
+            status: root_operation_completion.JournalStatus,
+            detail: []const u8,
+        }{
+            .{
+                .name = "transaction.complete",
+                .status = .archived,
+                .detail = "transaction.complete was archived by the executor that finished the transaction",
+            },
+            .{
+                .name = "transaction.journal",
+                .status = .active,
+                .detail = "transaction.journal was still active when the completion was interrupted",
+            },
+        };
+        for (candidates) |candidate| {
+            const digest = self.readStateDigest(allocator, dir, candidate.name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{
+                    .status = .unreadable,
+                    .detail = try std.fmt.allocPrint(
+                        allocator,
+                        "{s} could not be read: {s}",
+                        .{ candidate.name, @errorName(err) },
+                    ),
+                },
+            };
+            return .{
+                .status = candidate.status,
+                .document_sha256 = digest,
+                .detail = candidate.detail,
+            };
+        }
+        return .{
+            .status = .absent,
+            .detail = "no transaction journal remains under the explicit state path consulted by recovery",
+        };
+    }
+
+    /// Digest of one bounded state-directory file, read without following a
+    /// symbolic link and without accepting a directory.
+    fn readStateDigest(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        dir: std.Io.Dir,
+        name: []const u8,
+    ) ![32]u8 {
+        var file = try dir.openFile(self.io, name, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        });
+        defer file.close(self.io);
+        var reader = file.reader(self.io, &.{});
+        const bytes = try reader.interface.allocRemaining(
+            allocator,
+            .limited(transaction_recovery.maximum_journal_bytes),
+        );
+        defer allocator.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
     }
 
     fn loadInstalled(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !dpkg_status.OwnedDatabase {
@@ -1025,6 +1374,10 @@ const RootOperationGuard = struct {
     locks: root_operation.SystemLockBackend = undefined,
     coordinator: root_operation.Coordinator = undefined,
     attempt: ?root_operation.Attempt = null,
+    /// Set when a simulated process death unwound through this guard. The
+    /// durable record then stays exactly as it was published, because a dead
+    /// process cannot complete, clear, or abandon anything.
+    crashed: bool = false,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -1033,6 +1386,16 @@ const RootOperationGuard = struct {
     fn active(self: *RootOperationGuard) ?*root_operation.Attempt {
         if (self.attempt) |*value| return value;
         return null;
+    }
+
+    /// Reproduces a process death at one completion boundary. Only the test
+    /// seam can reach it; without an injector every boundary simply runs.
+    fn crash(self: *RootOperationGuard, point: CompletionPoint) !void {
+        const injector = self.backend.completion_crash orelse return;
+        injector.hit(point) catch |err| {
+            self.crashed = true;
+            return err;
+        };
     }
 
     fn open(
@@ -1201,6 +1564,7 @@ const RootOperationGuard = struct {
                 .journal_archived = true,
             }),
         ) catch |err| return mapRootOperationError(operation, err);
+        try self.crash(.after_provenance_published);
         attempt.clear() catch |err| return mapRootOperationError(operation, err);
         return null;
     }
@@ -1213,7 +1577,9 @@ const RootOperationGuard = struct {
             // past the executor bridge stays exactly as published, so the next
             // mutation is refused until it is explicitly recovered. A failure
             // here simply leaves the record, which the next attempt reports.
-            if (value.locked()) {
+            // A simulated crash unwinds without any of this: the record must
+            // survive exactly as the dead process left it.
+            if (value.locked() and !self.crashed) {
                 if (value.record().state.provenPreMutation())
                     value.abandonIfPreMutation(self.allocator) catch {}
                 else if (value.record().clearable()) value.clear() catch {};
@@ -1225,6 +1591,63 @@ const RootOperationGuard = struct {
         self.owned_root = null;
     }
 };
+
+/// Name of the detailed transaction provenance document a locked product
+/// transaction publishes under the explicit state path.
+const transaction_result_name = "transaction-result.json";
+
+/// What survived of a completed attempt's evidence, or the reason its
+/// provenance obligation may not be discharged at all.
+const OwedEvidence = struct {
+    transaction: root_operation_completion.TransactionProvenance,
+    journal: root_operation_completion.Journal,
+    /// When set, nothing is published and the record stays exactly as the
+    /// interrupted attempt left it.
+    blocked: ?[]const u8 = null,
+};
+
+fn blockedEvidence(message: []const u8) OwedEvidence {
+    return .{
+        .transaction = .{ .status = .unavailable, .detail = "evidence was not evaluated" },
+        .journal = .{ .status = .absent, .detail = "evidence was not evaluated" },
+        .blocked = message,
+    };
+}
+
+/// A root whose owed provenance cannot be discharged stays blocked. The
+/// diagnostic names the exact document to inspect, and the record is left
+/// exactly as published so no evidence is destroyed by the report.
+fn blockedRecovery(operation: api.Operation, message: []const u8) api.Result {
+    return api.failure(
+        operation,
+        .recovery,
+        .root_operation_recovery_required,
+        message,
+    );
+}
+
+/// Why a published transaction provenance document does not describe the
+/// interrupted attempt, or `null` when it does. The plan and exact-lock
+/// digests are the attempt's own preflight evidence, so a document that
+/// carries different ones was published for a different transaction.
+fn transactionProvenanceMismatch(
+    record: root_operation.Record,
+    binding: transaction_provenance.DocumentBinding,
+) ?[]const u8 {
+    const plan = record.plan_sha256 orelse
+        return "the interrupted attempt bound no reviewed plan to compare it against";
+    if (!std.mem.eql(u8, &plan, &binding.plan_sha256))
+        return "its plan digest belongs to a different transaction";
+    const lock = record.exact_lock orelse
+        return "the interrupted attempt bound no exact lock to compare it against";
+    if (!std.mem.eql(u8, &lock.digest_sha256, &binding.lock_sha256))
+        return "its exact-lock digest belongs to a different transaction";
+    if (!std.mem.eql(u8, record.target_architecture, binding.architecture()))
+        return "its target architecture differs from the interrupted attempt";
+    if (record.outcome == .succeeded and binding.outcome != .succeeded)
+        return "it does not describe a successful transaction";
+    return null;
+}
 
 fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
     return switch (err) {
@@ -1246,11 +1669,20 @@ fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
             .root_operation_conflict,
             "an interrupted debz operation left an unresolved root attempt",
         ),
-        error.RecoveryRequired, error.ProvenancePending => api.failure(
+        error.RecoveryRequired => api.failure(
             operation,
             .recovery,
             .root_operation_recovery_required,
             "a previous debz operation mutated this root and requires recovery",
+        ),
+        // The transaction itself finished; only the provenance it owes is
+        // missing. Naming the command that discharges it keeps the root from
+        // looking like it needs a hand-repaired record.
+        error.ProvenancePending => api.failure(
+            operation,
+            .recovery,
+            .root_operation_recovery_required,
+            "a previous debz operation completed on this root before publishing its provenance and requires recovery; run 'debz recover' to publish it",
         ),
         error.RootIdentityMismatch => api.failure(
             operation,
@@ -2112,7 +2544,7 @@ fn writeExecutionProvenance(
     defer provenance.deinit();
     var dir = try openAbsoluteDirectory(io, request.options.state_path);
     defer dir.close(io);
-    const store = try transaction_provenance.Store.init(io, dir, "transaction-result.json");
+    const store = try transaction_provenance.Store.init(io, dir, transaction_result_name);
     try store.writeAtomic(allocator, provenance.result);
 }
 

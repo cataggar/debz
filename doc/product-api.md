@@ -102,6 +102,25 @@ When both lock options are supplied, the validated input is atomically
 published at the output path. Successful locked transactions atomically publish
 `transaction-result.json` under the explicit state path.
 
+`recover` resolves an interrupted transaction. When the root's active attempt
+is already `completed` and only owes provenance — a crash between the terminal
+record and its published provenance — `recover` discharges that obligation
+without running dpkg again: it verifies any `transaction-result.json` that
+survived, publishes
+`INSTALL_ROOT/var/lib/debz/root-operation-completion-v1.json`
+([`schema/root-operation-completion-v1.json`](../schema/root-operation-completion-v1.json)),
+binds the record to it, clears the active intent, and reports success with
+`changed` true, because it published durable provenance and unblocked the root
+even though no package state changed. The result item names the outcome, the
+detailed-provenance classification (`already_present`, `recovered`, or
+`unavailable`), the journal classification, whether the interrupted run's
+recovery intent could be removed, and the statement digest. A
+document that cannot be read, decoded, or bound to the interrupted attempt
+leaves the root blocked with exit 8 and a diagnostic naming the document to
+inspect; nothing is published or cleared. A mutating command run against such a
+root is refused with exit 8 and a diagnostic naming `debz recover`. See
+[root-scoped operation coordination](root-operation.md).
+
 `debz transaction-result verify --state-path PATH --lock-input PATH
 --architecture ARCH --json` is the read-only action handoff for that combined
 document. It opens the state directory and result without following symbolic
