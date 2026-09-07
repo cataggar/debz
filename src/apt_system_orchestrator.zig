@@ -1013,6 +1013,11 @@ pub const StateStore = struct {
         std.mem.Allocator,
         OperationPaths,
     ) anyerror!api.OwnedRequest,
+    readRetainedFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        OperationPaths,
+    ) anyerror!?operation_state.OwnedState,
     retainTransactionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -1033,6 +1038,13 @@ pub const StateStore = struct {
         OperationPaths,
         CompletionInput,
     ) anyerror!api.CompletionBinding,
+    verifyCompletionFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        OperationPaths,
+        CompletionInput,
+        api.CompletionBinding,
+    ) anyerror!void,
 
     pub fn readActive(
         self: StateStore,
@@ -1041,12 +1053,32 @@ pub const StateStore = struct {
     ) !?operation_state.OwnedState {
         return self.readActiveFn(self.context, allocator, state_path);
     }
+
+    pub fn readRetained(
+        self: StateStore,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+    ) !?operation_state.OwnedState {
+        return self.readRetainedFn(self.context, allocator, paths);
+    }
+};
+
+pub const FinishBoundary = enum { after_retained_publish };
+
+pub const FinishCrash = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, FinishBoundary) anyerror!void,
+
+    pub fn hit(self: FinishCrash, boundary: FinishBoundary) !void {
+        try self.hitFn(self.context, boundary);
+    }
 };
 
 pub const SystemStateStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     wait_ms: u64 = 30_000,
+    finish_crash: ?FinishCrash = null,
 
     const operation_lock_name = "operation.lock";
 
@@ -1058,9 +1090,11 @@ pub const SystemStateStore = struct {
             .compareAndSetFn = compareAndSet,
             .finishFn = finish,
             .readRequestFn = readRequest,
+            .readRetainedFn = readRetained,
             .retainTransactionFn = retainTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
+            .verifyCompletionFn = verifyCompletion,
         };
     }
 
@@ -1233,28 +1267,60 @@ pub const SystemStateStore = struct {
             false,
         );
         defer operation_dir.close(self.io);
-        const final_bytes = try final.canonicalJson(allocator);
-        defer allocator.free(final_bytes);
-        try publishAtomic(
-            self,
+        var retained: ?operation_state.OwnedState = null;
+        defer if (retained) |*owned| owned.deinit();
+        if (try readOptionalFile(
             allocator,
+            self.io,
             operation_dir,
             retained_state_name,
-            final_bytes,
-        );
+        )) |source| {
+            defer allocator.free(source);
+            retained = try operation_state.decode(
+                allocator,
+                source,
+                operation_state.maximum_document_bytes,
+            );
+            if (!finalStateEquivalent(retained.?.state, final))
+                return error.PublicationConflict;
+        } else {
+            const final_bytes = try final.canonicalJson(allocator);
+            defer allocator.free(final_bytes);
+            try publishAtomic(
+                self,
+                allocator,
+                operation_dir,
+                retained_state_name,
+                final_bytes,
+            );
+            retained = try operation_state.decode(
+                allocator,
+                final_bytes,
+                operation_state.maximum_document_bytes,
+            );
+            if (self.finish_crash) |crash|
+                try crash.hit(.after_retained_publish);
+        }
+        const durable_final = retained.?.state;
 
         const state_path = std.fs.path.dirname(
             std.fs.path.dirname(paths.active_state) orelse
                 return error.InvalidPath,
         ) orelse return error.InvalidPath;
-        const already_final = expected.generation == final.generation and
+        const already_final = expected.generation == durable_final.generation and
             std.mem.eql(
                 u8,
                 &expected.digest_sha256,
-                &final.digest_sha256,
+                &durable_final.digest_sha256,
             );
         if (!already_final)
-            try compareAndSet(context, allocator, state_path, expected, final);
+            try compareAndSet(
+                context,
+                allocator,
+                state_path,
+                expected,
+                durable_final,
+            );
         const apt_path = std.fs.path.dirname(paths.active_state) orelse
             return error.InvalidPath;
         var apt_dir = try openSecureAbsoluteDirectory(
@@ -1283,11 +1349,11 @@ pub const SystemStateStore = struct {
             operation_state.maximum_document_bytes,
         );
         defer state.deinit();
-        if (state.state.generation != final.generation or
+        if (state.state.generation != durable_final.generation or
             !std.mem.eql(
                 u8,
                 &state.state.digest_sha256,
-                &final.digest_sha256,
+                &durable_final.digest_sha256,
             )) return error.StaleState;
         try apt_dir.deleteFile(self.io, operation_state.document_name);
         try syncDirectory(self.io, apt_dir);
@@ -1307,6 +1373,29 @@ pub const SystemStateStore = struct {
         );
         defer allocator.free(bytes);
         return api.decodeRequest(allocator, bytes);
+    }
+
+    fn readRetained(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+    ) !?operation_state.OwnedState {
+        const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        const bytes = readTrustedOperationFile(
+            self.io,
+            allocator,
+            paths.retained_state,
+            operation_state.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        return try operation_state.decode(
+            allocator,
+            bytes,
+            operation_state.maximum_document_bytes,
+        );
     }
 
     fn retainTransaction(
@@ -1416,6 +1505,7 @@ pub const SystemStateStore = struct {
             );
             return completionBinding(paths, input, completion);
         }
+
         const completion = try createExecutionCompletion(input);
         const source = try completion.canonicalJson(allocator);
         defer allocator.free(source);
@@ -1427,6 +1517,38 @@ pub const SystemStateStore = struct {
             source,
         );
         return completionBinding(paths, input, completion);
+    }
+
+    fn verifyCompletion(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+        input: CompletionInput,
+        expected: api.CompletionBinding,
+    ) !void {
+        const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        var dir = try openSecureAbsoluteDirectory(
+            self.io,
+            allocator,
+            paths.directory,
+            false,
+        );
+        defer dir.close(self.io);
+        const existing = try readOptionalFile(
+            allocator,
+            self.io,
+            dir,
+            completion_document_name,
+        ) orelse return error.MissingCompletion;
+        defer allocator.free(existing);
+        const completion = try verifyExistingCompletion(
+            allocator,
+            existing,
+            input,
+        );
+        const observed = completionBinding(paths, input, completion);
+        if (!completionEqual(observed, expected))
+            return error.CompletionMismatch;
     }
 
     fn publishAtomic(
@@ -1481,6 +1603,7 @@ pub const SystemStateStore = struct {
 
 pub const VerifiedLock = struct {
     binding: api.DocumentBinding,
+    semantic_request_sha256: [32]u8,
 };
 
 pub const VerifiedTransaction = struct {
@@ -1501,6 +1624,7 @@ pub const ResultVerifier = struct {
         std.mem.Allocator,
         []const u8,
         []const u8,
+        [32]u8,
     ) anyerror!VerifiedLock,
     verifyTransactionFn: *const fn (
         *anyopaque,
@@ -1527,6 +1651,7 @@ pub const SystemResultVerifier = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         architecture: []const u8,
+        expected_request_sha256: [32]u8,
     ) !VerifiedLock {
         const self: *SystemResultVerifier = @ptrCast(@alignCast(context));
         const source = try readTrustedOperationFile(
@@ -1547,12 +1672,20 @@ pub const SystemResultVerifier = struct {
             decoded.lock.target_architecture,
             architecture,
         )) return error.ArchitectureMismatch;
-        return .{ .binding = .{
-            .path = path,
-            .schema = exact_lock.schema_id,
-            .version = exact_lock.schema_version,
-            .digest_sha256 = decoded.lock.digest_sha256,
-        } };
+        if (!std.mem.eql(
+            u8,
+            &decoded.lock.request_sha256,
+            &expected_request_sha256,
+        )) return error.RequestDigestMismatch;
+        return .{
+            .binding = .{
+                .path = path,
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = decoded.lock.digest_sha256,
+            },
+            .semantic_request_sha256 = decoded.lock.request_sha256,
+        };
     }
 
     fn verifyTransaction(
@@ -1907,6 +2040,11 @@ pub const Engine = struct {
             allocator,
             generated_paths.exact_lock,
             profile.architecture,
+            try workflowSemanticDigest(
+                allocator,
+                workflow_operation,
+                selectors,
+            ),
         ) catch {
             return .{ .result = try self.failBeforeMutation(
                 allocator,
@@ -2029,6 +2167,7 @@ pub const Engine = struct {
             allocator,
             prepared.paths.exact_lock,
             loaded.view.architecture,
+            try semanticDigestForRequest(allocator, prepared.request),
         ) catch return self.finishPreMutationFailure(
             allocator,
             prepared,
@@ -2105,6 +2244,7 @@ pub const Engine = struct {
             allocator,
             prepared.paths.exact_lock,
             loaded.view.architecture,
+            try semanticDigestForRequest(allocator, prepared.request),
         ) catch return self.finishPreMutationFailure(
             allocator,
             prepared,
@@ -2176,6 +2316,7 @@ pub const Engine = struct {
             loaded.view,
             &current,
             false,
+            null,
             null,
         );
     }
@@ -2261,24 +2402,12 @@ pub const Engine = struct {
                 "recovery",
                 "active state is not a recoverable post-mutation operation",
             ) };
-        if (active.state.phase != .recovery_required and
-            active.state.phase != .recovering)
-        {
-            try self.transition(
-                allocator,
-                loaded.view.state_path,
-                &active,
-                .{
-                    .phase = .recovery_required,
-                    .diagnostic = "interrupted mutation requires recovery",
-                },
-            );
-        }
         const verified = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
             paths.exact_lock,
             loaded.view.architecture,
+            try semanticDigestForRequest(allocator, retained.request),
         ) catch return .{ .result = try api.failure(
             retained.request,
             .recovery,
@@ -2369,8 +2498,7 @@ pub const Engine = struct {
         );
         defer current.deinit();
         if (!stateMatchesPreparation(current.state, recovery.prepared) or
-            (current.state.phase != .recovery_required and
-                current.state.phase != .recovering))
+            !recoverableOuterPhase(current.state.phase))
             return api.failure(
                 recovery.prepared.request,
                 .recovery,
@@ -2383,6 +2511,10 @@ pub const Engine = struct {
             allocator,
             recovery.prepared.paths.exact_lock,
             loaded.view.architecture,
+            try semanticDigestForRequest(
+                allocator,
+                recovery.prepared.request,
+            ),
         ) catch return api.failure(
             recovery.prepared.request,
             .recovery,
@@ -2401,6 +2533,37 @@ pub const Engine = struct {
             "recovery",
             "retained exact lock was replaced before recovery",
         );
+        loaded.revalidate(allocator) catch return recoveryDiagnostic(
+            allocator,
+            recovery.prepared.request,
+            current.state.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            true,
+            recovery.prepared.profile_state_path,
+        );
+        var retained_final = self.store.readRetained(
+            allocator,
+            recovery.prepared.paths,
+        ) catch return recoveryDiagnostic(
+            allocator,
+            recovery.prepared.request,
+            current.state.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            true,
+            recovery.prepared.profile_state_path,
+        );
+        defer if (retained_final) |*owned| owned.deinit();
+        if (retained_final) |*retained|
+            return self.reconcileRetainedFinal(
+                allocator,
+                recovery.prepared,
+                &current,
+                retained.state,
+            );
         loaded.revalidate(allocator) catch return self.recoveryFailed(
             allocator,
             recovery.prepared,
@@ -2414,18 +2577,19 @@ pub const Engine = struct {
                 &current,
                 "lower-level root-operation status could not be inspected",
             );
-        if (lower_status == .clean or lower_status == .completed) {
+        if (lower_status == .clean) {
             const lower_recovery_completed =
                 current.state.phase == .recovering;
-            try self.transition(
-                allocator,
-                loaded.view.state_path,
-                &current,
-                .{
-                    .phase = .recovering,
-                    .diagnostic = "reconciling completed transaction",
-                },
-            );
+            if (current.state.phase == .recovery_required)
+                try self.transition(
+                    allocator,
+                    loaded.view.state_path,
+                    &current,
+                    .{
+                        .phase = .recovering,
+                        .diagnostic = "reconciling completed transaction",
+                    },
+                );
             loaded.revalidate(allocator) catch return self.recoveryFailed(
                 allocator,
                 recovery.prepared,
@@ -2450,6 +2614,7 @@ pub const Engine = struct {
                 &current,
                 lower_recovery_completed,
                 if (lower_completion) |owned| owned.document else null,
+                recovery_lock,
             );
         }
         try self.transition(
@@ -2463,6 +2628,10 @@ pub const Engine = struct {
             allocator,
             recovery.prepared.paths.exact_lock,
             loaded.view.architecture,
+            try semanticDigestForRequest(
+                allocator,
+                recovery.prepared.request,
+            ),
         ) catch return self.recoveryFailed(
             allocator,
             recovery.prepared,
@@ -2535,6 +2704,7 @@ pub const Engine = struct {
                 owned.document
             else
                 null,
+            before_recovery,
         );
     }
 
@@ -2546,6 +2716,7 @@ pub const Engine = struct {
         current: *operation_state.OwnedState,
         recovered: bool,
         recovery_document: ?root_operation_completion.Document,
+        recovery_lock: ?VerifiedLock,
     ) !api.Result {
         var retained: api.DocumentBinding = undefined;
         if (recovered and recovery_document != null) {
@@ -2555,6 +2726,8 @@ pub const Engine = struct {
                 document,
                 prepared,
                 profile,
+                recovery_lock orelse
+                    return error.MissingRecoveryLockVerification,
             )) return self.markRecoveryRequired(
                 allocator,
                 prepared,
@@ -2616,7 +2789,12 @@ pub const Engine = struct {
             profile.state_path,
             current,
             .{
-                .phase = if (recovered) .recovering else .verifying,
+                .phase = if (recovered or
+                    current.state.phase == .recovery_required or
+                    current.state.phase == .recovering)
+                    .recovering
+                else
+                    .verifying,
                 .transaction_result = retained,
                 .diagnostic = if (recovered)
                     "lower-level recovery completed"
@@ -2667,26 +2845,71 @@ pub const Engine = struct {
             "state",
             "completion is verified but durable active-state publication failed",
         );
-        var result: api.Result = .{
-            .operation = prepared.request.operation,
-            .request_sha256 = prepared.request_sha256,
-            .profile = prepared.profile,
-            .outcome = .success,
-            .exit_status = .success,
-            .changed = true,
-            .summary = if (recovered)
-                "transaction recovered and verified"
-            else
-                "transaction completed and verified",
-            .evidence = .{
+        return completedResult(allocator, prepared, final.state);
+    }
+
+    fn reconcileRetainedFinal(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        prepared: Preparation,
+        current: *operation_state.OwnedState,
+        retained: operation_state.State,
+    ) !api.Result {
+        if (!retainedFinalMatchesActive(retained, current.state, prepared))
+            return recoveryDiagnostic(
+                allocator,
+                prepared.request,
+                current.state.profile,
+                current.state.exact_lock,
+                current.state.transaction_result,
+                current.state.root_operation_completion,
+                true,
+                prepared.profile_state_path,
+            );
+        const transaction = retained.transaction_result.?;
+        const completion = retained.root_operation_completion.?;
+        self.store.verifyCompletionFn(
+            self.store.context,
+            allocator,
+            prepared.paths,
+            .{
+                .attempt_id = prepared.attempt_id,
+                .request_sha256 = prepared.request_sha256,
+                .profile = prepared.profile,
                 .exact_lock = prepared.exact_lock,
-                .transaction_result = retained,
-                .root_operation_completion = completion,
-                .active_operation_state = prepared.paths.retained_state,
+                .transaction_result = transaction,
+                .recovered = retained.outcome == .recovered,
+                .completed_unix = self.clock.nowFn(self.clock.context),
             },
-        };
-        result = try api.complete(result);
-        return api.ownResult(allocator, result);
+            completion,
+        ) catch return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            current.state.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            true,
+            prepared.profile_state_path,
+        );
+        self.store.finishFn(
+            self.store.context,
+            allocator,
+            prepared.paths,
+            operation_state.Expected.fromState(current.state),
+            retained,
+        ) catch return api.failure(
+            prepared.request,
+            .configuration,
+            .state_persistence_failed,
+            "state",
+            "retained final state could not reconcile the active operation",
+        );
+        return completedResult(
+            allocator,
+            prepared,
+            retained,
+        );
     }
 
     fn blockedByActive(
@@ -3111,6 +3334,35 @@ fn semanticOperation(operation: api.Operation) WorkflowOperation {
     };
 }
 
+fn workflowSemanticDigest(
+    allocator: std.mem.Allocator,
+    operation: WorkflowOperation,
+    selectors: []const solver.PackageSelector,
+) ![32]u8 {
+    return production_backend.workflowSemanticRequestDigest(
+        allocator,
+        switch (operation) {
+            .install => .install,
+            .remove => .remove,
+            .upgrade_all => .upgrade_all,
+        },
+        selectors,
+    );
+}
+
+fn semanticDigestForRequest(
+    allocator: std.mem.Allocator,
+    request: api.Request,
+) ![32]u8 {
+    const selectors = try selectorsFor(allocator, request);
+    defer allocator.free(selectors);
+    return workflowSemanticDigest(
+        allocator,
+        semanticOperation(request.operation),
+        selectors,
+    );
+}
+
 fn selectorsFor(
     allocator: std.mem.Allocator,
     request: api.Request,
@@ -3329,6 +3581,124 @@ fn documentEqual(
         std.mem.eql(u8, &left.digest_sha256, &right.digest_sha256);
 }
 
+fn completionEqual(
+    left: api.CompletionBinding,
+    right: api.CompletionBinding,
+) bool {
+    return documentEqual(left.document, right.document) and
+        std.mem.eql(
+            u8,
+            &left.completed_attempt_id,
+            &right.completed_attempt_id,
+        );
+}
+
+fn finalStateEquivalent(
+    retained: operation_state.State,
+    proposed: operation_state.State,
+) bool {
+    return retained.phase == .completed and
+        proposed.phase == .completed and
+        retained.generation == proposed.generation and
+        retained.operation == proposed.operation and
+        retained.mutation_started == proposed.mutation_started and
+        retained.outcome == proposed.outcome and
+        std.mem.eql(u8, &retained.attempt_id, &proposed.attempt_id) and
+        std.mem.eql(
+            u8,
+            &retained.request_sha256,
+            &proposed.request_sha256,
+        ) and
+        profileEqual(retained.profile, proposed.profile) and
+        retained.exact_lock != null and
+        proposed.exact_lock != null and
+        documentEqual(retained.exact_lock.?, proposed.exact_lock.?) and
+        retained.transaction_result != null and
+        proposed.transaction_result != null and
+        documentEqual(
+            retained.transaction_result.?,
+            proposed.transaction_result.?,
+        ) and
+        retained.root_operation_completion != null and
+        proposed.root_operation_completion != null and
+        completionEqual(
+            retained.root_operation_completion.?,
+            proposed.root_operation_completion.?,
+        );
+}
+
+fn recoverableOuterPhase(phase: operation_state.Phase) bool {
+    return switch (phase) {
+        .mutating,
+        .verifying,
+        .recovery_required,
+        .recovering,
+        .completed,
+        => true,
+        else => false,
+    };
+}
+
+fn retainedFinalMatchesActive(
+    retained: operation_state.State,
+    active: operation_state.State,
+    prepared: Preparation,
+) bool {
+    if (retained.phase != .completed or
+        (retained.outcome != .succeeded and retained.outcome != .recovered) or
+        !stateMatchesPreparation(retained, prepared) or
+        retained.transaction_result == null or
+        retained.root_operation_completion == null)
+        return false;
+    if (active.transaction_result) |transaction|
+        if (!documentEqual(transaction, retained.transaction_result.?))
+            return false;
+    if (active.root_operation_completion) |completion|
+        if (!completionEqual(
+            completion,
+            retained.root_operation_completion.?,
+        ))
+            return false;
+    if (retained.phase == active.phase and
+        retained.generation == active.generation and
+        std.mem.eql(
+            u8,
+            &retained.digest_sha256,
+            &active.digest_sha256,
+        ))
+        return true;
+    operation_state.validateTransition(active, retained) catch return false;
+    return true;
+}
+
+fn completedResult(
+    allocator: std.mem.Allocator,
+    prepared: Preparation,
+    final: operation_state.State,
+) !api.Result {
+    const recovered = final.outcome == .recovered;
+    var result: api.Result = .{
+        .operation = prepared.request.operation,
+        .request_sha256 = prepared.request_sha256,
+        .profile = prepared.profile,
+        .outcome = .success,
+        .exit_status = .success,
+        .changed = true,
+        .summary = if (recovered)
+            "transaction recovered and verified"
+        else
+            "transaction completed and verified",
+        .evidence = .{
+            .exact_lock = final.exact_lock,
+            .transaction_result = final.transaction_result,
+            .root_operation_completion = final.root_operation_completion,
+            .active_operation_state = prepared.paths.retained_state,
+        },
+    };
+    result = try api.complete(result);
+    return api.ownResult(allocator, result);
+}
+
 fn stateMatchesPreparation(
     state: operation_state.State,
     prepared: Preparation,
@@ -3357,6 +3727,7 @@ fn recoveryCompletionMatches(
     document: root_operation_completion.Document,
     prepared: Preparation,
     profile: ProfileView,
+    verified_lock: VerifiedLock,
 ) !bool {
     const lock = document.exact_lock orelse return false;
     const expected_operation: product_api.Operation = switch (prepared.request.operation) {
@@ -3373,10 +3744,25 @@ fn recoveryCompletionMatches(
     };
     const selectors = try selectorsFor(allocator, prepared.request);
     defer allocator.free(selectors);
-    const request_sha256 = try production_backend.workflowSemanticRequestDigest(
+    const semantic_request_sha256 = try production_backend.workflowSemanticRequestDigest(
         allocator,
         workflow_operation,
         selectors,
+    );
+    const options = executeOptions(profile, prepared.paths.exact_lock);
+    const original_request_sha256 = try production_backend.workflowProductRequestDigest(
+        allocator,
+        workflow_operation,
+        .execute,
+        selectors,
+        options,
+    );
+    const recovery_request_sha256 = try production_backend.workflowProductRequestDigest(
+        allocator,
+        workflow_operation,
+        .recover,
+        selectors,
+        options,
     );
     const operation_matches = switch (document.operation) {
         .package_transaction => |operation| operation == expected_operation,
@@ -3385,7 +3771,21 @@ fn recoveryCompletionMatches(
     return operation_matches and
         document.mutation_started and
         (document.outcome == .succeeded or document.outcome == .recovered) and
-        std.mem.eql(u8, &document.request_sha256, &request_sha256) and
+        std.mem.eql(
+            u8,
+            &verified_lock.semantic_request_sha256,
+            &semantic_request_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &document.request_sha256,
+            &original_request_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &document.discharge.request_sha256,
+            &recovery_request_sha256,
+        ) and
         std.mem.eql(u8, document.install_root, live_root.logical_root_path) and
         std.mem.eql(u8, document.target_architecture, profile.architecture) and
         std.mem.eql(u8, lock.schema, prepared.exact_lock.schema) and
@@ -3674,6 +4074,70 @@ fn syncDirectory(io: std.Io, dir: std.Io.Dir) !void {
     }
 }
 
+const TestStatePair = struct {
+    current: operation_state.OwnedState,
+    final: operation_state.OwnedState,
+
+    fn deinit(self: *TestStatePair) void {
+        self.final.deinit();
+        self.current.deinit();
+        self.* = undefined;
+    }
+};
+
+fn testStatePair(
+    allocator: std.mem.Allocator,
+    paths: OperationPaths,
+    attempt_id: [32]u8,
+) !TestStatePair {
+    const exact: api.DocumentBinding = .{
+        .path = paths.exact_lock,
+        .schema = exact_lock.schema_id,
+        .version = exact_lock.schema_version,
+        .digest_sha256 = @splat(0x51),
+    };
+    const transaction: api.DocumentBinding = .{
+        .path = paths.transaction_result,
+        .schema = transaction_provenance.schema_id,
+        .version = transaction_provenance.schema_version,
+        .digest_sha256 = @splat(0x52),
+    };
+    var current = try operation_state.create(allocator, .{
+        .attempt_id = attempt_id,
+        .generation = 7,
+        .operation = .install,
+        .phase = .verifying,
+        .mutation_started = true,
+        .outcome = .pending,
+        .request_sha256 = @splat(0x53),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x54),
+            .reference_evidence_sha256 = @splat(0x55),
+        },
+        .exact_lock = exact,
+        .transaction_result = transaction,
+        .updated_unix = 100,
+    });
+    errdefer current.deinit();
+    const completion: api.CompletionBinding = .{
+        .document = .{
+            .path = paths.completion,
+            .schema = completion_schema_id,
+            .version = completion_schema_version,
+            .digest_sha256 = @splat(0x56),
+        },
+        .completed_attempt_id = attempt_id,
+    };
+    const final = try nextState(allocator, current.state, .{
+        .phase = .completed,
+        .outcome = .succeeded,
+        .root_operation_completion = completion,
+        .updated_unix = 200,
+    });
+    return .{ .current = current, .final = final };
+}
+
 test "apt_system_orchestrator.test.selector parsing preserves one batch" {
     const request: api.Request = .{
         .operation = .install,
@@ -3750,6 +4214,221 @@ test "apt_system_orchestrator.test.system state store exposes durable operation 
     };
     const interface = store.interface();
     try std.testing.expect(interface.context == @as(*anyopaque, @ptrCast(&store)));
+}
+
+test "apt_system_orchestrator.test.system finish reuses retained final after pre-CAS crash" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try directory.dir.realPath(
+        std.testing.io,
+        &root_buffer,
+    );
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_buffer[0..root_length]},
+    );
+    defer std.testing.allocator.free(state_path);
+    const attempt_id: [32]u8 = @splat(0x41);
+    var paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        attempt_id,
+    );
+    defer paths.deinit(std.testing.allocator);
+    var states = try testStatePair(
+        std.testing.allocator,
+        paths,
+        attempt_id,
+    );
+    defer states.deinit();
+    var crash: TestFinishCrash = .{};
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .finish_crash = crash.interface(),
+    };
+    const interface = store.interface();
+    interface.reserveFn(
+        interface.context,
+        std.testing.allocator,
+        paths,
+        "{}",
+        states.current.state,
+    ) catch |err| switch (err) {
+        error.NotRootOwned => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(
+        error.InjectedFinishCrash,
+        interface.finishFn(
+            interface.context,
+            std.testing.allocator,
+            paths,
+            operation_state.Expected.fromState(states.current.state),
+            states.final.state,
+        ),
+    );
+    const retained_before = try readTrustedOperationFile(
+        std.testing.io,
+        std.testing.allocator,
+        paths.retained_state,
+        operation_state.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(retained_before);
+    var active = (try interface.readActive(
+        std.testing.allocator,
+        state_path,
+    )).?;
+    defer active.deinit();
+    try std.testing.expectEqual(
+        states.current.state.digest_sha256,
+        active.state.digest_sha256,
+    );
+
+    var regenerated = try nextState(
+        std.testing.allocator,
+        active.state,
+        .{
+            .phase = .completed,
+            .outcome = .succeeded,
+            .root_operation_completion = states.final.state.root_operation_completion,
+            .updated_unix = 999,
+        },
+    );
+    defer regenerated.deinit();
+    store.finish_crash = null;
+    try interface.finishFn(
+        interface.context,
+        std.testing.allocator,
+        paths,
+        operation_state.Expected.fromState(active.state),
+        regenerated.state,
+    );
+    try std.testing.expect((try interface.readActive(
+        std.testing.allocator,
+        state_path,
+    )) == null);
+    const retained_after = try readTrustedOperationFile(
+        std.testing.io,
+        std.testing.allocator,
+        paths.retained_state,
+        operation_state.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(retained_after);
+    try std.testing.expectEqualSlices(
+        u8,
+        retained_before,
+        retained_after,
+    );
+}
+
+test "apt_system_orchestrator.test.system finish rejects foreign retained final" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try directory.dir.realPath(
+        std.testing.io,
+        &root_buffer,
+    );
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_buffer[0..root_length]},
+    );
+    defer std.testing.allocator.free(state_path);
+    const attempt_id: [32]u8 = @splat(0x61);
+    var paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        attempt_id,
+    );
+    defer paths.deinit(std.testing.allocator);
+    var states = try testStatePair(
+        std.testing.allocator,
+        paths,
+        attempt_id,
+    );
+    defer states.deinit();
+    var crash: TestFinishCrash = .{};
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .finish_crash = crash.interface(),
+    };
+    const interface = store.interface();
+    interface.reserveFn(
+        interface.context,
+        std.testing.allocator,
+        paths,
+        "{}",
+        states.current.state,
+    ) catch |err| switch (err) {
+        error.NotRootOwned => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(
+        error.InjectedFinishCrash,
+        interface.finishFn(
+            interface.context,
+            std.testing.allocator,
+            paths,
+            operation_state.Expected.fromState(states.current.state),
+            states.final.state,
+        ),
+    );
+    var foreign_paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        @as([32]u8, @splat(0x62)),
+    );
+    defer foreign_paths.deinit(std.testing.allocator);
+    var foreign = try testStatePair(
+        std.testing.allocator,
+        foreign_paths,
+        @splat(0x62),
+    );
+    defer foreign.deinit();
+    const foreign_bytes = try foreign.final.state.canonicalJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(foreign_bytes);
+    const attempt_hex = std.fmt.bytesToHex(attempt_id, .lower);
+    const retained_relative = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "state/apt/operations/{s}/{s}",
+        .{ &attempt_hex, retained_state_name },
+    );
+    defer std.testing.allocator.free(retained_relative);
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = retained_relative,
+        .data = foreign_bytes,
+    });
+    store.finish_crash = null;
+    try std.testing.expectError(
+        error.PublicationConflict,
+        interface.finishFn(
+            interface.context,
+            std.testing.allocator,
+            paths,
+            operation_state.Expected.fromState(states.current.state),
+            states.final.state,
+        ),
+    );
+    var active = (try interface.readActive(
+        std.testing.allocator,
+        state_path,
+    )).?;
+    defer active.deinit();
+    try std.testing.expectEqual(
+        states.current.state.digest_sha256,
+        active.state.digest_sha256,
+    );
 }
 
 test "apt_system_orchestrator.test.ordinary completion uses a distinct lock-bound schema" {
@@ -4012,6 +4691,13 @@ const FakeRunner = struct {
     transport_roundtrip: bool = false,
     recovery_completion_source: ?[]u8 = null,
     recovery_completion_reads: usize = 0,
+    recovery_completion_mismatch: RecoveryCompletionMismatch = .none,
+
+    const RecoveryCompletionMismatch = enum {
+        none,
+        original_request,
+        discharge_request,
+    };
 
     fn deinit(self: *FakeRunner) void {
         if (self.recovery_completion_source) |source|
@@ -4094,7 +4780,11 @@ const FakeRunner = struct {
             result.owned_result = decoded;
         }
         if (request.mode == .recover and result.result.exit_status == .success) {
-            var completion = try fakeRecoveryCompletion(allocator, request);
+            var completion = try fakeRecoveryCompletion(
+                allocator,
+                request,
+                self.recovery_completion_mismatch,
+            );
             errdefer completion.deinit();
             const source = try completion.document.canonicalJson(self.allocator);
             if (self.recovery_completion_source) |previous|
@@ -4131,6 +4821,7 @@ const FakeRunner = struct {
 fn fakeRecoveryCompletion(
     allocator: std.mem.Allocator,
     request: WorkflowRequest,
+    mismatch: FakeRunner.RecoveryCompletionMismatch,
 ) !root_operation_completion.OwnedDocument {
     const production_operation: production_backend.WorkflowSemanticOperation = switch (request.operation) {
         .install => .install,
@@ -4142,11 +4833,22 @@ fn fakeRecoveryCompletion(
         .remove => .remove,
         .upgrade_all => .upgrade_all,
     };
-    const semantic_digest = try production_backend.workflowSemanticRequestDigest(
+    var original_request_digest = try production_backend.workflowProductRequestDigest(
         allocator,
         production_operation,
+        .execute,
         request.selectors,
+        request.options,
     );
+    var recovery_request_digest = try production_backend.workflowProductRequestDigest(
+        allocator,
+        production_operation,
+        .recover,
+        request.selectors,
+        request.options,
+    );
+    if (mismatch == .original_request) original_request_digest[0] ^= 0xff;
+    if (mismatch == .discharge_request) recovery_request_digest[0] ^= 0xff;
     var record = try root_operation.create(allocator, .{
         .attempt_id = @splat(0x91),
         .generation = 4,
@@ -4164,7 +4866,7 @@ fn fakeRecoveryCompletion(
             .version = exact_lock.schema_version,
             .digest_sha256 = @splat(0x55),
         } },
-        .request_sha256 = semantic_digest,
+        .request_sha256 = original_request_digest,
         .policy_sha256 = @splat(0x92),
         .target_architecture = request.options.architecture,
         .reserved_unix = 90,
@@ -4184,7 +4886,7 @@ fn fakeRecoveryCompletion(
         .discharge = .{
             .surface = .package_transaction,
             .operation = "recover",
-            .request_sha256 = @splat(0x93),
+            .request_sha256 = recovery_request_digest,
         },
     });
 }
@@ -4200,6 +4902,7 @@ const FakeStateStore = struct {
     retained_transaction: bool = false,
     completion_published: bool = false,
     fail_finish: bool = false,
+    fail_after_retain_once: bool = false,
 
     fn deinit(self: *FakeStateStore) void {
         if (self.active_bytes) |bytes| self.allocator.free(bytes);
@@ -4216,9 +4919,11 @@ const FakeStateStore = struct {
             .compareAndSetFn = compareAndSet,
             .finishFn = finish,
             .readRequestFn = readRequest,
+            .readRetainedFn = readRetained,
             .retainTransactionFn = retainTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
+            .verifyCompletionFn = verifyCompletion,
         };
     }
 
@@ -4289,6 +4994,12 @@ const FakeStateStore = struct {
     ) !void {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
         if (self.fail_finish) return error.InjectedFinishFailure;
+        if (self.fail_after_retain_once) {
+            self.fail_after_retain_once = false;
+            if (self.retained_bytes) |bytes| self.allocator.free(bytes);
+            self.retained_bytes = try final.canonicalJson(self.allocator);
+            return error.InjectedFinishCrash;
+        }
         if (expected.generation != final.generation or
             !std.mem.eql(
                 u8,
@@ -4310,6 +5021,20 @@ const FakeStateStore = struct {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
         return api.decodeRequest(allocator, self.request_bytes orelse
             return error.FileNotFound);
+    }
+
+    fn readRetained(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: OperationPaths,
+    ) !?operation_state.OwnedState {
+        const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        const bytes = self.retained_bytes orelse return null;
+        return try operation_state.decode(
+            allocator,
+            bytes,
+            operation_state.maximum_document_bytes,
+        );
     }
 
     fn retainTransaction(
@@ -4364,6 +5089,23 @@ const FakeStateStore = struct {
             .completed_attempt_id = input.attempt_id,
         };
     }
+
+    fn verifyCompletion(
+        context: *anyopaque,
+        _: std.mem.Allocator,
+        _: OperationPaths,
+        input: CompletionInput,
+        expected: api.CompletionBinding,
+    ) !void {
+        const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        if (!self.completion_published or
+            !std.mem.eql(
+                u8,
+                &expected.completed_attempt_id,
+                &input.attempt_id,
+            ))
+            return error.CompletionMismatch;
+    }
 };
 
 const FakeVerifier = struct {
@@ -4373,6 +5115,7 @@ const FakeVerifier = struct {
     transaction_digest: [32]u8 = @splat(0x66),
     lock_checks: usize = 0,
     different_lock_check: ?usize = null,
+    different_semantic_check: ?usize = null,
     transaction_checks: usize = 0,
 
     fn interface(self: *FakeVerifier) ResultVerifier {
@@ -4388,6 +5131,7 @@ const FakeVerifier = struct {
         _: std.mem.Allocator,
         path: []const u8,
         _: []const u8,
+        expected_request_sha256: [32]u8,
     ) !VerifiedLock {
         const self: *FakeVerifier = @ptrCast(@alignCast(context));
         self.lock_checks += 1;
@@ -4396,12 +5140,18 @@ const FakeVerifier = struct {
             [_]u8{0x77} ** 32
         else
             self.lock_digest;
-        return .{ .binding = .{
-            .path = path,
-            .schema = exact_lock.schema_id,
-            .version = exact_lock.schema_version,
-            .digest_sha256 = digest,
-        } };
+        var semantic_request_sha256 = expected_request_sha256;
+        if (self.different_semantic_check == self.lock_checks)
+            semantic_request_sha256[0] ^= 0xff;
+        return .{
+            .binding = .{
+                .path = path,
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = digest,
+            },
+            .semantic_request_sha256 = semantic_request_sha256,
+        };
     }
 
     fn verifyTransaction(
@@ -4463,6 +5213,22 @@ const FakeCompletionCrash = struct {
         if (!self.triggered and boundary == self.boundary) {
             self.triggered = true;
             return error.InjectedCompletionCrash;
+        }
+    }
+};
+
+const TestFinishCrash = struct {
+    triggered: bool = false,
+
+    fn interface(self: *TestFinishCrash) FinishCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, _: FinishBoundary) !void {
+        const self: *TestFinishCrash = @ptrCast(@alignCast(context));
+        if (!self.triggered) {
+            self.triggered = true;
+            return error.InjectedFinishCrash;
         }
     }
 };
@@ -4591,7 +5357,10 @@ test "apt_system_orchestrator.test.private runner transfers canonical result thr
             },
         },
     ) catch |err| switch (err) {
-        error.NotPrivileged, error.NamespaceUnavailable => return error.SkipZigTest,
+        error.NotPrivileged,
+        error.NamespaceUnavailable,
+        error.UnsafeRuntimeDirectory,
+        => return error.SkipZigTest,
         else => return err,
     };
     defer result.deinit();
@@ -4625,7 +5394,10 @@ test "apt_system_orchestrator.test.private runner validates every workflow mode 
                 },
             },
         ) catch |err| switch (err) {
-            error.NotPrivileged, error.NamespaceUnavailable => return error.SkipZigTest,
+            error.NotPrivileged,
+            error.NamespaceUnavailable,
+            error.UnsafeRuntimeDirectory,
+            => return error.SkipZigTest,
             else => return err,
         };
         defer result.deinit();
@@ -5163,6 +5935,96 @@ test "apt_system_orchestrator.test.recovery reconstructs retained request and ex
     try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
 }
 
+test "apt_system_orchestrator.test.completed lower record is discharged before outer reconciliation" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+    harness.runner.inspect_status = .completed;
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    var result = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(api.Outcome.success, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expect(harness.store.active_bytes == null);
+
+    var next = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.remove, &.{"beta"}),
+    ));
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 2), harness.backend.plan_calls);
+}
+
+test "apt_system_orchestrator.test.production recovery digest domains fail closed independently" {
+    inline for (.{ "original", "discharge", "semantic" }) |domain| {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.runner.fail_mode = .execute;
+        var interrupted = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer interrupted.deinit();
+        harness.runner.fail_mode = null;
+        var recovery = switch (try harness.engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        if (std.mem.eql(u8, domain, "original"))
+            harness.runner.recovery_completion_mismatch = .original_request
+        else if (std.mem.eql(u8, domain, "discharge"))
+            harness.runner.recovery_completion_mismatch = .discharge_request
+        else
+            harness.verifier.different_semantic_check =
+                harness.verifier.lock_checks + 2;
+        var result = try harness.engine.executeRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
+        try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+        try std.testing.expect(harness.store.active_bytes != null);
+        try std.testing.expect(!harness.store.completion_published);
+    }
+}
+
 test "apt_system_orchestrator.test.valid lock replacement is rejected before recovery mutation" {
     inline for (.{ @as(usize, 1), @as(usize, 2) }) |check_offset| {
         var harness = Harness.init(std.testing.allocator);
@@ -5426,6 +6288,61 @@ test "apt_system_orchestrator.test.finish failure leaves completion evidence act
     try std.testing.expectEqual(api.DiagnosticId.state_persistence_failed, result.diagnostics[0].id);
     try std.testing.expect(harness.store.active_bytes != null);
     try std.testing.expect(harness.store.completion_published);
+}
+
+test "apt_system_orchestrator.test.retained final state reconciles without regeneration" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.store.fail_after_retain_once = true;
+    var failed = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer failed.deinit();
+    try std.testing.expectEqual(
+        api.DiagnosticId.state_persistence_failed,
+        failed.diagnostics[0].id,
+    );
+    const retained_before = try std.testing.allocator.dupe(
+        u8,
+        harness.store.retained_bytes.?,
+    );
+    defer std.testing.allocator.free(retained_before);
+    harness.sources.now_value = 999;
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    const inspections_before = harness.runner.inspect_calls;
+    var result = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(api.Outcome.success, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
+    try std.testing.expectEqual(
+        inspections_before,
+        harness.runner.inspect_calls,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        retained_before,
+        harness.store.retained_bytes.?,
+    );
+    try std.testing.expect(harness.store.active_bytes == null);
 }
 
 comptime {

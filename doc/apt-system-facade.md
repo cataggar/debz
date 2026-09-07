@@ -266,7 +266,12 @@ same-directory atomic rename, directory sync, and operation locks. Completed
 operation directories are retained as history while the active record is
 removed only after the final state is durable. A crash before removal therefore
 leaves a deterministic active or completed record rather than an ambiguous
-symlink or cross-filesystem pointer.
+symlink or cross-filesystem pointer. If the retained final state was published
+but active-state compare-and-set was interrupted, retry strictly decodes that
+immutable document, verifies the same attempt, request, profile, lock,
+transaction, and completion bindings, and advances and clears the matching
+active state with the retained generation and timestamps. It never regenerates
+a competing final document; stale or foreign retained state fails closed.
 
 After a successful backend return, `SystemResultVerifier` rereads the canonical
 exact lock and validates `transaction-result.json` through
@@ -285,23 +290,32 @@ mismatches fail closed. A recoverable plan reports the stable action
 the original semantic `ProductionWorkflow` recovery request, rechecks the full
 lock binding immediately before recovery mutation, and verifies and retains its
 result through the same boundaries. Recovery first inspects the retained
-lower-level root-operation state. If that state is clear after lower-level
-recovery, it strictly decodes the retained
+lower-level root-operation state. Only a clean lower root can enter direct
+outer reconciliation. A completed lower record may still owe provenance, so it
+is routed through `ProductionWorkflow` recovery to
+`dischargeOwedProvenance`, which publishes the discharge and clears the record
+without replaying package mutation. Once the lower root is clean after
+recovery, the engine strictly decodes the retained
 `root-operation-completion-v1.json`, checks the semantic request, architecture,
 exact-lock schema/version/digest, operation, outcome, and recovery discharge,
 then retains that honest evidence and finalizes the outer state without
-rerunning lower-level recovery. The discharge can truthfully classify detailed
-transaction provenance as unavailable when publication was the interrupted
-boundary; it does not fabricate a transaction result. If lower-level recovery
-evidence remains active, the engine invokes workflow recovery exactly as
-retained. Crashes at every outer post-backend boundary converge through this
-reconciliation path exactly once, while canonical or binding mismatches remain
-recovery-required.
+rerunning lower-level recovery. The root record request digest is checked
+against the original execute-mode production product request, the discharge
+digest against the recover-mode production product request, and the exact
+lock's request digest against the separately computed semantic transaction
+request. These digest domains are never substituted for one another. The
+discharge can truthfully classify detailed transaction provenance as
+unavailable when publication was the interrupted boundary; it does not
+fabricate a transaction result. Crashes at every outer post-backend boundary
+converge through this reconciliation path exactly once, while canonical or
+binding mismatches remain recovery-required.
 
 Profile loading, live-root execution, workflow backend, state store,
 confirmation, result verifier, clock, and attempt-ID generation are explicit
-dependencies. Unit tests use only injected fakes; the reusable production
-adapters cover the strict profile loader, `ProductionWorkflow`, durable system
-store, and lock/provenance verifier. Only the capability-gated private-runner
-integration test enters the real namespace supervisor; it skips when the
-required Linux root namespace capabilities are unavailable.
+dependencies. Hermetic tests use injected fakes plus production-created
+root-operation evidence; capability-gated tests exercise the durable system
+store's real publication and crash-reconciliation path. The reusable
+production adapters cover the strict profile loader, `ProductionWorkflow`,
+durable system store, and lock/provenance verifier. Only the capability-gated
+private-runner integration test enters the real namespace supervisor; it skips
+when the required Linux root namespace capabilities are unavailable.

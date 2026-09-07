@@ -2325,6 +2325,32 @@ pub fn workflowSemanticRequestDigest(
     );
 }
 
+pub fn workflowProductRequestDigest(
+    allocator: std.mem.Allocator,
+    operation: WorkflowSemanticOperation,
+    mode: WorkflowMode,
+    selectors: []const solver.PackageSelector,
+    options: api.CommonOptions,
+) ![32]u8 {
+    const canonical = try allocator.dupe(solver.PackageSelector, selectors);
+    defer allocator.free(canonical);
+    std.mem.sort(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
+    const packages = try allocator.alloc([]const u8, canonical.len);
+    defer allocator.free(packages);
+    var formatted: usize = 0;
+    errdefer for (packages[0..formatted]) |package| allocator.free(package);
+    for (canonical, 0..) |selector, index| {
+        packages[index] = try formatSelector(allocator, selector);
+        formatted += 1;
+    }
+    defer for (packages) |package| allocator.free(package);
+    return productRequestDigest(.{
+        .operation = workflowSurfaceOperation(operation, mode),
+        .packages = packages,
+        .options = options,
+    });
+}
+
 fn hashLengthPrefixed(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     var length_buffer: [32]u8 = undefined;
     const length = std.fmt.bufPrint(&length_buffer, "{d}:", .{value.len}) catch unreachable;
@@ -3515,6 +3541,13 @@ test "production workflow recovery reconciles completion without a second mutati
             .{},
         ),
     );
+    const future = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expect(future.exit_status != .recovery);
 }
 
 test "production workflow successful recovery publishes honest completion evidence" {
@@ -3590,6 +3623,49 @@ test "production workflow successful recovery publishes honest completion eviden
     );
     try std.testing.expectEqual(root_operation.Outcome.recovered, completion.document.outcome);
     try std.testing.expectEqualStrings("recover", completion.document.discharge.operation);
+    try std.testing.expectEqualSlices(
+        u8,
+        &(try workflowProductRequestDigest(
+            allocator,
+            .remove,
+            .execute,
+            &selectors,
+            options,
+        )),
+        &completion.document.request_sha256,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &(try workflowProductRequestDigest(
+            allocator,
+            .remove,
+            .recover,
+            &selectors,
+            options,
+        )),
+        &completion.document.discharge.request_sha256,
+    );
+    const lock_source = try readFile(
+        allocator,
+        std.testing.io,
+        fixture.lock_path,
+        exact_lock.maximum_document_bytes,
+    );
+    var lock = try exact_lock.decode(
+        allocator,
+        lock_source,
+        exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &(try workflowSemanticRequestDigest(
+            allocator,
+            .remove,
+            &selectors,
+        )),
+        &lock.lock.request_sha256,
+    );
 }
 
 test "production workflow accepts batch install planning and requires lock-bound execution" {
@@ -3735,6 +3811,28 @@ test "production workflow digest binds every selector and product v1 stays singl
     });
     try std.testing.expect(!std.mem.eql(u8, &execute_first, &execute_batch));
     try std.testing.expect(!std.mem.eql(u8, &recovery_first, &recovery_batch));
+    try std.testing.expectEqualSlices(
+        u8,
+        &execute_batch,
+        &(try workflowProductRequestDigest(
+            allocator,
+            .install,
+            .execute,
+            &selectors,
+            options,
+        )),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &recovery_batch,
+        &(try workflowProductRequestDigest(
+            allocator,
+            .install,
+            .recover,
+            &selectors,
+            options,
+        )),
+    );
 
     var backend: Backend = .{ .io = std.testing.io };
     const rejected = try api.execute(allocator, .{
