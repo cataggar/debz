@@ -356,6 +356,38 @@ fn exerciseArchive(bytes: []const u8) !void {
         },
         .diagnostic => {},
     }
+    debz.archive_application.fuzzOne(std.testing.allocator, bytes, .{ .local = .{} }, .{
+        .payload = .{
+            .outer = .{
+                .max_archive_bytes = max_input,
+                .max_member_bytes = max_input,
+                .max_signature_bytes = 8192,
+                .max_members = 8,
+            },
+            .max_control_compressed_bytes = max_input,
+            .max_control_decompressed_bytes = 64 * 1024,
+            .max_data_compressed_bytes = max_input,
+            .max_data_decompressed_bytes = 64 * 1024,
+            .max_decoder_memory = 4 * 1024 * 1024,
+            .max_entries_per_tar = 128,
+            .max_path_bytes = 1024,
+            .max_link_bytes = 1024,
+            .max_inventory_bytes_per_tar = 64 * 1024,
+            .max_control_file_bytes = 8192,
+            .max_conffiles_bytes = 8192,
+            .max_conffiles = 64,
+            .max_maintainer_script_bytes = 8192,
+            .max_total_maintainer_script_bytes = 16 * 1024,
+            .max_total_entry_bytes = 64 * 1024,
+        },
+        .max_files = 128,
+        .max_control_members = 16,
+        .max_checksums_bytes = 8192,
+        .max_checksum_entries = 128,
+        .max_triggers_bytes = 8192,
+        .max_trigger_declarations = 64,
+        .max_control_member_bytes = 8192,
+    });
 }
 
 test "fuzz.lock provenance and transaction journals" {

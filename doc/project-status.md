@@ -105,6 +105,16 @@ inventory before an archive reaches the executor. The separate
 can enforce a narrow repository-descriptor profile. See
 [Debian payload validation](deb-payload-validation.md).
 
+`debz.archive_application.prepare` builds the native application model on top of
+that validation. It exposes normalized payload entries with mode, ownership,
+mtime, bounded content, digests, and link identity, verified `md5sums`,
+lifecycle scripts, conffile and trigger declarations, the control relationships
+that authorize placement, an explicit supported/unsupported feature
+classification, and a deterministic application digest that
+`archive_application.revalidate` must reproduce immediately before application.
+It writes no target file and implements no package-database or lifecycle
+semantics. See [Native archive application model](archive-application-model.md).
+
 `debz.dpkg_status` parses only caller-supplied status bytes or explicit paths. It preserves source diagnostics and models package identity, exact Debian versions, installation states, package flags, dependency relations, and installed size without implicitly reading the host dpkg database.
 
 `debz.package_database` imports a caller-captured `var/lib/dpkg` generation

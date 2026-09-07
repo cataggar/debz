@@ -190,13 +190,20 @@ pub const EntryKind = enum { regular, directory, symlink, hardlink };
 
 pub const Entry = struct {
     path: []u8,
+    /// Canonical archive-root-relative link identity used for conflict
+    /// validation. Absolute symlink targets are interpreted relative to the
+    /// archive root.
     link_target: ?[]u8,
+    /// Exact link bytes recorded by the archive. Applying a symlink must
+    /// publish these bytes rather than the canonical identity.
+    link_literal: ?[]u8,
     kind: EntryKind,
     mode: u32,
     uid: u64,
     gid: u64,
     owner_name: ?[]const u8,
     group_name: ?[]const u8,
+    mtime: u64,
     size: u64,
     header_offset: usize,
     content_offset: usize,
@@ -208,6 +215,7 @@ pub const RootEntry = struct {
     gid: u64,
     owner_name: ?[]const u8,
     group_name: ?[]const u8,
+    mtime: u64,
     header_offset: usize,
 };
 
@@ -1003,7 +1011,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 108, entries.items.len);
         const gid = parseOctal(header[116..124]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 116, entries.items.len);
-        _ = parseOctal(header[136..148]) orelse
+        const mtime = parseOctal(header[136..148]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 136, entries.items.len);
         _ = parseOctal(header[329..337]) orelse
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 329, entries.items.len);
@@ -1074,6 +1082,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
                 .gid = gid,
                 .owner_name = owner_name,
                 .group_name = group_name,
+                .mtime = mtime,
                 .header_offset = offset,
             };
             if (pending_long_name) |value| {
@@ -1099,6 +1108,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             return setTarFailure(diagnostic, stage, .conflicting_path, member, offset, entries.items.len);
 
         var link_target: ?[]u8 = null;
+        var link_literal: ?[]u8 = null;
         if (kind == .symlink or kind == .hardlink) {
             const raw_link = if (pending_long_link) |value| value else fieldString(header[157..257]) orelse
                 return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
@@ -1123,9 +1133,14 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
                 return setTarFailure(diagnostic, stage, .conflicting_path, member, offset + 157, entries.items.len);
             }
             link_target = target;
+            link_literal = allocator.dupe(u8, raw_link) catch {
+                allocator.free(target);
+                return setTarFailure(diagnostic, stage, .out_of_memory, member, offset + 157, entries.items.len);
+            };
         } else if (pending_long_link != null)
             return setTarFailure(diagnostic, stage, .unsupported_tar_extension, member, offset + 156, entries.items.len);
         errdefer if (link_target) |target| allocator.free(target);
+        errdefer if (link_literal) |literal| allocator.free(literal);
         if (hasSymlinkAncestor(&paths, path))
             return setTarFailure(diagnostic, stage, .conflicting_path, member, offset, entries.items.len);
         if (kind == .symlink and makesExistingLinkTargetSymlinkMediated(entries.items, path))
@@ -1136,6 +1151,10 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
         if (link_target) |target| {
             inventory_bytes = std.math.add(usize, inventory_bytes, target.len) catch
+                return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
+        }
+        if (link_literal) |literal| {
+            inventory_bytes = std.math.add(usize, inventory_bytes, literal.len) catch
                 return setTarFailure(diagnostic, stage, .tar_metadata_limit, member, offset, entries.items.len);
         }
         if (inventory_bytes > limits.max_inventory_bytes_per_tar)
@@ -1150,12 +1169,14 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         entries.append(allocator, .{
             .path = path,
             .link_target = link_target,
+            .link_literal = link_literal,
             .kind = kind,
             .mode = @intCast(mode_u64),
             .uid = uid,
             .gid = gid,
             .owner_name = owner_name,
             .group_name = group_name,
+            .mtime = mtime,
             .size = size,
             .header_offset = offset,
             .content_offset = content_offset,
@@ -1442,6 +1463,7 @@ fn validFilename(expected: Expected) bool {
 fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
     allocator.free(entry.path);
     if (entry.link_target) |target| allocator.free(target);
+    if (entry.link_literal) |literal| allocator.free(literal);
 }
 
 fn freeInventory(allocator: std.mem.Allocator, inventory: *TarInventory) void {

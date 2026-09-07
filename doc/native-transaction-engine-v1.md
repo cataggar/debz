@@ -54,6 +54,25 @@ missing checksum file is supported because Debian packages do not universally
 require one; malformed, duplicate, mismatched, or out-of-inventory entries are
 rejected.
 
+`debz.archive_application` implements this profile. It converts one validated
+archive into the application-ready model the engine and the native program
+compiler consume: normalized payload entries with kind, mode, uid, gid, mtime,
+bounded content offsets, SHA-256, verified MD5, symlink and hard-link identity,
+and directory metadata; lifecycle scripts with safe names, kinds, modes,
+digests, and bytes; conffile declarations; trigger declarations; and the
+`Pre-Depends`, `Depends`, `Conflicts`, `Breaks`, `Replaces`, `Provides`,
+`Essential`, architecture, and package/version facts that authorize placement.
+Each modeled archive carries a deterministic application digest, and
+`archive_application.revalidate` reproduces that digest from the artifact bytes
+immediately before application so the authenticated digest, size, and origin
+binding survives the gap between review and mutation. Feature support is an
+explicit classification rather than a best effort: `templates`, `shlibs`, and
+`symbols` are retained verbatim without interpretation, the debconf `config`
+script is preserved but never executed, and `alternatives` is rejected because
+dpkg acts on it. The complete supported and rejected tables, the pinned-fixture
+inventory, and the v1 support decision are in
+[Native archive application model](archive-application-model.md).
+
 ## Package database profile
 
 All paths below are relative to the selected root. Reads and writes use
