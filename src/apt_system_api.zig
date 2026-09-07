@@ -15,7 +15,7 @@ pub const schema_version: u32 = 1;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
 pub const maximum_diagnostics: usize = 8;
-pub const maximum_summary_bytes: usize = 4096;
+pub const maximum_summary_characters: usize = 4096;
 
 pub const Operation = enum {
     update,
@@ -323,7 +323,7 @@ pub fn validateRequest(request: Request) !void {
 
 pub fn validateResult(result: Result) !void {
     if (result.api_version != api_version) return error.UnsupportedApiVersion;
-    if (result.summary.len == 0 or result.summary.len > maximum_summary_bytes)
+    if (!validText(result.summary, maximum_summary_characters))
         return error.InvalidSummary;
     if (result.diagnostic_count > maximum_diagnostics)
         return error.TooManyDiagnostics;
@@ -341,8 +341,7 @@ pub fn validateResult(result: Result) !void {
         return error.UnexpectedTransactionEvidence;
     for (result.diagnostics[0..result.diagnostic_count]) |diagnostic| {
         if (diagnostic.outcome != result.outcome or
-            diagnostic.message.len == 0 or
-            diagnostic.message.len > maximum_summary_bytes)
+            !validText(diagnostic.message, maximum_summary_characters))
             return error.InvalidDiagnostic;
         if (diagnostic.phase) |phase|
             if (!validText(phase, 128)) return error.InvalidDiagnostic;
@@ -420,8 +419,10 @@ fn validPackage(package: []const u8) bool {
 }
 
 fn validText(text: []const u8, maximum: usize) bool {
-    if (text.len == 0 or text.len > maximum or !std.unicode.utf8ValidateSlice(text))
+    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text))
         return false;
+    const characters = std.unicode.utf8CountCodepoints(text) catch return false;
+    if (characters > maximum) return false;
     for (text) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     return true;
 }
@@ -842,6 +843,82 @@ test "apt_system_api.test.runtime rejects exit and diagnostic outcome mismatches
     result.exit_status = .planning;
     result.diagnostics[0].outcome = .download;
     try std.testing.expectError(error.InvalidDiagnostic, validateResult(result));
+}
+
+test "apt_system_api.test.invalid UTF-8 cannot be completed executed or serialized" {
+    const Fake = struct {
+        fn run(context: *anyopaque, _: std.mem.Allocator, _: Request) !Result {
+            const result: *Result = @ptrCast(@alignCast(context));
+            return result.*;
+        }
+    };
+    const request: Request = .{
+        .operation = .install,
+        .packages = &.{"curl"},
+    };
+    const invalid_utf8 = [_]u8{0xff};
+    var result = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "planning",
+        "planning failed",
+    );
+    result.summary = &invalid_utf8;
+    try std.testing.expectError(error.InvalidSummary, validateResult(result));
+    try std.testing.expectError(error.InvalidSummary, complete(result));
+    result.digest_sha256 = digestPayload(result);
+    try std.testing.expectError(
+        error.InvalidSummary,
+        result.canonicalJson(std.testing.allocator),
+    );
+    try std.testing.expectError(
+        error.InvalidBackendResult,
+        execute(std.testing.allocator, request, .{
+            .context = &result,
+            .executeFn = Fake.run,
+        }),
+    );
+
+    result.summary = "planning failed";
+    result.diagnostics[0].message = &invalid_utf8;
+    try std.testing.expectError(error.InvalidDiagnostic, validateResult(result));
+}
+
+test "apt_system_api.test.summary limits count Unicode characters" {
+    const request: Request = .{
+        .operation = .install,
+        .packages = &.{"curl"},
+    };
+    const valid = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters * 2,
+    );
+    defer std.testing.allocator.free(valid);
+    for (0..maximum_summary_characters) |index| {
+        valid[index * 2] = 0xc3;
+        valid[index * 2 + 1] = 0xa9;
+    }
+    var result = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "planning",
+        "planning failed",
+    );
+    result.summary = valid;
+    try validateResult(result);
+
+    const too_long = try std.testing.allocator.alloc(
+        u8,
+        (maximum_summary_characters + 1) * 2,
+    );
+    defer std.testing.allocator.free(too_long);
+    @memcpy(too_long[0..valid.len], valid);
+    too_long[valid.len] = 0xc3;
+    too_long[valid.len + 1] = 0xa9;
+    result.summary = too_long;
+    try std.testing.expectError(error.InvalidSummary, validateResult(result));
 }
 
 test "apt_system_api.test.result schema matches enums and absolute paths" {

@@ -751,9 +751,9 @@ fn stickyCompletion(
 }
 
 fn validDiagnostic(value: []const u8) bool {
-    if (value.len > api.maximum_summary_bytes or
-        !std.unicode.utf8ValidateSlice(value))
-        return false;
+    if (!std.unicode.utf8ValidateSlice(value)) return false;
+    const characters = std.unicode.utf8CountCodepoints(value) catch return false;
+    if (characters > api.maximum_summary_characters) return false;
     for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     return true;
 }
