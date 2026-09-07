@@ -746,8 +746,8 @@ fn lessInstalledRecord(_: void, left: dpkg_status.Package, right: dpkg_status.Pa
 /// Transaction planning is pure: it does not download package archives and
 /// never invokes dpkg or any other package executor.
 pub const PlanRequest = union(enum) {
-    install: PackageSelector,
-    remove: PackageSelector,
+    install: []const PackageSelector,
+    remove: []const PackageSelector,
     upgrade: []const PackageSelector,
     upgrade_all,
     reinstall: PackageSelector,
@@ -1059,7 +1059,7 @@ fn planInputSchemaVersion(input: PlanInput) u32 {
 
 fn planTransactionInternal(
     allocator: std.mem.Allocator,
-    input: PlanInput,
+    raw_input: PlanInput,
 ) PlanningError!PlanningResult {
     var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
     arena_ptr.* = .init(allocator);
@@ -1068,6 +1068,10 @@ fn planTransactionInternal(
         allocator.destroy(arena_ptr);
     }
     const owned = arena_ptr.allocator();
+    var canonical_request = try canonicalPlanRequest(allocator, raw_input.request);
+    defer canonical_request.deinit(allocator);
+    var input = raw_input;
+    input.request = canonical_request.request;
 
     if (!std.mem.eql(u8, input.target_architecture, input.installed.native_architecture)) {
         return failureOne(allocator, arena_ptr, .architecture_mismatch, null, null, "target architecture differs from installed-state native architecture");
@@ -1368,6 +1372,11 @@ fn lessRepositoryLookupIndex(
 }
 
 fn validatePlanPolicy(input: PlanInput) ?[]const u8 {
+    switch (input.request) {
+        .install => |selectors| if (validateSelectorSet(selectors)) |problem| return problem,
+        .remove => |selectors| if (validateSelectorSet(selectors)) |problem| return problem,
+        else => {},
+    }
     switch (input.policy.phased_updates) {
         .deterministic_percentage => |value| if (value > 100)
             return "deterministic phased-update value must be between 0 and 100",
@@ -1393,6 +1402,85 @@ fn validatePlanPolicy(input: PlanInput) ?[]const u8 {
         }
     }
     return null;
+}
+
+const CanonicalPlanRequest = struct {
+    request: PlanRequest,
+    selectors: ?[]PackageSelector = null,
+
+    fn deinit(self: *CanonicalPlanRequest, allocator: std.mem.Allocator) void {
+        if (self.selectors) |selectors| allocator.free(selectors);
+        self.* = undefined;
+    }
+};
+
+fn canonicalPlanRequest(
+    allocator: std.mem.Allocator,
+    request: PlanRequest,
+) !CanonicalPlanRequest {
+    return switch (request) {
+        .install => |selectors| canonicalSelectorRequest(allocator, .install, selectors),
+        .remove => |selectors| canonicalSelectorRequest(allocator, .remove, selectors),
+        .upgrade => |selectors| canonicalSelectorRequest(allocator, .upgrade, selectors),
+        .upgrade_all, .reinstall => .{ .request = request },
+    };
+}
+
+fn canonicalSelectorRequest(
+    allocator: std.mem.Allocator,
+    comptime tag: std.meta.Tag(PlanRequest),
+    selectors: []const PackageSelector,
+) !CanonicalPlanRequest {
+    const canonical = try allocator.dupe(PackageSelector, selectors);
+    std.mem.sort(PackageSelector, canonical, {}, lessPackageSelector);
+    return .{
+        .request = @unionInit(PlanRequest, @tagName(tag), canonical),
+        .selectors = canonical,
+    };
+}
+
+fn lessPackageSelector(_: void, left: PackageSelector, right: PackageSelector) bool {
+    const name_order = std.mem.order(u8, left.name, right.name);
+    if (name_order != .eq) return name_order == .lt;
+    const architecture_order = optionalTextOrder(left.architecture, right.architecture);
+    if (architecture_order != .eq) return architecture_order == .lt;
+    return optionalTextOrder(left.version, right.version) == .lt;
+}
+
+fn optionalTextOrder(left: ?[]const u8, right: ?[]const u8) std.math.Order {
+    if (left == null and right != null) return .lt;
+    if (left != null and right == null) return .gt;
+    if (left == null) return .eq;
+    return std.mem.order(u8, left.?, right.?);
+}
+
+fn validateSelectorSet(selectors: []const PackageSelector) ?[]const u8 {
+    if (selectors.len == 0) return "install and remove requests require at least one selector";
+    for (selectors) |selector| {
+        if (selector.name.len == 0 or
+            (selector.version != null and selector.version.?.len == 0) or
+            (selector.architecture != null and selector.architecture.?.len == 0))
+            return "package selectors may not contain empty components";
+    }
+    for (selectors, 0..) |selector, index| {
+        for (selectors[0..index]) |previous| {
+            if (!std.mem.eql(u8, selector.name, previous.name)) continue;
+            const same_architecture = selector.architecture == null or
+                previous.architecture == null or
+                std.mem.eql(u8, selector.architecture.?, previous.architecture.?);
+            if (!same_architecture) continue;
+            if (optionalTextEqual(selector.version, previous.version) and
+                optionalTextEqual(selector.architecture, previous.architecture))
+                return "package selector set contains a duplicate selector";
+            return "package selector set contains conflicting selectors for one package identity";
+        }
+    }
+    return null;
+}
+
+fn optionalTextEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn failureOne(
@@ -1707,7 +1795,7 @@ fn preflightRequest(
     jobs: *libsolv.Queue,
 ) PlanningError!?PlanFailure {
     switch (input.request) {
-        .install => |selector| {
+        .install => |selectors| for (selectors) |selector| {
             if (selector.version != null or selector.architecture != null) {
                 const candidate = findAvailableCandidate(context, selector) orelse {
                     return (try selectorFailure(backing, arena, context, selector)).failure;
@@ -1729,7 +1817,7 @@ fn preflightRequest(
                 libsolv.queue_push2(jobs, libsolv.SOLVER_INSTALL | libsolv.SOLVER_SOLVABLE | libsolv.SOLVER_FORCEBEST, candidate);
             }
         },
-        .remove => |selector| {
+        .remove => |selectors| for (selectors) |selector| {
             if (installedSelectorAmbiguous(context, selector)) {
                 return (try failureOne(backing, arena, .invalid_policy, selector.name, null, "installed package selector is ambiguous; specify an architecture")).failure;
             }
@@ -1865,7 +1953,15 @@ fn addAuthorizedReverseRemovalJobs(
                 }
             }
             if (!must_remove) continue;
-            if (!identityAuthorized(input.authorized_removals, dependent.name.value, dependent.architecture.value))
+            if (!requestedRemoval(
+                input.request,
+                context,
+                mapping.solvable_id,
+            ) and !identityAuthorized(
+                input.authorized_removals,
+                dependent.name.value,
+                dependent.architecture.value,
+            ))
                 return dependent.name.value;
             removed[dependent_index] = true;
             changed = true;
@@ -2231,32 +2327,40 @@ fn validateNamedInstallAction(
     input: PlanInput,
     actions: []const PlanAction,
 ) PlanningError!?PlanFailure {
-    const selector = switch (input.request) {
+    const selectors = switch (input.request) {
         .install => |value| value,
         else => return null,
     };
-    const candidate_id = findAvailableCandidate(context, selector) orelse return null;
-    const origin = findOrigin(internal(context), candidate_id).?;
-    if (findInstalledSelector(context, .{
-        .name = origin.package,
-        .version = origin.version,
-        .architecture = origin.architecture,
-    }) != null) return null;
-    for (actions) |action| {
-        if (!isRemoval(action.kind) and
-            std.mem.eql(u8, action.package, origin.package) and
-            std.mem.eql(u8, action.version, origin.version) and
-            std.mem.eql(u8, action.architecture, origin.architecture))
-            return null;
+    for (selectors) |selector| {
+        const candidate_id = findAvailableCandidate(context, selector) orelse continue;
+        const origin = findOrigin(internal(context), candidate_id).?;
+        if (findInstalledSelector(context, .{
+            .name = origin.package,
+            .version = origin.version,
+            .architecture = origin.architecture,
+        }) != null) continue;
+        var found = false;
+        for (actions) |action| {
+            if (!isRemoval(action.kind) and
+                std.mem.eql(u8, action.package, origin.package) and
+                std.mem.eql(u8, action.version, origin.version) and
+                std.mem.eql(u8, action.architecture, origin.architecture))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        return (try failureOne(
+            backing,
+            arena,
+            .unsatisfied_dependency,
+            selector.name,
+            null,
+            "solver did not materialize the selected named package",
+        )).failure;
     }
-    return (try failureOne(
-        backing,
-        arena,
-        .unsatisfied_dependency,
-        selector.name,
-        null,
-        "solver did not materialize the selected named package",
-    )).failure;
+    return null;
 }
 
 fn materializeProblems(
@@ -2651,12 +2755,12 @@ fn requestedIdentity(
     architecture: []const u8,
 ) bool {
     return switch (request) {
-        .install, .remove, .reinstall => |selector| selectorMatches(selector, name, version, architecture),
-        .upgrade => |selectors| blk: {
+        .install, .remove, .upgrade => |selectors| blk: {
             for (selectors) |selector|
                 if (selectorMatches(selector, name, version, architecture)) break :blk true;
             break :blk false;
         },
+        .reinstall => |selector| selectorMatches(selector, name, version, architecture),
         .upgrade_all => false,
     };
 }
@@ -2750,19 +2854,22 @@ fn materializeOrdering(
 }
 
 fn requestedRemoval(request: PlanRequest, context: *Context, solvable_id: libsolv.Id) bool {
-    const selector = switch (request) {
+    const selectors = switch (request) {
         .remove => |value| value,
         else => return false,
     };
     const installed_index = findInstalledBySolvable(context, solvable_id) orelse return false;
     const state = internal(context);
     const record = state.source_records[state.mappings[installed_index].record_index];
-    if (!std.mem.eql(u8, selector.name, record.name.value)) return false;
-    if (selector.version) |version|
-        if (!std.mem.eql(u8, version, record.version.spelling.value)) return false;
-    if (selector.architecture) |architecture|
-        if (!std.mem.eql(u8, architecture, record.architecture.value)) return false;
-    return true;
+    for (selectors) |selector| {
+        if (!std.mem.eql(u8, selector.name, record.name.value)) continue;
+        if (selector.version) |version|
+            if (!std.mem.eql(u8, version, record.version.spelling.value)) continue;
+        if (selector.architecture) |architecture|
+            if (!std.mem.eql(u8, architecture, record.architecture.value)) continue;
+        return true;
+    }
+    return false;
 }
 
 fn findOrigin(state: *Internal, solvable_id: libsolv.Id) ?*const OriginOwned {
@@ -4025,7 +4132,7 @@ test "planner materializes owned install closure and stable canonical JSON" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -4056,6 +4163,179 @@ test "planner materializes owned install closure and stable canonical JSON" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"schema_version\":2") != null);
+}
+
+test "solver.test.batch install submits requested selectors with one shared dependency" {
+    const text =
+        "Package: alpha\nVersion: 1\nArchitecture: amd64\nDepends: shared\nFilename: pool/alpha.deb\nSize: 2\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: beta\nVersion: 1\nArchitecture: amd64\nDepends: shared\nFilename: pool/beta.deb\nSize: 3\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n\n" ++
+        "Package: shared\nVersion: 1\nArchitecture: amd64\nFilename: pool/shared.deb\nSize: 5\n" ++
+        "SHA256: 3333333333333333333333333333333333333333333333333333333333333333\n";
+    const id = testRepositoryId('b');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const installed: ImportInput = .{
+        .records = &.{},
+        .native_architecture = "amd64",
+        .policies = &.{},
+        .hold_authority = .explicit_policy,
+    };
+    const selectors = [_]PackageSelector{ .{ .name = "alpha" }, .{ .name = "beta" } };
+    const reversed = [_]PackageSelector{ selectors[1], selectors[0] };
+    const first_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = installed,
+        .target_architecture = "amd64",
+        .request = .{ .install = &selectors },
+    });
+    var first = first_result.plan;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 3), first.actions.len);
+    try std.testing.expectEqual(@as(u64, 10), first.download_bytes);
+    try std.testing.expect(first.actions[0].requested);
+    try std.testing.expect(first.actions[1].requested);
+    try std.testing.expect(!first.actions[2].requested);
+
+    const second_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = installed,
+        .target_architecture = "amd64",
+        .request = .{ .install = &reversed },
+    });
+    var second = second_result.plan;
+    defer second.deinit();
+    const first_json = try first.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(first_json);
+    const second_json = try second.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(second_json);
+    try std.testing.expectEqualStrings(first_json, second_json);
+}
+
+test "solver.test.batch selectors reject empty duplicate and overlapping identities" {
+    const installed: ImportInput = .{
+        .records = &.{},
+        .native_architecture = "amd64",
+        .policies = &.{},
+        .hold_authority = .explicit_policy,
+    };
+    const cases = [_][]const PackageSelector{
+        &.{},
+        &.{ .{ .name = "demo" }, .{ .name = "demo" } },
+        &.{ .{ .name = "demo" }, .{ .name = "demo", .architecture = "amd64" } },
+        &.{ .{ .name = "demo", .architecture = "amd64", .version = "1" }, .{ .name = "demo", .architecture = "amd64", .version = "2" } },
+    };
+    const expected = [_][]const u8{
+        "install and remove requests require at least one selector",
+        "package selector set contains a duplicate selector",
+        "package selector set contains conflicting selectors for one package identity",
+        "package selector set contains conflicting selectors for one package identity",
+    };
+    inline for ([_]std.meta.Tag(PlanRequest){ .install, .remove }) |operation| {
+        for (cases, expected) |selectors, detail| {
+            const result = try planTransaction(std.testing.allocator, .{
+                .repositories = &.{},
+                .installed = installed,
+                .target_architecture = "amd64",
+                .request = @unionInit(PlanRequest, @tagName(operation), selectors),
+            });
+            var failure = result.failure;
+            defer failure.deinit();
+            try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
+            try std.testing.expectEqualStrings(detail, failure.problems[0].detail);
+        }
+    }
+}
+
+test "solver.test.batch install reports conflicts between separately requested packages" {
+    const text =
+        "Package: left\nVersion: 1\nArchitecture: amd64\nConflicts: right\nFilename: pool/left.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: right\nVersion: 1\nArchitecture: amd64\nFilename: pool/right.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('c');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const selectors = [_]PackageSelector{ .{ .name = "left" }, .{ .name = "right" } };
+    const result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = &selectors },
+    });
+    var failure = result.failure;
+    defer failure.deinit();
+    try std.testing.expect(failure.problems[0].kind == .conflict or
+        failure.problems[0].kind == .unsatisfied_dependency);
+}
+
+test "solver.test.batch architecture selectors and requested removals stay explicit" {
+    const text =
+        "Package: native\nVersion: 1\nArchitecture: amd64\nFilename: pool/native.deb\nSize: 1\n" ++
+        "SHA256: 1111111111111111111111111111111111111111111111111111111111111111\n\n" ++
+        "Package: data\nVersion: 1\nArchitecture: all\nFilename: pool/data.deb\nSize: 1\n" ++
+        "SHA256: 2222222222222222222222222222222222222222222222222222222222222222\n";
+    const id = testRepositoryId('d');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const selectors = [_]PackageSelector{
+        .{ .name = "native", .architecture = "amd64" },
+        .{ .name = "data", .architecture = "amd64" },
+    };
+    const install_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &repositories,
+        .installed = .{
+            .records = &.{},
+            .native_architecture = "amd64",
+            .policies = &.{},
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .install = &selectors },
+    });
+    var install_plan = install_result.plan;
+    defer install_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), install_plan.actions.len);
+    for (install_plan.actions) |action| try std.testing.expect(action.requested);
+
+    var database = try parsedDatabase(
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nDepends: lib\n\n" ++
+            "Package: lib\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    const policies = [_]InstalledPolicy{
+        .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+        .{ .name = "lib", .architecture = "amd64", .install_reason = .automatic, .held = false },
+    };
+    const removals = [_]PackageSelector{ .{ .name = "app" }, .{ .name = "lib" } };
+    const remove_result = try planTransaction(std.testing.allocator, .{
+        .repositories = &.{},
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .remove = &removals },
+        .policy = .{ .allow_remove_dependencies = true },
+    });
+    var remove_plan = remove_result.plan;
+    defer remove_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), remove_plan.summary.removals);
+    for (remove_plan.actions) |action| {
+        try std.testing.expect(action.requested);
+        try std.testing.expectEqual(ActionReason.explicit_request, action.reason);
+    }
 }
 
 test "solver.test.mixed authenticated repository and verified local artifact produce plan v3" {
@@ -4108,7 +4388,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -4196,7 +4476,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
         .exact_lock_v2 = &lock.lock,
     });
     var replay_plan = replay_result.plan;
@@ -4215,7 +4495,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
     });
     var reversed_plan = reversed_result.plan;
     defer reversed_plan.deinit();
@@ -4237,7 +4517,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "vendor-repo" } },
+        .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
         .exact_lock_v2 = &lock.lock,
     });
     var substitution_failure = substituted_result.failure;
@@ -4303,7 +4583,7 @@ test "solver.test.v1 exact lock replay remains repository-only schema v2" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
         .exact_lock = &lock.lock,
     });
     var plan = result.plan;
@@ -4349,7 +4629,7 @@ test "solver.test.local planning failures use v3 while repository failures remai
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "demo" } },
+        .request = .{ .install = &.{.{ .name = "demo" }} },
     });
     var local_failure = local_result.failure;
     defer local_failure.deinit();
@@ -4377,7 +4657,7 @@ test "solver.test.local planning failures use v3 while repository failures remai
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "demo" } },
+        .request = .{ .install = &.{.{ .name = "demo" }} },
     });
     var repository_failure = repository_result.failure;
     defer repository_failure.deinit();
@@ -4451,7 +4731,7 @@ test "solver.test.exact lock v2 reinstalls matching local dpkg identity" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "demo" } },
+        .request = .{ .install = &.{.{ .name = "demo" }} },
         .exact_lock_v2 = &lock.lock,
     });
     var plan = result.plan;
@@ -4486,7 +4766,7 @@ test "planner installs a named package with Debian replacement metadata" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "apt" } },
+        .request = .{ .install = &.{.{ .name = "apt" }} },
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -4510,7 +4790,7 @@ test "real metadata facts produce ubuntu-minimal closures on native architecture
                 .hold_authority = .explicit_policy,
             },
             .target_architecture = architecture,
-            .request = .{ .install = .{ .name = "ubuntu-minimal" } },
+            .request = .{ .install = &.{.{ .name = "ubuntu-minimal" }} },
         });
         var plan = result.plan;
         defer plan.deinit();
@@ -4578,7 +4858,7 @@ test "planner rejects untrusted duplicate and unhealthy inputs before solve" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     var failure = result.failure;
     try std.testing.expectEqual(ProblemKind.unauthenticated_repository, failure.problems[0].kind);
@@ -4597,7 +4877,7 @@ test "planner rejects untrusted duplicate and unhealthy inputs before solve" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     failure = result.failure;
     try std.testing.expectEqual(ProblemKind.duplicate_repository, failure.problems[0].kind);
@@ -4650,7 +4930,7 @@ test "planner enforces exact selection downgrade and protected held essential po
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app", .version = "1", .architecture = "amd64" } },
+        .request = .{ .install = &.{.{ .name = "app", .version = "1", .architecture = "amd64" }} },
     });
     var failure = result.failure;
     try std.testing.expectEqual(ProblemKind.unsupported_feature, failure.problems[0].kind);
@@ -4665,7 +4945,7 @@ test "planner enforces exact selection downgrade and protected held essential po
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .remove = .{ .name = "base" } },
+        .request = .{ .remove = &.{.{ .name = "base" }} },
     });
     failure = result.failure;
     try std.testing.expectEqual(ProblemKind.essential_violation, failure.problems[0].kind);
@@ -4715,7 +4995,7 @@ test "planner recommends policy and repository priority are deterministic" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "root" } },
+        .request = .{ .install = &.{.{ .name = "root" }} },
         .policy = .{ .recommends = true },
     });
     var plan = result.plan;
@@ -4752,7 +5032,7 @@ test "planner protects reverse dependencies and returns typed unsat graph" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .remove = .{ .name = "lib" } },
+        .request = .{ .remove = &.{.{ .name = "lib" }} },
     });
     var failure = result.failure;
     defer failure.deinit();
@@ -4816,7 +5096,7 @@ test "planner supports named upgrade upgrade-all and explicitly allowed downgrad
         .repositories = &repositories,
         .installed = installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app", .version = "1", .architecture = "amd64" } },
+        .request = .{ .install = &.{.{ .name = "app", .version = "1", .architecture = "amd64" }} },
         .policy = .{ .allow_downgrade = true },
     });
     var down = down_result.plan;
@@ -4848,7 +5128,7 @@ test "planner reports exact architecture version and conflict failures" {
         .repositories = &repositories,
         .installed = installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "root", .architecture = "arm64" } },
+        .request = .{ .install = &.{.{ .name = "root", .architecture = "arm64" }} },
     });
     var failure = result.failure;
     try std.testing.expectEqual(ProblemKind.architecture_mismatch, failure.problems[0].kind);
@@ -4858,7 +5138,7 @@ test "planner reports exact architecture version and conflict failures" {
         .repositories = &repositories,
         .installed = installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "root", .version = "9" } },
+        .request = .{ .install = &.{.{ .name = "root", .version = "9" }} },
     });
     failure = result.failure;
     try std.testing.expectEqual(ProblemKind.version_mismatch, failure.problems[0].kind);
@@ -4868,7 +5148,7 @@ test "planner reports exact architecture version and conflict failures" {
         .repositories = &repositories,
         .installed = installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "root" } },
+        .request = .{ .install = &.{.{ .name = "root" }} },
     });
     failure = result.failure;
     defer failure.deinit();
@@ -4960,7 +5240,7 @@ test "phased updates require deterministic explicit opt in" {
         },
         .phased_candidates = &phased,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     var failure = result.failure;
     failure.deinit();
@@ -4975,7 +5255,7 @@ test "phased updates require deterministic explicit opt in" {
         },
         .phased_candidates = &phased,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
         .policy = .{ .phased_updates = .include_all },
     });
     var plan = result.plan;
@@ -5009,7 +5289,7 @@ test "candidate enumeration permutations produce byte-identical plans" {
         .repositories = &first_repositories,
         .installed = base_installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     var first = first_result.plan;
     defer first.deinit();
@@ -5017,7 +5297,7 @@ test "candidate enumeration permutations produce byte-identical plans" {
         .repositories = &second_repositories,
         .installed = base_installed,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app" } },
+        .request = .{ .install = &.{.{ .name = "app" }} },
     });
     var second = second_result.plan;
     defer second.deinit();
@@ -5054,7 +5334,7 @@ test "install-only policy retains installed version and installs exact new versi
         },
         .install_only = &install_only,
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "kernel", .version = "2", .architecture = "amd64" } },
+        .request = .{ .install = &.{.{ .name = "kernel", .version = "2", .architecture = "amd64" }} },
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -5084,7 +5364,7 @@ test "reverse dependency removal requires complete explicit authorization" {
         },
         .authorized_removals = &authorized,
         .target_architecture = "amd64",
-        .request = .{ .remove = .{ .name = "lib" } },
+        .request = .{ .remove = &.{.{ .name = "lib" }} },
         .policy = .{ .allow_remove_dependencies = true },
     });
     var plan = result.plan;
@@ -5123,7 +5403,7 @@ test "exact unqualified selection prefers native architecture and request identi
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "app", .version = "1" } },
+        .request = .{ .install = &.{.{ .name = "app", .version = "1" }} },
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -5165,7 +5445,7 @@ test "ambiguous installed multiarch requests and contradictory limits fail expli
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .remove = .{ .name = "app" } },
+        .request = .{ .remove = &.{.{ .name = "app" }} },
     });
     var failure = result.failure;
     try std.testing.expectEqual(ProblemKind.invalid_policy, failure.problems[0].kind);
@@ -5289,7 +5569,7 @@ test "solver.test.large reversed local lock replay uses bounded indexes" {
             .hold_authority = .explicit_policy,
         },
         .target_architecture = "amd64",
-        .request = .{ .install = .{ .name = "package-00001" } },
+        .request = .{ .install = &.{.{ .name = "package-00001" }} },
         .exact_lock_v2 = &lock.lock,
     });
     var plan = result.plan;

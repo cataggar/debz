@@ -23,6 +23,24 @@ const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = transaction_engine.Executor;
 
+/// Internal package workflow contract. Product API v1 remains a singleton
+/// facade for install and remove; orchestrators use this seam when one
+/// reviewed exact lock must bind a batch.
+pub const WorkflowSemanticOperation = enum { install, remove, upgrade_all };
+pub const WorkflowMode = enum { plan_only, download_only, execute, recover };
+
+pub const WorkflowRequest = struct {
+    operation: WorkflowSemanticOperation,
+    mode: WorkflowMode,
+    selectors: []const solver.PackageSelector = &.{},
+    options: api.CommonOptions,
+};
+
+const WorkflowDirective = struct {
+    operation: WorkflowSemanticOperation,
+    mode: WorkflowMode,
+};
+
 /// Durable boundary inside the completion sequence of one product mutation.
 ///
 /// The window between the terminal `completed` record and the cleared active
@@ -95,6 +113,71 @@ pub const Backend = struct {
     pub fn execute(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
         return self.route(allocator, request) catch |err|
             mapRuntimeError(request.operation, err);
+    }
+
+    /// Executes the internal semantic-operation/mode contract. Planning and
+    /// downloading cannot reserve or mutate the root. Execution and recovery
+    /// require an explicit exact lock, confirmation, and conffile policy.
+    pub fn executeWorkflow(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        workflow: WorkflowRequest,
+    ) !api.Result {
+        const operation = workflowSurfaceOperation(workflow.operation, workflow.mode);
+        const count_valid = switch (workflow.operation) {
+            .install, .remove => workflow.selectors.len != 0,
+            .upgrade_all => workflow.selectors.len == 0,
+        };
+        if (!count_valid)
+            return api.failure(operation, .usage, .invalid_request, "invalid workflow selector count");
+        if (workflow.mode == .plan_only and workflow.options.lock_output_path == null)
+            return api.failure(operation, .usage, .configuration_required, "plan-only workflow requires an exact-lock output path");
+        if (workflow.mode == .execute or workflow.mode == .recover) {
+            if (workflow.options.lock_input_path == null)
+                return api.failure(operation, .usage, .configuration_required, "execution and recovery require an exact-lock input");
+            if (!workflow.options.assume_yes)
+                return api.failure(operation, .usage, .confirmation_required, "execution and recovery require explicit confirmation");
+            if (workflow.options.conffile == .unspecified)
+                return api.failure(operation, .usage, .conffile_policy_required, "execution and recovery require an explicit conffile policy");
+        }
+        if (workflow.mode == .execute or workflow.mode == .recover) {
+            _ = self.selectedExecutor() catch return api.failure(
+                operation,
+                .unavailable,
+                .transaction_backend_unavailable,
+                "selected transaction backend is unavailable",
+            );
+        }
+
+        const canonical_selectors = try allocator.dupe(solver.PackageSelector, workflow.selectors);
+        defer allocator.free(canonical_selectors);
+        std.mem.sort(
+            solver.PackageSelector,
+            canonical_selectors,
+            {},
+            lessWorkflowSelector,
+        );
+        const packages = try allocator.alloc([]const u8, canonical_selectors.len);
+        defer allocator.free(packages);
+        var formatted_count: usize = 0;
+        errdefer for (packages[0..formatted_count]) |package| allocator.free(package);
+        for (canonical_selectors, 0..) |selector, index| {
+            packages[index] = try formatSelector(allocator, selector);
+            formatted_count += 1;
+        }
+        defer {
+            for (packages) |package| allocator.free(package);
+        }
+
+        const request: api.Request = .{
+            .operation = operation,
+            .packages = packages,
+            .options = workflow.options,
+        };
+        return self.withRepositories(allocator, request, .{
+            .operation = workflow.operation,
+            .mode = workflow.mode,
+        }) catch |err| mapRuntimeError(operation, err);
     }
 
     pub fn packageCacheFingerprint(
@@ -350,7 +433,7 @@ pub const Backend = struct {
             .list_installed => self.listInstalled(allocator, request),
             .why => self.why(allocator, request),
             .clean => self.clean(allocator, request),
-            else => self.withRepositories(allocator, request),
+            else => self.withRepositories(allocator, request, null),
         };
     }
 
@@ -440,7 +523,12 @@ pub const Backend = struct {
         );
     }
 
-    fn withRepositories(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
+    fn withRepositories(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        workflow: ?WorkflowDirective,
+    ) !api.Result {
         if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "repository command requires --source or --config");
         if (request.options.keyring_paths.len == 0)
@@ -455,7 +543,7 @@ pub const Backend = struct {
         // root access.
         var guard: RootOperationGuard = .{ .backend = self, .allocator = allocator };
         defer guard.deinit();
-        if (rootOperationSurface(request.operation)) |operation| {
+        if (workflowRootOperation(request.operation, workflow)) |operation| {
             if (guard.open(allocator, request, operation)) |failure| return failure;
         }
 
@@ -466,7 +554,7 @@ pub const Backend = struct {
         // interrupted. Running the command-oriented executor first would ask
         // the legacy journal about a transaction it already archived and
         // answer with a failure that can never discharge the obligation.
-        if (request.operation == .recover) {
+        if (workflowMode(request.operation, workflow) == .recover) {
             if (try self.dischargeOwedProvenance(allocator, &guard, request)) |result|
                 return result;
         }
@@ -531,7 +619,7 @@ pub const Backend = struct {
         var refresh_outcome = try repository_policy.refreshAll(allocator, .{
             .configuration = &configuration,
             .runtimes = runtimes,
-            .mode = if (request.operation == .recover or request.options.offline or request.options.cache_only)
+            .mode = if (workflowMode(request.operation, workflow) == .recover or request.options.offline or request.options.cache_only)
                 .cache_only
             else
                 .online,
@@ -571,20 +659,25 @@ pub const Backend = struct {
 
         var installed = try self.loadInstalled(allocator, request);
         defer installed.deinit();
-        const planning_records = if (request.operation == .recover)
+        const planning_records = if (workflowMode(request.operation, workflow) == .recover)
             try healthyInstalledRecords(allocator, installed.database.packages)
         else
             installed.database.packages;
-        defer if (request.operation == .recover) allocator.free(planning_records);
+        defer if (workflowMode(request.operation, workflow) == .recover) allocator.free(planning_records);
         const policies = try installedPolicies(allocator, planning_records);
         defer allocator.free(policies);
-        var recovery_intent: ?std.json.Parsed(RecoveryIntent) = if (request.operation == .recover)
+        var recovery_intent: ?std.json.Parsed(RecoveryIntent) = if (workflowMode(request.operation, workflow) == .recover)
             try readRecoveryIntent(allocator, self.io, request.options.state_path)
         else
             null;
         defer if (recovery_intent) |*value| value.deinit();
         var effective_request = request;
         if (recovery_intent) |*intent| {
+            if (workflow) |directive| {
+                if (intent.value.operation != workflowSemanticSurface(directive.operation) or
+                    !stringSlicesEqual(intent.value.packages, request.packages))
+                    return api.failure(request.operation, .recovery, .recovery_failed, "recovery intent does not match the requested semantic operation and selectors");
+            }
             effective_request.operation = intent.value.operation;
             effective_request.packages = intent.value.packages;
             effective_request.options.recommends = intent.value.recommends;
@@ -594,8 +687,9 @@ pub const Backend = struct {
             effective_request.options.force = intent.value.force;
             effective_request.options.lock_wait_ms = intent.value.lock_wait_ms;
         }
+        const mode = workflowMode(request.operation, workflow);
         if (request.options.lock_output_path != null and request.options.lock_input_path == null and
-            request.operation != .plan and request.operation != .download)
+            mode != .plan_only and mode != .download_only)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output without --lock-input is restricted to non-mutating plan or download lock resolution");
         var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
             readLock(allocator, self.io, path) catch
@@ -615,8 +709,8 @@ pub const Backend = struct {
                 .hold_authority = .explicit_policy,
             },
             .target_architecture = request.options.architecture,
-            .mode = if (effective_request.operation == .download) .download_only else .plan_only,
-            .request = try planRequestFromSelectors(effective_request.operation, selectors),
+            .mode = if (mode == .download_only) .download_only else .plan_only,
+            .request = try planRequestFromWorkflow(effective_request.operation, workflow, selectors),
             .policy = .{
                 .recommends = effective_request.options.recommends,
                 .allow_downgrade = effective_request.options.allow_downgrade,
@@ -638,6 +732,11 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
+        if (lock) |*value| {
+            const digest = try canonicalPlanDigest(allocator, plan.*);
+            if (!std.mem.eql(u8, &digest, &value.lock.request_sha256))
+                return api.failure(request.operation, .planning, .planning_failed, "exact lock does not bind the complete requested plan");
+        }
         var generated_lock: ?exact_lock.OwnedLock = null;
         defer if (generated_lock) |*value| value.deinit();
         if (request.options.lock_output_path) |path| {
@@ -663,7 +762,7 @@ pub const Backend = struct {
                 try writeLock(allocator, self.io, path, generated_lock.?.lock);
             }
         }
-        if (request.operation == .plan) return planResult(allocator, request.operation, plan.*);
+        if (mode == .plan_only) return planResult(allocator, request.operation, plan.*);
 
         // The reviewed plan and the exact lock it was resolved against are the
         // preflight evidence for this attempt. Binding them before acquisition
@@ -709,7 +808,7 @@ pub const Backend = struct {
                     .selected = selected,
                     .policy = .{
                         .mode = if (request.options.offline or request.options.cache_only) .cache_only else .online,
-                        .workflow = if (request.operation == .download) .download_only else .transaction,
+                        .workflow = if (mode == .download_only) .download_only else .transaction,
                         .maximum_package_bytes = 1024 * 1024 * 1024,
                         .deadlines = deadlines(request.options.deadline_ms),
                         .redirect_limit = 8,
@@ -783,7 +882,7 @@ pub const Backend = struct {
             });
             try verified.append(allocator, package);
         }
-        if (request.operation == .download)
+        if (mode == .download_only)
             return planResultChanged(allocator, request.operation, plan.*, false, "packages downloaded and verified");
 
         const executor_policy = try executionPolicy(allocator, effective_request);
@@ -808,7 +907,7 @@ pub const Backend = struct {
             .journal = journal.interface(),
             .status = status_reader.interface(),
         };
-        if (request.operation == .recover) {
+        if (mode == .recover) {
             const executor = self.selectedExecutor() catch unreachable;
             // The journal is command-oriented, so the bridge stays pending
             // until the executor reports which commands it replayed.
@@ -1338,6 +1437,49 @@ fn rootOperationSurface(operation: api.Operation) ?root_operation.Operation {
         .clean,
         => null,
     };
+}
+
+fn workflowSemanticSurface(operation: WorkflowSemanticOperation) api.Operation {
+    return switch (operation) {
+        .install => .install,
+        .remove => .remove,
+        .upgrade_all => .upgrade_all,
+    };
+}
+
+fn workflowSurfaceOperation(
+    operation: WorkflowSemanticOperation,
+    mode: WorkflowMode,
+) api.Operation {
+    return switch (mode) {
+        .plan_only => .plan,
+        .download_only => .download,
+        .execute => workflowSemanticSurface(operation),
+        .recover => .recover,
+    };
+}
+
+fn workflowMode(operation: api.Operation, workflow: ?WorkflowDirective) WorkflowMode {
+    if (workflow) |directive| return directive.mode;
+    return switch (operation) {
+        .plan => .plan_only,
+        .download => .download_only,
+        .recover => .recover,
+        else => .execute,
+    };
+}
+
+fn workflowRootOperation(
+    operation: api.Operation,
+    workflow: ?WorkflowDirective,
+) ?root_operation.Operation {
+    if (workflow) |directive| return switch (directive.mode) {
+        .plan_only, .download_only => null,
+        .execute, .recover => .{
+            .package_transaction = workflowSemanticSurface(directive.operation),
+        },
+    };
+    return rootOperationSurface(operation);
 }
 
 /// Bounded digest of the reviewed request. It binds exactly what the caller
@@ -2075,16 +2217,66 @@ fn healthyInstalledRecords(
     return records.toOwnedSlice(allocator);
 }
 
-fn planRequestFromSelectors(operation: api.Operation, selectors: []solver.PackageSelector) !solver.PlanRequest {
+fn planRequestFromWorkflow(
+    operation: api.Operation,
+    workflow: ?WorkflowDirective,
+    selectors: []solver.PackageSelector,
+) !solver.PlanRequest {
+    if (workflow) |directive| return switch (directive.operation) {
+        .install => .{ .install = selectors },
+        .remove => .{ .remove = selectors },
+        .upgrade_all => .upgrade_all,
+    };
     return switch (operation) {
-        .install, .plan, .download => if (selectors.len == 0) .upgrade_all else .{ .install = selectors[0] },
-        .remove => .{ .remove = selectors[0] },
+        .install, .plan, .download => if (selectors.len == 0) .upgrade_all else .{ .install = selectors[0..1] },
+        .remove => .{ .remove = selectors[0..1] },
         .upgrade => .{ .upgrade = selectors },
         .upgrade_all => .upgrade_all,
         .reinstall => .{ .reinstall = selectors[0] },
         .recover => .upgrade_all,
         else => error.InvalidOperation,
     };
+}
+
+fn formatSelector(allocator: std.mem.Allocator, selector: solver.PackageSelector) ![]u8 {
+    if (selector.name.len == 0 or
+        (selector.version != null and selector.version.?.len == 0) or
+        (selector.architecture != null and selector.architecture.?.len == 0))
+        return error.InvalidSelector;
+    if (selector.architecture) |architecture| {
+        if (selector.version) |version|
+            return std.fmt.allocPrint(allocator, "{s}:{s}={s}", .{ selector.name, architecture, version });
+        return std.fmt.allocPrint(allocator, "{s}:{s}", .{ selector.name, architecture });
+    }
+    if (selector.version) |version|
+        return std.fmt.allocPrint(allocator, "{s}={s}", .{ selector.name, version });
+    return allocator.dupe(u8, selector.name);
+}
+
+fn lessWorkflowSelector(
+    _: void,
+    left: solver.PackageSelector,
+    right: solver.PackageSelector,
+) bool {
+    const name_order = std.mem.order(u8, left.name, right.name);
+    if (name_order != .eq) return name_order == .lt;
+    const architecture_order = workflowOptionalTextOrder(left.architecture, right.architecture);
+    if (architecture_order != .eq) return architecture_order == .lt;
+    return workflowOptionalTextOrder(left.version, right.version) == .lt;
+}
+
+fn workflowOptionalTextOrder(left: ?[]const u8, right: ?[]const u8) std.math.Order {
+    if (left == null and right != null) return .lt;
+    if (left != null and right == null) return .gt;
+    if (left == null) return .eq;
+    return std.mem.order(u8, left.?, right.?);
+}
+
+fn stringSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_value, right_value|
+        if (!std.mem.eql(u8, left_value, right_value)) return false;
+    return true;
 }
 
 fn parseSelector(value: []const u8) solver.PackageSelector {
@@ -2390,10 +2582,7 @@ fn lockFromPlan(
         });
     }
 
-    const plan_json = try plan.canonicalJson(allocator);
-    defer allocator.free(plan_json);
-    var request_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(plan_json, &request_digest, .{});
+    const request_digest = try canonicalPlanDigest(allocator, plan);
     return exact_lock.create(allocator, .{
         .target_architecture = request.options.architecture,
         .request_sha256 = request_digest,
@@ -2409,6 +2598,14 @@ fn lockFromPlan(
         .packages = packages.items,
         .authenticated_metadata = true,
     });
+}
+
+fn canonicalPlanDigest(allocator: std.mem.Allocator, plan: solver.Plan) ![32]u8 {
+    const plan_json = try plan.canonicalJson(allocator);
+    defer allocator.free(plan_json);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plan_json, &digest, .{});
+    return digest;
 }
 
 fn planChangesIdentity(
@@ -2758,6 +2955,7 @@ fn realNow(io: std.Io) i64 {
 const TestProcess = struct {
     io: std.Io,
     dir: std.Io.Dir,
+    calls: usize = 0,
 
     fn interface(self: *TestProcess) transaction_executor.ProcessRunner {
         return .{ .context = self, .runFn = run };
@@ -2765,6 +2963,7 @@ const TestProcess = struct {
 
     fn run(context: *anyopaque, invocation: transaction_executor.Invocation) !transaction_executor.ProcessResult {
         const self: *TestProcess = @ptrCast(@alignCast(context));
+        self.calls += 1;
         if (invocation.phase == .remove) try self.dir.writeFile(self.io, .{
             .sub_path = "root/var/lib/dpkg/status",
             .data = "",
@@ -2772,6 +2971,382 @@ const TestProcess = struct {
         return .{ .termination = .{ .exited = 0 } };
     }
 };
+
+const ProductionWorkflowFixture = struct {
+    allocator: std.mem.Allocator,
+    source_path: []u8,
+    keyring_path: []u8,
+    source_paths: [1][]const u8,
+    keyring_paths: [1][]const u8,
+    install_root: []u8,
+    cache_path: []u8,
+    state_path: []u8,
+    lock_path: []u8,
+    second_lock_path: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        directory: *std.testing.TmpDir,
+        status: []const u8,
+    ) !ProductionWorkflowFixture {
+        const fixture = @import("fixtures/openpgp.zig");
+        return initWithRepository(
+            allocator,
+            directory,
+            status,
+            &fixture.repository_in_release,
+            &fixture.repository_packages,
+            &fixture.keyring,
+        );
+    }
+
+    fn initWithRepository(
+        allocator: std.mem.Allocator,
+        directory: *std.testing.TmpDir,
+        status: []const u8,
+        in_release: []const u8,
+        packages: []const u8,
+        keyring: []const u8,
+    ) !ProductionWorkflowFixture {
+        try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+        try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
+        try directory.dir.makePath(std.testing.io, "root/var/lib/debz");
+        try directory.dir.makePath(std.testing.io, "state");
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "repo/dists/stable/InRelease",
+            .data = in_release,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "repo/dists/stable/main/binary-amd64/Packages",
+            .data = packages,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "keyring.gpg",
+            .data = keyring,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/var/lib/dpkg/status",
+            .data = status,
+        });
+
+        var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+        const root = real_buffer[0..real_length];
+        const source_path = try std.fmt.allocPrint(allocator, "{s}/sources.list", .{root});
+        errdefer allocator.free(source_path);
+        const keyring_path = try std.fmt.allocPrint(allocator, "{s}/keyring.gpg", .{root});
+        errdefer allocator.free(keyring_path);
+        const repository_path = try std.fmt.allocPrint(allocator, "{s}/repo", .{root});
+        defer allocator.free(repository_path);
+        const source_bytes = try std.fmt.allocPrint(
+            allocator,
+            "deb [arch=amd64 signed-by={s}] file://{s} stable main\n",
+            .{ keyring_path, repository_path },
+        );
+        defer allocator.free(source_bytes);
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "sources.list",
+            .data = source_bytes,
+        });
+        const install_root = try std.fmt.allocPrint(allocator, "{s}/root", .{root});
+        errdefer allocator.free(install_root);
+        const cache_path = try std.fmt.allocPrint(allocator, "{s}/cache", .{root});
+        errdefer allocator.free(cache_path);
+        const state_path = try std.fmt.allocPrint(allocator, "{s}/state", .{root});
+        errdefer allocator.free(state_path);
+        const lock_path = try std.fmt.allocPrint(allocator, "{s}/batch-lock.json", .{root});
+        errdefer allocator.free(lock_path);
+        const second_lock_path = try std.fmt.allocPrint(allocator, "{s}/single-lock.json", .{root});
+        errdefer allocator.free(second_lock_path);
+        return .{
+            .allocator = allocator,
+            .source_path = source_path,
+            .keyring_path = keyring_path,
+            .source_paths = .{source_path},
+            .keyring_paths = .{keyring_path},
+            .install_root = install_root,
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .lock_path = lock_path,
+            .second_lock_path = second_lock_path,
+        };
+    }
+
+    fn deinit(self: *ProductionWorkflowFixture) void {
+        self.allocator.free(self.source_path);
+        self.allocator.free(self.keyring_path);
+        self.allocator.free(self.install_root);
+        self.allocator.free(self.cache_path);
+        self.allocator.free(self.state_path);
+        self.allocator.free(self.lock_path);
+        self.allocator.free(self.second_lock_path);
+        self.* = undefined;
+    }
+
+    fn options(self: *const ProductionWorkflowFixture) api.CommonOptions {
+        return .{
+            .install_root = self.install_root,
+            .source_paths = &self.source_paths,
+            .keyring_paths = &self.keyring_paths,
+            .cache_path = self.cache_path,
+            .state_path = self.state_path,
+            .architecture = "amd64",
+        };
+    }
+};
+
+test "production workflow plans a successful batch install into one exact lock" {
+    const in_release = @embedFile("fixtures/batch_workflow/InRelease");
+    const packages = @embedFile("fixtures/batch_workflow/Packages");
+    const keyring = @embedFile("fixtures/batch_workflow/keyring.gpg");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(
+        std.testing.allocator,
+        &directory,
+        "",
+        in_release,
+        packages,
+        keyring,
+    );
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = 1_788_796_860,
+        .process_runner = process.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{ .{ .name = "beta" }, .{ .name = "alpha" } };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    try std.testing.expectEqual(@as(usize, 3), planned.items.len);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+    const lock_bytes = try readFile(
+        std.testing.allocator,
+        std.testing.io,
+        fixture.lock_path,
+        exact_lock.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(lock_bytes);
+    var lock = try exact_lock.decode(
+        std.testing.allocator,
+        lock_bytes,
+        exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    try std.testing.expectEqual(@as(usize, 3), lock.lock.packages.len);
+    var requested: usize = 0;
+    var dependencies: usize = 0;
+    for (lock.lock.packages) |package| switch (package.retention) {
+        .requested => requested += 1,
+        .dependency => dependencies += 1,
+        .retained => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), requested);
+    try std.testing.expectEqual(@as(usize, 1), dependencies);
+
+    var replay_options = fixture.options();
+    replay_options.lock_input_path = fixture.lock_path;
+    replay_options.lock_output_path = fixture.second_lock_path;
+    const replayed = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = replay_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, replayed.exit_status);
+    const replay_bytes = try readFile(
+        std.testing.allocator,
+        std.testing.io,
+        fixture.second_lock_path,
+        exact_lock.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(replay_bytes);
+    try std.testing.expectEqualStrings(lock_bytes, replay_bytes);
+}
+
+test "production workflow plan-only batches do not mutate and removal locks replay" {
+    const signed_fixture = @import("fixtures/openpgp.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(
+        std.testing.allocator,
+        &directory,
+        "Package: first\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n\n" ++
+            "Package: second\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer fixture.deinit();
+
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = signed_fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const removals = [_]solver.PackageSelector{ .{ .name = "first" }, .{ .name = "second" } };
+    var plan_options = fixture.options();
+    plan_options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &removals,
+        .options = plan_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    try std.testing.expectEqual(@as(usize, 2), planned.items.len);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+    const unchanged = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/var/lib/dpkg/status",
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expect(std.mem.indexOf(u8, unchanged, "Package: first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unchanged, "Package: second") != null);
+
+    const lock_bytes = try readFile(
+        std.testing.allocator,
+        std.testing.io,
+        fixture.lock_path,
+        exact_lock.maximum_document_bytes,
+    );
+    defer std.testing.allocator.free(lock_bytes);
+    var lock = try exact_lock.decode(
+        std.testing.allocator,
+        lock_bytes,
+        exact_lock.maximum_document_bytes,
+    );
+    defer lock.deinit();
+    try std.testing.expectEqual(@as(usize, 0), lock.lock.packages.len);
+
+    var execute_options = fixture.options();
+    execute_options.lock_input_path = fixture.lock_path;
+    execute_options.assume_yes = true;
+    execute_options.noninteractive = true;
+    execute_options.conffile = .keep_existing;
+    const incomplete = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = removals[0..1],
+        .options = execute_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.planning, incomplete.exit_status);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+    const executed = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &removals,
+        .options = execute_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, executed.exit_status);
+    try std.testing.expect(executed.changed);
+    try std.testing.expect(process.calls != 0);
+}
+
+test "production workflow accepts batch install planning and requires lock-bound execution" {
+    const signed_fixture = @import("fixtures/openpgp.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(std.testing.allocator, &directory, "");
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = signed_fixture.created + 30,
+        .process_runner = process.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{ .{ .name = "hello" }, .{ .name = "missing" } };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.planning, planned.exit_status);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+    options.lock_output_path = null;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const no_lock = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.usage, no_lock.exit_status);
+    try std.testing.expectEqual(api.ErrorId.configuration_required, no_lock.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+    options.lock_input_path = "/explicit/exact-lock.json";
+    options.assume_yes = false;
+    const no_confirmation = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ErrorId.confirmation_required, no_confirmation.diagnostics[0].id);
+    options.assume_yes = true;
+    options.conffile = .unspecified;
+    const no_conffile = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ErrorId.conffile_policy_required, no_conffile.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+}
+
+test "production workflow digest binds every selector and product v1 stays singleton" {
+    const options: api.CommonOptions = .{
+        .install_root = "/root",
+        .cache_path = "/cache",
+        .state_path = "/state",
+        .architecture = "amd64",
+        .assume_yes = true,
+    };
+    const first = productRequestDigest(.{
+        .operation = .install,
+        .packages = &.{"first"},
+        .options = options,
+    });
+    const batch = productRequestDigest(.{
+        .operation = .install,
+        .packages = &.{ "first", "second:amd64=1" },
+        .options = options,
+    });
+    const recovery = productRequestDigest(.{
+        .operation = .recover,
+        .packages = &.{ "first", "second:amd64=1" },
+        .options = options,
+    });
+    try std.testing.expect(!std.mem.eql(u8, &first, &batch));
+    try std.testing.expect(!std.mem.eql(u8, &batch, &recovery));
+
+    var backend: Backend = .{ .io = std.testing.io };
+    const rejected = try api.execute(std.testing.allocator, .{
+        .operation = .install,
+        .packages = &.{ "first", "second" },
+        .options = options,
+    }, backend.interface());
+    try std.testing.expectEqual(api.ExitStatus.usage, rejected.exit_status);
+    try std.testing.expectEqual(api.ErrorId.invalid_request, rejected.diagnostics[0].id);
+}
 
 test "production backend reports command-specific missing repository input" {
     var backend: Backend = .{ .io = std.testing.io };
