@@ -148,7 +148,10 @@ digest; it is not a sequence of singleton product API calls.
 `success`, `usage`, `configuration`, `authentication`, `planning`, `download`,
 `transaction`, `recovery`, and `internal` outcomes. Diagnostics carry a stable
 identifier and the same outcome classification. Human summary text is not a
-machine interface.
+machine interface. `list_installed` success additionally carries a bounded,
+owned `items` array preserving each package name and optional version,
+architecture, and detail. Other operations cannot return items, and the items
+participate in the canonical result digest.
 
 Every result binds the canonical request digest. `apt_system_api.execute`
 rejects any backend result whose operation or request digest differs from the
@@ -207,8 +210,9 @@ runner. Install, remove, and upgrade-all preparation instead:
 
 1. loads the explicitly requested strict profile and revalidates every bound
    source, config, keyring, and credential reference;
-2. rejects a post-mutation active operation before repository work, while a
-   CAS-proven pre-mutation or completed record is retained and reconciled;
+2. rejects an outer or lower-level post-mutation active operation before
+   repository work, while a CAS-proven outer pre-mutation or completed record
+   is retained and reconciled;
 3. reserves one durable operation directory under
    `STATE/apt/operations/ATTEMPT`;
 4. submits every selector in one `ProductionWorkflow` plan-only request;
@@ -222,12 +226,23 @@ caller's confirmation source; execution always takes conffile behavior from
 the loaded profile.
 
 Confirmed execution reloads and revalidates the profile, rereads the active
-state with locked compare-and-set, revalidates the exact lock, acquires the
-locked package closure, and invokes `ProductionWorkflow` execute with the same
-selectors and exact lock. The only install-root spelling supplied to a backend
-is `live_root.logical_root_path`; `/` remains denied by product API v1 and
-`live_root.host_root_allowed` remains false. Root, runtime, lock, or mountpoint
-replacement is surfaced as a typed conflict.
+state with locked compare-and-set, revalidates the full exact-lock binding
+immediately before acquisition and again immediately before mutation, acquires
+the locked package closure, and invokes `ProductionWorkflow` execute with the
+same selectors and exact lock. A valid but different replacement is rejected,
+not merely a malformed lock. The only install-root spelling supplied to a
+backend is `live_root.logical_root_path`; `/` remains denied by product API v1
+and `live_root.host_root_allowed` remains false. Root, runtime, lock, or
+mountpoint replacement is surfaced as a typed conflict.
+
+`PrivateLiveRootRunner` is the production composition's concrete runner. It
+invokes `live_root.run`, drains a bounded pipe concurrently, and accepts only a
+canonical product-result document whose operation matches the request.
+Termination, namespace setup, identity replacement, cleanup, transport, and
+lower-level root-operation status failures remain typed at the runner boundary.
+Owned list items and diagnostics are copied into the parent before namespace
+cleanup. A capability-gated integration test exercises the real root-mapped
+namespace path.
 
 The system state-store adapter creates and opens every directory component
 without following symbolic links. Request, retained state, exact lock,
@@ -253,11 +268,20 @@ root-operation status, and final state all agree.
 state, and exact lock. Profile, request, selector, attempt, state, or evidence
 mismatches fail closed. A recoverable plan reports the stable action
 `debz recover --system-profile PATH`; confirmed `executeRecovery` reconstructs
-the original semantic `ProductionWorkflow` recovery request and verifies and
-retains its result through the same boundaries.
+the original semantic `ProductionWorkflow` recovery request, rechecks the full
+lock binding immediately before recovery mutation, and verifies and retains its
+result through the same boundaries. Recovery first inspects the retained
+lower-level root-operation state. If that state is clear and the exact-lock-
+bound transaction result already exists, it reconciles and finalizes the outer
+state without rerunning package mutation or lower-level recovery. If lower-
+level recovery evidence remains active, it invokes workflow recovery exactly
+as retained. Existing completion evidence is canonicalized and binding-checked
+before reuse, including across a changed wall clock.
 
 Profile loading, live-root execution, workflow backend, state store,
 confirmation, result verifier, clock, and attempt-ID generation are explicit
 dependencies. Unit tests use only injected fakes; the reusable production
 adapters cover the strict profile loader, `ProductionWorkflow`, durable system
-store, and lock/provenance verifier without touching `/` in tests.
+store, and lock/provenance verifier. Only the capability-gated private-runner
+integration test enters the real namespace supervisor; it skips when the
+required Linux root namespace capabilities are unavailable.

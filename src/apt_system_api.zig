@@ -14,6 +14,7 @@ pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
 pub const schema_version: u32 = 1;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
+pub const maximum_result_items: usize = 4096;
 pub const maximum_diagnostics: usize = 8;
 pub const maximum_summary_characters: usize = 4096;
 pub const maximum_path_bytes: usize = system_profile.maximum_path_bytes;
@@ -213,6 +214,13 @@ pub const Evidence = struct {
     active_operation_state: ?[]const u8 = null,
 };
 
+pub const Item = struct {
+    package: []const u8,
+    version: ?[]const u8 = null,
+    architecture: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -222,6 +230,7 @@ pub const Result = struct {
     exit_status: ExitStatus,
     changed: bool = false,
     summary: []const u8,
+    items: []const Item = &.{},
     evidence: Evidence = .{},
     diagnostics: [maximum_diagnostics]Diagnostic = undefined,
     diagnostic_count: usize = 0,
@@ -398,6 +407,16 @@ pub fn ownResult(
     const owned = owner.arena.allocator();
     var result = input;
     result.summary = try owned.dupe(u8, input.summary);
+    const items = try owned.alloc(Item, input.items.len);
+    for (input.items, 0..) |item, index| {
+        items[index] = .{
+            .package = try owned.dupe(u8, item.package),
+            .version = try dupeOptional(owned, item.version),
+            .architecture = try dupeOptional(owned, item.architecture),
+            .detail = try dupeOptional(owned, item.detail),
+        };
+    }
+    result.items = items;
     if (input.profile) |profile| result.profile = .{
         .path = try owned.dupe(u8, profile.path),
         .sha256 = profile.sha256,
@@ -437,6 +456,19 @@ pub fn validateResult(result: Result) !void {
     if (result.api_version != api_version) return error.UnsupportedApiVersion;
     if (!validText(result.summary, maximum_summary_characters))
         return error.InvalidSummary;
+    if (result.items.len > maximum_result_items) return error.TooManyItems;
+    if (result.operation != .list_installed and result.items.len != 0)
+        return error.UnexpectedItems;
+    for (result.items) |item| {
+        if (!validPackage(item.package)) return error.InvalidItem;
+        if (item.version) |version|
+            if (!validText(version, 1024)) return error.InvalidItem;
+        if (item.architecture) |architecture|
+            if (!validText(architecture, 64)) return error.InvalidItem;
+        if (item.detail) |detail|
+            if (!validText(detail, maximum_summary_characters))
+                return error.InvalidItem;
+    }
     if (result.diagnostic_count > maximum_diagnostics)
         return error.TooManyDiagnostics;
     if (result.exit_status != exitStatus(result.outcome))
@@ -633,6 +665,20 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
         result.changed,
     });
     try writeString(writer, result.summary);
+    try writer.writeAll(",\"items\":[");
+    for (result.items, 0..) |item, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"package\":");
+        try writeString(writer, item.package);
+        try writer.writeAll(",\"version\":");
+        try writeOptionalString(writer, item.version);
+        try writer.writeAll(",\"architecture\":");
+        try writeOptionalString(writer, item.architecture);
+        try writer.writeAll(",\"detail\":");
+        try writeOptionalString(writer, item.detail);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
     try writer.writeAll(",\"evidence\":");
     try writeEvidence(writer, result.evidence);
     try writer.writeAll(",\"diagnostics\":[");
@@ -1196,6 +1242,56 @@ test "apt_system_api.test.text validation stops at bounded limits" {
     );
 }
 
+test "apt_system_api.test.list items are owned and bind the canonical digest" {
+    var package = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
+    var version = [_]u8{ '1', '.', '2' };
+    var architecture = [_]u8{ 'a', 'm', 'd', '6', '4' };
+    const items = [_]Item{.{
+        .package = &package,
+        .version = &version,
+        .architecture = &architecture,
+    }};
+    const input = try complete(.{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "one installed package",
+        .items = &items,
+    });
+    var owned = try ownResult(std.testing.allocator, input);
+    defer owned.deinit();
+    @memset(&package, 'x');
+    @memset(&version, 'x');
+    @memset(&architecture, 'x');
+    try std.testing.expectEqualStrings("alpha", owned.items[0].package);
+    try std.testing.expectEqualStrings("1.2", owned.items[0].version.?);
+    try std.testing.expectEqualStrings("amd64", owned.items[0].architecture.?);
+    const canonical = try owned.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "\"items\":[{\"package\":\"alpha\",\"version\":\"1.2\",\"architecture\":\"amd64\",\"detail\":null}]",
+    ) != null);
+
+    var changed = owned;
+    const replacement = [_]Item{.{ .package = "beta" }};
+    changed.items = &replacement;
+    try std.testing.expectError(
+        error.DigestMismatch,
+        changed.canonicalJson(std.testing.allocator),
+    );
+    var non_list = input;
+    non_list.operation = .update;
+    try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+}
+
 test "apt_system_api.test.result schema matches enums and absolute paths" {
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1207,6 +1303,19 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, source, .{});
     defer parsed.deinit();
     const definitions = parsed.value.object.get("$defs").?.object;
+    const required = parsed.value.object.get("required").?.array.items;
+    var items_required = false;
+    for (required) |field|
+        if (std.mem.eql(u8, field.string, "items")) {
+            items_required = true;
+            break;
+        };
+    try std.testing.expect(items_required);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(maximum_result_items)),
+        parsed.value.object.get("properties").?.object
+            .get("items").?.object.get("maxItems").?.integer,
+    );
     try std.testing.expectEqualStrings(
         absolute_path.schema_pattern,
         definitions.get("absolutePath").?.object.get("pattern").?.string,
