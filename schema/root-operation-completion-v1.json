@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/root-operation-completion-v1",
+  "title": "debz root operation completion provenance v1",
+  "description": "Durable statement that discharges the provenance a completed root attempt still owed after its completion was interrupted. It binds the attempt and the active record it discharges, and classifies what survived of the detailed transaction provenance and of the transaction journal. It never restates command, script, package, or verification outcomes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "record_generation",
+    "record_digest_sha256",
+    "install_root",
+    "root_identity_sha256",
+    "backend",
+    "surface",
+    "operation",
+    "phase",
+    "step",
+    "mutation_started",
+    "outcome",
+    "request_sha256",
+    "policy_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "database_generation_sha256",
+    "artifact_evidence_sha256",
+    "target_architecture",
+    "foreign_architectures",
+    "reserved_unix",
+    "updated_unix",
+    "transaction_provenance",
+    "journal",
+    "discharge",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/root-operation-completion-v1" },
+    "version": { "const": 1 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "record_generation": { "type": "integer", "minimum": 1 },
+    "record_digest_sha256": { "$ref": "#/$defs/sha256" },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "backend": { "enum": ["legacy_dpkg", "native"] },
+    "surface": { "enum": ["package_transaction", "repository_bootstrap"] },
+    "operation": { "type": "string", "minLength": 1 },
+    "phase": {
+      "enum": [
+        "reserved",
+        "authorization",
+        "preflight",
+        "mutation",
+        "script",
+        "trigger",
+        "database",
+        "verification",
+        "provenance"
+      ]
+    },
+    "step": { "type": "integer", "minimum": 0 },
+    "mutation_started": { "const": true },
+    "outcome": { "enum": ["succeeded", "failed_after_mutation", "recovered"] },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "authorization_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "program_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "plan_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "exact_lock": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/lockBinding" }]
+    },
+    "database_generation_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "artifact_evidence_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "target_architecture": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9-]+$" },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9-]+$" }
+    },
+    "reserved_unix": { "type": "integer" },
+    "updated_unix": { "type": "integer" },
+    "transaction_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "schema", "document_sha256", "detail"],
+      "properties": {
+        "status": { "enum": ["already_present", "recovered", "unavailable"] },
+        "schema": {
+          "oneOf": [{ "type": "null" }, { "type": "string", "minLength": 1, "maxLength": 256 }]
+        },
+        "document_sha256": { "$ref": "#/$defs/optionalSha256" },
+        "detail": { "$ref": "#/$defs/detail" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "unavailable" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "schema": { "type": "null" },
+              "document_sha256": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "schema": { "type": "string", "minLength": 1 },
+              "document_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      ]
+    },
+    "journal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "document_sha256", "detail"],
+      "properties": {
+        "status": { "enum": ["archived", "active", "absent", "unreadable"] },
+        "document_sha256": { "$ref": "#/$defs/optionalSha256" },
+        "detail": { "$ref": "#/$defs/detail" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "enum": ["archived", "active"] } },
+            "required": ["status"]
+          },
+          "then": { "properties": { "document_sha256": { "$ref": "#/$defs/sha256" } } },
+          "else": { "properties": { "document_sha256": { "type": "null" } } }
+        }
+      ]
+    },
+    "discharge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "operation", "request_sha256"],
+      "properties": {
+        "surface": { "enum": ["package_transaction", "repository_bootstrap"] },
+        "operation": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "request_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "optionalSha256": {
+      "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }]
+    },
+    "detail": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[ -~]+$" },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "lockBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "digest_sha256"],
+      "properties": {
+        "schema": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

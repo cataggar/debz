@@ -297,6 +297,91 @@ pub fn validateDocument(
     };
 }
 
+/// The identity a published transaction result binds, read back from a
+/// document that was already validated as canonical and digest-consistent.
+///
+/// It exists for recovery: a run that finds a result document where its own
+/// interrupted attempt would have published one must decide whether that
+/// document describes *this* attempt before it is allowed to count as the
+/// attempt's detailed provenance. Only fixed-size identity is returned, so a
+/// caller never has to keep the parsed document alive.
+pub const DocumentBinding = struct {
+    digest_sha256: [32]u8,
+    request_sha256: [32]u8,
+    solver_policy_sha256: [32]u8,
+    executor_policy_sha256: [32]u8,
+    plan_sha256: [32]u8,
+    lock_sha256: [32]u8,
+    outcome: Outcome,
+    final_verification: VerificationStatus,
+    architecture_storage: [64]u8,
+    architecture_length: u8,
+
+    pub fn architecture(self: *const DocumentBinding) []const u8 {
+        return self.architecture_storage[0..self.architecture_length];
+    }
+};
+
+/// Validates `source` and reads back exactly the identity it binds. Anything
+/// that is not a canonical, digest-consistent v1 result document — or that
+/// carries an unknown outcome, verification status, or oversized architecture
+/// — fails instead of returning a partial binding.
+pub fn readBinding(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    maximum_bytes: usize,
+) !DocumentBinding {
+    var validated = try validateDocument(allocator, source, maximum_bytes);
+    defer validated.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, validated.bytes, .{
+        .allocate = .alloc_always,
+        .parse_numbers = true,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const document = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.NonCanonicalDocument,
+    };
+    const architecture = try bindingString(document, "target_architecture");
+    if (architecture.len == 0 or architecture.len > 64) return error.InvalidIdentity;
+    const outcome_text = try bindingString(document, "outcome");
+    const outcome = std.meta.stringToEnum(Outcome, outcome_text) orelse
+        return error.NonCanonicalDocument;
+    const final = switch (document.get("final_verification") orelse
+        return error.NonCanonicalDocument) {
+        .object => |value| value,
+        else => return error.NonCanonicalDocument,
+    };
+    const status_text = try bindingString(final, "status");
+    const status = std.meta.stringToEnum(VerificationStatus, status_text) orelse
+        return error.NonCanonicalDocument;
+    var binding: DocumentBinding = .{
+        .digest_sha256 = validated.digest_sha256,
+        .request_sha256 = try bindingDigest(document, "request_sha256"),
+        .solver_policy_sha256 = try bindingDigest(document, "solver_policy_sha256"),
+        .executor_policy_sha256 = try bindingDigest(document, "executor_policy_sha256"),
+        .plan_sha256 = try bindingDigest(document, "plan_sha256"),
+        .lock_sha256 = try bindingDigest(document, "lock_sha256"),
+        .outcome = outcome,
+        .final_verification = status,
+        .architecture_storage = @splat(0),
+        .architecture_length = @intCast(architecture.len),
+    };
+    @memcpy(binding.architecture_storage[0..architecture.len], architecture);
+    return binding;
+}
+
+fn bindingString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.NonCanonicalDocument;
+    if (value != .string) return error.NonCanonicalDocument;
+    return value.string;
+}
+
+fn bindingDigest(object: std.json.ObjectMap, name: []const u8) ![32]u8 {
+    return parseDigest(try bindingString(object, name));
+}
+
 pub const Store = struct {
     io: std.Io,
     dir: std.Io.Dir,
@@ -1010,6 +1095,72 @@ test "transaction_provenance.test.deterministic provenance recovery and redactio
     try std.testing.expectError(
         error.RepositoryEvidenceMismatch,
         verifyLockEvidence(lock, &wrong_repository, &packages, null),
+    );
+}
+
+test "transaction_provenance.test.published result binds a readable identity" {
+    const repository_id: [64]u8 = @splat('b');
+    const repositories = [_]RepositoryEvidence{.{
+        .source_config_id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = @splat(3),
+        .metadata_sha256 = @splat(4),
+        .signer_fingerprints = &.{@splat(5)},
+        .signature_verified = true,
+    }};
+    const packages = [_]PackageEvidence{.{
+        .name = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .repository_id = repository_id,
+        .repository_snapshot_sha256 = @splat(1),
+        .package_sha256 = @splat(6),
+        .cas_sha256 = @splat(6),
+        .declared_size = 99,
+    }};
+    var owned = try create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(8),
+        .solver_policy_sha256 = @splat(9),
+        .executor_policy_sha256 = @splat(10),
+        .plan_sha256 = @splat(11),
+        .lock_sha256 = @splat(12),
+        .repositories = &repositories,
+        .packages = &packages,
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(13),
+            .package_origins_sha256 = @splat(14),
+            .detail = "ok",
+        },
+        .outcome = .succeeded,
+    });
+    defer owned.deinit();
+    const json = try owned.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    const binding = try readBinding(std.testing.allocator, json, maximum_document_bytes);
+    try std.testing.expectEqualStrings("amd64", binding.architecture());
+    try std.testing.expectEqual(Outcome.succeeded, binding.outcome);
+    try std.testing.expectEqual(VerificationStatus.exact_match, binding.final_verification);
+    try std.testing.expectEqualSlices(u8, &owned.result.digest_sha256, &binding.digest_sha256);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(11)), &binding.plan_sha256);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(12)), &binding.lock_sha256);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(8)), &binding.request_sha256);
+
+    var tampered = try std.testing.allocator.dupe(u8, json);
+    defer std.testing.allocator.free(tampered);
+    tampered[std.mem.indexOf(u8, tampered, "\"outcome\":\"succeeded\"").? + 12] = 'x';
+    try std.testing.expectError(
+        error.DigestMismatch,
+        readBinding(std.testing.allocator, tampered, maximum_document_bytes),
+    );
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        readBinding(std.testing.allocator, json, json.len - 1),
     );
 }
 

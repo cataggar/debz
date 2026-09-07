@@ -9,6 +9,9 @@ Before mutation, the executor validates the complete action/ordering shape,
 identities, artifact mappings, paths, conffile policy, and typed force policy.
 It then acquires, in fixed order, the debz transaction lock,
 `var/lib/dpkg/lock-frontend`, and `var/lib/dpkg/lock`, using bounded waits.
+Those are ranks 4 of the total lock order defined in
+[root-scoped operation coordination](root-operation.md); callers hold the root
+mutation lock (rank 0) around them.
 On Linux, the production adapter uses `F_OFD_SETLK` open-file-description write
 locks. They conflict with dpkg's POSIX record locks, preserving cross-process
 exclusion, while making independent same-process manager instances serialize
@@ -98,6 +101,23 @@ diagnostics, completed-command count, plan digest, and command/artifact
 digests. Root safety and lock ownership are rechecked at command boundaries. A report is
 successful only after every ordered command makes its required state transition,
 the final trigger command exits zero, and exact post-state verification passes.
+
+`Report.commands` and `RecoveryReport.commands` are provenance for *completed*
+commands: an entry is appended only after the command returned and the
+operation deadline was re-checked. `transaction_state` is the field that says
+whether anything was handed to `dpkg` at all — it is set to `in_progress` and
+the command boundary is persisted before the first spawn, and a recovery
+publishes the decoded journal's state before its own first command. A caller
+that must decide whether the root may have been mutated therefore reads both:
+zero commands with a `not_started` transaction state is the only combination
+that proves nothing started, and
+[root-scoped operation coordination](root-operation.md) derives its witness
+from exactly that pairing. A recovery report is read with one extra rule: the
+transaction state is published only after the journal decodes, so a recovery
+that failed with `journal_io` or `journal_corrupt` reports `not_started`
+without ever having learned what the journal said, and is classified as
+observed mutation instead.
+
 Durable journal recovery is implemented and exported as `recoverTransaction`:
 it integrity-decodes the journal, requires the supplied plan, root, executor
 policy, and exact lock to match its bindings, and runs the bounded dpkg

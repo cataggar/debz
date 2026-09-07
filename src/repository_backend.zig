@@ -15,6 +15,8 @@ const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
+const root_fs = @import("root_fs.zig");
+const root_operation = @import("root_operation.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const target_apt_config = @import("target_apt_config.zig");
@@ -87,6 +89,15 @@ pub const Backend = struct {
         var paths = try ResolvedPaths.init(allocator, request);
         defer paths.deinit();
 
+        // Rank 0 of the total lock order. Repository bootstrap shares the
+        // root's operation namespace with package transactions, so neither can
+        // start while the other holds an unresolved attempt. The transaction
+        // backend was already selected above, so an unavailable native
+        // selection still fails before any root access.
+        var guard: RootOperationGuard = .{ .io = self.io, .allocator = allocator };
+        defer guard.deinit();
+        if (guard.open(request, self.transaction_backend, self.now_unix)) |failure| return failure;
+
         var production_acquisition = repository_acquisition.Production{ .io = self.io };
         const acquisition_dependencies = self.acquisition_dependencies orelse
             production_acquisition.dependencies();
@@ -122,6 +133,12 @@ pub const Backend = struct {
 
         const operation_locks = self.operation_locks orelse
             operation_lock_manager.interface();
+        guard.enterRank(.repository_operation) catch return api.failure(
+            .internal,
+            .internal_error,
+            "lock",
+            "repository operation lock was requested out of order",
+        );
         const operation_lock_wait = budget.remainingTime() catch |err|
             return api.failure(
                 .unavailable,
@@ -191,6 +208,7 @@ pub const Backend = struct {
         );
         defer before_snapshot.deinit();
         const architecture = before_snapshot.manifest.manifest.native_architecture;
+        if (guard.preflight(architecture)) |failure| return failure;
         if (prior_state) |*prior| {
             if (!std.mem.eql(u8, prior.state.root, request.root) or
                 !std.mem.eql(u8, prior.state.architecture, architecture) or
@@ -1273,6 +1291,15 @@ pub const Backend = struct {
                 recovery_needed = true;
             };
             if (!recovery_needed) {
+                // Verification only. The target locks are still taken beneath
+                // the root operation lock, so the established order holds.
+                guard.enterRank(.target_database) catch return api.failure(
+                    .internal,
+                    .internal_error,
+                    "lock",
+                    "target locks were requested out of order",
+                );
+                defer guard.exitRank(.target_database);
                 const transaction_lock_path = try rootPath(
                     allocator,
                     request.root,
@@ -1414,6 +1441,19 @@ pub const Backend = struct {
             }
         }
         if (!skip_install or recovery_needed) {
+            // Handing control to the command-oriented executor is the point
+            // after which this backend can no longer prove that the root was
+            // untouched. The durable bridge is published before the executor
+            // takes any target lock and is resolved from the executor's own
+            // command evidence below.
+            if (guard.enterExecutor()) |failure| return progress.fail(
+                state_store,
+                allocator,
+                failure.exit_status,
+                failure.diagnostics[0].id,
+                "root-operation",
+                failure.diagnostics[0].message,
+            );
             var system_process = transaction_executor.SystemProcessRunner{
                 .allocator = allocator,
                 .io = self.io,
@@ -1518,6 +1558,23 @@ pub const Backend = struct {
                 value.succeeded()
             else
                 report.?.succeeded();
+            // The executor's own transaction state decides the witness. A
+            // report that ran no command is only proof that nothing started
+            // when the transaction state is still `not_started`; a spawn that
+            // timed out or hit the deadline reports zero commands after dpkg
+            // may already have mutated the root.
+            const observed = if (recovery_report) |value|
+                root_operation.recoveryReportWitness(value)
+            else
+                root_operation.reportWitness(report.?);
+            if (guard.observe(observed, succeeded)) |failure| return progress.fail(
+                state_store,
+                allocator,
+                failure.exit_status,
+                failure.diagnostics[0].id,
+                "root-operation",
+                failure.diagnostics[0].message,
+            );
             if (!succeeded) {
                 if (descriptorIdentityInstalled(
                     allocator,
@@ -1573,7 +1630,7 @@ pub const Backend = struct {
                 "executor report does not match the persisted plan and verification policy",
             );
 
-            if (recovery_report) |value|
+            progress.provenance_sha256 = if (recovery_report) |value|
                 publishRecoveryProvenance(
                     allocator,
                     self.io,
@@ -1857,9 +1914,320 @@ pub const Backend = struct {
             "complete",
             @errorName(err),
         );
+        if (guard.finish(progress.provenanceDigest())) |failure| return progress.fail(
+            state_store,
+            allocator,
+            failure.exit_status,
+            failure.diagnostics[0].id,
+            "root-operation",
+            failure.diagnostics[0].message,
+        );
         return progress.success(allocator);
     }
 };
+
+/// Owns rank 0 of the total lock order for one repository bootstrap. It
+/// reserves the shared root attempt before the repository operation lock, so
+/// a repository add and a package transaction can never mutate one root at the
+/// same time, and it resolves the command-oriented executor bridge from the
+/// executor's own evidence rather than assuming a mutation happened.
+const RootOperationGuard = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    owned_root: ?root_fs.OwnedRoot = null,
+    locks: root_operation.SystemLockBackend = undefined,
+    coordinator: root_operation.Coordinator = undefined,
+    attempt: ?root_operation.Attempt = null,
+
+    fn open(
+        self: *RootOperationGuard,
+        request: api.Request,
+        backend: transaction_engine.Kind,
+        now_unix: ?i64,
+    ) ?api.Result {
+        self.owned_root = root_fs.openAbsoluteRoot(self.io, request.root) catch
+            return api.failure(
+                .usage,
+                .invalid_root,
+                "target",
+                "target root is unsafe or unavailable",
+            );
+        self.locks = .{ .allocator = self.allocator, .io = self.io };
+        self.coordinator = root_operation.Coordinator.open(
+            self.io,
+            self.owned_root.?.root,
+            request.root,
+            self.locks.interface(),
+        ) catch |err| return mapRootOperationError(err);
+        self.coordinator.now_unix = now_unix;
+        self.attempt = self.coordinator.acquire(self.allocator, .{
+            // Repository bootstrap is resumable by construction: its durable
+            // operation state already replays acquisition, planning, install,
+            // import, and refresh. The root attempt is bound to the same
+            // request before anything is acquired, so a rerun of exactly this
+            // request adopts its own evidence and finishes it, while a
+            // different descriptor, architecture, policy, or package
+            // operation is still refused and leaves the evidence untouched.
+            .intent = .same_operation,
+            .existing = .reclaim_resolved,
+            .backend = backend,
+            .operation = .{ .repository_bootstrap = .add },
+            .request_sha256 = repositoryRequestDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = request.architecture orelse "all",
+            .wait_ms = request.state.lock_wait_ms,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    /// Pointer to the live attempt, never a copy: every boundary must be
+    /// published on the record this guard owns.
+    fn active(self: *RootOperationGuard) ?*root_operation.Attempt {
+        if (self.attempt) |*value| return value;
+        return null;
+    }
+
+    fn enterRank(self: *RootOperationGuard, rank: root_operation.Rank) !void {
+        var attempt = self.active() orelse return;
+        try attempt.enterRank(rank);
+    }
+
+    fn preflight(self: *RootOperationGuard, architecture: []const u8) ?api.Result {
+        _ = architecture;
+        var attempt = self.active() orelse return null;
+        if (attempt.record().state != .reserved) return null;
+        attempt.advance(self.allocator, .{
+            .state = .preflight,
+            .phase = .preflight,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    /// Publishes the executor bridge, or resumes an adopted attempt through
+    /// the durable recovery boundary. An attempt that already carries mutation
+    /// evidence never pretends to be a fresh hand-over.
+    fn enterExecutor(self: *RootOperationGuard) ?api.Result {
+        var attempt = self.active() orelse return null;
+        switch (attempt.record().state) {
+            // Nothing was mutated yet, so publish the bridge.
+            .reserved, .preflight => attempt.advance(self.allocator, .{
+                .state = .mutation_pending,
+                .phase = .mutation,
+            }) catch |err| return mapRootOperationError(err),
+            // The bridge an earlier run published stays exactly as it is, so
+            // this run's own executor evidence can never discharge another
+            // run's hand-over as never having started.
+            .mutation_pending => {},
+            // An adopted attempt already carries mutation evidence. Resuming
+            // it walks the exact recovery edges instead of moving backwards
+            // into the bridge, which the edge table would refuse anyway.
+            .mutating, .verifying, .recovery_required, .recovering => attempt.beginRecovery(
+                self.allocator,
+                .mutation,
+            ) catch |err| return mapRootOperationError(err),
+            // The attempt already finished; only its provenance is owed.
+            .completed => {},
+        }
+        attempt.enterRank(.target_database) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    fn exitRank(self: *RootOperationGuard, rank: root_operation.Rank) void {
+        var attempt = self.active() orelse return;
+        attempt.exitRank(rank);
+    }
+
+    /// Resolves the bridge from the executor's own transaction evidence. The
+    /// witness is derived by `root_operation`, never from a command count, and
+    /// the attempt itself decides which witness may be applied: evidence that
+    /// this run started nothing says nothing about a bridge an earlier run
+    /// published, so an inherited bridge resolves as observed mutation and
+    /// keeps the root blocked until it is recovered.
+    fn observe(
+        self: *RootOperationGuard,
+        observed: root_operation.Witness,
+        succeeded: bool,
+    ) ?api.Result {
+        var attempt = self.active() orelse return null;
+        // Already finished; `finish` still owes its provenance.
+        if (attempt.record().state == .completed) return null;
+        if (attempt.record().state == .mutation_pending) {
+            const applied = attempt.witness(self.allocator, observed) catch |err|
+                return mapRootOperationError(err);
+            if (applied == .proved_not_started) return null;
+        }
+        if (!attempt.record().mutation_started) return null;
+        if (!succeeded) {
+            attempt.requireRecovery(self.allocator, .mutation) catch |err|
+                return mapRootOperationError(err);
+            return null;
+        }
+        if (attempt.record().state == .mutating) attempt.advance(self.allocator, .{
+            .state = .verifying,
+            .phase = .verification,
+        }) catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    /// Completes the attempt from wherever it durably stopped and only then
+    /// publishes provenance and clears the active intent. It is reached only
+    /// once the bootstrap itself has succeeded, so every state that carries
+    /// mutation evidence is finished rather than left blocking the root.
+    fn finish(self: *RootOperationGuard, document_sha256: ?[32]u8) ?api.Result {
+        var attempt = self.active() orelse return null;
+        switch (attempt.record().state) {
+            .completed => {},
+            .reserved, .preflight => attempt.complete(
+                self.allocator,
+                .abandoned_before_mutation,
+            ) catch |err| return mapRootOperationError(err),
+            // The bootstrap succeeded but the bridge was never witnessed,
+            // because the executor was skipped on this run. Nothing here can
+            // prove the root was untouched, so the conservative witness is
+            // taken and the attempt is finished with its evidence intact.
+            .mutation_pending => {
+                _ = attempt.witness(self.allocator, .mutation_observed) catch |err|
+                    return mapRootOperationError(err);
+                if (self.completeMutated(.succeeded)) |failure| return failure;
+            },
+            .mutating, .verifying => if (self.completeMutated(.succeeded)) |failure|
+                return failure,
+            // A resumed attempt that had to walk the recovery edges finishes
+            // as recovered, which keeps its mutation evidence and still
+            // discharges the intent.
+            .recovery_required, .recovering => if (self.completeMutated(.recovered)) |failure|
+                return failure,
+        }
+        const record = attempt.record();
+        if (record.provenance == .pending) attempt.publishProvenance(
+            self.allocator,
+            root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .document_sha256 = document_sha256,
+                .journal_archived = true,
+            }),
+        ) catch |err| return mapRootOperationError(err);
+        attempt.clear() catch |err| return mapRootOperationError(err);
+        return null;
+    }
+
+    /// Walks the exact edges from an attempt that carries mutation evidence to
+    /// `completed`, so no boundary between the executor and the terminal
+    /// outcome is ever skipped.
+    fn completeMutated(
+        self: *RootOperationGuard,
+        outcome: root_operation.Outcome,
+    ) ?api.Result {
+        var attempt = self.active() orelse return null;
+        switch (outcome) {
+            .succeeded => {
+                if (attempt.record().state == .mutating) attempt.advance(self.allocator, .{
+                    .state = .verifying,
+                    .phase = .verification,
+                }) catch |err| return mapRootOperationError(err);
+            },
+            .recovered => attempt.beginRecovery(self.allocator, .verification) catch |err|
+                return mapRootOperationError(err),
+            else => {},
+        }
+        attempt.complete(self.allocator, outcome) catch |err|
+            return mapRootOperationError(err);
+        return null;
+    }
+
+    fn deinit(self: *RootOperationGuard) void {
+        if (self.attempt) |*value| {
+            // An attempt that is durably proven never to have mutated the root
+            // is released rather than left behind. Anything at or past the
+            // executor bridge stays exactly as published, so the next mutation
+            // is refused until it is explicitly recovered. A failure here
+            // simply leaves the pre-mutation record, which the next attempt
+            // reports as an unresolved attempt.
+            if (value.locked()) {
+                if (value.record().state.provenPreMutation())
+                    value.abandonIfPreMutation(self.allocator) catch {}
+                else if (value.record().clearable()) value.clear() catch {};
+            }
+            value.release();
+        }
+        self.attempt = null;
+        if (self.owned_root) |*value| value.close();
+        self.owned_root = null;
+    }
+};
+
+fn mapRootOperationError(err: anyerror) api.Result {
+    return switch (err) {
+        error.LockTimeout, error.LockUnavailable, error.LockCanceled => api.failure(
+            .unavailable,
+            .recovery_required,
+            "root-operation",
+            "another debz operation holds the root mutation lock",
+        ),
+        error.OperationInProgress, error.ResolvedAttemptPresent, error.AttemptMismatch => api.failure(
+            .recovery,
+            .recovery_required,
+            "root-operation",
+            "an interrupted debz operation left an unresolved root attempt",
+        ),
+        error.RecoveryRequired, error.ProvenancePending, error.RootIdentityMismatch => api.failure(
+            .recovery,
+            .recovery_required,
+            "root-operation",
+            "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.RecordCorrupt, error.UnsupportedSchema => api.failure(
+            .recovery,
+            .state_corrupt,
+            "root-operation",
+            "the active root attempt record is unreadable",
+        ),
+        error.InvalidRoot, error.RootTooLong, error.NamespaceUnavailable => api.failure(
+            .usage,
+            .invalid_root,
+            "target",
+            "target root cannot host the debz operation namespace",
+        ),
+        else => api.failure(
+            .internal,
+            .internal_error,
+            "root-operation",
+            "root operation coordination failed",
+        ),
+    };
+}
+
+/// Bounded digest of the reviewed repository request.
+fn repositoryRequestDigest(request: api.Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-repository-request-v1\x00");
+    hash.update(@tagName(request.operation));
+    hash.update("\x00");
+    hash.update(request.root);
+    hash.update("\x00");
+    hash.update(request.descriptor_url);
+    hash.update("\x00");
+    hash.update(request.architecture orelse "");
+    hash.update("\x00");
+    if (request.expected_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    hash.update(if (request.no_refresh) "\x01" else "\x00");
+    return hash.finalResult();
+}
+
+fn repositoryPolicyDigest(request: api.Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-repository-policy-v1\x00");
+    hash.update(if (request.no_refresh) "\x01" else "\x00");
+    hash.update(if (request.state.path) |value| value else "");
+    hash.update("\x00");
+    hash.update(if (request.cache.path) |value| value else "");
+    hash.update("\x00");
+    hash.update(if (request.network.proxy_url) |value| value else "");
+    return hash.finalResult();
+}
 
 const Progress = struct {
     root: []const u8,
@@ -1882,11 +2250,18 @@ const Progress = struct {
     plan_sha256: ?[32]u8 = null,
     exact_lock_path: ?[]const u8 = null,
     provenance_path: ?[]const u8 = null,
+    provenance_sha256: ?[32]u8 = null,
     manifest_path: ?[]const u8 = null,
     managed_files: []const state_module.FileEvidence = &.{},
     durable_phase: state_module.Phase = .initialized,
     diagnostic_id: ?api.DiagnosticId = null,
     diagnostic: []const u8 = "",
+
+    /// Digest of the transaction provenance document published for this
+    /// operation, when one exists.
+    fn provenanceDigest(self: *const Progress) ?[32]u8 {
+        return self.provenance_sha256;
+    }
 
     fn persist(
         self: *Progress,
@@ -3395,7 +3770,7 @@ fn publishProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.Report,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     return publishBoundProvenance(
         allocator,
         io,
@@ -3415,7 +3790,7 @@ fn publishRecoveryProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.RecoveryReport,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     return publishBoundProvenance(
         allocator,
         io,
@@ -3440,7 +3815,7 @@ fn publishBoundProvenance(
     lock: *const exact_lock_v2.Lock,
     report: ProvenanceReport,
     refreshed: ?*repository_policy.RefreshResult,
-) !void {
+) ![32]u8 {
     _ = refreshed;
     const repositories = try allocator.alloc(
         transaction_provenance_v2.RepositoryEvidence,
@@ -3528,6 +3903,7 @@ fn publishBoundProvenance(
         provenance_name,
     );
     try store.writeAtomic(allocator, provenance.result);
+    return provenance.result.digest_sha256;
 }
 
 fn verifyInstalledDescriptor(
@@ -4655,6 +5031,25 @@ const RepositoryTestExecutor = struct {
     clock_ms: ?*u64 = null,
     advance_ms_after_install: u64 = 0,
     install_status: ?[]const u8 = null,
+    /// Publishes a directory under the operation directory using the name of a
+    /// document the backend is about to write, so the very next post-executor
+    /// publication fails with the root already mutated.
+    collide_after_install: ?[]const u8 = null,
+    /// Records the descriptor as only half-configured so installed-descriptor
+    /// verification fails after the executor already changed the root, without
+    /// disturbing the target's apt configuration.
+    half_configure_descriptor: bool = false,
+    /// Reports the exact shape of a failure before any spawn: no command
+    /// completed and the transaction state never left `not_started`. An
+    /// expired deadline, a refused preflight, a lock that could not be taken,
+    /// and a journal that could not be decoded all look like this.
+    no_start_failure: ?transaction_executor.FailureCode = null,
+    /// Refuses the transaction as needing explicit recovery without touching
+    /// the root, which is how the backend is driven into its recovery path.
+    recovery_transition_first: bool = false,
+    /// The same pre-spawn failure shape for the recovery path, where the
+    /// transaction state is published only once the journal has decoded.
+    no_start_recovery_failure: ?transaction_executor.FailureCode = null,
 
     fn interface(self: *RepositoryTestExecutor) Executor {
         return .{
@@ -4662,6 +5057,28 @@ const RepositoryTestExecutor = struct {
             .executeFn = execute,
             .recoverFn = recover,
         };
+    }
+
+    /// The operation directory the backend selected for this request, found
+    /// exactly the way `execute` finds the published exact lock.
+    fn openOperationDirectory(self: *RepositoryTestExecutor) !std.Io.Dir {
+        var operations = try self.directory.openDir(
+            self.io,
+            "root/var/lib/debz/repository/operations",
+            .{ .iterate = true },
+        );
+        defer operations.close(self.io);
+        var iterator = operations.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            var operation = try operations.openDir(self.io, entry.name, .{});
+            operation.access(self.io, exact_lock_name, .{}) catch {
+                operation.close(self.io);
+                continue;
+            };
+            return operation;
+        }
+        return error.OperationDirectoryMissing;
     }
 
     fn execute(
@@ -4699,6 +5116,33 @@ const RepositoryTestExecutor = struct {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
         arena.* = .init(allocator);
+        // Nothing is installed and nothing is recorded: the report is
+        // indistinguishable from an untouched root through its command count.
+        if (self.no_start_failure) |code| return .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = plan_sha256,
+            .transaction_state = .not_started,
+            .root_identity = @splat(0x22),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = exact_lock.digest_sha256,
+            .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
+        };
+        if (self.recovery_transition_first) return .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = &.{},
+            .plan_sha256 = plan_sha256,
+            .transaction_state = .interrupted,
+            .root_identity = @splat(0x22),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = exact_lock.digest_sha256,
+            .failure = .{
+                .code = .invalid_recovery_transition,
+                .diagnostic = "injected recovery requirement",
+            },
+        };
         const interrupted = self.interrupt_first and self.calls == 1;
         const recovery_required = self.interrupt_first and self.calls > 1;
         if ((!interrupted or !self.interrupt_before_install) and !recovery_required) {
@@ -4706,6 +5150,18 @@ const RepositoryTestExecutor = struct {
                 try self.installDescriptorWithStatus(self.interrupted_status.?)
             else
                 try self.installDescriptor();
+            if (self.half_configure_descriptor) try self.directory.writeFile(self.io, .{
+                .sub_path = "root/var/lib/dpkg/status",
+                .data = "Package: packages-microsoft-prod\n" ++
+                    "Status: install ok half-configured\n" ++
+                    "Architecture: all\n" ++
+                    "Version: 1.1\n",
+            });
+            if (self.collide_after_install) |name| {
+                var operation = try self.openOperationDirectory();
+                defer operation.close(self.io);
+                try operation.createDirPath(self.io, name);
+            }
             if (self.clock_ms) |clock|
                 clock.* +|= self.advance_ms_after_install;
         }
@@ -4752,6 +5208,24 @@ const RepositoryTestExecutor = struct {
         const exact_lock = request.exact_lock_v2 orelse
             return error.MissingExactLock;
         self.recovered_exact_lock = true;
+        if (self.no_start_recovery_failure) |code| {
+            const failed_arena = try allocator.create(std.heap.ArenaAllocator);
+            errdefer allocator.destroy(failed_arena);
+            failed_arena.* = .init(allocator);
+            // The journal never decoded, so the report carries the state it
+            // was initialized with rather than the journal's own.
+            return .{
+                .allocator = allocator,
+                .arena = failed_arena,
+                .state = .not_started,
+                .commands = &.{},
+                .plan_sha256 = transaction_executor.planDigest(request.plan.*),
+                .root_identity = @splat(0x22),
+                .policy_sha256 = transaction_executor.policyDigest(request.policy),
+                .lock_sha256 = exact_lock.digest_sha256,
+                .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
+            };
+        }
         try self.installDescriptor();
         const arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(arena);
@@ -5227,7 +5701,7 @@ test "repository backend holds bounded target locks for idempotent verification"
                 .failure = null,
             };
             defer report.deinit();
-            try publishProvenance(
+            _ = try publishProvenance(
                 std.testing.allocator,
                 std.testing.io,
                 operation_dir,
@@ -7124,4 +7598,773 @@ test "repository backend rejects unavailable native transaction before root acce
         result.diagnostics[0].id,
     );
     try std.testing.expect(!result.changed);
+}
+
+/// Reads the durable root attempt straight out of a staged test root, exactly
+/// as the next debz invocation would.
+fn readRootAttempt(
+    directory: std.Io.Dir,
+) !?root_operation.OwnedRecord {
+    var root_dir = try directory.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+    return store.read(std.testing.allocator);
+}
+
+/// Whether a package transaction could start on this root right now. Every
+/// post-executor failure must keep this false until the bootstrap is resumed,
+/// because the shared root attempt is what stops two mutations from
+/// overlapping.
+fn packageMutationAdmitted(directory: std.Io.Dir, root_path: []const u8) !bool {
+    var owned = try root_fs.openAbsoluteRoot(std.testing.io, root_path);
+    defer owned.close();
+    _ = directory;
+    var locks: root_operation.SystemLockBackend = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var coordinator = try root_operation.Coordinator.open(
+        std.testing.io,
+        owned.root,
+        root_path,
+        locks.interface(),
+    );
+    coordinator.now_unix = 1_700_000_000;
+    var attempt = coordinator.acquire(std.testing.allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .legacy_dpkg,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(0x31),
+        .policy_sha256 = @splat(0x32),
+        .target_architecture = "amd64",
+    }) catch |err| switch (err) {
+        error.RecoveryRequired,
+        error.ProvenancePending,
+        error.AttemptMismatch,
+        error.OperationInProgress,
+        error.ResolvedAttemptPresent,
+        => return false,
+        else => return err,
+    };
+    // The probe never leaves evidence of its own behind.
+    attempt.abandonIfPreMutation(std.testing.allocator) catch {};
+    attempt.release();
+    return true;
+}
+
+// Every stage after the executor can fail on a root the executor already
+// changed. The durable root attempt has to survive those failures — clearing
+// it would let an unrelated mutation start on a half-bootstrapped root — but
+// it must not lock the operation out of its own resumable progress either.
+// Before the same-operation binding existed, the second run opened a generic
+// mutation intent, was refused by its own evidence, and the root could never
+// be finished by debz again.
+test "repository backend resumes its own attempt after a failure at every post-executor stage" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const Stage = enum {
+        provenance,
+        installed_progress,
+        verify_installed,
+        manifest,
+        imported_progress,
+        refresh,
+    };
+    for (std.enums.values(Stage)) |stage| {
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+        };
+        var state_failure: RepositoryStateFailure = .{
+            .boundary = .after_rename,
+            .fail_from_write = std.math.maxInt(usize),
+        };
+        switch (stage) {
+            .provenance => executor.collide_after_install = provenance_name,
+            .manifest => executor.collide_after_install = manifest_name,
+            .verify_installed => executor.half_configure_descriptor = true,
+            // The seventh and eighth durable checkpoints are `installed` and
+            // `imported`; both are written after the root was changed.
+            .installed_progress => state_failure.fail_from_write = 7,
+            .imported_progress => state_failure.fail_from_write = 8,
+            .refresh => acquisition.fail_in_release_request = 2,
+        }
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .state_write_hooks = state_failure.hooks(),
+        };
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        var interrupted = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        errdefer std.debug.print("stage: {t}\n", .{stage});
+        try std.testing.expect(interrupted.exit_status != .success);
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        interrupted.deinit();
+
+        // The root attempt kept its mutation evidence rather than being
+        // cleared as abandoned, so nothing else may mutate this root.
+        var stranded = (try readRootAttempt(directory.dir)).?;
+        try std.testing.expect(stranded.record.mutation_started);
+        try std.testing.expect(
+            stranded.record.state.blocksMutation() or
+                stranded.record.provenance == .pending,
+        );
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        // A different descriptor is a different operation: it may neither
+        // adopt this evidence nor overwrite it.
+        var other = try api.execute(std.testing.allocator, .{
+            .root = root,
+            .descriptor_url = "file:///other-descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        }, backend.interface());
+        try std.testing.expectEqual(api.ExitStatus.recovery, other.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.recovery_required,
+            other.diagnostics[0].id,
+        );
+        other.deinit();
+        // A different architecture is a different operation too.
+        var other_architecture = try api.execute(std.testing.allocator, .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "arm64",
+        }, backend.interface());
+        try std.testing.expectEqual(api.ExitStatus.recovery, other_architecture.exit_status);
+        other_architecture.deinit();
+
+        var untouched = (try readRootAttempt(directory.dir)).?;
+        try std.testing.expectEqualSlices(
+            u8,
+            &stranded.record.digest_sha256,
+            &untouched.record.digest_sha256,
+        );
+        untouched.deinit();
+        stranded.deinit();
+
+        // Clear the injection and rerun exactly the same request.
+        backend.state_write_hooks = .{};
+        state_failure.fail_from_write = std.math.maxInt(usize);
+        executor.collide_after_install = null;
+        executor.half_configure_descriptor = false;
+        acquisition.fail_in_release_request = null;
+        switch (stage) {
+            .provenance, .manifest => {
+                var operation = try executor.openOperationDirectory();
+                defer operation.close(std.testing.io);
+                try operation.deleteTree(
+                    std.testing.io,
+                    if (stage == .provenance) provenance_name else manifest_name,
+                );
+            },
+            else => {},
+        }
+        var resumed = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
+        try std.testing.expect(resumed.installed);
+        try std.testing.expect(resumed.paths.provenance != null);
+        try std.testing.expect(resumed.paths.target_manifest != null);
+
+        // Provenance was published before the intent was cleared, so the
+        // finished bootstrap leaves no active attempt behind and the root is
+        // available to the next mutation.
+        try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+        try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// A crash leaves the record exactly where the last durable boundary put it.
+// The rerun has to pick its own attempt back up from each of those boundaries
+// without a second mutation ever starting from a generic intent, and without
+// the provenance obligation being skipped.
+test "repository backend adopts a crashed attempt at every durable boundary" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const Crash = struct {
+        state: root_operation.State,
+        phase: root_operation.Phase,
+        mutation_started: bool,
+        outcome: root_operation.Outcome = .pending,
+        provenance: root_operation.ProvenanceState = .pending,
+    };
+    const crashes = [_]Crash{
+        // Crashed while reserved, before anything was bound.
+        .{ .state = .reserved, .phase = .reserved, .mutation_started = false },
+        // Crashed at the hand-over, with no report ever returned.
+        .{ .state = .mutation_pending, .phase = .mutation, .mutation_started = false },
+        // Crashed after the executor was witnessed as having mutated.
+        .{ .state = .mutating, .phase = .mutation, .mutation_started = true },
+        .{ .state = .verifying, .phase = .verification, .mutation_started = true },
+        .{ .state = .recovery_required, .phase = .mutation, .mutation_started = true },
+        .{ .state = .recovering, .phase = .database, .mutation_started = true },
+        // Crashed between completing and publishing provenance.
+        .{
+            .state = .completed,
+            .phase = .provenance,
+            .mutation_started = true,
+            .outcome = .succeeded,
+        },
+    };
+    for (crashes) |crash| {
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var record = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7c),
+            .generation = 4,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = crash.state,
+            .phase = crash.phase,
+            .step = 3,
+            .mutation_started = crash.mutation_started,
+            .outcome = crash.outcome,
+            .provenance = crash.provenance,
+            .request_sha256 = repositoryRequestDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        try store.writeAtomic(std.testing.allocator, record.record);
+        record.deinit();
+        root_dir.close(std.testing.io);
+
+        errdefer std.debug.print("crash state: {t}\n", .{crash.state});
+        // Nothing else may take the root while the crashed evidence stands.
+        if (crash.state != .reserved)
+            try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var resumed = try api.execute(
+            std.testing.allocator,
+            request,
+            backend.interface(),
+        );
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
+        // A record that already claimed the bootstrap was completed keeps its
+        // outcome; every other boundary is finished by running the bootstrap.
+        try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+        try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// A rerun adopts the record its own interrupted run left behind, including one
+// left at the executor bridge. That run handed control to dpkg and never came
+// back, so this run's executor evidence says nothing about it: a deadline that
+// expired, a preflight that was refused, a lock that could not be taken, or a
+// journal that could not be decoded all report `not_started` with no commands.
+// Resolving the inherited bridge from that report discharged another run's
+// hand-over as never started and cleared the only evidence blocking the root.
+test "repository backend never discharges an inherited bridge with its own no-start report" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const Case = struct {
+        code: transaction_executor.FailureCode,
+        /// Whether the failure is reported by the executor's recovery path,
+        /// which is reached when the transaction refuses to run without one.
+        recovery: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .code = .process_timeout },
+        .{ .code = .invalid_root },
+        .{ .code = .lock_timeout },
+        .{ .code = .journal_corrupt },
+        // The recovery path reports the same shape, including the journal it
+        // never found a state for.
+        .{ .code = .journal_missing, .recovery = true },
+        .{ .code = .journal_corrupt, .recovery = true },
+        .{ .code = .lock_timeout, .recovery = true },
+    };
+    for (cases) |case| {
+        const code = case.code;
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        errdefer std.debug.print(
+            "failure code: {t} recovery: {}\n",
+            .{ code, case.recovery },
+        );
+
+        // The interrupted run of exactly this request stopped at the
+        // hand-over, with no witness ever published.
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var stranded = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7d),
+            .generation = 4,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = .mutation_pending,
+            .phase = .mutation,
+            .step = 3,
+            .mutation_started = false,
+            .outcome = .pending,
+            .provenance = .pending,
+            .request_sha256 = repositoryRequestDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer stranded.deinit();
+        try store.writeAtomic(std.testing.allocator, stranded.record);
+        root_dir.close(std.testing.io);
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            .no_start_failure = if (case.recovery) null else code,
+            .recovery_transition_first = case.recovery,
+            .no_start_recovery_failure = if (case.recovery) code else null,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var result = try api.execute(std.testing.allocator, request, backend.interface());
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        try std.testing.expectEqual(
+            @as(usize, if (case.recovery) 1 else 0),
+            executor.recover_calls,
+        );
+
+        // The inherited hand-over is still unresolved: the record blocks, it
+        // carries mutation evidence, and its provenance obligation was not
+        // waived by completing it as abandoned.
+        var observed = (try readRootAttempt(directory.dir)).?;
+        defer observed.deinit();
+        try std.testing.expectEqual(
+            root_operation.State.recovery_required,
+            observed.record.state,
+        );
+        try std.testing.expect(observed.record.state.blocksMutation());
+        try std.testing.expect(observed.record.mutation_started);
+        try std.testing.expectEqual(
+            root_operation.ProvenanceState.pending,
+            observed.record.provenance,
+        );
+        try std.testing.expectEqual(root_operation.Outcome.pending, observed.record.outcome);
+        try std.testing.expect(!observed.record.clearable());
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// The conservative rule only applies to a hand-over this run did not perform.
+// A bridge this very run published, whose executor really did report that
+// nothing started, still releases the root instead of blocking it.
+test "repository backend still clears a bridge it published itself when nothing started" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+        .no_start_failure = .lock_timeout,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+    try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+}
+
+// A record that is completed with its provenance discharged is evidence that
+// an operation finished. Adopting it — matching request or not — let a rerun
+// execute under a record that already said the mutation was over, so a crash
+// mid-rerun left durable evidence claiming the opposite. The rerun therefore
+// reserves its own attempt instead.
+test "repository backend reserves a new attempt instead of adopting a settled record" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    for ([_]bool{ true, false }) |same_request| {
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        const request: api.Request = .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        };
+        errdefer std.debug.print("same request: {}\n", .{same_request});
+
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var settled = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7e),
+            .generation = 9,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = .completed,
+            .phase = .provenance,
+            .step = 8,
+            .mutation_started = true,
+            .outcome = .succeeded,
+            .provenance = .published,
+            .provenance_sha256 = @splat(0xcd),
+            .request_sha256 = if (same_request)
+                repositoryRequestDigest(request)
+            else
+                @splat(0x14),
+            .policy_sha256 = repositoryPolicyDigest(request),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer settled.deinit();
+        try std.testing.expect(settled.record.clearable());
+        try store.writeAtomic(std.testing.allocator, settled.record);
+        root_dir.close(std.testing.io);
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+            // Crash right after the executor mutated the root, before the
+            // rerun could publish its own provenance.
+            .collide_after_install = provenance_name,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var interrupted = try api.execute(std.testing.allocator, request, backend.interface());
+        try std.testing.expect(interrupted.exit_status != .success);
+        // The rerun really executed rather than resting on settled evidence.
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        interrupted.deinit();
+
+        // A fresh attempt: a new identifier, a strictly higher generation, and
+        // durable evidence of the rerun's own mutation.
+        var reserved = (try readRootAttempt(directory.dir)).?;
+        defer reserved.deinit();
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &settled.record.attempt_id,
+            &reserved.record.attempt_id,
+        ));
+        try std.testing.expect(reserved.record.generation > settled.record.generation);
+        try std.testing.expect(reserved.record.mutation_started);
+        try std.testing.expect(
+            reserved.record.state.blocksMutation() or
+                reserved.record.provenance == .pending,
+        );
+        try std.testing.expect(!reserved.record.clearable());
+        // No package transaction may start while the rerun is unresolved.
+        try std.testing.expect(!try packageMutationAdmitted(directory.dir, root));
+
+        // Clearing the injection lets the same rerun finish and discharge it.
+        executor.collide_after_install = null;
+        var operation = try executor.openOperationDirectory();
+        try operation.deleteTree(std.testing.io, provenance_name);
+        operation.close(std.testing.io);
+        var resumed = try api.execute(std.testing.allocator, request, backend.interface());
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, resumed.exit_status);
+        try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+        try std.testing.expect(try packageMutationAdmitted(directory.dir, root));
+    }
+}
+
+// A record that belongs to another operation is never adopted, whichever
+// boundary it stopped at, and the bootstrap that finds it leaves it exactly as
+// it was published.
+test "repository backend refuses to adopt an unrelated unresolved attempt" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const cases = [_]struct {
+        operation: root_operation.Operation,
+        request_digest: [32]u8,
+        state: root_operation.State,
+        phase: root_operation.Phase,
+        mutation_started: bool,
+        outcome: root_operation.Outcome = .pending,
+        provenance: root_operation.ProvenanceState = .pending,
+    }{
+        // Another surface entirely.
+        .{
+            .operation = .{ .package_transaction = .install },
+            .request_digest = @splat(0x11),
+            .state = .mutating,
+            .phase = .database,
+            .mutation_started = true,
+        },
+        // The same surface, a different request.
+        .{
+            .operation = .{ .repository_bootstrap = .add },
+            .request_digest = @splat(0x12),
+            .state = .verifying,
+            .phase = .verification,
+            .mutation_started = true,
+        },
+        // The same surface, a different request, owing provenance.
+        .{
+            .operation = .{ .repository_bootstrap = .add },
+            .request_digest = @splat(0x13),
+            .state = .completed,
+            .phase = .provenance,
+            .mutation_started = true,
+            .outcome = .succeeded,
+        },
+    };
+    for (cases) |case| {
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        try store.ensureNamespace();
+        var record = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x2d),
+            .generation = 2,
+            .install_root = root,
+            .backend = .legacy_dpkg,
+            .operation = case.operation,
+            .state = case.state,
+            .phase = case.phase,
+            .step = 6,
+            .mutation_started = case.mutation_started,
+            .outcome = case.outcome,
+            .provenance = case.provenance,
+            .request_sha256 = case.request_digest,
+            .policy_sha256 = @splat(0x22),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer record.deinit();
+        try store.writeAtomic(std.testing.allocator, record.record);
+        root_dir.close(std.testing.io);
+
+        var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+        var executor: RepositoryTestExecutor = .{
+            .io = std.testing.io,
+            .directory = directory.dir,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .executor = executor.interface(),
+            .acquisition_dependencies = acquisition.dependencies(),
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        };
+        var result = try api.execute(std.testing.allocator, .{
+            .root = root,
+            .descriptor_url = "file:///descriptor.deb",
+            .expected_sha256 = sha256(descriptor),
+            .architecture = "amd64",
+        }, backend.interface());
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+        try std.testing.expectEqual(
+            api.DiagnosticId.recovery_required,
+            result.diagnostics[0].id,
+        );
+        // The bootstrap never reached the executor and never touched the
+        // record it could not adopt.
+        try std.testing.expectEqual(@as(usize, 0), executor.calls);
+        var observed = (try readRootAttempt(directory.dir)).?;
+        defer observed.deinit();
+        try std.testing.expectEqualSlices(
+            u8,
+            &record.record.digest_sha256,
+            &observed.record.digest_sha256,
+        );
+    }
+}
+
+test "repository backend refuses bootstrap while a package transaction attempt is unresolved" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(root_path);
+
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const root: root_fs.Root = .init(std.testing.io, root_dir);
+    const store = root_operation.Store.init(root);
+    try store.ensureNamespace();
+    var record = try root_operation.create(std.testing.allocator, .{
+        .attempt_id = @splat(0x5b),
+        .generation = 1,
+        .install_root = root_path,
+        .backend = .legacy_dpkg,
+        .operation = .{ .package_transaction = .install },
+        .state = .mutating,
+        .phase = .database,
+        .step = 5,
+        .mutation_started = true,
+        .outcome = .pending,
+        .provenance = .pending,
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .reserved_unix = 1_700_000_000,
+        .updated_unix = 1_700_000_000,
+    });
+    defer record.deinit();
+    try store.writeAtomic(std.testing.allocator, record.record);
+
+    var backend: Backend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = @splat(0x33),
+        .architecture = "amd64",
+        .cache = .{ .path = "/var/cache/debz" },
+        .state = .{ .path = "/var/lib/debz" },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.recovery_required,
+        result.diagnostics[0].id,
+    );
+
+    // The blocked bootstrap never reached the repository operation lock, so the
+    // durable package-transaction evidence is untouched.
+    var observed = (try store.read(std.testing.allocator)).?;
+    defer observed.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &record.record.digest_sha256,
+        &observed.record.digest_sha256,
+    );
+}
+
+test "repository backend rejects an unavailable native backend before root access" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/root",
+        .{real_buffer[0..real_length]},
+    );
+    defer std.testing.allocator.free(root_path);
+
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+        .native_executor = null,
+        .now_unix = 1_700_000_000,
+    };
+    var result = try api.execute(std.testing.allocator, .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = @splat(0x33),
+        .architecture = "amd64",
+        .cache = .{ .path = "/var/cache/debz" },
+        .state = .{ .path = "/var/lib/debz" },
+    }, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(
+        api.DiagnosticId.transaction_backend_unavailable,
+        result.diagnostics[0].id,
+    );
+
+    // The unavailable selection failed before anything touched the root, so the
+    // shared operation namespace was never provisioned.
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.statFile(std.testing.io, "root/var/lib/debz", .{}),
+    );
 }

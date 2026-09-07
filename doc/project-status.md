@@ -59,6 +59,35 @@ link, refuses absolute, traversing, and control-byte paths before any syscall,
 creates only exclusively, and replaces existing paths only through fsynced
 staged publication. See [Root-anchored filesystem primitives](root-filesystem.md).
 
+`debz.root_operation` is the single mutation gate for a selected root. One root
+mutation lock and one durable, versioned active-attempt record in the root's
+`var/lib/debz` namespace are shared by repository bootstrap and package
+transactions, so two debz operations can never mutate one root at once. The
+record binds the attempt identity, root identity, backend, operation surface,
+authorization/program/plan/request/policy/exact-lock digests, package-database
+base generation, artifact evidence, architectures, durable phase and step,
+sticky mutation evidence, and provenance publication state. Transitions are
+monotonic, idempotent, and compare-and-set, an interrupted attempt is
+classified as safely abandoned before mutation or recovery required, and the
+active intent is cleared only after provenance is published. The
+command-oriented executor bridge is resolved from the executor's own
+transaction state rather than a command count, so a first command that timed
+out, hit the deadline, or failed to spawn leaves recovery evidence instead of
+clearing a root nobody can prove was untouched, and a bridge inherited from an
+earlier run is never discharged by this run's own no-start evidence.
+Repository bootstrap binds its attempt to a stable request digest before
+acquisition, so a rerun of the same request adopts its own evidence and
+finishes it while an unrelated operation, descriptor, or request is still
+refused; a record that already published its provenance is settled, so the
+rerun reserves a new attempt over it rather than executing under it. A package
+transaction whose completion was interrupted before its provenance was
+published is discharged by `debz recover` through
+`debz.root_operation_completion`, a versioned statement in the same namespace
+that binds the completed record and says whether its detailed transaction
+provenance was already present, recovered, or interrupted, without running the
+transaction engine again and without restating any command, script, or package
+outcome. See [Root-scoped operation coordination](root-operation.md).
+
 ## Typed metadata and archives
 
 The project exposes typed configuration and request APIs, a CLI command vocabulary, and bounded parsers for DEB822, Debian versions, binary package relations, control records, repository `Release` metadata, repository source configuration, and Debian binary package outer archives.
