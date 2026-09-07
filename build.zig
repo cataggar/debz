@@ -279,6 +279,17 @@ pub fn build(b: *std.Build) void {
     b.step("test-root-operation", "Run root operation lock and active-record tests")
         .dependOn(&run_root_operation_tests.step);
 
+    const package_database_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "package_database.test.",
+            "package_database_changes.test.",
+        },
+    });
+    const run_package_database_tests = b.addRunArtifact(package_database_tests);
+    b.step("test-package-database", "Run native package database model and change-set tests")
+        .dependOn(&run_package_database_tests.step);
+
     const refresh_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"repository_refresh.test."},
@@ -462,6 +473,7 @@ fn installReleaseFiles(
         "native-transaction-program.md",
         "openpgp-verifier.md",
         "package-acquisition.md",
+        "package-database.md",
         "product-api.md",
         "project-status.md",
         "repository-management.md",

@@ -20,6 +20,7 @@
 - [Dpkg transaction executor](transaction-executor.md) documents install-root safety, locks, argv/environment policy, ordering, triggers, force policy, and failure provenance.
 - [Exact closure locks and transaction provenance](exact-locks-and-provenance.md) documents canonical schemas, reproduction constraints, redaction, persistence, recovery evidence, and final verification.
 - [Transaction recovery](transaction-recovery.md) documents durable journals, explicit repair, and exact post-state verification.
+- [Native package database](package-database.md) documents the bounded typed model, import validation, canonical writers, generation evidence, and staged change-set plans for `var/lib/dpkg`.
 - [Native transaction engine v1 compatibility contract](native-transaction-engine-v1.md) defines the package, database, lifecycle, durability, and differential-test boundary required before replacing dpkg.
 - [Native transaction program v1](native-transaction-program.md) documents the pre-mutation program compiler: its inputs, typed steps, lifecycle expansion, validation, determinism, digest binding, and engine wiring.
 - [Root-scoped operation coordination](root-operation.md) documents the shared root mutation lock, the durable active-attempt record, the total lock order, the state machine, and the recovery contract for repository bootstrap and package transactions.

@@ -77,6 +77,10 @@ database path component.
 | `var/lib/dpkg/parts/` | Empty is accepted. Nonempty records are retained and classified during feature inventory before mutation. |
 | `var/lib/dpkg/available` | Preserve as non-authoritative compatibility data; the native engine does not use it for solving or authorization. |
 
+The typed model, import validation, canonical writers, generation evidence, and
+staged change-set plans for these surfaces are documented in
+[Native package database](package-database.md).
+
 Package information filenames must follow dpkg's package and architecture
 qualification rules. Unknown regular files under `info` and unknown
 well-formed status fields are retained. Unknown database directories, links,

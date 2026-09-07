@@ -13,6 +13,11 @@
 src/fixtures/** -text
 fuzz/corpus/** -text
 
+# dpkg terminates every status record with a blank line, including the last, so
+# a faithful status fixture ends with one. That is exact database content, not
+# a stray blank line to be trimmed.
+src/fixtures/package-database/** whitespace=-blank-at-eof
+
 # Binary artifacts, wherever they appear.
 *.deb binary
 *.tar binary
