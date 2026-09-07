@@ -285,17 +285,49 @@ pub fn build(b: *std.Build) void {
     production_backend_test_step.dependOn(&run_production_backend_tests.step);
     test_step.dependOn(&run_production_backend_tests.step);
 
-    const apt_system_tests = b.addTest(.{
-        .root_module = debz,
-        .filters = &.{
-            "system_profile.test.",
-            "apt_system_api.test.",
-            "apt_system_state.test.",
-        },
+    const system_profile_test_module = b.createModule(.{
+        .root_source_file = b.path("src/system_profile.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const run_apt_system_tests = b.addRunArtifact(apt_system_tests);
-    b.step("test-apt-system", "Run trusted profile and apt/system contract tests")
-        .dependOn(&run_apt_system_tests.step);
+    const system_profile_tests = b.addTest(.{
+        .root_module = system_profile_test_module,
+        .filters = &.{"system_profile.test."},
+    });
+    const run_system_profile_tests = b.addRunArtifact(system_profile_tests);
+
+    const apt_system_api_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const apt_system_api_tests = b.addTest(.{
+        .root_module = apt_system_api_test_module,
+        .filters = &.{"apt_system_api.test."},
+    });
+    const run_apt_system_api_tests = b.addRunArtifact(apt_system_api_tests);
+
+    const apt_system_state_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const apt_system_state_tests = b.addTest(.{
+        .root_module = apt_system_state_test_module,
+        .filters = &.{"apt_system_state.test."},
+    });
+    const run_apt_system_state_tests = b.addRunArtifact(apt_system_state_tests);
+
+    const apt_system_test_step = b.step(
+        "test-apt-system",
+        "Run trusted profile and apt/system contract tests",
+    );
+    apt_system_test_step.dependOn(&run_system_profile_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
+    test_step.dependOn(&run_system_profile_tests.step);
+    test_step.dependOn(&run_apt_system_api_tests.step);
+    test_step.dependOn(&run_apt_system_state_tests.step);
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,

@@ -273,10 +273,13 @@ pub fn load(
 
     var trusted_file_count: usize = 1 + profile.keyring_paths.len;
     for (profile.repositories) |repository|
-        trusted_file_count += 1 + @intFromBool(repository.config_path != null);
-    trusted_file_count += @intFromBool(
+        trusted_file_count += 1 + @as(
+            usize,
+            @intFromBool(repository.config_path != null),
+        );
+    trusted_file_count += @as(usize, @intFromBool(
         profile.network.credential_reference != null,
-    );
+    ));
     if (trusted_file_count > limits.maximum_trusted_files)
         return error.TooManyTrustedFiles;
 
@@ -659,15 +662,30 @@ pub const SystemFileSystem = struct {
     ) !ReadResult {
         const self: *SystemFileSystem = @ptrCast(@alignCast(context));
         if (builtin.os.tag != .linux) return error.OwnershipUnavailable;
-        var file = try openAbsoluteFileNoFollow(self.io, path);
+        var path_file = try openAbsolutePathNoFollow(self.io, path);
+        defer path_file.close(self.io);
+        const path_metadata = try metadataFromOpenFile(self.io, path_file);
+        try validateTrustedMetadata(path_metadata, maximum_bytes);
+
+        var file = try openAbsoluteReadableNoFollow(self.io, path);
         defer file.close(self.io);
         const metadata = try metadataFromOpenFile(self.io, file);
         try validateTrustedMetadata(metadata, maximum_bytes);
+        if (!sameObject(path_metadata, metadata))
+            return error.TrustedFileReplaced;
         var reader = file.reader(self.io, &.{});
         const bytes = try reader.interface.allocRemaining(
             allocator,
             .limited(maximum_bytes),
         );
+        errdefer allocator.free(bytes);
+        const after_read = try metadataFromOpenFile(self.io, file);
+        if (!std.mem.eql(
+            u8,
+            &identityDigest(metadata),
+            &identityDigest(after_read),
+        ))
+            return error.FileChangedWhileReading;
         return .{ .bytes = bytes, .metadata = metadata };
     }
 
@@ -690,22 +708,42 @@ pub fn loadSystem(
     return load(allocator, system.interface(), profile_path, limits);
 }
 
-fn openAbsoluteFileNoFollow(io: Io, path: []const u8) !File {
+fn openAbsolutePathNoFollow(io: Io, path: []const u8) !File {
+    return openAbsoluteLeafNoFollow(io, path, .{
+        .PATH = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    });
+}
+
+fn openAbsoluteReadableNoFollow(io: Io, path: []const u8) !File {
+    return openAbsoluteLeafNoFollow(io, path, .{
+        .NONBLOCK = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    });
+}
+
+fn openAbsoluteLeafNoFollow(
+    io: Io,
+    path: []const u8,
+    flags: std.posix.O,
+) !File {
     if (!validTrustedPath(path)) return error.InvalidPath;
     const parent_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
     const leaf = std.fs.path.basename(path);
     var parent = try openAbsoluteDirectoryNoFollow(io, parent_path);
     defer parent.close(io);
     if (builtin.os.tag != .linux) return error.OwnershipUnavailable;
-    const fd = try std.posix.openat(parent.handle, leaf, .{
-        .NONBLOCK = true,
-        .NOFOLLOW = true,
-        .CLOEXEC = true,
-    }, 0);
+    const fd = try std.posix.openat(parent.handle, leaf, flags, 0);
     return .{
         .handle = fd,
-        .flags = .{ .nonblocking = true },
+        .flags = .{ .nonblocking = flags.NONBLOCK },
     };
+}
+
+fn sameObject(first: Metadata, second: Metadata) bool {
+    return first.device == second.device and first.inode == second.inode;
 }
 
 fn openAbsoluteDirectoryNoFollow(io: Io, path: []const u8) !Io.Dir {
@@ -919,6 +957,19 @@ test "system_profile.test.strict profile loads only explicit trusted inputs" {
     try std.testing.expect(loaded.profile.network.credential_reference == null);
 }
 
+test "system_profile.test.optional repository config count uses usize arithmetic" {
+    var fake: FakeFileSystem = .{ .profile_source = valid_profile_json };
+    var loaded = try load(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 4), loaded.trusted_file_count);
+    try std.testing.expectEqual(@as(usize, 3), loaded.trusted_files.len);
+}
+
 test "system_profile.test.omitted locations select only debz safe defaults" {
     var fake: FakeFileSystem = .{ .profile_source = defaulted_profile_json };
     var loaded = try load(
@@ -1045,13 +1096,13 @@ test "system_profile.test.consumption reverifies identity and content" {
     fake.override_path = source_path;
     fake.override_metadata = .{
         .kind = .file,
-        .size = 32,
+        .size = "changed-content-changed-content!".len,
         .mode = 0o644,
         .uid = 0,
         .device = 1,
         .inode = 2,
     };
-    fake.override_bytes = "changed-content-changed-content!!";
+    fake.override_bytes = "changed-content-changed-content!";
     try std.testing.expectError(
         error.TrustedFileContentChanged,
         loaded.readTrustedFile(
@@ -1062,6 +1113,7 @@ test "system_profile.test.consumption reverifies identity and content" {
         ),
     );
     fake.override_bytes = null;
+    fake.override_metadata.size = 32;
     fake.override_metadata.inode = 3;
     try std.testing.expectError(
         error.TrustedFileReplaced,
@@ -1096,7 +1148,7 @@ test "system_profile.test.consumption reverifies identity and content" {
     );
 }
 
-test "system_profile.test.Linux special files are opened nonblocking before rejection" {
+test "system_profile.test.Linux FIFO is classified with O_PATH before rejection" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1125,6 +1177,55 @@ test "system_profile.test.Linux special files are opened nonblocking before reje
             maximum_profile_bytes,
         ),
     );
+}
+
+test "system_profile.test.Linux device nodes are classified through O_PATH" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var system: SystemFileSystem = .{ .io = std.testing.io };
+    try std.testing.expectError(
+        error.NotRegularFile,
+        system.interface().read(
+            std.testing.allocator,
+            "/dev/null",
+            maximum_profile_bytes,
+        ),
+    );
+    try std.testing.expect(sameObject(
+        .{
+            .kind = .file,
+            .size = 1,
+            .mode = 0o600,
+            .uid = 0,
+            .device = 1,
+            .inode = 2,
+        },
+        .{
+            .kind = .file,
+            .size = 2,
+            .mode = 0o400,
+            .uid = 0,
+            .device = 1,
+            .inode = 2,
+        },
+    ));
+    try std.testing.expect(!sameObject(
+        .{
+            .kind = .file,
+            .size = 1,
+            .mode = 0o600,
+            .uid = 0,
+            .device = 1,
+            .inode = 2,
+        },
+        .{
+            .kind = .file,
+            .size = 1,
+            .mode = 0o600,
+            .uid = 0,
+            .device = 1,
+            .inode = 3,
+        },
+    ));
 }
 
 test "system_profile.test.profile file itself is trust validated" {

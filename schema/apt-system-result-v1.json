@@ -46,6 +46,158 @@
   "allOf": [
     {
       "if": {
+        "properties": { "outcome": { "const": "usage" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 2 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "usage" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "configuration" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 3 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "configuration" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "authentication" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 4 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "authentication" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "planning" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 5 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "planning" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "download" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 6 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "download" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "transaction" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 7 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "transaction" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "recovery" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 8 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "recovery" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "internal" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 70 },
+          "diagnostics": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/diagnostic" },
+                { "properties": { "outcome": { "const": "internal" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": { "outcome": { "const": "success" } },
         "required": ["outcome"]
       },

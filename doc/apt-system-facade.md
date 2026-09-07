@@ -36,10 +36,11 @@ configuration, dpkg configuration, or process environment settings.
 every source, config, keyring, and credential file are bounded and must be a
 canonical absolute non-root path. Every ancestor directory is opened without
 following symbolic links and must be root-owned and not group- or
-world-writable. The leaf is opened on Linux with `O_NOFOLLOW | O_NONBLOCK |
-O_CLOEXEC`, classified from that descriptor before any read, and must be a
-root-owned regular file that is not group- or world-writable. FIFO and special
-files therefore fail without a blocking read. Platforms that cannot model
+world-writable. On Linux the leaf is first opened with `O_PATH | O_NOFOLLOW |
+O_CLOEXEC` and classified without opening the underlying object for I/O. Only
+a validated regular file is then opened read-only; its device and inode must
+match the `O_PATH` descriptor before any read. FIFO, device, and other special
+files therefore fail before an I/O-capable open. Platforms that cannot model
 ownership fail closed. Tests inject file and ancestor metadata and do not
 require root.
 
@@ -125,9 +126,12 @@ The store takes an operation lock, rereads the current canonical state, and
 compares attempt ID, generation, and digest before every transition. The next
 generation must be exactly one greater and follow the legal phase graph.
 Publication uses a writer-unique mode-0600 staged file with file and directory
-sync around atomic rename. Stale and concurrent writers fail rather than
-overwrite evidence, and no transition is possible from completed state or
-backwards out of recovery evidence.
+sync around atomic rename. Directory durability uses a separate sync-capable
+descriptor rather than the path-only handle used for relative operations. An
+error reported after rename means the new state may already be visible and
+must be reconciled by rereading it. Stale and concurrent writers fail rather
+than overwrite evidence, and no transition is possible from completed state
+or backwards out of recovery evidence.
 
 The state cannot call a package mutation successful or recovered without the
 same lock, transaction, and root-completion evidence required by the result.

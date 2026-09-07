@@ -825,6 +825,25 @@ test "apt_system_api.test.outcomes have stable exit classifications" {
     }
 }
 
+test "apt_system_api.test.runtime rejects exit and diagnostic outcome mismatches" {
+    const request: Request = .{
+        .operation = .install,
+        .packages = &.{"curl"},
+    };
+    var result = failure(
+        request,
+        .planning,
+        .planning_failed,
+        "planning",
+        "planning failed",
+    );
+    result.exit_status = .download;
+    try std.testing.expectError(error.InvalidExitStatus, validateResult(result));
+    result.exit_status = .planning;
+    result.diagnostics[0].outcome = .download;
+    try std.testing.expectError(error.InvalidDiagnostic, validateResult(result));
+}
+
 test "apt_system_api.test.result schema matches enums and absolute paths" {
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -844,4 +863,50 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
     try std.testing.expectEqual(std.meta.fields(Outcome).len, outcomes.len);
     const diagnostic_ids = definitions.get("diagnosticId").?.object.get("enum").?.array.items;
     try std.testing.expectEqual(std.meta.fields(DiagnosticId).len, diagnostic_ids.len);
+
+    const conditions = parsed.value.object.get("allOf").?.array.items;
+    inline for (std.meta.fields(Outcome)) |field| {
+        const outcome: Outcome = @enumFromInt(field.value);
+        const expected_status: i64 = @intFromEnum(exitStatus(outcome));
+        var found = false;
+        for (conditions) |condition| {
+            const condition_object = condition.object;
+            const if_object = condition_object.get("if") orelse continue;
+            const if_properties = if_object.object.get("properties") orelse continue;
+            const outcome_property = if_properties.object.get("outcome") orelse continue;
+            const outcome_const = outcome_property.object.get("const") orelse continue;
+            if (!std.mem.eql(u8, outcome_const.string, field.name)) continue;
+            const then_object = condition_object.get("then").?.object;
+            const then_properties = then_object.get("properties").?.object;
+            const schema_status = then_properties.get("exit_status").?
+                .object.get("const").?.integer;
+            try std.testing.expectEqual(expected_status, schema_status);
+            const wrong_status = if (expected_status == 70)
+                @as(i64, 0)
+            else
+                expected_status + 1;
+            try std.testing.expect(schema_status != wrong_status);
+            if (outcome != .success) {
+                const diagnostic_items = then_properties.get("diagnostics").?
+                    .object.get("items").?.object;
+                const item_conditions = diagnostic_items.get("allOf").?.array.items;
+                const diagnostic_outcome = item_conditions[1].object
+                    .get("properties").?.object
+                    .get("outcome").?.object
+                    .get("const").?.string;
+                try std.testing.expectEqualStrings(field.name, diagnostic_outcome);
+                const wrong_outcome_index =
+                    (@as(usize, @intCast(field.value)) + 1) %
+                    std.meta.fields(Outcome).len;
+                try std.testing.expect(!std.mem.eql(
+                    u8,
+                    std.meta.fields(Outcome)[wrong_outcome_index].name,
+                    diagnostic_outcome,
+                ));
+            }
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
 }

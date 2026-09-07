@@ -345,13 +345,33 @@ pub const Store = struct {
         try self.dir.rename(stage, self.dir, self.name, self.io);
         renamed = true;
         try self.write_hooks.run(.after_rename);
-        switch (@import("builtin").os.tag) {
-            .linux => if (std.os.linux.errno(std.os.linux.fsync(self.dir.handle)) != .SUCCESS)
-                return error.Unexpected,
-            else => {},
-        }
+        try syncDirectory(self.io, self.dir);
     }
 };
+
+fn syncDirectory(io: std.Io, dir: std.Io.Dir) !void {
+    if (@import("builtin").os.tag != .linux) return;
+    const fd = try std.posix.openat(dir.handle, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0);
+    var sync_file: std.Io.File = .{
+        .handle = fd,
+        .flags = .{ .nonblocking = false },
+    };
+    defer sync_file.close(io);
+    switch (std.os.linux.errno(std.os.linux.fsync(fd))) {
+        .SUCCESS => {},
+        .BADF => return error.InvalidDirectoryHandle,
+        .INVAL, .ROFS => return error.OperationUnsupported,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => return error.Unexpected,
+    }
+}
 
 pub const Expected = struct {
     attempt_id: [32]u8,
@@ -1007,7 +1027,7 @@ fn testCompletedState(allocator: std.mem.Allocator) !OwnedState {
                 .version = 1,
                 .digest_sha256 = @splat(0x55),
             },
-            .completed_attempt_id = @splat(0x66),
+            .completed_attempt_id = @splat(0x11),
         },
         .updated_unix = 1_800_000_000,
     });
@@ -1179,6 +1199,7 @@ test "apt_system_state.test.transitions are monotonic and evidence is sticky" {
 }
 
 test "apt_system_state.test.locked compare-and-set rejects concurrent and stale writers" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var locks: TestLockBackend = .{};
@@ -1264,6 +1285,65 @@ test "apt_system_state.test.locked compare-and-set rejects concurrent and stale 
     defer loaded.deinit();
     try std.testing.expectEqual(@as(u64, 2), loaded.state.generation);
     try std.testing.expectEqual(Phase.profile_loaded, loaded.state.phase);
+}
+
+test "apt_system_state.test.post-rename errors preserve published state" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const Hooks = struct {
+        fn run(_: ?*anyopaque, boundary: WriteBoundary) !void {
+            if (boundary == .after_rename)
+                return error.InjectedPostRenameFailure;
+        }
+    };
+
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var locks: TestLockBackend = .{};
+    var store = try Store.init(
+        std.testing.io,
+        directory.dir,
+        document_name,
+        locks.interface(),
+    );
+    var reserved = try testReservedState(std.testing.allocator);
+    defer reserved.deinit();
+    try store.initialize(
+        std.testing.allocator,
+        reserved.state,
+        maximum_document_bytes,
+        0,
+    );
+
+    var next_input = reserved.state;
+    next_input.generation += 1;
+    next_input.phase = .profile_loaded;
+    next_input.updated_unix += 1;
+    var next = try create(std.testing.allocator, next_input);
+    defer next.deinit();
+    store.write_hooks = .{ .runFn = Hooks.run };
+    try std.testing.expectError(
+        error.InjectedPostRenameFailure,
+        store.compareAndSet(
+            std.testing.allocator,
+            Expected.fromState(reserved.state),
+            next.state,
+            maximum_document_bytes,
+            0,
+        ),
+    );
+
+    var published = try store.read(
+        std.testing.allocator,
+        maximum_document_bytes,
+    );
+    defer published.deinit();
+    try std.testing.expectEqual(next.state.generation, published.state.generation);
+    try std.testing.expectEqual(next.state.phase, published.state.phase);
+    try std.testing.expectEqualSlices(
+        u8,
+        &next.state.digest_sha256,
+        &published.state.digest_sha256,
+    );
 }
 
 test "apt_system_state.test.production operation lock serializes writers" {
