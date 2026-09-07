@@ -94,7 +94,7 @@ Preflight refuses, before anything can change:
 | `symbolic_link_component` | any prefix component that is a symbolic link |
 | `unsupported_kind` | a device, socket, FIFO, or unknown kind on a target |
 | `ancestor_conflict` | an ancestor the plan turns into a file, a link, or nothing |
-| `path_alias` | two distinct targets that resolve to one inode |
+| `path_alias` | two distinct modeled paths, targets or sources, that resolve to one inode |
 | `hard_link_ambiguous` | a link to itself, or a link whose source the plan republishes later |
 | `hard_link_source_invalid` | a link source that is absent or is not a regular file |
 | `directory_not_empty` | removing or replacing a directory that still has entries |
@@ -233,17 +233,50 @@ durable boundary, and accepts nothing else.
 
 Every member of that set keeps the identity the recorded states share — kind,
 content digest, link target, and, wherever an inode survives the transition,
-the recorded inode, link count, and the plan's device — so an entry an external
-writer replaced, truncated, or retargeted is still `external_modification` and
-still becomes `recovery_required`.
+the recorded inode, the plan's device, and a link count the transaction can
+account for — so an entry an external writer replaced, truncated, retargeted,
+or linked is still `external_modification` and still becomes
+`recovery_required`.
 
-| Step shape | States the transaction itself can have left |
-| --- | --- |
-| `set_metadata`, and `create_directory` on an existing directory | the recorded inode with the ordered metadata chain below |
-| `create_directory` over nothing or over a non-directory | an **empty** directory whose mode and ownership are whatever `mkdir` produced under the caller's umask and the parent's set-group-ID bit |
-| any transition a rename cannot express (a directory becoming something else) | the path momentarily **empty**, between the `rmdir` and the publication |
-| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the recorded one |
-| while restoring: a recorded symbolic link | the exact recorded target on a fresh inode whose timestamp has not been written back yet |
+| Step shape | States the transaction itself can have left | Window |
+| --- | --- | --- |
+| `set_metadata`, and `create_directory` on an existing directory | the recorded inode with the ordered metadata chain below | the step's metadata boundary |
+| `create_directory` over nothing or over a non-directory | an **empty** directory whose mode and ownership are whatever `mkdir` produced under the caller's umask and the parent's set-group-ID bit | the step's publication and metadata boundaries |
+| a transition that crosses the directory boundary in either direction | the path momentarily **empty**, between the removal and the creation that replaces it | the step's publication boundary, and the whole restoration |
+| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the recorded one | the restoration |
+| while restoring: a recorded symbolic link | the exact recorded target on a fresh inode whose timestamp has not been written back yet | the restoration |
+
+### The window an intermediate is accepted in
+
+A state is only this transaction's own work if this transaction could have been
+making it at the moment it was observed, so every row above is bounded by the
+journal rather than by shape alone. The engine accepts an intermediate only
+while the boundary that produces it is open: every earlier boundary of that
+step is durable, the boundary itself is not, and the transaction has durably
+reached a stage in which it mutates the root at all. A step past the point the
+forward pass can have reached has done nothing, and a step that published the
+boundary has finished it.
+
+A momentarily empty name is the sharpest case. `mkdir` cannot take a name a
+non-directory holds and a directory cannot be renamed over, so a transition
+that crosses the directory boundary — in either direction — removes what is
+there before it creates what replaces it. That is the only reason this layer
+ever leaves a name empty, and it is symmetric: the forward pass removes the
+recorded old entry before publishing the new one and the restoration removes
+the new entry before putting the recorded old one back, so `regular →
+directory`, `symlink → directory`, and `directory → regular` are all resumable
+forwards from the unlink and backwards from the `rmdir`. An absence anywhere
+else — on a step whose publication removes nothing, such as a metadata step or
+a directory creation that found its directory already there, or on a step that
+has not yet published the boundary before its own publication — is somebody
+else's removal and stays `external_modification`.
+
+Where a transition has no durable boundary between the start of the step and
+its removal, as when a symbolic link is replaced by a directory and there is no
+content to back up, the window opens with the step itself. Nothing foreign is
+adopted there: the only state accepted is absence, the plan authorized removing
+exactly that entry, and the recorded old symbolic link is restorable from the
+journal either way.
 
 The metadata chain from a state `from` toward a state `to` is exactly the
 prefixes of the ordered writes: `from` itself; ownership applied with the
@@ -268,6 +301,55 @@ Every boundary is idempotent. A retry compares the observed state to the
 recorded expectation, to the recorded desired state, and to that step's closed
 reachable set; anything else is `external_modification` and never a guess.
 
+### Link counts the transaction changes itself
+
+A link count is part of an inode's identity: it is what refuses an entry that
+gained or lost a hard link behind the transaction's back. The transaction moves
+link counts itself, though, and demanding the recorded count back would wedge
+recovery on its own work. Every direct subdirectory it creates or removes moves
+the containing directory's count by one through the subdirectory's own `..`,
+and every hard link it stages, publishes, or holds as a backup adds one to the
+inode it links.
+
+Neither is a guess. The plan names the entries that do it and the progress log
+says how far each of them got, so the engine computes the exact set of counts
+this transaction can have produced on the recorded inode and refuses everything
+outside it. The set is a closed interval, because each contributing entry moves
+the count by exactly one and does so independently:
+
+| Contribution | Delta | Live from | Live until |
+| --- | --- | --- | --- |
+| a direct subdirectory this plan creates | +1 | that step's publication boundary | that step is recorded reverted |
+| a direct subdirectory this plan removes | −1 | that step's publication boundary | that step is recorded reverted |
+| a hard link this plan stages from the inode | +1 | that step's staging boundary | that step is reverted **and** the workspace is released |
+| a backup this plan captures of the inode | +1 | that step's backup boundary | the workspace is released |
+
+Each contribution is *certain* when its boundary is durable, *possible* when
+the step is inside that boundary, and absent otherwise; a possible contribution
+widens the interval by one instead of moving it. Rollback is modeled the way it
+actually runs — in reverse index order — so while a step is being restored every
+later step has already given its links back and every earlier one still holds
+them. Workspace links outlive the step that made them, because staging and
+backup entries are released only after the whole transaction resolves.
+
+The recorded count itself always stays admissible: it is the count the journal
+observed, and a filesystem that does not maintain directory link counts reports
+it unchanged however many subdirectories a plan makes. Everything else is
+checked against the interval, so an outside hard link on a file this plan is
+re-moding, or an outside subdirectory in a directory this plan is re-moding, is
+one link past what the transaction can account for and becomes
+`recovery_required`. The count is only ever consulted after the recorded inode
+number itself matched, so it never admits a different inode wearing the
+recorded identity.
+
+What the model cannot derive, preflight refuses before anything is mutated. A
+journal records paths, not the inodes two paths may share, so a link staged
+from one name for an inode whose other name the plan also touches would change
+a count nothing in the journal accounts for. Every path the plan models —
+targets and the sources of copies and hard links alike — is therefore
+registered by inode, and a second name for an inode the plan already models is
+`path_alias` at preflight rather than a wedged recovery afterwards.
+
 ## Recovery
 
 The recorded stage decides the direction:
@@ -289,13 +371,17 @@ durably, tells the root-operation attempt through `Attempt.requireRecovery`,
 and refuses every further mutation until an operator resolves it. `clear` is
 refused unless the stage is `completed` or `rolled_back`.
 
-A `set_metadata` step proves its recorded precondition before it changes an
-inode, because unlike a publication it never takes the target name over and
-would otherwise stamp the plan's mode, ownership, and timestamp onto whatever
-entry now occupies the name. The precondition it accepts is the recorded old
-state, the recorded new state, or one of that step's own reachable metadata
-combinations on the recorded inode — never an unrelated mode, ownership, or
-timestamp, and never a different inode carrying the recorded metadata.
+Every step that writes metadata onto the inode it finds — a `set_metadata`
+step, and a `create_directory` step at its metadata boundary — proves its
+recorded precondition first, because unlike a publication it never takes the
+target name over and would otherwise stamp the plan's mode, ownership, and
+timestamp onto whatever entry now occupies the name. The precondition it
+accepts is the recorded old state, the recorded new state, or one of that
+step's own reachable intermediates: the ordered metadata combinations on the
+recorded inode, or the still-empty directory its own publication boundary
+created. Never an unrelated mode, ownership, or timestamp; never a different
+inode carrying the recorded metadata; and never a directory that already holds
+entries this transaction did not put there.
 
 A cancellation or an expired deadline is observed at a step boundary, turns the
 transaction around, and leaves a cleanly restored root plus the durable
@@ -367,6 +453,25 @@ records, and a replayed copy of the durable tail must all stay corrupt or
 stale rather than being repaired away, a stale writer must still be refused
 when the tail is torn, and power loss during the repair itself must leave the
 same torn tail for the next pass.
+
+A transition that crosses the directory boundary is interrupted at each of its
+own boundaries — before the unlink, between the unlink and the `mkdir`, before
+the metadata, and before the parent sync — for a recorded regular file and for
+a recorded symbolic link, and each interruption is proven both ways: resumed
+forward with `apply`, which must finish the transition, and resolved backwards
+with `recover`, which must put the recorded file or link back. A target that
+disappears before the step could have removed anything, one that disappears on
+a step whose publication removes nothing, and a directory removed after this
+transaction created it must all stay `external_modification`.
+
+Link counts the transaction changes itself are proven end to end and as a
+model: a metadata step whose inode a later step hard-links, and one whose
+directory the plan fills with a subdirectory, must both survive a partially
+applied or partially restored metadata boundary, while one extra hard link or
+one extra subdirectory that this plan does not account for must still become
+`recovery_required`. The reachable interval itself is enumerated directly
+across staging, publication, backup capture, reverse-order rollback, and the
+workspace release.
 
 The suite also covers disk-full, short-write, `fsync`, `rename`, `unlink`, and
 `link` failures, external modification and symbolic-link swaps between

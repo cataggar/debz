@@ -1866,17 +1866,9 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
     const model_index = try resolveModel(builder, path.text, &requires);
     try requireAncestors(builder, path, &requires);
 
-    const expected = builder.models.items[model_index].state;
-    switch (expected) {
-        .absent => {},
-        .present => |state| {
-            if (builder.models.items[model_index].produced) {
-                // The plan itself produced this state, so it is exact by
-                // construction and cannot be an alias of another target.
-            } else try recordAlias(builder, state, path.text, index);
-        },
-    }
+    try recordAlias(builder, model_index, path.text);
 
+    const expected = builder.models.items[model_index].state;
     const step = try buildStep(builder, intent, path, expected, index, &requires);
     try builder.steps.append(builder.allocator, step);
     try builder.contents.append(builder.allocator, switch (intent) {
@@ -1959,18 +1951,34 @@ fn requireAncestors(
     }
 }
 
-fn recordAlias(
-    builder: *Builder,
-    state: State,
-    path: []const u8,
-    index: u32,
-) BuildError!void {
+/// Refuses a plan that models one inode under two names.
+///
+/// Two names for one inode make the plan ambiguous about identity, and they
+/// make its own effect on that inode's link count underivable: the journal
+/// records a step's path, not the inode its source or backup happens to
+/// share, so a hard link staged from one name changes the link count the
+/// other name's metadata step recorded and nothing in the journal says it
+/// did. Every path the plan models is registered, sources included, so the
+/// ambiguity is refused before anything is mutated rather than discovered as
+/// a wedged recovery afterwards. A state the plan itself produced is exact by
+/// construction, and a path registered again is the same entry, not an alias
+/// of it.
+fn recordAlias(builder: *Builder, model_index: u32, path: []const u8) BuildError!void {
+    const model = builder.models.items[model_index];
+    if (model.produced) return;
+    const state = switch (model.state) {
+        .absent => return,
+        .present => |value| value,
+    };
     if (state.kind == .directory) return;
     if (state.inode == 0) return;
     const key = (@as(u128, builder.workspace_device) << 64) | state.inode;
     const found = try builder.aliases.getOrPut(builder.allocator, key);
-    if (found.found_existing) return builder.fail(.preflight, .path_alias, path);
-    found.value_ptr.* = index;
+    if (found.found_existing) {
+        if (found.value_ptr.* == model_index) return;
+        return builder.fail(.preflight, .path_alias, path);
+    }
+    found.value_ptr.* = model_index;
 }
 
 /// One no-follow observation of a target path, translated into either an
@@ -2377,6 +2385,7 @@ fn resolveSource(
 ) BuildError!Expectation {
     if (withinNamespace(path)) return builder.fail(.preflight, .path_collision, path);
     const model_index = try resolveModel(builder, path, requires);
+    try recordAlias(builder, model_index, path);
     return builder.models.items[model_index].state;
 }
 
@@ -3132,7 +3141,7 @@ fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Ph
     const found = switch (observation.state) {
         // Nothing is at the path. The transaction removes an old entry itself
         // only when the transition it is making cannot be a single rename.
-        .absent => return removalReachable(step, phase),
+        .absent => return removalReachable(engine, step, phase),
         .present => |value| value,
     };
     // Every path in the plan shares one device, so an entry that arrived from
@@ -3140,9 +3149,12 @@ fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Ph
     if (observation.modeled and observation.device != engine.owned.journal.device) return false;
 
     // The recorded inode is still there, so only its metadata can have moved,
-    // and the ordered writes say exactly how far.
+    // and the ordered writes say exactly how far. Its link count may have
+    // moved too, but only by the exact amount this transaction's own
+    // journaled progress accounts for.
     if (expected) |old| {
-        if (found.inode == old.inode and found.link_count == old.link_count and
+        if (found.inode == old.inode and
+            linkCountReachable(engine, step, old, found.link_count, phase) and
             identityEqual(found, old))
         {
             const desired = switch (step.desired) {
@@ -3166,7 +3178,7 @@ fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Ph
     // transaction can have created a directory at this path in this
     // direction, and that the directory is still empty and therefore still
     // exactly as removable as when it was made.
-    if (found.kind == .directory and directoryCreationReachable(step, phase, found))
+    if (found.kind == .directory and directoryCreationReachable(engine, step, phase, found))
         return emptyDirectory(engine, step);
 
     // A symbolic link the transaction re-created from the journal while
@@ -3190,33 +3202,101 @@ fn writesMetadataInPlace(step: Step) bool {
     };
 }
 
-/// True when this transaction itself can have left the path empty. Forward,
-/// that happens only where a rename cannot express the transition and the old
-/// entry has to be unlinked first; while restoring, it happens wherever a
-/// directory is on either side of the transition, because the restoration
-/// removes what it finds before it re-creates the recorded old entry.
-fn removalReachable(step: Step, phase: Phase) bool {
+/// The durable state that immediately precedes `boundary` in this step's own
+/// ordered boundary list, or null when the step never publishes `boundary` at
+/// all.
+fn boundaryPredecessor(step: Step, boundary: StepState) ?StepState {
+    var previous: StepState = .prepared;
+    for (step.boundaries()) |item| {
+        if (item == boundary) return previous;
+        previous = item;
+    }
+    return null;
+}
+
+/// True when the engine can be part way through `boundary` of `step` right
+/// now, which is what makes a half-made transition this transaction's own
+/// work rather than somebody else's. The journal proves every part of it: the
+/// transaction durably authorized mutation, every earlier boundary of this
+/// step is durable, and `boundary` itself is not. A step that has not
+/// published the boundary before `boundary` never entered it, and a step that
+/// published `boundary` finished it, so neither can be holding it open.
+fn insideBoundary(engine: *const Engine, step: Step, boundary: StepState) bool {
+    switch (engine.progress.stage) {
+        // Nothing outside the private workspace has been touched yet, or
+        // everything that was owed has already been released.
+        .prepared, .completed, .rolled_back => return false,
+        else => {},
+    }
+    const state = engine.progress.state(step.index);
+    // A reverted step's recorded old state was observed back in place.
+    if (state == .reverted) return false;
+    const previous = boundaryPredecessor(step, boundary) orelse return false;
+    return state.rank() == previous.rank();
+}
+
+/// True when the step's own transition has to remove the entry that is there
+/// before it can create the entry that replaces it, which is the only reason
+/// this transaction ever leaves a target name empty.
+///
+/// That is exactly a transition that crosses the directory boundary, in
+/// either direction: `mkdir` cannot take a name a non-directory holds, and a
+/// directory cannot be renamed over. The test is symmetric because the
+/// transition is - the forward pass removes the recorded old entry before it
+/// publishes the new one, and the restoration removes the new entry before it
+/// puts the recorded old one back. Everything else is a single rename or an
+/// in-place write and never empties the name, and a removal's absence is its
+/// own desired state rather than an intermediate.
+fn crossesDirectoryBoundary(step: Step) bool {
     const expected = switch (step.expected) {
         .absent => return false,
         .present => |value| value,
     };
-    const desired_kind = switch (step.desired) {
+    const desired = switch (step.desired) {
         // An absent target is the desired state of a removal, which
         // `matches` already accepted.
         .absent => return false,
-        .present => |value| value.kind,
+        .present => |value| value,
     };
-    if (expected.kind == .directory) return true;
-    return phase == .restore and desired_kind == .directory;
+    return (expected.kind == .directory) != (desired.kind == .directory);
+}
+
+/// True when this transaction itself can have left the path empty.
+///
+/// Forward, the removal and the creation that replaces it are the two halves
+/// of one publication boundary, so the window is exactly the one the journal
+/// delimits: the step has published every earlier boundary of its own and has
+/// not published `published`. An absence outside that window - a target that
+/// vanished before this step could have removed anything, or one on a step
+/// whose publication removes nothing at all - is somebody else's work and
+/// stays `external_modification`.
+///
+/// While restoring, the same transition runs backwards: `revertStep` removes
+/// whatever it finds before it re-creates the recorded old entry, and it does
+/// that for every step it has not already recorded as reverted, so the window
+/// is the whole restoration. A forward window that was still open when the
+/// transaction turned around stays open, because the absence the forward pass
+/// left is still there to be undone.
+fn removalReachable(engine: *const Engine, step: Step, phase: Phase) bool {
+    if (!crossesDirectoryBoundary(step)) return false;
+    if (insideBoundary(engine, step, .published)) return true;
+    return phase == .restore and engine.progress.stage == .rolling_back;
 }
 
 /// True when this transaction itself can have created the directory it is
 /// looking at. Forward, that is a `create_directory` step whose recorded old
-/// state is not already a directory, between its `mkdir` and its metadata
-/// boundary. While restoring, it is additionally any step whose recorded old
-/// state is a directory the restoration has to re-create from the journal,
-/// which is provably a different inode from the recorded one.
-fn directoryCreationReachable(step: Step, phase: Phase, found: State) bool {
+/// state is not already a directory, between the `mkdir` inside its
+/// publication boundary and the rewrite inside its metadata boundary - the
+/// two boundaries the journal shows are still owed. While restoring, it is
+/// additionally any step whose recorded old state is a directory the
+/// restoration has to re-create from the journal, which is provably a
+/// different inode from the recorded one.
+fn directoryCreationReachable(
+    engine: *const Engine,
+    step: Step,
+    phase: Phase,
+    found: State,
+) bool {
     const created_forward = step.kind == .create_directory and switch (step.expected) {
         .absent => true,
         .present => |old| old.kind != .directory,
@@ -3224,12 +3304,255 @@ fn directoryCreationReachable(step: Step, phase: Phase, found: State) bool {
         .absent => false,
         .present => |value| value.kind == .directory,
     };
-    if (created_forward) return true;
+    if (created_forward and (insideBoundary(engine, step, .published) or
+        insideBoundary(engine, step, .metadata_applied))) return true;
     if (phase != .restore) return false;
     return switch (step.expected) {
         .absent => false,
         .present => |old| old.kind == .directory and found.inode != old.inode,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Reachable link counts
+// ---------------------------------------------------------------------------
+//
+// A link count is part of an inode's identity: it is what refuses an entry
+// that gained a hard link, lost one, or was replaced behind the transaction's
+// back. This transaction changes link counts itself, though. Every direct
+// subdirectory it creates or removes moves the containing directory's count
+// by one through the subdirectory's own `..`, and every hard link it stages,
+// publishes, or holds as a backup adds one to the inode it links.
+//
+// Neither is a guess: the plan names the entries that do it and the progress
+// log says how far each of them got. The model below therefore computes the
+// exact set of counts this transaction can have produced on one recorded
+// inode - a closed interval, because each contributing entry moves the count
+// by exactly one and does so independently - and refuses everything outside
+// it. It is consulted only after the recorded inode number itself matched, so
+// nothing it accepts is a different inode wearing the recorded identity.
+
+/// How much of one contributing step's effect on a link count is durably
+/// known. `uncertain` is a boundary that may or may not have run, and
+/// contributes either nothing or its whole delta.
+const Certainty = enum { none, uncertain, applied };
+
+/// The closed set of link counts one recorded inode can hold: every integer
+/// from `lower` to `upper`. The arithmetic is signed and wide so a plan that
+/// removes more links than a count holds can never wrap into acceptance.
+const LinkCounts = struct {
+    lower: i128,
+    upper: i128,
+
+    fn add(self: *LinkCounts, delta: i64, certainty: Certainty) void {
+        switch (certainty) {
+            .none => {},
+            .applied => {
+                self.lower += delta;
+                self.upper += delta;
+            },
+            .uncertain => if (delta < 0) {
+                self.lower += delta;
+            } else {
+                self.upper += delta;
+            },
+        }
+    }
+
+    fn contains(self: LinkCounts, value: u64) bool {
+        const found: i128 = value;
+        return found >= self.lower and found <= self.upper;
+    }
+};
+
+/// True when `found` is a link count this transaction itself can have
+/// produced on the recorded inode.
+fn linkCountReachable(
+    engine: *const Engine,
+    step: Step,
+    old: State,
+    found: u64,
+    phase: Phase,
+) bool {
+    // The recorded count is always admissible: it is the count the journal
+    // observed, and a filesystem that does not maintain directory link counts
+    // reports it unchanged however many subdirectories this plan makes.
+    if (found == old.link_count) return true;
+    return reachableLinkCounts(engine, step, old, phase).contains(found);
+}
+
+/// Every link count the recorded inode behind `step` can hold right now,
+/// derived from this transaction's plan and its journaled progress.
+fn reachableLinkCounts(engine: *const Engine, step: Step, old: State, phase: Phase) LinkCounts {
+    var counts: LinkCounts = .{ .lower = old.link_count, .upper = old.link_count };
+    if (old.kind == .symlink) return counts;
+    const frontier = forwardFrontier(engine);
+    for (engine.owned.journal.steps) |other| {
+        switch (old.kind) {
+            .directory => {
+                if (!directChild(other.path, step.path)) continue;
+                const delta = subdirectoryDelta(other);
+                if (delta == 0) continue;
+                // The `mkdir` and the `rmdir` both happen inside the child
+                // step's publication boundary.
+                counts.add(delta, treeCertainty(engine, other, .published, step, phase, frontier));
+            },
+            .regular => {
+                // A hard link this plan stages from the recorded path adds a
+                // link the moment it is staged and keeps it when the
+                // publication renames the staged link into place.
+                if (other.kind == .publish_hard_link and other.source != null and
+                    std.mem.eql(u8, other.source.?, step.path))
+                    counts.add(1, workspaceCertainty(
+                        engine,
+                        other,
+                        .staged,
+                        step,
+                        phase,
+                        frontier,
+                    ));
+                // A backup of the recorded path is a hard link to the very
+                // inode being classified, held until the workspace is
+                // released.
+                if (backsUpTarget(other, step, old))
+                    counts.add(1, workspaceCertainty(
+                        engine,
+                        other,
+                        .backup_captured,
+                        step,
+                        phase,
+                        frontier,
+                    ));
+            },
+            .symlink => unreachable,
+        }
+    }
+    return counts;
+}
+
+/// The highest step index the forward pass can have reached. It applies steps
+/// in index order and never leaves one behind, so no step past the first one
+/// that has not verified has done any work at all.
+fn forwardFrontier(engine: *const Engine) u32 {
+    for (engine.owned.journal.steps) |step| {
+        if (engine.progress.state(step.index).rank() < StepState.verified.rank())
+            return step.index;
+    }
+    return @intCast(engine.owned.journal.steps.len);
+}
+
+/// True when `child` names an entry directly inside `parent`. Paths are
+/// canonical, root-relative, and carry no trailing separator, so this is an
+/// exact containment test rather than a prefix guess.
+fn directChild(child: []const u8, parent: []const u8) bool {
+    if (child.len <= parent.len + 1) return false;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child[parent.len] != '/') return false;
+    return std.mem.indexOfScalar(u8, child[parent.len + 1 ..], '/') == null;
+}
+
+/// The change one step makes to the link count of the directory that contains
+/// it. A directory holds one link to its parent through its own `..`, so
+/// creating one adds a link, removing one drops it, and every other
+/// transition leaves the parent's count alone.
+fn subdirectoryDelta(step: Step) i64 {
+    const before: i64 = switch (step.expected) {
+        .absent => 0,
+        .present => |value| if (value.kind == .directory) 1 else 0,
+    };
+    const after: i64 = switch (step.desired) {
+        .absent => 0,
+        .present => |value| if (value.kind == .directory) 1 else 0,
+    };
+    return after - before;
+}
+
+/// True when `other` captures a backup of the exact inode `step` is holding
+/// at its own path. The backup is a hard link to whatever is at `other.path`
+/// when it runs, so it counts when that path is this step's path and the
+/// inode there is the recorded one: either because `other` recorded the same
+/// inode, or because `other` runs later and this step leaves its own inode
+/// there.
+fn backsUpTarget(other: Step, step: Step, old: State) bool {
+    if (other.backup_entry == null) return false;
+    if (!std.mem.eql(u8, other.path, step.path)) return false;
+    return switch (other.expected) {
+        .absent => false,
+        .present => |state| state.inode == old.inode or
+            (state.inode == 0 and other.index > step.index),
+    };
+}
+
+/// How far a contributing step got toward the boundary that makes its link
+/// appear or disappear, for a link that lives in the published tree.
+fn treeCertainty(
+    engine: *const Engine,
+    other: Step,
+    boundary: StepState,
+    step: Step,
+    phase: Phase,
+    frontier: u32,
+) Certainty {
+    // Nothing outside the private workspace has been touched yet.
+    if (engine.progress.stage == .prepared) return .none;
+    const state = engine.progress.state(other.index);
+    // A reverted step's recorded old state was observed back in place, so
+    // whatever it did to the count is undone.
+    if (state == .reverted) return .none;
+    const reached = boundaryCertainty(other, state, boundary, frontier);
+    // Rollback undoes steps in reverse index order, so by the time this step
+    // is being restored every later step is already recorded as reverted. One
+    // that is not is a restoration in flight, whose link may already be gone.
+    if (phase == .restore and other.index > step.index and reached == .applied)
+        return .uncertain;
+    return reached;
+}
+
+/// The same question for a link that lives in the private workspace. A
+/// staging or backup entry is created at its own boundary and survives until
+/// the workspace is released, including across the restoration of the step
+/// that made it, so it outlives the step's own recorded progress.
+fn workspaceCertainty(
+    engine: *const Engine,
+    other: Step,
+    boundary: StepState,
+    step: Step,
+    phase: Phase,
+    frontier: u32,
+) Certainty {
+    switch (engine.progress.stage) {
+        // Nothing has been staged or captured yet.
+        .prepared => return .none,
+        // The release removed every staging and backup entry.
+        .completed, .rolled_back => return .none,
+        // The release is running: an entry may or may not be gone already.
+        .completing, .releasing_rollback => {
+            const state = engine.progress.state(other.index);
+            return if (boundaryCertainty(other, state, boundary, frontier) == .none and
+                state != .reverted) .none else .uncertain;
+        },
+        else => {},
+    }
+    const state = engine.progress.state(other.index);
+    // A reverted step no longer says how far it got before it was undone, and
+    // a staged entry it never published is still in the workspace, so its
+    // link is uncertain until the release removes it.
+    if (state == .reverted) return .uncertain;
+    const reached = boundaryCertainty(other, state, boundary, frontier);
+    if (phase == .restore and other.index > step.index and reached == .applied)
+        return .uncertain;
+    return reached;
+}
+
+/// Whether a step at durable state `state` has passed `boundary`, is inside
+/// it, or has not reached it. A step past the forward pass's frontier has not
+/// started at all, which is what keeps the first boundary of a later step from
+/// being counted as in flight for the whole transaction.
+fn boundaryCertainty(step: Step, state: StepState, boundary: StepState, frontier: u32) Certainty {
+    const previous = boundaryPredecessor(step, boundary) orelse return .none;
+    if (state.rank() >= boundary.rank()) return .applied;
+    if (step.index > frontier) return .none;
+    return if (state.rank() == previous.rank()) .uncertain else .none;
 }
 
 /// A directory with entries is not the directory this transaction made, and a
@@ -3394,12 +3717,14 @@ fn applyStepMetadata(engine: *Engine, step: Step) Error!void {
         .absent => return,
         .present => |value| value,
     };
-    // A metadata-only step never takes the target name over, so whatever
-    // inode is at the path right now is the one that would be changed. It
-    // must still be the recorded one, or a state only this step's own
-    // interrupted metadata writes can have produced; a directory this step
-    // just created is exempt because it has not received its metadata yet.
-    if (step.kind == .set_metadata) {
+    // A step that writes metadata onto the inode it finds - a metadata-only
+    // step, or a directory creation that has already taken the name - would
+    // otherwise stamp the plan's mode, ownership, and timestamp onto whatever
+    // entry now occupies the name. The entry must still be the recorded one,
+    // or a state only this step's own interrupted boundaries can have
+    // produced: the ordered metadata writes on the recorded inode, or the
+    // still-empty directory this step's own publication boundary created.
+    if (writesMetadataInPlace(step)) {
         var observation: Observation = .{};
         try requirePrecondition(engine, step, &observation, true);
     }
@@ -3604,6 +3929,11 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
             .symlink => {
                 const target = expected.link_target orelse
                     return engine.reject(.recovery, .backup_missing, step.index, .restore_create);
+                // A symbolic link is published by renaming a staged link over
+                // the name, and a rename cannot take a name a directory
+                // holds, so a directory the forward pass created there is
+                // removed first exactly as it is for a recorded regular file.
+                try removeDirectoryTarget(engine, step, actual);
                 try engine.hook(.restore_create, step.index);
                 engine.root.publishSymbolicLink(targetPath(step), target, .{
                     .overwrite = .replace,
@@ -4779,6 +5109,30 @@ test "root_mutation.test.preflight refuses every unsafe or ambiguous intent" {
     try expectDiagnostic(
         &fixture,
         &.{ fileIntent("etc/linked", "x"), fileIntent("etc/alias", "y") },
+        .path_alias,
+    );
+    // A source is modeled exactly like a target, so a link staged from one
+    // name for an inode whose other name the plan also touches is refused
+    // here rather than left to wedge recovery: the extra link it puts on that
+    // inode is not derivable from the journal, which records paths.
+    try expectDiagnostic(
+        &fixture,
+        &.{
+            .{ .metadata = .{ .path = "etc/linked", .mode = 0o600 } },
+            .{ .hard_link = .{ .path = "etc/clone", .source = "etc/alias" } },
+        },
+        .path_alias,
+    );
+    try expectDiagnostic(
+        &fixture,
+        &.{
+            .{ .metadata = .{ .path = "etc/linked", .mode = 0o600 } },
+            .{ .copy = .{
+                .path = "etc/copy",
+                .source = "etc/alias",
+                .source_sha256 = @splat(0x00),
+            } },
+        },
         .path_alias,
     );
     try expectDiagnostic(
@@ -6405,6 +6759,672 @@ test "root_mutation.test.an external metadata change is never mistaken for an in
     try other_root.publishFile(try root_fs.Path.init("etc/meta"), "meta\n", .{});
     const swap_report = try apply(&swapped, .fromPlan(&swap));
     try testing.expectEqual(Outcome.recovery_required, swap_report.outcome);
+}
+
+// ---------------------------------------------------------------------------
+// Transitions that cross the directory boundary
+// ---------------------------------------------------------------------------
+
+/// The recorded old state of a target a `create_directory` step takes over.
+/// A directory can be neither renamed over nor renamed away, so both of these
+/// are unlinked before `mkdir` can take the name.
+const Replaced = enum { regular, symlink };
+
+fn seedReplaced(root: root_fs.Root, kind: Replaced) !void {
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc"),
+        root_fs.default_directory_permissions,
+    );
+    switch (kind) {
+        .regular => try writeExisting(root, "etc/thing", "old\n"),
+        .symlink => try root.createSymbolicLink(try root_fs.Path.init("etc/thing"), "elsewhere"),
+    }
+}
+
+fn expectReplacedSeed(root: root_fs.Root, kind: Replaced) !void {
+    switch (kind) {
+        .regular => try expectContent(root, "etc/thing", "old\n"),
+        .symlink => {
+            var buffer: [64]u8 = undefined;
+            const target = try root.readSymbolicLink(try root_fs.Path.init("etc/thing"), &buffer);
+            try testing.expectEqualStrings("elsewhere", target);
+        },
+    }
+    try expectAbsent(root, "etc/other");
+}
+
+/// The transition intents: a non-directory becomes a directory that the next
+/// step immediately fills, so a resumed transaction has to finish both.
+fn replacedIntents() [2]Intent {
+    return .{
+        directoryIntent("etc/thing"),
+        fileIntent("etc/other", "content\n"),
+    };
+}
+
+/// Crashes at `boundary` of the transition step and resumes with `apply`,
+/// which is the path a re-run of the same transaction takes: the recorded
+/// direction is still forward, so the interrupted transition must be finished
+/// rather than refused as somebody else's work.
+fn runForwardTransitionResume(kind: Replaced, boundary: Boundary) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedReplaced(root, kind);
+
+    const intents = replacedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = boundary, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    const entry = try root.entry(try root_fs.Path.init("etc/thing"));
+    try testing.expect(entry.isDirectory());
+    try testing.expectEqual(@as(u32, 0o755), entry.mode);
+    try expectContent(root, "etc/other", "content\n");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+/// The same interruption resolved backwards, which restores the recorded old
+/// non-directory over the directory the transaction created.
+fn runForwardTransitionRollback(kind: Replaced, boundary: Boundary) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedReplaced(root, kind);
+
+    const intents = replacedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = boundary, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    try expectReplacedSeed(root, kind);
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a non-directory becoming a directory resumes from every boundary" {
+    // `target_remove` stops before the old entry is unlinked, `publish_create`
+    // after the unlink and before the `mkdir`, `metadata_apply` after the
+    // `mkdir`, and `parent_sync` after the directory is complete. Every one of
+    // them is resumable forwards and backwards.
+    const boundaries = [_]Boundary{
+        .target_remove,
+        .publish_create,
+        .metadata_apply,
+        .parent_sync,
+    };
+    for ([_]Replaced{ .regular, .symlink }) |kind| {
+        for (boundaries) |boundary| {
+            runForwardTransitionResume(kind, boundary) catch |err| {
+                std.debug.print("resume of {t} at {t} failed\n", .{ kind, boundary });
+                return err;
+            };
+            runForwardTransitionRollback(kind, boundary) catch |err| {
+                std.debug.print("rollback of {t} at {t} failed\n", .{ kind, boundary });
+                return err;
+            };
+        }
+    }
+}
+
+test "root_mutation.test.an absence outside a step's own removal window is foreign" {
+    // A target that disappears before the step could have removed anything.
+    // The regular file the transition would have replaced is recorded in the
+    // backup boundary, which has not run, so the absence is nobody's work but
+    // an outsider's - and, with no backup captured, no rollback can put the
+    // vanished content back either.
+    {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try seedReplaced(root, .regular);
+
+        const intents = replacedIntents();
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+        defer engine.deinit();
+
+        try root.removeFile(try root_fs.Path.init("etc/thing"));
+        const report = try apply(&engine, .fromPlan(&plan));
+        try testing.expectEqual(Outcome.recovery_required, report.outcome);
+        try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+        try testing.expectEqual(@as(u32, 0), report.diagnostic.?.step.?);
+    }
+
+    // A step whose publication removes nothing at all never leaves the name
+    // empty, so an absence is external however far the step has got.
+    {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try writeExisting(root, "etc/plain", "old\n");
+
+        const intents = [_]Intent{fileIntent("etc/plain", "new\n")};
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+        defer engine.deinit();
+
+        try root.removeFile(try root_fs.Path.init("etc/plain"));
+        const report = try apply(&engine, .fromPlan(&plan));
+        try testing.expectEqual(Outcome.recovery_required, report.outcome);
+        try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+    }
+
+    // Neither does a metadata step, nor a directory creation that finds the
+    // directory already there: both write onto the entry that is present, and
+    // an entry that vanished is not one this transaction removed.
+    for ([_]Intent{
+        .{ .metadata = .{ .path = "etc/empty", .mode = 0o700 } },
+        .{ .directory = .{ .path = "etc/empty", .mode = 0o700, .uid = currentUid(), .gid = currentGid() } },
+    }) |intent| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try root.createDirectoryPath(
+            try root_fs.Path.init("etc/empty"),
+            root_fs.default_directory_permissions,
+        );
+
+        const intents = [_]Intent{intent};
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+        defer engine.deinit();
+
+        try root.removeDirectory(try root_fs.Path.init("etc/empty"));
+        const report = try apply(&engine, .fromPlan(&plan));
+        try testing.expectEqual(Outcome.recovery_required, report.outcome);
+        try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+    }
+}
+
+test "root_mutation.test.a directory removed after this transaction made it is foreign" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedReplaced(root, .regular);
+
+    const intents = replacedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    // Power loss after the `mkdir` and before the metadata boundary. The
+    // removal window is closed: the step published its publication boundary,
+    // so an absence now is somebody else's removal of the directory this
+    // transaction created, not a transition it is still part way through.
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_apply, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try root.removeDirectory(try root_fs.Path.init("etc/thing"));
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+    // The backup still holds the recorded regular file, so the transaction is
+    // not wedged: it turns around and puts the recorded old state back.
+    try testing.expectEqual(Outcome.rolled_back, report.outcome);
+    try expectReplacedSeed(root, .regular);
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+// ---------------------------------------------------------------------------
+// Link counts this transaction changes itself
+// ---------------------------------------------------------------------------
+
+test "root_mutation.test.a hard link this plan stages does not wedge its source's metadata" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "etc/tool", "payload\n");
+    try root.applyMetadata(try root_fs.Path.init("etc/tool"), .{ .modified_nanoseconds = 5 });
+
+    // A metadata step on the very inode a later step hard-links. The link is
+    // staged before it is published, so the source gains a link the recorded
+    // state does not have while the transaction is still running.
+    const intents = [_]Intent{
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600, .modified_nanoseconds = 9 } },
+        .{ .hard_link = .{ .path = "etc/clone", .source = "etc/tool" } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .publish_rename, .step = 1 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    // The staged link is real and still holds the source's inode.
+    try testing.expectEqual(
+        @as(u64, 2),
+        (try root.entry(try root_fs.Path.init("etc/tool"))).link_count,
+    );
+
+    // The rollback restores the recorded metadata in the same three ordered
+    // writes, and power loss between two of them leaves the source carrying a
+    // partially restored state and the extra staged link at once.
+    var second: Injector = .{ .faults = &.{.{ .boundary = .metadata_utimens, .step = 0 }} };
+    var restoring = (try open(testing.allocator, root, &fixture.attempt, .{
+        .hooks = second.interface(),
+    })).?;
+    try testing.expectError(error.SimulatedCrash, recover(&restoring));
+    restoring.deinit();
+    try testing.expect(second.allFired());
+    const partial = try root.entry(try root_fs.Path.init("etc/tool"));
+    try testing.expectEqual(@as(u32, 0o644), partial.mode);
+    try testing.expectEqual(@as(i128, 9), partial.modified_nanoseconds);
+    try testing.expectEqual(@as(u64, 2), partial.link_count);
+
+    // The count is exactly the recorded one plus this transaction's own
+    // staged link, so the partially restored state is the transaction's own
+    // work and the restoration finishes it.
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    const restored = try root.entry(try root_fs.Path.init("etc/tool"));
+    try testing.expectEqual(@as(u32, 0o644), restored.mode);
+    try testing.expectEqual(@as(i128, 5), restored.modified_nanoseconds);
+    try testing.expectEqual(@as(u64, 1), restored.link_count);
+    try expectAbsent(root, "etc/clone");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a hard link nobody planned still wedges its source's metadata" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "etc/tool", "payload\n");
+    try root.applyMetadata(try root_fs.Path.init("etc/tool"), .{ .modified_nanoseconds = 5 });
+
+    const intents = [_]Intent{
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600, .modified_nanoseconds = 9 } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_utimens, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+
+    // This plan links nothing, so a link that appeared belongs to somebody
+    // else and the partially applied metadata is no longer provably this
+    // transaction's own work.
+    try root.createHardLink(
+        try root_fs.Path.init("etc/tool"),
+        try root_fs.Path.init("etc/stolen"),
+    );
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const report = try recover(&engine);
+    try testing.expectEqual(Outcome.recovery_required, report.outcome);
+    try testing.expectEqual(Stage.recovery_required, engine.stage());
+}
+
+test "root_mutation.test.a subdirectory this plan creates does not wedge its parent's metadata" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // A directory publishes at most an ownership change and a mode change, so
+    // a real second group is what makes the two writes - and the state
+    // between them - reachable at all.
+    const other = alternateGid() orelse return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/conf"),
+        root_fs.default_directory_permissions,
+    );
+
+    // The plan creates a subdirectory of the directory whose metadata it also
+    // rewrites, so the parent gains a link through the child's `..` before the
+    // metadata boundary runs.
+    const intents = [_]Intent{
+        directoryIntent("etc/conf/sub"),
+        .{ .metadata = .{ .path = "etc/conf", .mode = 0o700, .gid = other } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_chmod, .step = 1 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    const partial = try root.entry(try root_fs.Path.init("etc/conf"));
+    try testing.expectEqual(other, partial.gid);
+    try testing.expectEqual(@as(u64, 3), partial.link_count);
+
+    // The count is exactly the recorded one plus the subdirectory this plan
+    // made, so the half-written metadata is this transaction's own and the
+    // forward pass finishes it.
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&engine, .fromPlan(&plan))).outcome);
+    try expectMetadata(root, "etc/conf", 0o700, currentUid(), other);
+    try testing.expect((try root.entry(try root_fs.Path.init("etc/conf/sub"))).isDirectory());
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a subdirectory nobody planned still wedges its parent's metadata" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const other = alternateGid() orelse return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/conf"),
+        root_fs.default_directory_permissions,
+    );
+
+    const intents = [_]Intent{
+        directoryIntent("etc/conf/sub"),
+        .{ .metadata = .{ .path = "etc/conf", .mode = 0o700, .gid = other } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_chmod, .step = 1 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+
+    // One more subdirectory than this plan accounts for is one link outside
+    // the exact set the transaction can have produced.
+    try root.createDirectory(
+        try root_fs.Path.init("etc/conf/foreign"),
+        root_fs.default_directory_permissions,
+    );
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.recovery_required, report.outcome);
+    try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+    try testing.expectEqual(Stage.recovery_required, engine.stage());
+}
+
+test "root_mutation.test.the reachable link counts are exactly this plan's own links" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/conf"),
+        root_fs.default_directory_permissions,
+    );
+    try writeExisting(root, "etc/tool", "payload\n");
+    try writeExisting(root, "etc/conf/file", "old\n");
+
+    const intents = [_]Intent{
+        // 0: a subdirectory of `etc/conf` made before its parent's metadata.
+        directoryIntent("etc/conf/early"),
+        // 1: the parent's own metadata, the step being classified.
+        .{ .metadata = .{ .path = "etc/conf", .mode = 0o700 } },
+        // 2: a second subdirectory, made after it.
+        directoryIntent("etc/conf/late"),
+        // 3: a file replacing a file, which changes no count at all.
+        fileIntent("etc/conf/file", "new\n"),
+        // 4: the metadata of the file a later step hard-links.
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600 } },
+        // 5: that hard link, which adds a link to `etc/tool`'s inode.
+        .{ .hard_link = .{ .path = "etc/clone", .source = "etc/tool" } },
+        // 6: a deeper path, which is not a direct child of `etc/conf`.
+        directoryIntent("etc/conf/early/deeper"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const directory = switch (steps[1].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    const file = switch (steps[4].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try testing.expectEqual(@as(u64, 2), directory.link_count);
+    try testing.expectEqual(@as(u64, 1), file.link_count);
+
+    // Nothing has been applied, so nothing but the recorded count is
+    // reachable - and the recorded count is always reachable.
+    for ([_]Phase{ .forward, .restore }) |phase| {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, phase);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 3, phase));
+        try testing.expect(linkCountReachable(&engine, steps[1], directory, 2, phase));
+    }
+
+    // Once mutation is authorized the first step is inside its own
+    // publication boundary: its `mkdir` may or may not have run. Every later
+    // step is still past the forward pass's frontier and has done nothing.
+    try engine.publishStage(.applying);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 3), counts.upper);
+    }
+    // Once the `mkdir` is durable the extra link is certain, and one more
+    // than that is refused.
+    try engine.publishState(0, .published);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        try testing.expectEqual(@as(i128, 3), counts.lower);
+        try testing.expectEqual(@as(i128, 3), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 4, .forward));
+        // The recorded count stays admissible: a filesystem that does not
+        // maintain directory link counts reports it unchanged.
+        try testing.expect(linkCountReachable(&engine, steps[1], directory, 2, .forward));
+    }
+
+    // The second subdirectory is only reachable once the pass has actually
+    // got to it, and it adds exactly one more link.
+    try engine.publishState(0, .verified);
+    try engine.publishState(1, .verified);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        try testing.expectEqual(@as(i128, 3), counts.lower);
+        try testing.expectEqual(@as(i128, 4), counts.upper);
+    }
+    try engine.publishState(2, .verified);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        try testing.expectEqual(@as(i128, 4), counts.lower);
+        try testing.expectEqual(@as(i128, 4), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 5, .forward));
+    }
+    // A file replacing a file and a directory two levels down are not links
+    // on this directory at all.
+    try engine.publishState(3, .verified);
+    try engine.publishState(6, .verified);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        try testing.expectEqual(@as(i128, 4), counts.lower);
+        try testing.expectEqual(@as(i128, 4), counts.upper);
+    }
+
+    // A hard link is a link on its source's inode from the moment it is
+    // staged. Before the pass reaches the linking step, nothing is staged.
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 1), counts.upper);
+    }
+    try engine.publishState(4, .verified);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+    try engine.publishState(5, .staged);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[4], file, 3, .forward));
+    }
+    // Publication renames the staged link into place; the link itself stays.
+    try engine.publishState(5, .published);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+
+    // Rollback undoes steps in reverse index order, so while a step is being
+    // restored every later step has already given its links back and every
+    // earlier one still holds them.
+    try engine.publishStage(.rolling_back);
+    try engine.publishState(6, .reverted);
+    try engine.publishState(5, .reverted);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        // The published link went with the step, but the staged entry it was
+        // renamed from is only released after the whole restoration.
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+    try engine.publishState(4, .reverted);
+    try engine.publishState(3, .reverted);
+    try engine.publishState(2, .reverted);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .restore);
+        // The later subdirectory is gone; the earlier one is still there.
+        try testing.expectEqual(@as(i128, 3), counts.lower);
+        try testing.expectEqual(@as(i128, 3), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 4, .restore));
+    }
+    try engine.publishState(1, .reverted);
+    try engine.publishState(0, .reverted);
+    {
+        const counts = reachableLinkCounts(&engine, steps[1], directory, .restore);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+
+    // The release removes every staging and backup entry, so a workspace link
+    // is uncertain while it runs and gone once it is finished.
+    try engine.publishStage(.releasing_rollback);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+    try engine.publishStage(.rolled_back);
+    {
+        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 1), counts.upper);
+    }
+}
+
+test "root_mutation.test.a backup is a link on the inode it preserves" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "etc/tool", "payload\n");
+
+    // The metadata step and the replacement name the same path, so the
+    // backup the replacement captures is a hard link to the very inode the
+    // metadata step is writing on.
+    const intents = [_]Intent{
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600 } },
+        fileIntent("etc/tool", "replaced\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const file = switch (steps[0].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try testing.expect(steps[1].backup_entry != null);
+    try engine.publishStage(.applying);
+    try engine.publishState(0, .verified);
+    {
+        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 1), counts.upper);
+    }
+    // Inside the backup boundary the link may or may not exist yet.
+    try engine.publishState(1, .staged);
+    {
+        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        try testing.expectEqual(@as(i128, 1), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+    try engine.publishState(1, .backup_captured);
+    {
+        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+        try testing.expect(!linkCountReachable(&engine, steps[0], file, 3, .forward));
+    }
+}
+
+test "root_mutation.test.direct containment decides which links count" {
+    try testing.expect(directChild("etc/conf/sub", "etc/conf"));
+    try testing.expect(!directChild("etc/conf/sub/deeper", "etc/conf"));
+    try testing.expect(!directChild("etc/conf", "etc/conf"));
+    try testing.expect(!directChild("etc/confetti", "etc/conf"));
+    try testing.expect(!directChild("etc/conf", "etc/conf/sub"));
+    try testing.expect(!directChild("other/conf/sub", "etc/conf"));
+    // No step targets the root itself, so the root is never a parent here.
+    try testing.expect(!directChild("etc", ""));
 }
 
 // ---------------------------------------------------------------------------
