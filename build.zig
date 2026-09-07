@@ -259,6 +259,32 @@ pub fn build(b: *std.Build) void {
     const run_solver_tests = b.addRunArtifact(solver_tests);
     b.step("test-solver", "Run solver adapter tests").dependOn(&run_solver_tests.step);
 
+    const production_backend_test_module = b.createModule(.{
+        .root_source_file = b.path("src/production_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    production_backend_test_module.addOptions("debz_build_options", build_options);
+    production_backend_test_module.addIncludePath(libsolv_dependency.path("src"));
+    production_backend_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    production_backend_test_module.addIncludePath(zstd_dependency.path("lib"));
+    production_backend_test_module.addCMacro("LZMA_API_STATIC", "1");
+    production_backend_test_module.linkLibrary(libsolv);
+    production_backend_test_module.linkLibrary(liblzma);
+    production_backend_test_module.linkLibrary(zstd);
+    production_backend_test_module.link_libc = true;
+    const production_backend_tests = b.addTest(.{
+        .root_module = production_backend_test_module,
+        .filters = &.{"production workflow"},
+    });
+    const run_production_backend_tests = b.addRunArtifact(production_backend_tests);
+    const production_backend_test_step = b.step(
+        "test-production-backend",
+        "Run production backend workflow and exact-lock tests",
+    );
+    production_backend_test_step.dependOn(&run_production_backend_tests.step);
+    test_step.dependOn(&run_production_backend_tests.step);
+
     const native_program_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{ "native_program.test.", "transaction_engine.test." },

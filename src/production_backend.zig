@@ -41,6 +41,14 @@ const WorkflowDirective = struct {
     mode: WorkflowMode,
 };
 
+const TransactionSemanticOperation = enum {
+    install,
+    remove,
+    upgrade,
+    upgrade_all,
+    reinstall,
+};
+
 /// Durable boundary inside the completion sequence of one product mutation.
 ///
 /// The window between the terminal `completed` record and the cleared active
@@ -700,6 +708,26 @@ pub const Backend = struct {
         const selectors = try allocator.alloc(solver.PackageSelector, effective_request.packages.len);
         defer allocator.free(selectors);
         for (effective_request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
+        const semantic_request_digest = try semanticRequestDigest(
+            allocator,
+            effective_request.operation,
+            workflow,
+            selectors,
+        );
+        const solver_policy_digest = package_cache_workflow.solverPolicyDigest(
+            effective_request.options.recommends,
+            effective_request.options.allow_downgrade,
+            switch (effective_request.options.repository_policy) {
+                .strict_priority => .strict_priority,
+                .best_version => .best_version,
+            },
+        );
+        if (lock) |*value| {
+            if (!std.mem.eql(u8, &semantic_request_digest, &value.lock.request_sha256))
+                return api.failure(request.operation, .planning, .lock_verification_failed, "exact lock semantic request does not match the requested operation and selectors");
+            if (!std.mem.eql(u8, &solver_policy_digest, &value.lock.policy_sha256))
+                return api.failure(request.operation, .planning, .lock_verification_failed, "exact lock solver policy does not match the effective request policy");
+        }
         var planning = try solver.planTransaction(allocator, .{
             .repositories = refreshed.universe.repositories,
             .installed = .{
@@ -732,11 +760,6 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
-        if (lock) |*value| {
-            const digest = try canonicalPlanDigest(allocator, plan.*);
-            if (!std.mem.eql(u8, &digest, &value.lock.request_sha256))
-                return api.failure(request.operation, .planning, .planning_failed, "exact lock does not bind the complete requested plan");
-        }
         var generated_lock: ?exact_lock.OwnedLock = null;
         defer if (generated_lock) |*value| value.deinit();
         if (request.options.lock_output_path) |path| {
@@ -749,6 +772,8 @@ pub const Backend = struct {
                     refreshed,
                     planning_records,
                     plan.*,
+                    semantic_request_digest,
+                    solver_policy_digest,
                 ) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -2238,6 +2263,61 @@ fn planRequestFromWorkflow(
     };
 }
 
+fn semanticRequestDigest(
+    allocator: std.mem.Allocator,
+    operation: api.Operation,
+    workflow: ?WorkflowDirective,
+    selectors: []const solver.PackageSelector,
+) ![32]u8 {
+    const semantic = if (workflow) |directive|
+        switch (directive.operation) {
+            .install => TransactionSemanticOperation.install,
+            .remove => TransactionSemanticOperation.remove,
+            .upgrade_all => TransactionSemanticOperation.upgrade_all,
+        }
+    else switch (operation) {
+        .install, .plan, .download => if (selectors.len == 0)
+            TransactionSemanticOperation.upgrade_all
+        else
+            TransactionSemanticOperation.install,
+        .remove => TransactionSemanticOperation.remove,
+        .upgrade => TransactionSemanticOperation.upgrade,
+        .upgrade_all => TransactionSemanticOperation.upgrade_all,
+        .reinstall => TransactionSemanticOperation.reinstall,
+        else => return error.InvalidOperation,
+    };
+    const canonical = try allocator.dupe(solver.PackageSelector, selectors);
+    defer allocator.free(canonical);
+    std.mem.sort(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
+
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-semantic-transaction-request-v1\x00");
+    hash.update(@tagName(semantic));
+    hash.update("\x00");
+    for (canonical) |selector| {
+        hashLengthPrefixed(&hash, selector.name);
+        hashOptionalText(&hash, selector.architecture);
+        hashOptionalText(&hash, selector.version);
+    }
+    return hash.finalResult();
+}
+
+fn hashLengthPrefixed(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var length_buffer: [32]u8 = undefined;
+    const length = std.fmt.bufPrint(&length_buffer, "{d}:", .{value.len}) catch unreachable;
+    hash.update(length);
+    hash.update(value);
+}
+
+fn hashOptionalText(hash: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
+    if (value) |text| {
+        hash.update("\x01");
+        hashLengthPrefixed(hash, text);
+    } else {
+        hash.update("\x00");
+    }
+}
+
 fn formatSelector(allocator: std.mem.Allocator, selector: solver.PackageSelector) ![]u8 {
     if (selector.name.len == 0 or
         (selector.version != null and selector.version.?.len == 0) or
@@ -2479,6 +2559,8 @@ fn lockFromPlan(
     refreshed: *repository_policy.RefreshResult,
     installed: []const dpkg_status.Package,
     plan: solver.Plan,
+    semantic_request_digest: [32]u8,
+    solver_policy_digest: [32]u8,
 ) !exact_lock.OwnedLock {
     var packages: std.ArrayList(exact_lock.Package) = .empty;
     defer packages.deinit(allocator);
@@ -2549,6 +2631,13 @@ fn lockFromPlan(
             .dpkg_selection_hold = package.status.want == .hold,
         });
     }
+    if (packages.items.len == 0) {
+        for (refreshed.universe.repositories) |repository| {
+            var repository_id: [64]u8 = undefined;
+            @memcpy(&repository_id, repository.repository_id.slice());
+            try repository_ids.append(allocator, repository_id);
+        }
+    }
 
     var repositories: std.ArrayList(exact_lock.Repository) = .empty;
     defer repositories.deinit(allocator);
@@ -2582,30 +2671,14 @@ fn lockFromPlan(
         });
     }
 
-    const request_digest = try canonicalPlanDigest(allocator, plan);
     return exact_lock.create(allocator, .{
         .target_architecture = request.options.architecture,
-        .request_sha256 = request_digest,
-        .policy_sha256 = package_cache_workflow.solverPolicyDigest(
-            request.options.recommends,
-            request.options.allow_downgrade,
-            switch (request.options.repository_policy) {
-                .strict_priority => .strict_priority,
-                .best_version => .best_version,
-            },
-        ),
+        .request_sha256 = semantic_request_digest,
+        .policy_sha256 = solver_policy_digest,
         .repositories = repositories.items,
         .packages = packages.items,
         .authenticated_metadata = true,
     });
-}
-
-fn canonicalPlanDigest(allocator: std.mem.Allocator, plan: solver.Plan) ![32]u8 {
-    const plan_json = try plan.canonicalJson(allocator);
-    defer allocator.free(plan_json);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(plan_json, &digest, .{});
-    return digest;
 }
 
 fn planChangesIdentity(
@@ -3008,10 +3081,10 @@ const ProductionWorkflowFixture = struct {
         packages: []const u8,
         keyring: []const u8,
     ) !ProductionWorkflowFixture {
-        try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
-        try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
-        try directory.dir.makePath(std.testing.io, "root/var/lib/debz");
-        try directory.dir.makePath(std.testing.io, "state");
+        try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/debz");
+        try directory.dir.createDirPath(std.testing.io, "state");
         try directory.dir.writeFile(std.testing.io, .{
             .sub_path = "repo/dists/stable/InRelease",
             .data = in_release,
@@ -3096,13 +3169,16 @@ const ProductionWorkflowFixture = struct {
 };
 
 test "production workflow plans a successful batch install into one exact lock" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const in_release = @embedFile("fixtures/batch_workflow/InRelease");
     const packages = @embedFile("fixtures/batch_workflow/Packages");
     const keyring = @embedFile("fixtures/batch_workflow/keyring.gpg");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var fixture = try ProductionWorkflowFixture.initWithRepository(
-        std.testing.allocator,
+        allocator,
         &directory,
         "",
         in_release,
@@ -3119,7 +3195,7 @@ test "production workflow plans a successful batch install into one exact lock" 
     const selectors = [_]solver.PackageSelector{ .{ .name = "beta" }, .{ .name = "alpha" } };
     var options = fixture.options();
     options.lock_output_path = fixture.lock_path;
-    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+    const planned = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .plan_only,
         .selectors = &selectors,
@@ -3130,14 +3206,14 @@ test "production workflow plans a successful batch install into one exact lock" 
     try std.testing.expectEqual(@as(usize, 0), process.calls);
 
     const lock_bytes = try readFile(
-        std.testing.allocator,
+        allocator,
         std.testing.io,
         fixture.lock_path,
         exact_lock.maximum_document_bytes,
     );
-    defer std.testing.allocator.free(lock_bytes);
+    defer allocator.free(lock_bytes);
     var lock = try exact_lock.decode(
-        std.testing.allocator,
+        allocator,
         lock_bytes,
         exact_lock.maximum_document_bytes,
     );
@@ -3156,7 +3232,7 @@ test "production workflow plans a successful batch install into one exact lock" 
     var replay_options = fixture.options();
     replay_options.lock_input_path = fixture.lock_path;
     replay_options.lock_output_path = fixture.second_lock_path;
-    const replayed = try backend.executeWorkflow(std.testing.allocator, .{
+    const replayed = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .plan_only,
         .selectors = &selectors,
@@ -3164,21 +3240,24 @@ test "production workflow plans a successful batch install into one exact lock" 
     });
     try std.testing.expectEqual(api.ExitStatus.success, replayed.exit_status);
     const replay_bytes = try readFile(
-        std.testing.allocator,
+        allocator,
         std.testing.io,
         fixture.second_lock_path,
         exact_lock.maximum_document_bytes,
     );
-    defer std.testing.allocator.free(replay_bytes);
+    defer allocator.free(replay_bytes);
     try std.testing.expectEqualStrings(lock_bytes, replay_bytes);
 }
 
 test "production workflow plan-only batches do not mutate and removal locks replay" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const signed_fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var fixture = try ProductionWorkflowFixture.init(
-        std.testing.allocator,
+        allocator,
         &directory,
         "Package: first\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n\n" ++
             "Package: second\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
@@ -3194,7 +3273,7 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     const removals = [_]solver.PackageSelector{ .{ .name = "first" }, .{ .name = "second" } };
     var plan_options = fixture.options();
     plan_options.lock_output_path = fixture.lock_path;
-    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+    const planned = try backend.executeWorkflow(allocator, .{
         .operation = .remove,
         .mode = .plan_only,
         .selectors = &removals,
@@ -3206,43 +3285,63 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     const unchanged = try directory.dir.readFileAlloc(
         std.testing.io,
         "root/var/lib/dpkg/status",
-        std.testing.allocator,
+        allocator,
         .limited(4096),
     );
-    defer std.testing.allocator.free(unchanged);
+    defer allocator.free(unchanged);
     try std.testing.expect(std.mem.indexOf(u8, unchanged, "Package: first") != null);
     try std.testing.expect(std.mem.indexOf(u8, unchanged, "Package: second") != null);
 
     const lock_bytes = try readFile(
-        std.testing.allocator,
+        allocator,
         std.testing.io,
         fixture.lock_path,
         exact_lock.maximum_document_bytes,
     );
-    defer std.testing.allocator.free(lock_bytes);
+    defer allocator.free(lock_bytes);
     var lock = try exact_lock.decode(
-        std.testing.allocator,
+        allocator,
         lock_bytes,
         exact_lock.maximum_document_bytes,
     );
     defer lock.deinit();
     try std.testing.expectEqual(@as(usize, 0), lock.lock.packages.len);
+    try std.testing.expectEqual(@as(usize, 1), lock.lock.repositories.len);
 
     var execute_options = fixture.options();
     execute_options.lock_input_path = fixture.lock_path;
     execute_options.assume_yes = true;
     execute_options.noninteractive = true;
     execute_options.conffile = .keep_existing;
-    const incomplete = try backend.executeWorkflow(std.testing.allocator, .{
+    var wrong_policy = execute_options;
+    wrong_policy.recommends = true;
+    const policy_mismatch = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &removals,
+        .options = wrong_policy,
+    });
+    try std.testing.expectEqual(api.ExitStatus.planning, policy_mismatch.exit_status);
+    try std.testing.expectEqual(
+        api.ErrorId.lock_verification_failed,
+        policy_mismatch.diagnostics[0].id,
+    );
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+    const incomplete = try backend.executeWorkflow(allocator, .{
         .operation = .remove,
         .mode = .execute,
         .selectors = removals[0..1],
         .options = execute_options,
     });
     try std.testing.expectEqual(api.ExitStatus.planning, incomplete.exit_status);
+    try std.testing.expectEqual(
+        api.ErrorId.lock_verification_failed,
+        incomplete.diagnostics[0].id,
+    );
     try std.testing.expectEqual(@as(usize, 0), process.calls);
 
-    const executed = try backend.executeWorkflow(std.testing.allocator, .{
+    const executed = try backend.executeWorkflow(allocator, .{
         .operation = .remove,
         .mode = .execute,
         .selectors = &removals,
@@ -3251,13 +3350,24 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     try std.testing.expectEqual(api.ExitStatus.success, executed.exit_status);
     try std.testing.expect(executed.changed);
     try std.testing.expect(process.calls != 0);
+    const final_status = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/var/lib/dpkg/status",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(final_status);
+    try std.testing.expectEqual(@as(usize, 0), final_status.len);
 }
 
 test "production workflow accepts batch install planning and requires lock-bound execution" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const signed_fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    var fixture = try ProductionWorkflowFixture.init(std.testing.allocator, &directory, "");
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
     defer fixture.deinit();
     var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
@@ -3268,7 +3378,7 @@ test "production workflow accepts batch install planning and requires lock-bound
     const selectors = [_]solver.PackageSelector{ .{ .name = "hello" }, .{ .name = "missing" } };
     var options = fixture.options();
     options.lock_output_path = fixture.lock_path;
-    const planned = try backend.executeWorkflow(std.testing.allocator, .{
+    const planned = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .plan_only,
         .selectors = &selectors,
@@ -3281,7 +3391,7 @@ test "production workflow accepts batch install planning and requires lock-bound
     options.assume_yes = true;
     options.noninteractive = true;
     options.conffile = .keep_existing;
-    const no_lock = try backend.executeWorkflow(std.testing.allocator, .{
+    const no_lock = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .execute,
         .selectors = &selectors,
@@ -3293,7 +3403,7 @@ test "production workflow accepts batch install planning and requires lock-bound
 
     options.lock_input_path = "/explicit/exact-lock.json";
     options.assume_yes = false;
-    const no_confirmation = try backend.executeWorkflow(std.testing.allocator, .{
+    const no_confirmation = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .execute,
         .selectors = &selectors,
@@ -3302,7 +3412,7 @@ test "production workflow accepts batch install planning and requires lock-bound
     try std.testing.expectEqual(api.ErrorId.confirmation_required, no_confirmation.diagnostics[0].id);
     options.assume_yes = true;
     options.conffile = .unspecified;
-    const no_conffile = try backend.executeWorkflow(std.testing.allocator, .{
+    const no_conffile = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .execute,
         .selectors = &selectors,
@@ -3313,6 +3423,9 @@ test "production workflow accepts batch install planning and requires lock-bound
 }
 
 test "production workflow digest binds every selector and product v1 stays singleton" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const options: api.CommonOptions = .{
         .install_root = "/root",
         .cache_path = "/cache",
@@ -3320,26 +3433,79 @@ test "production workflow digest binds every selector and product v1 stays singl
         .architecture = "amd64",
         .assume_yes = true,
     };
-    const first = productRequestDigest(.{
+    const selector = [_]solver.PackageSelector{.{ .name = "first" }};
+    const selectors = [_]solver.PackageSelector{
+        .{ .name = "first" },
+        .{ .name = "second", .architecture = "amd64", .version = "1" },
+    };
+    const reversed = [_]solver.PackageSelector{ selectors[1], selectors[0] };
+    const first_semantic = try semanticRequestDigest(
+        allocator,
+        .plan,
+        .{ .operation = .install, .mode = .plan_only },
+        &selector,
+    );
+    const planned_semantic = try semanticRequestDigest(
+        allocator,
+        .plan,
+        .{ .operation = .install, .mode = .plan_only },
+        &selectors,
+    );
+    const downloaded_semantic = try semanticRequestDigest(
+        allocator,
+        .download,
+        .{ .operation = .install, .mode = .download_only },
+        &reversed,
+    );
+    const executed_semantic = try semanticRequestDigest(
+        allocator,
+        .install,
+        .{ .operation = .install, .mode = .execute },
+        &reversed,
+    );
+    const recovered_semantic = try semanticRequestDigest(
+        allocator,
+        .recover,
+        .{ .operation = .install, .mode = .recover },
+        &selectors,
+    );
+    const removed_semantic = try semanticRequestDigest(
+        allocator,
+        .remove,
+        .{ .operation = .remove, .mode = .execute },
+        &selectors,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &first_semantic, &planned_semantic));
+    try std.testing.expectEqualSlices(u8, &planned_semantic, &downloaded_semantic);
+    try std.testing.expectEqualSlices(u8, &planned_semantic, &executed_semantic);
+    try std.testing.expectEqualSlices(u8, &planned_semantic, &recovered_semantic);
+    try std.testing.expect(!std.mem.eql(u8, &planned_semantic, &removed_semantic));
+
+    const execute_first = productRequestDigest(.{
         .operation = .install,
         .packages = &.{"first"},
         .options = options,
     });
-    const batch = productRequestDigest(.{
+    const execute_batch = productRequestDigest(.{
         .operation = .install,
         .packages = &.{ "first", "second:amd64=1" },
         .options = options,
     });
-    const recovery = productRequestDigest(.{
+    const recovery_first = productRequestDigest(.{
+        .operation = .recover,
+        .packages = &.{"first"},
+        .options = options,
+    });
+    const recovery_batch = productRequestDigest(.{
         .operation = .recover,
         .packages = &.{ "first", "second:amd64=1" },
         .options = options,
     });
-    try std.testing.expect(!std.mem.eql(u8, &first, &batch));
-    try std.testing.expect(!std.mem.eql(u8, &batch, &recovery));
+    try std.testing.expect(!std.mem.eql(u8, &execute_first, &execute_batch));
+    try std.testing.expect(!std.mem.eql(u8, &recovery_first, &recovery_batch));
 
     var backend: Backend = .{ .io = std.testing.io };
-    const rejected = try api.execute(std.testing.allocator, .{
+    const rejected = try api.execute(allocator, .{
         .operation = .install,
         .packages = &.{ "first", "second" },
         .options = options,
@@ -3370,15 +3536,15 @@ test "production credentials are restricted to one repository origin" {
         "Bearer secret",
     );
     defer context.deinit(std.testing.allocator);
-    try std.testing.expect((try context.get(
+    try std.testing.expect((try CredentialContext.get(
         &context,
         try repository_acquisition.Uri.parse("https://REPO.example/other"),
     )) != null);
-    try std.testing.expect((try context.get(
+    try std.testing.expect((try CredentialContext.get(
         &context,
         try repository_acquisition.Uri.parse("https://attacker.example/debian"),
     )) == null);
-    try std.testing.expect((try context.get(
+    try std.testing.expect((try CredentialContext.get(
         &context,
         try repository_acquisition.Uri.parse("https://repo.example:444/debian"),
     )) == null);
@@ -3387,7 +3553,7 @@ test "production credentials are restricted to one repository origin" {
 test "production explicit file reads reject symlinked parents" {
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    try directory.dir.makePath(std.testing.io, "real");
+    try directory.dir.createDirPath(std.testing.io, "real");
     try directory.dir.writeFile(std.testing.io, .{ .sub_path = "real/input", .data = "secret" });
     try directory.dir.symLink(std.testing.io, "real", "linked", .{ .is_directory = true });
     var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3408,9 +3574,9 @@ test "production backend authenticates an explicit file repository" {
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
-    try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
-    try directory.dir.makePath(std.testing.io, "state");
+    try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/dists/stable/InRelease",
         .data = &fixture.repository_in_release,
@@ -3477,9 +3643,9 @@ test "production exact lock imports and validates the installed baseline" {
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
-    try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
-    try directory.dir.makePath(std.testing.io, "state");
+    try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "state");
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/dists/stable/InRelease",
         .data = &fixture.repository_in_release,
@@ -3617,10 +3783,10 @@ test "production backend mutation uses injected process runner" {
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
-    try directory.dir.makePath(std.testing.io, "repo/dists/stable/main/binary-amd64");
-    try directory.dir.makePath(std.testing.io, "root/var/lib/dpkg");
-    try directory.dir.makePath(std.testing.io, "root/var/lib/debz");
-    try directory.dir.makePath(std.testing.io, "state");
+    try directory.dir.createDirPath(std.testing.io, "repo/dists/stable/main/binary-amd64");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/debz");
+    try directory.dir.createDirPath(std.testing.io, "state");
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/dists/stable/InRelease",
         .data = &fixture.repository_in_release,
