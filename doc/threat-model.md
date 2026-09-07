@@ -71,13 +71,19 @@ install-root spelling `/run/debz/system-root`. A root-owned mode-0700 runtime
 directory, mode-0600 no-follow lock, and mode-0700 empty mountpoint serialize
 setup. The helper pins and revalidates source and mountpoint device, inode,
 mount, owner, and mode identities; makes a new mount namespace recursively
-private before recursively bind-mounting `/`; and rejects replacement or a
-host-visible pre-existing mount. The callback runs as init of a nested PID
-namespace. Its exit destroys all namespace descendants, after which the
-supervisor unmounts and its own exit destroys the private mount namespace.
-Normal errors and catchable interrupts follow the same cleanup path. Abrupt
-machine failure can leave only the checked empty mountpoint in the host
-namespace, never the private bind mount.
+private; attaches detached `open_tree` clones to pinned runtime and mountpoint
+descriptors with `move_mount`; and proves the absolute runtime, lock, and
+mounted-root names still resolve to those identities immediately before the
+callback. Replacement or a host-visible pre-existing mount fails closed. The
+callback runs as init of a nested PID namespace. Its exit destroys all
+namespace descendants, after which the supervisor unmounts and its own exit
+destroys the private mount namespace. A dedicated control pipe is held only by
+the invoking parent; EOF makes the supervisor kill and reap namespace init
+before unmounting and releasing its inherited lock. The workload never retains
+the lock or control descriptor. Normal errors, parent death, and catchable
+interrupts therefore follow the same cleanup path. Abrupt machine failure can
+leave only the checked empty mountpoint in the host namespace, never the
+private bind mount.
 
 ## Security properties
 

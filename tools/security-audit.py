@@ -190,7 +190,7 @@ def audit_production_sources() -> None:
         for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
             child_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(
-            r"\blinux\.(?:unshare|setns|mount|umount2)\s*\(", text
+            r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(", text
         ):
             namespace_calls.append(
                 f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
@@ -210,6 +210,9 @@ def audit_production_sources() -> None:
     namespace_paths = sorted({call.rsplit(":", 1)[0] for call in namespace_calls})
     if namespace_paths not in ([], ["src/live_root.zig"]):
         fail(f"native namespace boundary changed: {namespace_calls!r}")
+    live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
+    if "linux.syscall3(\n        .open_tree," not in live_root:
+        fail("live-root detached open_tree boundary changed")
 
 
 def audit_dependencies() -> None:

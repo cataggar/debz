@@ -525,6 +525,7 @@ test {
     _ = maintainer_script;
     _ = transaction_executor;
     _ = transaction_recovery;
+    _ = live_root;
     _ = root_fs;
     _ = root_mutation;
     _ = root_operation;

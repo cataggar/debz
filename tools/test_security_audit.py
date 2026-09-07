@@ -146,10 +146,15 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertNotIn("std.process.run(", live_root)
         self.assertIn("linux.unshare(linux.CLONE.NEWNS)", live_root)
         self.assertIn("linux.mount(", live_root)
+        self.assertIn(".open_tree,", live_root)
+        self.assertIn("linux.move_mount(", live_root)
         namespace_owners = sorted(
             relative
             for relative, text in sources.items()
-            if re.search(r"\blinux\.(?:unshare|setns|mount|umount2)\s*\(", text)
+            if re.search(
+                r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
+                text,
+            )
         )
         self.assertEqual(["src/live_root.zig"], namespace_owners)
 

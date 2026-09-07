@@ -9,13 +9,17 @@
 //! callback runs as that namespace's init process.  When init exits Linux
 //! destroys every remaining process in that PID namespace; the supervisor then
 //! unmounts the bind and exits, destroying the mount namespace.  Catchable
-//! interrupt signals are relayed parent -> supervisor -> namespace init.
+//! interrupt signals are relayed parent -> supervisor -> namespace init. A
+//! control pipe with a sole parent writer turns parent death into EOF; the
+//! supervisor then kills and reaps namespace init before mount and lock cleanup.
 //!
 //! The `/run/debz` directory, lock, and empty mountpoint are root-owned,
 //! no-follow opened, mode checked, and protected by an open-file-description
-//! lock.  Source, mountpoint, and mounted-root identities are re-read around
-//! every namespace transition.  Replacement or an unexpected host-visible
-//! mount fails closed.
+//! lock.  A detached clone of the pinned runtime directory is attached back to
+//! its descriptor, making `/run/debz` a private-namespace mountpoint before the
+//! source tree is attached to a descriptor opened beneath it. Source, runtime,
+//! lock, mountpoint, and mounted-root identities are re-read around every
+//! transition. Replacement or an unexpected host-visible mount fails closed.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,11 +43,15 @@ pub const Request = struct {
 
 pub const SetupStage = enum(u8) {
     source_validation,
+    runtime_validation,
+    lock_validation,
     mountpoint_validation,
     mount_namespace,
     private_propagation,
+    runtime_pin,
     recursive_bind,
     bind_validation,
+    parent_liveness,
     pid_namespace,
     workload_fork,
     callback,
@@ -70,6 +78,8 @@ pub const Error = error{
     UnsafeMountpoint,
     ActiveHostMount,
     RootReplaced,
+    RuntimeReplaced,
+    LockReplaced,
     MountpointReplaced,
     NamespaceUnavailable,
     PipeFailed,
@@ -116,15 +126,34 @@ pub fn run(request: Request) Error!Result {
         closeFd(&report_pipe[1]);
     }
 
+    var control_pipe: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&control_pipe, .{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    })) != .SUCCESS) return error.PipeFailed;
+    defer {
+        closeFd(&control_pipe[0]);
+        closeFd(&control_pipe[1]);
+    }
+
     const forked = linux.fork();
     switch (linux.errno(forked)) {
         .SUCCESS => {},
         else => return error.ForkFailed,
     }
     const pid: i32 = @intCast(forked);
-    if (pid == 0) supervisorMain(request, pinned, old_mask, report_pipe);
+    if (pid == 0)
+        supervisorMain(
+            request,
+            pinned,
+            old_mask,
+            signal_fd,
+            report_pipe,
+            control_pipe,
+        );
 
     closeFd(&report_pipe[1]);
+    closeFd(&control_pipe[0]);
     _ = linux.setpgid(pid, pid);
     const waited = try superviseProcess(pid, signal_fd, request.termination_grace_ms);
     const failure = readFailure(report_pipe[0]);
@@ -147,11 +176,14 @@ const Identity = struct {
         return self.device == other.device and self.inode == other.inode;
     }
 
-    fn eql(self: Identity, other: Identity) bool {
+    fn samePinnedEntry(self: Identity, other: Identity) bool {
         return self.sameEntry(other) and
-            self.mount_id == other.mount_id and
             self.uid == other.uid and self.gid == other.gid and
             self.mode == other.mode and self.kind == other.kind;
+    }
+
+    fn eql(self: Identity, other: Identity) bool {
+        return self.samePinnedEntry(other) and self.mount_id == other.mount_id;
     }
 };
 
@@ -163,6 +195,7 @@ const PinnedPaths = struct {
     source: Identity,
     runtime: Identity,
     mountpoint: Identity,
+    lock: Identity,
 
     fn open() Error!PinnedPaths {
         const source_fd = try openDirectoryAbsolute("/");
@@ -180,7 +213,9 @@ const PinnedPaths = struct {
         const lock_fd = try openLock(runtime_fd);
         errdefer _ = linux.close(lock_fd);
         const lock_identity = try identityOf(lock_fd);
-        if (!privateRootFile(lock_identity)) return error.UnsafeLockFile;
+        if (!privateRootFile(lock_identity) or
+            lock_identity.mount_id != runtime.mount_id)
+            return error.UnsafeLockFile;
         switch (linux.errno(linux.flock(lock_fd, 2))) {
             .SUCCESS => {},
             else => return error.SystemCallFailed,
@@ -203,6 +238,7 @@ const PinnedPaths = struct {
             .source = source,
             .runtime = runtime,
             .mountpoint = mountpoint,
+            .lock = lock_identity,
         };
     }
 
@@ -328,42 +364,151 @@ fn supervisorMain(
     request: Request,
     pinned: PinnedPaths,
     old_mask: linux.sigset_t,
-    pipes: [2]i32,
+    parent_signal_fd: i32,
+    report_pipe: [2]i32,
+    control_pipe: [2]i32,
 ) noreturn {
-    closeRaw(pipes[0]);
+    closeRaw(parent_signal_fd);
+    closeRaw(report_pipe[0]);
+    closeRaw(control_pipe[1]);
     _ = linux.setpgid(0, 0);
+    ignoreBrokenPipe();
 
-    var mounted = false;
-    validateSource(pinned) catch |err| childFail(pipes[1], .source_validation, errorNumber(err));
-    validateMountpoint(pinned) catch |err|
-        childFail(pipes[1], .mountpoint_validation, errorNumber(err));
+    var runtime_pinned = false;
+    var root_mounted = false;
+    if (!parentAlive(control_pipe[0]))
+        parentDied(root_mounted, runtime_pinned);
+    validateSource(pinned) catch |err|
+        childFail(report_pipe[1], .source_validation, errorNumber(err));
+    validateUnpinnedPaths(pinned) catch |err|
+        childFail(report_pipe[1], stageForPathError(err), errorNumber(err));
 
     switch (linux.errno(linux.unshare(linux.CLONE.NEWNS))) {
         .SUCCESS => {},
-        else => |err| childFail(pipes[1], .mount_namespace, @intFromEnum(err)),
+        else => |err| childFail(report_pipe[1], .mount_namespace, @intFromEnum(err)),
     }
     switch (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0))) {
         .SUCCESS => {},
-        else => |err| childFail(pipes[1], .private_propagation, @intFromEnum(err)),
+        else => |err| childFail(report_pipe[1], .private_propagation, @intFromEnum(err)),
     }
-    validateSource(pinned) catch |err| childFail(pipes[1], .source_validation, errorNumber(err));
-    validateMountpoint(pinned) catch |err|
-        childFail(pipes[1], .mountpoint_validation, errorNumber(err));
+    validateSource(pinned) catch |err|
+        childFail(report_pipe[1], .source_validation, errorNumber(err));
+    validateUnpinnedPaths(pinned) catch |err|
+        childFail(report_pipe[1], stageForPathError(err), errorNumber(err));
 
-    switch (linux.errno(linux.mount("/", logical_root_path, null, linux.MS.BIND | linux.MS.REC, 0))) {
-        .SUCCESS => mounted = true,
-        else => |err| childFail(pipes[1], .recursive_bind, @intFromEnum(err)),
+    const runtime_tree = openTreeClone(pinned.runtime_fd, false) catch |err|
+        childFail(report_pipe[1], .runtime_pin, errorNumber(err));
+    switch (linux.errno(linux.move_mount(
+        runtime_tree,
+        "",
+        pinned.runtime_fd,
+        "",
+        descriptor_move,
+    ))) {
+        .SUCCESS => {
+            closeRaw(runtime_tree);
+            runtime_pinned = true;
+        },
+        else => |err| {
+            closeRaw(runtime_tree);
+            childFail(report_pipe[1], .runtime_pin, @intFromEnum(err));
+        },
     }
-    validateBind(pinned) catch |err| {
-        if (mounted) unmountBestEffort();
-        childFail(pipes[1], .bind_validation, errorNumber(err));
+    if (!parentAlive(control_pipe[0]))
+        parentDied(root_mounted, runtime_pinned);
+    validatePinnedRuntime(pinned) catch |err|
+        namespaceFail(
+            report_pipe[1],
+            stageForPathError(err),
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+
+    const target_fd = openDirectoryAbsolute(logical_root_path) catch |err|
+        namespaceFail(
+            report_pipe[1],
+            .mountpoint_validation,
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+    const target = identityOf(target_fd) catch |err| {
+        closeRaw(target_fd);
+        namespaceFail(
+            report_pipe[1],
+            .mountpoint_validation,
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
     };
+    if (!target.samePinnedEntry(pinned.mountpoint)) {
+        closeRaw(target_fd);
+        namespaceFail(
+            report_pipe[1],
+            .mountpoint_validation,
+            0,
+            root_mounted,
+            runtime_pinned,
+        );
+    }
+
+    const source_tree = openTreeClone(pinned.source_fd, true) catch |err| {
+        closeRaw(target_fd);
+        namespaceFail(
+            report_pipe[1],
+            .recursive_bind,
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+    };
+    switch (linux.errno(linux.move_mount(
+        source_tree,
+        "",
+        target_fd,
+        "",
+        descriptor_move,
+    ))) {
+        .SUCCESS => {
+            closeRaw(source_tree);
+            closeRaw(target_fd);
+            root_mounted = true;
+        },
+        else => |err| {
+            closeRaw(source_tree);
+            closeRaw(target_fd);
+            namespaceFail(
+                report_pipe[1],
+                .recursive_bind,
+                @intFromEnum(err),
+                root_mounted,
+                runtime_pinned,
+            );
+        },
+    }
+    validateCallbackPaths(pinned) catch |err|
+        namespaceFail(
+            report_pipe[1],
+            stageForPathError(err),
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+    if (!parentAlive(control_pipe[0]))
+        parentDied(root_mounted, runtime_pinned);
 
     switch (linux.errno(linux.unshare(linux.CLONE.NEWPID))) {
         .SUCCESS => {},
         else => |err| {
-            unmountBestEffort();
-            childFail(pipes[1], .pid_namespace, @intFromEnum(err));
+            namespaceFail(
+                report_pipe[1],
+                .pid_namespace,
+                @intFromEnum(err),
+                root_mounted,
+                runtime_pinned,
+            );
         },
     }
 
@@ -371,33 +516,57 @@ fn supervisorMain(
     switch (linux.errno(worker_raw)) {
         .SUCCESS => {},
         else => |err| {
-            unmountBestEffort();
-            childFail(pipes[1], .workload_fork, @intFromEnum(err));
+            namespaceFail(
+                report_pipe[1],
+                .workload_fork,
+                @intFromEnum(err),
+                root_mounted,
+                runtime_pinned,
+            );
         },
     }
     const worker: i32 = @intCast(worker_raw);
-    if (worker == 0) workloadMain(request, old_mask, pipes[1]);
+    if (worker == 0)
+        workloadMain(request, old_mask, report_pipe[1], control_pipe[0], pinned);
 
-    const status = superviseWorkload(worker, request.termination_grace_ms) catch {
+    const supervised = superviseWorkload(
+        worker,
+        request.termination_grace_ms,
+        control_pipe[0],
+    ) catch {
         _ = linux.kill(worker, .KILL);
-        _ = reapBlocking(worker);
-        unmountBestEffort();
-        childFail(pipes[1], .cleanup, 0);
+        _ = reapBlocking(worker) catch null;
+        namespaceFail(
+            report_pipe[1],
+            .cleanup,
+            0,
+            root_mounted,
+            runtime_pinned,
+        );
     };
     // Once namespace PID 1 has exited, Linux has killed every other process in
     // that PID namespace.  No descendant can retain this mount namespace.
-    switch (linux.errno(linux.umount2(logical_root_path, linux.UMOUNT_NOFOLLOW))) {
-        .SUCCESS => mounted = false,
-        else => |err| childFail(pipes[1], .cleanup, @intFromEnum(err)),
+    cleanupNamespaceStrict() catch |err|
+        childFail(report_pipe[1], .cleanup, errorNumber(err));
+    closeRaw(control_pipe[0]);
+    if (supervised.parent_died) {
+        closeRaw(report_pipe[1]);
+        linux.exit_group(125);
     }
-    if (mounted) unmountBestEffort();
-    validateMountpoint(pinned) catch |err|
-        childFail(pipes[1], .mountpoint_validation, errorNumber(err));
-    closeRaw(pipes[1]);
-    exitStatus(status);
+    closeRaw(report_pipe[1]);
+    exitStatus(supervised.status);
 }
 
-fn workloadMain(request: Request, old_mask: linux.sigset_t, report_fd: i32) noreturn {
+fn workloadMain(
+    request: Request,
+    old_mask: linux.sigset_t,
+    report_fd: i32,
+    control_fd: i32,
+    pinned: PinnedPaths,
+) noreturn {
+    closeRaw(control_fd);
+    var inherited = pinned;
+    inherited.close();
     _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
     resetInterruptActions();
     const code = request.child(request.context, logical_root_path) catch
@@ -415,24 +584,135 @@ fn validateSource(pinned: PinnedPaths) Error!void {
         return error.RootReplaced;
 }
 
-fn validateMountpoint(pinned: PinnedPaths) Error!void {
-    const descriptor = try identityOf(pinned.mountpoint_fd);
-    const named = try identityAt(pinned.runtime_fd, "system-root");
-    if (!descriptor.eql(pinned.mountpoint) or !named.eql(pinned.mountpoint))
+fn validateUnpinnedPaths(pinned: PinnedPaths) Error!void {
+    const runtime = try identityAbsolute(runtime_directory_path);
+    if (!runtime.eql(pinned.runtime)) return error.RuntimeReplaced;
+    const lock = try identityAbsolute(lock_path);
+    if (!lock.eql(pinned.lock)) return error.LockReplaced;
+    const mountpoint = try identityAbsolute(logical_root_path);
+    if (!mountpoint.eql(pinned.mountpoint)) return error.MountpointReplaced;
+}
+
+fn validatePinnedRuntime(pinned: PinnedPaths) Error!void {
+    const runtime = try identityAbsolute(runtime_directory_path);
+    if (!runtime.samePinnedEntry(pinned.runtime) or
+        runtime.mount_id == pinned.runtime.mount_id)
+        return error.RuntimeReplaced;
+    const lock = try identityAbsolute(lock_path);
+    if (!lock.samePinnedEntry(pinned.lock) or
+        lock.link_count != 1 or lock.mount_id != runtime.mount_id)
+        return error.LockReplaced;
+    const mountpoint = try identityAbsolute(logical_root_path);
+    if (!mountpoint.samePinnedEntry(pinned.mountpoint) or
+        mountpoint.mount_id != runtime.mount_id)
         return error.MountpointReplaced;
 }
 
-fn validateBind(pinned: PinnedPaths) Error!void {
+fn validateCallbackPaths(pinned: PinnedPaths) Error!void {
     try validateSource(pinned);
-    const mounted_fd = try openDirectoryAbsolute(logical_root_path);
-    defer _ = linux.close(mounted_fd);
-    const mounted = try identityOf(mounted_fd);
-    if (!mounted.sameEntry(pinned.source) or mounted.mount_id == pinned.source.mount_id)
+    const runtime = try identityAbsolute(runtime_directory_path);
+    if (!runtime.samePinnedEntry(pinned.runtime) or
+        runtime.mount_id == pinned.runtime.mount_id)
+        return error.RuntimeReplaced;
+    const lock = try identityAbsolute(lock_path);
+    if (!lock.samePinnedEntry(pinned.lock) or
+        lock.link_count != 1 or lock.mount_id != runtime.mount_id)
+        return error.LockReplaced;
+    const mounted = try identityAbsolute(logical_root_path);
+    if (!mounted.samePinnedEntry(pinned.source) or
+        mounted.mount_id == pinned.source.mount_id or
+        mounted.mount_id == runtime.mount_id)
         return error.RootReplaced;
 }
 
-fn unmountBestEffort() void {
-    _ = linux.umount2(logical_root_path, linux.MNT.DETACH | linux.UMOUNT_NOFOLLOW);
+fn identityAbsolute(path: [*:0]const u8) Error!Identity {
+    return identityAt(linux.AT.FDCWD, path);
+}
+
+const open_tree_clone: u32 = 1;
+const open_tree_cloexec: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
+
+fn openTreeClone(fd: i32, recursive: bool) Error!i32 {
+    const flags = open_tree_clone | open_tree_cloexec | linux.AT.EMPTY_PATH |
+        @as(u32, if (recursive) linux.AT.RECURSIVE else 0);
+    const raw = linux.syscall3(
+        .open_tree,
+        @bitCast(@as(isize, fd)),
+        @intFromPtr(@as([*:0]const u8, "")),
+        flags,
+    );
+    return fdResult(raw);
+}
+
+const descriptor_move: linux.MOVE_MOUNT = .{
+    .F_SYMLINKS = false,
+    .F_AUTOMOUNTS = false,
+    .F_EMPTY_PATH = true,
+    ._8 = false,
+    .T_SYMLINKS = false,
+    .T_AUTOMOUNTS = false,
+    .T_EMPTY_PATH = true,
+    ._80 = false,
+    .SET_GROUP = false,
+};
+
+fn cleanupNamespaceStrict() Error!void {
+    switch (linux.errno(linux.umount2(logical_root_path, linux.UMOUNT_NOFOLLOW))) {
+        .SUCCESS => {},
+        else => return error.SystemCallFailed,
+    }
+    switch (linux.errno(linux.umount2(runtime_directory_path, linux.UMOUNT_NOFOLLOW))) {
+        .SUCCESS => {},
+        else => return error.SystemCallFailed,
+    }
+}
+
+fn cleanupNamespaceBestEffort(root_mounted: bool, runtime_pinned: bool) void {
+    if (root_mounted)
+        _ = linux.umount2(
+            logical_root_path,
+            linux.MNT.DETACH | linux.UMOUNT_NOFOLLOW,
+        );
+    if (runtime_pinned)
+        _ = linux.umount2(
+            runtime_directory_path,
+            linux.MNT.DETACH | linux.UMOUNT_NOFOLLOW,
+        );
+}
+
+fn namespaceFail(
+    report_fd: i32,
+    stage: SetupStage,
+    errno: u32,
+    root_mounted: bool,
+    runtime_pinned: bool,
+) noreturn {
+    cleanupNamespaceBestEffort(root_mounted, runtime_pinned);
+    childFail(report_fd, stage, errno);
+}
+
+fn parentDied(root_mounted: bool, runtime_pinned: bool) noreturn {
+    cleanupNamespaceBestEffort(root_mounted, runtime_pinned);
+    linux.exit_group(125);
+}
+
+fn stageForPathError(err: anyerror) SetupStage {
+    return switch (err) {
+        error.RuntimeReplaced => .runtime_validation,
+        error.LockReplaced, error.UnsafeLockFile => .lock_validation,
+        error.MountpointReplaced, error.UnsafeMountpoint, error.ActiveHostMount => .mountpoint_validation,
+        error.RootReplaced => .bind_validation,
+        else => .runtime_validation,
+    };
+}
+
+fn ignoreBrokenPipe() void {
+    const action: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = linux.sigaction(.PIPE, &action, null);
 }
 
 fn interruptSet() linux.sigset_t {
@@ -475,7 +755,12 @@ fn superviseProcess(pid: i32, signal_fd: i32, grace_ms: u64) Error!WaitResult {
     return .{ .status = try reapBlocking(pid), .interrupt = interrupt };
 }
 
-fn superviseWorkload(pid: i32, grace_ms: u64) Error!u32 {
+const WorkloadResult = struct {
+    status: u32,
+    parent_died: bool,
+};
+
+fn superviseWorkload(pid: i32, grace_ms: u64, control_fd: i32) Error!WorkloadResult {
     var watched = interruptSet();
     const signal_fd_raw = linux.signalfd(
         -1,
@@ -487,13 +772,36 @@ fn superviseWorkload(pid: i32, grace_ms: u64) Error!u32 {
     defer _ = linux.close(signal_fd);
 
     while (!probeExited(pid)) {
+        if (!parentAlive(control_fd)) {
+            _ = linux.kill(pid, .KILL);
+            return .{
+                .status = try reapBlocking(pid),
+                .parent_died = true,
+            };
+        }
         if (readSignal(signal_fd)) |signal| {
             _ = linux.kill(pid, signal);
             if (!awaitExit(pid, grace_ms)) _ = linux.kill(pid, .KILL);
         }
         sleepMilliseconds(5);
     }
-    return reapBlocking(pid);
+    return .{
+        .status = try reapBlocking(pid),
+        .parent_died = false,
+    };
+}
+
+fn parentAlive(control_fd: i32) bool {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const raw = linux.read(control_fd, &byte, byte.len);
+        switch (linux.errno(raw)) {
+            .SUCCESS => return raw != 0,
+            .AGAIN => return true,
+            .INTR => continue,
+            else => return false,
+        }
+    }
 }
 
 fn readSignal(fd: i32) ?linux.SIG {
@@ -554,7 +862,7 @@ fn exitStatus(status: u32) noreturn {
     if (linux.W.IFSIGNALED(status)) {
         const signal = linux.W.TERMSIG(status);
         _ = linux.kill(linux.getpid(), signal);
-        linux.exit_group(128 + @intFromEnum(signal));
+        linux.exit_group(@intCast(128 + @intFromEnum(signal)));
     }
     linux.exit_group(125);
 }
@@ -626,25 +934,34 @@ fn closeRaw(fd: i32) void {
 // every cleanup edge can be tested without privilege.
 fn enter(operations: anytype) !void {
     try operations.validateSource();
-    try operations.validateMountpoint();
+    try operations.validateUnpinnedPaths();
     try operations.unshareMount();
     try operations.makePrivate();
     try operations.validateSource();
-    try operations.validateMountpoint();
-    try operations.recursiveBind();
-    errdefer operations.unmount();
-    try operations.validateBind();
+    try operations.validateUnpinnedPaths();
+    try operations.pinRuntime();
+    errdefer operations.unpinRuntime();
+    try operations.validatePinnedRuntime();
+    try operations.attachRoot();
+    errdefer operations.unmountRoot();
+    try operations.validateCallbackPaths();
 }
 
 const Event = enum {
     source,
+    runtime,
+    lock,
     mountpoint,
     unshare,
     private,
-    bind,
-    bind_validation,
+    runtime_pin,
+    attach_root,
+    callback_validation,
     child,
-    unmount,
+    unmount_root,
+    unpin_runtime,
+    parent_eof,
+    unlock,
     signal,
     kill,
     reap,
@@ -656,9 +973,11 @@ const RecordingOperations = struct {
     calls: usize = 0,
     fail_call: ?usize = null,
     replace_root_on_source_call: ?usize = null,
-    replace_mountpoint_on_call: ?usize = null,
+    replace_runtime_on_check: ?usize = null,
+    replace_lock_on_check: ?usize = null,
+    replace_mountpoint_on_check: ?usize = null,
     source_calls: usize = 0,
-    mountpoint_calls: usize = 0,
+    path_checks: usize = 0,
     fail_child: bool = false,
 
     fn record(self: *RecordingOperations, event: Event) !void {
@@ -675,11 +994,30 @@ const RecordingOperations = struct {
             return error.RootReplaced;
     }
 
-    fn validateMountpoint(self: *RecordingOperations) !void {
+    fn validatePaths(self: *RecordingOperations, callback: bool) !void {
+        self.path_checks += 1;
+        try self.record(.runtime);
+        if (self.replace_runtime_on_check == self.path_checks)
+            return error.RuntimeReplaced;
+        try self.record(.lock);
+        if (self.replace_lock_on_check == self.path_checks)
+            return error.LockReplaced;
         try self.record(.mountpoint);
-        self.mountpoint_calls += 1;
-        if (self.replace_mountpoint_on_call == self.mountpoint_calls)
+        if (self.replace_mountpoint_on_check == self.path_checks)
             return error.MountpointReplaced;
+        if (callback) try self.record(.callback_validation);
+    }
+
+    fn validateUnpinnedPaths(self: *RecordingOperations) !void {
+        try self.validatePaths(false);
+    }
+
+    fn validatePinnedRuntime(self: *RecordingOperations) !void {
+        try self.validatePaths(false);
+    }
+
+    fn validateCallbackPaths(self: *RecordingOperations) !void {
+        try self.validatePaths(true);
     }
 
     fn unshareMount(self: *RecordingOperations) !void {
@@ -690,12 +1028,12 @@ const RecordingOperations = struct {
         try self.record(.private);
     }
 
-    fn recursiveBind(self: *RecordingOperations) !void {
-        try self.record(.bind);
+    fn pinRuntime(self: *RecordingOperations) !void {
+        try self.record(.runtime_pin);
     }
 
-    fn validateBind(self: *RecordingOperations) !void {
-        try self.record(.bind_validation);
+    fn attachRoot(self: *RecordingOperations) !void {
+        try self.record(.attach_root);
     }
 
     fn runChild(self: *RecordingOperations) !u8 {
@@ -704,8 +1042,13 @@ const RecordingOperations = struct {
         return 0;
     }
 
-    fn unmount(self: *RecordingOperations) void {
-        self.events[self.event_count] = .unmount;
+    fn unmountRoot(self: *RecordingOperations) void {
+        self.events[self.event_count] = .unmount_root;
+        self.event_count += 1;
+    }
+
+    fn unpinRuntime(self: *RecordingOperations) void {
+        self.events[self.event_count] = .unpin_runtime;
         self.event_count += 1;
     }
 };
@@ -716,12 +1059,15 @@ fn expectEvents(expected: []const Event, operations: *const RecordingOperations)
 
 fn exerciseLifecycle(operations: anytype) !u8 {
     try enter(operations);
-    defer operations.unmount();
+    defer {
+        operations.unmountRoot();
+        operations.unpinRuntime();
+    }
     return operations.runChild();
 }
 
 const RecordingSupervisor = struct {
-    events: [4]Event = undefined,
+    events: [8]Event = undefined,
     count: usize = 0,
     exits_during_grace: bool = false,
 
@@ -745,12 +1091,37 @@ const RecordingSupervisor = struct {
     fn reap(self: *RecordingSupervisor) void {
         self.append(.reap);
     }
+
+    fn parentEof(self: *RecordingSupervisor) void {
+        self.append(.parent_eof);
+    }
+
+    fn unmountRoot(self: *RecordingSupervisor) void {
+        self.append(.unmount_root);
+    }
+
+    fn unpinRuntime(self: *RecordingSupervisor) void {
+        self.append(.unpin_runtime);
+    }
+
+    fn unlock(self: *RecordingSupervisor) void {
+        self.append(.unlock);
+    }
 };
 
 fn finishInterrupted(operations: anytype) void {
     operations.signal();
     if (!operations.awaitExit()) operations.kill();
     operations.reap();
+}
+
+fn finishParentDeath(operations: anytype) void {
+    operations.parentEof();
+    operations.kill();
+    operations.reap();
+    operations.unmountRoot();
+    operations.unpinRuntime();
+    operations.unlock();
 }
 
 test "live_root.test.stable alternate root never aliases host root" {
@@ -818,40 +1189,73 @@ test "live_root.test.namespace setup ordering is fixed" {
     try expectEvents(
         &.{
             .source,
+            .runtime,
+            .lock,
             .mountpoint,
             .unshare,
             .private,
             .source,
+            .runtime,
+            .lock,
             .mountpoint,
-            .bind,
-            .bind_validation,
+            .runtime_pin,
+            .runtime,
+            .lock,
+            .mountpoint,
+            .attach_root,
+            .runtime,
+            .lock,
+            .mountpoint,
+            .callback_validation,
         },
         &operations,
     );
 }
 
 test "live_root.test.cleanup covers every setup failure boundary" {
-    // Failures through bind itself have no successful mount to remove.
-    for (1..9) |failure| {
+    for (1..20) |failure| {
         var operations: RecordingOperations = .{ .fail_call = failure };
         try std.testing.expectError(error.Injected, enter(&operations));
-        const should_unmount = failure == 8;
-        try std.testing.expectEqual(
-            should_unmount,
-            operations.event_count != 0 and
-                operations.events[operations.event_count - 1] == .unmount,
-        );
+        if (failure >= 16) {
+            try std.testing.expectEqual(
+                Event.unmount_root,
+                operations.events[operations.event_count - 2],
+            );
+            try std.testing.expectEqual(
+                Event.unpin_runtime,
+                operations.events[operations.event_count - 1],
+            );
+        } else if (failure >= 12) {
+            try std.testing.expectEqual(
+                Event.unpin_runtime,
+                operations.events[operations.event_count - 1],
+            );
+        }
     }
 }
 
 test "live_root.test.normal and callback exits both unmount" {
     var success: RecordingOperations = .{};
     try std.testing.expectEqual(@as(u8, 0), try exerciseLifecycle(&success));
-    try std.testing.expectEqual(Event.unmount, success.events[success.event_count - 1]);
+    try std.testing.expectEqual(
+        Event.unmount_root,
+        success.events[success.event_count - 2],
+    );
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        success.events[success.event_count - 1],
+    );
 
     var failure: RecordingOperations = .{ .fail_child = true };
     try std.testing.expectError(error.ChildFailed, exerciseLifecycle(&failure));
-    try std.testing.expectEqual(Event.unmount, failure.events[failure.event_count - 1]);
+    try std.testing.expectEqual(
+        Event.unmount_root,
+        failure.events[failure.event_count - 2],
+    );
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        failure.events[failure.event_count - 1],
+    );
 }
 
 test "live_root.test.root replacement fails before mounting" {
@@ -862,21 +1266,51 @@ test "live_root.test.root replacement fails before mounting" {
     var after_unshare: RecordingOperations = .{ .replace_root_on_source_call = 2 };
     try std.testing.expectError(error.RootReplaced, enter(&after_unshare));
     try expectEvents(
-        &.{ .source, .mountpoint, .unshare, .private, .source },
+        &.{ .source, .runtime, .lock, .mountpoint, .unshare, .private, .source },
         &after_unshare,
     );
 }
 
-test "live_root.test.mountpoint replacement fails before mounting" {
-    var operations: RecordingOperations = .{ .replace_mountpoint_on_call = 1 };
-    try std.testing.expectError(error.MountpointReplaced, enter(&operations));
-    try expectEvents(&.{ .source, .mountpoint }, &operations);
+test "live_root.test.runtime replacement fails across attach and callback boundaries" {
+    var before_attach: RecordingOperations = .{ .replace_runtime_on_check = 3 };
+    try std.testing.expectError(error.RuntimeReplaced, enter(&before_attach));
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        before_attach.events[before_attach.event_count - 1],
+    );
 
-    var after_unshare: RecordingOperations = .{ .replace_mountpoint_on_call = 2 };
-    try std.testing.expectError(error.MountpointReplaced, enter(&after_unshare));
-    try expectEvents(
-        &.{ .source, .mountpoint, .unshare, .private, .source, .mountpoint },
-        &after_unshare,
+    var before_callback: RecordingOperations = .{ .replace_runtime_on_check = 4 };
+    try std.testing.expectError(error.RuntimeReplaced, enter(&before_callback));
+    try std.testing.expectEqual(
+        Event.unmount_root,
+        before_callback.events[before_callback.event_count - 2],
+    );
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        before_callback.events[before_callback.event_count - 1],
+    );
+}
+
+test "live_root.test.mountpoint replacement fails across attach and callback boundaries" {
+    var operations: RecordingOperations = .{ .replace_mountpoint_on_check = 1 };
+    try std.testing.expectError(error.MountpointReplaced, enter(&operations));
+
+    var before_attach: RecordingOperations = .{ .replace_mountpoint_on_check = 3 };
+    try std.testing.expectError(error.MountpointReplaced, enter(&before_attach));
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        before_attach.events[before_attach.event_count - 1],
+    );
+
+    var before_callback: RecordingOperations = .{ .replace_mountpoint_on_check = 4 };
+    try std.testing.expectError(error.MountpointReplaced, enter(&before_callback));
+    try std.testing.expectEqual(
+        Event.unmount_root,
+        before_callback.events[before_callback.event_count - 2],
+    );
+    try std.testing.expectEqual(
+        Event.unpin_runtime,
+        before_callback.events[before_callback.event_count - 1],
     );
 }
 
@@ -898,20 +1332,190 @@ test "live_root.test.interruption orders signal kill and reap" {
     );
 }
 
+test "live_root.test.parent EOF kills and reaps before mount and lock cleanup" {
+    var operations: RecordingSupervisor = .{};
+    finishParentDeath(&operations);
+    try std.testing.expectEqualSlices(
+        Event,
+        &.{
+            .parent_eof,
+            .kill,
+            .reap,
+            .unmount_root,
+            .unpin_runtime,
+            .unlock,
+        },
+        operations.events[0..operations.count],
+    );
+}
+
+test "live_root.test.control pipe EOF detects parent death without a signal race" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var control: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&control, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer {
+        closeFd(&control[0]);
+        closeFd(&control[1]);
+    }
+    try std.testing.expect(parentAlive(control[0]));
+    closeFd(&control[1]);
+    try std.testing.expect(!parentAlive(control[0]));
+}
+
 fn integrationChild(_: ?*anyopaque, install_root: []const u8) anyerror!u8 {
     if (!std.mem.eql(u8, install_root, logical_root_path)) return error.BadRoot;
     return 0;
 }
 
-test "live_root.test.linux integration when namespace capabilities are available" {
-    if (builtin.os.tag != .linux or linux.geteuid() != 0) return error.SkipZigTest;
-    const result = try run(.{ .child = integrationChild });
+fn expectIntegrationAvailable(result: Result) !void {
     switch (result) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         .setup_failed => |failure| switch (failure.stage) {
-            .mount_namespace, .private_propagation, .pid_namespace => return error.SkipZigTest,
+            .mount_namespace,
+            .private_propagation,
+            .runtime_pin,
+            .recursive_bind,
+            .pid_namespace,
+            => return error.SkipZigTest,
             else => return error.UnexpectedIntegrationFailure,
         },
         else => return error.UnexpectedIntegrationFailure,
     }
+}
+
+test "live_root.test.linux integration when namespace capabilities are available" {
+    if (builtin.os.tag != .linux or linux.geteuid() != 0) return error.SkipZigTest;
+    try expectIntegrationAvailable(try run(.{ .child = integrationChild }));
+}
+
+const ParentDeathContext = struct {
+    ready_fd: i32,
+    lifetime_fd: i32,
+};
+
+fn parentDeathChild(raw: ?*anyopaque, install_root: []const u8) anyerror!u8 {
+    if (!std.mem.eql(u8, install_root, logical_root_path)) return error.BadRoot;
+    const context: *ParentDeathContext = @ptrCast(@alignCast(raw.?));
+    var byte: [1]u8 = .{1};
+    if (linux.errno(linux.write(context.ready_fd, &byte, byte.len)) != .SUCCESS)
+        return error.ReadyFailed;
+    _ = context.lifetime_fd;
+    while (true) sleepMilliseconds(1_000);
+}
+
+test "live_root.test.parent death terminates workload and releases lock" {
+    if (builtin.os.tag != .linux or linux.geteuid() != 0) return error.SkipZigTest;
+    try expectIntegrationAvailable(try run(.{ .child = integrationChild }));
+
+    var ready: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer {
+        closeFd(&ready[0]);
+        closeFd(&ready[1]);
+    }
+    var lifetime: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.pipe2(&lifetime, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    defer {
+        closeFd(&lifetime[0]);
+        closeFd(&lifetime[1]);
+    }
+
+    const parent_raw = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(parent_raw));
+    const parent: i32 = @intCast(parent_raw);
+    if (parent == 0) {
+        closeRaw(ready[0]);
+        closeRaw(lifetime[0]);
+        var context: ParentDeathContext = .{
+            .ready_fd = ready[1],
+            .lifetime_fd = lifetime[1],
+        };
+        const result = run(.{
+            .context = &context,
+            .child = parentDeathChild,
+            .termination_grace_ms = 50,
+        }) catch linux.exit_group(120);
+        switch (result) {
+            .exited => |code| linux.exit_group(code),
+            else => linux.exit_group(121),
+        }
+    }
+
+    closeFd(&ready[1]);
+    closeFd(&lifetime[1]);
+    var parent_live = true;
+    defer if (parent_live) {
+        _ = linux.kill(parent, .KILL);
+        _ = reapBlocking(parent) catch null;
+    };
+    try std.testing.expect(try waitForPipeByte(ready[0], 5_000));
+    _ = linux.kill(parent, .KILL);
+    _ = try reapBlocking(parent);
+    parent_live = false;
+
+    try std.testing.expect(try waitForPipeEof(lifetime[0], 5_000));
+    try std.testing.expect(try waitForLockRelease(5_000));
+}
+
+fn waitForPipeByte(fd: i32, timeout_ms: u64) !bool {
+    const deadline = monotonicMilliseconds() + timeout_ms;
+    var byte: [1]u8 = undefined;
+    while (monotonicMilliseconds() < deadline) {
+        const raw = linux.read(fd, &byte, byte.len);
+        switch (linux.errno(raw)) {
+            .SUCCESS => return raw == 1,
+            .AGAIN => sleepMilliseconds(5),
+            .INTR => continue,
+            else => return error.PipeReadFailed,
+        }
+    }
+    return false;
+}
+
+fn waitForPipeEof(fd: i32, timeout_ms: u64) !bool {
+    const deadline = monotonicMilliseconds() + timeout_ms;
+    var byte: [1]u8 = undefined;
+    while (monotonicMilliseconds() < deadline) {
+        const raw = linux.read(fd, &byte, byte.len);
+        switch (linux.errno(raw)) {
+            .SUCCESS => if (raw == 0) return true,
+            .AGAIN => sleepMilliseconds(5),
+            .INTR => continue,
+            else => return error.PipeReadFailed,
+        }
+    }
+    return false;
+}
+
+fn waitForLockRelease(timeout_ms: u64) !bool {
+    const deadline = monotonicMilliseconds() + timeout_ms;
+    while (monotonicMilliseconds() < deadline) {
+        const runtime_fd = openDirectoryAbsolute(runtime_directory_path) catch {
+            sleepMilliseconds(5);
+            continue;
+        };
+        const lock_fd = openLock(runtime_fd) catch {
+            closeRaw(runtime_fd);
+            sleepMilliseconds(5);
+            continue;
+        };
+        const result = linux.errno(linux.flock(lock_fd, 2 | 4));
+        closeRaw(lock_fd);
+        closeRaw(runtime_fd);
+        switch (result) {
+            .SUCCESS => return true,
+            .AGAIN => sleepMilliseconds(5),
+            else => return error.LockProbeFailed,
+        }
+    }
+    return false;
 }

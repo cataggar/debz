@@ -312,6 +312,13 @@ pub fn build(b: *std.Build) void {
     const run_root_operation_tests = b.addRunArtifact(root_operation_tests);
     b.step("test-root-operation", "Run live-root, root operation, and root filesystem tests")
         .dependOn(&run_root_operation_tests.step);
+    const live_root_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"live_root.test."},
+    });
+    const run_live_root_tests = b.addRunArtifact(live_root_tests);
+    b.step("test-live-root", "Run private live-root supervisor tests")
+        .dependOn(&run_live_root_tests.step);
 
     const package_database_tests = b.addTest(.{
         .root_module = debz,
