@@ -751,10 +751,24 @@ fn stickyCompletion(
 }
 
 fn validDiagnostic(value: []const u8) bool {
-    if (!std.unicode.utf8ValidateSlice(value)) return false;
-    const characters = std.unicode.utf8CountCodepoints(value) catch return false;
-    if (characters > api.maximum_summary_characters) return false;
-    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    const maximum = api.maximum_summary_characters;
+    const maximum_bytes = std.math.mul(usize, maximum, 4) catch return false;
+    if (value.len > maximum_bytes) return false;
+    var index: usize = 0;
+    var characters: usize = 0;
+    while (index < value.len) {
+        const sequence_length: usize = std.unicode.utf8ByteSequenceLength(
+            value[index],
+        ) catch return false;
+        if (sequence_length > value.len - index) return false;
+        const codepoint = std.unicode.utf8Decode(
+            value[index..][0..sequence_length],
+        ) catch return false;
+        characters += 1;
+        if (characters > maximum) return false;
+        if (codepoint < 0x20 or codepoint == 0x7f) return false;
+        index += sequence_length;
+    }
     return true;
 }
 
@@ -1105,6 +1119,35 @@ test "apt_system_state.test.phase and mutation evidence are strictly coupled" {
     update.mutation_started = false;
     update.diagnostic = "";
     try validate(update);
+}
+
+test "apt_system_state.test.diagnostics reject bounded oversized text" {
+    const ascii = try std.testing.allocator.alloc(
+        u8,
+        api.maximum_summary_characters + 1,
+    );
+    defer std.testing.allocator.free(ascii);
+    @memset(ascii, 'a');
+    try std.testing.expect(!validDiagnostic(ascii));
+
+    const unicode = try std.testing.allocator.alloc(
+        u8,
+        (api.maximum_summary_characters + 1) * 2,
+    );
+    defer std.testing.allocator.free(unicode);
+    for (0..api.maximum_summary_characters + 1) |index| {
+        unicode[index * 2] = 0xc3;
+        unicode[index * 2 + 1] = 0xa9;
+    }
+    try std.testing.expect(!validDiagnostic(unicode));
+
+    const over_byte_bound = try std.testing.allocator.alloc(
+        u8,
+        api.maximum_summary_characters * 4 + 1,
+    );
+    defer std.testing.allocator.free(over_byte_bound);
+    @memset(over_byte_bound, 'a');
+    try std.testing.expect(!validDiagnostic(over_byte_bound));
 }
 
 test "apt_system_state.test.transitions are monotonic and evidence is sticky" {

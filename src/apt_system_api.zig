@@ -253,7 +253,7 @@ pub fn failure(
     id: DiagnosticId,
     phase: []const u8,
     message: []const u8,
-) Result {
+) !Result {
     var result: Result = .{
         .operation = request.operation,
         .request_sha256 = requestDigestUnchecked(request),
@@ -269,8 +269,7 @@ pub fn failure(
         .phase = phase,
         .message = message,
     };
-    result.digest_sha256 = digestPayload(result);
-    return result;
+    return complete(result);
 }
 
 pub fn ownResult(
@@ -419,12 +418,31 @@ fn validPackage(package: []const u8) bool {
 }
 
 fn validText(text: []const u8, maximum: usize) bool {
-    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text))
-        return false;
-    const characters = std.unicode.utf8CountCodepoints(text) catch return false;
-    if (characters > maximum) return false;
-    for (text) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    validateBoundedText(text, maximum) catch return false;
     return true;
+}
+
+fn validateBoundedText(text: []const u8, maximum: usize) !void {
+    if (text.len == 0) return error.EmptyText;
+    const maximum_bytes = std.math.mul(usize, maximum, 4) catch
+        return error.TextTooLong;
+    if (text.len > maximum_bytes) return error.TextTooLong;
+    var index: usize = 0;
+    var characters: usize = 0;
+    while (index < text.len) {
+        const sequence_length: usize = std.unicode.utf8ByteSequenceLength(
+            text[index],
+        ) catch return error.InvalidUtf8;
+        if (sequence_length > text.len - index) return error.InvalidUtf8;
+        const codepoint = std.unicode.utf8Decode(
+            text[index..][0..sequence_length],
+        ) catch return error.InvalidUtf8;
+        characters += 1;
+        if (characters > maximum) return error.TextTooLong;
+        if (codepoint < 0x20 or codepoint == 0x7f)
+            return error.ControlCharacter;
+        index += sequence_length;
+    }
 }
 
 fn digestPayload(result: Result) [32]u8 {
@@ -689,7 +707,7 @@ test "apt_system_api.test.facade rejects unsupported package shapes before backe
         fn run(context: *anyopaque, _: std.mem.Allocator, request: Request) !Result {
             const value: *bool = @ptrCast(@alignCast(context));
             value.* = true;
-            return failure(request, .internal, .internal_error, "test", "called");
+            return try failure(request, .internal, .internal_error, "test", "called");
         }
     };
     const result = try execute(std.testing.allocator, .{
@@ -719,7 +737,7 @@ test "apt_system_api.test.backend results bind the exact submitted request" {
         .assume_yes = true,
     };
 
-    var stale = failure(
+    var stale = try failure(
         previous,
         .planning,
         .planning_failed,
@@ -734,7 +752,7 @@ test "apt_system_api.test.backend results bind the exact submitted request" {
         }),
     );
 
-    var wrong_operation = failure(
+    var wrong_operation = try failure(
         request,
         .planning,
         .planning_failed,
@@ -751,7 +769,7 @@ test "apt_system_api.test.backend results bind the exact submitted request" {
         }),
     );
 
-    var wrong_digest = failure(
+    var wrong_digest = try failure(
         request,
         .planning,
         .planning_failed,
@@ -783,7 +801,7 @@ test "apt_system_api.test.backend results bind the exact submitted request" {
         }),
     );
 
-    var valid_failure = failure(
+    var valid_failure = try failure(
         request,
         .planning,
         .planning_failed,
@@ -831,7 +849,7 @@ test "apt_system_api.test.runtime rejects exit and diagnostic outcome mismatches
         .operation = .install,
         .packages = &.{"curl"},
     };
-    var result = failure(
+    var result = try failure(
         request,
         .planning,
         .planning_failed,
@@ -857,7 +875,27 @@ test "apt_system_api.test.invalid UTF-8 cannot be completed executed or serializ
         .packages = &.{"curl"},
     };
     const invalid_utf8 = [_]u8{0xff};
-    var result = failure(
+    try std.testing.expectError(
+        error.InvalidSummary,
+        failure(
+            request,
+            .planning,
+            .planning_failed,
+            "planning",
+            &invalid_utf8,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidDiagnostic,
+        failure(
+            request,
+            .planning,
+            .planning_failed,
+            &invalid_utf8,
+            "planning failed",
+        ),
+    );
+    var result = try failure(
         request,
         .planning,
         .planning_failed,
@@ -899,7 +937,7 @@ test "apt_system_api.test.summary limits count Unicode characters" {
         valid[index * 2] = 0xc3;
         valid[index * 2 + 1] = 0xa9;
     }
-    var result = failure(
+    var result = try failure(
         request,
         .planning,
         .planning_failed,
@@ -919,6 +957,48 @@ test "apt_system_api.test.summary limits count Unicode characters" {
     too_long[valid.len + 1] = 0xa9;
     result.summary = too_long;
     try std.testing.expectError(error.InvalidSummary, validateResult(result));
+
+    const ascii_too_long = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters + 1,
+    );
+    defer std.testing.allocator.free(ascii_too_long);
+    @memset(ascii_too_long, 'a');
+    try std.testing.expectError(
+        error.InvalidSummary,
+        failure(
+            request,
+            .planning,
+            .planning_failed,
+            "planning",
+            ascii_too_long,
+        ),
+    );
+}
+
+test "apt_system_api.test.text validation stops at bounded limits" {
+    const over_byte_bound = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters * 4 + 1,
+    );
+    defer std.testing.allocator.free(over_byte_bound);
+    @memset(over_byte_bound, 'a');
+    try std.testing.expectError(
+        error.TextTooLong,
+        validateBoundedText(over_byte_bound, maximum_summary_characters),
+    );
+
+    const over_character_bound = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters + 2,
+    );
+    defer std.testing.allocator.free(over_character_bound);
+    @memset(over_character_bound, 'a');
+    over_character_bound[over_character_bound.len - 1] = 0xff;
+    try std.testing.expectError(
+        error.TextTooLong,
+        validateBoundedText(over_character_bound, maximum_summary_characters),
+    );
 }
 
 test "apt_system_api.test.result schema matches enums and absolute paths" {
