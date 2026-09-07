@@ -309,7 +309,7 @@ or linked is still `external_modification` and still becomes
 | `set_metadata`, and `create_directory` on an existing directory | the bound inode with the ordered metadata chain below | the step's metadata boundary |
 | `create_directory` over nothing or over a non-directory | an **empty** directory whose mode and ownership are whatever `mkdir` produced under the caller's umask and the parent's set-group-ID bit | the step's publication and metadata boundaries |
 | a transition that crosses the directory boundary in either direction | the path momentarily **empty**, between the removal and the creation that replaces it | the step's publication boundary, and the whole restoration |
-| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the bound one | the restoration |
+| while restoring: a recorded directory | an **empty** directory it re-created from the journal, on a different inode from the bound one or where the journal records that this step already removed the recorded one | the restoration |
 | while restoring: a recorded symbolic link | the exact recorded target on a fresh inode whose timestamp has not been written back yet | the restoration |
 
 ### Several steps on one path
@@ -406,13 +406,30 @@ writes back to the recorded old metadata from every member adds nothing new,
 because every restored state already carries the recorded ownership and so can
 issue no further `chown`.
 
+The chain is one member of the set rather than the whole of it, so a state it
+refuses is still offered to the rest. That matters wherever the bound number
+survives a re-creation: a symbolic link restored from the journal onto a reused
+inode number holds the recorded target with its timestamp still owed, which is
+the recorded old state part way through being republished and not a metadata
+combination any in-place write could have produced.
+
 A directory is only accepted as the transaction's own creation while it is
 still empty, which is exactly the condition under which removing it restores
 the recorded absence; a directory that has gained an entry is refused and
 becomes `recovery_required`. While restoring, a re-created directory is
-recognized by being a *different* inode from the bound one, which is evidence
-only when an inode is actually bound: a recorded directory nothing bound an
-inode to admits no directory at all, because "different from nothing" would
+recognized by evidence that the entry the bound inode named is no longer at
+the path: either the directory carries a *different* inode, or the journal
+itself records that this step already replaced the recorded directory, or is
+inside the publication boundary that removes it. Both are the same statement,
+and the second is the one a filesystem that reuses inode numbers needs —
+`ext4` hands a just-freed number straight back out, so the directory a
+restoration re-creates a moment after removing the file that replaced it very
+often carries the recorded number again, and requiring a difference would wedge
+an ordinary rollback on the transaction's own work. It reaches no further: it
+is admitted only on a step whose own transition crosses the directory boundary
+and therefore re-creates one, and only while the directory is still empty.
+Either way an inode must actually be bound: a recorded directory nothing bound
+an inode to admits no directory at all, because "different from nothing" would
 accept any empty directory an outside writer left at the path. Every accepted
 intermediate is resolved by finishing or undoing the boundary that produced it
 — the writer recomputes the components that still differ from what it observes

@@ -3630,7 +3630,10 @@ fn selfProduced(
     // The bound inode is still there, so only its metadata can have moved,
     // and the ordered writes say exactly how far. Its link count may have
     // moved too, but only by the exact amount this transaction's own
-    // journaled progress accounts for.
+    // journaled progress accounts for. An inode number the filesystem handed
+    // back out after this transaction freed it is not that entry, so a
+    // metadata chain this branch refuses falls through to the states a
+    // re-creation leaves rather than ending the classification here.
     if (expected) |old| {
         if (comparableIdentity(bound, old, engine.owned.journal.device)) |identity| {
             if (found.inode == identity.inode and
@@ -3639,17 +3642,7 @@ fn selfProduced(
                 linkCountReachable(engine, step, old, identity, found.link_count, phase) and
                 identityEqual(found, old))
             {
-                const desired = switch (step.desired) {
-                    // A removal writes no metadata, so the recorded old
-                    // metadata is the only combination reachable, and that is
-                    // already `expected`.
-                    .absent => return false,
-                    .present => |value| value,
-                };
-                if (!writesMetadataInPlace(step)) return false;
-                if (!identityEqual(found, desired)) return false;
-                const set = reachableMetadata(old.kind, old.metadata, desired.metadata, phase);
-                return set.contains(found.metadata);
+                if (metadataChainReachable(step, old, found, phase)) return true;
             }
         }
     }
@@ -3674,6 +3667,22 @@ fn selfProduced(
         }
     }
     return false;
+}
+
+/// The ordered metadata writes this step can be part way through on the inode
+/// it found. A step that publishes a replacement by rename writes no metadata
+/// onto the entry it found, and a removal writes none at all, so for both the
+/// recorded old metadata is the only combination reachable and that is
+/// already `expected`.
+fn metadataChainReachable(step: Step, old: State, found: State, phase: Phase) bool {
+    if (!writesMetadataInPlace(step)) return false;
+    const desired = switch (step.desired) {
+        .absent => return false,
+        .present => |value| value,
+    };
+    if (!identityEqual(found, desired)) return false;
+    const set = reachableMetadata(old.kind, old.metadata, desired.metadata, phase);
+    return set.contains(found.metadata);
 }
 
 /// True for the steps that write metadata onto the inode they found, rather
@@ -3772,13 +3781,31 @@ fn removalReachable(engine: *const Engine, step: Step, phase: Phase) bool {
 /// publication boundary and the rewrite inside its metadata boundary - the
 /// two boundaries the journal shows are still owed. While restoring, it is
 /// additionally any step whose recorded old state is a directory the
-/// restoration has to re-create from the journal, which is provably a
-/// different inode from the one bound to that recorded state.
+/// restoration has to re-create from the journal.
 ///
 /// "Different from nothing" proves nothing, so a recorded directory no
 /// boundary has bound an inode to admits no directory at all: without a bound
 /// inode this test would accept any empty directory an outside writer left at
 /// the path, which is exactly the substitution the model exists to refuse.
+///
+/// Given a bound inode, a re-creation is proven two ways, and either is
+/// enough because both state the same thing - the entry that inode was bound
+/// to is no longer at the path:
+///
+/// - the directory holds a *different* inode from the bound one; or
+/// - the journal itself says this step already removed the recorded directory
+///   or is inside the publication boundary that removes it, so a directory at
+///   the path can only have been created after that.
+///
+/// The second is what a filesystem that reuses inode numbers needs. `ext4`
+/// hands the number of a just-freed inode straight back out, so the
+/// directory this restoration re-creates a moment after removing the file
+/// that replaced it very often *is* the recorded number again. Refusing that
+/// would wedge an ordinary rollback on the transaction's own work, and
+/// accepting it adds no reach: it is admitted only where the journal already
+/// proves the recorded entry was removed, only while the directory is still
+/// empty, and only on a step whose own transition crosses the directory
+/// boundary and therefore re-creates it.
 fn directoryCreationReachable(
     engine: *const Engine,
     step: Step,
@@ -3804,7 +3831,22 @@ fn directoryCreationReachable(
         .bound => |value| value,
         .absent, .pending, .unreported => return false,
     };
-    return found.inode != identity.inode;
+    if (found.inode != identity.inode) return true;
+    return recreatedByRestoration(engine, step);
+}
+
+/// True when the journal proves this step's own restoration is what put a
+/// directory back at the path: the step's transition crosses the directory
+/// boundary in the first place, it has not already been recorded reverted,
+/// and it has either durably published the entry that replaced the recorded
+/// directory or is inside the publication boundary that removes it.
+fn recreatedByRestoration(engine: *const Engine, step: Step) bool {
+    if (!crossesDirectoryBoundary(step)) return false;
+    if (insideBoundary(engine, step, .published)) return true;
+    if (engine.progress.stage != .rolling_back) return false;
+    const state = engine.progress.state(step.index);
+    if (state == .reverted) return false;
+    return state.rank() >= StepState.published.rank();
 }
 
 // ---------------------------------------------------------------------------
@@ -5234,6 +5276,18 @@ fn writeExisting(root: root_fs.Root, path: []const u8, bytes: []const u8) !void 
     if (resolved.parent()) |parent|
         try root.createDirectoryPath(parent, root_fs.default_directory_permissions);
     try root.publishFile(resolved, bytes, .{});
+}
+
+/// Replaces `path` with fresh content on a provably different inode: the
+/// replacement is created while the original still exists, so a filesystem
+/// that hands a just-freed inode number straight back out - `ext4` does -
+/// cannot give the two the same number.
+fn replaceOnNewInode(root: root_fs.Root, path: []const u8, bytes: []const u8) !void {
+    var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const spelling = try std.fmt.bufPrint(&buffer, "{s}.replacement", .{path});
+    const staged = try root_fs.Path.init(spelling);
+    try root.publishFile(staged, bytes, .{});
+    try root.rename(staged, try root_fs.Path.init(path), .replace);
 }
 
 fn readExisting(root: root_fs.Root, path: []const u8) ![]u8 {
@@ -8970,8 +9024,7 @@ test "root_mutation.test.a backup is attributed to the inode it actually preserv
     // does the last step's, so the backup the last step captures is a link on
     // that inode and never on the original.
     try engine.publishState(0, .published, .unbound);
-    try root.removeFile(try root_fs.Path.init("etc/tool"));
-    try writeExisting(root, "etc/tool", "one\n");
+    try replaceOnNewInode(root, "etc/tool", "one\n");
     try engine.publishState(0, .parent_synced, .unbound);
     try publishVerified(&engine, 0);
     const published = try boundPrecondition(&engine, 1);
@@ -9041,8 +9094,7 @@ test "root_mutation.test.a hard link is attributed to the inode it actually name
     try engine.publishState(0, .staged, .unbound);
     try engine.publishState(0, .backup_captured, .unbound);
     try engine.publishState(0, .published, .unbound);
-    try root.removeFile(try root_fs.Path.init("etc/tool"));
-    try writeExisting(root, "etc/tool", "one\n");
+    try replaceOnNewInode(root, "etc/tool", "one\n");
     try engine.publishState(0, .parent_synced, .unbound);
     try publishVerified(&engine, 0);
     try publishVerified(&engine, 1);
@@ -9551,7 +9603,7 @@ test "root_mutation.test.an external inode substitution is never resumed as this
     }
 }
 
-test "root_mutation.test.a restored directory is re-created on a new inode" {
+test "root_mutation.test.a restored directory is re-created, on whatever inode" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -9562,12 +9614,13 @@ test "root_mutation.test.a restored directory is re-created on a new inode" {
     );
 
     // The first step creates a directory, the second replaces it with a file.
-    // Restoring the second re-creates the directory the first published,
-    // which is provably a different inode from the one that step bound - and,
-    // without a bound inode, could not be told from any empty directory an
-    // outside writer happened to leave at the path. The restoration is
-    // interrupted after the `mkdir`, so the resumed pass has to classify
-    // exactly that re-created directory.
+    // Restoring the second re-creates the directory the first published. The
+    // re-creation is a different inode from the one that step bound - unless
+    // the filesystem hands the freed number straight back out, as `ext4`
+    // does, in which case the journal's own record that this step already
+    // replaced the recorded directory is what proves the same thing. The
+    // restoration is interrupted after the `mkdir`, so the resumed pass has
+    // to classify exactly that re-created directory either way.
     const intents = [_]Intent{
         directoryIntentWithMode("etc/fresh", 0o755),
         fileIntent("etc/fresh", "newer\n"),
@@ -9592,7 +9645,82 @@ test "root_mutation.test.a restored directory is re-created on a new inode" {
     const created = engine.progress.identity(0);
     try testing.expect(restored.isDirectory());
     try testing.expect(created.bound());
-    try testing.expect(restored.inode != created.inode);
+
+    const report = try recover(&engine);
+    try testing.expectEqual(Outcome.rolled_back, report.outcome);
+    try expectAbsent(root, "etc/fresh");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a re-created directory is accepted on a reused inode number" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc"),
+        root_fs.default_directory_permissions,
+    );
+
+    // A filesystem is free to hand a just-freed inode number straight back
+    // out, and `ext4` routinely does, so the directory a restoration
+    // re-creates a moment after removing the file that replaced it can carry
+    // the very number the producing boundary bound. The number alone
+    // therefore cannot be required to differ; the journal's own record that
+    // this step already replaced the recorded directory proves the same
+    // thing. The inode is forced here so the proof is exercised on every
+    // filesystem rather than only on one that reuses numbers.
+    const intents = [_]Intent{
+        directoryIntentWithMode("etc/fresh", 0o755),
+        fileIntent("etc/fresh", "newer\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{
+        .{ .boundary = .verify, .step = 1, .err = error.RenameFailed },
+        .{ .boundary = .metadata_apply, .step = 1 },
+    } };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    const outcome = apply(&crashed, .fromPlan(&plan));
+    crashed.deinit();
+    try testing.expectError(error.SimulatedCrash, outcome);
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const step = engine.journal().steps[1];
+    const bound = try boundPrecondition(&engine, 1);
+    var observation: Observation = .{};
+    try observeTarget(&engine, step, try root_fs.Path.init("etc/fresh"), &observation);
+    switch (observation.state) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |*value| value.inode = bound.inode,
+    }
+    try testing.expect(try selfProduced(&engine, step, observation, .restore, .{ .bound = bound }));
+
+    // The relaxation reaches exactly the step whose own transition re-creates
+    // a recorded directory. A step that never removed one proves nothing by
+    // having published.
+    try testing.expect(!recreatedByRestoration(&engine, engine.journal().steps[0]));
+
+    // An entry carrying the bound number that is not the recorded directory
+    // is still foreign: a directory that has gained an entry is refused
+    // whatever its number says.
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/fresh/intruder"),
+        root_fs.default_directory_permissions,
+    );
+    var occupied: Observation = .{};
+    try observeTarget(&engine, step, try root_fs.Path.init("etc/fresh"), &occupied);
+    switch (occupied.state) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |*value| value.inode = bound.inode,
+    }
+    try testing.expect(!try selfProduced(&engine, step, occupied, .restore, .{ .bound = bound }));
+    try root.removeDirectory(try root_fs.Path.init("etc/fresh/intruder"));
 
     const report = try recover(&engine);
     try testing.expectEqual(Outcome.rolled_back, report.outcome);
