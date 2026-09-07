@@ -3489,10 +3489,10 @@ fn planDescriptor(
         .request = if (reinstall) .{ .reinstall = .{
             .name = package,
             .version = version,
-        } } else .{ .install = .{
+        } } else .{ .install = &.{.{
             .name = package,
             .version = version,
-        } },
+        }} },
         .policy = .{
             .recommends = false,
             .allow_downgrade = false,

@@ -1,0 +1,22 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: stable
+Codename: bookworm
+Date: Mon, 07 Sep 2026 16:00:00 +0000
+Valid-Until: Sat, 07 Sep 2030 16:00:00 +0000
+Architectures: amd64
+Components: main
+SHA256:
+ 017d23216866a9cf679579f6693dc52527330278da0ed039e453b2fa3fdf61da 691 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+iQEzBAEBCAAdFiEElVazSVRXO8Dy7uKvKMNqQhfJA0sFAmqe354ACgkQKMNqQhfJ
+A0uaSQf+L5bo13a6YJLISwkEi3/sd0yNt3zTjgzg9HnU8In9JfZ8ONH9t/wdFImO
+XHQ5ZfTLRKspEgXvjp9QEifZq/76lMXyYYkJPfi23ncKIP6B0IPN9Eysi2fgXhze
+YbsyzvMfsPRb1TkwhmZSfbr7FJFIfPgUQCQRnXzMoREtw6C8PEULyDA/oEciqXFr
+7L9nftZIDvYTTmrTdKmq9j1D1pKUSDGgYRn/RhyfiO4rwlOkIu/dpw0MWv9DiZVg
+CJjrQ3S2o2GdbejFpWanQOLGCTXCQjP3cWOm/WPzVC49IDz50gEOey2NTYWz6+2S
+nezG//RVlFI9THhK0KWQF1diuCeAYg==
+=LLre
+-----END PGP SIGNATURE-----

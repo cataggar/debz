@@ -1,0 +1,28 @@
+Package: alpha
+Version: 1
+Architecture: amd64
+Maintainer: Test <test@example.invalid>
+Description: alpha
+Depends: shared
+Filename: pool/alpha_1_amd64.deb
+Size: 4
+SHA256: 1111111111111111111111111111111111111111111111111111111111111111
+
+Package: beta
+Version: 1
+Architecture: amd64
+Maintainer: Test <test@example.invalid>
+Description: beta
+Depends: shared
+Filename: pool/beta_1_amd64.deb
+Size: 4
+SHA256: 2222222222222222222222222222222222222222222222222222222222222222
+
+Package: shared
+Version: 1
+Architecture: amd64
+Maintainer: Test <test@example.invalid>
+Description: shared
+Filename: pool/shared_1_amd64.deb
+Size: 4
+SHA256: 3333333333333333333333333333333333333333333333333333333333333333

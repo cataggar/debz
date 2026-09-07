@@ -110,7 +110,11 @@ pub const ValidationError = error{
 pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Error || ValidationError)!OwnedLock {
     if (!input.authenticated_metadata) return error.UnauthenticatedMetadata;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
-    if (input.packages.len == 0) return error.EmptyClosure;
+    // An intentionally empty final closure is represented by no packages plus
+    // at least one authenticated repository snapshot. The repository evidence
+    // prevents an empty lock from becoming an unauthenticated bare assertion.
+    if (input.packages.len == 0 and input.repositories.len == 0)
+        return error.EmptyClosure;
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -161,8 +165,10 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;
     }
-    for (referenced_repositories) |referenced|
-        if (!referenced) return error.UnusedRepository;
+    if (packages.len != 0) {
+        for (referenced_repositories) |referenced|
+            if (!referenced) return error.UnusedRepository;
+    }
 
     var lock: Lock = .{
         .target_architecture = try owned.dupe(u8, input.target_architecture),
@@ -549,6 +555,40 @@ test "exact_lock.test.canonical roundtrip tamper holds and closure ordering" {
     const version_offset = std.mem.indexOf(u8, unknown, "\"version\":1").? + "\"version\":".len;
     unknown[version_offset] = '2';
     try std.testing.expectError(error.UnsupportedSchema, decode(std.testing.allocator, unknown, maximum_document_bytes));
+}
+
+test "exact_lock.test.authenticated repository evidence permits an intentional empty closure" {
+    const repository: Repository = .{
+        .id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    };
+    var owned = try create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(5),
+        .policy_sha256 = @splat(6),
+        .repositories = &.{repository},
+        .packages = &.{},
+        .authenticated_metadata = true,
+    });
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.lock.packages.len);
+    try std.testing.expectEqual(@as(usize, 1), owned.lock.repositories.len);
+    const encoded = try owned.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decode(std.testing.allocator, encoded, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), decoded.lock.packages.len);
+    try std.testing.expectError(error.EmptyClosure, create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(5),
+        .policy_sha256 = @splat(6),
+        .repositories = &.{},
+        .packages = &.{},
+        .authenticated_metadata = true,
+    }));
 }
 
 test "exact_lock.test.unsupported schema is typed before version-specific field decoding" {
