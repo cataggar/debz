@@ -27,7 +27,7 @@ Everything lives under the root's own bookkeeping directory, shared with
 | Root-relative path | Purpose |
 | --- | --- |
 | `var/lib/debz/root-mutation-v1.json` | the versioned durable journal, written once per transaction |
-| `var/lib/debz/root-mutation-v1.log` | the append-only, hash-chained progress log |
+| `var/lib/debz/root-mutation-v2.log` | the append-only, hash-chained progress log |
 | `var/lib/debz/mutation/staging/` | new content, materialized before publication |
 | `var/lib/debz/mutation/backup/` | hard links preserving replaced or removed content |
 
@@ -121,12 +121,35 @@ progress record appended at the exact offset the caller proved durable and
 `fsync`ed:
 
 ```
-<sequence:016x> <scope> <index:08x> <boundary:24> <chain:064x>\n
+<sequence:016x> <scope> <index:08x> <boundary:24> <device:016x> <inode:016x> <links:016x> <chain:064x>\n
 ```
 
 Each record chains onto its predecessor, and the first chains onto the journal
 digest, so a log can never be replayed against a different journal, and a
 record cannot be reordered or replayed.
+
+The three identity columns are the entry a boundary bound to the state it
+published — the containing device, the inode number, and that inode's link
+count at the moment the boundary observed it. They are part of the chained
+preimage rather than a comment beside it, so an edited, spliced, or relocated
+identity breaks the chain. A journal states the shape of a state the plan will
+produce; only a boundary can state which inode it landed on, and [several
+steps on one path](#several-steps-on-one-path) depend on exactly that.
+
+The columns are as wide as the values they carry, so a record that binds an
+entry is exactly as long as one that binds nothing and a torn tail stays
+exactly as detectable. Replay refuses evidence the journal contradicts, which
+the chain alone cannot catch because a forger recomputes it:
+
+| Record | Result |
+| --- | --- |
+| a bound inode on a journal-scoped record, or on any step boundary other than `verified` | `error.ProgressCorrupt` |
+| a bound inode on a step whose desired state is an absence | `error.ProgressCorrupt` |
+| a bound inode on a device other than the one the journal pinned | `error.ProgressCorrupt` |
+| a bound inode with no links, or a device or link count with no inode | `error.ProgressCorrupt` |
+
+The writer validates the record it is about to append by the same rules, so it
+can never publish evidence its own replay would refuse.
 
 Appending is a compare-and-set. The writer reads the **last complete record at
 exactly `accepted_bytes - one record`**, never at whatever the physical end
@@ -188,7 +211,9 @@ Application of one step:
    exception described below.
 5. **parent synced** — the destination directory is `fsync`ed.
 6. **verified** — the target is observed again and compared to the desired state
-   exactly, including the content digest and link target.
+   exactly, including the content digest and link target. The entry that
+   comparison proved is bound in the very record that publishes the boundary,
+   so the state and the inode it landed on become durable together.
 
 ## Metadata order and privileged bits
 
@@ -233,18 +258,70 @@ durable boundary, and accepts nothing else.
 
 Every member of that set keeps the identity the recorded states share — kind,
 content digest, link target, and, wherever an inode survives the transition,
-the recorded inode, the plan's device, and a link count the transaction can
+the bound inode, the plan's device, and a link count the transaction can
 account for — so an entry an external writer replaced, truncated, retargeted,
 or linked is still `external_modification` and still becomes
 `recovery_required`.
 
 | Step shape | States the transaction itself can have left | Window |
 | --- | --- | --- |
-| `set_metadata`, and `create_directory` on an existing directory | the recorded inode with the ordered metadata chain below | the step's metadata boundary |
+| `set_metadata`, and `create_directory` on an existing directory | the bound inode with the ordered metadata chain below | the step's metadata boundary |
 | `create_directory` over nothing or over a non-directory | an **empty** directory whose mode and ownership are whatever `mkdir` produced under the caller's umask and the parent's set-group-ID bit | the step's publication and metadata boundaries |
 | a transition that crosses the directory boundary in either direction | the path momentarily **empty**, between the removal and the creation that replaces it | the step's publication boundary, and the whole restoration |
-| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the recorded one | the restoration |
+| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the bound one | the restoration |
 | while restoring: a recorded symbolic link | the exact recorded target on a fresh inode whose timestamp has not been written back yet | the restoration |
+
+### Several steps on one path
+
+A plan may touch one path more than once — a file published and then re-moded,
+a documentation directory two packages both ship. Preflight models each path
+once, so the second step's recorded precondition is exactly the first step's
+recorded desired state, and refusing such a plan would refuse the most ordinary
+shape there is.
+
+A desired state carries no inode, because no plan can predict one. Treating
+that zero as "any inode" would admit an entry an outside writer substituted and
+would break the directory and link-count reasoning that depends on knowing
+which inode is which; treating it as "no inode" would wedge every interrupted
+metadata write on a path a plan touches twice. Neither is necessary: the
+producing step's verified boundary bound the entry it published, so a
+precondition the plan produced resolves to that bound inode.
+
+| Precondition | Resolves to |
+| --- | --- |
+| an absence | nothing to bind |
+| a state preflight observed | the inode preflight observed |
+| a state an earlier step produces, once that step verified | the inode that step's verified boundary bound |
+| a state an earlier step produces, before that step verified | nothing, and the step provably has not run |
+| a state observed where the platform reports no inode number | the degenerate zero, which is the structural comparison such a platform has always had |
+
+The last row keeps a platform without inode numbers exactly as strict as it was
+and no stricter: zero matches only zero, so an entry whose inode *is* reported
+is still refused, and a directory is never accepted as a re-creation on the
+strength of being "different from nothing".
+
+The row before it is a proof, not a fallback. The forward pass reaches a step
+only after every earlier step verified, and a verified boundary binds its entry
+in the same record that publishes it, so an unbound precondition means the step
+never started. A crash before that record therefore cannot let a dependent step
+advance. During a rollback such a step is skipped rather than restored over —
+its own reversal is nothing, and the path is owed the state the producing step
+gives back on its own turn — and the skip additionally requires the step to
+still be at its prepared boundary and to sit past the point the forward pass
+can have reached, so a platform that reports no inodes fails closed instead.
+
+The bound inode is then what the recorded old state is compared against.
+An entry of the same kind holding the same bytes with the same metadata is not
+the recorded entry when it is a different inode, which is exactly what an
+external replacement looks like, so a substitution made after the producing
+step verified is `recovery_required` in both directions rather than a
+precondition the next step happily writes onto.
+
+A binding is evidence about what this transaction published, not about what is
+at the path now, so it survives that step's own restoration: the backup and
+staging links the plan took on that inode are still links on it until the
+workspace is released, and the [link-count model](#link-counts-the-transaction-changes-itself)
+attributes them by that inode alone.
 
 ### The window an intermediate is accepted in
 
@@ -291,11 +368,15 @@ issue no further `chown`.
 A directory is only accepted as the transaction's own creation while it is
 still empty, which is exactly the condition under which removing it restores
 the recorded absence; a directory that has gained an entry is refused and
-becomes `recovery_required`. Every accepted intermediate is resolved by
-finishing or undoing the boundary that produced it — the writer recomputes the
-components that still differ from what it observes — never by adopting it as
-the new truth. Verification at the end of the step is still an exact comparison
-with the desired state.
+becomes `recovery_required`. While restoring, a re-created directory is
+recognized by being a *different* inode from the bound one, which is evidence
+only when an inode is actually bound: a recorded directory nothing bound an
+inode to admits no directory at all, because "different from nothing" would
+accept any empty directory an outside writer left at the path. Every accepted
+intermediate is resolved by finishing or undoing the boundary that produced it
+— the writer recomputes the components that still differ from what it observes
+— never by adopting it as the new truth. Verification at the end of the step is
+still an exact comparison with the desired state.
 
 Every boundary is idempotent. A retry compares the observed state to the
 recorded expectation, to the recorded desired state, and to that step's closed
@@ -313,7 +394,7 @@ inode it links.
 
 Neither is a guess. The plan names the entries that do it and the progress log
 says how far each of them got, so the engine computes the exact set of counts
-this transaction can have produced on the recorded inode and refuses everything
+this transaction can have produced on the bound inode and refuses everything
 outside it. The set is a closed interval, because each contributing entry moves
 the count by exactly one and does so independently:
 
@@ -332,14 +413,28 @@ later step has already given its links back and every earlier one still holds
 them. Workspace links outlive the step that made them, because staging and
 backup entries are released only after the whole transaction resolves.
 
-The recorded count itself always stays admissible: it is the count the journal
-observed, and a filesystem that does not maintain directory link counts reports
-it unchanged however many subdirectories a plan makes. Everything else is
-checked against the interval, so an outside hard link on a file this plan is
-re-moding, or an outside subdirectory in a directory this plan is re-moding, is
-one link past what the transaction can account for and becomes
-`recovery_required`. The count is only ever consulted after the recorded inode
-number itself matched, so it never admits a different inode wearing the
+A backup counts only against the inode it actually preserves, and so does a
+hard link. Both name whatever the path they were taken from was holding at the
+moment they were taken, resolved exactly the way a precondition is — by the
+boundary that bound it — so a link or backup taken after some intervening step
+of the same plan republished that path is attributed to the inode that step
+published and never to the one under examination, and one whose own
+precondition nothing has bound yet is attributed to nothing at all.
+
+The baseline is the count the boundary that bound the inode observed, so a
+contribution taken *before* that boundary is already inside it: what is open
+for those is whether the link has since been given back, not whether it was
+ever made. Counting such a link twice would move the whole interval up by one
+and admit exactly one outside hard link.
+
+The bound count itself always stays admissible: it is the count a boundary
+actually observed, and a filesystem that does not maintain directory link
+counts reports it unchanged however many subdirectories a plan makes.
+Everything else is checked against the interval, so an outside hard link on a
+file this plan is re-moding, or an outside subdirectory in a directory this
+plan is re-moding, is one link past what the transaction can account for and
+becomes `recovery_required`. The count is only ever consulted after the bound
+inode number itself matched, so it never admits a different inode wearing the
 recorded identity.
 
 What the model cannot derive, preflight refuses before anything is mutated. A
@@ -368,7 +463,10 @@ undone in reverse order and re-observed afterwards; a step whose target matches
 neither the recorded old state, nor the recorded new state, nor that step's
 closed set of reachable intermediate states publishes `recovery_required`
 durably, tells the root-operation attempt through `Attempt.requireRecovery`,
-and refuses every further mutation until an operator resolves it. `clear` is
+and refuses every further mutation until an operator resolves it. A step whose
+precondition an earlier step of the same plan owes and no boundary ever bound
+is skipped instead: it provably never ran, and the path is restored by that
+earlier step's own reversal further down the same reverse pass. `clear` is
 refused unless the stage is `completed` or `rolled_back`.
 
 Every step that writes metadata onto the inode it finds — a `set_metadata`
@@ -376,12 +474,12 @@ step, and a `create_directory` step at its metadata boundary — proves its
 recorded precondition first, because unlike a publication it never takes the
 target name over and would otherwise stamp the plan's mode, ownership, and
 timestamp onto whatever entry now occupies the name. The precondition it
-accepts is the recorded old state, the recorded new state, or one of that
-step's own reachable intermediates: the ordered metadata combinations on the
-recorded inode, or the still-empty directory its own publication boundary
-created. Never an unrelated mode, ownership, or timestamp; never a different
-inode carrying the recorded metadata; and never a directory that already holds
-entries this transaction did not put there.
+accepts is the recorded old state on the inode bound to it, the recorded new
+state, or one of that step's own reachable intermediates: the ordered metadata
+combinations on the bound inode, or the still-empty directory its own
+publication boundary created. Never an unrelated mode, ownership, or timestamp;
+never a different inode carrying the recorded metadata; and never a directory
+that already holds entries this transaction did not put there.
 
 A cancellation or an expired deadline is observed at a step boundary, turns the
 transaction around, and leaves a cleanly restored root plus the durable
@@ -471,7 +569,31 @@ applied or partially restored metadata boundary, while one extra hard link or
 one extra subdirectory that this plan does not account for must still become
 `recovery_required`. The reachable interval itself is enumerated directly
 across staging, publication, backup capture, reverse-order rollback, and the
-workspace release.
+workspace release, on both sides of the boundary that bound the count, and a
+backup taken across an intervening replacement of the same path must be
+attributed to the inode it actually preserves.
+
+Several steps on one path are proven at every boundary the second step passes
+through, including each metadata syscall on its own, twice per boundary: a
+resumed forward pass must finish the transaction, and a fresh process must roll
+it back to the exact recorded entries, inode included. Rollback is additionally
+interrupted inside each restoration boundary of such a chain and resumed. A
+repeated directory step on a populated directory must re-mode the directory
+that is there, and two packages shipping the same documentation directory must
+produce a satisfied second step rather than a refusal. An outside writer that
+substitutes a same-kind, same-content, same-metadata inode after the producing
+step verified must be `recovery_required` in both directions, and a step whose
+producing step never verified must be skipped rather than restored over.
+
+The write-ahead format is proven column by column: a bound identity round trips
+at every width, a record that binds an entry is exactly as long as one that
+does not, and a forged record that chains correctly but binds an entry on a
+stage record, on an unverified boundary, on a removal, on another device, or
+without a link count is `error.ProgressCorrupt` — as is editing a bound
+identity without rebuilding the chain. The checked-in fuzz corpus carries a
+complete log of the new format and is compared byte for byte against the
+canonical encoding, so a format change is a failing test rather than a corpus
+that quietly stops parsing.
 
 The suite also covers disk-full, short-write, `fsync`, `rename`, `unlink`, and
 `link` failures, external modification and symbolic-link swaps between
@@ -481,7 +603,8 @@ corrupt, truncated, torn, replayed, and unknown-schema journals and logs, stale
 and mismatched attempts, a lost root lock, cancellation, restart recovery
 through a freshly opened engine, database publication and rollback against a
 real `var/lib/dpkg` generation, and allocation failure at every allocation of
-preflight, decode, and replay. Every test uses a disposable alternate root.
+preflight, decode, replay, and reopening. Every test uses a disposable
+alternate root.
 
 The scenarios that need a second group or a privileged caller report
 `SkipZigTest` where the environment cannot provide one; the ordering contract,

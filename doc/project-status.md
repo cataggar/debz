@@ -74,6 +74,14 @@ creation is atomic, each step also states the exact closed set of intermediate
 states the transaction itself could have produced from its last durable
 boundary, and accepts nothing outside it, so a half-applied boundary is finished
 or undone deterministically while an external modification is still refused.
+A plan may touch one path more than once, and the second step's precondition is
+then the first step's desired state, which can carry no inode; the verified
+boundary of the producing step therefore binds the device, inode, and link count
+it published inside the same chained progress record, and every dependent
+precondition, directory re-creation, and backup attribution resolves that bound
+entry instead of a zero. A precondition nothing has bound yet is proof the step
+never ran, and a structurally identical entry on a different inode is an
+external replacement rather than the recorded state.
 Root-local staging and backups live in
 a private `var/lib/debz/mutation` workspace, are created exclusively so a planted
 entry can never be followed, and are released only after the whole transaction

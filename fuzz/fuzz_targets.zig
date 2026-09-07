@@ -36,7 +36,14 @@ const state_corpus = &.{
     @embedFile("corpus/state/repository-add-state.json"),
     @embedFile("corpus/state/root-operation.json"),
     @embedFile("corpus/state/root-operation-completion.json"),
+    @embedFile("corpus/state/root-mutation-progress"),
 };
+
+/// The checked-in progress log for the root mutation write-ahead protocol.
+/// It is replayed against the module's own fixed synthetic journal, so a
+/// mutated record exercises the shape, the chain, and the identity rules the
+/// recovery path depends on.
+const mutation_progress_seed = @embedFile("corpus/state/root-mutation-progress");
 
 fn input(smith: *std.testing.Smith, storage: *[max_input]u8) []const u8 {
     @disableInstrumentation();
@@ -456,6 +463,31 @@ fn exerciseState(bytes: []const u8) !void {
         defer journal.deinit();
         debz.root_mutation.fuzzProgress(std.testing.allocator, journal.journal, bytes);
     } else |_| {}
+    // A progress log is a durable artifact of its own: it is reachable on a
+    // compromised root without the journal document beside it, so it is
+    // replayed against a fixed journal as well.
+    debz.root_mutation.fuzzProgressLog(std.testing.allocator, bytes);
+}
+
+test "fuzz.the mutation progress corpus is the exact write-ahead format" {
+    var buffer: [debz.root_mutation.fuzz_seed_bytes]u8 = undefined;
+    const expected = debz.root_mutation.fuzzSeedLog(&buffer);
+    // Regenerate the seed from `fuzzSeedLog` whenever the record format or
+    // the chain changes; a corpus that no longer parses fuzzes nothing.
+    try std.testing.expectEqualSlices(u8, expected, mutation_progress_seed);
+
+    var progress = try debz.root_mutation.replayProgress(
+        std.testing.allocator,
+        debz.root_mutation.fuzzJournal(),
+        mutation_progress_seed,
+    );
+    defer progress.deinit();
+    try std.testing.expectEqual(mutation_progress_seed.len, progress.accepted_bytes);
+    try std.testing.expectEqual(debz.root_mutation.Stage.completed, progress.stage);
+    // The verified boundary of each step bound the entry it published, and
+    // the second step of the pair inherits its precondition from the first.
+    try std.testing.expect(progress.identity(0).bound());
+    try std.testing.expectEqual(progress.identity(0).inode, progress.identity(1).inode);
 }
 
 test "fuzz.deterministic bounded mutation smoke" {

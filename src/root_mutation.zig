@@ -54,8 +54,13 @@ pub const schema_version: u32 = 1;
 /// Progress records are a separate append-only log so publishing a boundary
 /// costs one bounded append and one fsync rather than a rewrite of the whole
 /// journal. Its own version travels with every record.
-pub const progress_schema_id = "https://debz.dev/schema/root-mutation-progress-v1";
-pub const progress_schema_version: u32 = 1;
+///
+/// Version 2 widened the record with the runtime identity a boundary binds to
+/// the state it published, because a desired state cannot predict an inode
+/// and a later step on the same path has nothing else to authenticate its own
+/// precondition against.
+pub const progress_schema_id = "https://debz.dev/schema/root-mutation-progress-v2";
+pub const progress_schema_version: u32 = 2;
 
 /// Absolute ceilings. `Limits` may tighten them; nothing may raise them.
 pub const maximum_document_bytes: usize = 64 * 1024 * 1024;
@@ -64,8 +69,12 @@ pub const maximum_steps: usize = 100_000;
 pub const maximum_step_dependencies: usize = 8;
 pub const maximum_path_bytes: usize = root_fs.maximum_path_bytes;
 pub const maximum_link_target_bytes: usize = root_fs.maximum_link_target_bytes;
-/// One progress record is fixed shape, so its length is a hard constant.
-pub const progress_record_bytes: usize = 16 + 1 + 7 + 1 + 8 + 1 + 24 + 1 + 64 + 1;
+/// One progress record is fixed shape, so its length is a hard constant. The
+/// three identity columns are as wide as the values they carry, so a record
+/// that binds an inode is exactly as long as one that binds nothing and a
+/// torn tail stays exactly as detectable.
+pub const progress_record_bytes: usize = 16 + 1 + 7 + 1 + 8 + 1 + 24 + 1 +
+    16 + 1 + 16 + 1 + 16 + 1 + 64 + 1;
 /// Permission and special mode bits only; a file-type bit never appears in a
 /// modeled mode.
 pub const maximum_mode: u32 = 0o7777;
@@ -79,7 +88,7 @@ pub const minimum_timestamp_nanoseconds: i128 = std.math.minInt(i96);
 /// debz-owned directory.
 pub const namespace_path = root_operation.namespace_path;
 pub const journal_name = "root-mutation-v1.json";
-pub const progress_name = "root-mutation-v1.log";
+pub const progress_name = "root-mutation-v2.log";
 pub const workspace_name = "mutation";
 pub const staging_name = "staging";
 pub const backup_name = "backup";
@@ -273,7 +282,9 @@ pub const State = struct {
     /// Symbolic links only. The exact stored target bytes.
     link_target: ?[]const u8 = null,
     /// Link identity of the observed inode. Zero in a desired state, which
-    /// cannot predict an inode number.
+    /// cannot predict an inode number; the boundary that verifies such a
+    /// state binds the entry it landed on in the progress log instead, and
+    /// `precondition` resolves it from there.
     inode: u64 = 0,
     link_count: u64 = 0,
 };
@@ -282,6 +293,39 @@ pub const State = struct {
 pub const Expectation = union(enum) {
     absent,
     present: State,
+};
+
+/// The runtime identity of one entry: the device that holds it, the inode
+/// number that names it, and the link count that inode carried at the moment
+/// a durable boundary observed it.
+///
+/// A journal cannot contain this for a state the plan produces - no plan can
+/// predict an inode - so it is bound at run time by the boundary that makes
+/// the state authoritative and published in that boundary's own progress
+/// record. Everything that later has to tell the entry this transaction
+/// produced from an entry somebody else substituted for it compares against
+/// the bound identity rather than against a zero.
+pub const Identity = struct {
+    device: u64 = 0,
+    inode: u64 = 0,
+    link_count: u64 = 0,
+
+    /// Nothing was bound. It is the only identity a record may carry at a
+    /// boundary that publishes no state.
+    pub const unbound: Identity = .{};
+
+    /// True when a boundary actually observed an inode. Zero is not a valid
+    /// inode number on any filesystem this layer supports, so it is the
+    /// unambiguous spelling of "nothing is bound here" and is never treated
+    /// as a wildcard.
+    pub fn bound(self: Identity) bool {
+        return self.inode != 0;
+    }
+
+    pub fn eql(self: Identity, other: Identity) bool {
+        return self.device == other.device and self.inode == other.inode and
+            self.link_count == other.link_count;
+    }
 };
 
 pub const Overwrite = enum {
@@ -445,10 +489,15 @@ fn identityEqual(left: State, right: State) bool {
 // itself could have produced from its last durable boundary, and accepts
 // nothing else. Every member of the set keeps the identity - kind, content
 // digest, link target, and, wherever an inode survives the transition, the
-// recorded inode, link count, and containing device - that the recorded
-// states share, so an entry an external writer replaced, truncated, or
-// retargeted is still `external_modification` and still becomes
-// `recovery_required`.
+// inode bound to the recorded state, its link count, and the containing
+// device - that the recorded states share, so an entry an external writer
+// replaced, truncated, or retargeted is still `external_modification` and
+// still becomes `recovery_required`.
+//
+// A state the plan itself produces carries no inode, because no plan can
+// predict one; the boundary that verified it bound the entry it landed on, and
+// a precondition that names such a state resolves to that binding rather than
+// to a zero. See `precondition`.
 
 /// The bits Linux can clear from a regular file's mode when it is chowned.
 /// The set-user-ID bit always goes; the set-group-ID bit goes when the entry
@@ -1269,22 +1318,29 @@ pub const ProgressRecord = struct {
     index: u32,
     stage: Stage,
     state: StepState,
+    /// The entry this boundary bound to the state it published, or
+    /// `Identity.unbound` at every boundary that publishes no state. It is
+    /// part of the chained preimage, so it cannot be edited, spliced in, or
+    /// moved to another record without breaking the chain.
+    identity: Identity = .unbound,
     chain_sha256: [32]u8,
 
     pub const no_index: u32 = std.math.maxInt(u32);
 
-    /// `sequence`, `scope`, `index`, and the published name, chained onto the
-    /// previous record. The first record chains onto the journal digest, so a
-    /// log can never be replayed against a different journal.
+    /// `sequence`, `scope`, `index`, the published name, and the bound
+    /// identity, chained onto the previous record. The first record chains
+    /// onto the journal digest, so a log can never be replayed against a
+    /// different journal.
     pub fn chain(
         previous: [32]u8,
         sequence: u64,
         scope: Scope,
         index: u32,
         boundary: []const u8,
+        identity: Identity,
     ) [32]u8 {
         var hash = Sha256.init(.{});
-        hash.update("debz-root-mutation-progress-v1\x00");
+        hash.update("debz-root-mutation-progress-v2\x00");
         hash.update(&previous);
         var scratch: [8]u8 = undefined;
         std.mem.writeInt(u64, &scratch, sequence, .big);
@@ -1296,6 +1352,11 @@ pub const ProgressRecord = struct {
         hash.update(&index_bytes);
         hash.update(boundary);
         hash.update("\x00");
+        var identity_bytes: [24]u8 = undefined;
+        std.mem.writeInt(u64, identity_bytes[0..8], identity.device, .big);
+        std.mem.writeInt(u64, identity_bytes[8..16], identity.inode, .big);
+        std.mem.writeInt(u64, identity_bytes[16..24], identity.link_count, .big);
+        hash.update(&identity_bytes);
         return hash.finalResult();
     }
 
@@ -1313,16 +1374,23 @@ pub const ProgressRecord = struct {
         const text = self.name();
         @memcpy(padded[0..text.len], text);
         const digest = std.fmt.bytesToHex(self.chain_sha256, .lower);
-        return std.fmt.bufPrint(buffer, "{x:0>16} {s} {x:0>8} {s} {s}\n", .{
-            self.sequence,
-            switch (self.scope) {
-                .journal => "journal",
-                .step => "step   ",
+        return std.fmt.bufPrint(
+            buffer,
+            "{x:0>16} {s} {x:0>8} {s} {x:0>16} {x:0>16} {x:0>16} {s}\n",
+            .{
+                self.sequence,
+                switch (self.scope) {
+                    .journal => "journal",
+                    .step => "step   ",
+                },
+                self.index,
+                padded,
+                self.identity.device,
+                self.identity.inode,
+                self.identity.link_count,
+                digest,
             },
-            self.index,
-            padded,
-            digest,
-        }) catch unreachable;
+        ) catch unreachable;
     }
 };
 
@@ -1330,7 +1398,8 @@ pub const ProgressError = error{ProgressCorrupt};
 
 fn decodeProgressRecord(line: []const u8) ProgressError!ProgressRecord {
     if (line.len != progress_record_bytes - 1) return error.ProgressCorrupt;
-    if (line[16] != ' ' or line[24] != ' ' or line[33] != ' ' or line[58] != ' ')
+    if (line[16] != ' ' or line[24] != ' ' or line[33] != ' ' or line[58] != ' ' or
+        line[75] != ' ' or line[92] != ' ' or line[109] != ' ')
         return error.ProgressCorrupt;
     const sequence = std.fmt.parseUnsigned(u64, line[0..16], 16) catch
         return error.ProgressCorrupt;
@@ -1350,6 +1419,14 @@ fn decodeProgressRecord(line: []const u8) ProgressError!ProgressRecord {
         .index = index,
         .stage = .prepared,
         .state = .prepared,
+        .identity = .{
+            .device = std.fmt.parseUnsigned(u64, line[59..75], 16) catch
+                return error.ProgressCorrupt,
+            .inode = std.fmt.parseUnsigned(u64, line[76..92], 16) catch
+                return error.ProgressCorrupt,
+            .link_count = std.fmt.parseUnsigned(u64, line[93..109], 16) catch
+                return error.ProgressCorrupt,
+        },
         .chain_sha256 = undefined,
     };
     switch (scope) {
@@ -1365,8 +1442,37 @@ fn decodeProgressRecord(line: []const u8) ProgressError!ProgressRecord {
         },
     }
     if (std.mem.indexOfScalar(u8, text, ' ') != null) return error.ProgressCorrupt;
-    record.chain_sha256 = parseHex(32, line[59..123]) catch return error.ProgressCorrupt;
+    record.chain_sha256 = parseHex(32, line[110..174]) catch return error.ProgressCorrupt;
     return record;
+}
+
+/// Refuses a record that binds an identity the boundary it names cannot have
+/// produced. Authentication proves a record is this log's; this proves the
+/// evidence inside it is about a state the journal says that step publishes,
+/// so a forged or misplaced inode is corruption rather than a fact a later
+/// step could resolve its own precondition against.
+fn validateRecordIdentity(journal: Journal, record: ProgressRecord) ProgressError!void {
+    const identity = record.identity;
+    if (!identity.bound()) {
+        // A partly filled identity names no entry and is not an absence
+        // either, so it is never silently rounded to one.
+        if (identity.device != 0 or identity.link_count != 0) return error.ProgressCorrupt;
+        return;
+    }
+    // Only the boundary that makes a published state authoritative may bind
+    // the inode that state landed on.
+    if (record.scope != .step or record.state != .verified) return error.ProgressCorrupt;
+    // Every entry that exists has at least one link, and every path in the
+    // plan lives on the one device the journal pinned.
+    if (identity.link_count == 0) return error.ProgressCorrupt;
+    if (identity.device != journal.device) return error.ProgressCorrupt;
+    if (record.index >= journal.steps.len) return error.ProgressCorrupt;
+    switch (journal.steps[record.index].desired) {
+        // A step whose desired state is an absence publishes no entry, so
+        // there is no inode for it to have bound.
+        .absent => return error.ProgressCorrupt,
+        .present => {},
+    }
 }
 
 /// Replayed progress. `states` is dense over the journal's steps, so lookups
@@ -1377,18 +1483,34 @@ pub const Progress = struct {
     sequence: u64,
     chain_sha256: [32]u8,
     states: []StepState,
+    /// Dense over the journal's steps: the entry each step's verified
+    /// boundary bound to the state it published. It is evidence about what
+    /// this transaction did rather than about what is at the path now, so a
+    /// step that has not verified binds nothing and a step whose restoration
+    /// gives its published state back keeps the binding - the backup and
+    /// staging links it took are still links on that very inode until the
+    /// workspace is released.
+    identities: []Identity,
     /// Bytes of the log that decoded cleanly. A torn trailing record is left
     /// out, so the next append overwrites it.
     accepted_bytes: u64,
 
     pub fn deinit(self: *Progress) void {
         self.allocator.free(self.states);
+        self.allocator.free(self.identities);
         self.* = undefined;
     }
 
     pub fn state(self: Progress, index: u32) StepState {
         if (index >= self.states.len) return .prepared;
         return self.states[index];
+    }
+
+    /// The entry the step's own verified boundary bound, or `Identity.unbound`
+    /// when no boundary has bound one.
+    pub fn identity(self: Progress, index: u32) Identity {
+        if (index >= self.identities.len) return .unbound;
+        return self.identities[index];
     }
 };
 
@@ -1405,12 +1527,16 @@ pub fn replayProgress(
     const states = try allocator.alloc(StepState, journal.steps.len);
     errdefer allocator.free(states);
     @memset(states, .prepared);
+    const identities = try allocator.alloc(Identity, journal.steps.len);
+    errdefer allocator.free(identities);
+    @memset(identities, .unbound);
     var progress: Progress = .{
         .allocator = allocator,
         .stage = .prepared,
         .sequence = 0,
         .chain_sha256 = journal.digest_sha256,
         .states = states,
+        .identities = identities,
         .accepted_bytes = 0,
     };
     var offset: usize = 0;
@@ -1432,14 +1558,20 @@ pub fn replayProgress(
             record.scope,
             record.index,
             record.name(),
+            record.identity,
         );
         if (!std.mem.eql(u8, &expected_chain, &record.chain_sha256))
             return error.ProgressCorrupt;
+        try validateRecordIdentity(journal, record);
         switch (record.scope) {
             .journal => progress.stage = record.stage,
             .step => {
                 if (record.index >= states.len) return error.ProgressCorrupt;
                 states[record.index] = record.state;
+                // Only a verified boundary binds an entry, and what it bound
+                // stays bound: the links this transaction took on that inode
+                // outlive the step's own restoration.
+                if (record.identity.bound()) identities[record.index] = record.identity;
             },
         }
         progress.sequence = record.sequence;
@@ -2540,11 +2672,16 @@ pub const Engine = struct {
     attempt: *root_operation.Attempt,
     owned: OwnedJournal,
     progress: Progress,
+    /// For every step, its neighbours on its own path. They are what turn a
+    /// precondition the plan produced - and therefore could not give an inode
+    /// - into the exact entry a durable boundary bound.
+    path_links: []const PathLink,
     options: Options,
     diagnostic: ?Diagnostic = null,
 
     pub fn deinit(self: *Engine) void {
         self.progress.deinit();
+        self.allocator.free(self.path_links);
         self.owned.deinit();
         self.* = undefined;
     }
@@ -2561,10 +2698,17 @@ pub const Engine = struct {
         return .{ .root = self.root, .limits = self.options.limits };
     }
 
-    /// Publishes a boundary. The append is compare-and-set against the log's
-    /// durable tail: a writer whose view is older than the file's chain is
-    /// stale and is refused rather than allowed to fork the history.
-    fn publish(self: *Engine, scope: Scope, index: u32, name: []const u8) Error!void {
+    /// Publishes a boundary, together with the entry that boundary bound. The
+    /// append is compare-and-set against the log's durable tail: a writer
+    /// whose view is older than the file's chain is stale and is refused
+    /// rather than allowed to fork the history.
+    fn publish(
+        self: *Engine,
+        scope: Scope,
+        index: u32,
+        name: []const u8,
+        identity: Identity,
+    ) Error!void {
         if (!self.attempt.locked()) return self.reject(.journal, .lock_lost, null, null);
         const record: ProgressRecord = .{
             .sequence = self.progress.sequence + 1,
@@ -2578,14 +2722,19 @@ pub const Engine = struct {
                 std.meta.stringToEnum(StepState, name).?
             else
                 .prepared,
+            .identity = identity,
             .chain_sha256 = ProgressRecord.chain(
                 self.progress.chain_sha256,
                 self.progress.sequence + 1,
                 scope,
                 index,
                 name,
+                identity,
             ),
         };
+        // The writer never emits evidence its own replay would refuse.
+        validateRecordIdentity(self.owned.journal, record) catch
+            return self.reject(.progress, .progress_corrupt, null, .progress_append);
         var buffer: [progress_record_bytes]u8 = undefined;
         const encoded = record.encode(&buffer);
         try self.hook(.progress_append, index);
@@ -2603,7 +2752,10 @@ pub const Engine = struct {
         self.progress.accepted_bytes += encoded.len;
         switch (scope) {
             .journal => self.progress.stage = record.stage,
-            .step => self.progress.states[index] = record.state,
+            .step => {
+                self.progress.states[index] = record.state;
+                if (record.identity.bound()) self.progress.identities[index] = record.identity;
+            },
         }
     }
 
@@ -2665,12 +2817,28 @@ pub const Engine = struct {
 
     fn publishStage(self: *Engine, value: Stage) Error!void {
         if (self.progress.stage == value) return;
-        try self.publish(.journal, ProgressRecord.no_index, @tagName(value));
+        try self.publish(.journal, ProgressRecord.no_index, @tagName(value), .unbound);
     }
 
-    fn publishState(self: *Engine, index: u32, value: StepState) Error!void {
+    fn publishState(self: *Engine, index: u32, value: StepState, identity: Identity) Error!void {
         if (self.progress.states[index] == value) return;
-        try self.publish(.step, index, @tagName(value));
+        try self.publish(.step, index, @tagName(value), identity);
+    }
+
+    /// The step whose desired state is `index`'s recorded precondition, or
+    /// null when preflight observed that precondition on disk.
+    fn producer(self: *const Engine, index: u32) ?u32 {
+        if (index >= self.path_links.len) return null;
+        const value = self.path_links[index].previous;
+        return if (value == no_producer) null else value;
+    }
+
+    /// The next step of the plan that touches the same path as `index`, or
+    /// null when nothing does.
+    fn successor(self: *const Engine, index: u32) ?u32 {
+        if (index >= self.path_links.len) return null;
+        const value = self.path_links[index].next;
+        return if (value == no_producer) null else value;
     }
 
     /// Runs the harness seam for one boundary. A simulated crash propagates
@@ -2805,6 +2973,8 @@ pub fn prepare(
     errdefer owned.deinit();
     var progress = try replayProgress(allocator, owned.journal, &.{});
     errdefer progress.deinit();
+    const path_links = try linkPaths(allocator, owned.journal);
+    errdefer allocator.free(path_links);
 
     var engine: Engine = .{
         .allocator = allocator,
@@ -2812,11 +2982,12 @@ pub fn prepare(
         .attempt = attempt,
         .owned = owned,
         .progress = progress,
+        .path_links = path_links,
         .options = options,
     };
     // The prepared boundary is published explicitly rather than assumed from
     // an empty log, so the log always states which journal it belongs to.
-    try engine.publish(.journal, ProgressRecord.no_index, @tagName(Stage.prepared));
+    try engine.publish(.journal, ProgressRecord.no_index, @tagName(Stage.prepared), .unbound);
     return engine;
 }
 
@@ -2845,13 +3016,73 @@ pub fn open(
     defer allocator.free(bytes);
     var progress = try replayProgress(allocator, owned.journal, bytes);
     errdefer progress.deinit();
+    const path_links = try linkPaths(allocator, owned.journal);
+    errdefer allocator.free(path_links);
     return .{
         .allocator = allocator,
         .root = root,
         .attempt = attempt,
         .owned = owned,
         .progress = progress,
+        .path_links = path_links,
         .options = options,
+    };
+}
+
+/// Sentinel for a step with no earlier or later step on its own path.
+const no_producer: u32 = std.math.maxInt(u32);
+
+/// The neighbours of one step on its own path.
+const PathLink = struct {
+    /// The step whose desired state is this step's recorded precondition.
+    previous: u32 = no_producer,
+    /// The next step of the plan that touches the same path.
+    next: u32 = no_producer,
+};
+
+/// Links every step whose recorded precondition is a state this plan itself
+/// produces to the step that produces it, and every step to the next one on
+/// its own path.
+///
+/// Preflight models each path once: the state a step expects is either the
+/// observation it made before the transaction started or, when an earlier
+/// step already touched the path, exactly that step's desired state. The
+/// journal therefore already says which steps share a path, and the link is
+/// proven rather than assumed - a step whose recorded precondition is not its
+/// predecessor's recorded desired state describes a history no plan can
+/// produce, and a journal that says that cannot be resolved at all.
+fn linkPaths(allocator: std.mem.Allocator, journal: Journal) Error![]PathLink {
+    const links = try allocator.alloc(PathLink, journal.steps.len);
+    errdefer allocator.free(links);
+    @memset(links, .{});
+    var latest: std.StringHashMapUnmanaged(u32) = .empty;
+    defer latest.deinit(allocator);
+    for (journal.steps) |step| {
+        const found = try latest.getOrPut(allocator, step.path);
+        if (found.found_existing) {
+            const previous = found.value_ptr.*;
+            if (!expectationsEqual(journal.steps[previous].desired, step.expected))
+                return error.JournalCorrupt;
+            links[step.index].previous = previous;
+            links[previous].next = step.index;
+        }
+        found.value_ptr.* = step.index;
+    }
+    return links;
+}
+
+/// Exact equality of two recorded expectations, identity numbers included. It
+/// is the journal's own consistency check, not an observation comparison, so
+/// it compares every recorded field rather than only what a metadata write
+/// can change.
+fn expectationsEqual(left: Expectation, right: Expectation) bool {
+    return switch (left) {
+        .absent => right == .absent,
+        .present => |value| switch (right) {
+            .absent => false,
+            .present => |other| statesEqual(value, other) and value.inode == other.inode and
+                value.link_count == other.link_count,
+        },
     };
 }
 
@@ -2926,16 +3157,23 @@ fn forward(engine: *Engine, content: Content, applied: *usize) Error!void {
 fn applyStep(engine: *Engine, step: Step, content: Content) Error!void {
     for (step.boundaries()) |boundary| {
         if (engine.progress.state(step.index).rank() >= boundary.rank()) continue;
+        var identity: Identity = .unbound;
         switch (boundary) {
             .staged => try stageStep(engine, step, content),
             .backup_captured => try captureBackup(engine, step),
             .published => try publishStep(engine, step),
             .metadata_applied => try applyStepMetadata(engine, step),
             .parent_synced => try syncParent(engine, step),
-            .verified => try verifyStep(engine, step),
+            // Verification is the boundary that makes the published state
+            // authoritative, so the entry it proved is bound in the very
+            // record that publishes it. A crash before that record leaves the
+            // step unverified, and no later step on the same path can start
+            // until it verifies, so no successor can ever advance on an
+            // identity this transaction did not durably bind.
+            .verified => identity = try verifyStep(engine, step),
             .prepared, .completed, .reverted => unreachable,
         }
-        try engine.publishState(step.index, boundary);
+        try engine.publishState(step.index, boundary, identity);
     }
 }
 
@@ -3065,14 +3303,22 @@ fn readSource(engine: *Engine, step: Step) Error![]const u8 {
 /// old inode until the whole transaction verifies.
 fn captureBackup(engine: *Engine, step: Step) Error!void {
     const backup = backupFor(step) orelse return;
-    const expected = switch (step.expected) {
+    switch (step.expected) {
         .absent => return,
-        .present => |value| value,
-    };
+        .present => {},
+    }
     var observation: Observation = .{};
     try requirePrecondition(engine, step, &observation, false);
+    // The precondition just proved the target is the recorded old entry, so
+    // the inode it is holding right now is the one a backup has to name. A
+    // recorded state cannot be compared here instead: the state an earlier
+    // step of this plan produced carries no inode of its own.
+    const held = switch (observation.state) {
+        .absent => return engine.reject(.backup, .precondition_failed, step.index, .backup_link),
+        .present => |value| value,
+    };
     if (engine.root.entryIfExists(backup.path()) catch null) |existing| {
-        if (existing.inode == expected.inode) return;
+        if (existing.inode == held.inode and held.inode != 0) return;
         removeWorkspaceEntry(engine, backup.path()) catch
             return engine.reject(.backup, .io_failed, step.index, .backup_link);
     }
@@ -3125,15 +3371,134 @@ fn requirePrecondition(
 /// closed set of states this transaction itself could have produced.
 fn classify(engine: *Engine, step: Step, observation: Observation, phase: Phase) Error!Reach {
     const actual = observation.state;
-    if (matches(actual, step.expected)) return .expected;
+    const bound = precondition(engine, step);
+    if (matchesPrecondition(actual, step.expected, bound)) return .expected;
     if (matches(actual, step.desired)) return .desired;
-    return if (try selfProduced(engine, step, observation, phase)) .intermediate else .foreign;
+    return if (try selfProduced(engine, step, observation, phase, bound))
+        .intermediate
+    else
+        .foreign;
+}
+
+/// Where the inode behind one step's recorded precondition comes from.
+///
+/// A journal states the shape of a precondition - kind, content, metadata -
+/// but it can only state the inode of a state preflight observed. The state
+/// an earlier step of the same plan produces has no inode until that step
+/// runs, so its identity is whatever the producing step's verified boundary
+/// durably bound.
+const Precondition = union(enum) {
+    /// The step expects nothing at its path, so there is no inode to bind.
+    absent,
+    /// The exact entry the recorded precondition names.
+    bound: Bound,
+    /// The precondition is a state an earlier step of this plan produces and
+    /// no verified boundary has bound an inode to it. That is only true
+    /// before the producing step verified, and the forward pass reaches a
+    /// step only after every earlier step verified, so it is also proof that
+    /// this step has not run.
+    pending,
+    /// The precondition names an entry whose inode the platform never
+    /// reported. Nothing can be authenticated against it, so nothing is.
+    unreported,
+};
+
+/// One resolved identity, plus the step that bound it. Contributions to a
+/// link count from steps at or before that step are already inside
+/// `link_count`, which is what keeps a count observed part way through a
+/// transaction from being double counted.
+const Bound = struct {
+    device: u64,
+    inode: u64,
+    link_count: u64,
+    /// The step whose verified boundary observed `link_count`, or null when
+    /// preflight observed it before the transaction started.
+    since: ?u32,
+};
+
+/// The identity an observation of `step`'s own path is compared against, or
+/// null when the recorded precondition names no entry at all.
+///
+/// A platform that reports no inode numbers yields the degenerate identity
+/// zero, which is exactly the structural comparison such a platform has
+/// always had: it still refuses every entry whose inode *is* reported, so it
+/// admits nothing a platform with inodes would admit.
+fn comparableIdentity(bound: Precondition, old: State, device: u64) ?Bound {
+    return switch (bound) {
+        .bound => |value| value,
+        .unreported => .{
+            .device = device,
+            .inode = 0,
+            .link_count = old.link_count,
+            .since = null,
+        },
+        // Nothing is recorded at the path, or the step that owes it the
+        // recorded state has not run, so there is nothing to compare.
+        .absent, .pending => null,
+    };
+}
+
+fn precondition(engine: *const Engine, step: Step) Precondition {
+    const expected = switch (step.expected) {
+        .absent => return .absent,
+        .present => |value| value,
+    };
+    const producer = engine.producer(step.index) orelse {
+        if (expected.inode == 0) return .unreported;
+        return .{ .bound = .{
+            .device = engine.owned.journal.device,
+            .inode = expected.inode,
+            .link_count = expected.link_count,
+            .since = null,
+        } };
+    };
+    const recorded = engine.progress.identity(producer);
+    if (!recorded.bound()) return .pending;
+    // A `set_metadata` step publishes the inode it found, so a recorded
+    // precondition can carry an inode number of its own even when the plan
+    // produced the state. The boundary that actually observed the entry wins:
+    // a journal states a prediction, and only a durable boundary states what
+    // the transaction really published.
+    return .{ .bound = .{
+        .device = recorded.device,
+        .inode = recorded.inode,
+        .link_count = recorded.link_count,
+        .since = producer,
+    } };
+}
+
+/// The recorded old state, on the exact inode a boundary bound to it.
+///
+/// An entry of the same kind holding the same bytes with the same metadata is
+/// still not the recorded entry when it is a different inode: that is exactly
+/// what an external replacement looks like, and admitting it would let a
+/// metadata step stamp the plan's ownership onto a substituted file and let a
+/// rollback restore over one. The inode is only compared when a boundary
+/// actually bound one, so a platform that reports no inodes keeps the
+/// structural comparison it always had.
+fn matchesPrecondition(actual: Expectation, expected: Expectation, bound: Precondition) bool {
+    if (!matches(actual, expected)) return false;
+    const identity = switch (bound) {
+        .bound => |value| value,
+        .absent, .pending, .unreported => return true,
+    };
+    const found = switch (actual) {
+        .absent => return true,
+        .present => |value| value,
+    };
+    return found.inode == identity.inode;
 }
 
 /// The complete reachable-state model. Everything it accepts, this
 /// transaction wrote itself between two durable boundaries; everything it
 /// refuses becomes `recovery_required`.
-fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Phase) Error!bool {
+fn selfProduced(
+    engine: *Engine,
+    step: Step,
+    observation: Observation,
+    phase: Phase,
+    bound: Precondition,
+) Error!bool {
     const expected = switch (step.expected) {
         .absent => null,
         .present => |value| value,
@@ -3148,26 +3513,30 @@ fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Ph
     // a different filesystem was never this transaction's work.
     if (observation.modeled and observation.device != engine.owned.journal.device) return false;
 
-    // The recorded inode is still there, so only its metadata can have moved,
+    // The bound inode is still there, so only its metadata can have moved,
     // and the ordered writes say exactly how far. Its link count may have
     // moved too, but only by the exact amount this transaction's own
     // journaled progress accounts for.
     if (expected) |old| {
-        if (found.inode == old.inode and
-            linkCountReachable(engine, step, old, found.link_count, phase) and
-            identityEqual(found, old))
-        {
-            const desired = switch (step.desired) {
-                // A removal writes no metadata, so the recorded old metadata
-                // is the only combination reachable, and that is already
-                // `expected`.
-                .absent => return false,
-                .present => |value| value,
-            };
-            if (!writesMetadataInPlace(step)) return false;
-            if (!identityEqual(found, desired)) return false;
-            const set = reachableMetadata(old.kind, old.metadata, desired.metadata, phase);
-            return set.contains(found.metadata);
+        if (comparableIdentity(bound, old, engine.owned.journal.device)) |identity| {
+            if (found.inode == identity.inode and
+                (identity.device == 0 or !observation.modeled or
+                    observation.device == identity.device) and
+                linkCountReachable(engine, step, old, identity, found.link_count, phase) and
+                identityEqual(found, old))
+            {
+                const desired = switch (step.desired) {
+                    // A removal writes no metadata, so the recorded old
+                    // metadata is the only combination reachable, and that is
+                    // already `expected`.
+                    .absent => return false,
+                    .present => |value| value,
+                };
+                if (!writesMetadataInPlace(step)) return false;
+                if (!identityEqual(found, desired)) return false;
+                const set = reachableMetadata(old.kind, old.metadata, desired.metadata, phase);
+                return set.contains(found.metadata);
+            }
         }
     }
 
@@ -3178,7 +3547,7 @@ fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Ph
     // transaction can have created a directory at this path in this
     // direction, and that the directory is still empty and therefore still
     // exactly as removable as when it was made.
-    if (found.kind == .directory and directoryCreationReachable(engine, step, phase, found))
+    if (found.kind == .directory and directoryCreationReachable(engine, step, phase, found, bound))
         return emptyDirectory(engine, step);
 
     // A symbolic link the transaction re-created from the journal while
@@ -3290,12 +3659,18 @@ fn removalReachable(engine: *const Engine, step: Step, phase: Phase) bool {
 /// two boundaries the journal shows are still owed. While restoring, it is
 /// additionally any step whose recorded old state is a directory the
 /// restoration has to re-create from the journal, which is provably a
-/// different inode from the recorded one.
+/// different inode from the one bound to that recorded state.
+///
+/// "Different from nothing" proves nothing, so a recorded directory no
+/// boundary has bound an inode to admits no directory at all: without a bound
+/// inode this test would accept any empty directory an outside writer left at
+/// the path, which is exactly the substitution the model exists to refuse.
 fn directoryCreationReachable(
     engine: *const Engine,
     step: Step,
     phase: Phase,
     found: State,
+    bound: Precondition,
 ) bool {
     const created_forward = step.kind == .create_directory and switch (step.expected) {
         .absent => true,
@@ -3307,10 +3682,15 @@ fn directoryCreationReachable(
     if (created_forward and (insideBoundary(engine, step, .published) or
         insideBoundary(engine, step, .metadata_applied))) return true;
     if (phase != .restore) return false;
-    return switch (step.expected) {
-        .absent => false,
-        .present => |old| old.kind == .directory and found.inode != old.inode,
+    switch (step.expected) {
+        .absent => return false,
+        .present => |old| if (old.kind != .directory) return false,
+    }
+    const identity = switch (bound) {
+        .bound => |value| value,
+        .absent, .pending, .unreported => return false,
     };
+    return found.inode != identity.inode;
 }
 
 // ---------------------------------------------------------------------------
@@ -3326,35 +3706,52 @@ fn directoryCreationReachable(
 //
 // Neither is a guess: the plan names the entries that do it and the progress
 // log says how far each of them got. The model below therefore computes the
-// exact set of counts this transaction can have produced on one recorded
-// inode - a closed interval, because each contributing entry moves the count
-// by exactly one and does so independently - and refuses everything outside
-// it. It is consulted only after the recorded inode number itself matched, so
+// exact set of counts this transaction can have produced on one bound inode -
+// a closed interval, because each contributing entry moves the count by
+// exactly one and does so independently - and refuses everything outside it.
+// It is consulted only after the bound inode number itself matched, so
 // nothing it accepts is a different inode wearing the recorded identity.
+//
+// The baseline is the count the boundary that bound the inode observed, which
+// is not always the count that existed before the transaction started: a
+// contribution taken before that boundary is already inside it, so what the
+// model asks about those is whether the link has since been given back.
 
 /// How much of one contributing step's effect on a link count is durably
 /// known. `uncertain` is a boundary that may or may not have run, and
 /// contributes either nothing or its whole delta.
 const Certainty = enum { none, uncertain, applied };
 
-/// The closed set of link counts one recorded inode can hold: every integer
+/// The closed set of link counts one bound inode can hold: every integer
 /// from `lower` to `upper`. The arithmetic is signed and wide so a plan that
 /// removes more links than a count holds can never wrap into acceptance.
 const LinkCounts = struct {
     lower: i128,
     upper: i128,
 
-    fn add(self: *LinkCounts, delta: i64, certainty: Certainty) void {
-        switch (certainty) {
+    /// `counted` says the contribution was already inside the count the
+    /// identity recorded, in which case what is open is whether it has since
+    /// been given back rather than whether it was ever made. Certainty is
+    /// therefore read backwards for it: a contribution still in place moves
+    /// nothing, and one provably gone moves the count by its own delta the
+    /// other way.
+    fn add(self: *LinkCounts, delta: i64, certainty: Certainty, counted: bool) void {
+        const effective = if (counted) -delta else delta;
+        const reached: Certainty = if (!counted) certainty else switch (certainty) {
+            .applied => .none,
+            .none => .applied,
+            .uncertain => .uncertain,
+        };
+        switch (reached) {
             .none => {},
             .applied => {
-                self.lower += delta;
-                self.upper += delta;
+                self.lower += effective;
+                self.upper += effective;
             },
-            .uncertain => if (delta < 0) {
-                self.lower += delta;
+            .uncertain => if (effective < 0) {
+                self.lower += effective;
             } else {
-                self.upper += delta;
+                self.upper += effective;
             },
         }
     }
@@ -3366,28 +3763,43 @@ const LinkCounts = struct {
 };
 
 /// True when `found` is a link count this transaction itself can have
-/// produced on the recorded inode.
+/// produced on the bound inode.
 fn linkCountReachable(
     engine: *const Engine,
     step: Step,
     old: State,
+    identity: Bound,
     found: u64,
     phase: Phase,
 ) bool {
-    // The recorded count is always admissible: it is the count the journal
-    // observed, and a filesystem that does not maintain directory link counts
-    // reports it unchanged however many subdirectories this plan makes.
-    if (found == old.link_count) return true;
-    return reachableLinkCounts(engine, step, old, phase).contains(found);
+    // The bound count is always admissible: it is the count a boundary
+    // actually observed, and a filesystem that does not maintain directory
+    // link counts reports it unchanged however many subdirectories this plan
+    // makes.
+    if (found == identity.link_count) return true;
+    return reachableLinkCounts(engine, step, old, identity, phase).contains(found);
 }
 
-/// Every link count the recorded inode behind `step` can hold right now,
-/// derived from this transaction's plan and its journaled progress.
-fn reachableLinkCounts(engine: *const Engine, step: Step, old: State, phase: Phase) LinkCounts {
-    var counts: LinkCounts = .{ .lower = old.link_count, .upper = old.link_count };
+/// Every link count the bound inode behind `step` can hold right now, derived
+/// from this transaction's plan and its journaled progress.
+///
+/// The baseline is the count the boundary that bound the inode observed, so a
+/// contribution that was already inside it is modeled by whether it has since
+/// been given back rather than by whether it was ever made. Counting it a
+/// second time would shift the whole interval and admit exactly one outside
+/// hard link.
+fn reachableLinkCounts(
+    engine: *const Engine,
+    step: Step,
+    old: State,
+    identity: Bound,
+    phase: Phase,
+) LinkCounts {
+    var counts: LinkCounts = .{ .lower = identity.link_count, .upper = identity.link_count };
     if (old.kind == .symlink) return counts;
     const frontier = forwardFrontier(engine);
     for (engine.owned.journal.steps) |other| {
+        const counted = if (identity.since) |already| other.index <= already else false;
         switch (old.kind) {
             .directory => {
                 if (!directChild(other.path, step.path)) continue;
@@ -3395,14 +3807,17 @@ fn reachableLinkCounts(engine: *const Engine, step: Step, old: State, phase: Pha
                 if (delta == 0) continue;
                 // The `mkdir` and the `rmdir` both happen inside the child
                 // step's publication boundary.
-                counts.add(delta, treeCertainty(engine, other, .published, step, phase, frontier));
+                counts.add(
+                    delta,
+                    treeCertainty(engine, other, .published, step, phase, frontier),
+                    counted,
+                );
             },
             .regular => {
-                // A hard link this plan stages from the recorded path adds a
+                // A hard link this plan stages from the bound inode adds a
                 // link the moment it is staged and keeps it when the
                 // publication renames the staged link into place.
-                if (other.kind == .publish_hard_link and other.source != null and
-                    std.mem.eql(u8, other.source.?, step.path))
+                if (linksFromTarget(engine, other, step, identity.inode))
                     counts.add(1, workspaceCertainty(
                         engine,
                         other,
@@ -3410,11 +3825,11 @@ fn reachableLinkCounts(engine: *const Engine, step: Step, old: State, phase: Pha
                         step,
                         phase,
                         frontier,
-                    ));
-                // A backup of the recorded path is a hard link to the very
+                    ), counted);
+                // A backup of the bound inode is a hard link to the very
                 // inode being classified, held until the workspace is
                 // released.
-                if (backsUpTarget(other, step, old))
+                if (backsUpTarget(engine, other, step, identity.inode))
                     counts.add(1, workspaceCertainty(
                         engine,
                         other,
@@ -3422,7 +3837,7 @@ fn reachableLinkCounts(engine: *const Engine, step: Step, old: State, phase: Pha
                         step,
                         phase,
                         frontier,
-                    ));
+                    ), counted);
             },
             .symlink => unreachable,
         }
@@ -3467,20 +3882,51 @@ fn subdirectoryDelta(step: Step) i64 {
     return after - before;
 }
 
-/// True when `other` captures a backup of the exact inode `step` is holding
-/// at its own path. The backup is a hard link to whatever is at `other.path`
-/// when it runs, so it counts when that path is this step's path and the
-/// inode there is the recorded one: either because `other` recorded the same
-/// inode, or because `other` runs later and this step leaves its own inode
-/// there.
-fn backsUpTarget(other: Step, step: Step, old: State) bool {
+/// True when `other` stages a hard link from the exact inode `step` is being
+/// classified on.
+///
+/// The link names whatever the source path was holding when it was staged,
+/// which is the entry the last step on that path before it published. That
+/// step's verified boundary bound it, and no link can have been staged before
+/// that boundary at all, so a link taken after some intervening step of the
+/// same plan republished the source is attributed to the inode that step
+/// published and never to the one under examination.
+fn linksFromTarget(engine: *const Engine, other: Step, step: Step, inode: u64) bool {
+    if (other.kind != .publish_hard_link) return false;
+    const source = other.source orelse return false;
+    if (!std.mem.eql(u8, source, step.path)) return false;
+    var holder = step.index;
+    while (engine.successor(holder)) |next| {
+        if (next >= other.index) break;
+        holder = next;
+    }
+    return engine.progress.identity(holder).inode == inode;
+}
+
+/// True when `other` holds a backup hard link to the exact inode `step` is
+/// being classified on.
+///
+/// A backup is a hard link to whatever `other.path` was holding when `other`
+/// captured it, so it counts only when that path is this step's path and the
+/// entry `other`'s own recorded precondition names is this very inode. That
+/// precondition is resolved exactly as this step's is - by the boundary that
+/// bound it - so a backup of an inode some intervening step published at the
+/// same path is attributed to that inode and never to this one, and a backup
+/// whose own precondition nothing has bound yet is attributed to nothing at
+/// all rather than to whichever inode happens to be under examination.
+fn backsUpTarget(engine: *const Engine, other: Step, step: Step, inode: u64) bool {
     if (other.backup_entry == null) return false;
     if (!std.mem.eql(u8, other.path, step.path)) return false;
-    return switch (other.expected) {
-        .absent => false,
-        .present => |state| state.inode == old.inode or
-            (state.inode == 0 and other.index > step.index),
+    const old = switch (other.expected) {
+        .absent => return false,
+        .present => |value| value,
     };
+    const identity = comparableIdentity(
+        precondition(engine, other),
+        old,
+        engine.owned.journal.device,
+    ) orelse return false;
+    return identity.inode == inode;
 }
 
 /// How far a contributing step got toward the boundary that makes its link
@@ -3721,9 +4167,10 @@ fn applyStepMetadata(engine: *Engine, step: Step) Error!void {
     // step, or a directory creation that has already taken the name - would
     // otherwise stamp the plan's mode, ownership, and timestamp onto whatever
     // entry now occupies the name. The entry must still be the recorded one,
-    // or a state only this step's own interrupted boundaries can have
-    // produced: the ordered metadata writes on the recorded inode, or the
-    // still-empty directory this step's own publication boundary created.
+    // on the inode bound to it, or a state only this step's own interrupted
+    // boundaries can have produced: the ordered metadata writes on that
+    // inode, or the still-empty directory this step's own publication
+    // boundary created.
     if (writesMetadataInPlace(step)) {
         var observation: Observation = .{};
         try requirePrecondition(engine, step, &observation, true);
@@ -3815,12 +4262,35 @@ fn syncParent(engine: *Engine, step: Step) Error!void {
         return engine.reject(.publication, .io_failed, step.index, .parent_sync);
 }
 
-fn verifyStep(engine: *Engine, step: Step) Error!void {
+/// Proves the step reached its desired state and binds the entry that state
+/// landed on. The bound identity is what a later step on the same path
+/// authenticates its own recorded precondition against, so it is observed
+/// here, at the one moment the state is known to be exactly the recorded one,
+/// and never inferred afterwards.
+fn verifyStep(engine: *Engine, step: Step) Error!Identity {
     try engine.hook(.verify, step.index);
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     if (!matches(observation.state, step.desired))
         return engine.reject(.verification, .verification_failed, step.index, .verify);
+    const state = switch (observation.state) {
+        // A removal publishes no entry, so it binds none.
+        .absent => return .unbound,
+        .present => |value| value,
+    };
+    // Every path in the plan lives on the device the journal pinned, so an
+    // entry that verified on another one is not the entry the plan compiled
+    // against, whatever it now holds.
+    if (observation.modeled and observation.device != engine.owned.journal.device)
+        return engine.reject(.verification, .verification_failed, step.index, .verify);
+    // A platform that cannot report an inode binds nothing rather than
+    // binding a zero that would later read as a wildcard.
+    if (state.inode == 0 or state.link_count == 0) return .unbound;
+    return .{
+        .device = engine.owned.journal.device,
+        .inode = state.inode,
+        .link_count = state.link_count,
+    };
 }
 
 fn removeWorkspaceEntry(engine: *Engine, path: root_fs.Path) !void {
@@ -3834,6 +4304,17 @@ fn removeWorkspaceEntry(engine: *Engine, path: root_fs.Path) !void {
 // ---------------------------------------------------------------------------
 // Rollback, release, and recovery
 // ---------------------------------------------------------------------------
+
+/// True when `step` cannot have touched its target at all, so its reversal is
+/// nothing rather than a restoration of a state that was never published.
+fn untouchedStep(engine: *const Engine, step: Step) bool {
+    switch (precondition(engine, step)) {
+        .pending => {},
+        .absent, .bound, .unreported => return false,
+    }
+    if (engine.progress.state(step.index) != .prepared) return false;
+    return step.index > forwardFrontier(engine);
+}
 
 /// Restores the recorded old state of every step in reverse order. Backups
 /// are still intact because they are released only after the whole
@@ -3851,7 +4332,7 @@ fn rollback(engine: *Engine) Error!Report {
             error.OutOfMemory => return error.OutOfMemory,
             else => return requireRecovery(engine),
         };
-        try engine.publishState(step.index, .reverted);
+        try engine.publishState(step.index, .reverted, .unbound);
         reverted += 1;
     }
     release(engine, .rolled_back) catch |err| switch (err) {
@@ -3865,6 +4346,21 @@ fn rollback(engine: *Engine) Error!Report {
 }
 
 fn revertStep(engine: *Engine, step: Step) Error!void {
+    // A step whose recorded precondition is a state an earlier step of this
+    // plan produces, and to which no verified boundary ever bound an inode,
+    // has provably done nothing at all: the forward pass reaches a step only
+    // after every earlier one verified, and a verified boundary binds the
+    // entry it published in the very record that publishes it. There is
+    // nothing of this step's to undo, and the path is owed the state the
+    // producing step is about to give back on its own turn further down the
+    // same reverse pass.
+    //
+    // Both halves of that proof are required. The step must still be at its
+    // own prepared boundary, and the forward pass must not have been able to
+    // reach it, so a platform that reports no inodes - where a producing step
+    // verifies without binding one - takes the ordinary classification and
+    // fails closed instead of skipping real work.
+    if (untouchedStep(engine, step)) return;
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     const actual = observation.state;
@@ -4327,6 +4823,148 @@ pub fn fuzzProgress(allocator: std.mem.Allocator, journal: Journal, bytes: []con
     progress.deinit();
 }
 
+/// The journal the progress-log corpus is replayed against: two steps on one
+/// path, which is the shape whose second step can only resolve its own
+/// recorded precondition against the entry the first one bound. Everything it
+/// names has static lifetime, so a checked-in log stays meaningful across
+/// runs and a mutated one exercises the record decoder, the chain, and the
+/// identity rules through the exact production replay.
+const fuzz_published: State = .{
+    .kind = .regular,
+    .metadata = .{ .mode = 0o644, .uid = 0, .gid = 0, .modified_nanoseconds = 0 },
+    .size = 4,
+    .content_sha256 = @splat(0x11),
+};
+
+const fuzz_remodeled: State = .{
+    .kind = .regular,
+    .metadata = .{ .mode = 0o600, .uid = 0, .gid = 0, .modified_nanoseconds = 0 },
+    .size = 4,
+    .content_sha256 = @splat(0x11),
+};
+
+const fuzz_steps = [_]Step{
+    .{
+        .index = 0,
+        .kind = .publish_file,
+        .path = "etc/fuzz",
+        .requires = &.{},
+        .overwrite = .replace,
+        .removal = .require_present,
+        .expected = .absent,
+        .desired = .{ .present = fuzz_published },
+        .staging_entry = "00000000",
+    },
+    .{
+        .index = 1,
+        .kind = .set_metadata,
+        .path = "etc/fuzz",
+        .requires = &.{0},
+        .overwrite = .replace,
+        .removal = .require_present,
+        .expected = .{ .present = fuzz_published },
+        .desired = .{ .present = fuzz_remodeled },
+    },
+};
+
+pub fn fuzzJournal() Journal {
+    var journal: Journal = .{
+        .attempt_id = @splat(0x22),
+        .attempt_generation = 1,
+        .attempt_digest_sha256 = @splat(0x33),
+        .install_root = "/",
+        .root_identity_sha256 = @splat(0x44),
+        .evidence = .{},
+        .device = 0x55,
+        .staging_bytes = 4,
+        .budget_bytes = 4096,
+        .steps = &fuzz_steps,
+        .steps_sha256 = stepsDigest(&fuzz_steps),
+        .digest_sha256 = @splat(0),
+    };
+    journal.digest_sha256 = journalDigest(journal);
+    return journal;
+}
+
+/// One boundary of the corpus seed. A journal-scoped record names no step and
+/// binds no entry, so both default.
+const SeedBoundary = struct {
+    scope: Scope,
+    index: u32 = ProgressRecord.no_index,
+    name: []const u8,
+    identity: Identity = .unbound,
+};
+
+/// The bound entry both verified boundaries of the seed publish: one inode,
+/// because the second step re-modes what the first one published.
+const fuzz_seed_identity: Identity = .{ .device = 0x55, .inode = 0x1234, .link_count = 1 };
+
+/// Boundaries of one complete transaction over `fuzzJournal`, in the exact
+/// order the engine publishes them.
+const fuzz_seed_boundaries = [_]SeedBoundary{
+    .{ .scope = .journal, .name = "prepared" },
+    .{ .scope = .journal, .name = "applying" },
+    .{ .scope = .step, .index = 0, .name = "staged" },
+    .{ .scope = .step, .index = 0, .name = "published" },
+    .{ .scope = .step, .index = 0, .name = "parent_synced" },
+    .{ .scope = .step, .index = 0, .name = "verified", .identity = fuzz_seed_identity },
+    .{ .scope = .step, .index = 1, .name = "metadata_applied" },
+    .{ .scope = .step, .index = 1, .name = "verified", .identity = fuzz_seed_identity },
+    .{ .scope = .journal, .name = "verified" },
+    .{ .scope = .journal, .name = "completing" },
+    .{ .scope = .journal, .name = "completed" },
+};
+
+/// Byte length of the checked-in progress-log corpus seed.
+pub const fuzz_seed_bytes: usize = fuzz_seed_boundaries.len * progress_record_bytes;
+
+/// Builds the exact log a complete transaction over `fuzzJournal` leaves
+/// behind. The checked-in corpus seed is compared against it, so a change to
+/// the record format or the chain is a failing test with a regenerated seed
+/// rather than a corpus that quietly stops parsing.
+pub fn fuzzSeedLog(buffer: *[fuzz_seed_bytes]u8) []const u8 {
+    const journal = fuzzJournal();
+    var chain = journal.digest_sha256;
+    var offset: usize = 0;
+    for (fuzz_seed_boundaries, 1..) |boundary, sequence| {
+        const record: ProgressRecord = .{
+            .sequence = sequence,
+            .scope = boundary.scope,
+            .index = boundary.index,
+            .stage = if (boundary.scope == .journal)
+                std.meta.stringToEnum(Stage, boundary.name).?
+            else
+                .applying,
+            .state = if (boundary.scope == .step)
+                std.meta.stringToEnum(StepState, boundary.name).?
+            else
+                .prepared,
+            .identity = boundary.identity,
+            .chain_sha256 = ProgressRecord.chain(
+                chain,
+                sequence,
+                boundary.scope,
+                boundary.index,
+                boundary.name,
+                boundary.identity,
+            ),
+        };
+        chain = record.chain_sha256;
+        var scratch: [progress_record_bytes]u8 = undefined;
+        @memcpy(buffer[offset..][0..progress_record_bytes], record.encode(&scratch));
+        offset += progress_record_bytes;
+    }
+    return buffer[0..offset];
+}
+
+/// Fuzz boundary for a progress log on its own, without a journal document in
+/// the same bytes. Every attacker-reachable log is replayed against the fixed
+/// synthetic journal, so record shape, chaining, and identity validation are
+/// all exercised by mutated corpus bytes.
+pub fn fuzzProgressLog(allocator: std.mem.Allocator, bytes: []const u8) void {
+    fuzzProgress(allocator, fuzzJournal(), bytes);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4459,6 +5097,27 @@ fn expectDiagnostic(fixture: *Fixture, intents: []const Intent, code: Code) !voi
         },
         .diagnostic => |diagnostic| try testing.expectEqual(code, diagnostic.code),
     }
+}
+
+/// The entry one step's recorded precondition resolves to, which is either
+/// preflight's own observation or the identity a producing step bound.
+fn boundPrecondition(engine: *const Engine, index: u32) !Bound {
+    return switch (precondition(engine, engine.journal().steps[index])) {
+        .bound => |value| value,
+        else => error.PreconditionUnbound,
+    };
+}
+
+/// Publishes a step's verified boundary with the entry its path is actually
+/// holding, exactly as `applyStep` does after `verifyStep` proved it.
+fn publishVerified(engine: *Engine, index: u32) !void {
+    const step = engine.journal().steps[index];
+    const found = try engine.root.entry(.{ .text = step.path });
+    try engine.publishState(index, .verified, .{
+        .device = engine.journal().device,
+        .inode = found.inode,
+        .link_count = found.link_count,
+    });
 }
 
 test "root_mutation.test.journal round trips through its canonical encoding" {
@@ -5074,6 +5733,162 @@ test "root_mutation.test.corrupt journals and progress logs fail closed" {
     const replayed = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ log, log });
     defer testing.allocator.free(replayed);
     try root.publishFile(progress_file, replayed, .{});
+    try testing.expectError(
+        error.ProgressCorrupt,
+        open(testing.allocator, root, &fixture.attempt, .{}),
+    );
+}
+
+test "root_mutation.test.a forged identity record is refused even when it chains" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const intents = seedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    const journal = engine.journal();
+    const sequence = engine.progress.sequence;
+    const chain = engine.progress.chain_sha256;
+    const device = journal.device;
+    engine.deinit();
+
+    const progress_file = try root_fs.Path.init(progress_path);
+    const log = try root.readFileAlloc(testing.allocator, progress_file, maximum_progress_bytes);
+    defer testing.allocator.free(log);
+
+    // Everything a forger can reach is chained, so the only forgeries left to
+    // refuse are the ones that chain correctly and still say something the
+    // journal contradicts. Step 5 removes `etc/doomed` and step 7 re-modes
+    // `etc/meta`; only a boundary that publishes an entry may bind one.
+    const forgeries = [_]struct {
+        name: []const u8,
+        record: ProgressRecord,
+    }{
+        .{ .name = "a stage record binding an entry", .record = .{
+            .sequence = sequence + 1,
+            .scope = .journal,
+            .index = ProgressRecord.no_index,
+            .stage = .applying,
+            .state = .prepared,
+            .identity = .{ .device = device, .inode = 0x2a, .link_count = 1 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "an unverified boundary binding an entry", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 7,
+            .stage = .applying,
+            .state = .metadata_applied,
+            .identity = .{ .device = device, .inode = 0x2a, .link_count = 1 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "a removal binding an entry", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 5,
+            .stage = .applying,
+            .state = .verified,
+            .identity = .{ .device = device, .inode = 0x2a, .link_count = 1 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "an entry on another device", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 7,
+            .stage = .applying,
+            .state = .verified,
+            .identity = .{ .device = device +% 1, .inode = 0x2a, .link_count = 1 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "an inode with no links", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 7,
+            .stage = .applying,
+            .state = .verified,
+            .identity = .{ .device = device, .inode = 0x2a, .link_count = 0 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "a link count with no inode", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 7,
+            .stage = .applying,
+            .state = .verified,
+            .identity = .{ .device = 0, .inode = 0, .link_count = 2 },
+            .chain_sha256 = undefined,
+        } },
+        .{ .name = "a device with no inode", .record = .{
+            .sequence = sequence + 1,
+            .scope = .step,
+            .index = 7,
+            .stage = .applying,
+            .state = .verified,
+            .identity = .{ .device = device, .inode = 0, .link_count = 0 },
+            .chain_sha256 = undefined,
+        } },
+    };
+    for (forgeries) |forgery| {
+        var record = forgery.record;
+        record.chain_sha256 = ProgressRecord.chain(
+            chain,
+            record.sequence,
+            record.scope,
+            record.index,
+            record.name(),
+            record.identity,
+        );
+        var buffer: [progress_record_bytes]u8 = undefined;
+        const forged = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{
+            log,
+            record.encode(&buffer),
+        });
+        defer testing.allocator.free(forged);
+        try root.publishFile(progress_file, forged, .{});
+        testing.expectError(
+            error.ProgressCorrupt,
+            open(testing.allocator, root, &fixture.attempt, .{}),
+        ) catch |err| {
+            std.debug.print("forgery accepted: {s}\n", .{forgery.name});
+            return err;
+        };
+    }
+
+    // The same record with an identity the journal does allow chains, decodes,
+    // and is accepted, so the refusals above are about the evidence rather
+    // than about the shape.
+    var honest: ProgressRecord = forgeries[1].record;
+    honest.state = .verified;
+    honest.chain_sha256 = ProgressRecord.chain(
+        chain,
+        honest.sequence,
+        honest.scope,
+        honest.index,
+        honest.name(),
+        honest.identity,
+    );
+    var buffer: [progress_record_bytes]u8 = undefined;
+    const accepted = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{
+        log,
+        honest.encode(&buffer),
+    });
+    defer testing.allocator.free(accepted);
+    try root.publishFile(progress_file, accepted, .{});
+    var reopened = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer reopened.deinit();
+    try testing.expectEqual(@as(u64, 0x2a), reopened.progress.identity(7).inode);
+
+    // Editing a bound identity without rebuilding the chain is corruption:
+    // the evidence is part of the chained preimage, not a comment beside it.
+    const tampered = try testing.allocator.dupe(u8, accepted);
+    defer testing.allocator.free(tampered);
+    const identity_digit = accepted.len - progress_record_bytes + 91;
+    tampered[identity_digit] = if (tampered[identity_digit] == 'a') 'b' else 'a';
+    try root.publishFile(progress_file, tampered, .{});
     try testing.expectError(
         error.ProgressCorrupt,
         open(testing.allocator, root, &fixture.attempt, .{}),
@@ -5720,6 +6535,18 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
             };
             progress.deinit();
         }
+
+        fn openOnce(
+            allocator: std.mem.Allocator,
+            root: root_fs.Root,
+            attempt: *root_operation.Attempt,
+        ) !void {
+            var engine = open(allocator, root, attempt, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return,
+            } orelse return;
+            engine.deinit();
+        }
     };
 
     var fixture: Fixture = undefined;
@@ -5753,6 +6580,14 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
         testing.allocator,
         Case.replayOnce,
         .{ engine.journal(), log },
+    );
+    // Reopening reads the journal, replays the log, and links every step
+    // whose precondition an earlier step produces, so it is the path a
+    // recovery takes and every allocation on it must fail closed.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        Case.openOnce,
+        .{ root, &fixture.attempt },
     );
 }
 
@@ -5881,21 +6716,41 @@ test "root_mutation.test.progress records have one fixed canonical shape" {
     try testing.expectEqual(record.scope, decoded.scope);
     try testing.expectEqual(record.index, decoded.index);
     try testing.expectEqual(record.state, decoded.state);
+    try testing.expect(!decoded.identity.bound());
     try testing.expectEqualSlices(u8, &record.chain_sha256, &decoded.chain_sha256);
+
+    // A bound identity is the same fixed width as an unbound one, whatever
+    // the values, so binding an entry never changes a record's length.
+    var identified: ProgressRecord = record;
+    identified.state = .verified;
+    identified.identity = .{
+        .device = std.math.maxInt(u64),
+        .inode = std.math.maxInt(u64),
+        .link_count = std.math.maxInt(u64),
+    };
+    const wide = identified.encode(&buffer);
+    try testing.expectEqual(progress_record_bytes, wide.len);
+    const wide_decoded = try decodeProgressRecord(wide[0 .. wide.len - 1]);
+    try testing.expect(wide_decoded.identity.eql(identified.identity));
+    identified.identity = .{ .device = 0x2a, .inode = 0x1b, .link_count = 3 };
+    const narrow = identified.encode(&buffer);
+    try testing.expectEqual(progress_record_bytes, narrow.len);
+    try testing.expect((try decodeProgressRecord(narrow[0 .. narrow.len - 1]))
+        .identity.eql(identified.identity));
 
     // Every longest boundary name still fits the fixed field.
     inline for (@typeInfo(StepState).@"enum".fields) |field| {
-        var wide: ProgressRecord = record;
-        wide.state = @field(StepState, field.name);
-        try testing.expectEqual(progress_record_bytes, wide.encode(&buffer).len);
+        var state_record: ProgressRecord = record;
+        state_record.state = @field(StepState, field.name);
+        try testing.expectEqual(progress_record_bytes, state_record.encode(&buffer).len);
         _ = try decodeProgressRecord(buffer[0 .. progress_record_bytes - 1]);
     }
     inline for (@typeInfo(Stage).@"enum".fields) |field| {
-        var wide: ProgressRecord = record;
-        wide.scope = .journal;
-        wide.index = ProgressRecord.no_index;
-        wide.stage = @field(Stage, field.name);
-        try testing.expectEqual(progress_record_bytes, wide.encode(&buffer).len);
+        var stage_record: ProgressRecord = record;
+        stage_record.scope = .journal;
+        stage_record.index = ProgressRecord.no_index;
+        stage_record.stage = @field(Stage, field.name);
+        try testing.expectEqual(progress_record_bytes, stage_record.encode(&buffer).len);
         _ = try decodeProgressRecord(buffer[0 .. progress_record_bytes - 1]);
     }
 
@@ -5911,6 +6766,24 @@ test "root_mutation.test.progress records have one fixed canonical shape" {
         error.ProgressCorrupt,
         decodeProgressRecord(damaged[0 .. progress_record_bytes - 1]),
     );
+    // Each identity column has its own separator, and a non-hexadecimal digit
+    // in any of them is corruption rather than a zero.
+    for ([_]usize{ 75, 92, 109 }) |separator| {
+        damaged = buffer;
+        damaged[separator] = 'x';
+        try testing.expectError(
+            error.ProgressCorrupt,
+            decodeProgressRecord(damaged[0 .. progress_record_bytes - 1]),
+        );
+    }
+    for ([_]usize{ 60, 77, 94 }) |digit| {
+        damaged = buffer;
+        damaged[digit] = 'g';
+        try testing.expectError(
+            error.ProgressCorrupt,
+            decodeProgressRecord(damaged[0 .. progress_record_bytes - 1]),
+        );
+    }
     damaged = buffer;
     @memcpy(damaged[34..41], "unknown");
     try testing.expectError(
@@ -7234,15 +8107,35 @@ test "root_mutation.test.the reachable link counts are exactly this plan's own l
     };
     try testing.expectEqual(@as(u64, 2), directory.link_count);
     try testing.expectEqual(@as(u64, 1), file.link_count);
+    // No two of these steps share a path, so every precondition here is
+    // preflight's own observation and binds the inode it observed.
+    const directory_bound = try boundPrecondition(&engine, 1);
+    const file_bound = try boundPrecondition(&engine, 4);
+    try testing.expectEqual(directory.inode, directory_bound.inode);
+    try testing.expect(directory_bound.since == null);
 
     // Nothing has been applied, so nothing but the recorded count is
     // reachable - and the recorded count is always reachable.
     for ([_]Phase{ .forward, .restore }) |phase| {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, phase);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, phase);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 3, phase));
-        try testing.expect(linkCountReachable(&engine, steps[1], directory, 2, phase));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            3,
+            phase,
+        ));
+        try testing.expect(linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            2,
+            phase,
+        ));
     }
 
     // Once mutation is authorized the first step is inside its own
@@ -7250,45 +8143,66 @@ test "root_mutation.test.the reachable link counts are exactly this plan's own l
     // step is still past the forward pass's frontier and has done nothing.
     try engine.publishStage(.applying);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .forward);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 3), counts.upper);
     }
     // Once the `mkdir` is durable the extra link is certain, and one more
     // than that is refused.
-    try engine.publishState(0, .published);
+    try engine.publishState(0, .published, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .forward);
         try testing.expectEqual(@as(i128, 3), counts.lower);
         try testing.expectEqual(@as(i128, 3), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 4, .forward));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            4,
+            .forward,
+        ));
         // The recorded count stays admissible: a filesystem that does not
         // maintain directory link counts reports it unchanged.
-        try testing.expect(linkCountReachable(&engine, steps[1], directory, 2, .forward));
+        try testing.expect(linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            2,
+            .forward,
+        ));
     }
 
     // The second subdirectory is only reachable once the pass has actually
     // got to it, and it adds exactly one more link.
-    try engine.publishState(0, .verified);
-    try engine.publishState(1, .verified);
+    try engine.publishState(0, .verified, .unbound);
+    try engine.publishState(1, .verified, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .forward);
         try testing.expectEqual(@as(i128, 3), counts.lower);
         try testing.expectEqual(@as(i128, 4), counts.upper);
     }
-    try engine.publishState(2, .verified);
+    try engine.publishState(2, .verified, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .forward);
         try testing.expectEqual(@as(i128, 4), counts.lower);
         try testing.expectEqual(@as(i128, 4), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 5, .forward));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            5,
+            .forward,
+        ));
     }
     // A file replacing a file and a directory two levels down are not links
     // on this directory at all.
-    try engine.publishState(3, .verified);
-    try engine.publishState(6, .verified);
+    try engine.publishState(3, .verified, .unbound);
+    try engine.publishState(6, .verified, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .forward);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .forward);
         try testing.expectEqual(@as(i128, 4), counts.lower);
         try testing.expectEqual(@as(i128, 4), counts.upper);
     }
@@ -7296,27 +8210,36 @@ test "root_mutation.test.the reachable link counts are exactly this plan's own l
     // A hard link is a link on its source's inode from the moment it is
     // staged. Before the pass reaches the linking step, nothing is staged.
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 1), counts.upper);
     }
-    try engine.publishState(4, .verified);
+    // The linking step names the inode the metadata step's verified boundary
+    // bound, so the link is attributed only once that boundary is durable.
+    try publishVerified(&engine, 4);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
-    try engine.publishState(5, .staged);
+    try engine.publishState(5, .staged, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[4], file, 3, .forward));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[4],
+            file,
+            file_bound,
+            3,
+            .forward,
+        ));
     }
     // Publication renames the staged link into place; the link itself stays.
-    try engine.publishState(5, .published);
+    try engine.publishState(5, .published, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
@@ -7325,29 +8248,36 @@ test "root_mutation.test.the reachable link counts are exactly this plan's own l
     // restored every later step has already given its links back and every
     // earlier one still holds them.
     try engine.publishStage(.rolling_back);
-    try engine.publishState(6, .reverted);
-    try engine.publishState(5, .reverted);
+    try engine.publishState(6, .reverted, .unbound);
+    try engine.publishState(5, .reverted, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .restore);
         // The published link went with the step, but the staged entry it was
         // renamed from is only released after the whole restoration.
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
-    try engine.publishState(4, .reverted);
-    try engine.publishState(3, .reverted);
-    try engine.publishState(2, .reverted);
+    try engine.publishState(4, .reverted, .unbound);
+    try engine.publishState(3, .reverted, .unbound);
+    try engine.publishState(2, .reverted, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .restore);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .restore);
         // The later subdirectory is gone; the earlier one is still there.
         try testing.expectEqual(@as(i128, 3), counts.lower);
         try testing.expectEqual(@as(i128, 3), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[1], directory, 4, .restore));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[1],
+            directory,
+            directory_bound,
+            4,
+            .restore,
+        ));
     }
-    try engine.publishState(1, .reverted);
-    try engine.publishState(0, .reverted);
+    try engine.publishState(1, .reverted, .unbound);
+    try engine.publishState(0, .reverted, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[1], directory, .restore);
+        const counts = reachableLinkCounts(&engine, steps[1], directory, directory_bound, .restore);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
@@ -7356,13 +8286,13 @@ test "root_mutation.test.the reachable link counts are exactly this plan's own l
     // is uncertain while it runs and gone once it is finished.
     try engine.publishStage(.releasing_rollback);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .restore);
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
     try engine.publishStage(.rolled_back);
     {
-        const counts = reachableLinkCounts(&engine, steps[4], file, .restore);
+        const counts = reachableLinkCounts(&engine, steps[4], file, file_bound, .restore);
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 1), counts.upper);
     }
@@ -7393,27 +8323,330 @@ test "root_mutation.test.a backup is a link on the inode it preserves" {
         .present => |state| state,
     };
     try testing.expect(steps[1].backup_entry != null);
+    const file_bound = try boundPrecondition(&engine, 0);
     try engine.publishStage(.applying);
-    try engine.publishState(0, .verified);
+    // The replacement's own precondition is the metadata step's desired
+    // state, which carries no inode of its own: until the metadata step's
+    // verified boundary binds the entry it published, the backup that step
+    // will capture is attributed to nothing.
+    try testing.expectEqual(Precondition.pending, precondition(&engine, steps[1]));
+    try engine.publishState(1, .staged, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[0], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 1), counts.upper);
     }
-    // Inside the backup boundary the link may or may not exist yet.
-    try engine.publishState(1, .staged);
+    try publishVerified(&engine, 0);
     {
-        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[0], file, file_bound, .forward);
+        // Inside the backup boundary the link may or may not exist yet.
         try testing.expectEqual(@as(i128, 1), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
     }
-    try engine.publishState(1, .backup_captured);
+    try engine.publishState(1, .backup_captured, .unbound);
     {
-        const counts = reachableLinkCounts(&engine, steps[0], file, .forward);
+        const counts = reachableLinkCounts(&engine, steps[0], file, file_bound, .forward);
         try testing.expectEqual(@as(i128, 2), counts.lower);
         try testing.expectEqual(@as(i128, 2), counts.upper);
-        try testing.expect(!linkCountReachable(&engine, steps[0], file, 3, .forward));
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[0],
+            file,
+            file_bound,
+            3,
+            .forward,
+        ));
     }
+}
+
+test "root_mutation.test.a backup is attributed to the inode it actually preserves" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "etc/tool", "payload\n");
+
+    // Three steps on one path: the original inode is replaced, the
+    // replacement's metadata is rewritten, and the replacement is itself
+    // replaced. The last step's backup is a hard link to the inode the first
+    // replacement published, and to nothing else - attributing it to the
+    // original inode as well would admit exactly one outside hard link on an
+    // entry the plan is about to restore.
+    const intents = [_]Intent{
+        fileIntent("etc/tool", "one\n"),
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600 } },
+        fileIntent("etc/tool", "two\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const original = switch (steps[0].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try testing.expect(steps[0].backup_entry != null);
+    try testing.expect(steps[2].backup_entry != null);
+    const original_bound = try boundPrecondition(&engine, 0);
+    try engine.publishStage(.applying);
+
+    // The first step's own backup is a link on the original inode.
+    try engine.publishState(0, .staged, .unbound);
+    try engine.publishState(0, .backup_captured, .unbound);
+    {
+        const counts = reachableLinkCounts(&engine, steps[0], original, original_bound, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+
+    // The replacement publishes a different inode, which the verified
+    // boundary binds. The metadata step's precondition resolves to it, and so
+    // does the last step's, so the backup the last step captures is a link on
+    // that inode and never on the original.
+    try engine.publishState(0, .published, .unbound);
+    try root.removeFile(try root_fs.Path.init("etc/tool"));
+    try writeExisting(root, "etc/tool", "one\n");
+    try engine.publishState(0, .parent_synced, .unbound);
+    try publishVerified(&engine, 0);
+    const published = try boundPrecondition(&engine, 1);
+    try testing.expect(published.inode != original.inode);
+    try testing.expectEqual(@as(?u32, 0), published.since);
+    try publishVerified(&engine, 1);
+    try engine.publishState(2, .staged, .unbound);
+    try engine.publishState(2, .backup_captured, .unbound);
+    {
+        // One link for the name, one for the first step's backup. The last
+        // step's backup belongs to the inode the plan published in between.
+        const counts = reachableLinkCounts(&engine, steps[0], original, original_bound, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[0],
+            original,
+            original_bound,
+            3,
+            .forward,
+        ));
+    }
+
+    // On the published inode the same backup is certain, and the count the
+    // binding boundary observed is not counted twice.
+    const replacement = try boundPrecondition(&engine, 2);
+    const replaced_state = switch (steps[1].desired) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    {
+        const counts =
+            reachableLinkCounts(&engine, steps[2], replaced_state, replacement, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+}
+
+test "root_mutation.test.a hard link is attributed to the inode it actually names" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "etc/tool", "payload\n");
+
+    // The plan replaces the file, re-modes the replacement, and then
+    // hard-links it. The link names the inode the replacement published, so
+    // it is a link on that inode and never on the one the plan found.
+    const intents = [_]Intent{
+        fileIntent("etc/tool", "one\n"),
+        .{ .metadata = .{ .path = "etc/tool", .mode = 0o600 } },
+        .{ .hard_link = .{ .path = "etc/clone", .source = "etc/tool" } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const original = switch (steps[0].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    const original_bound = try boundPrecondition(&engine, 0);
+    try engine.publishStage(.applying);
+    try engine.publishState(0, .staged, .unbound);
+    try engine.publishState(0, .backup_captured, .unbound);
+    try engine.publishState(0, .published, .unbound);
+    try root.removeFile(try root_fs.Path.init("etc/tool"));
+    try writeExisting(root, "etc/tool", "one\n");
+    try engine.publishState(0, .parent_synced, .unbound);
+    try publishVerified(&engine, 0);
+    try publishVerified(&engine, 1);
+    try engine.publishState(2, .staged, .unbound);
+
+    const replacement = try boundPrecondition(&engine, 1);
+    const remodeled = switch (steps[1].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try testing.expect(replacement.inode != original.inode);
+    {
+        // On the published inode: its own name plus the staged link.
+        const counts = reachableLinkCounts(&engine, steps[1], remodeled, replacement, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+    }
+    {
+        // On the inode the plan found: its own name plus the backup the first
+        // step captured, and nothing from a link that names another inode.
+        const counts = reachableLinkCounts(&engine, steps[0], original, original_bound, .forward);
+        try testing.expectEqual(@as(i128, 2), counts.lower);
+        try testing.expectEqual(@as(i128, 2), counts.upper);
+        try testing.expect(!linkCountReachable(
+            &engine,
+            steps[0],
+            original,
+            original_bound,
+            3,
+            .forward,
+        ));
+    }
+}
+
+test "root_mutation.test.a bound count already holds the links taken before it" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/conf"),
+        root_fs.default_directory_permissions,
+    );
+
+    // The subdirectory is created before the step that binds the parent's
+    // identity, so the link it adds is already inside the count that boundary
+    // observed. Counting it again would move the whole interval up by one and
+    // admit an outside subdirectory as this transaction's own work.
+    const intents = [_]Intent{
+        directoryIntent("etc/conf/child"),
+        directoryIntent("etc/conf"),
+        .{ .metadata = .{ .path = "etc/conf", .mode = 0o700 } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const directory = switch (steps[2].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try engine.publishStage(.applying);
+    try engine.publishState(0, .published, .unbound);
+    try root.createDirectory(
+        try root_fs.Path.init("etc/conf/child"),
+        root_fs.default_directory_permissions,
+    );
+    try engine.publishState(0, .metadata_applied, .unbound);
+    try engine.publishState(0, .parent_synced, .unbound);
+    try publishVerified(&engine, 0);
+    try engine.publishState(1, .published, .unbound);
+    try engine.publishState(1, .metadata_applied, .unbound);
+    try engine.publishState(1, .parent_synced, .unbound);
+    try publishVerified(&engine, 1);
+
+    const bound = try boundPrecondition(&engine, 2);
+    try testing.expectEqual(@as(?u32, 1), bound.since);
+    const observed = try root.entry(try root_fs.Path.init("etc/conf"));
+    try testing.expectEqual(observed.link_count, bound.link_count);
+    const counts = reachableLinkCounts(&engine, steps[2], directory, bound, .forward);
+    try testing.expectEqual(bound.link_count, @as(u64, @intCast(counts.lower)));
+    try testing.expectEqual(bound.link_count, @as(u64, @intCast(counts.upper)));
+    // One more subdirectory than the plan accounts for is still refused, both
+    // above the bound count and below it.
+    try testing.expect(!linkCountReachable(
+        &engine,
+        steps[2],
+        directory,
+        bound,
+        bound.link_count + 1,
+        .forward,
+    ));
+    try testing.expect(!linkCountReachable(
+        &engine,
+        steps[2],
+        directory,
+        bound,
+        bound.link_count - 1,
+        .forward,
+    ));
+}
+
+test "root_mutation.test.a link taken after the binding boundary widens the interval" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc/conf"),
+        root_fs.default_directory_permissions,
+    );
+
+    // The same three steps in the order that binds the parent's identity
+    // before the subdirectory exists. The link the subdirectory adds is then
+    // outside the bound count and is added to it exactly once.
+    const intents = [_]Intent{
+        directoryIntent("etc/conf"),
+        directoryIntent("etc/conf/child"),
+        .{ .metadata = .{ .path = "etc/conf", .mode = 0o700 } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    const steps = engine.journal().steps;
+    const directory = switch (steps[2].expected) {
+        .absent => return error.UnexpectedAbsence,
+        .present => |state| state,
+    };
+    try engine.publishStage(.applying);
+    try engine.publishState(0, .published, .unbound);
+    try engine.publishState(0, .metadata_applied, .unbound);
+    try engine.publishState(0, .parent_synced, .unbound);
+    try publishVerified(&engine, 0);
+    const bound = try boundPrecondition(&engine, 2);
+    try testing.expectEqual(@as(?u32, 0), bound.since);
+
+    try engine.publishState(1, .published, .unbound);
+    try root.createDirectory(
+        try root_fs.Path.init("etc/conf/child"),
+        root_fs.default_directory_permissions,
+    );
+    try engine.publishState(1, .metadata_applied, .unbound);
+    try engine.publishState(1, .parent_synced, .unbound);
+    try publishVerified(&engine, 1);
+
+    const counts = reachableLinkCounts(&engine, steps[2], directory, bound, .forward);
+    try testing.expectEqual(bound.link_count + 1, @as(u64, @intCast(counts.lower)));
+    try testing.expectEqual(bound.link_count + 1, @as(u64, @intCast(counts.upper)));
+    try testing.expect(linkCountReachable(
+        &engine,
+        steps[2],
+        directory,
+        bound,
+        bound.link_count + 1,
+        .forward,
+    ));
+    try testing.expect(!linkCountReachable(
+        &engine,
+        steps[2],
+        directory,
+        bound,
+        bound.link_count + 2,
+        .forward,
+    ));
 }
 
 test "root_mutation.test.direct containment decides which links count" {
@@ -7425,6 +8658,448 @@ test "root_mutation.test.direct containment decides which links count" {
     try testing.expect(!directChild("other/conf/sub", "etc/conf"));
     // No step targets the root itself, so the root is never a parent here.
     try testing.expect(!directChild("etc", ""));
+}
+
+// ---------------------------------------------------------------------------
+// Several steps on one path
+// ---------------------------------------------------------------------------
+
+/// What the seeded same-path root held before the transaction, so a
+/// restoration can be checked against the exact entries rather than against
+/// their shape.
+const SamePathSeed = struct {
+    tool_inode: u64,
+    tool_mode: u32,
+    tool_modified: i128,
+    directory_inode: u64,
+    directory_mode: u32,
+};
+
+/// A regular file a plan republishes and then re-modes, and a populated
+/// directory two steps of the same plan both ship - the shape every package
+/// that owns a shared documentation directory produces.
+fn seedSamePath(root: root_fs.Root) !SamePathSeed {
+    try writeExisting(root, "etc/tool", "old\n");
+    try root.createDirectoryPath(
+        try root_fs.Path.init("usr/share/doc"),
+        root_fs.default_directory_permissions,
+    );
+    try root.applyMetadata(try root_fs.Path.init("usr/share/doc"), .{ .mode = 0o700 });
+    try writeExisting(root, "usr/share/doc/keep", "kept\n");
+    const tool = try root.entry(try root_fs.Path.init("etc/tool"));
+    const directory = try root.entry(try root_fs.Path.init("usr/share/doc"));
+    return .{
+        .tool_inode = tool.inode,
+        .tool_mode = tool.mode,
+        .tool_modified = tool.modified_nanoseconds,
+        .directory_inode = directory.inode,
+        .directory_mode = directory.mode,
+    };
+}
+
+fn directoryIntentWithMode(path: []const u8, mode: u32) Intent {
+    return .{ .directory = .{
+        .path = path,
+        .mode = mode,
+        .uid = currentUid(),
+        .gid = currentGid(),
+    } };
+}
+
+/// Two steps on the file and two on the directory. Every later step's
+/// recorded precondition is the earlier step's desired state, which carries
+/// no inode of its own.
+fn samePathIntents() [4]Intent {
+    return .{
+        fileIntent("etc/tool", "new\n"),
+        .{ .metadata = .{
+            .path = "etc/tool",
+            .mode = 0o600,
+            .modified_nanoseconds = 2_000_000_000,
+        } },
+        directoryIntentWithMode("usr/share/doc", 0o755),
+        directoryIntentWithMode("usr/share/doc", 0o750),
+    };
+}
+
+fn expectSamePathSeeded(root: root_fs.Root, seed: SamePathSeed) !void {
+    try expectContent(root, "etc/tool", "old\n");
+    const tool = try root.entry(try root_fs.Path.init("etc/tool"));
+    // The backup is a hard link, so the restored file is the very inode the
+    // transaction found, not a copy of it.
+    try testing.expectEqual(seed.tool_inode, tool.inode);
+    try testing.expectEqual(seed.tool_mode, tool.mode);
+    try testing.expectEqual(seed.tool_modified, tool.modified_nanoseconds);
+    const directory = try root.entry(try root_fs.Path.init("usr/share/doc"));
+    try testing.expectEqual(seed.directory_inode, directory.inode);
+    try testing.expectEqual(seed.directory_mode, directory.mode);
+    try expectContent(root, "usr/share/doc/keep", "kept\n");
+}
+
+fn expectSamePathApplied(root: root_fs.Root, seed: SamePathSeed) !void {
+    try expectContent(root, "etc/tool", "new\n");
+    const tool = try root.entry(try root_fs.Path.init("etc/tool"));
+    try testing.expectEqual(@as(u32, 0o600), tool.mode);
+    try testing.expectEqual(@as(i128, 2_000_000_000), tool.modified_nanoseconds);
+    const directory = try root.entry(try root_fs.Path.init("usr/share/doc"));
+    // A repeated directory step re-modes the directory that is there; it
+    // never replaces it and never empties it.
+    try testing.expectEqual(seed.directory_inode, directory.inode);
+    try testing.expectEqual(@as(u32, 0o750), directory.mode);
+    try expectContent(root, "usr/share/doc/keep", "kept\n");
+}
+
+/// How an interrupted transaction is picked up: by pushing the same pass
+/// forward, or by a fresh process resolving the journal it found.
+const Resumption = enum { forward, restart };
+
+fn runSamePathScenario(
+    faults: []const Fault,
+    resumption: Resumption,
+    expectation: CrashExpectation,
+) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    const seed = try seedSamePath(root);
+
+    var injector: Injector = .{ .faults = faults };
+    const intents = samePathIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    const outcome = apply(&crashed, .fromPlan(&plan));
+    crashed.deinit();
+    try testing.expectError(error.SimulatedCrash, outcome);
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const report = switch (resumption) {
+        .forward => try apply(&engine, .fromPlan(&plan)),
+        .restart => try recover(&engine),
+    };
+    switch (expectation) {
+        .new_state => {
+            try testing.expectEqual(Outcome.applied, report.outcome);
+            try expectSamePathApplied(root, seed);
+        },
+        .old_state => {
+            try testing.expectEqual(Outcome.rolled_back, report.outcome);
+            try expectSamePathSeeded(root, seed);
+        },
+    }
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+    try expectAbsent(root, journal_path);
+}
+
+test "root_mutation.test.a later step on one path resumes on the inode the earlier step bound" {
+    // Every boundary the second step of each path passes through, including
+    // each metadata syscall on its own. The state left between two of them is
+    // neither the recorded precondition - which carries no inode at all - nor
+    // the recorded desired state, so it is resolvable only against the entry
+    // the earlier step's verified boundary bound.
+    const points = [_]Fault{
+        .{ .boundary = .precondition_check, .step = 1 },
+        .{ .boundary = .metadata_apply, .step = 1 },
+        .{ .boundary = .metadata_chmod, .step = 1 },
+        .{ .boundary = .metadata_utimens, .step = 1 },
+        .{ .boundary = .verify, .step = 1 },
+        .{ .boundary = .precondition_check, .step = 3 },
+        .{ .boundary = .metadata_apply, .step = 3 },
+        .{ .boundary = .metadata_chmod, .step = 3 },
+        .{ .boundary = .parent_sync, .step = 3 },
+        .{ .boundary = .verify, .step = 3 },
+    };
+    for (points) |point| {
+        const faults = [_]Fault{point};
+        // A resumed forward pass finishes the transaction it was making.
+        runSamePathScenario(&faults, .forward, .new_state) catch |err| {
+            std.debug.print(
+                "forward resume failed at {t} of step {?d}\n",
+                .{ point.boundary, point.step },
+            );
+            return err;
+        };
+        // A fresh process restores the recorded old state instead, and gets
+        // the same classification of the same half-finished work.
+        runSamePathScenario(&faults, .restart, .old_state) catch |err| {
+            std.debug.print(
+                "restart rollback failed at {t} of step {?d}\n",
+                .{ point.boundary, point.step },
+            );
+            return err;
+        };
+    }
+}
+
+test "root_mutation.test.an interrupted rollback of a same-path chain resumes" {
+    // The first fault turns the transaction around, the second stops the
+    // restoration part way through it. Recovery then resumes a rollback whose
+    // remaining steps still have to classify what the forward pass and the
+    // restoration each left on one path. Every stop names the restoration's
+    // own arrival at the boundary, never the forward pass's.
+    const stops = [_]Fault{
+        .{ .boundary = .metadata_apply, .step = 3, .occurrence = 2 },
+        .{ .boundary = .metadata_apply, .step = 2, .occurrence = 2 },
+        .{ .boundary = .metadata_apply, .step = 1, .occurrence = 2 },
+        .{ .boundary = .restore_rename, .step = 0 },
+        .{ .boundary = .parent_sync, .step = 0, .occurrence = 2 },
+    };
+    for (stops) |stop| {
+        const faults = [_]Fault{
+            .{ .boundary = .verify, .step = 3, .err = error.RenameFailed },
+            stop,
+        };
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        const seed = try seedSamePath(root);
+
+        var injector: Injector = .{ .faults = &faults };
+        const intents = samePathIntents();
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+            .hooks = injector.interface(),
+        });
+        const outcome = apply(&crashed, .fromPlan(&plan));
+        crashed.deinit();
+        try testing.expectError(error.SimulatedCrash, outcome);
+        testing.expect(injector.allFired()) catch |err| {
+            std.debug.print("rollback stop at {t} never fired\n", .{stop.boundary});
+            return err;
+        };
+
+        var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+        defer engine.deinit();
+        try testing.expectEqual(Stage.rolling_back, engine.stage());
+        const report = recover(&engine) catch |err| {
+            std.debug.print("rollback resume failed after {t}\n", .{stop.boundary});
+            return err;
+        };
+        testing.expectEqual(Outcome.rolled_back, report.outcome) catch |err| {
+            std.debug.print(
+                "rollback resume after {t}: {any}\n",
+                .{ stop.boundary, report.diagnostic },
+            );
+            return err;
+        };
+        try expectSamePathSeeded(root, seed);
+        try expectWorkspaceEmpty(root);
+        try clear(&engine);
+    }
+}
+
+test "root_mutation.test.a compatible repeated directory step is not work" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    const seed = try seedSamePath(root);
+
+    // Two packages shipping the same documentation directory produce two
+    // identical directory steps on one path. The second is satisfied by the
+    // first's desired state and reaches its verified boundary without
+    // touching the root, rather than being refused as a repeat.
+    const intents = [_]Intent{
+        directoryIntentWithMode("usr/share/doc", 0o755),
+        directoryIntentWithMode("usr/share/doc", 0o755),
+        directoryIntentWithMode("usr/share/doc/debz", 0o755),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    const steps = plan.steps;
+    try testing.expect(!steps[0].satisfied());
+    try testing.expect(steps[1].satisfied());
+    try testing.expectEqualSlices(StepState, &.{.verified}, steps[1].boundaries());
+
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    const directory = try root.entry(try root_fs.Path.init("usr/share/doc"));
+    try testing.expectEqual(seed.directory_inode, directory.inode);
+    try testing.expectEqual(@as(u32, 0o755), directory.mode);
+    // The repeated step neither emptied the directory nor replaced it.
+    try expectContent(root, "usr/share/doc/keep", "kept\n");
+    const child = try root.entry(try root_fs.Path.init("usr/share/doc/debz"));
+    try testing.expect(child.isDirectory());
+    // The verified boundary of the satisfied step bound the same entry the
+    // step before it published.
+    try testing.expectEqual(directory.inode, engine.progress.identity(1).inode);
+    try testing.expectEqual(directory.inode, engine.progress.identity(0).inode);
+    try clear(&engine);
+}
+
+test "root_mutation.test.an external inode substitution is never resumed as this plan's own" {
+    for ([_]Resumption{ .forward, .restart }) |resumption| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        _ = try seedSamePath(root);
+
+        const intents = samePathIntents();
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_chmod, .step = 1 }} };
+        var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+            .hooks = injector.interface(),
+        });
+        try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+        crashed.deinit();
+
+        // An outside writer replaces the published file with a different
+        // inode of the same kind holding the same bytes, and copies the
+        // metadata the step expects to find. Nothing about its shape says it
+        // is not the entry the plan published; only the inode the verified
+        // boundary bound does.
+        const target = try root_fs.Path.init("etc/tool");
+        const published = try root.entry(target);
+        const substitute = try root_fs.Path.init("etc/tool.substitute");
+        try root.writeNewFile(substitute, "new\n", .{}, true);
+        try root.applyMetadata(substitute, .{ .mode = published.mode });
+        try root.applyMetadata(substitute, .{
+            .modified_nanoseconds = published.modified_nanoseconds,
+        });
+        try root.rename(substitute, target, .replace);
+        const swapped = try root.entry(target);
+        try testing.expect(swapped.inode != published.inode);
+
+        var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+        defer engine.deinit();
+        const report = switch (resumption) {
+            .forward => try apply(&engine, .fromPlan(&plan)),
+            .restart => try recover(&engine),
+        };
+        try testing.expectEqual(Outcome.recovery_required, report.outcome);
+        try testing.expectEqual(Stage.recovery_required, engine.stage());
+        // The substituted entry is left exactly as found: an unresolved
+        // journal is never resolved by guessing.
+        try testing.expectEqual(swapped.inode, (try root.entry(target)).inode);
+        try testing.expectError(error.RecoveryRequired, clear(&engine));
+    }
+}
+
+test "root_mutation.test.a restored directory is re-created on a new inode" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc"),
+        root_fs.default_directory_permissions,
+    );
+
+    // The first step creates a directory, the second replaces it with a file.
+    // Restoring the second re-creates the directory the first published,
+    // which is provably a different inode from the one that step bound - and,
+    // without a bound inode, could not be told from any empty directory an
+    // outside writer happened to leave at the path. The restoration is
+    // interrupted after the `mkdir`, so the resumed pass has to classify
+    // exactly that re-created directory.
+    const intents = [_]Intent{
+        directoryIntentWithMode("etc/fresh", 0o755),
+        fileIntent("etc/fresh", "newer\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{
+        .{ .boundary = .verify, .step = 1, .err = error.RenameFailed },
+        .{ .boundary = .metadata_apply, .step = 1 },
+    } };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    const outcome = apply(&crashed, .fromPlan(&plan));
+    crashed.deinit();
+    try testing.expectError(error.SimulatedCrash, outcome);
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    const restored = try root.entry(try root_fs.Path.init("etc/fresh"));
+    const created = engine.progress.identity(0);
+    try testing.expect(restored.isDirectory());
+    try testing.expect(created.bound());
+    try testing.expect(restored.inode != created.inode);
+
+    const report = try recover(&engine);
+    try testing.expectEqual(Outcome.rolled_back, report.outcome);
+    try expectAbsent(root, "etc/fresh");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a step whose producer never verified is not restored over" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    const seed = try seedSamePath(root);
+
+    // The producing step fails at its own verification, so the step after it
+    // on the same path never ran and no boundary ever bound the entry its
+    // precondition names. Its reversal is nothing at all, and the path is
+    // restored by the producing step's own reversal.
+    const intents = samePathIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{
+        .{ .boundary = .verify, .step = 0, .err = error.RenameFailed },
+    } };
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    defer engine.deinit();
+
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.rolled_back, report.outcome);
+    try testing.expectEqual(Precondition.pending, precondition(&engine, engine.journal().steps[1]));
+    try expectSamePathSeeded(root, seed);
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a platform that reports no inode keeps its structural comparison" {
+    const old: State = .{
+        .kind = .regular,
+        .metadata = testMetadata(),
+        .size = 1,
+        .content_sha256 = @splat(0),
+        .inode = 0,
+        .link_count = 3,
+    };
+    // A precondition preflight could not attach an inode to compares zero to
+    // zero, which is exactly the comparison a platform without inode numbers
+    // has always had: it still refuses every entry whose inode is reported,
+    // and it still admits the ordered metadata writes on the entry itself.
+    const degenerate = comparableIdentity(.unreported, old, 7).?;
+    try testing.expectEqual(@as(u64, 0), degenerate.inode);
+    try testing.expectEqual(@as(u64, 7), degenerate.device);
+    try testing.expectEqual(old.link_count, degenerate.link_count);
+    try testing.expect(degenerate.since == null);
+
+    // A precondition an earlier step of the plan owes and no boundary has
+    // bound names no entry at all, and neither does an absence.
+    try testing.expect(comparableIdentity(.pending, old, 7) == null);
+    try testing.expect(comparableIdentity(.absent, old, 7) == null);
+
+    // A bound precondition is passed through with the step that bound it.
+    const bound = comparableIdentity(.{ .bound = .{
+        .device = 7,
+        .inode = 0x2a,
+        .link_count = 1,
+        .since = 4,
+    } }, old, 7).?;
+    try testing.expectEqual(@as(u64, 0x2a), bound.inode);
+    try testing.expectEqual(@as(?u32, 4), bound.since);
 }
 
 // ---------------------------------------------------------------------------
