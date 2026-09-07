@@ -3,9 +3,12 @@
 `debz.apt_system_api` is a separate versioned orchestration contract for a
 future deliberately limited `debz apt` interface. `debz.apt_system_cli` now
 defines its pure parsing, help, rendering, and confirmation-decision contract.
-It preserves product API v1 and the existing root CLI unchanged. The module is
-not yet wired into `main.zig` and does not execute dependency-solver behavior,
-mount namespaces, live-root views, or production orchestration.
+`debz.apt_system_orchestrator` implements the reusable profile-bound engine
+behind that contract. Product API v1 and the existing root CLI remain
+unchanged. Neither module is wired into `main.zig`, so this document does not
+claim that the commands are currently exposed; the pure CLI module itself
+performs no dependency-solver, namespace, live-root, or production
+orchestration work.
 
 The interface is **apt-shaped, not apt-compatible**. It promises no apt output,
 wording, exit-code convention, option aliases, configuration discovery, or
@@ -195,3 +198,66 @@ same lock, transaction, and root-completion evidence required by the result.
 Once mutation has started, failure remains distinguishable from a
 pre-mutation failure and the `recovery_required` phase cannot be represented as
 safe abandonment.
+
+## Orchestration engine
+
+The engine separates `prepare` from confirmed `execute`. Update and
+list-installed requests route directly through the injected private-live-root
+runner. Install, remove, and upgrade-all preparation instead:
+
+1. loads the explicitly requested strict profile and revalidates every bound
+   source, config, keyring, and credential reference;
+2. rejects a post-mutation active operation before repository work, while a
+   CAS-proven pre-mutation or completed record is retained and reconciled;
+3. reserves one durable operation directory under
+   `STATE/apt/operations/ATTEMPT`;
+4. submits every selector in one `ProductionWorkflow` plan-only request;
+5. retains and validates one canonical `exact-lock-v1.json`; and
+6. returns the complete backend change set for rendering and review.
+
+Preparation never executes a package transaction. The caller can render the
+review and either pass explicit confirmation to `execute` or return the
+versioned `confirmation_required` result. `-y` is therefore only a future
+caller's confirmation source; execution always takes conffile behavior from
+the loaded profile.
+
+Confirmed execution reloads and revalidates the profile, rereads the active
+state with locked compare-and-set, revalidates the exact lock, acquires the
+locked package closure, and invokes `ProductionWorkflow` execute with the same
+selectors and exact lock. The only install-root spelling supplied to a backend
+is `live_root.logical_root_path`; `/` remains denied by product API v1 and
+`live_root.host_root_allowed` remains false. Root, runtime, lock, or mountpoint
+replacement is surfaced as a typed conflict.
+
+The system state-store adapter creates and opens every directory component
+without following symbolic links. Request, retained state, exact lock,
+transaction result, and completion evidence stay on the profile state
+filesystem. Publication uses mode-restricted staged files, file sync,
+same-directory atomic rename, directory sync, and operation locks. Completed
+operation directories are retained as history while the active record is
+removed only after the final state is durable. A crash before removal therefore
+leaves a deterministic active or completed record rather than an ambiguous
+symlink or cross-filesystem pointer.
+
+After a successful backend return, `SystemResultVerifier` rereads the canonical
+exact lock and validates `transaction-result.json` through
+`transaction_result_summary.verify` and transaction-provenance v1. Only then
+does the store retain the transaction document and publish
+`apt-system-execution-completion-v1`. This ordinary completion schema is
+deliberately distinct from the recovery-only
+`root-operation-completion-v1.json` discharge statement. Apt/system success is
+published only after the exact lock, verified transaction result, completed
+root-operation status, and final state all agree.
+
+`prepareRecovery` reloads the same profile, retained canonical request, active
+state, and exact lock. Profile, request, selector, attempt, state, or evidence
+mismatches fail closed. A recoverable plan reports the stable action
+`debz recover --system-profile PATH`; confirmed `executeRecovery` reconstructs
+the original semantic `ProductionWorkflow` recovery request and verifies and
+retains its result through the same boundaries.
+
+Profile loading, live-root execution, workflow backend, state store,
+confirmation, result verifier, clock, and attempt-ID generation are explicit
+dependencies. Unit tests use only injected fakes; the reusable production
+adapters cover the strict profile loader, `ProductionWorkflow`, durable system
+store, and lock/provenance verifier without touching `/` in tests.

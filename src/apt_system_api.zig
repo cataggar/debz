@@ -64,6 +64,78 @@ pub const Request = struct {
     }
 };
 
+pub const OwnedRequest = struct {
+    request: Request,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedRequest) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+const WireRequest = struct {
+    schema: []const u8,
+    version: u32,
+    api_version: u32,
+    operation: Operation,
+    profile_path: []const u8,
+    packages: []const []const u8,
+    assume_yes: bool,
+};
+
+/// Decodes the canonical request retained with an operation. Recovery uses
+/// this boundary instead of reconstructing selectors from human diagnostics
+/// or mutable caller input.
+pub fn decodeRequest(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedRequest {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(WireRequest, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidDocument;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.schema, request_schema_id) or
+        parsed.value.version != schema_version)
+        return error.UnsupportedSchema;
+    const decoded: Request = .{
+        .api_version = parsed.value.api_version,
+        .operation = parsed.value.operation,
+        .profile_path = parsed.value.profile_path,
+        .packages = parsed.value.packages,
+        .assume_yes = parsed.value.assume_yes,
+    };
+    try validateRequest(decoded);
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const packages = try owned.alloc([]const u8, decoded.packages.len);
+    for (decoded.packages, 0..) |package, index|
+        packages[index] = try owned.dupe(u8, package);
+    var result: OwnedRequest = .{
+        .request = .{
+            .api_version = decoded.api_version,
+            .operation = decoded.operation,
+            .profile_path = try owned.dupe(u8, decoded.profile_path),
+            .packages = packages,
+            .assume_yes = decoded.assume_yes,
+        },
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+    const canonical = try result.request.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return result;
+}
+
 pub const Outcome = enum {
     success,
     usage,

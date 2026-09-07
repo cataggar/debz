@@ -8,6 +8,7 @@ pub const system_profile = @import("system_profile.zig");
 pub const apt_system_api = @import("apt_system_api.zig");
 pub const apt_system_cli = @import("apt_system_cli.zig");
 pub const apt_system_state = @import("apt_system_state.zig");
+pub const apt_system_orchestrator = @import("apt_system_orchestrator.zig");
 pub const repository_api = @import("repository_api.zig");
 pub const repository_state = @import("repository_state.zig");
 pub const repository_backend = @import("repository_backend.zig");
