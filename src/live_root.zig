@@ -248,6 +248,12 @@ const PinnedPaths = struct {
         closeFd(&self.runtime_fd);
         closeFd(&self.source_fd);
     }
+
+    fn closeNonLock(self: *PinnedPaths) void {
+        closeFd(&self.mountpoint_fd);
+        closeFd(&self.runtime_fd);
+        closeFd(&self.source_fd);
+    }
 };
 
 fn privateRootDirectory(identity: Identity) bool {
@@ -374,14 +380,24 @@ fn supervisorMain(
     _ = linux.setpgid(0, 0);
     ignoreBrokenPipe();
 
+    var owned = pinned;
     var runtime_pinned = false;
     var root_mounted = false;
     if (!parentAlive(control_pipe[0]))
         parentDied(root_mounted, runtime_pinned);
-    validateSource(pinned) catch |err|
+    validateOriginalSource(owned) catch |err|
         childFail(report_pipe[1], .source_validation, errorNumber(err));
-    validateUnpinnedPaths(pinned) catch |err|
+    validateUnpinnedPaths(owned) catch |err|
         childFail(report_pipe[1], stageForPathError(err), errorNumber(err));
+
+    var runtime_tree = openTreeClone(owned.runtime_fd, false) catch |err|
+        childFail(report_pipe[1], .runtime_pin, errorNumber(err));
+    var source_tree = openTreeClone(owned.source_fd, true) catch |err| {
+        closeFd(&runtime_tree);
+        childFail(report_pipe[1], .recursive_bind, errorNumber(err));
+    };
+    if (!parentAlive(control_pipe[0]))
+        parentDied(root_mounted, runtime_pinned);
 
     switch (linux.errno(linux.unshare(linux.CLONE.NEWNS))) {
         .SUCCESS => {},
@@ -391,32 +407,8 @@ fn supervisorMain(
         .SUCCESS => {},
         else => |err| childFail(report_pipe[1], .private_propagation, @intFromEnum(err)),
     }
-    validateSource(pinned) catch |err|
-        childFail(report_pipe[1], .source_validation, errorNumber(err));
-    validateUnpinnedPaths(pinned) catch |err|
-        childFail(report_pipe[1], stageForPathError(err), errorNumber(err));
 
-    const runtime_tree = openTreeClone(pinned.runtime_fd, false) catch |err|
-        childFail(report_pipe[1], .runtime_pin, errorNumber(err));
-    switch (linux.errno(linux.move_mount(
-        runtime_tree,
-        "",
-        pinned.runtime_fd,
-        "",
-        descriptor_move,
-    ))) {
-        .SUCCESS => {
-            closeRaw(runtime_tree);
-            runtime_pinned = true;
-        },
-        else => |err| {
-            closeRaw(runtime_tree);
-            childFail(report_pipe[1], .runtime_pin, @intFromEnum(err));
-        },
-    }
-    if (!parentAlive(control_pipe[0]))
-        parentDied(root_mounted, runtime_pinned);
-    validatePinnedRuntime(pinned) catch |err|
+    var namespace_targets = openNamespaceTargets(owned) catch |err|
         namespaceFail(
             report_pipe[1],
             stageForPathError(err),
@@ -424,61 +416,52 @@ fn supervisorMain(
             root_mounted,
             runtime_pinned,
         );
-
-    const target_fd = openDirectoryAbsolute(logical_root_path) catch |err|
-        namespaceFail(
-            report_pipe[1],
-            .mountpoint_validation,
-            errorNumber(err),
-            root_mounted,
-            runtime_pinned,
-        );
-    const target = identityOf(target_fd) catch |err| {
-        closeRaw(target_fd);
-        namespaceFail(
-            report_pipe[1],
-            .mountpoint_validation,
-            errorNumber(err),
-            root_mounted,
-            runtime_pinned,
-        );
-    };
-    if (!target.samePinnedEntry(pinned.mountpoint)) {
-        closeRaw(target_fd);
-        namespaceFail(
-            report_pipe[1],
-            .mountpoint_validation,
-            0,
-            root_mounted,
-            runtime_pinned,
-        );
-    }
-
-    const source_tree = openTreeClone(pinned.source_fd, true) catch |err| {
-        closeRaw(target_fd);
-        namespaceFail(
-            report_pipe[1],
-            .recursive_bind,
-            errorNumber(err),
-            root_mounted,
-            runtime_pinned,
-        );
-    };
     switch (linux.errno(linux.move_mount(
-        source_tree,
+        runtime_tree,
         "",
-        target_fd,
+        namespace_targets.runtime_fd,
         "",
         descriptor_move,
     ))) {
         .SUCCESS => {
-            closeRaw(source_tree);
-            closeRaw(target_fd);
+            closeFd(&runtime_tree);
+            runtime_pinned = true;
+        },
+        else => |err| {
+            namespace_targets.close();
+            closeFd(&runtime_tree);
+            closeFd(&source_tree);
+            childFail(report_pipe[1], .runtime_pin, @intFromEnum(err));
+        },
+    }
+    const namespace_source = namespace_targets.source;
+    const namespace_runtime = namespace_targets.runtime;
+    namespace_targets.close();
+    if (!parentAlive(control_pipe[0]))
+        parentDied(root_mounted, runtime_pinned);
+
+    var attached = openAttachedRuntime(owned, namespace_runtime) catch |err|
+        namespaceFail(
+            report_pipe[1],
+            stageForPathError(err),
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+    switch (linux.errno(linux.move_mount(
+        source_tree,
+        "",
+        attached.mountpoint_fd,
+        "",
+        descriptor_move,
+    ))) {
+        .SUCCESS => {
+            closeFd(&source_tree);
             root_mounted = true;
         },
         else => |err| {
-            closeRaw(source_tree);
-            closeRaw(target_fd);
+            attached.close();
+            closeFd(&source_tree);
             namespaceFail(
                 report_pipe[1],
                 .recursive_bind,
@@ -488,7 +471,36 @@ fn supervisorMain(
             );
         },
     }
-    validateCallbackPaths(pinned) catch |err|
+    const mounted_root = identityAbsolute(logical_root_path) catch |err| {
+        attached.close();
+        namespaceFail(
+            report_pipe[1],
+            .bind_validation,
+            errorNumber(err),
+            root_mounted,
+            runtime_pinned,
+        );
+    };
+    if (!mounted_root.samePinnedEntry(owned.source) or
+        mounted_root.mount_id == namespace_source.mount_id or
+        mounted_root.mount_id == attached.runtime.mount_id)
+    {
+        attached.close();
+        namespaceFail(
+            report_pipe[1],
+            .bind_validation,
+            0,
+            root_mounted,
+            runtime_pinned,
+        );
+    }
+    const expected: NamespaceIdentity = .{
+        .source = namespace_source,
+        .runtime = attached.runtime,
+        .mounted_root = mounted_root,
+    };
+    attached.close();
+    validateCallbackPaths(owned, expected) catch |err|
         namespaceFail(
             report_pipe[1],
             stageForPathError(err),
@@ -498,6 +510,7 @@ fn supervisorMain(
         );
     if (!parentAlive(control_pipe[0]))
         parentDied(root_mounted, runtime_pinned);
+    owned.closeNonLock();
 
     switch (linux.errno(linux.unshare(linux.CLONE.NEWPID))) {
         .SUCCESS => {},
@@ -527,7 +540,7 @@ fn supervisorMain(
     }
     const worker: i32 = @intCast(worker_raw);
     if (worker == 0)
-        workloadMain(request, old_mask, report_pipe[1], control_pipe[0], pinned);
+        workloadMain(request, old_mask, report_pipe[1], control_pipe[0], owned.lock_fd);
 
     const supervised = superviseWorkload(
         worker,
@@ -546,8 +559,8 @@ fn supervisorMain(
     };
     // Once namespace PID 1 has exited, Linux has killed every other process in
     // that PID namespace.  No descendant can retain this mount namespace.
-    cleanupNamespaceStrict() catch |err|
-        childFail(report_pipe[1], .cleanup, errorNumber(err));
+    if (cleanupNamespaceStrict()) |errno|
+        childFail(report_pipe[1], .cleanup, errno);
     closeRaw(control_pipe[0]);
     if (supervised.parent_died) {
         closeRaw(report_pipe[1]);
@@ -562,11 +575,10 @@ fn workloadMain(
     old_mask: linux.sigset_t,
     report_fd: i32,
     control_fd: i32,
-    pinned: PinnedPaths,
+    lock_fd: i32,
 ) noreturn {
     closeRaw(control_fd);
-    var inherited = pinned;
-    inherited.close();
+    closeRaw(lock_fd);
     _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
     resetInterruptActions();
     const code = request.child(request.context, logical_root_path) catch
@@ -575,7 +587,7 @@ fn workloadMain(
     linux.exit_group(code);
 }
 
-fn validateSource(pinned: PinnedPaths) Error!void {
+fn validateOriginalSource(pinned: PinnedPaths) Error!void {
     const descriptor = try identityOf(pinned.source_fd);
     const named_fd = try openDirectoryAbsolute("/");
     defer _ = linux.close(named_fd);
@@ -593,10 +605,24 @@ fn validateUnpinnedPaths(pinned: PinnedPaths) Error!void {
     if (!mountpoint.eql(pinned.mountpoint)) return error.MountpointReplaced;
 }
 
-fn validatePinnedRuntime(pinned: PinnedPaths) Error!void {
+const NamespaceTargets = struct {
+    runtime_fd: i32,
+    mountpoint_fd: i32,
+    source: Identity,
+    runtime: Identity,
+
+    fn close(self: *NamespaceTargets) void {
+        closeFd(&self.mountpoint_fd);
+        closeFd(&self.runtime_fd);
+    }
+};
+
+fn openNamespaceTargets(pinned: PinnedPaths) Error!NamespaceTargets {
+    const source = try identityAbsolute("/");
+    if (!namespaceCloneMatches(pinned.source, source))
+        return error.RootReplaced;
     const runtime = try identityAbsolute(runtime_directory_path);
-    if (!runtime.samePinnedEntry(pinned.runtime) or
-        runtime.mount_id == pinned.runtime.mount_id)
+    if (!namespaceCloneMatches(pinned.runtime, runtime))
         return error.RuntimeReplaced;
     const lock = try identityAbsolute(lock_path);
     if (!lock.samePinnedEntry(pinned.lock) or
@@ -606,23 +632,95 @@ fn validatePinnedRuntime(pinned: PinnedPaths) Error!void {
     if (!mountpoint.samePinnedEntry(pinned.mountpoint) or
         mountpoint.mount_id != runtime.mount_id)
         return error.MountpointReplaced;
+
+    const runtime_fd = try openDirectoryAbsolute(runtime_directory_path);
+    errdefer closeRaw(runtime_fd);
+    if (!(try identityOf(runtime_fd)).eql(runtime)) return error.RuntimeReplaced;
+    const mountpoint_fd = try openDirectoryAt(runtime_fd, "system-root");
+    errdefer closeRaw(mountpoint_fd);
+    if (!(try identityOf(mountpoint_fd)).eql(mountpoint))
+        return error.MountpointReplaced;
+    return .{
+        .runtime_fd = runtime_fd,
+        .mountpoint_fd = mountpoint_fd,
+        .source = source,
+        .runtime = runtime,
+    };
 }
 
-fn validateCallbackPaths(pinned: PinnedPaths) Error!void {
-    try validateSource(pinned);
+const AttachedRuntime = struct {
+    runtime_fd: i32,
+    mountpoint_fd: i32,
+    runtime: Identity,
+
+    fn close(self: *AttachedRuntime) void {
+        closeFd(&self.mountpoint_fd);
+        closeFd(&self.runtime_fd);
+    }
+};
+
+fn openAttachedRuntime(
+    pinned: PinnedPaths,
+    previous_runtime: Identity,
+) Error!AttachedRuntime {
     const runtime = try identityAbsolute(runtime_directory_path);
-    if (!runtime.samePinnedEntry(pinned.runtime) or
-        runtime.mount_id == pinned.runtime.mount_id)
+    if (!attachedMountMatches(pinned.runtime, previous_runtime, runtime))
         return error.RuntimeReplaced;
     const lock = try identityAbsolute(lock_path);
     if (!lock.samePinnedEntry(pinned.lock) or
         lock.link_count != 1 or lock.mount_id != runtime.mount_id)
         return error.LockReplaced;
+    const mountpoint = try identityAbsolute(logical_root_path);
+    if (!mountpoint.samePinnedEntry(pinned.mountpoint) or
+        mountpoint.mount_id != runtime.mount_id)
+        return error.MountpointReplaced;
+
+    const runtime_fd = try openDirectoryAbsolute(runtime_directory_path);
+    errdefer closeRaw(runtime_fd);
+    if (!(try identityOf(runtime_fd)).eql(runtime)) return error.RuntimeReplaced;
+    const mountpoint_fd = try openDirectoryAt(runtime_fd, "system-root");
+    errdefer closeRaw(mountpoint_fd);
+    if (!(try identityOf(mountpoint_fd)).eql(mountpoint))
+        return error.MountpointReplaced;
+    return .{
+        .runtime_fd = runtime_fd,
+        .mountpoint_fd = mountpoint_fd,
+        .runtime = runtime,
+    };
+}
+
+fn namespaceCloneMatches(original: Identity, current: Identity) bool {
+    return current.samePinnedEntry(original) and
+        current.mount_id != original.mount_id;
+}
+
+fn attachedMountMatches(
+    original: Identity,
+    namespace_clone: Identity,
+    attached: Identity,
+) bool {
+    return attached.samePinnedEntry(original) and
+        attached.mount_id != original.mount_id and
+        attached.mount_id != namespace_clone.mount_id;
+}
+
+const NamespaceIdentity = struct {
+    source: Identity,
+    runtime: Identity,
+    mounted_root: Identity,
+};
+
+fn validateCallbackPaths(pinned: PinnedPaths, expected: NamespaceIdentity) Error!void {
+    const source = try identityAbsolute("/");
+    if (!source.eql(expected.source)) return error.RootReplaced;
+    const runtime = try identityAbsolute(runtime_directory_path);
+    if (!runtime.eql(expected.runtime)) return error.RuntimeReplaced;
+    const lock = try identityAbsolute(lock_path);
+    if (!lock.samePinnedEntry(pinned.lock) or
+        lock.link_count != 1 or lock.mount_id != runtime.mount_id)
+        return error.LockReplaced;
     const mounted = try identityAbsolute(logical_root_path);
-    if (!mounted.samePinnedEntry(pinned.source) or
-        mounted.mount_id == pinned.source.mount_id or
-        mounted.mount_id == runtime.mount_id)
-        return error.RootReplaced;
+    if (!mounted.eql(expected.mounted_root)) return error.RootReplaced;
 }
 
 fn identityAbsolute(path: [*:0]const u8) Error!Identity {
@@ -656,15 +754,22 @@ const descriptor_move: linux.MOVE_MOUNT = .{
     .SET_GROUP = false,
 };
 
-fn cleanupNamespaceStrict() Error!void {
-    switch (linux.errno(linux.umount2(logical_root_path, linux.UMOUNT_NOFOLLOW))) {
+fn cleanupNamespaceStrict() ?u32 {
+    switch (linux.errno(linux.umount2(
+        logical_root_path,
+        linux.MNT.DETACH | linux.UMOUNT_NOFOLLOW,
+    ))) {
         .SUCCESS => {},
-        else => return error.SystemCallFailed,
+        else => |err| return @intFromEnum(err),
     }
-    switch (linux.errno(linux.umount2(runtime_directory_path, linux.UMOUNT_NOFOLLOW))) {
+    switch (linux.errno(linux.umount2(
+        runtime_directory_path,
+        linux.MNT.DETACH | linux.UMOUNT_NOFOLLOW,
+    ))) {
         .SUCCESS => {},
-        else => return error.SystemCallFailed,
+        else => |err| return @intFromEnum(err),
     }
+    return null;
 }
 
 fn cleanupNamespaceBestEffort(root_mounted: bool, runtime_pinned: bool) void {
@@ -935,13 +1040,14 @@ fn closeRaw(fd: i32) void {
 fn enter(operations: anytype) !void {
     try operations.validateSource();
     try operations.validateUnpinnedPaths();
+    try operations.cloneRuntime();
+    try operations.cloneSource();
     try operations.unshareMount();
     try operations.makePrivate();
-    try operations.validateSource();
-    try operations.validateUnpinnedPaths();
-    try operations.pinRuntime();
+    try operations.openNamespaceTargets();
+    try operations.attachRuntime();
     errdefer operations.unpinRuntime();
-    try operations.validatePinnedRuntime();
+    try operations.openAttachedRuntime();
     try operations.attachRoot();
     errdefer operations.unmountRoot();
     try operations.validateCallbackPaths();
@@ -952,9 +1058,11 @@ const Event = enum {
     runtime,
     lock,
     mountpoint,
+    clone_runtime,
+    clone_source,
     unshare,
     private,
-    runtime_pin,
+    attach_runtime,
     attach_root,
     callback_validation,
     child,
@@ -1012,11 +1120,25 @@ const RecordingOperations = struct {
         try self.validatePaths(false);
     }
 
-    fn validatePinnedRuntime(self: *RecordingOperations) !void {
+    fn cloneRuntime(self: *RecordingOperations) !void {
+        try self.record(.clone_runtime);
+    }
+
+    fn cloneSource(self: *RecordingOperations) !void {
+        try self.record(.clone_source);
+    }
+
+    fn openNamespaceTargets(self: *RecordingOperations) !void {
+        try self.validateSource();
+        try self.validatePaths(false);
+    }
+
+    fn openAttachedRuntime(self: *RecordingOperations) !void {
         try self.validatePaths(false);
     }
 
     fn validateCallbackPaths(self: *RecordingOperations) !void {
+        try self.validateSource();
         try self.validatePaths(true);
     }
 
@@ -1028,8 +1150,8 @@ const RecordingOperations = struct {
         try self.record(.private);
     }
 
-    fn pinRuntime(self: *RecordingOperations) !void {
-        try self.record(.runtime_pin);
+    fn attachRuntime(self: *RecordingOperations) !void {
+        try self.record(.attach_runtime);
     }
 
     fn attachRoot(self: *RecordingOperations) !void {
@@ -1192,17 +1314,20 @@ test "live_root.test.namespace setup ordering is fixed" {
             .runtime,
             .lock,
             .mountpoint,
+            .clone_runtime,
+            .clone_source,
             .unshare,
             .private,
             .source,
             .runtime,
             .lock,
             .mountpoint,
-            .runtime_pin,
+            .attach_runtime,
             .runtime,
             .lock,
             .mountpoint,
             .attach_root,
+            .source,
             .runtime,
             .lock,
             .mountpoint,
@@ -1213,10 +1338,10 @@ test "live_root.test.namespace setup ordering is fixed" {
 }
 
 test "live_root.test.cleanup covers every setup failure boundary" {
-    for (1..20) |failure| {
+    for (1..23) |failure| {
         var operations: RecordingOperations = .{ .fail_call = failure };
         try std.testing.expectError(error.Injected, enter(&operations));
-        if (failure >= 16) {
+        if (failure >= 18) {
             try std.testing.expectEqual(
                 Event.unmount_root,
                 operations.events[operations.event_count - 2],
@@ -1225,7 +1350,7 @@ test "live_root.test.cleanup covers every setup failure boundary" {
                 Event.unpin_runtime,
                 operations.events[operations.event_count - 1],
             );
-        } else if (failure >= 12) {
+        } else if (failure >= 14) {
             try std.testing.expectEqual(
                 Event.unpin_runtime,
                 operations.events[operations.event_count - 1],
@@ -1266,9 +1391,45 @@ test "live_root.test.root replacement fails before mounting" {
     var after_unshare: RecordingOperations = .{ .replace_root_on_source_call = 2 };
     try std.testing.expectError(error.RootReplaced, enter(&after_unshare));
     try expectEvents(
-        &.{ .source, .runtime, .lock, .mountpoint, .unshare, .private, .source },
+        &.{
+            .source,
+            .runtime,
+            .lock,
+            .mountpoint,
+            .clone_runtime,
+            .clone_source,
+            .unshare,
+            .private,
+            .source,
+        },
         &after_unshare,
     );
+}
+
+test "live_root.test.mount identities transition across unshare and attachment" {
+    const original: Identity = .{
+        .device = 4,
+        .inode = 20,
+        .mount_id = 100,
+        .uid = 0,
+        .gid = 0,
+        .mode = linux.S.IFDIR | 0o700,
+        .kind = linux.S.IFDIR,
+        .link_count = 2,
+    };
+    var namespace_clone = original;
+    namespace_clone.mount_id = 101;
+    try std.testing.expect(namespaceCloneMatches(original, namespace_clone));
+    try std.testing.expect(!namespaceCloneMatches(original, original));
+
+    var attached = original;
+    attached.mount_id = 102;
+    try std.testing.expect(attachedMountMatches(original, namespace_clone, attached));
+    try std.testing.expect(!attachedMountMatches(original, namespace_clone, namespace_clone));
+
+    var replacement = namespace_clone;
+    replacement.inode += 1;
+    try std.testing.expect(!namespaceCloneMatches(original, replacement));
 }
 
 test "live_root.test.runtime replacement fails across attach and callback boundaries" {
@@ -1380,9 +1541,18 @@ fn expectIntegrationAvailable(result: Result) !void {
             .recursive_bind,
             .pid_namespace,
             => return error.SkipZigTest,
-            else => return error.UnexpectedIntegrationFailure,
+            else => {
+                std.debug.print(
+                    "live-root integration setup failed at {s} errno={}\n",
+                    .{ @tagName(failure.stage), failure.errno },
+                );
+                return error.UnexpectedIntegrationFailure;
+            },
         },
-        else => return error.UnexpectedIntegrationFailure,
+        else => |value| {
+            std.debug.print("live-root integration result: {any}\n", .{value});
+            return error.UnexpectedIntegrationFailure;
+        },
     }
 }
 
