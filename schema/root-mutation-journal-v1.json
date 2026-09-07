@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/root-mutation-journal-v1",
+  "title": "debz root mutation journal v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "attempt_generation",
+    "attempt_digest_sha256",
+    "install_root",
+    "root_identity_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "database_generation_sha256",
+    "database_plan_sha256",
+    "artifact_evidence_sha256",
+    "device",
+    "staging_bytes",
+    "budget_bytes",
+    "steps",
+    "steps_sha256",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/root-mutation-journal-v1" },
+    "version": { "const": 1 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "attempt_generation": { "type": "integer", "minimum": 1 },
+    "attempt_digest_sha256": { "$ref": "#/$defs/sha256" },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "authorization_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "program_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "plan_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "exact_lock": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema", "version", "digest_sha256"],
+          "properties": {
+            "schema": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "version": { "type": "integer", "minimum": 1 },
+            "digest_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "database_generation_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "database_plan_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "artifact_evidence_sha256": { "$ref": "#/$defs/optionalSha256" },
+    "device": { "type": "integer", "minimum": 0 },
+    "staging_bytes": { "type": "integer", "minimum": 0 },
+    "budget_bytes": { "type": "integer", "minimum": 0 },
+    "steps": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "steps_sha256": { "$ref": "#/$defs/sha256" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "optionalSha256": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+    },
+    "absolutePath": { "type": "string", "pattern": "^/", "maxLength": 4096 },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^/].*$"
+    },
+    "workspaceName": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "mode",
+        "uid",
+        "gid",
+        "modified_nanoseconds",
+        "size",
+        "content_sha256",
+        "link_target",
+        "inode",
+        "link_count"
+      ],
+      "properties": {
+        "kind": { "enum": ["regular", "directory", "symlink"] },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "uid": { "type": "integer", "minimum": 0 },
+        "gid": { "type": "integer", "minimum": 0 },
+        "modified_nanoseconds": { "type": "integer" },
+        "size": { "type": "integer", "minimum": 0 },
+        "content_sha256": { "$ref": "#/$defs/optionalSha256" },
+        "link_target": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 4095 }
+          ]
+        },
+        "inode": { "type": "integer", "minimum": 0 },
+        "link_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "expectation": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/state" }]
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "kind",
+        "path",
+        "requires",
+        "overwrite",
+        "removal",
+        "expected",
+        "desired",
+        "source",
+        "source_sha256",
+        "artifact",
+        "staging_entry",
+        "backup_entry"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "kind": {
+          "enum": [
+            "publish_file",
+            "copy_file",
+            "publish_symlink",
+            "publish_hard_link",
+            "create_directory",
+            "set_metadata",
+            "remove_path",
+            "remove_directory"
+          ]
+        },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "requires": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "overwrite": { "enum": ["require_absent", "replace"] },
+        "removal": { "enum": ["require_present", "allow_absent"] },
+        "expected": { "$ref": "#/$defs/expectation" },
+        "desired": { "$ref": "#/$defs/expectation" },
+        "source": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/relativePath" }]
+        },
+        "source_sha256": { "$ref": "#/$defs/optionalSha256" },
+        "artifact": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["index", "application_sha256"],
+              "properties": {
+                "index": { "type": "integer", "minimum": 0 },
+                "application_sha256": { "$ref": "#/$defs/sha256" }
+              }
+            }
+          ]
+        },
+        "staging_entry": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/workspaceName" }]
+        },
+        "backup_entry": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/workspaceName" }]
+        }
+      }
+    }
+  }
+}

@@ -275,6 +275,13 @@ pub fn build(b: *std.Build) void {
             "root_fs.test.",
         },
     });
+    const root_mutation_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"root_mutation.test."},
+    });
+    const run_root_mutation_tests = b.addRunArtifact(root_mutation_tests);
+    b.step("test-root-mutation", "Run crash-safe root mutation layer tests")
+        .dependOn(&run_root_mutation_tests.step);
     const run_root_operation_tests = b.addRunArtifact(root_operation_tests);
     b.step("test-root-operation", "Run root operation lock and active-record tests")
         .dependOn(&run_root_operation_tests.step);
@@ -490,6 +497,7 @@ fn installReleaseFiles(
         "release-tooling.md",
         "releasing.md",
         "root-filesystem.md",
+        "root-mutation.md",
         "root-operation.md",
         "safety-ci.md",
         "solver-planning.md",

@@ -448,6 +448,14 @@ fn exerciseState(bytes: []const u8) !void {
         var document = value;
         document.deinit();
     } else |_| {}
+    // The mutation journal and its write-ahead log are the durable inputs the
+    // recovery path parses, and both are reachable on a compromised root.
+    debz.root_mutation.fuzzOne(std.testing.allocator, bytes);
+    if (debz.root_mutation.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var journal = value;
+        defer journal.deinit();
+        debz.root_mutation.fuzzProgress(std.testing.allocator, journal.journal, bytes);
+    } else |_| {}
 }
 
 test "fuzz.deterministic bounded mutation smoke" {

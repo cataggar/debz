@@ -1388,6 +1388,28 @@ const testing = std.testing;
 
 const test_mtime: u64 = 1_700_000_000;
 
+/// Deterministic in-memory archive builder. It is exactly the builder this
+/// module's own tests use, so a fixture another module builds can never drift
+/// from the profile the model accepts.
+pub const test_fixtures = struct {
+    pub const Entry = TestEntry;
+    pub const Archive = TestArchive;
+    pub const mtime = test_mtime;
+
+    pub fn build(allocator: std.mem.Allocator, options: TestArchive) ![]u8 {
+        return buildArchive(allocator, options);
+    }
+
+    /// `md5sums` line for one payload path, which the model verifies.
+    pub fn checksumLine(
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        path: []const u8,
+    ) ![]u8 {
+        return md5Line(allocator, content, path);
+    }
+};
+
 const TestEntry = struct {
     path: []const u8,
     kind: u8 = '0',

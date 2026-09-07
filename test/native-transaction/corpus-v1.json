@@ -275,6 +275,34 @@
       "expected": "failure-before-mutation"
     },
     {
+      "id": "mutation-journal-recovery",
+      "initial": "healthy",
+      "operations": ["install", "recover"],
+      "features": ["mutation-journal", "crash-injection", "rollback", "recovery"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "mutation-external-modification",
+      "initial": "locally-modified",
+      "operations": ["upgrade"],
+      "features": ["mutation-journal", "external-change", "precondition"],
+      "expected": "recovery-required"
+    },
+    {
+      "id": "mutation-backup-restore",
+      "initial": "healthy",
+      "operations": ["remove", "recover"],
+      "features": ["mutation-journal", "backup", "rollback", "recovery"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "mutation-cross-device-refused",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["mutation-journal", "cross-device", "preflight"],
+      "expected": "failure-before-mutation"
+    },
+    {
       "id": "corrupt-root-rejected",
       "initial": "corrupt",
       "operations": ["install"],
