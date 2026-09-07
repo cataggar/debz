@@ -73,6 +73,10 @@ pub const MetadataError = error{
     /// The platform cannot express the requested ownership or timestamp
     /// change without following the final component.
     NoFollowMetadataUnsupported,
+    /// The entry carries a `security.capability` attribute that a change of
+    /// ownership would silently destroy, or the attribute could not be read,
+    /// so the ownership change is refused instead of made.
+    CapabilityAttributePresent,
 };
 
 /// A validated root-relative path. The text is borrowed; callers own it for
@@ -598,16 +602,36 @@ pub const Root = struct {
         try file.sync(self.io);
     }
 
-    /// Byte length of an existing regular file plus its last `buffer.len`
+    /// Byte length of an existing regular file plus a bounded window of its
     /// bytes, read without following the final component. A write-ahead log
     /// uses it to compare its own view against the durable tail before it
     /// appends.
-    pub const Tail = struct {
+    ///
+    /// `size` is always the physical length, which is what proves whether
+    /// anything follows the window, and `bytes` is short only when the file
+    /// ends inside the window.
+    pub const Window = struct {
         size: u64,
         bytes: []const u8,
     };
 
-    pub fn readTail(self: Root, path: Path, buffer: []u8) !Tail {
+    /// Reads `buffer.len` bytes starting at exactly `offset`. The offset is
+    /// supplied by the caller rather than derived from the physical end, so a
+    /// torn trailing write can never shift the window and make a complete
+    /// record decode as garbage.
+    pub fn readWindowAt(self: Root, path: Path, offset: u64, buffer: []u8) !Window {
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+        if (offset >= size) return .{ .size = size, .bytes = buffer[0..0] };
+        const length: usize = @intCast(@min(size - offset, buffer.len));
+        const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
+        return .{ .size = size, .bytes = buffer[0..read] };
+    }
+
+    /// Byte length of an existing regular file plus its last `buffer.len`
+    /// bytes.
+    pub fn readTail(self: Root, path: Path, buffer: []u8) !Window {
         var file = try self.openRegularFile(path);
         defer file.close(self.io);
         const size = (try file.stat(self.io)).size;
@@ -615,6 +639,50 @@ pub const Root = struct {
         const offset = size - length;
         const read = try file.readPositionalAll(self.io, buffer[0..length], offset);
         return .{ .size = size, .bytes = buffer[0..read] };
+    }
+
+    /// Discards everything after `length` in an existing regular file and
+    /// fsyncs the result. A write-ahead log uses it to repair a trailing
+    /// write that was proven never to have completed, so the repair itself is
+    /// durable before anything is appended after it.
+    pub fn truncateFile(self: Root, path: Path, length: u64, durable: bool) !void {
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        var file = parent.dir.openFile(self.io, parent.leaf, .{
+            .mode = .write_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| return mapRegularFileError(err);
+        defer file.close(self.io);
+        try file.setLength(self.io, length);
+        if (durable) try file.sync(self.io);
+    }
+
+    /// True when the final component carries a `security.capability`
+    /// attribute. Linux drops that attribute together with the set-user-ID
+    /// and set-group-ID bits whenever a non-directory is chowned, so a caller
+    /// that is about to change ownership in place has to know first.
+    ///
+    /// An attribute that cannot be read is reported as present, because the
+    /// only safe answer to "would this chown destroy a privilege the plan
+    /// does not model" is yes.
+    pub fn hasCapabilityAttribute(self: Root, path: Path) !bool {
+        if (builtin.os.tag != .linux) return false;
+        var file = try self.openRegularFile(path);
+        defer file.close(self.io);
+        const linux = std.os.linux;
+        var value: [1]u8 = undefined;
+        const result = linux.fgetxattr(file.handle, "security.capability", &value, 0);
+        return switch (linux.errno(result)) {
+            .SUCCESS => true,
+            // No attribute, or a filesystem that cannot store one at all.
+            .NODATA, .OPNOTSUPP => false,
+            // The buffer is deliberately zero-length, so a stored attribute
+            // reports its size rather than being copied out.
+            .RANGE => true,
+            else => true,
+        };
     }
 
     /// Appends `bytes` at exactly `offset` in an existing regular file and
@@ -643,7 +711,10 @@ pub const Root = struct {
 
     /// Applies exact metadata to the final component without following it.
     /// Every component is already resolved no-follow, so this can never chmod
-    /// or chown a path outside the root through a planted link.
+    /// or chown a path outside the root through a planted link. Ownership is
+    /// written before the mode and the modification time last, so a `chown`
+    /// can never silently drop a set-user-ID or set-group-ID bit the caller
+    /// asked for.
     pub fn applyMetadata(self: Root, path: Path, update: MetadataUpdate) !void {
         var parent = try self.openParent(path);
         defer parent.close(self.io);
@@ -973,17 +1044,22 @@ fn statxKind(mode: u16) File.Kind {
     };
 }
 
+/// Applies exact metadata to one already resolved final component in the only
+/// order that cannot lose a bit the caller asked for.
+///
+/// Linux clears the set-user-ID bit of a non-directory on every `chown`, and
+/// the set-group-ID bit of a group-executable non-directory, and it drops the
+/// `security.capability` attribute with them. It does so regardless of the
+/// caller's privilege. A `chmod` issued before the `chown` would therefore be
+/// silently undone, so ownership is always written first, the mode second, and
+/// the modification time last.
+///
+/// The modification time is written last because it is the only component a
+/// later repair of the mode or ownership must not disturb: `chmod` and `chown`
+/// update `ctime` alone, so once `utimensat` has run the entry is exactly what
+/// the caller asked for and any retry of the earlier components leaves it that
+/// way.
 fn applyMetadataAt(io: Io, base: Dir, leaf: []const u8, update: MetadataUpdate) !void {
-    if (update.mode) |mode| {
-        base.setFilePermissions(io, leaf, .fromMode(@intCast(mode)), .{
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
-            // A symbolic link has no independent mode anywhere the native
-            // engine runs, so the caller must not have planned one.
-            error.OperationUnsupported => return error.NoFollowMetadataUnsupported,
-            else => return mapLeafError(err),
-        };
-    }
     if (update.uid != null or update.gid != null) {
         // `std.Io.Dir.setFileOwner` declares an error set narrower than the
         // one its own dispatch can return, so the no-follow change is issued
@@ -1015,6 +1091,16 @@ fn applyMetadataAt(io: Io, base: Dir, leaf: []const u8, update: MetadataUpdate) 
             .IO => return error.InputOutput,
             else => return error.Unexpected,
         }
+    }
+    if (update.mode) |mode| {
+        base.setFilePermissions(io, leaf, .fromMode(@intCast(mode)), .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            // A symbolic link has no independent mode anywhere the native
+            // engine runs, so the caller must not have planned one.
+            error.OperationUnsupported => return error.NoFollowMetadataUnsupported,
+            else => return mapLeafError(err),
+        };
     }
     if (update.modified_nanoseconds) |nanoseconds| {
         // `Io.Timestamp` is 96-bit; a wider value can never be stored, so it
@@ -1737,4 +1823,106 @@ test "root_fs.test.device identity distinguishes filesystems" {
     if (remote.device == local.device) return error.SkipZigTest;
     try testing.expect(local.modeled and remote.modeled);
     try testing.expect(local.device != remote.device);
+}
+
+test "root_fs.test.ownership is written before a mode that carries privileged bits" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("tool"), "payload", .{});
+    const uid = std.os.linux.getuid();
+    const gid = std.os.linux.getgid();
+
+    // Linux clears the set-user-ID bit of a non-directory on every `chown`,
+    // and the set-group-ID bit of a group-executable one, whatever the
+    // caller's privilege and even when the ownership does not actually
+    // change. A mode written before the ownership would therefore be silently
+    // downgraded, so the order is part of the contract and is asserted here
+    // without needing a second uid or gid.
+    for ([_]u32{ 0o4755, 0o2755, 0o6755, 0o1755 }) |mode| {
+        try root.applyMetadata(try testPath("tool"), .{
+            .mode = mode,
+            .uid = uid,
+            .gid = gid,
+            .modified_nanoseconds = 7_000_000_000,
+        });
+        const updated = try root.entry(try testPath("tool"));
+        try testing.expectEqual(mode, updated.mode);
+        try testing.expectEqual(uid, updated.uid);
+        try testing.expectEqual(gid, updated.gid);
+        try testing.expectEqual(@as(i128, 7_000_000_000), updated.modified_nanoseconds);
+    }
+
+    // A directory keeps its set-group-ID bit across a chown, and the same
+    // order still publishes exactly what was asked for.
+    try root.createDirectory(try testPath("group"), default_directory_permissions);
+    try root.applyMetadata(try testPath("group"), .{ .mode = 0o2775, .uid = uid, .gid = gid });
+    try testing.expectEqual(@as(u32, 0o2775), (try root.entry(try testPath("group"))).mode);
+}
+
+test "root_fs.test.capability attributes are reported before an ownership change" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.publishFile(try testPath("plain"), "payload", .{});
+    try testing.expect(!try root.hasCapabilityAttribute(try testPath("plain")));
+
+    // An entry that cannot be opened as a regular file cannot be proven free
+    // of a capability attribute, and the caller treats that as present.
+    try root.createDirectory(try testPath("dir"), default_directory_permissions);
+    try testing.expectError(
+        error.NotRegularFile,
+        root.hasCapabilityAttribute(try testPath("dir")),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        root.hasCapabilityAttribute(try testPath("missing")),
+    );
+}
+
+test "root_fs.test.windows read at a proven offset and truncation repairs a tail" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+
+    try root.writeNewFile(try testPath("log"), "aaaa" ++ "bbbb" ++ "cc", .{}, true);
+    var buffer: [4]u8 = undefined;
+
+    // The window is taken at exactly the offset the caller proved durable,
+    // so a torn trailing write never shifts it.
+    const first = try root.readWindowAt(try testPath("log"), 0, &buffer);
+    try testing.expectEqual(@as(u64, 10), first.size);
+    try testing.expectEqualStrings("aaaa", first.bytes);
+    const second = try root.readWindowAt(try testPath("log"), 4, &buffer);
+    try testing.expectEqual(@as(u64, 10), second.size);
+    try testing.expectEqualStrings("bbbb", second.bytes);
+    // A window that runs past the end reports the physical size and the short
+    // read, which is how a partial tail is recognized.
+    const torn = try root.readWindowAt(try testPath("log"), 8, &buffer);
+    try testing.expectEqual(@as(u64, 10), torn.size);
+    try testing.expectEqualStrings("cc", torn.bytes);
+    const past = try root.readWindowAt(try testPath("log"), 10, &buffer);
+    try testing.expectEqual(@as(u64, 10), past.size);
+    try testing.expectEqual(@as(usize, 0), past.bytes.len);
+
+    // The tail helper still reads from the physical end.
+    const tail = try root.readTail(try testPath("log"), &buffer);
+    try testing.expectEqual(@as(u64, 10), tail.size);
+    try testing.expectEqualStrings("bbcc", tail.bytes);
+
+    try root.truncateFile(try testPath("log"), 8, true);
+    const repaired = try root.readWindowAt(try testPath("log"), 4, &buffer);
+    try testing.expectEqual(@as(u64, 8), repaired.size);
+    try testing.expectEqualStrings("bbbb", repaired.bytes);
+
+    // Truncation never follows a planted link and never reaches a directory.
+    try root.createSymbolicLink(try testPath("planted"), "log");
+    try testing.expectError(
+        error.NotRegularFile,
+        root.truncateFile(try testPath("planted"), 0, true),
+    );
 }

@@ -18,6 +18,15 @@
 //! already verified, or publishes a durable typed recovery requirement; it
 //! never guesses, and an unresolved journal refuses every further mutation.
 //!
+//! Metadata is published as ownership, then mode, then modification time,
+//! because Linux clears the set-user-ID and set-group-ID bits and drops
+//! `security.capability` on every `chown` of a non-directory. Neither that
+//! sequence nor a directory creation is atomic, so each step also states the
+//! exact, closed set of intermediate states the transaction itself could have
+//! produced from its last durable boundary. A half-applied boundary is
+//! finished or undone deterministically; anything outside that set is still an
+//! external modification and still becomes a recovery requirement.
+//!
 //! What this module deliberately does not do: it does not run maintainer
 //! scripts, process triggers, decide package ownership, or interpret unpack
 //! semantics. Those slices compose the primitives here. Arbitrary maintainer
@@ -393,6 +402,15 @@ pub const Step = struct {
 fn statesEqual(left: State, right: State) bool {
     if (left.kind != right.kind) return false;
     if (!left.metadata.eql(right.metadata)) return false;
+    return identityEqual(left, right);
+}
+
+/// Everything about a state that no metadata write can change: the kind, and
+/// the exact content of a regular file or the exact target of a symbolic
+/// link. Two observations with equal identity are the same bytes; the caller
+/// compares the inode separately when it also needs the same inode.
+fn identityEqual(left: State, right: State) bool {
+    if (left.kind != right.kind) return false;
     switch (left.kind) {
         .regular => {
             if (left.size != right.size) return false;
@@ -409,6 +427,157 @@ fn statesEqual(left: State, right: State) bool {
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Reachable intermediate states
+// ---------------------------------------------------------------------------
+//
+// Applying metadata is three ordered syscalls, not one atomic step, and
+// creating a directory publishes an inode whose mode and ownership are
+// whatever `mkdir` produced under the caller's umask and the parent's
+// set-group-ID bit until the metadata boundary rewrites them. Power loss can
+// therefore leave a target in a state that is neither the recorded old state
+// nor the recorded new one, and refusing every such state would wedge a
+// transaction on its own half-finished work.
+//
+// The answer is not to relax the comparison but to enumerate it. For each
+// step this module states the exact, closed set of states the transaction
+// itself could have produced from its last durable boundary, and accepts
+// nothing else. Every member of the set keeps the identity - kind, content
+// digest, link target, and, wherever an inode survives the transition, the
+// recorded inode, link count, and containing device - that the recorded
+// states share, so an entry an external writer replaced, truncated, or
+// retargeted is still `external_modification` and still becomes
+// `recovery_required`.
+
+/// The bits Linux can clear from a regular file's mode when it is chowned.
+/// The set-user-ID bit always goes; the set-group-ID bit goes when the entry
+/// is group executable, and kernels have differed about the exact condition,
+/// so both outcomes are modeled rather than assumed. A directory keeps its
+/// bits, and a symbolic link has no mode of its own to lose.
+const privilege_bits: u32 = 0o6000;
+
+/// True when a `chown` of this kind and mode could drop a bit, which is
+/// exactly when the mode has to be rewritten afterwards even though it
+/// already equals the desired one.
+fn privilegeBitsAtRisk(kind: Kind, mode: u32) bool {
+    return kind == .regular and mode & privilege_bits != 0;
+}
+
+/// True when applying `to` onto an entry of `kind` that currently holds
+/// `from` issues a `chmod`. It mirrors `applyDesiredMetadata` exactly, so the
+/// reachable set and the writer can never disagree.
+fn writesMode(kind: Kind, from: Metadata, to: Metadata) bool {
+    if (kind == .symlink) return false;
+    if (from.mode != to.mode) return true;
+    return writesOwner(from, to) and privilegeBitsAtRisk(kind, from.mode);
+}
+
+fn writesOwner(from: Metadata, to: Metadata) bool {
+    return from.uid != to.uid or from.gid != to.gid;
+}
+
+fn writesTimestamp(kind: Kind, from: Metadata, to: Metadata) bool {
+    return kind != .directory and from.modified_nanoseconds != to.modified_nanoseconds;
+}
+
+/// A bounded, deduplicated set of metadata combinations. One application
+/// issues at most three ordered writes and branches only on whether the
+/// `chown` cleared a privilege bit, so a single chain is at most six entries;
+/// the closure a restore adds converges after one round. The capacity is
+/// deliberately larger than that proven bound, and a set that somehow filled
+/// would only ever refuse more.
+const MetadataSet = struct {
+    items: [32]Metadata = undefined,
+    len: usize = 0,
+
+    fn add(self: *MetadataSet, value: Metadata) void {
+        if (self.contains(value)) return;
+        if (self.len == self.items.len) return;
+        self.items[self.len] = value;
+        self.len += 1;
+    }
+
+    fn contains(self: MetadataSet, value: Metadata) bool {
+        for (self.items[0..self.len]) |item| {
+            if (item.eql(value)) return true;
+        }
+        return false;
+    }
+};
+
+/// Adds every combination one interrupted application from `from` toward `to`
+/// can leave, in the fixed order ownership, mode, modification time.
+fn addMetadataChain(set: *MetadataSet, kind: Kind, from: Metadata, to: Metadata) void {
+    set.add(from);
+    var current = from;
+    if (writesOwner(from, to)) {
+        current.uid = to.uid;
+        current.gid = to.gid;
+        set.add(current);
+        if (privilegeBitsAtRisk(kind, current.mode)) {
+            var cleared = current;
+            cleared.mode = current.mode & ~@as(u32, 0o4000);
+            set.add(cleared);
+            cleared.mode = current.mode & ~privilege_bits;
+            set.add(cleared);
+            // Ownership that can clear a bit always forces the mode write, so
+            // the branch converges on the desired mode at the next step.
+            std.debug.assert(writesMode(kind, from, to));
+        }
+    }
+    if (writesMode(kind, from, to)) {
+        current.mode = to.mode;
+        set.add(current);
+    }
+    if (writesTimestamp(kind, from, to)) {
+        current.modified_nanoseconds = to.modified_nanoseconds;
+        set.add(current);
+    }
+}
+
+/// Every metadata combination this transaction could have left on one inode
+/// while moving it from `expected` toward `desired`, plus - once the
+/// transaction has turned around - every combination an interrupted
+/// restoration back to `expected` could leave. The restoration walks the same
+/// three ordered writes from wherever the forward pass stopped, so the union
+/// closes after one round: each restored state already owns `expected`'s
+/// ownership, so no further `chown` and therefore no further branch is
+/// possible.
+fn reachableMetadata(kind: Kind, expected: Metadata, desired: Metadata, phase: Phase) MetadataSet {
+    var set: MetadataSet = .{};
+    addMetadataChain(&set, kind, expected, desired);
+    if (phase == .forward) return set;
+    var rounds: usize = 0;
+    while (rounds < 4) : (rounds += 1) {
+        const before = set.len;
+        const snapshot = set;
+        for (snapshot.items[0..snapshot.len]) |start|
+            addMetadataChain(&set, kind, start, expected);
+        if (set.len == before) break;
+    }
+    return set;
+}
+
+/// The direction the transaction is durably committed to. It decides which
+/// intermediate states are reachable: only a transaction that has already
+/// published `rolling_back` can be part way through a restoration.
+const Phase = enum { forward, restore };
+
+/// Classification of one observed target against everything this transaction
+/// could itself have left there.
+const Reach = enum {
+    /// Exactly the recorded old state.
+    expected,
+    /// Exactly the recorded new state.
+    desired,
+    /// A state only this transaction's own partially applied boundary can
+    /// have produced. It is resolved by finishing or undoing that boundary,
+    /// never by adopting it.
+    intermediate,
+    /// Nothing this transaction did could have produced it.
+    foreign,
+};
 
 // ---------------------------------------------------------------------------
 // Write-ahead protocol
@@ -495,12 +664,16 @@ pub const StepState = enum(u8) {
 
 /// Every syscall and durability boundary the engine can stop at. The crash
 /// injection harness names points with this enum, so a test can prove the
-/// outcome of an interruption at each one.
+/// outcome of an interruption at each one. Metadata is deliberately split into
+/// its three ordered syscalls, because power loss between any two of them
+/// leaves a state the recovery model has to name.
 pub const Boundary = enum {
     journal_write,
     journal_sync,
     progress_append,
     progress_sync,
+    /// Repair of a trailing write that was proven never to have completed.
+    progress_truncate,
     workspace_create,
     stage_create,
     stage_write,
@@ -514,6 +687,14 @@ pub const Boundary = enum {
     publish_rename,
     publish_create,
     metadata_apply,
+    /// The ownership change, which is issued first because it can clear mode
+    /// bits and drop `security.capability`.
+    metadata_chown,
+    /// The mode change, which is issued after ownership so a cleared
+    /// set-user-ID or set-group-ID bit is always written back.
+    metadata_chmod,
+    /// The modification-time change, which is issued last.
+    metadata_utimens,
     parent_sync,
     verify,
     release_staging,
@@ -2085,6 +2266,17 @@ fn buildStep(
                 else
                     present.metadata.modified_nanoseconds,
             };
+            // Changing the ownership of a regular file in place drops its
+            // `security.capability` attribute, which this layer does not
+            // model and could not restore. The intent is refused before
+            // anything changes rather than published and then discovered.
+            // A directory keeps its attributes across a `chown`, and a
+            // symbolic link cannot carry one.
+            if (present.kind == .regular and writesOwner(present.metadata, desired.metadata)) {
+                const carries = builder.root.hasCapabilityAttribute(path) catch true;
+                if (carries)
+                    return builder.fail(.preflight, .metadata_unsupported, path.text);
+            }
             step.desired = .{ .present = desired };
         },
         .remove => |value| {
@@ -2406,30 +2598,60 @@ pub const Engine = struct {
         }
     }
 
-    /// Compare-and-set against the log's durable tail. A writer whose view is
-    /// older or newer than what the file actually holds would fork the
-    /// history, so it is refused instead of appending. The comparison is the
-    /// chain digest of the last complete record, which binds the whole prefix
-    /// and the journal it belongs to.
+    /// Compare-and-set against the log's durable tail, plus the repair of a
+    /// trailing write that provably never completed.
+    ///
+    /// The last complete record is read at exactly `accepted_bytes - one
+    /// record`, never from the physical end, so a torn trailing write can
+    /// never shift the window and make a complete record decode as garbage.
+    /// The comparison is that record's sequence and chain digest, which bind
+    /// the whole prefix and the journal it belongs to, so a writer whose view
+    /// is older or newer than what the file actually holds is refused instead
+    /// of forking the history.
+    ///
+    /// Only bytes past the compared record can be discarded, and only when
+    /// there are fewer of them than one record, which is exactly the shape a
+    /// half-written append leaves and a shape no complete record can have. A
+    /// full extra record - replayed, reordered, foreign, or written by
+    /// another writer - is never repaired away: it means this writer's view
+    /// is stale. The repair is `fsync`ed before the append, so a crash during
+    /// it leaves either the same torn tail or the truncated prefix, and both
+    /// replay to the same accepted prefix.
     fn compareAndSet(self: *Engine) Error!void {
         const path = root_fs.Path.init(progress_path) catch unreachable;
         var buffer: [progress_record_bytes]u8 = undefined;
-        const tail = self.root.readTail(path, &buffer) catch
+        const accepted = self.progress.accepted_bytes;
+        const offset = if (accepted == 0) 0 else accepted - progress_record_bytes;
+        const window = self.root.readWindowAt(path, offset, &buffer) catch
             return self.reject(.progress, .io_failed, null, .progress_append);
-        if (tail.size != self.progress.accepted_bytes)
+        // The durable prefix this writer proved can never shrink; a shorter
+        // file is a different history.
+        if (window.size < accepted)
             return self.reject(.progress, .progress_stale, null, .progress_append);
-        if (self.progress.accepted_bytes == 0) {
+        const trailing = window.size - accepted;
+        // One whole record or more past the accepted prefix is another
+        // writer's append, not a torn one.
+        if (trailing >= progress_record_bytes)
+            return self.reject(.progress, .progress_stale, null, .progress_append);
+        if (accepted == 0) {
             if (!std.mem.eql(u8, &self.progress.chain_sha256, &self.owned.journal.digest_sha256))
                 return self.reject(.progress, .progress_stale, null, .progress_append);
-            return;
+        } else {
+            if (window.bytes.len < progress_record_bytes)
+                return self.reject(.progress, .progress_corrupt, null, .progress_append);
+            const line = window.bytes[0 .. progress_record_bytes - 1];
+            if (window.bytes[progress_record_bytes - 1] != '\n')
+                return self.reject(.progress, .progress_corrupt, null, .progress_append);
+            const decoded = decodeProgressRecord(line) catch
+                return self.reject(.progress, .progress_corrupt, null, .progress_append);
+            if (decoded.sequence != self.progress.sequence or
+                !std.mem.eql(u8, &decoded.chain_sha256, &self.progress.chain_sha256))
+                return self.reject(.progress, .progress_stale, null, .progress_append);
         }
-        if (tail.bytes.len != progress_record_bytes)
-            return self.reject(.progress, .progress_corrupt, null, .progress_append);
-        const decoded = decodeProgressRecord(tail.bytes[0 .. progress_record_bytes - 1]) catch
-            return self.reject(.progress, .progress_corrupt, null, .progress_append);
-        if (decoded.sequence != self.progress.sequence or
-            !std.mem.eql(u8, &decoded.chain_sha256, &self.progress.chain_sha256))
-            return self.reject(.progress, .progress_stale, null, .progress_append);
+        if (trailing == 0) return;
+        try self.hook(.progress_truncate, ProgressRecord.no_index);
+        self.root.truncateFile(path, accepted, true) catch
+            return self.reject(.progress, .io_failed, null, .progress_truncate);
     }
 
     fn publishStage(self: *Engine, value: Stage) Error!void {
@@ -2795,8 +3017,7 @@ fn stageStep(engine: *Engine, step: Step, content: Content) Error!void {
 
     if (step.kind != .publish_hard_link) {
         try engine.hook(.stage_metadata, step.index);
-        applyDesiredMetadata(engine, staging.path(), desired) catch
-            return engine.reject(.staging, .metadata_unsupported, step.index, .stage_metadata);
+        try applyDesiredMetadata(engine, step.index, .staging, staging.path(), desired);
     }
     try engine.hook(.stage_dir_sync, step.index);
     engine.root.syncDirectory(root_fs.Path.init(staging_path) catch unreachable) catch
@@ -2840,7 +3061,7 @@ fn captureBackup(engine: *Engine, step: Step) Error!void {
         .present => |value| value,
     };
     var observation: Observation = .{};
-    try requirePrecondition(engine, step, &observation);
+    try requirePrecondition(engine, step, &observation, false);
     if (engine.root.entryIfExists(backup.path()) catch null) |existing| {
         if (existing.inode == expected.inode) return;
         removeWorkspaceEntry(engine, backup.path()) catch
@@ -2860,17 +3081,168 @@ fn captureBackup(engine: *Engine, step: Step) Error!void {
 const Observation = struct {
     link_buffer: [maximum_link_target_bytes]u8 = undefined,
     state: Expectation = .absent,
+    /// Containing device of an observed entry, which the journal pins for the
+    /// whole plan. It is not part of `State` because a desired state cannot
+    /// predict one, but an intermediate state must still be on the device the
+    /// transaction was compiled against.
+    device: u64 = 0,
+    /// False when the platform cannot report ownership and device, so the
+    /// classifier never reads a zero as an observation.
+    modeled: bool = false,
 };
 
 /// Compares the target to its recorded precondition. A retry after an
-/// interruption is satisfied by the recorded desired state, and anything else
-/// is an external modification, never a guess.
-fn requirePrecondition(engine: *Engine, step: Step, observation: *Observation) Error!void {
+/// interruption is satisfied by the recorded desired state or, when the
+/// boundary that was interrupted is one this transaction can only have left
+/// part way through itself, by a state in that boundary's closed reachable
+/// set. Anything else is an external modification, never a guess.
+fn requirePrecondition(
+    engine: *Engine,
+    step: Step,
+    observation: *Observation,
+    accept_intermediate: bool,
+) Error!void {
     try engine.hook(.precondition_check, step.index);
     try observeTarget(engine, step, targetPath(step), observation);
-    if (matches(observation.state, step.expected)) return;
-    if (matches(observation.state, step.desired)) return;
+    switch (try classify(engine, step, observation.*, .forward)) {
+        .expected, .desired => return,
+        .intermediate => if (accept_intermediate) return,
+        .foreign => {},
+    }
     return engine.reject(.publication, .external_modification, step.index, .precondition_check);
+}
+
+/// Classifies one observed target against the recorded states and against the
+/// closed set of states this transaction itself could have produced.
+fn classify(engine: *Engine, step: Step, observation: Observation, phase: Phase) Error!Reach {
+    const actual = observation.state;
+    if (matches(actual, step.expected)) return .expected;
+    if (matches(actual, step.desired)) return .desired;
+    return if (try selfProduced(engine, step, observation, phase)) .intermediate else .foreign;
+}
+
+/// The complete reachable-state model. Everything it accepts, this
+/// transaction wrote itself between two durable boundaries; everything it
+/// refuses becomes `recovery_required`.
+fn selfProduced(engine: *Engine, step: Step, observation: Observation, phase: Phase) Error!bool {
+    const expected = switch (step.expected) {
+        .absent => null,
+        .present => |value| value,
+    };
+    const found = switch (observation.state) {
+        // Nothing is at the path. The transaction removes an old entry itself
+        // only when the transition it is making cannot be a single rename.
+        .absent => return removalReachable(step, phase),
+        .present => |value| value,
+    };
+    // Every path in the plan shares one device, so an entry that arrived from
+    // a different filesystem was never this transaction's work.
+    if (observation.modeled and observation.device != engine.owned.journal.device) return false;
+
+    // The recorded inode is still there, so only its metadata can have moved,
+    // and the ordered writes say exactly how far.
+    if (expected) |old| {
+        if (found.inode == old.inode and found.link_count == old.link_count and
+            identityEqual(found, old))
+        {
+            const desired = switch (step.desired) {
+                // A removal writes no metadata, so the recorded old metadata
+                // is the only combination reachable, and that is already
+                // `expected`.
+                .absent => return false,
+                .present => |value| value,
+            };
+            if (!writesMetadataInPlace(step)) return false;
+            if (!identityEqual(found, desired)) return false;
+            const set = reachableMetadata(old.kind, old.metadata, desired.metadata, phase);
+            return set.contains(found.metadata);
+        }
+    }
+
+    // A directory the transaction created itself. `mkdir` publishes whatever
+    // the caller's umask and the parent's set-group-ID bit produce, and the
+    // metadata boundary rewrites it, so the intermediate mode and ownership
+    // are not predictable from the journal - the evidence is that only this
+    // transaction can have created a directory at this path in this
+    // direction, and that the directory is still empty and therefore still
+    // exactly as removable as when it was made.
+    if (found.kind == .directory and directoryCreationReachable(step, phase, found))
+        return emptyDirectory(engine, step);
+
+    // A symbolic link the transaction re-created from the journal while
+    // restoring. The link target is the whole content of a symbolic link, so
+    // an exact target plus a pending metadata write is the recorded old state
+    // part way through being republished.
+    if (phase == .restore and found.kind == .symlink) {
+        if (expected) |old| {
+            if (old.kind == .symlink and identityEqual(found, old)) return true;
+        }
+    }
+    return false;
+}
+
+/// True for the steps that write metadata onto the inode they found, rather
+/// than onto a replacement they publish by rename.
+fn writesMetadataInPlace(step: Step) bool {
+    return switch (step.kind) {
+        .set_metadata, .create_directory => true,
+        else => false,
+    };
+}
+
+/// True when this transaction itself can have left the path empty. Forward,
+/// that happens only where a rename cannot express the transition and the old
+/// entry has to be unlinked first; while restoring, it happens wherever a
+/// directory is on either side of the transition, because the restoration
+/// removes what it finds before it re-creates the recorded old entry.
+fn removalReachable(step: Step, phase: Phase) bool {
+    const expected = switch (step.expected) {
+        .absent => return false,
+        .present => |value| value,
+    };
+    const desired_kind = switch (step.desired) {
+        // An absent target is the desired state of a removal, which
+        // `matches` already accepted.
+        .absent => return false,
+        .present => |value| value.kind,
+    };
+    if (expected.kind == .directory) return true;
+    return phase == .restore and desired_kind == .directory;
+}
+
+/// True when this transaction itself can have created the directory it is
+/// looking at. Forward, that is a `create_directory` step whose recorded old
+/// state is not already a directory, between its `mkdir` and its metadata
+/// boundary. While restoring, it is additionally any step whose recorded old
+/// state is a directory the restoration has to re-create from the journal,
+/// which is provably a different inode from the recorded one.
+fn directoryCreationReachable(step: Step, phase: Phase, found: State) bool {
+    const created_forward = step.kind == .create_directory and switch (step.expected) {
+        .absent => true,
+        .present => |old| old.kind != .directory,
+    } and switch (step.desired) {
+        .absent => false,
+        .present => |value| value.kind == .directory,
+    };
+    if (created_forward) return true;
+    if (phase != .restore) return false;
+    return switch (step.expected) {
+        .absent => false,
+        .present => |old| old.kind == .directory and found.inode != old.inode,
+    };
+}
+
+/// A directory with entries is not the directory this transaction made, and a
+/// directory this transaction made is still empty, so emptiness is the proof
+/// that removing or re-moding it is exactly the recorded transition.
+fn emptyDirectory(engine: *Engine, step: Step) Error!bool {
+    var dir = engine.root.openDirectory(targetPath(step)) catch
+        return engine.reject(.publication, .io_failed, step.index, .precondition_check);
+    defer dir.close(engine.root.io);
+    var iterator = dir.iterate();
+    const first = iterator.next(engine.root.io) catch
+        return engine.reject(.publication, .io_failed, step.index, .precondition_check);
+    return first == null;
 }
 
 fn observeTarget(
@@ -2880,6 +3252,8 @@ fn observeTarget(
     observation: *Observation,
 ) Error!void {
     observation.state = .absent;
+    observation.device = 0;
+    observation.modeled = false;
     const found = engine.root.entryIfExists(path) catch
         return engine.reject(.publication, .io_failed, step.index, .precondition_check);
     const value = found orelse return;
@@ -2907,6 +3281,8 @@ fn observeTarget(
             return engine.reject(.publication, .io_failed, step.index, .precondition_check),
         .directory => state.metadata.modified_nanoseconds = 0,
     }
+    observation.device = value.device;
+    observation.modeled = value.modeled;
     observation.state = .{ .present = state };
 }
 
@@ -2943,7 +3319,7 @@ fn hashPath(engine: *Engine, path: root_fs.Path) ![32]u8 {
 /// exactly one thing.
 fn publishStep(engine: *Engine, step: Step) Error!void {
     var observation: Observation = .{};
-    try requirePrecondition(engine, step, &observation);
+    try requirePrecondition(engine, step, &observation, true);
     const actual = observation.state;
     if (matches(actual, step.desired) and step.kind != .create_directory) return;
 
@@ -3020,15 +3396,15 @@ fn applyStepMetadata(engine: *Engine, step: Step) Error!void {
     };
     // A metadata-only step never takes the target name over, so whatever
     // inode is at the path right now is the one that would be changed. It
-    // must still be the recorded one; a directory this step just created is
-    // exempt because it has not received its metadata yet.
+    // must still be the recorded one, or a state only this step's own
+    // interrupted metadata writes can have produced; a directory this step
+    // just created is exempt because it has not received its metadata yet.
     if (step.kind == .set_metadata) {
         var observation: Observation = .{};
-        try requirePrecondition(engine, step, &observation);
+        try requirePrecondition(engine, step, &observation, true);
     }
     try engine.hook(.metadata_apply, step.index);
-    applyDesiredMetadata(engine, targetPath(step), desired) catch
-        return engine.reject(.metadata, .io_failed, step.index, .metadata_apply);
+    try applyDesiredMetadata(engine, step.index, .metadata, targetPath(step), desired);
     switch (desired.kind) {
         .regular => engine.root.syncRegularFile(targetPath(step)) catch
             return engine.reject(.metadata, .io_failed, step.index, .metadata_apply),
@@ -3038,23 +3414,70 @@ fn applyStepMetadata(engine: *Engine, step: Step) Error!void {
     }
 }
 
-/// Only the components that actually differ are written, so an unprivileged
+/// Publishes exact metadata in the only order that cannot lose a bit: the
+/// ownership first, the mode second, and the modification time last.
+///
+/// Linux clears the set-user-ID bit of a non-directory on every `chown`, the
+/// set-group-ID bit of a group-executable one, and the `security.capability`
+/// attribute with them, whatever the caller's privilege. Writing the mode
+/// first would therefore publish `04755` as `0755` and wedge verification and
+/// rollback on a state neither side recorded. Writing ownership first fixes
+/// the order; the mode is additionally rewritten whenever a `chown` was
+/// issued and the desired mode keeps a bit that `chown` can clear, even
+/// though the mode already matches, so the final chmod is never skipped.
+///
+/// Only components that actually differ are written, so an unprivileged
 /// caller that models the ownership it already has never issues a `chown` it
-/// is not allowed to make.
-fn applyDesiredMetadata(engine: *Engine, path: root_fs.Path, desired: State) !void {
-    const current = try engine.root.entry(path);
+/// is not allowed to make. Each write is a separate durability boundary, so a
+/// power loss between any two of them is an injectable, modeled state rather
+/// than an unknown one.
+fn applyDesiredMetadata(
+    engine: *Engine,
+    index: u32,
+    surface: Surface,
+    path: root_fs.Path,
+    desired: State,
+) Error!void {
+    const current = engine.root.entry(path) catch
+        return engine.reject(surface, .io_failed, index, .metadata_apply);
     // Never write metadata onto a kind the plan did not model, which would
     // mean the entry was replaced since it was observed.
-    if (Kind.fromFileKind(current.kind) != desired.kind) return error.UnexpectedPathKind;
-    var update: root_fs.MetadataUpdate = .{};
-    if (desired.kind != .symlink and current.mode != desired.metadata.mode)
-        update.mode = desired.metadata.mode;
-    if (current.modeled and current.uid != desired.metadata.uid) update.uid = desired.metadata.uid;
-    if (current.modeled and current.gid != desired.metadata.gid) update.gid = desired.metadata.gid;
-    if (desired.kind != .directory and
-        current.modified_nanoseconds != desired.metadata.modified_nanoseconds)
-        update.modified_nanoseconds = desired.metadata.modified_nanoseconds;
-    try engine.root.applyMetadata(path, update);
+    if (Kind.fromFileKind(current.kind) != desired.kind)
+        return engine.reject(surface, .external_modification, index, .metadata_apply);
+    const found: Metadata = .{
+        .mode = current.mode,
+        .uid = current.uid,
+        .gid = current.gid,
+        .modified_nanoseconds = current.modified_nanoseconds,
+    };
+    const owner = current.modeled and writesOwner(found, desired.metadata);
+    if (owner) {
+        // A `chown` silently drops `security.capability`, which this layer
+        // does not model and cannot restore, so an entry that carries one is
+        // refused before the ownership changes instead of after. Only a
+        // regular file can carry one.
+        if (desired.kind == .regular) {
+            const carries = engine.root.hasCapabilityAttribute(path) catch true;
+            if (carries)
+                return engine.reject(surface, .metadata_unsupported, index, .metadata_chown);
+        }
+        try engine.hook(.metadata_chown, index);
+        engine.root.applyMetadata(path, .{
+            .uid = desired.metadata.uid,
+            .gid = desired.metadata.gid,
+        }) catch return engine.reject(surface, .io_failed, index, .metadata_chown);
+    }
+    if (writesMode(desired.kind, found, desired.metadata)) {
+        try engine.hook(.metadata_chmod, index);
+        engine.root.applyMetadata(path, .{ .mode = desired.metadata.mode }) catch
+            return engine.reject(surface, .io_failed, index, .metadata_chmod);
+    }
+    if (writesTimestamp(desired.kind, found, desired.metadata)) {
+        try engine.hook(.metadata_utimens, index);
+        engine.root.applyMetadata(path, .{
+            .modified_nanoseconds = desired.metadata.modified_nanoseconds,
+        }) catch return engine.reject(surface, .io_failed, index, .metadata_utimens);
+    }
 }
 
 fn syncParent(engine: *Engine, step: Step) Error!void {
@@ -3120,9 +3543,20 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     const actual = observation.state;
-    if (matches(actual, step.expected)) return;
-    if (!matches(actual, step.desired))
-        return engine.reject(.recovery, .recovery_required, step.index, .restore_rename);
+    switch (try classify(engine, step, observation, .restore)) {
+        // The recorded old state is already back in place.
+        .expected => return,
+        // The recorded new state, or a state only this transaction's own
+        // interrupted boundary can have produced. Both are undone by the
+        // same deterministic restoration below.
+        .desired, .intermediate => {},
+        .foreign => return engine.reject(
+            .recovery,
+            .recovery_required,
+            step.index,
+            .restore_rename,
+        ),
+    }
 
     // A metadata-only step never took the target name over, so undoing it is
     // republishing the recorded old mode, ownership, and timestamp.
@@ -3132,8 +3566,7 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
             .present => |value| value,
         };
         try engine.hook(.metadata_apply, step.index);
-        applyDesiredMetadata(engine, targetPath(step), expected) catch
-            return engine.reject(.recovery, .io_failed, step.index, .metadata_apply);
+        try applyDesiredMetadata(engine, step.index, .recovery, targetPath(step), expected);
         try observeTarget(engine, step, targetPath(step), &observation);
         if (!matches(observation.state, step.expected))
             return engine.reject(.recovery, .recovery_required, step.index, .verify);
@@ -3202,8 +3635,7 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
         .absent => {},
         .present => |expected| {
             try engine.hook(.metadata_apply, step.index);
-            applyDesiredMetadata(engine, targetPath(step), expected) catch
-                return engine.reject(.recovery, .io_failed, step.index, .metadata_apply);
+            try applyDesiredMetadata(engine, step.index, .recovery, targetPath(step), expected);
         },
     }
     try syncParent(engine, step);
@@ -5399,4 +5831,874 @@ test "root_mutation.test.a stale writer cannot fork the progress log" {
     const report = try apply(&other, .fromPlan(&plan));
     try testing.expectEqual(Outcome.applied, report.outcome);
     try clear(&other);
+}
+
+// ---------------------------------------------------------------------------
+// Ownership, privileged mode bits, and self-created intermediate states
+// ---------------------------------------------------------------------------
+
+/// A group this process may actually move an entry to, so an ownership change
+/// is a real `chown` and not a modeled one. `null` when the environment
+/// cannot offer a second group, which is the only case where the end-to-end
+/// scenarios below cannot run; the ordering contract itself is proven without
+/// a second group by `root_fs.test.ownership is written before a mode that
+/// carries privileged bits`.
+fn alternateGid() ?u32 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    const current = linux.getgid();
+    var buffer: [64]std.posix.gid_t = undefined;
+    const result = linux.getgroups(buffer.len, &buffer);
+    if (linux.errno(result) == .SUCCESS) {
+        for (buffer[0..result]) |value| {
+            if (value != current) return value;
+        }
+    }
+    // Only a privileged caller may name a group it does not belong to.
+    if (linux.getuid() == 0) return if (current == 0) 1 else 0;
+    return null;
+}
+
+fn expectMetadata(root: root_fs.Root, path: []const u8, mode: u32, uid: u32, gid: u32) !void {
+    const found = try root.entry(try root_fs.Path.init(path));
+    testing.expectEqual(mode, found.mode) catch |err| {
+        std.debug.print("{s}: mode {o} expected {o}\n", .{ path, found.mode, mode });
+        return err;
+    };
+    try testing.expectEqual(uid, found.uid);
+    try testing.expectEqual(gid, found.gid);
+}
+
+test "root_mutation.test.privileged mode bits survive a real ownership change" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const other = alternateGid() orelse return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    const uid = currentUid();
+    const gid = currentGid();
+
+    // Two existing entries whose mode already carries exactly the bits the
+    // plan wants. Only their group changes, so a writer that skipped the
+    // final `chmod` because the mode "already matched" would publish 0755,
+    // fail verification, and then wedge rollback on a state neither side
+    // recorded.
+    try writeExisting(root, "usr/bin/suid", "old\n");
+    try root.applyMetadata(try root_fs.Path.init("usr/bin/suid"), .{ .mode = 0o4755 });
+    try writeExisting(root, "usr/bin/sgid", "old\n");
+    try root.applyMetadata(try root_fs.Path.init("usr/bin/sgid"), .{ .mode = 0o2755 });
+    try root.createSymbolicLink(try root_fs.Path.init("usr/bin/alias"), "suid");
+    try root.createDirectoryPath(
+        try root_fs.Path.init("usr/lib"),
+        root_fs.default_directory_permissions,
+    );
+
+    const intents = [_]Intent{
+        .{ .file = .{
+            .path = "usr/bin/fresh",
+            .bytes = "payload\n",
+            .mode = 0o4755,
+            .uid = uid,
+            .gid = other,
+            .modified_nanoseconds = 1_000_000_000,
+        } },
+        .{ .metadata = .{ .path = "usr/bin/suid", .mode = 0o4755, .gid = other } },
+        .{ .metadata = .{ .path = "usr/bin/sgid", .mode = 0o2755, .gid = other } },
+        .{ .directory = .{ .path = "usr/lib/drop", .mode = 0o2775, .uid = uid, .gid = other } },
+        // Neither a symbolic link nor a directory can lose a capability
+        // attribute to a `chown`, so neither is refused for carrying one.
+        .{ .metadata = .{ .path = "usr/bin/alias", .gid = other } },
+        .{ .metadata = .{ .path = "usr/lib", .gid = other } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&engine, .fromPlan(&plan))).outcome);
+
+    try expectMetadata(root, "usr/bin/fresh", 0o4755, uid, other);
+    try expectMetadata(root, "usr/bin/suid", 0o4755, uid, other);
+    try expectMetadata(root, "usr/bin/sgid", 0o2755, uid, other);
+    try expectMetadata(root, "usr/lib/drop", 0o2775, uid, other);
+    try testing.expectEqual(other, (try root.entry(try root_fs.Path.init("usr/bin/alias"))).gid);
+    try testing.expectEqual(other, (try root.entry(try root_fs.Path.init("usr/lib"))).gid);
+    try clear(&engine);
+
+    // The same transition backwards, rolled back part way through, restores
+    // the exact recorded mode and ownership including the privileged bits.
+    const back = [_]Intent{
+        .{ .metadata = .{ .path = "usr/bin/suid", .mode = 0o4755, .gid = gid } },
+        .{ .metadata = .{ .path = "usr/bin/sgid", .mode = 0o2755, .gid = gid } },
+        fileIntent("usr/bin/fresh", "replaced\n"),
+    };
+    var second = try planFor(&fixture, &back);
+    defer second.deinit();
+    var injector: Injector = .{ .faults = &.{.{
+        .boundary = .verify,
+        .step = 2,
+        .err = error.RenameFailed,
+    }} };
+    var rolled = try prepare(testing.allocator, root, &fixture.attempt, &second, .{}, .{
+        .hooks = injector.interface(),
+    });
+    defer rolled.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try apply(&rolled, .fromPlan(&second))).outcome);
+    try expectMetadata(root, "usr/bin/suid", 0o4755, uid, other);
+    try expectMetadata(root, "usr/bin/sgid", 0o2755, uid, other);
+    try expectMetadata(root, "usr/bin/fresh", 0o4755, uid, other);
+    try expectContent(root, "usr/bin/fresh", "payload\n");
+    try expectWorkspaceEmpty(root);
+    try clear(&rolled);
+}
+
+/// A parent whose set-group-ID bit is set gives every entry created inside it
+/// the parent's group instead of the caller's, so `mkdir` and the staging
+/// area publish intermediate ownership that matches neither recorded state.
+fn seedGroupRoot(root: root_fs.Root, other: u32) !void {
+    try root.createDirectoryPath(
+        try root_fs.Path.init("srv/shared"),
+        root_fs.default_directory_permissions,
+    );
+    try root.applyMetadata(try root_fs.Path.init("srv/shared"), .{ .mode = 0o2775, .gid = other });
+    try writeExisting(root, "srv/shared/tool", "old\n");
+    try root.applyMetadata(try root_fs.Path.init("srv/shared/tool"), .{ .mode = 0o4755 });
+    try writeExisting(root, "srv/shared/doomed", "gone\n");
+}
+
+fn groupIntents(other: u32) [4]Intent {
+    return .{
+        .{ .directory = .{
+            .path = "srv/shared/sub",
+            .mode = 0o2755,
+            .uid = currentUid(),
+            .gid = currentGid(),
+        } },
+        .{ .file = .{
+            .path = "srv/shared/new",
+            .bytes = "created\n",
+            .mode = 0o4755,
+            .uid = currentUid(),
+            .gid = other,
+            .modified_nanoseconds = 1_000_000_000,
+        } },
+        .{ .metadata = .{ .path = "srv/shared/tool", .mode = 0o4755, .gid = currentGid() } },
+        .{ .remove = .{ .path = "srv/shared/doomed" } },
+    };
+}
+
+fn expectGroupSeeded(root: root_fs.Root, other: u32) !void {
+    try expectMetadata(root, "srv/shared/tool", 0o4755, currentUid(), other);
+    try expectContent(root, "srv/shared/doomed", "gone\n");
+    try expectAbsent(root, "srv/shared/sub");
+    try expectAbsent(root, "srv/shared/new");
+}
+
+fn expectGroupApplied(root: root_fs.Root, other: u32) !void {
+    try expectMetadata(root, "srv/shared/tool", 0o4755, currentUid(), currentGid());
+    try expectAbsent(root, "srv/shared/doomed");
+    try expectMetadata(root, "srv/shared/new", 0o4755, currentUid(), other);
+    try expectContent(root, "srv/shared/new", "created\n");
+    const sub = try root.entry(try root_fs.Path.init("srv/shared/sub"));
+    try testing.expect(sub.isDirectory());
+    try testing.expectEqual(currentGid(), sub.gid);
+    try testing.expectEqual(@as(u32, 0o2755), sub.mode);
+}
+
+fn runGroupCrashScenario(
+    other: u32,
+    faults: []const Fault,
+    expectation: CrashExpectation,
+) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedGroupRoot(root, other);
+
+    var injector: Injector = .{ .faults = faults };
+    const intents = groupIntents(other);
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var crashed = prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    }) catch |err| {
+        try testing.expectEqual(error.SimulatedCrash, err);
+        try testing.expect(injector.allFired());
+        try recoverGroup(&fixture, other, .old_state);
+        return;
+    };
+    const outcome = apply(&crashed, .fromPlan(&plan));
+    crashed.deinit();
+    try testing.expectError(error.SimulatedCrash, outcome);
+    try testing.expect(injector.allFired());
+    try recoverGroup(&fixture, other, expectation);
+}
+
+fn recoverGroup(fixture: *Fixture, other: u32, expectation: CrashExpectation) !void {
+    const root = fixture.root();
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})) orelse {
+        try expectGroupSeeded(root, other);
+        return;
+    };
+    defer engine.deinit();
+    const report = try recover(&engine);
+    switch (expectation) {
+        .old_state => {
+            try testing.expectEqual(Outcome.rolled_back, report.outcome);
+            try expectGroupSeeded(root, other);
+        },
+        .new_state => {
+            try testing.expectEqual(Outcome.applied, report.outcome);
+            try expectGroupApplied(root, other);
+        },
+    }
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+    try expectAbsent(root, journal_path);
+}
+
+test "root_mutation.test.crash at every metadata syscall under a set-group-ID parent recovers exactly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const other = alternateGid() orelse return error.SkipZigTest;
+
+    // Every one of these leaves a state that is neither the recorded old one
+    // nor the recorded new one: a directory carrying the parent's inherited
+    // group, an inode whose ownership moved but whose mode has not caught up
+    // yet, or a mode written without its timestamp.
+    const rollback_boundaries = [_]Boundary{
+        .journal_write,
+        .journal_sync,
+        .progress_append,
+        .progress_sync,
+        .stage_create,
+        .stage_write,
+        .stage_sync,
+        .stage_metadata,
+        .stage_dir_sync,
+        .backup_link,
+        .backup_dir_sync,
+        .precondition_check,
+        .target_remove,
+        .publish_rename,
+        .publish_create,
+        .metadata_apply,
+        .metadata_chown,
+        .metadata_chmod,
+        .metadata_utimens,
+        .parent_sync,
+        .verify,
+    };
+    for (rollback_boundaries) |boundary| {
+        const faults = [_]Fault{.{ .boundary = boundary }};
+        runGroupCrashScenario(other, &faults, .old_state) catch |err| {
+            std.debug.print("set-group-ID crash scenario failed at {t}\n", .{boundary});
+            return err;
+        };
+    }
+
+    // The same boundaries reached a second time, which is where an ownership
+    // change has already happened once and the mode write has not.
+    for ([_]Boundary{ .metadata_chown, .metadata_chmod }) |boundary| {
+        const faults = [_]Fault{.{ .boundary = boundary, .occurrence = 2 }};
+        runGroupCrashScenario(other, &faults, .old_state) catch |err| {
+            std.debug.print("second-occurrence scenario failed at {t}\n", .{boundary});
+            return err;
+        };
+    }
+
+    for ([_]Boundary{ .release_staging, .release_backup }) |boundary| {
+        const faults = [_]Fault{.{ .boundary = boundary }};
+        runGroupCrashScenario(other, &faults, .new_state) catch |err| {
+            std.debug.print("set-group-ID release scenario failed at {t}\n", .{boundary});
+            return err;
+        };
+    }
+
+    // Restoration boundaries need a first fault to turn the transaction
+    // around, and then interrupt the restoration itself part way through its
+    // own ordered metadata writes.
+    for ([_]Boundary{ .restore_rename, .metadata_chown, .metadata_chmod }) |boundary| {
+        const faults = [_]Fault{
+            .{ .boundary = .verify, .step = 3, .err = error.RenameFailed },
+            .{
+                .boundary = boundary,
+                .step = if (boundary == .restore_rename) null else 2,
+                .occurrence = if (boundary == .restore_rename) 1 else 2,
+            },
+        };
+        runGroupCrashScenario(other, &faults, .old_state) catch |err| {
+            std.debug.print("set-group-ID restore scenario failed at {t}\n", .{boundary});
+            return err;
+        };
+    }
+
+    // Nothing injected at all still produces the exact recorded new state.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedGroupRoot(root, other);
+    const intents = groupIntents(other);
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&engine, .fromPlan(&plan))).outcome);
+    try expectGroupApplied(root, other);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a directory the transaction created is removable before its metadata" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const other = alternateGid() orelse return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    // A set-group-ID parent makes `mkdir` publish the parent's group, so the
+    // state between the directory's creation and its metadata boundary is
+    // provably an intermediate one rather than either recorded state.
+    try root.createDirectoryPath(
+        try root_fs.Path.init("opt"),
+        root_fs.default_directory_permissions,
+    );
+    try root.applyMetadata(try root_fs.Path.init("opt"), .{ .mode = 0o2775, .gid = other });
+    const intents = [_]Intent{
+        .{ .directory = .{
+            .path = "opt/tree",
+            .mode = 0o2755,
+            .uid = currentUid(),
+            .gid = currentGid(),
+        } },
+        fileIntent("opt/tree/child", "leaf\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .metadata_apply, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    // The directory exists and does not hold its planned ownership yet.
+    const partial = try root.entry(try root_fs.Path.init("opt/tree"));
+    try testing.expect(partial.isDirectory());
+    try testing.expectEqual(other, partial.gid);
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    try expectAbsent(root, "opt/tree");
+    try clear(&engine);
+
+    // A directory that is no longer this transaction's own empty creation is
+    // never removed on a guess.
+    var planted: Fixture = undefined;
+    try planted.init();
+    defer planted.deinit();
+    const planted_root = planted.root();
+    try planted_root.createDirectoryPath(
+        try root_fs.Path.init("opt"),
+        root_fs.default_directory_permissions,
+    );
+    try planted_root.applyMetadata(
+        try root_fs.Path.init("opt"),
+        .{ .mode = 0o2775, .gid = other },
+    );
+    var second = try planFor(&planted, &intents);
+    defer second.deinit();
+    var again: Injector = .{ .faults = &.{.{ .boundary = .metadata_apply, .step = 0 }} };
+    var interrupted = try prepare(
+        testing.allocator,
+        planted_root,
+        &planted.attempt,
+        &second,
+        .{},
+        .{ .hooks = again.interface() },
+    );
+    try testing.expectError(error.SimulatedCrash, apply(&interrupted, .fromPlan(&second)));
+    interrupted.deinit();
+    try planted_root.writeNewFile(try root_fs.Path.init("opt/tree/planted"), "x", .{}, true);
+
+    var blocked = (try open(testing.allocator, planted_root, &planted.attempt, .{})).?;
+    defer blocked.deinit();
+    try testing.expectEqual(Outcome.recovery_required, (try recover(&blocked)).outcome);
+    try testing.expectEqual(Stage.recovery_required, blocked.stage());
+    try testing.expectError(error.RecoveryRequired, apply(&blocked, .fromPlan(&second)));
+}
+
+test "root_mutation.test.the reachable metadata set is exactly the ordered writes" {
+    const expected: Metadata = .{
+        .mode = 0o4755,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 5,
+    };
+    const desired: Metadata = .{
+        .mode = 0o4755,
+        .uid = 10,
+        .gid = 30,
+        .modified_nanoseconds = 9,
+    };
+    // Ownership that can clear a privileged bit always forces the mode write,
+    // so the desired mode is never left behind even though it already
+    // matches.
+    try testing.expect(writesMode(.regular, expected, desired));
+    try testing.expect(!writesMode(.symlink, expected, desired));
+    try testing.expect(!writesMode(.directory, expected, desired));
+
+    const applying = reachableMetadata(.regular, expected, desired, .forward);
+    // Nothing applied, ownership applied with the bit still set or already
+    // cleared, mode rewritten, and finally the timestamp.
+    try testing.expect(applying.contains(expected));
+    try testing.expect(applying.contains(.{
+        .mode = 0o4755,
+        .uid = 10,
+        .gid = 30,
+        .modified_nanoseconds = 5,
+    }));
+    try testing.expect(applying.contains(.{
+        .mode = 0o0755,
+        .uid = 10,
+        .gid = 30,
+        .modified_nanoseconds = 5,
+    }));
+    try testing.expect(applying.contains(desired));
+    try testing.expectEqual(@as(usize, 4), applying.len);
+    // A combination none of the three writes can produce is refused, however
+    // close it looks.
+    try testing.expect(!applying.contains(.{
+        .mode = 0o0700,
+        .uid = 10,
+        .gid = 30,
+        .modified_nanoseconds = 5,
+    }));
+    try testing.expect(!applying.contains(.{
+        .mode = 0o4755,
+        .uid = 11,
+        .gid = 30,
+        .modified_nanoseconds = 9,
+    }));
+    try testing.expect(!applying.contains(.{
+        .mode = 0o0755,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 5,
+    }));
+
+    // Once the transaction has turned around, an interrupted restoration is
+    // reachable from wherever the forward pass stopped, and the union is
+    // closed: walking the ordered writes back to the recorded old metadata
+    // from every member adds nothing new.
+    const restore = reachableMetadata(.regular, expected, desired, .restore);
+    for (applying.items[0..applying.len]) |value| try testing.expect(restore.contains(value));
+    try testing.expect(restore.contains(.{
+        .mode = 0o4755,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 9,
+    }));
+    try testing.expect(restore.contains(.{
+        .mode = 0o0755,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 9,
+    }));
+    var closed = restore;
+    for (restore.items[0..restore.len]) |start|
+        addMetadataChain(&closed, .regular, start, expected);
+    try testing.expectEqual(restore.len, closed.len);
+    try testing.expect(restore.len < closed.items.len);
+    try testing.expect(!restore.contains(.{
+        .mode = 0o0700,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 9,
+    }));
+
+    // A directory keeps its privileged bits across an ownership change and
+    // never publishes a modification time, so its chain is shorter.
+    const directory = reachableMetadata(.directory, .{
+        .mode = 0o2755,
+        .uid = 10,
+        .gid = 20,
+        .modified_nanoseconds = 0,
+    }, .{
+        .mode = 0o2755,
+        .uid = 10,
+        .gid = 30,
+        .modified_nanoseconds = 0,
+    }, .forward);
+    try testing.expectEqual(@as(usize, 2), directory.len);
+}
+
+test "root_mutation.test.a transition that unlinks before it publishes stays resumable" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    try root.createDirectory(
+        try root_fs.Path.init("becomes-file"),
+        root_fs.default_directory_permissions,
+    );
+    const intents = [_]Intent{fileIntent("becomes-file", "now a file\n")};
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    // Power loss between the `rmdir` a rename cannot express and the rename
+    // itself leaves the name empty, which is neither recorded state.
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .publish_rename, .step = 0 }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try expectAbsent(root, "becomes-file");
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    try testing.expect((try root.entry(try root_fs.Path.init("becomes-file"))).isDirectory());
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.an external metadata change is never mistaken for an intermediate" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    try writeExisting(root, "etc/meta", "meta\n");
+    const intents = [_]Intent{
+        .{ .metadata = .{ .path = "etc/meta", .mode = 0o600 } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    // A mode nobody in this plan could have written is an external
+    // modification, not a partially applied boundary.
+    try root.applyMetadata(try root_fs.Path.init("etc/meta"), .{ .mode = 0o640 });
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.recovery_required, report.outcome);
+    try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+    try testing.expectEqual(@as(u32, 0o640), (try root.entry(try root_fs.Path.init("etc/meta"))).mode);
+
+    // A replacement that carries exactly the recorded metadata but a
+    // different inode is refused for the same reason.
+    var second: Fixture = undefined;
+    try second.init();
+    defer second.deinit();
+    const other_root = second.root();
+    try writeExisting(other_root, "etc/meta", "meta\n");
+    var swap = try planFor(&second, &intents);
+    defer swap.deinit();
+    var swapped = try prepare(testing.allocator, other_root, &second.attempt, &swap, .{}, .{});
+    defer swapped.deinit();
+    try other_root.publishFile(try root_fs.Path.init("etc/meta"), "meta\n", .{});
+    const swap_report = try apply(&swapped, .fromPlan(&swap));
+    try testing.expectEqual(Outcome.recovery_required, swap_report.outcome);
+}
+
+// ---------------------------------------------------------------------------
+// Torn, extra, and foreign progress records
+// ---------------------------------------------------------------------------
+
+/// Writes `bytes` straight past the end of the durable log, which is exactly
+/// what a half-completed append leaves behind.
+fn appendPastProgress(root: root_fs.Root, bytes: []const u8) !void {
+    const path = try root_fs.Path.init(progress_path);
+    const size = (try root.entry(path)).size;
+    try root.appendAt(path, size, bytes, true);
+}
+
+fn progressSize(root: root_fs.Root) !u64 {
+    return (try root.entry(try root_fs.Path.init(progress_path))).size;
+}
+
+/// The first `partial` bytes of a record that would have been valid, which is
+/// the hardest torn tail to tell from a complete one.
+fn tornRecordPrefix(buffer: *[progress_record_bytes]u8, partial: usize) []const u8 {
+    const torn: ProgressRecord = .{
+        .sequence = 0x5a5a,
+        .scope = .journal,
+        .index = ProgressRecord.no_index,
+        .stage = .verified,
+        .state = .prepared,
+        .chain_sha256 = @splat(0xab),
+    };
+    return torn.encode(buffer)[0..partial];
+}
+
+fn runTornTailScenario(partial: usize, fault: Boundary, expectation: CrashExpectation) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const intents = seedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{.{ .boundary = fault }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+
+    const durable = try progressSize(root);
+    try testing.expectEqual(@as(u64, 0), durable % progress_record_bytes);
+    var buffer: [progress_record_bytes]u8 = undefined;
+    try appendPastProgress(root, tornRecordPrefix(&buffer, partial));
+    try testing.expectEqual(durable + partial, try progressSize(root));
+
+    // The torn tail is neither trusted nor fatal: replay stops at the last
+    // complete record, the next append repairs the file, and recovery still
+    // reaches a terminal stage.
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(durable, engine.progress.accepted_bytes);
+    const report = try recover(&engine);
+    switch (expectation) {
+        .old_state => {
+            try testing.expectEqual(Outcome.rolled_back, report.outcome);
+            try expectSeededState(root);
+        },
+        .new_state => {
+            try testing.expectEqual(Outcome.applied, report.outcome);
+            try expectAppliedState(root);
+        },
+    }
+    const repaired = try progressSize(root);
+    try testing.expect(repaired > durable);
+    try testing.expectEqual(@as(u64, 0), repaired % progress_record_bytes);
+    try expectWorkspaceEmpty(root);
+    try testing.expectEqual(engine.stage(), (try inspect(testing.allocator, root, .{})).?);
+    try clear(&engine);
+    try expectAbsent(root, journal_path);
+    try expectAbsent(root, progress_path);
+}
+
+test "root_mutation.test.a torn trailing progress record is repaired instead of wedging" {
+    // Every length a half-completed append can leave, from one byte to one
+    // byte short of a whole record.
+    var partial: usize = 1;
+    while (partial < progress_record_bytes) : (partial += 1) {
+        runTornTailScenario(partial, .publish_rename, .old_state) catch |err| {
+            std.debug.print("torn tail of {d} bytes failed\n", .{partial});
+            return err;
+        };
+    }
+
+    // The same repair on a transaction that already verified finishes forward
+    // instead of undoing proven-good work.
+    for ([_]usize{ 1, progress_record_bytes / 2, progress_record_bytes - 1 }) |length|
+        try runTornTailScenario(length, .release_staging, .new_state);
+}
+
+test "root_mutation.test.a complete extra progress record is never repaired away" {
+    var buffer: [progress_record_bytes]u8 = undefined;
+    const cases = [_]struct { name: []const u8, extra: usize }{
+        .{ .name = "one whole garbage record", .extra = progress_record_bytes },
+        .{ .name = "a whole record and a torn one", .extra = progress_record_bytes + 7 },
+        .{ .name = "two whole garbage records", .extra = 2 * progress_record_bytes },
+    };
+    for (cases) |case| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try seedRoot(root);
+
+        const intents = seedIntents();
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var injector: Injector = .{ .faults = &.{.{ .boundary = .publish_rename }} };
+        var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+            .hooks = injector.interface(),
+        });
+        try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+        crashed.deinit();
+
+        var garbage: [3 * progress_record_bytes]u8 = @splat('z');
+        try appendPastProgress(root, garbage[0..case.extra]);
+        // A record-sized run of bytes is a complete record, so it is
+        // corruption rather than a torn write, and the journal stays
+        // unresolvable rather than being silently truncated.
+        try testing.expectError(
+            error.ProgressCorrupt,
+            open(testing.allocator, root, &fixture.attempt, .{}),
+        );
+        try testing.expectError(
+            error.ProgressCorrupt,
+            inspect(testing.allocator, root, .{}),
+        );
+        try expectSeededState(root);
+    }
+
+    // A well-formed record that simply repeats the durable tail is a replay,
+    // not a torn write.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+    const intents = seedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .publish_rename }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+
+    const tail = try root.readTail(try root_fs.Path.init(progress_path), &buffer);
+    try appendPastProgress(root, tail.bytes);
+    try testing.expectError(
+        error.ProgressCorrupt,
+        open(testing.allocator, root, &fixture.attempt, .{}),
+    );
+}
+
+test "root_mutation.test.a stale writer is refused even when the tail is torn" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const intents = seedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+
+    // Another writer advanced the durable log and then lost power part way
+    // through its own next append. The stale view holds neither the complete
+    // record nor the torn one, so it is refused rather than repairing away a
+    // boundary it never saw.
+    var other = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer other.deinit();
+    try other.publishStage(.applying);
+    var buffer: [progress_record_bytes]u8 = undefined;
+    try appendPastProgress(root, tornRecordPrefix(&buffer, 11));
+
+    try testing.expectError(error.StaleWriter, engine.publishStage(.applying));
+    try expectSeededState(root);
+
+    // The writer that actually holds the durable tail repairs it and
+    // continues.
+    const report = try apply(&other, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    try testing.expectEqual(@as(u64, 0), try progressSize(root) % progress_record_bytes);
+    try expectAppliedState(root);
+    try clear(&other);
+}
+
+test "root_mutation.test.a crash during the repair of a torn tail is itself safe" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const intents = seedIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var injector: Injector = .{ .faults = &.{.{ .boundary = .publish_rename }} };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+
+    const durable = try progressSize(root);
+    var buffer: [progress_record_bytes]u8 = undefined;
+    try appendPastProgress(root, tornRecordPrefix(&buffer, 40));
+
+    // Power loss at the repair itself leaves the same torn tail, which the
+    // next pass repairs again.
+    var repairing: Injector = .{ .faults = &.{.{ .boundary = .progress_truncate }} };
+    var interrupted = (try open(testing.allocator, root, &fixture.attempt, .{
+        .hooks = repairing.interface(),
+    })).?;
+    try testing.expectError(error.SimulatedCrash, recover(&interrupted));
+    interrupted.deinit();
+    try testing.expect(repairing.allFired());
+    try testing.expectEqual(durable + 40, try progressSize(root));
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    try expectSeededState(root);
+    try testing.expectEqual(@as(u64, 0), try progressSize(root) % progress_record_bytes);
+    try clear(&engine);
+}
+
+test "root_mutation.test.a symbolic link re-created while restoring is finished, not refused" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc"),
+        root_fs.default_directory_permissions,
+    );
+    try root.createSymbolicLink(try root_fs.Path.init("etc/link"), "first");
+    try root.applyMetadata(try root_fs.Path.init("etc/link"), .{
+        .modified_nanoseconds = 3_000_000_000,
+    });
+
+    const intents = [_]Intent{
+        symlinkIntent("etc/link", "second"),
+        fileIntent("etc/other", "payload\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    // Restoring a symbolic link is a fresh inode plus a timestamp write, so
+    // power loss between them leaves the exact recorded target with a
+    // timestamp that matches neither recorded state.
+    var injector: Injector = .{ .faults = &.{
+        .{ .boundary = .verify, .step = 1, .err = error.RenameFailed },
+        .{ .boundary = .metadata_utimens, .step = 0, .occurrence = 2 },
+    } };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try testing.expect(injector.allFired());
+
+    var buffer: [maximum_link_target_bytes]u8 = undefined;
+    const interrupted = try root.entry(try root_fs.Path.init("etc/link"));
+    try testing.expectEqualStrings(
+        "first",
+        try root.readSymbolicLink(try root_fs.Path.init("etc/link"), &buffer),
+    );
+    try testing.expect(interrupted.modified_nanoseconds != 3_000_000_000);
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    const restored = try root.entry(try root_fs.Path.init("etc/link"));
+    try testing.expectEqual(@as(i128, 3_000_000_000), restored.modified_nanoseconds);
+    try testing.expectEqualStrings(
+        "first",
+        try root.readSymbolicLink(try root_fs.Path.init("etc/link"), &buffer),
+    );
+    try expectAbsent(root, "etc/other");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
 }

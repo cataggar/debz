@@ -102,7 +102,7 @@ Preflight refuses, before anything can change:
 | `cross_device` | a target whose filesystem differs from the workspace |
 | `capacity_exceeded` / `numeric_overflow` / `step_limit` | bounded resource accounting |
 | `content_digest_mismatch` | content that does not hash to the digest the caller authorized |
-| `metadata_unsupported` | a mode change on a symbolic link, or a mode outside `07777` |
+| `metadata_unsupported` | a mode change on a symbolic link, a mode outside `07777`, or an in-place ownership change on a non-directory carrying `security.capability` |
 
 A directory's modification time is derived from its own entries, so a later
 step in the same plan would invalidate it as soon as it published a child. It
@@ -125,12 +125,37 @@ progress record appended at the exact offset the caller proved durable and
 ```
 
 Each record chains onto its predecessor, and the first chains onto the journal
-digest, so a log can never be replayed against a different journal, a record
-cannot be reordered or replayed, and a torn trailing write is discarded rather
-than trusted. Appending is a compare-and-set: the writer reads the log's
-durable tail and refuses with `error.StaleWriter` unless the file length and
-the last record's sequence and chain digest are exactly the ones it holds, so a
-writer whose view has been overtaken can never fork the history.
+digest, so a log can never be replayed against a different journal, and a
+record cannot be reordered or replayed.
+
+Appending is a compare-and-set. The writer reads the **last complete record at
+exactly `accepted_bytes - one record`**, never at whatever the physical end
+happens to be, and refuses with `error.StaleWriter` unless that record's
+sequence and chain digest are exactly the ones it holds. Reading at a proven
+offset is what makes a torn tail survivable: a window taken from the physical
+end after a half-completed append is a slice of two different records and
+decodes as garbage.
+
+The physical length is then compared to the accepted prefix:
+
+| Physical length | Meaning | Result |
+| --- | --- | --- |
+| shorter than the accepted prefix | a different history | `error.StaleWriter` |
+| exactly the accepted prefix | nothing is owed | append |
+| up to one byte short of a whole record past it | a torn trailing write | truncate to the accepted prefix, `fsync`, then append |
+| one whole record or more past it | another writer's append, a replay, or a foreign record | `error.StaleWriter` |
+
+Only bytes past the compared record can be discarded, and only when there are
+fewer of them than one record — a shape no complete record can have. A whole
+extra record is never repaired away, because it is evidence that this writer's
+view is stale rather than evidence of a torn write. The repair is `fsync`ed
+before the append, so power loss during the repair leaves either the same torn
+tail or the truncated prefix, and both replay to the same accepted prefix.
+
+Replay applies the mirror rule: a trailing run shorter than one record was
+never durable and is dropped, while a complete record that fails to decode,
+chains onto the wrong predecessor, or carries the wrong sequence is
+`error.ProgressCorrupt` and leaves the journal unresolved.
 
 Transaction stages are `prepared`, `applying`, `rolling_back`, `verified`,
 `completing`, `completed`, `releasing_rollback`, `rolled_back`, and
@@ -157,16 +182,91 @@ Application of one step:
    (a directory becoming a file, link, or hard link, or a non-directory becoming
    a directory) removes the old entry first; the recorded expectation and
    desired state still differ in exactly one way, so the step stays resumable.
-4. **metadata applied** — `create_directory` and `set_metadata` write their mode,
-   ownership, and timestamp and `fsync` the affected inode. Only components that
-   actually differ are written.
+4. **metadata applied** — `create_directory` and `set_metadata` write their
+   ownership, mode, and timestamp in that exact order and `fsync` the affected
+   inode. Only components that actually differ are written, with one deliberate
+   exception described below.
 5. **parent synced** — the destination directory is `fsync`ed.
 6. **verified** — the target is observed again and compared to the desired state
    exactly, including the content digest and link target.
 
+## Metadata order and privileged bits
+
+Applying metadata is three syscalls, and their order is part of the durable
+contract:
+
+1. **ownership**, 2. **mode**, 3. **modification time**.
+
+Linux clears the set-user-ID bit of a non-directory on every `chown`, and the
+set-group-ID bit of a group-executable one, whatever the caller's privilege and
+even when the ownership does not actually change. Writing the mode first would
+publish `04755` as `0755`, fail verification, and then wedge rollback on a state
+neither side recorded. Ownership therefore goes first, and the mode is
+additionally rewritten whenever an ownership change was issued and the desired
+mode keeps a bit that a `chown` can clear — even though the mode already
+matches — so the final `chmod` is never skipped. The timestamp goes last,
+because `chmod` and `chown` update `ctime` alone and a later repair of either
+must not disturb a timestamp that is already correct.
+
+A `chown` of a non-directory also drops its `security.capability` attribute.
+This layer does not model extended attributes and could not restore one, so a
+`set_metadata` intent that would change the ownership of a non-directory
+carrying that attribute is refused during preflight (`metadata_unsupported`)
+and re-checked immediately before the `chown`. Publication steps are
+unaffected: they replace the inode outright, the old inode with its attributes
+is held in the backup area until the transaction verifies, and the newly staged
+inode never had any.
+
+Each of the three writes is a separate crash-injection boundary
+(`metadata_chown`, `metadata_chmod`, `metadata_utimens`), so power loss between
+any two of them is a modeled, injectable state rather than an unknown one.
+
+## Reachable intermediate states
+
+Neither metadata application nor directory creation is atomic, so power loss
+can leave a target in a state that is neither the recorded old state nor the
+recorded new one. Refusing every such state would wedge a transaction on its
+own half-finished work; adopting whatever is found would silently accept an
+external change. This layer does neither: for each step it states the exact,
+closed set of states the transaction itself could have produced from its last
+durable boundary, and accepts nothing else.
+
+Every member of that set keeps the identity the recorded states share — kind,
+content digest, link target, and, wherever an inode survives the transition,
+the recorded inode, link count, and the plan's device — so an entry an external
+writer replaced, truncated, or retargeted is still `external_modification` and
+still becomes `recovery_required`.
+
+| Step shape | States the transaction itself can have left |
+| --- | --- |
+| `set_metadata`, and `create_directory` on an existing directory | the recorded inode with the ordered metadata chain below |
+| `create_directory` over nothing or over a non-directory | an **empty** directory whose mode and ownership are whatever `mkdir` produced under the caller's umask and the parent's set-group-ID bit |
+| any transition a rename cannot express (a directory becoming something else) | the path momentarily **empty**, between the `rmdir` and the publication |
+| while restoring: a recorded directory | an **empty** directory it re-created from the journal, provably a different inode from the recorded one |
+| while restoring: a recorded symbolic link | the exact recorded target on a fresh inode whose timestamp has not been written back yet |
+
+The metadata chain from a state `from` toward a state `to` is exactly the
+prefixes of the ordered writes: `from` itself; ownership applied with the
+privileged bits still present or already cleared; the mode rewritten; and
+finally the timestamp. It is at most a handful of combinations, and it is
+closed: once the transaction has turned around, an interrupted restoration is
+reachable from wherever the forward pass stopped, and walking the same ordered
+writes back to the recorded old metadata from every member adds nothing new,
+because every restored state already carries the recorded ownership and so can
+issue no further `chown`.
+
+A directory is only accepted as the transaction's own creation while it is
+still empty, which is exactly the condition under which removing it restores
+the recorded absence; a directory that has gained an entry is refused and
+becomes `recovery_required`. Every accepted intermediate is resolved by
+finishing or undoing the boundary that produced it — the writer recomputes the
+components that still differ from what it observes — never by adopting it as
+the new truth. Verification at the end of the step is still an exact comparison
+with the desired state.
+
 Every boundary is idempotent. A retry compares the observed state to the
-recorded expectation and to the recorded desired state; anything else is
-`external_modification` and never a guess.
+recorded expectation, to the recorded desired state, and to that step's closed
+reachable set; anything else is `external_modification` and never a guess.
 
 ## Recovery
 
@@ -183,16 +283,19 @@ Rollback is always possible because backups are released only after the whole
 transaction verifies, so recovery never needs the original content re-supplied
 and never depends on the process that started the transaction. Each step is
 undone in reverse order and re-observed afterwards; a step whose target matches
-neither the recorded old state nor the recorded new state publishes
-`recovery_required` durably, tells the root-operation attempt through
-`Attempt.requireRecovery`, and refuses every further mutation until an operator
-resolves it. `clear` is refused unless the stage is `completed` or
-`rolled_back`.
+neither the recorded old state, nor the recorded new state, nor that step's
+closed set of reachable intermediate states publishes `recovery_required`
+durably, tells the root-operation attempt through `Attempt.requireRecovery`,
+and refuses every further mutation until an operator resolves it. `clear` is
+refused unless the stage is `completed` or `rolled_back`.
 
 A `set_metadata` step proves its recorded precondition before it changes an
 inode, because unlike a publication it never takes the target name over and
 would otherwise stamp the plan's mode, ownership, and timestamp onto whatever
-entry now occupies the name.
+entry now occupies the name. The precondition it accepts is the recorded old
+state, the recorded new state, or one of that step's own reachable metadata
+combinations on the recorded inode — never an unrelated mode, ownership, or
+timestamp, and never a different inode carrying the recorded metadata.
 
 A cancellation or an expired deadline is observed at a step boundary, turns the
 transaction around, and leaves a cleanly restored root plus the durable
@@ -242,13 +345,39 @@ phases here, and records script and trigger outcomes through
 
 `zig build test-root-mutation` runs the layer's own suite. It injects a
 simulated power loss at every syscall and durability boundary of every
-primitive and proves that the resulting root is exactly the old state, exactly
-the new state, or a durable recovery requirement; the harness fails if an
-injected fault never fires. It also covers disk-full, short-write, `fsync`,
-`rename`, `unlink`, and `link` failures, external modification and symbolic-link
-swaps between preflight and publication, corrupt, truncated, torn, replayed, and
-unknown-schema journals and logs, stale and mismatched attempts, a lost root
-lock, cancellation, restart recovery through a freshly opened engine, database
-publication and rollback against a real `var/lib/dpkg` generation, and
-allocation failure at every allocation of preflight, decode, and replay. Every
-test uses a disposable alternate root.
+primitive — including each of the three metadata syscalls separately — and
+proves that the resulting root is exactly the old state, exactly the new state,
+or a durable recovery requirement; the harness fails if an injected fault never
+fires. The whole boundary matrix is also run underneath a set-group-ID parent
+directory with a real second group, so `mkdir` and the staging area publish
+ownership that matches neither recorded state and every self-created
+intermediate has to be recognized rather than refused. Publication and
+`set_metadata` are proven end to end for `04755` and `02755` across a real
+ownership change, in both directions, with the exact mode, uid, and gid
+asserted after application and after rollback; the ordering contract itself is
+additionally proven without needing a second group, because a `chown` clears
+the bits even when it does not change the owner.
+
+The write-ahead log is torn deliberately at every length from one byte to one
+byte short of a whole record, on transactions that recover backwards and
+forwards, and each case must replay to the last complete record, repair the
+file, reach a terminal stage, report the same stage through `inspect`, and
+clear. A whole extra record, a whole record plus a torn one, two whole
+records, and a replayed copy of the durable tail must all stay corrupt or
+stale rather than being repaired away, a stale writer must still be refused
+when the tail is torn, and power loss during the repair itself must leave the
+same torn tail for the next pass.
+
+The suite also covers disk-full, short-write, `fsync`, `rename`, `unlink`, and
+`link` failures, external modification and symbolic-link swaps between
+preflight and publication, an external mode change and an inode substitution
+that must never be mistaken for the transaction's own intermediate state,
+corrupt, truncated, torn, replayed, and unknown-schema journals and logs, stale
+and mismatched attempts, a lost root lock, cancellation, restart recovery
+through a freshly opened engine, database publication and rollback against a
+real `var/lib/dpkg` generation, and allocation failure at every allocation of
+preflight, decode, and replay. Every test uses a disposable alternate root.
+
+The scenarios that need a second group or a privileged caller report
+`SkipZigTest` where the environment cannot provide one; the ordering contract,
+the reachable-state model, and the whole write-ahead log suite run everywhere.

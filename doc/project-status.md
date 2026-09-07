@@ -65,14 +65,28 @@ and desired states, publishes them as a versioned durable journal plus a
 hash-chained write-ahead progress log before the first target byte changes, and
 then walks explicit durability boundaries - staged, backup captured, published,
 metadata applied, parent synced, verified, completed - comparing observed state
-to the recorded expectation at every one. Root-local staging and backups live in
+to the recorded expectation at every one. Metadata is published as ownership,
+then mode, then modification time, because Linux drops set-user-ID,
+set-group-ID, and `security.capability` on every `chown` of a non-directory; the
+mode is rewritten even when it already matches whenever an ownership change
+could have cleared a bit it keeps. Because neither that sequence nor directory
+creation is atomic, each step also states the exact closed set of intermediate
+states the transaction itself could have produced from its last durable
+boundary, and accepts nothing outside it, so a half-applied boundary is finished
+or undone deterministically while an external modification is still refused.
+Root-local staging and backups live in
 a private `var/lib/debz/mutation` workspace, are created exclusively so a planted
 entry can never be followed, and are released only after the whole transaction
 verifies, so recovery can always restore the recorded old state without
 re-supplying content. Preflight refuses special files, symbolic-link components,
 path aliases, ancestor conflicts, hard-link ambiguity, non-empty directory
-transitions, cross-device targets, capacity and overflow, and content that does
-not hash to the authorized digest. Recovery either restores the old state,
+transitions, cross-device targets, capacity and overflow, content that does
+not hash to the authorized digest, and an in-place ownership change that would
+silently destroy a file capability. Appending a progress boundary is a
+compare-and-set against the last complete record read at a proven offset: a
+trailing run shorter than one record is a torn write and is truncated and
+`fsync`ed before the append, while a whole extra record is a stale or foreign
+history and is refused. Recovery either restores the old state,
 finishes releasing a verified transaction, or publishes a durable typed recovery
 requirement that blocks every further mutation. `lowerDatabasePlan` is the typed
 adapter that consumes `package_database_changes.Plan` in its own status-old,
