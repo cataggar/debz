@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-system-operation-state-v1",
+  "title": "debz apt-shaped facade durable active operation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "generation",
+    "operation",
+    "phase",
+    "mutation_started",
+    "outcome",
+    "request_sha256",
+    "profile",
+    "exact_lock",
+    "transaction_result",
+    "root_operation_completion",
+    "updated_unix",
+    "diagnostic",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-system-operation-state-v1" },
+    "version": { "const": 1 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "generation": { "type": "integer", "minimum": 1 },
+    "operation": { "$ref": "#/$defs/operation" },
+    "phase": {
+      "enum": [
+        "reserved",
+        "profile_loaded",
+        "authenticated",
+        "planned",
+        "downloaded",
+        "mutating",
+        "verifying",
+        "recovery_required",
+        "completed"
+      ]
+    },
+    "mutation_started": { "type": "boolean" },
+    "outcome": {
+      "enum": [
+        "pending",
+        "succeeded",
+        "failed_before_mutation",
+        "failed_after_mutation",
+        "recovered"
+      ]
+    },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "profile": { "$ref": "#/$defs/profileBinding" },
+    "exact_lock": { "$ref": "#/$defs/optionalDocumentBinding" },
+    "transaction_result": { "$ref": "#/$defs/optionalDocumentBinding" },
+    "root_operation_completion": {
+      "oneOf": [
+        { "$ref": "#/$defs/completionBinding" },
+        { "type": "null" }
+      ]
+    },
+    "updated_unix": { "type": "integer" },
+    "diagnostic": { "type": "string", "maxLength": 4096 },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "phase": { "const": "completed" } },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": { "outcome": { "not": { "const": "pending" } } }
+      },
+      "else": {
+        "properties": { "outcome": { "const": "pending" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "mutation_started": { "const": false } },
+        "required": ["mutation_started"]
+      },
+      "then": {
+        "properties": {
+          "transaction_result": { "type": "null" },
+          "root_operation_completion": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": { "enum": ["update", "list_installed"] }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "mutation_started": { "const": false },
+          "exact_lock": { "type": "null" },
+          "transaction_result": { "type": "null" },
+          "root_operation_completion": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "enum": ["succeeded", "recovered"] },
+          "operation": { "enum": ["install", "remove", "upgrade"] }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "exact_lock": { "$ref": "#/$defs/documentBinding" },
+          "transaction_result": { "$ref": "#/$defs/documentBinding" },
+          "root_operation_completion": { "$ref": "#/$defs/completionBinding" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "recovery_required" }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "diagnostic": { "minLength": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "failed_before_mutation",
+              "failed_after_mutation",
+              "recovered"
+            ]
+          }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "diagnostic": { "minLength": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$",
+      "not": { "const": "/" }
+    },
+    "operation": {
+      "enum": ["update", "install", "remove", "upgrade", "list_installed"]
+    },
+    "profileBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "documentBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema", "version", "digest_sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "schema": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "version": { "type": "integer", "minimum": 1 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "optionalDocumentBinding": {
+      "oneOf": [
+        { "$ref": "#/$defs/documentBinding" },
+        { "type": "null" }
+      ]
+    },
+    "completionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document", "completed_attempt_id"],
+      "properties": {
+        "document": { "$ref": "#/$defs/documentBinding" },
+        "completed_attempt_id": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

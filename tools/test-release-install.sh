@@ -41,6 +41,9 @@ test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
 for schema in \
   apt-config-snapshot-v1.json \
+  apt-system-operation-state-v1.json \
+  apt-system-request-v1.json \
+  apt-system-result-v1.json \
   command-result-v1.json \
   exact-closure-lock-v1.json \
   exact-closure-lock-v2.json \
@@ -51,6 +54,7 @@ for schema in \
   repository-operation-result-v1.json \
   root-operation-completion-v1.json \
   root-operation-record-v1.json \
+  system-profile-v1.json \
   transaction-plan-v1.json \
   transaction-plan-v2.json \
   transaction-plan-v3.json \
@@ -64,6 +68,7 @@ test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
 test -f "$release_prefix/share/doc/debz/doc/repository-management.md"
 test -f "$release_prefix/share/doc/debz/doc/root-filesystem.md"
 test -f "$release_prefix/share/doc/debz/doc/maintainer-script-runner.md"
+test -f "$release_prefix/share/doc/debz/doc/apt-system-facade.md"
 # Every tracked document must ship: a linked document that is never installed
 # would leave the released documentation set silently incomplete.
 for document in doc/*.md

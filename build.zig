@@ -285,6 +285,18 @@ pub fn build(b: *std.Build) void {
     production_backend_test_step.dependOn(&run_production_backend_tests.step);
     test_step.dependOn(&run_production_backend_tests.step);
 
+    const apt_system_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "system_profile.test.",
+            "apt_system_api.test.",
+            "apt_system_state.test.",
+        },
+    });
+    const run_apt_system_tests = b.addRunArtifact(apt_system_tests);
+    b.step("test-apt-system", "Run trusted profile and apt/system contract tests")
+        .dependOn(&run_apt_system_tests.step);
+
     const native_program_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{ "native_program.test.", "transaction_engine.test." },
@@ -529,6 +541,7 @@ fn installReleaseFiles(
 ) void {
     const docs = [_][]const u8{
         "README.md",
+        "apt-system-facade.md",
         "archive-application-model.md",
         "authenticated-refresh.md",
         "deb-payload-validation.md",
@@ -561,6 +574,9 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-system-operation-state-v1.json",
+        "apt-system-request-v1.json",
+        "apt-system-result-v1.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
@@ -573,6 +589,7 @@ fn installReleaseFiles(
         "repository-operation-result-v1.json",
         "root-operation-completion-v1.json",
         "root-operation-record-v1.json",
+        "system-profile-v1.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",

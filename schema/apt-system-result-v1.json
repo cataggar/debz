@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-system-result-v1",
+  "title": "debz apt-shaped system facade result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "api_version",
+    "operation",
+    "request_sha256",
+    "profile",
+    "outcome",
+    "exit_status",
+    "changed",
+    "summary",
+    "evidence",
+    "diagnostics",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-system-result-v1" },
+    "version": { "const": 1 },
+    "api_version": { "const": 1 },
+    "operation": { "$ref": "#/$defs/operation" },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "profile": {
+      "oneOf": [
+        { "$ref": "#/$defs/profileBinding" },
+        { "type": "null" }
+      ]
+    },
+    "outcome": { "$ref": "#/$defs/outcome" },
+    "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
+    "changed": { "type": "boolean" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "outcome": { "const": "success" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "exit_status": { "const": 0 },
+          "profile": { "$ref": "#/$defs/profileBinding" },
+          "diagnostics": { "maxItems": 0 }
+        }
+      },
+      "else": {
+        "properties": { "diagnostics": { "minItems": 1 } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "success" },
+          "operation": { "enum": ["install", "remove", "upgrade"] }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "allOf": [
+              { "$ref": "#/$defs/evidence" },
+              {
+                "properties": {
+                  "exact_lock": { "$ref": "#/$defs/documentBinding" },
+                  "transaction_result": { "$ref": "#/$defs/documentBinding" },
+                  "root_operation_completion": { "$ref": "#/$defs/completionBinding" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": { "enum": ["update", "list_installed"] }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "allOf": [
+              { "$ref": "#/$defs/evidence" },
+              {
+                "properties": {
+                  "exact_lock": { "type": "null" },
+                  "transaction_result": { "type": "null" },
+                  "root_operation_completion": { "type": "null" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$",
+      "not": { "const": "/" }
+    },
+    "operation": {
+      "enum": ["update", "install", "remove", "upgrade", "list_installed"]
+    },
+    "outcome": {
+      "enum": [
+        "success",
+        "usage",
+        "configuration",
+        "authentication",
+        "planning",
+        "download",
+        "transaction",
+        "recovery",
+        "internal"
+      ]
+    },
+    "diagnosticId": {
+      "enum": [
+        "unsupported_api_version",
+        "invalid_request",
+        "unsupported_syntax",
+        "confirmation_required",
+        "profile_not_found",
+        "profile_untrusted",
+        "profile_invalid",
+        "repository_authentication_failed",
+        "planning_failed",
+        "exact_lock_publication_failed",
+        "download_failed",
+        "transaction_failed",
+        "transaction_evidence_invalid",
+        "root_operation_conflict",
+        "recovery_required",
+        "recovery_failed",
+        "state_persistence_failed",
+        "internal_error"
+      ]
+    },
+    "profileBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "documentBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema", "version", "digest_sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "schema": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "version": { "type": "integer", "minimum": 1 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "completionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document", "completed_attempt_id"],
+      "properties": {
+        "document": { "$ref": "#/$defs/documentBinding" },
+        "completed_attempt_id": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exact_lock",
+        "transaction_result",
+        "root_operation_completion",
+        "active_operation_state"
+      ],
+      "properties": {
+        "exact_lock": {
+          "oneOf": [
+            { "$ref": "#/$defs/documentBinding" },
+            { "type": "null" }
+          ]
+        },
+        "transaction_result": {
+          "oneOf": [
+            { "$ref": "#/$defs/documentBinding" },
+            { "type": "null" }
+          ]
+        },
+        "root_operation_completion": {
+          "oneOf": [
+            { "$ref": "#/$defs/completionBinding" },
+            { "type": "null" }
+          ]
+        },
+        "active_operation_state": {
+          "oneOf": [
+            { "$ref": "#/$defs/absolutePath" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "outcome", "phase", "message"],
+      "properties": {
+        "id": { "$ref": "#/$defs/diagnosticId" },
+        "outcome": { "$ref": "#/$defs/outcome" },
+        "phase": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "null" }
+          ]
+        },
+        "message": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    }
+  }
+}

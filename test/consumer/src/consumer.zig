@@ -83,3 +83,22 @@ test "repository management API is exported without CLI coupling" {
     _ = debz.RepositoryResult;
     _ = debz.ProductionRepositoryBackend;
 }
+
+test "apt system contracts are exported without product API changes" {
+    const request: debz.AptSystemRequest = .{
+        .operation = .install,
+        .packages = &.{ "curl", "ca-certificates" },
+        .assume_yes = true,
+    };
+    try std.testing.expectEqual(debz.AptSystemOperation.install, request.operation);
+    try std.testing.expectEqualStrings(
+        debz.system_profile.default_profile_path,
+        request.profile_path,
+    );
+    _ = debz.SystemProfile;
+    _ = debz.SystemProfileFileSystem;
+    _ = debz.AptSystemResult;
+    _ = debz.AptSystemDiagnosticId;
+    _ = debz.AptSystemOperationState;
+    _ = debz.AptSystemOperationStore;
+}

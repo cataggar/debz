@@ -31,6 +31,12 @@ the separate versioned `debz.repository_api` surface documented in
 [Repository management API](repository-management.md), preserving every
 product API v1 request, result, schema, exit meaning, and host-root denial.
 
+The proposed apt-shaped system facade likewise has a separate
+`debz.apt_system_api` contract and trusted profile. It does not add
+multi-package requests, live-root orchestration, configuration inheritance, or
+new success evidence to product API v1. See
+[Apt-shaped system facade contracts](apt-system-facade.md).
+
 The nested `debz package-cache fingerprint` and `debz package-cache prepare`
 commands likewise use dedicated versioned schemas rather than changing product
 API v1. They expose `debz.package_cache_workflow` as a lock-oriented,

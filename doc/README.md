@@ -1,6 +1,9 @@
 # Documentation
 
 - [Stable product API and CLI contract](product-api.md)
+- [Apt-shaped system facade contracts](apt-system-facade.md) defines the
+  separate trusted profile, request/result, evidence, and durable active-state
+  contracts without promising apt compatibility.
 - [Repository management API](repository-management.md) documents the
   versioned API and `debz repo add` CLI, trust model, state machine,
   idempotence, and recovery evidence.
