@@ -963,9 +963,15 @@ pub const Backend = struct {
                 root_operation.recoveryReportWitness(report),
                 .recovered,
             )) |failure| return failure;
-            try deleteRecoveryIntent(self.io, request.options.state_path);
-            if (try guard.finish(allocator, request.operation)) |failure| return failure;
-            return success(request.operation, true, "transaction recovery completed", &.{});
+            if (try self.dischargeOwedProvenance(
+                allocator,
+                &guard,
+                request,
+            )) |result| return result;
+            return blockedRecovery(
+                request.operation,
+                "recovered transaction did not publish required root-operation completion provenance",
+            );
         }
         try writeRecoveryIntent(allocator, self.io, request.options.state_path, effective_request);
         const executor = self.selectedExecutor() catch unreachable;
@@ -2303,6 +2309,22 @@ fn semanticRequestDigest(
     return hash.finalResult();
 }
 
+pub fn workflowSemanticRequestDigest(
+    allocator: std.mem.Allocator,
+    operation: WorkflowSemanticOperation,
+    selectors: []const solver.PackageSelector,
+) ![32]u8 {
+    return semanticRequestDigest(
+        allocator,
+        .recover,
+        .{
+            .operation = operation,
+            .mode = .recover,
+        },
+        selectors,
+    );
+}
+
 fn hashLengthPrefixed(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     var length_buffer: [32]u8 = undefined;
     const length = std.fmt.bufPrint(&length_buffer, "{d}:", .{value.len}) catch unreachable;
@@ -3048,6 +3070,49 @@ const TestProcess = struct {
     }
 };
 
+const FailOnceProcess = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    calls: usize = 0,
+
+    fn interface(self: *FailOnceProcess) transaction_executor.ProcessRunner {
+        return .{ .context = self, .runFn = run };
+    }
+
+    fn run(
+        context: *anyopaque,
+        invocation: transaction_executor.Invocation,
+    ) !transaction_executor.ProcessResult {
+        const self: *FailOnceProcess = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        if (self.calls == 1)
+            return .{ .termination = .{ .exited = 1 } };
+        _ = invocation;
+        try self.dir.writeFile(self.io, .{
+            .sub_path = "root/var/lib/dpkg/status",
+            .data = "",
+        });
+        return .{ .termination = .{ .exited = 0 } };
+    }
+};
+
+const TestCompletionCrash = struct {
+    point: CompletionPoint,
+    triggered: bool = false,
+
+    fn interface(self: *TestCompletionCrash) CompletionCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: CompletionPoint) !void {
+        const self: *TestCompletionCrash = @ptrCast(@alignCast(context));
+        if (!self.triggered and point == self.point) {
+            self.triggered = true;
+            return error.InjectedCompletionCrash;
+        }
+    }
+};
+
 const ProductionWorkflowFixture = struct {
     allocator: std.mem.Allocator,
     source_path: []u8,
@@ -3361,6 +3426,170 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     );
     defer allocator.free(final_status);
     try std.testing.expectEqual(@as(usize, 0), final_status.len);
+}
+
+test "production workflow recovery reconciles completion without a second mutation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var crash: TestCompletionCrash = .{ .point = .after_completed_record };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+        .completion_crash = crash.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const interrupted = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
+    try std.testing.expect(crash.triggered);
+    try std.testing.expectEqual(@as(usize, 2), process.calls);
+
+    backend.completion_crash = null;
+    const recovered = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
+    try std.testing.expectEqual(@as(usize, 2), process.calls);
+    const completion_source = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation_completion.document_path,
+        allocator,
+        .limited(root_operation_completion.maximum_document_bytes),
+    );
+    defer allocator.free(completion_source);
+    var completion = try root_operation_completion.decode(
+        allocator,
+        completion_source,
+        root_operation_completion.maximum_document_bytes,
+    );
+    defer completion.deinit();
+    try std.testing.expectEqual(
+        root_operation_completion.TransactionProvenanceStatus.unavailable,
+        completion.document.transaction_provenance.status,
+    );
+    try std.testing.expectEqualStrings(
+        "recover",
+        completion.document.discharge.operation,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.openFile(
+            std.testing.io,
+            "root/" ++ root_operation.record_path,
+            .{},
+        ),
+    );
+}
+
+test "production workflow successful recovery publishes honest completion evidence" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    var process = FailOnceProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const failed = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.transaction, failed.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), process.calls);
+
+    const recovered = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
+    try std.testing.expect(process.calls > 1);
+    const completion_source = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation_completion.document_path,
+        allocator,
+        .limited(root_operation_completion.maximum_document_bytes),
+    );
+    var completion = try root_operation_completion.decode(
+        allocator,
+        completion_source,
+        root_operation_completion.maximum_document_bytes,
+    );
+    defer completion.deinit();
+    try std.testing.expect(
+        completion.document.transaction_provenance.status ==
+            .unavailable or
+            completion.document.transaction_provenance.status == .recovered,
+    );
+    try std.testing.expectEqual(root_operation.Outcome.recovered, completion.document.outcome);
+    try std.testing.expectEqualStrings("recover", completion.document.discharge.operation);
 }
 
 test "production workflow accepts batch install planning and requires lock-bound execution" {

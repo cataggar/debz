@@ -151,7 +151,10 @@ identifier and the same outcome classification. Human summary text is not a
 machine interface. `list_installed` success additionally carries a bounded,
 owned `items` array preserving each package name and optional version,
 architecture, and detail. Other operations cannot return items, and the items
-participate in the canonical result digest.
+participate in the canonical result digest. Runtime validation also measures
+the complete canonical encoding and rejects any result over the 256 KiB
+document ceiling, even when every individual item and the item count are
+otherwise valid.
 
 Every result binds the canonical request digest. `apt_system_api.execute`
 rejects any backend result whose operation or request digest differs from the
@@ -165,7 +168,8 @@ exact-byte digest, and aggregate reference-evidence digest. Successful package
 mutation is impossible to represent without all of:
 
 - the canonical exact-lock path, schema version, and digest;
-- the verified transaction-result path, schema version, and digest; and
+- the retained exact-lock-bound transaction or recovery-discharge evidence
+  path, schema version, and digest; and
 - root-operation completion path, schema version, digest, and completed
   attempt identifier.
 
@@ -235,14 +239,24 @@ backend is `live_root.logical_root_path`; `/` remains denied by product API v1
 and `live_root.host_root_allowed` remains false. Root, runtime, lock, or
 mountpoint replacement is surfaced as a typed conflict.
 
+The trusted profile-reference lease is revalidated immediately before every
+read-only route and every plan, download, execute, and recovery workflow call.
+It is revalidated again after download before execution and before retained
+recovery evidence is reconciled. Replacement between any two calls therefore
+prevents the later call; in particular, replacement after download produces
+zero execute calls.
+
 `PrivateLiveRootRunner` is the production composition's concrete runner. It
 invokes `live_root.run`, drains a bounded pipe concurrently, and accepts only a
-canonical product-result document whose operation matches the request.
+canonical product-result document whose operation matches the workflow
+surface: plan-only is `plan`, download-only is `download`, execute is the
+semantic package operation, and recovery is `recover`.
 Termination, namespace setup, identity replacement, cleanup, transport, and
 lower-level root-operation status failures remain typed at the runner boundary.
-Owned list items and diagnostics are copied into the parent before namespace
-cleanup. A capability-gated integration test exercises the real root-mapped
-namespace path.
+Owned results, including failure summaries and diagnostics, and list items are
+copied into the parent before namespace cleanup. Capability-gated integration
+tests exercise read-only routing and every workflow mode through the real
+root-mapped namespace path.
 
 The system state-store adapter creates and opens every directory component
 without following symbolic links. Request, retained state, exact lock,
@@ -271,12 +285,18 @@ mismatches fail closed. A recoverable plan reports the stable action
 the original semantic `ProductionWorkflow` recovery request, rechecks the full
 lock binding immediately before recovery mutation, and verifies and retains its
 result through the same boundaries. Recovery first inspects the retained
-lower-level root-operation state. If that state is clear and the exact-lock-
-bound transaction result already exists, it reconciles and finalizes the outer
-state without rerunning package mutation or lower-level recovery. If lower-
-level recovery evidence remains active, it invokes workflow recovery exactly
-as retained. Existing completion evidence is canonicalized and binding-checked
-before reuse, including across a changed wall clock.
+lower-level root-operation state. If that state is clear after lower-level
+recovery, it strictly decodes the retained
+`root-operation-completion-v1.json`, checks the semantic request, architecture,
+exact-lock schema/version/digest, operation, outcome, and recovery discharge,
+then retains that honest evidence and finalizes the outer state without
+rerunning lower-level recovery. The discharge can truthfully classify detailed
+transaction provenance as unavailable when publication was the interrupted
+boundary; it does not fabricate a transaction result. If lower-level recovery
+evidence remains active, the engine invokes workflow recovery exactly as
+retained. Crashes at every outer post-backend boundary converge through this
+reconciliation path exactly once, while canonical or binding mismatches remain
+recovery-required.
 
 Profile loading, live-root execution, workflow backend, state store,
 confirmation, result verifier, clock, and attempt-ID generation are explicit

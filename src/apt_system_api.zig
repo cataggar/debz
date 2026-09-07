@@ -504,6 +504,8 @@ pub fn validateResult(result: Result) !void {
     } else {
         if (result.diagnostic_count == 0) return error.MissingDiagnostic;
     }
+    if (encodedDocumentSize(result) > maximum_document_bytes)
+        return error.DocumentTooLarge;
 }
 
 pub fn validateCompleteResult(result: Result) !void {
@@ -631,14 +633,25 @@ fn writeRequest(request: Request, writer: *std.Io.Writer) !void {
 }
 
 fn writeResultDocument(result: Result, writer: *std.Io.Writer) !void {
-    try writeResultPayload(result, writer);
-    writer.undo(1);
+    try writeResultPayloadPrefix(result, writer);
     try writer.writeAll(",\"digest_sha256\":");
     try writeHex(writer, &result.digest_sha256);
     try writer.writeByte('}');
 }
 
+fn encodedDocumentSize(result: Result) usize {
+    var buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&buffer);
+    writeResultDocument(result, &discarding.writer) catch unreachable;
+    return @intCast(discarding.fullCount());
+}
+
 fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
+    try writeResultPayloadPrefix(result, writer);
+    try writer.writeByte('}');
+}
+
+fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
     try writeString(writer, result_schema_id);
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
@@ -694,7 +707,7 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
         try writeString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
 }
 
 fn writeEvidence(writer: *std.Io.Writer, evidence: Evidence) !void {
@@ -1290,6 +1303,71 @@ test "apt_system_api.test.list items are owned and bind the canonical digest" {
     var non_list = input;
     non_list.operation = .update;
     try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+}
+
+test "apt_system_api.test.result encoded-size budget accepts maximum and rejects one over" {
+    var items: [64]Item = undefined;
+    for (&items) |*item| item.* = .{ .package = "p" };
+    const full_detail = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters,
+    );
+    defer std.testing.allocator.free(full_detail);
+    @memset(full_detail, 'd');
+
+    var candidate: Result = .{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "x",
+        .items = &items,
+    };
+    var index: usize = 0;
+    while (index < items.len) : (index += 1) {
+        items[index].detail = full_detail;
+        if (encodedDocumentSize(candidate) > maximum_document_bytes) {
+            items[index].detail = null;
+            break;
+        }
+    }
+    const remainder = maximum_document_bytes - encodedDocumentSize(candidate);
+    const exact_summary = try std.testing.allocator.alloc(u8, 1 + remainder);
+    defer std.testing.allocator.free(exact_summary);
+    @memset(exact_summary, 's');
+    candidate.summary = exact_summary;
+    try std.testing.expectEqual(
+        maximum_document_bytes,
+        encodedDocumentSize(candidate),
+    );
+    const completed = try complete(candidate);
+    var owned = try ownResult(std.testing.allocator, completed);
+    defer owned.deinit();
+    const source = try owned.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqual(maximum_document_bytes, source.len);
+
+    const oversized_summary = try std.testing.allocator.alloc(
+        u8,
+        exact_summary.len + 1,
+    );
+    defer std.testing.allocator.free(oversized_summary);
+    @memset(oversized_summary, 's');
+    candidate.summary = oversized_summary;
+    try std.testing.expectEqual(
+        maximum_document_bytes + 1,
+        encodedDocumentSize(candidate),
+    );
+    try std.testing.expectError(error.DocumentTooLarge, complete(candidate));
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        ownResult(std.testing.allocator, candidate),
+    );
 }
 
 test "apt_system_api.test.result schema matches enums and absolute paths" {
