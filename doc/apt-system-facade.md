@@ -27,7 +27,8 @@ The default profile path is `/etc/debz/default.json`; its strict schema is
 - the default `keep_existing` or `use_package_version` conffile behavior; and
 - nullable, explicit proxy URL and credential-reference fields.
 
-Null or omitted proxy and credential fields mean disabled. They never mean
+Proxy URLs require the canonical lowercase `http` or `https` scheme. Null or
+omitted proxy and credential fields mean disabled. They never mean
 "read apt.conf", "inspect the environment", or "discover credentials".
 Likewise, the loader never consults `/etc/apt`, ambient keyrings, GnuPG
 configuration, dpkg configuration, or process environment settings.
@@ -97,7 +98,11 @@ machine interface.
 Every result binds the canonical request digest. `apt_system_api.execute`
 rejects any backend result whose operation or request digest differs from the
 submitted request, whose shape is invalid, or whose canonical result digest is
-wrong. Once a profile is loaded the result also binds the profile path,
+wrong. An envelope rejected before it can be canonicalized instead carries the
+SHA-256 of the fixed label
+`debz:apt-system-api-v1:rejected-unbound-request`; no rejected path, package,
+or other unbounded input is traversed or hashed. Once a profile is loaded the
+result also binds the profile path,
 exact-byte digest, and aggregate reference-evidence digest. Successful package
 mutation is impossible to represent without all of:
 

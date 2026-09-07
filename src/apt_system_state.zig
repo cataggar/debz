@@ -1121,6 +1121,17 @@ test "apt_system_state.test.phase and mutation evidence are strictly coupled" {
     try validate(update);
 }
 
+test "apt_system_state.test.profile paths are byte-bounded before scanning" {
+    var reserved = try testReservedState(std.testing.allocator);
+    defer reserved.deinit();
+    var state = reserved.state;
+    state.profile.path = @as(
+        [*]const u8,
+        @ptrFromInt(1),
+    )[0 .. api.maximum_path_bytes + 1];
+    try std.testing.expectError(error.InvalidProfile, validate(state));
+}
+
 test "apt_system_state.test.diagnostics reject bounded oversized text" {
     const ascii = try std.testing.allocator.alloc(
         u8,

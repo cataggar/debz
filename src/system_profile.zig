@@ -403,11 +403,9 @@ fn validateProfile(profile: Profile, limits: Limits) LoadError!void {
     if (profile.foreign_architectures.len > limits.maximum_foreign_architectures)
         return error.TooManyArchitectures;
     if (!validArchitecture(profile.architecture)) return error.InvalidArchitecture;
-    if (!absolute_path.nonRoot(profile.cache_path) or
-        profile.cache_path.len > maximum_path_bytes)
+    if (!absolute_path.nonRootBounded(profile.cache_path, maximum_path_bytes))
         return error.InvalidCachePath;
-    if (!absolute_path.nonRoot(profile.state_path) or
-        profile.state_path.len > maximum_path_bytes)
+    if (!absolute_path.nonRootBounded(profile.state_path, maximum_path_bytes))
         return error.InvalidStatePath;
 
     for (profile.foreign_architectures, 0..) |architecture, index| {
@@ -446,8 +444,8 @@ fn validateProfile(profile: Profile, limits: Limits) LoadError!void {
         const uri = std.Uri.parse(proxy) catch return error.InvalidProxy;
         if (uri.user != null or uri.password != null or uri.host == null)
             return error.InvalidProxy;
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
-            !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        if (!std.mem.eql(u8, uri.scheme, "http") and
+            !std.mem.eql(u8, uri.scheme, "https"))
             return error.InvalidProxy;
     }
     if (profile.network.credential_reference) |path|
@@ -570,7 +568,7 @@ pub fn validateTrustedMetadata(metadata: Metadata, maximum_bytes: u64) LoadError
 }
 
 fn validTrustedPath(path: []const u8) bool {
-    return path.len <= maximum_path_bytes and absolute_path.nonRoot(path);
+    return absolute_path.nonRootBounded(path, maximum_path_bytes);
 }
 
 fn validArchitecture(value: []const u8) bool {
@@ -749,7 +747,8 @@ fn sameObject(first: Metadata, second: Metadata) bool {
 fn openAbsoluteDirectoryNoFollow(io: Io, path: []const u8) !Io.Dir {
     if (std.mem.eql(u8, path, "/"))
         return Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
-    if (!absolute_path.nonRoot(path)) return error.InvalidPath;
+    if (!absolute_path.nonRootBounded(path, maximum_path_bytes))
+        return error.InvalidPath;
     var current = try Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
     errdefer current.close(io);
     var components = std.mem.splitScalar(u8, path[1..], '/');
@@ -1251,7 +1250,34 @@ test "system_profile.test.profile file itself is trust validated" {
     );
 }
 
-test "system_profile.test.profile schema uses the shared absolute path grammar" {
+test "system_profile.test.proxy schemes are canonical lowercase" {
+    const repositories = [_]Repository{.{
+        .source_path = "/etc/debz/debian.sources",
+    }};
+    const keyrings = [_][]const u8{
+        "/usr/share/keyrings/debian-archive-keyring.gpg",
+    };
+    var profile: Profile = .{
+        .repositories = &repositories,
+        .keyring_paths = &keyrings,
+        .architecture = "amd64",
+    };
+    inline for ([_][]const u8{
+        "HTTP://proxy.example",
+        "Https://proxy.example",
+        "hTtP://proxy.example",
+    }) |proxy| {
+        profile.network.proxy_url = proxy;
+        try std.testing.expectError(
+            error.InvalidProxy,
+            validateProfile(profile, .{}),
+        );
+    }
+    profile.network.proxy_url = "https://proxy.example";
+    try validateProfile(profile, .{});
+}
+
+test "system_profile.test.profile schema matches paths and proxy schemes" {
     const source = try Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         "schema/system-profile-v1.json",
@@ -1264,4 +1290,12 @@ test "system_profile.test.profile schema uses the shared absolute path grammar" 
     const pattern = parsed.value.object.get("$defs").?.object
         .get("absolutePath").?.object.get("pattern").?.string;
     try std.testing.expectEqualStrings(absolute_path.schema_pattern, pattern);
+    const proxy_pattern = parsed.value.object.get("$defs").?.object
+        .get("network").?.object.get("properties").?.object
+        .get("proxy_url").?.object.get("oneOf").?.array.items[0]
+        .object.get("pattern").?.string;
+    try std.testing.expectEqualStrings(
+        "^https?://(?![^/?#]*@)[^/?#]+(?:[/?#]|$)",
+        proxy_pattern,
+    );
 }

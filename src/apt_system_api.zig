@@ -16,6 +16,9 @@ pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
 pub const maximum_diagnostics: usize = 8;
 pub const maximum_summary_characters: usize = 4096;
+pub const maximum_path_bytes: usize = system_profile.maximum_path_bytes;
+pub const rejected_request_binding_label =
+    "debz:apt-system-api-v1:rejected-unbound-request";
 
 pub const Operation = enum {
     update,
@@ -208,8 +211,8 @@ pub fn execute(
             .unsupported_api_version
         else
             .invalid_request;
-        return failure(
-            request,
+        return rejectedRequestFailure(
+            request.operation,
             .usage,
             id,
             "request",
@@ -254,6 +257,7 @@ pub fn failure(
     phase: []const u8,
     message: []const u8,
 ) !Result {
+    try validateRequest(request);
     var result: Result = .{
         .operation = request.operation,
         .request_sha256 = requestDigestUnchecked(request),
@@ -270,6 +274,41 @@ pub fn failure(
         .message = message,
     };
     return complete(result);
+}
+
+fn rejectedRequestFailure(
+    operation: Operation,
+    outcome: Outcome,
+    id: DiagnosticId,
+    phase: []const u8,
+    message: []const u8,
+) !Result {
+    var result: Result = .{
+        .operation = operation,
+        .request_sha256 = rejectedRequestDigest(),
+        .outcome = outcome,
+        .exit_status = exitStatus(outcome),
+        .summary = message,
+        .diagnostics = undefined,
+        .diagnostic_count = 1,
+    };
+    result.diagnostics[0] = .{
+        .id = id,
+        .outcome = outcome,
+        .phase = phase,
+        .message = message,
+    };
+    return complete(result);
+}
+
+fn rejectedRequestDigest() [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        rejected_request_binding_label,
+        &digest,
+        .{},
+    );
+    return digest;
 }
 
 pub fn ownResult(
@@ -303,8 +342,10 @@ pub fn ownResult(
 
 pub fn validateRequest(request: Request) !void {
     if (request.api_version != api_version) return error.UnsupportedApiVersion;
-    if (!absolute_path.nonRoot(request.profile_path) or
-        request.profile_path.len > system_profile.maximum_path_bytes)
+    if (!absolute_path.nonRootBounded(
+        request.profile_path,
+        maximum_path_bytes,
+    ))
         return error.InvalidProfilePath;
     const count_valid = switch (request.operation) {
         .install, .remove => request.packages.len != 0 and
@@ -368,8 +409,10 @@ pub fn validateCompleteResult(result: Result) !void {
 }
 
 pub fn validateProfileBinding(profile: ProfileBinding) !void {
-    if (!absolute_path.nonRoot(profile.path) or
-        profile.path.len > system_profile.maximum_path_bytes)
+    if (!absolute_path.nonRootBounded(
+        profile.path,
+        maximum_path_bytes,
+    ))
         return error.InvalidProfileBinding;
 }
 
@@ -380,15 +423,19 @@ pub fn validateEvidence(evidence: Evidence) !void {
     if (evidence.root_operation_completion) |binding|
         try validateDocumentBinding(binding.document);
     if (evidence.active_operation_state) |path| {
-        if (!absolute_path.nonRoot(path) or
-            path.len > system_profile.maximum_path_bytes)
+        if (!absolute_path.nonRootBounded(
+            path,
+            maximum_path_bytes,
+        ))
             return error.InvalidEvidencePath;
     }
 }
 
 fn validateDocumentBinding(binding: DocumentBinding) !void {
-    if (!absolute_path.nonRoot(binding.path) or
-        binding.path.len > system_profile.maximum_path_bytes)
+    if (!absolute_path.nonRootBounded(
+        binding.path,
+        maximum_path_bytes,
+    ))
         return error.InvalidEvidencePath;
     if (!validText(binding.schema, 256) or binding.version == 0)
         return error.InvalidEvidenceSchema;
@@ -716,7 +763,83 @@ test "apt_system_api.test.facade rejects unsupported package shapes before backe
     }, .{ .context = &called, .executeFn = Fake.run });
     try std.testing.expectEqual(Outcome.usage, result.outcome);
     try std.testing.expectEqual(DiagnosticId.invalid_request, result.diagnostics[0].id);
+    const rejected_digest = rejectedRequestDigest();
+    try std.testing.expectEqualSlices(
+        u8,
+        &rejected_digest,
+        &result.request_sha256,
+    );
     try std.testing.expect(!called);
+}
+
+test "apt_system_api.test.rejected envelopes are never traversed or hashed" {
+    var called = false;
+    const Fake = struct {
+        fn run(context: *anyopaque, _: std.mem.Allocator, request: Request) !Result {
+            const value: *bool = @ptrCast(@alignCast(context));
+            value.* = true;
+            return try failure(request, .internal, .internal_error, "test", "called");
+        }
+    };
+    const inaccessible_path = @as(
+        [*]const u8,
+        @ptrFromInt(1),
+    )[0 .. system_profile.maximum_path_bytes + 1];
+    const path_result = try execute(std.testing.allocator, .{
+        .operation = .update,
+        .profile_path = inaccessible_path,
+    }, .{ .context = &called, .executeFn = Fake.run });
+    const rejected_digest = rejectedRequestDigest();
+    try std.testing.expectEqualSlices(
+        u8,
+        &rejected_digest,
+        &path_result.request_sha256,
+    );
+    try std.testing.expect(!called);
+
+    const inaccessible_package = @as(
+        [*]const u8,
+        @ptrFromInt(1),
+    )[0..256];
+    const package_result = try execute(std.testing.allocator, .{
+        .operation = .install,
+        .packages = &.{inaccessible_package},
+    }, .{ .context = &called, .executeFn = Fake.run });
+    try std.testing.expectEqualSlices(
+        u8,
+        &rejected_digest,
+        &package_result.request_sha256,
+    );
+    try std.testing.expect(!called);
+
+    const inaccessible_packages = @as(
+        [*]const []const u8,
+        @ptrFromInt(@alignOf([]const u8)),
+    )[0 .. maximum_packages + 1];
+    const count_result = try execute(std.testing.allocator, .{
+        .operation = .install,
+        .packages = inaccessible_packages,
+    }, .{ .context = &called, .executeFn = Fake.run });
+    try std.testing.expectEqualSlices(
+        u8,
+        &rejected_digest,
+        &count_result.request_sha256,
+    );
+    try std.testing.expect(!called);
+
+    try std.testing.expectError(
+        error.InvalidPackage,
+        failure(
+            .{
+                .operation = .install,
+                .packages = &.{inaccessible_package},
+            },
+            .usage,
+            .invalid_request,
+            "request",
+            "invalid request",
+        ),
+    );
 }
 
 test "apt_system_api.test.backend results bind the exact submitted request" {
