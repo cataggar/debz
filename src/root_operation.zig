@@ -57,7 +57,9 @@ pub const maximum_schema_bytes: usize = 256;
 pub const namespace_path = "var/lib/debz";
 pub const lock_name = "root-operation.lock";
 pub const record_name = "root-operation-v1.json";
+pub const deferred_ack_name = "root-operation-deferred-ack-v1.json";
 pub const record_path = namespace_path ++ "/" ++ record_name;
+pub const deferred_ack_path = namespace_path ++ "/" ++ deferred_ack_name;
 pub const lock_path = namespace_path ++ "/" ++ lock_name;
 
 /// Transaction backend the attempt is bound to. A record written for one
@@ -256,6 +258,100 @@ pub const OwnedRecord = struct {
         self.* = undefined;
     }
 };
+
+pub const deferred_ack_schema_id =
+    "https://debz.dev/schema/root-operation-deferred-ack-v1";
+pub const deferred_ack_schema_version: u32 = 1;
+
+pub const DeferredAcknowledgmentState = enum {
+    pending,
+    acknowledged,
+};
+
+/// Root-local non-reclaimable hand-off from a deferred lower recovery to its
+/// exact outer orchestrator attempt.
+pub const DeferredAcknowledgment = struct {
+    state: DeferredAcknowledgmentState = .pending,
+    attempt_id: [32]u8,
+    completion_sha256: [32]u8,
+    provenance_sha256: [32]u8,
+    acknowledgment_id: [32]u8,
+    digest_sha256: [32]u8 = @splat(0),
+
+    pub fn canonicalJson(
+        self: DeferredAcknowledgment,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (!std.mem.eql(
+            u8,
+            &self.digest_sha256,
+            &deferredAcknowledgmentDigest(self),
+        )) return error.DigestMismatch;
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try writeDeferredAcknowledgment(self, &output.writer);
+        const bytes = try output.toOwnedSlice();
+        if (bytes.len > maximum_document_bytes) {
+            allocator.free(bytes);
+            return error.DocumentTooLarge;
+        }
+        return bytes;
+    }
+};
+
+pub fn createDeferredAcknowledgment(
+    input: DeferredAcknowledgment,
+) DeferredAcknowledgment {
+    var result = input;
+    result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    return result;
+}
+
+const WireDeferredAcknowledgment = struct {
+    schema: []const u8,
+    version: u32,
+    state: DeferredAcknowledgmentState,
+    attempt_id: []const u8,
+    completion_sha256: []const u8,
+    provenance_sha256: []const u8,
+    acknowledgment_id: []const u8,
+    digest_sha256: []const u8,
+};
+
+pub fn decodeDeferredAcknowledgment(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !DeferredAcknowledgment {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(
+        WireDeferredAcknowledgment,
+        allocator,
+        source,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+    ) catch return error.NonCanonicalDocument;
+    defer parsed.deinit();
+    const wire = parsed.value;
+    if (!std.mem.eql(u8, wire.schema, deferred_ack_schema_id) or
+        wire.version != deferred_ack_schema_version)
+        return error.UnsupportedSchema;
+    const decoded: DeferredAcknowledgment = .{
+        .state = wire.state,
+        .attempt_id = try parseHex(32, wire.attempt_id),
+        .completion_sha256 = try parseHex(32, wire.completion_sha256),
+        .provenance_sha256 = try parseHex(32, wire.provenance_sha256),
+        .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
+        .digest_sha256 = try parseHex(32, wire.digest_sha256),
+    };
+    if (!std.mem.eql(
+        u8,
+        &decoded.digest_sha256,
+        &deferredAcknowledgmentDigest(decoded),
+    )) return error.DigestMismatch;
+    const canonical = try decoded.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return decoded;
+}
 
 pub const Input = struct {
     attempt_id: [32]u8,
@@ -502,6 +598,44 @@ fn writeDocument(record: Record, writer: *std.Io.Writer) !void {
     writer.undo(1);
     try writer.writeAll(",\"digest_sha256\":");
     try writeHexString(writer, &record.digest_sha256);
+    try writer.writeByte('}');
+}
+
+fn deferredAcknowledgmentDigest(
+    marker: DeferredAcknowledgment,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(deferred_ack_schema_id);
+    hash.update("\x001");
+    hash.update(@tagName(marker.state));
+    hash.update("\x00");
+    hash.update(&marker.attempt_id);
+    hash.update(&marker.completion_sha256);
+    hash.update(&marker.provenance_sha256);
+    hash.update(&marker.acknowledgment_id);
+    return hash.finalResult();
+}
+
+fn writeDeferredAcknowledgment(
+    marker: DeferredAcknowledgment,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeAll("{\"schema\":");
+    try writeJsonString(writer, deferred_ack_schema_id);
+    try writer.print(",\"version\":{},\"state\":", .{
+        deferred_ack_schema_version,
+    });
+    try writeJsonString(writer, @tagName(marker.state));
+    try writer.writeAll(",\"attempt_id\":");
+    try writeHexString(writer, &marker.attempt_id);
+    try writer.writeAll(",\"completion_sha256\":");
+    try writeHexString(writer, &marker.completion_sha256);
+    try writer.writeAll(",\"provenance_sha256\":");
+    try writeHexString(writer, &marker.provenance_sha256);
+    try writer.writeAll(",\"acknowledgment_id\":");
+    try writeHexString(writer, &marker.acknowledgment_id);
+    try writer.writeAll(",\"digest_sha256\":");
+    try writeHexString(writer, &marker.digest_sha256);
     try writer.writeByte('}');
 }
 
@@ -764,6 +898,99 @@ pub const Store = struct {
         });
     }
 
+    pub fn readDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+    ) !?DeferredAcknowledgment {
+        const path = try root_fs.Path.init(deferred_ack_path);
+        const bytes = self.root.readFileAlloc(
+            allocator,
+            path,
+            maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        return try decodeDeferredAcknowledgment(allocator, bytes);
+    }
+
+    pub fn publishDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        marker: DeferredAcknowledgment,
+    ) !void {
+        if (try self.readDeferredAcknowledgment(allocator)) |existing| {
+            if (std.mem.eql(
+                u8,
+                &existing.digest_sha256,
+                &marker.digest_sha256,
+            )) return;
+            return error.DeferredAcknowledgmentPresent;
+        }
+        const bytes = try marker.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .fail_if_exists,
+                .durable = true,
+            },
+        );
+    }
+
+    pub fn acknowledgeDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+    ) !DeferredAcknowledgment {
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if (observed.state != .pending or !std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var next = observed;
+        next.state = .acknowledged;
+        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        const bytes = try next.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+        return next;
+    }
+
+    pub fn clearDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+    ) !void {
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return;
+        if (!std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        self.root.removeFile(
+            try root_fs.Path.init(deferred_ack_path),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.root.syncDirectory(try root_fs.Path.init(namespace_path));
+    }
+
     /// Removes the active record and fsyncs the namespace so the removal
     /// survives power loss.
     pub fn clear(self: Store) !void {
@@ -1015,16 +1242,10 @@ pub const Request = struct {
     /// record so its completion can be returned to an outer coordinator
     /// without reclaiming it into a new attempt.
     adopt_settled_for_acknowledgment: bool = false,
+    deferred_acknowledgment_id: ?[32]u8 = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
     attempt_id: ?[32]u8 = null,
-};
-
-/// Exact identity of a settled attempt that a higher-level coordinator has
-/// durably retained and is now permitted to acknowledge.
-pub const SettledAcknowledgment = struct {
-    attempt_id: [32]u8,
-    provenance_sha256: [32]u8,
 };
 
 pub const Transition = struct {
@@ -1213,6 +1434,46 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
+        const deferred = store_handle.readDeferredAcknowledgment(
+            allocator,
+        ) catch return error.RecordCorrupt;
+        if (deferred) |marker| switch (marker.state) {
+            .acknowledged => {
+                if (prior) |*value| {
+                    if (!recordMatchesDeferredAcknowledgment(
+                        value.record,
+                        marker,
+                        false,
+                    )) return error.RecoveryRequired;
+                    store_handle.clear() catch return error.StoreFailed;
+                    value.deinit();
+                    prior = null;
+                }
+                store_handle.clearDeferredAcknowledgment(
+                    allocator,
+                    marker.digest_sha256,
+                ) catch return error.StoreFailed;
+            },
+            .pending => {
+                const acknowledgment_id =
+                    request.deferred_acknowledgment_id orelse
+                    return error.RecoveryRequired;
+                if (!request.adopt_settled_for_acknowledgment or
+                    !std.mem.eql(
+                        u8,
+                        &acknowledgment_id,
+                        &marker.acknowledgment_id,
+                    ) or
+                    prior == null or
+                    !recordMatchesDeferredAcknowledgment(
+                        prior.?.record,
+                        marker,
+                        true,
+                    ))
+                    return error.RecoveryRequired;
+            },
+        };
+
         // A durably settled record — completed with its provenance obligation
         // discharged — describes an operation that is over. No intent may
         // adopt it: continuing under a record that already says the mutation
@@ -1345,60 +1606,6 @@ pub const Coordinator = struct {
             .highest = .root_operation,
             .adopted = false,
             .bridge = .none,
-        };
-    }
-
-    /// Locks and returns the exact settled record named by an outer durable
-    /// acknowledgment. No record means a prior identical acknowledgment
-    /// already cleared it. A different record is never reclaimed or adopted.
-    pub fn resumeSettledForAcknowledgment(
-        self: *Coordinator,
-        allocator: std.mem.Allocator,
-        expected: SettledAcknowledgment,
-        wait_ms: u64,
-    ) Error!?Attempt {
-        const token = try self.locks.acquire(.{
-            .rank = .root_operation,
-            .root = self.root,
-            .identity = self.identity,
-            .path = lock_path,
-            .wait_ms = wait_ms,
-            .cancellation = transaction_executor.Cancellation.never(),
-        });
-        errdefer self.locks.release(token);
-
-        var owned = (self.store().read(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.RecordCorrupt,
-        }) orelse {
-            self.locks.release(token);
-            return null;
-        };
-        errdefer owned.deinit();
-        const record = owned.record;
-        if (!std.mem.eql(
-            u8,
-            &record.root_identity_sha256,
-            &self.identity.install_root_sha256,
-        )) return error.RootIdentityMismatch;
-        if (!record.clearable() or record.provenance != .published)
-            return error.ProvenancePending;
-        if (!std.mem.eql(u8, &record.attempt_id, &expected.attempt_id) or
-            record.provenance_sha256 == null or
-            !std.mem.eql(
-                u8,
-                &record.provenance_sha256.?,
-                &expected.provenance_sha256,
-            ))
-            return error.AttemptMismatch;
-        return .{
-            .coordinator = self,
-            .token = token,
-            .owned = owned,
-            .entered = .initEmpty(),
-            .highest = .root_operation,
-            .adopted = true,
-            .bridge = adoptedBridge(record.state),
         };
     }
 
@@ -1777,6 +1984,25 @@ fn startsMutation(state: State) bool {
 /// The bridge origin an adopted record implies. A record that already sits at
 /// the executor bridge was handed over by some earlier run, so this one
 /// inherits it and can never prove what that hand-over did.
+fn recordMatchesDeferredAcknowledgment(
+    record: Record,
+    marker: DeferredAcknowledgment,
+    allow_pending_provenance: bool,
+) bool {
+    if (!std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) or
+        record.state != .completed)
+        return false;
+    return switch (record.provenance) {
+        .published => record.provenance_sha256 != null and std.mem.eql(
+            u8,
+            &record.provenance_sha256.?,
+            &marker.provenance_sha256,
+        ),
+        .pending => allow_pending_provenance,
+        .not_required => false,
+    };
+}
+
 fn adoptedBridge(state: State) BridgeOrigin {
     return if (state == .mutation_pending) .inherited else .none;
 }

@@ -305,22 +305,31 @@ is routed through `ProductionWorkflow` recovery to
 `dischargeOwedProvenance` without replaying package mutation. Ordinary product
 recovery still clears the record on success. The internal apt/system workflow
 instead requests deferred clearing: discharge publishes the completion and
-the completed/published lower record, then returns their exact attempt,
-completion, and provenance token while leaving that record durable.
+an exact root-local `root-operation-deferred-ack-v1.json` marker before
+publishing the completed record's provenance. The marker binds the lower
+attempt, completion digest, provenance digest, and outer apt/system attempt.
+It makes the otherwise clearable completed/published record non-reclaimable by
+every ordinary mutation or recovery, including a request using a different
+profile or state path.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower
 attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
 binding before explicitly acknowledging the exact lower token and clearing its
-record. A crash before outer retention therefore leaves the lower
+record and marker. A crash before outer retention therefore leaves the lower
 completed/published record available for retry; a crash after retention but
 before acknowledgment uses the retained binding and idempotently clears; a
 crash after acknowledgment uses only the retained operation-local evidence.
-The acknowledgment rereads the global completion under the root-operation
-lock and rejects any attempt, completion, provenance, request, operation, or
-exact-lock mismatch before clearing. Transport and signal interruption follow
-the same path because the lower record is not cleared before acknowledgment.
+The acknowledgment rereads the marker, record, and global completion under the
+root-operation lock and first durably transitions the exact marker to
+`acknowledged`. It then clears the matching record and marker. A crash between
+those cleanup steps is idempotent: only an exact acknowledged marker may
+finish cleanup, while a pending marker remains non-reclaimable. Any attempt,
+completion, provenance, outer acknowledgment identity, request, operation, or
+exact-lock mismatch is rejected before clearing. Transport and signal
+interruption follow the same path because the lower record cannot be reclaimed
+before durable acknowledgment.
 Both an originally recovered transaction and an originally successful
 transaction whose provenance discharge was interrupted are accepted without a
 lower workflow replay, recovery request, or fabricated transaction result. It

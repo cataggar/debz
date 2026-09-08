@@ -34,6 +34,7 @@ pub const WorkflowRecoveryAcknowledgment = struct {
     attempt_id: [32]u8,
     completion_sha256: [32]u8,
     provenance_sha256: [32]u8,
+    acknowledgment_id: [32]u8,
 };
 
 pub const WorkflowRequest = struct {
@@ -44,6 +45,7 @@ pub const WorkflowRequest = struct {
     /// Internal cross-layer protocol. Ordinary product recovery keeps its
     /// historical clear-on-success behavior.
     defer_recovery_clear: bool = false,
+    deferred_acknowledgment_id: ?[32]u8 = null,
     recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
 };
 
@@ -51,6 +53,7 @@ const WorkflowDirective = struct {
     operation: WorkflowSemanticOperation,
     mode: WorkflowMode,
     defer_recovery_clear: bool = false,
+    deferred_acknowledgment_id: ?[32]u8 = null,
 };
 
 const TransactionSemanticOperation = enum {
@@ -83,6 +86,8 @@ pub const CompletionPoint = enum {
     /// A deferred recovery has prepared its success result while the exact
     /// completed/published lower record still remains durable.
     before_deferred_recovery_return,
+    after_deferred_acknowledged,
+    after_deferred_record_cleared,
 };
 
 /// Test seam that reproduces a process death at a completion boundary. A
@@ -198,7 +203,13 @@ pub const Backend = struct {
             .options = workflow.options,
         };
         if (workflow.recovery_acknowledgment) |acknowledgment| {
-            if (workflow.mode != .recover or !workflow.defer_recovery_clear)
+            if (workflow.mode != .recover or !workflow.defer_recovery_clear or
+                workflow.deferred_acknowledgment_id == null or
+                !std.mem.eql(
+                    u8,
+                    &workflow.deferred_acknowledgment_id.?,
+                    &acknowledgment.acknowledgment_id,
+                ))
                 return api.failure(
                     operation,
                     .usage,
@@ -216,6 +227,7 @@ pub const Backend = struct {
             .operation = workflow.operation,
             .mode = workflow.mode,
             .defer_recovery_clear = workflow.defer_recovery_clear,
+            .deferred_acknowledgment_id = workflow.deferred_acknowledgment_id,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -586,6 +598,18 @@ pub const Backend = struct {
             directive.mode == .recover and directive.defer_recovery_clear
         else
             false;
+        guard.deferred_acknowledgment_id = if (workflow) |directive|
+            directive.deferred_acknowledgment_id
+        else
+            null;
+        if (guard.preserve_settled and
+            guard.deferred_acknowledgment_id == null)
+            return api.failure(
+                request.operation,
+                .internal,
+                .internal_error,
+                "deferred recovery requires an acknowledgment identity",
+            );
         if (workflowRootOperation(request.operation, workflow)) |operation| {
             if (guard.open(allocator, request, operation)) |failure| return failure;
         }
@@ -606,6 +630,10 @@ pub const Backend = struct {
                     directive.defer_recovery_clear
                 else
                     false,
+                if (workflow) |directive|
+                    directive.deferred_acknowledgment_id
+                else
+                    null,
             )) |result|
                 return result;
         }
@@ -1013,6 +1041,10 @@ pub const Backend = struct {
                     directive.defer_recovery_clear
                 else
                     false,
+                if (workflow) |directive|
+                    directive.deferred_acknowledgment_id
+                else
+                    null,
             )) |result| return result;
             return blockedRecovery(
                 request.operation,
@@ -1119,6 +1151,7 @@ pub const Backend = struct {
         guard: *RootOperationGuard,
         request: api.Request,
         defer_clear: bool,
+        acknowledgment_id: ?[32]u8,
     ) !?api.Result {
         var attempt = guard.active() orelse return null;
         const record = attempt.record();
@@ -1143,6 +1176,24 @@ pub const Backend = struct {
                 request.operation,
                 "settled lower recovery completion evidence is stale or foreign",
             );
+            const marker = root_operation.Store.init(
+                guard.owned_root.?.root,
+            ).readDeferredAcknowledgment(allocator) catch
+                return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker is unreadable",
+                );
+            if (marker == null or acknowledgment_id == null or
+                !deferredMarkerMatches(
+                    marker.?,
+                    record,
+                    completion.document,
+                    acknowledgment_id.?,
+                ))
+                return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker is missing, stale, or foreign",
+                );
             guard.preserve_settled = true;
             const items = try allocator.alloc(api.Item, 1);
             items[0] = .{
@@ -1228,11 +1279,32 @@ pub const Backend = struct {
         // Provenance before clearing, exactly as an uninterrupted completion
         // does it: the digest binds the attempt to the statement just
         // published, so the cleared intent always leaves a verifiable link.
-        attempt.publishProvenance(allocator, root_operation.provenanceDigest(record, .{
+        const provenance_sha256 = root_operation.provenanceDigest(record, .{
             .outcome = record.outcome,
             .document_sha256 = statement.document.digest_sha256,
             .journal_archived = evidence.journal.status == .archived,
-        })) catch |err| return mapRootOperationError(request.operation, err);
+        });
+        if (defer_clear) {
+            const marker = root_operation.createDeferredAcknowledgment(.{
+                .attempt_id = record.attempt_id,
+                .completion_sha256 = statement.document.digest_sha256,
+                .provenance_sha256 = provenance_sha256,
+                .acknowledgment_id = acknowledgment_id.?,
+            });
+            root_operation.Store.init(
+                guard.owned_root.?.root,
+            ).publishDeferredAcknowledgment(
+                allocator,
+                marker,
+            ) catch return blockedRecovery(
+                request.operation,
+                "deferred lower recovery marker could not be published",
+            );
+        }
+        attempt.publishProvenance(
+            allocator,
+            provenance_sha256,
+        ) catch |err| return mapRootOperationError(request.operation, err);
         try guard.crash(.after_provenance_published);
         if (defer_clear) {
             guard.preserve_settled = true;
@@ -1299,37 +1371,72 @@ pub const Backend = struct {
             .allocator = allocator,
             .io = self.io,
         };
-        var coordinator = root_operation.Coordinator.open(
+        const lock_backend = locks.interface();
+        const coordinator = root_operation.Coordinator.open(
             self.io,
             owned_root.root,
             request.options.install_root,
-            locks.interface(),
+            lock_backend,
         ) catch |err| return mapRootOperationError(request.operation, err);
-        coordinator.now_unix = self.now_unix;
-        var attempt = (try coordinator.resumeSettledForAcknowledgment(
-            allocator,
-            .{
-                .attempt_id = acknowledgment.attempt_id,
-                .provenance_sha256 = acknowledgment.provenance_sha256,
-            },
-            request.options.lock_wait_ms,
-        )) orelse return success(
-            request.operation,
-            false,
-            "lower recovery acknowledgment was already finalized",
-            &.{},
-        );
-        defer attempt.release();
-        const record = attempt.record();
-        const expected_operation: api.Operation =
-            workflowSemanticSurface(semantic_operation);
-        if (record.operation != .package_transaction or
-            record.operation.package_transaction != expected_operation or
-            record.backend != self.transaction_backend)
+        const token = lock_backend.acquire(.{
+            .rank = .root_operation,
+            .root = owned_root.root,
+            .identity = coordinator.identity,
+            .path = root_operation.lock_path,
+            .wait_ms = request.options.lock_wait_ms,
+            .cancellation = transaction_executor.Cancellation.never(),
+        }) catch |err| return mapRootOperationError(request.operation, err);
+        defer lock_backend.release(token);
+        const store = coordinator.store();
+        const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
-                "deferred lower recovery acknowledgment names a foreign operation",
+                "deferred lower recovery marker is unreadable",
             );
+        var record = store.read(allocator) catch return blockedRecovery(
+            request.operation,
+            "deferred lower recovery record is unreadable",
+        );
+        defer if (record) |*owned| owned.deinit();
+        if (marker == null) {
+            if (record != null) return blockedRecovery(
+                request.operation,
+                "deferred lower recovery marker is missing for an active record",
+            );
+            return success(
+                request.operation,
+                false,
+                "lower recovery acknowledgment was already finalized",
+                &.{},
+            );
+        }
+        const observed_marker = marker.?;
+        if (!std.mem.eql(
+            u8,
+            &observed_marker.attempt_id,
+            &acknowledgment.attempt_id,
+        ) or
+            !std.mem.eql(
+                u8,
+                &observed_marker.completion_sha256,
+                &acknowledgment.completion_sha256,
+            ) or
+            !std.mem.eql(
+                u8,
+                &observed_marker.provenance_sha256,
+                &acknowledgment.provenance_sha256,
+            ) or
+            !std.mem.eql(
+                u8,
+                &observed_marker.acknowledgment_id,
+                &acknowledgment.acknowledgment_id,
+            ))
+            return blockedRecovery(
+                request.operation,
+                "deferred lower recovery acknowledgment marker is stale or foreign",
+            );
+        const expected_operation: api.Operation =
+            workflowSemanticSurface(semantic_operation);
 
         var completion = (root_operation_completion.Store.init(
             owned_root.root,
@@ -1342,28 +1449,69 @@ pub const Backend = struct {
         );
         defer completion.deinit();
         const document = completion.document;
-        const expected_provenance = root_operation.provenanceDigest(record, .{
-            .outcome = record.outcome,
-            .document_sha256 = document.digest_sha256,
-            .journal_archived = document.journal.status == .archived,
-        });
         if (!std.mem.eql(
             u8,
             &document.digest_sha256,
             &acknowledgment.completion_sha256,
-        ) or
-            !recoveryCompletionMatchesRecord(document, record, request) or
-            !std.mem.eql(
-                u8,
-                &expected_provenance,
-                &acknowledgment.provenance_sha256,
-            ))
+        ) or !std.mem.eql(
+            u8,
+            &document.attempt_id,
+            &acknowledgment.attempt_id,
+        ))
             return blockedRecovery(
                 request.operation,
                 "deferred lower recovery acknowledgment token is stale or foreign",
             );
-        attempt.clear() catch |err|
-            return mapRootOperationError(request.operation, err);
+        var acknowledged_marker = observed_marker;
+        if (observed_marker.state == .pending) {
+            const active = if (record) |owned|
+                owned.record
+            else
+                return blockedRecovery(
+                    request.operation,
+                    "pending deferred acknowledgment has no lower record",
+                );
+            if (active.operation != .package_transaction or
+                active.operation.package_transaction != expected_operation or
+                active.backend != self.transaction_backend or
+                !recoveryCompletionMatchesRecord(document, active, request))
+                return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery acknowledgment names a foreign operation",
+                );
+            acknowledged_marker =
+                store.acknowledgeDeferredAcknowledgment(
+                    allocator,
+                    observed_marker.digest_sha256,
+                ) catch return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery acknowledgment could not be committed",
+                );
+            if (self.completion_crash) |crash|
+                try crash.hit(.after_deferred_acknowledged);
+        }
+        if (record) |*owned| {
+            if (!recordMatchesAcknowledgment(owned.record, acknowledged_marker))
+                return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery record changed before clear",
+                );
+            store.clear() catch return blockedRecovery(
+                request.operation,
+                "deferred lower recovery record could not be cleared",
+            );
+            owned.deinit();
+            record = null;
+            if (self.completion_crash) |crash|
+                try crash.hit(.after_deferred_record_cleared);
+        }
+        store.clearDeferredAcknowledgment(
+            allocator,
+            acknowledged_marker.digest_sha256,
+        ) catch return blockedRecovery(
+            request.operation,
+            "deferred lower recovery marker could not be cleared",
+        );
         _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
         return success(
             request.operation,
@@ -1781,6 +1929,47 @@ fn recoveryCompletionMatchesRecord(
         std.mem.eql(u8, &expected_provenance, &provenance_sha256);
 }
 
+fn deferredMarkerMatches(
+    marker: root_operation.DeferredAcknowledgment,
+    record: root_operation.Record,
+    document: root_operation_completion.Document,
+    acknowledgment_id: [32]u8,
+) bool {
+    const provenance_sha256 = record.provenance_sha256 orelse return false;
+    return marker.state == .pending and
+        std.mem.eql(u8, &marker.attempt_id, &record.attempt_id) and
+        std.mem.eql(
+            u8,
+            &marker.completion_sha256,
+            &document.digest_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &marker.provenance_sha256,
+            &provenance_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &acknowledgment_id,
+        );
+}
+
+fn recordMatchesAcknowledgment(
+    record: root_operation.Record,
+    marker: root_operation.DeferredAcknowledgment,
+) bool {
+    return record.state == .completed and
+        record.provenance == .published and
+        record.provenance_sha256 != null and
+        std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) and
+        std.mem.eql(
+            u8,
+            &record.provenance_sha256.?,
+            &marker.provenance_sha256,
+        );
+}
+
 /// Owns rank 0 of the lock order for one product mutation. It is deliberately
 /// a thin bridge: it reserves the root, publishes each durable boundary the
 /// current command-oriented executor can justify, and resolves the pending
@@ -1801,6 +1990,7 @@ const RootOperationGuard = struct {
     /// acknowledgment hand-off. The settled record remains until that outer
     /// coordinator retains and explicitly acknowledges its exact token.
     preserve_settled: bool = false,
+    deferred_acknowledgment_id: ?[32]u8 = null,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -1865,6 +2055,7 @@ const RootOperationGuard = struct {
             .target_architecture = request.options.architecture,
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
+            .deferred_acknowledgment_id = self.deferred_acknowledgment_id,
         }) catch |err| return mapRootOperationError(request.operation, err);
         return null;
     }
@@ -3514,6 +3705,23 @@ const ProductionWorkflowFixture = struct {
     }
 };
 
+const DeferredAckContender = struct {
+    backend: *Backend,
+    request: WorkflowRequest,
+    status: ?api.ExitStatus = null,
+
+    fn run(self: *DeferredAckContender) void {
+        const result = self.backend.executeWorkflow(
+            std.heap.page_allocator,
+            self.request,
+        ) catch {
+            self.status = .internal;
+            return;
+        };
+        self.status = result.exit_status;
+    }
+};
+
 test "production workflow plans a successful batch install into one exact lock" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -3950,6 +4158,7 @@ test "production workflow deferred recovery completion survives every handoff cr
         });
         try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
         const mutation_calls = process.calls;
+        const acknowledgment_id: [32]u8 = @splat(0x6a);
 
         var recovery_crash: TestCompletionCrash = .{
             .point = recovery_crash_point,
@@ -3961,6 +4170,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = acknowledgment_id,
         });
         try std.testing.expectEqual(
             api.ExitStatus.internal,
@@ -3976,6 +4186,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = acknowledgment_id,
         });
         try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
         try std.testing.expectEqual(mutation_calls, process.calls);
@@ -4011,6 +4222,37 @@ test "production workflow deferred recovery completion survives every handoff cr
             root_operation_completion.TransactionProvenanceStatus.unavailable,
             completion.document.transaction_provenance.status,
         );
+        try directory.dir.access(
+            std.testing.io,
+            "root/" ++ root_operation.deferred_ack_path,
+            .{},
+        );
+        var foreign_options = options;
+        foreign_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-foreign",
+            .{fixture.state_path},
+        );
+        var contender: DeferredAckContender = .{
+            .backend = &backend,
+            .request = .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = foreign_options,
+            },
+        };
+        const contender_thread = try std.Thread.spawn(
+            .{},
+            DeferredAckContender.run,
+            .{&contender},
+        );
+        contender_thread.join();
+        try std.testing.expectEqual(
+            api.ExitStatus.recovery,
+            contender.status.?,
+        );
+        try std.testing.expectEqual(mutation_calls, process.calls);
 
         var wrong_completion = completion.document.digest_sha256;
         wrong_completion[0] ^= 0xff;
@@ -4020,10 +4262,12 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = wrong_completion,
                 .provenance_sha256 = record.record.provenance_sha256.?,
+                .acknowledgment_id = acknowledgment_id,
             },
         });
         try std.testing.expectEqual(api.ExitStatus.recovery, rejected.exit_status);
@@ -4032,16 +4276,76 @@ test "production workflow deferred recovery completion survives every handoff cr
             "root/" ++ root_operation.record_path,
             .{},
         );
+        const foreign_acknowledgment_id: [32]u8 = @splat(0x7b);
+        const foreign_ack = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = foreign_acknowledgment_id,
+            .recovery_acknowledgment = .{
+                .attempt_id = record.record.attempt_id,
+                .completion_sha256 = completion.document.digest_sha256,
+                .provenance_sha256 = record.record.provenance_sha256.?,
+                .acknowledgment_id = foreign_acknowledgment_id,
+            },
+        });
+        try std.testing.expectEqual(
+            api.ExitStatus.recovery,
+            foreign_ack.exit_status,
+        );
+        try directory.dir.access(
+            std.testing.io,
+            "root/" ++ root_operation.deferred_ack_path,
+            .{},
+        );
+        const acknowledgment_crash_point: ?CompletionPoint =
+            switch (recovery_crash_point) {
+                .after_owed_provenance_document => .after_deferred_acknowledged,
+                .after_provenance_published => .after_deferred_record_cleared,
+                .before_deferred_recovery_return => null,
+                else => unreachable,
+            };
+        if (acknowledgment_crash_point) |point| {
+            var acknowledgment_crash: TestCompletionCrash = .{
+                .point = point,
+            };
+            backend.completion_crash = acknowledgment_crash.interface();
+            const interrupted_ack = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .recover,
+                .selectors = &selectors,
+                .options = options,
+                .defer_recovery_clear = true,
+                .deferred_acknowledgment_id = acknowledgment_id,
+                .recovery_acknowledgment = .{
+                    .attempt_id = record.record.attempt_id,
+                    .completion_sha256 = completion.document.digest_sha256,
+                    .provenance_sha256 = record.record.provenance_sha256.?,
+                    .acknowledgment_id = acknowledgment_id,
+                },
+            });
+            try std.testing.expectEqual(
+                api.ExitStatus.internal,
+                interrupted_ack.exit_status,
+            );
+            try std.testing.expect(acknowledgment_crash.triggered);
+            backend.completion_crash = null;
+            try std.testing.expectEqual(mutation_calls, process.calls);
+        }
         const acknowledged = try backend.executeWorkflow(allocator, .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = completion.document.digest_sha256,
                 .provenance_sha256 = record.record.provenance_sha256.?,
+                .acknowledgment_id = acknowledgment_id,
             },
         });
         try std.testing.expectEqual(
@@ -4057,20 +4361,37 @@ test "production workflow deferred recovery completion survives every handoff cr
                 .{},
             ),
         );
+        try std.testing.expectError(
+            error.FileNotFound,
+            directory.dir.access(
+                std.testing.io,
+                "root/" ++ root_operation.deferred_ack_path,
+                .{},
+            ),
+        );
         const repeated = try backend.executeWorkflow(allocator, .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
+            .deferred_acknowledgment_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = completion.document.digest_sha256,
                 .provenance_sha256 = record.record.provenance_sha256.?,
+                .acknowledgment_id = acknowledgment_id,
             },
         });
         try std.testing.expectEqual(api.ExitStatus.success, repeated.exit_status);
         try std.testing.expectEqual(mutation_calls, process.calls);
+        const future = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = foreign_options,
+        });
+        try std.testing.expect(future.exit_status != .recovery);
     }
 }
 
