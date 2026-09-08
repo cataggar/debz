@@ -8,7 +8,11 @@ import pathlib
 import unittest
 
 import jsonschema
-from referencing import Registry, Resource
+try:
+    from referencing import Registry, Resource
+except ModuleNotFoundError:
+    Registry = None
+    Resource = None
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -26,20 +30,33 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         cls.request = json.loads(
             (ROOT / "schema/apt-system-request-v1.json").read_text()
         )
-        v1_resource = Resource.from_contents(cls.v1)
-        cls.registry = Registry().with_resources(
-            [
-                (cls.v1["$id"], v1_resource),
-                (
-                    "https://debz.dev/schema/apt-system-result-v1.json",
-                    v1_resource,
-                ),
-            ]
-        )
-        cls.validator = jsonschema.Draft202012Validator(
-            cls.v2,
-            registry=cls.registry,
-        )
+        if Registry is not None and Resource is not None:
+            v1_resource = Resource.from_contents(cls.v1)
+            registry = Registry().with_resources(
+                [
+                    (cls.v1["$id"], v1_resource),
+                    (
+                        "https://debz.dev/schema/apt-system-result-v1.json",
+                        v1_resource,
+                    ),
+                ]
+            )
+            cls.validator = jsonschema.Draft202012Validator(
+                cls.v2,
+                registry=registry,
+            )
+        else:
+            resolver = jsonschema.RefResolver.from_schema(
+                cls.v2,
+                store={
+                    cls.v1["$id"]: cls.v1,
+                    "https://debz.dev/schema/apt-system-result-v1.json": cls.v1,
+                },
+            )
+            cls.validator = jsonschema.Draft202012Validator(
+                cls.v2,
+                resolver=resolver,
+            )
         cls.request_validator = jsonschema.Draft202012Validator(cls.request)
 
     @staticmethod
