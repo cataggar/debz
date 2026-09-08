@@ -265,6 +265,8 @@ pub const deferred_ack_schema_version: u32 = 1;
 
 pub const DeferredAcknowledgmentState = enum {
     bound,
+    released,
+    abandoned,
     pending,
     acknowledged,
 };
@@ -314,7 +316,7 @@ pub fn createDeferredAcknowledgment(
 
 fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
     return switch (marker.state) {
-        .bound => marker.completion_sha256 == null and
+        .bound, .released, .abandoned => marker.completion_sha256 == null and
             marker.provenance_sha256 == null,
         .pending, .acknowledged => marker.completion_sha256 != null and
             marker.provenance_sha256 != null,
@@ -1015,6 +1017,38 @@ pub const Store = struct {
         return next;
     }
 
+    pub fn terminalizeDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+        terminal_state: DeferredAcknowledgmentState,
+    ) !DeferredAcknowledgment {
+        if (terminal_state != .released and terminal_state != .abandoned)
+            return error.InvalidDocument;
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if (observed.state != .bound or !std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var next = observed;
+        next.state = terminal_state;
+        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        const bytes = try next.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+        return next;
+    }
+
     pub fn clearDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
@@ -1485,13 +1519,24 @@ pub const Coordinator = struct {
             allocator,
         ) catch return error.RecordCorrupt;
         if (deferred) |marker| switch (marker.state) {
-            .acknowledged => {
+            .acknowledged => return error.RecoveryRequired,
+            .released, .abandoned => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                )) return error.RecoveryRequired;
                 if (prior) |*value| {
-                    if (!recordMatchesDeferredAcknowledgment(
-                        value.record,
-                        marker,
-                        false,
-                    )) return error.RecoveryRequired;
+                    if (!value.record.clearable() or
+                        !recordMatchesDeferredAcknowledgment(
+                            value.record,
+                            marker,
+                            false,
+                        ))
+                        return error.RecoveryRequired;
                     store_handle.clear() catch return error.StoreFailed;
                     value.deinit();
                     prior = null;
@@ -1500,35 +1545,56 @@ pub const Coordinator = struct {
                     allocator,
                     marker.digest_sha256,
                 ) catch return error.StoreFailed;
+                if (marker.state == .released)
+                    return error.ResolvedAttemptPresent;
             },
             .bound => {
-                if (prior != null and prior.?.record.clearable() and
-                    recordMatchesDeferredAcknowledgment(
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                ) or
+                    prior == null or
+                    !recordMatchesDeferredAcknowledgment(
                         prior.?.record,
                         marker,
-                        false,
+                        true,
                     ))
-                {
+                    return error.RecoveryRequired;
+                if (prior.?.record.clearable()) {
+                    const abandoned =
+                        prior.?.record.outcome == .abandoned_before_mutation;
+                    const terminal =
+                        store_handle.terminalizeDeferredAcknowledgment(
+                            allocator,
+                            marker.digest_sha256,
+                            if (abandoned) .abandoned else .released,
+                        ) catch return error.StoreFailed;
+                    store_handle.clear() catch return error.StoreFailed;
+                    prior.?.deinit();
+                    prior = null;
                     store_handle.clearDeferredAcknowledgment(
                         allocator,
-                        marker.digest_sha256,
+                        terminal.digest_sha256,
                     ) catch return error.StoreFailed;
-                } else {
-                    const orchestration_id =
-                        request.orchestration_id orelse
-                        return error.RecoveryRequired;
-                    if (!std.mem.eql(
-                        u8,
-                        &orchestration_id,
-                        &marker.acknowledgment_id,
-                    ) or
-                        prior == null or
-                        !recordMatchesDeferredAcknowledgment(
-                            prior.?.record,
-                            marker,
-                            true,
-                        ))
-                        return error.RecoveryRequired;
+                    if (!abandoned)
+                        return error.ResolvedAttemptPresent;
+                }
+                if (prior != null and prior.?.record.state.provenPreMutation()) {
+                    const adopted = prior.?;
+                    prior = null;
+                    return .{
+                        .coordinator = self,
+                        .token = token,
+                        .owned = adopted,
+                        .entered = .initEmpty(),
+                        .highest = .root_operation,
+                        .adopted = true,
+                        .bridge = .none,
+                    };
                 }
             },
             .pending => {
@@ -2072,6 +2138,8 @@ fn recordMatchesDeferredAcknowledgment(
         return false;
     return switch (marker.state) {
         .bound => true,
+        .released => record.outcome != .abandoned_before_mutation,
+        .abandoned => record.outcome == .abandoned_before_mutation,
         .pending, .acknowledged => switch (record.provenance) {
             .published => record.provenance_sha256 != null and
                 marker.provenance_sha256 != null and std.mem.eql(

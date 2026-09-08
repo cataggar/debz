@@ -48,6 +48,7 @@ pub const WorkflowRequest = struct {
     /// Internal outer-attempt identity, bound into the lower root record
     /// namespace before an orchestrated mutation can begin.
     orchestration_id: ?[32]u8 = null,
+    finalize_ownership: bool = false,
     recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
 };
 
@@ -73,6 +74,8 @@ const TransactionSemanticOperation = enum {
 /// blocking a healthy root, so every step in it is a named seam. Production
 /// callers leave `Backend.completion_crash` null and each step simply runs.
 pub const CompletionPoint = enum {
+    after_root_lock_acquired,
+    after_binding_published,
     /// The completed record is durable; nothing else has run.
     after_completed_record,
     /// The recovery intent has been removed from the state directory.
@@ -88,8 +91,18 @@ pub const CompletionPoint = enum {
     /// A deferred recovery has prepared its success result while the exact
     /// completed/published lower record still remains durable.
     before_deferred_recovery_return,
+    before_ownership_terminal_publish,
+    after_ownership_terminal_publish,
+    before_ownership_record_clear,
+    after_ownership_record_clear,
+    before_ownership_marker_clear,
+    after_ownership_marker_clear,
+    before_deferred_acknowledged,
     after_deferred_acknowledged,
+    before_deferred_record_cleared,
     after_deferred_record_cleared,
+    before_deferred_marker_cleared,
+    after_deferred_marker_cleared,
 };
 
 /// Test seam that reproduces a process death at a completion boundary. A
@@ -101,6 +114,20 @@ pub const CompletionCrash = struct {
     hitFn: *const fn (*anyopaque, CompletionPoint) anyerror!void,
 
     pub fn hit(self: CompletionCrash, point: CompletionPoint) !void {
+        return self.hitFn(self.context, point);
+    }
+};
+
+pub const RootBindingPoint = enum {
+    after_root_lock_acquired,
+    after_binding_published,
+};
+
+pub const RootBindingSync = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, RootBindingPoint) anyerror!void,
+
+    pub fn hit(self: RootBindingSync, point: RootBindingPoint) !void {
         return self.hitFn(self.context, point);
     }
 };
@@ -126,6 +153,8 @@ pub const Backend = struct {
     /// Test seam. Production callers leave it null and every completion
     /// boundary runs to its durable end.
     completion_crash: ?CompletionCrash = null,
+    /// Test-only synchronization around the root lock and initial binding.
+    root_binding_sync: ?RootBindingSync = null,
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -224,6 +253,23 @@ pub const Backend = struct {
                 workflow.operation,
                 acknowledgment,
             ) catch |err| mapRuntimeError(operation, err);
+        }
+        if (workflow.finalize_ownership) {
+            if (workflow.mode != .recover or
+                workflow.orchestration_id == null or
+                workflow.defer_recovery_clear or
+                workflow.recovery_acknowledgment != null)
+                return api.failure(
+                    operation,
+                    .internal,
+                    .internal_error,
+                    "invalid orchestration ownership finalization request",
+                );
+            return self.finalizeWorkflowOwnership(
+                allocator,
+                request,
+                workflow.orchestration_id.?,
+            );
         }
         return self.withRepositories(allocator, request, .{
             .operation = workflow.operation,
@@ -1514,6 +1560,8 @@ pub const Backend = struct {
                     request.operation,
                     "deferred lower recovery acknowledgment names a foreign operation",
                 );
+            if (self.completion_crash) |crash|
+                try crash.hit(.before_deferred_acknowledged);
             acknowledged_marker =
                 store.acknowledgeDeferredAcknowledgment(
                     allocator,
@@ -1531,6 +1579,8 @@ pub const Backend = struct {
                     request.operation,
                     "deferred lower recovery record changed before clear",
                 );
+            if (self.completion_crash) |crash|
+                try crash.hit(.before_deferred_record_cleared);
             store.clear() catch return blockedRecovery(
                 request.operation,
                 "deferred lower recovery record could not be cleared",
@@ -1540,6 +1590,8 @@ pub const Backend = struct {
             if (self.completion_crash) |crash|
                 try crash.hit(.after_deferred_record_cleared);
         }
+        if (self.completion_crash) |crash|
+            try crash.hit(.before_deferred_marker_cleared);
         store.clearDeferredAcknowledgment(
             allocator,
             acknowledged_marker.digest_sha256,
@@ -1547,11 +1599,149 @@ pub const Backend = struct {
             request.operation,
             "deferred lower recovery marker could not be cleared",
         );
+        if (self.completion_crash) |crash|
+            try crash.hit(.after_deferred_marker_cleared);
         _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
         return success(
             request.operation,
             false,
             "lower recovery acknowledgment finalized",
+            &.{},
+        );
+    }
+
+    fn finalizeWorkflowOwnership(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        orchestration_id: [32]u8,
+    ) !api.Result {
+        var owned_root = root_fs.openAbsoluteRoot(
+            self.io,
+            request.options.install_root,
+        ) catch return blockedRecovery(
+            request.operation,
+            "the live root is unavailable while finalizing ownership",
+        );
+        defer owned_root.close();
+        var locks: root_operation.SystemLockBackend = .{
+            .allocator = allocator,
+            .io = self.io,
+        };
+        const lock_backend = locks.interface();
+        const coordinator = root_operation.Coordinator.open(
+            self.io,
+            owned_root.root,
+            request.options.install_root,
+            lock_backend,
+        ) catch |err| return mapRootOperationError(request.operation, err);
+        const token = lock_backend.acquire(.{
+            .rank = .root_operation,
+            .root = owned_root.root,
+            .identity = coordinator.identity,
+            .path = root_operation.lock_path,
+            .wait_ms = request.options.lock_wait_ms,
+            .cancellation = transaction_executor.Cancellation.never(),
+        }) catch |err| return mapRootOperationError(request.operation, err);
+        defer lock_backend.release(token);
+        const store = coordinator.store();
+        const marker = store.readDeferredAcknowledgment(allocator) catch
+            return blockedRecovery(
+                request.operation,
+                "lower ownership marker is unreadable",
+            );
+        var record = store.read(allocator) catch return blockedRecovery(
+            request.operation,
+            "lower ownership record is unreadable",
+        );
+        defer if (record) |*owned| owned.deinit();
+        if (marker == null) {
+            if (record != null) return blockedRecovery(
+                request.operation,
+                "lower ownership marker is missing for an active record",
+            );
+            return success(
+                request.operation,
+                false,
+                "lower orchestration ownership was already finalized",
+                &.{},
+            );
+        }
+        const observed = marker.?;
+        if ((observed.state != .bound and
+            observed.state != .released and
+            observed.state != .abandoned) or
+            !std.mem.eql(
+                u8,
+                &observed.acknowledgment_id,
+                &orchestration_id,
+            ))
+            return blockedRecovery(
+                request.operation,
+                "lower ownership marker belongs to another orchestrator",
+            );
+        if (record) |owned| {
+            if (!owned.record.clearable() or
+                (observed.state == .released and
+                    owned.record.outcome == .abandoned_before_mutation) or
+                (observed.state == .abandoned and
+                    owned.record.outcome != .abandoned_before_mutation) or
+                !std.mem.eql(
+                    u8,
+                    &owned.record.attempt_id,
+                    &observed.attempt_id,
+                ))
+                return blockedRecovery(
+                    request.operation,
+                    "lower ownership record is unfinished or foreign",
+                );
+        }
+        const terminal = if (observed.state == .bound) blk: {
+            if (self.completion_crash) |crash|
+                try crash.hit(.before_ownership_terminal_publish);
+            const released = store.terminalizeDeferredAcknowledgment(
+                allocator,
+                observed.digest_sha256,
+                if (record != null and
+                    record.?.record.outcome == .abandoned_before_mutation)
+                    .abandoned
+                else
+                    .released,
+            ) catch return blockedRecovery(
+                request.operation,
+                "lower ownership terminal marker could not be published",
+            );
+            if (self.completion_crash) |crash|
+                try crash.hit(.after_ownership_terminal_publish);
+            break :blk released;
+        } else observed;
+        if (record) |*owned| {
+            if (self.completion_crash) |crash|
+                try crash.hit(.before_ownership_record_clear);
+            store.clear() catch return blockedRecovery(
+                request.operation,
+                "lower ownership record could not be cleared",
+            );
+            owned.deinit();
+            record = null;
+            if (self.completion_crash) |crash|
+                try crash.hit(.after_ownership_record_clear);
+        }
+        if (self.completion_crash) |crash|
+            try crash.hit(.before_ownership_marker_clear);
+        store.clearDeferredAcknowledgment(
+            allocator,
+            terminal.digest_sha256,
+        ) catch return blockedRecovery(
+            request.operation,
+            "lower ownership marker could not be cleared",
+        );
+        if (self.completion_crash) |crash|
+            try crash.hit(.after_ownership_marker_clear);
+        return success(
+            request.operation,
+            false,
+            "lower orchestration ownership finalized",
             &.{},
         );
     }
@@ -2095,6 +2285,19 @@ const RootOperationGuard = struct {
             .adopt_settled_for_acknowledgment = self.preserve_settled,
             .orchestration_id = self.orchestration_id,
         }) catch |err| return mapRootOperationError(request.operation, err);
+        self.crash(.after_root_lock_acquired) catch return api.failure(
+            request.operation,
+            .internal,
+            .internal_error,
+            "injected crash after root lock acquisition",
+        );
+        if (self.backend.root_binding_sync) |sync|
+            sync.hit(.after_root_lock_acquired) catch return api.failure(
+                request.operation,
+                .internal,
+                .internal_error,
+                "root binding synchronization failed",
+            );
         if (self.orchestration_id) |orchestration_id| {
             const store = self.coordinator.store();
             const existing = store.readDeferredAcknowledgment(
@@ -2143,6 +2346,19 @@ const RootOperationGuard = struct {
                     "lower orchestration binding could not be published",
                 );
             }
+            if (self.backend.root_binding_sync) |sync|
+                sync.hit(.after_binding_published) catch return api.failure(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    "root binding synchronization failed",
+                );
+            self.crash(.after_binding_published) catch return api.failure(
+                request.operation,
+                .internal,
+                .internal_error,
+                "injected crash after root ownership binding",
+            );
         }
         return null;
     }
@@ -2267,39 +2483,60 @@ const RootOperationGuard = struct {
             }),
         ) catch |err| return mapRootOperationError(operation, err);
         try self.crash(.after_provenance_published);
-        self.clearBoundOrchestrationBinding() catch
-            return blockedRecovery(
-                operation,
-                "completed lower operation orchestration binding could not be cleared",
-            );
-        attempt.clear() catch |err| return mapRootOperationError(operation, err);
+        if (self.orchestration_id == null) {
+            attempt.clear() catch |err|
+                return mapRootOperationError(operation, err);
+        } else {
+            self.finalizeOrchestrationOwnership(.released) catch
+                return blockedRecovery(
+                    operation,
+                    "completed lower operation ownership could not be finalized",
+                );
+        }
         return null;
     }
 
-    fn clearBoundOrchestrationBinding(
+    fn finalizeOrchestrationOwnership(
         self: *RootOperationGuard,
+        terminal_state: root_operation.DeferredAcknowledgmentState,
     ) !void {
         const orchestration_id = self.orchestration_id orelse return;
         const attempt = self.active() orelse return;
         const store = self.coordinator.store();
-        const binding = try store.readDeferredAcknowledgment(self.allocator) orelse
+        const observed = try store.readDeferredAcknowledgment(self.allocator) orelse
             return error.MissingOrchestrationBinding;
-        if (binding.state != .bound or
+        if ((observed.state != .bound and
+            observed.state != terminal_state) or
             !std.mem.eql(
                 u8,
-                &binding.attempt_id,
+                &observed.attempt_id,
                 &attempt.record().attempt_id,
             ) or
             !std.mem.eql(
                 u8,
-                &binding.acknowledgment_id,
+                &observed.acknowledgment_id,
                 &orchestration_id,
             ))
             return error.OrchestrationBindingMismatch;
+        const terminal = if (observed.state == .bound) blk: {
+            try self.crash(.before_ownership_terminal_publish);
+            const released = try store.terminalizeDeferredAcknowledgment(
+                self.allocator,
+                observed.digest_sha256,
+                terminal_state,
+            );
+            try self.crash(.after_ownership_terminal_publish);
+            break :blk released;
+        } else observed;
+        try self.crash(.before_ownership_record_clear);
+        try attempt.clear();
+        try self.crash(.after_ownership_record_clear);
+        try self.crash(.before_ownership_marker_clear);
         try store.clearDeferredAcknowledgment(
             self.allocator,
-            binding.digest_sha256,
+            terminal.digest_sha256,
         );
+        try self.crash(.after_ownership_marker_clear);
     }
 
     fn deinit(self: *RootOperationGuard) void {
@@ -2314,23 +2551,22 @@ const RootOperationGuard = struct {
             // survive exactly as the dead process left it.
             if (value.locked() and !self.crashed) {
                 if (value.record().state.provenPreMutation()) {
-                    const binding_cleared = if (self.orchestration_id == null)
-                        true
-                    else blk: {
-                        self.clearBoundOrchestrationBinding() catch break :blk false;
-                        break :blk true;
-                    };
-                    if (binding_cleared)
+                    if (self.orchestration_id == null) {
                         value.abandonIfPreMutation(self.allocator) catch {};
+                    } else {
+                        value.complete(
+                            self.allocator,
+                            .abandoned_before_mutation,
+                        ) catch {};
+                        if (value.record().clearable())
+                            self.finalizeOrchestrationOwnership(.abandoned) catch {};
+                    }
                 } else if (value.record().clearable() and !self.preserve_settled) {
-                    const binding_cleared = if (self.orchestration_id == null)
-                        true
-                    else blk: {
-                        self.clearBoundOrchestrationBinding() catch break :blk false;
-                        break :blk true;
-                    };
-                    if (binding_cleared)
+                    if (self.orchestration_id == null) {
                         value.clear() catch {};
+                    } else {
+                        self.finalizeOrchestrationOwnership(.released) catch {};
+                    }
                 }
             }
             value.release();
@@ -3715,6 +3951,43 @@ const TestCompletionCrash = struct {
     }
 };
 
+const TestRootBindingBarrier = struct {
+    point: RootBindingPoint,
+    reached: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn interface(self: *TestRootBindingBarrier) RootBindingSync {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: RootBindingPoint) !void {
+        const self: *TestRootBindingBarrier = @ptrCast(@alignCast(context));
+        if (point != self.point) return;
+        self.reached.store(true, .release);
+        while (!self.released.load(.acquire))
+            std.atomic.spinLoopHint();
+    }
+
+    fn wait(self: *TestRootBindingBarrier, wait_ms: u64) !void {
+        const started = std.Io.Clock.awake.now(std.testing.io);
+        while (!self.reached.load(.acquire)) {
+            const elapsed = started.durationTo(
+                std.Io.Clock.awake.now(std.testing.io),
+            ).toMilliseconds();
+            if (elapsed >= wait_ms) return error.TestTimedOut;
+            try std.Io.sleep(
+                std.testing.io,
+                .fromMilliseconds(1),
+                .awake,
+            );
+        }
+    }
+
+    fn release(self: *TestRootBindingBarrier) void {
+        self.released.store(true, .release);
+    }
+};
+
 const ProductionWorkflowFixture = struct {
     allocator: std.mem.Allocator,
     source_path: []u8,
@@ -3854,6 +4127,65 @@ const DeferredAckContender = struct {
         self.status = result.exit_status;
     }
 };
+
+fn backendRootRecord(
+    allocator: std.mem.Allocator,
+    directory: *std.testing.TmpDir,
+) !?root_operation.OwnedRecord {
+    const bytes = directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation.record_path,
+        allocator,
+        .limited(root_operation.maximum_document_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return try root_operation.decode(
+        allocator,
+        bytes,
+        root_operation.maximum_document_bytes,
+    );
+}
+
+fn backendRootCompletion(
+    allocator: std.mem.Allocator,
+    directory: *std.testing.TmpDir,
+) !?root_operation_completion.OwnedDocument {
+    const bytes = directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation_completion.document_path,
+        allocator,
+        .limited(root_operation_completion.maximum_document_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return try root_operation_completion.decode(
+        allocator,
+        bytes,
+        root_operation_completion.maximum_document_bytes,
+    );
+}
+
+fn backendDeferredMarker(
+    allocator: std.mem.Allocator,
+    directory: *std.testing.TmpDir,
+) !?root_operation.DeferredAcknowledgment {
+    const bytes = directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation.deferred_ack_path,
+        allocator,
+        .limited(root_operation.maximum_document_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return try root_operation.decodeDeferredAcknowledgment(allocator, bytes);
+}
 
 test "production workflow plans a successful batch install into one exact lock" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -4240,10 +4572,31 @@ test "production recovery crash after provenance publication leaves a settled cl
 
 test "production workflow deferred recovery completion survives every handoff crash and acknowledges once" {
     inline for (.{
-        CompletionPoint.after_owed_provenance_document,
-        .after_provenance_published,
-        .before_deferred_recovery_return,
-    }) |recovery_crash_point| {
+        .{
+            .recovery = CompletionPoint.after_owed_provenance_document,
+            .acknowledgment = CompletionPoint.before_deferred_acknowledged,
+        },
+        .{
+            .recovery = CompletionPoint.after_provenance_published,
+            .acknowledgment = CompletionPoint.after_deferred_acknowledged,
+        },
+        .{
+            .recovery = CompletionPoint.before_deferred_recovery_return,
+            .acknowledgment = CompletionPoint.before_deferred_record_cleared,
+        },
+        .{
+            .recovery = CompletionPoint.after_owed_provenance_document,
+            .acknowledgment = CompletionPoint.after_deferred_record_cleared,
+        },
+        .{
+            .recovery = CompletionPoint.after_provenance_published,
+            .acknowledgment = CompletionPoint.before_deferred_marker_cleared,
+        },
+        .{
+            .recovery = CompletionPoint.before_deferred_recovery_return,
+            .acknowledgment = CompletionPoint.after_deferred_marker_cleared,
+        },
+    }) |crash_case| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -4345,7 +4698,7 @@ test "production workflow deferred recovery completion survives every handoff cr
         );
 
         var recovery_crash: TestCompletionCrash = .{
-            .point = recovery_crash_point,
+            .point = crash_case.recovery,
         };
         backend.completion_crash = recovery_crash.interface();
         const first_recovery = try backend.executeWorkflow(allocator, .{
@@ -4478,16 +4831,9 @@ test "production workflow deferred recovery completion survives every handoff cr
             "root/" ++ root_operation.deferred_ack_path,
             .{},
         );
-        const acknowledgment_crash_point: ?CompletionPoint =
-            switch (recovery_crash_point) {
-                .after_owed_provenance_document => .after_deferred_acknowledged,
-                .after_provenance_published => .after_deferred_record_cleared,
-                .before_deferred_recovery_return => null,
-                else => unreachable,
-            };
-        if (acknowledgment_crash_point) |point| {
+        {
             var acknowledgment_crash: TestCompletionCrash = .{
-                .point = point,
+                .point = crash_case.acknowledgment,
             };
             backend.completion_crash = acknowledgment_crash.interface();
             const interrupted_ack = try backend.executeWorkflow(allocator, .{
@@ -4511,6 +4857,29 @@ test "production workflow deferred recovery completion survives every handoff cr
             try std.testing.expect(acknowledgment_crash.triggered);
             backend.completion_crash = null;
             try std.testing.expectEqual(mutation_calls, process.calls);
+            if (try backendDeferredMarker(allocator, &directory)) |_| {
+                const foreign_retry = try backend.executeWorkflow(
+                    allocator,
+                    .{
+                        .operation = .remove,
+                        .mode = .recover,
+                        .selectors = &selectors,
+                        .options = options,
+                        .defer_recovery_clear = true,
+                        .orchestration_id = competing_orchestration_id,
+                        .recovery_acknowledgment = .{
+                            .attempt_id = record.record.attempt_id,
+                            .completion_sha256 = completion.document.digest_sha256,
+                            .provenance_sha256 = record.record.provenance_sha256.?,
+                            .acknowledgment_id = competing_orchestration_id,
+                        },
+                    },
+                );
+                try std.testing.expectEqual(
+                    api.ExitStatus.recovery,
+                    foreign_retry.exit_status,
+                );
+            }
         }
         const acknowledged = try backend.executeWorkflow(allocator, .{
             .operation = .remove,
@@ -4640,6 +5009,482 @@ test "production workflow deferred recovery cannot claim an unbound lower attemp
             .{},
         ),
     );
+}
+
+test "production workflow root binding excludes overlapping foreign owners" {
+    inline for ([_]RootBindingPoint{
+        .after_root_lock_acquired,
+        .after_binding_published,
+    }) |binding_point| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        defer fixture.deinit();
+        var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+        var completion_crash: TestCompletionCrash = .{
+            .point = .after_completed_record,
+        };
+        var barrier: TestRootBindingBarrier = .{ .point = binding_point };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+            .completion_crash = completion_crash.interface(),
+            .root_binding_sync = barrier.interface(),
+        };
+        const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.noninteractive = true;
+        options.conffile = .keep_existing;
+        options.lock_wait_ms = 25;
+        const owner_id: [32]u8 = @splat(0xa1);
+        var owner: DeferredAckContender = .{
+            .backend = &backend,
+            .request = .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = options,
+                .orchestration_id = owner_id,
+            },
+        };
+        const owner_thread = try std.Thread.spawn(
+            .{},
+            DeferredAckContender.run,
+            .{&owner},
+        );
+        var owner_joined = false;
+        defer {
+            barrier.release();
+            if (!owner_joined) owner_thread.join();
+        }
+        try barrier.wait(5_000);
+
+        var distinct_options = options;
+        distinct_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-distinct",
+            .{fixture.state_path},
+        );
+        var identical_options = options;
+        identical_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-identical",
+            .{fixture.state_path},
+        );
+        var distinct: DeferredAckContender = .{
+            .backend = &backend,
+            .request = .{
+                .operation = .install,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = distinct_options,
+                .orchestration_id = @splat(0xb2),
+            },
+        };
+        var identical: DeferredAckContender = .{
+            .backend = &backend,
+            .request = .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = identical_options,
+                .orchestration_id = @splat(0xc3),
+            },
+        };
+        const distinct_thread = try std.Thread.spawn(
+            .{},
+            DeferredAckContender.run,
+            .{&distinct},
+        );
+        const identical_thread = try std.Thread.spawn(
+            .{},
+            DeferredAckContender.run,
+            .{&identical},
+        );
+        distinct_thread.join();
+        identical_thread.join();
+        try std.testing.expect(distinct.status.? != .success);
+        try std.testing.expect(identical.status.? != .success);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+        barrier.release();
+        owner_thread.join();
+        owner_joined = true;
+        try std.testing.expectEqual(api.ExitStatus.internal, owner.status.?);
+        const mutation_calls = process.calls;
+        try std.testing.expect(mutation_calls != 0);
+        backend.root_binding_sync = null;
+        backend.completion_crash = null;
+
+        const marker_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation.deferred_ack_path,
+            allocator,
+            .limited(root_operation.maximum_document_bytes),
+        );
+        const marker = try root_operation.decodeDeferredAcknowledgment(
+            allocator,
+            marker_source,
+        );
+        try std.testing.expectEqual(
+            root_operation.DeferredAcknowledgmentState.bound,
+            marker.state,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            &owner_id,
+            &marker.acknowledgment_id,
+        );
+
+        const recovered = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .orchestration_id = owner_id,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
+        try std.testing.expectEqual(mutation_calls, process.calls);
+        var record = (try backendRootRecord(
+            allocator,
+            &directory,
+        )).?;
+        defer record.deinit();
+        var completion = (try backendRootCompletion(
+            allocator,
+            &directory,
+        )).?;
+        defer completion.deinit();
+        const acknowledged = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .orchestration_id = owner_id,
+            .recovery_acknowledgment = .{
+                .attempt_id = record.record.attempt_id,
+                .completion_sha256 = completion.document.digest_sha256,
+                .provenance_sha256 = record.record.provenance_sha256.?,
+                .acknowledgment_id = owner_id,
+            },
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, acknowledged.exit_status);
+        try std.testing.expectEqual(mutation_calls, process.calls);
+        const later = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = identical_options,
+            .orchestration_id = @splat(0xc3),
+        });
+        try std.testing.expect(later.exit_status != .recovery);
+    }
+}
+
+test "production workflow ownership cleanup converges across every durable boundary" {
+    inline for ([_]CompletionPoint{
+        .before_ownership_terminal_publish,
+        .after_ownership_terminal_publish,
+        .before_ownership_record_clear,
+        .after_ownership_record_clear,
+        .before_ownership_marker_clear,
+        .after_ownership_marker_clear,
+    }) |crash_point| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        defer fixture.deinit();
+        var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+        var crash: TestCompletionCrash = .{ .point = crash_point };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+            .completion_crash = crash.interface(),
+        };
+        const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.noninteractive = true;
+        options.conffile = .keep_existing;
+        const owner_id: [32]u8 = @splat(0xd4);
+        const interrupted = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+        });
+        try std.testing.expectEqual(api.ExitStatus.recovery, interrupted.exit_status);
+        try std.testing.expect(crash.triggered);
+        const mutation_calls = process.calls;
+        try std.testing.expect(mutation_calls != 0);
+
+        const marker_before = try backendDeferredMarker(allocator, &directory);
+        if (marker_before) |marker| {
+            try std.testing.expect(
+                marker.state == .bound or marker.state == .released,
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                &owner_id,
+                &marker.acknowledgment_id,
+            );
+            var foreign_options = options;
+            foreign_options.state_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}-foreign-cleanup",
+                .{fixture.state_path},
+            );
+            const foreign = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = foreign_options,
+                .orchestration_id = @splat(0xe5),
+            });
+            try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
+            try std.testing.expectEqual(mutation_calls, process.calls);
+            const foreign_finalize = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .recover,
+                .selectors = &selectors,
+                .options = foreign_options,
+                .orchestration_id = @splat(0xe5),
+                .finalize_ownership = true,
+            });
+            try std.testing.expectEqual(
+                api.ExitStatus.recovery,
+                foreign_finalize.exit_status,
+            );
+            try std.testing.expectEqual(mutation_calls, process.calls);
+
+            backend.completion_crash = null;
+            const finalized = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .recover,
+                .selectors = &selectors,
+                .options = options,
+                .orchestration_id = owner_id,
+                .finalize_ownership = true,
+            });
+            try std.testing.expectEqual(api.ExitStatus.success, finalized.exit_status);
+            try std.testing.expectEqual(mutation_calls, process.calls);
+            try std.testing.expect((try backendRootRecord(
+                allocator,
+                &directory,
+            )) == null);
+            try std.testing.expect((try backendDeferredMarker(
+                allocator,
+                &directory,
+            )) == null);
+        } else {
+            try std.testing.expect((try backendRootRecord(
+                allocator,
+                &directory,
+            )) == null);
+        }
+        var later_options = options;
+        later_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-later-cleanup",
+            .{fixture.state_path},
+        );
+        const later = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = later_options,
+            .orchestration_id = @splat(0xf6),
+        });
+        try std.testing.expect(later.exit_status != .recovery);
+    }
+}
+
+test "production workflow pre-mutation ownership abandon converges across every durable boundary" {
+    inline for ([_]CompletionPoint{
+        .after_root_lock_acquired,
+        .after_binding_published,
+        .before_ownership_terminal_publish,
+        .after_ownership_terminal_publish,
+        .before_ownership_record_clear,
+        .after_ownership_record_clear,
+        .before_ownership_marker_clear,
+        .after_ownership_marker_clear,
+    }) |crash_point| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        defer fixture.deinit();
+        var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+        var crash: TestCompletionCrash = .{ .point = crash_point };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+            .completion_crash = crash.interface(),
+        };
+        const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        const valid_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "sources.list",
+            allocator,
+            .limited(4096),
+        );
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "sources.list",
+            .data = "not-an-apt-source\n",
+        });
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.noninteractive = true;
+        options.conffile = .keep_existing;
+        const owner_id: [32]u8 = @splat(0x17);
+        if (backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+        })) |failed| {
+            try std.testing.expect(failed.exit_status != .success);
+        } else |_| {}
+        try std.testing.expect(crash.triggered);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "sources.list",
+            .data = valid_source,
+        });
+
+        if (try backendDeferredMarker(allocator, &directory)) |marker| {
+            try std.testing.expect(
+                marker.state == .bound or marker.state == .abandoned,
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                &owner_id,
+                &marker.acknowledgment_id,
+            );
+            var foreign_options = options;
+            foreign_options.state_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}-foreign-abandon",
+                .{fixture.state_path},
+            );
+            const foreign = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = foreign_options,
+                .orchestration_id = @splat(0x28),
+            });
+            try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
+            try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+            backend.completion_crash = null;
+            const finalized = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = options,
+                .orchestration_id = owner_id,
+            });
+            if (finalized.exit_status != .success) {
+                try std.testing.expectEqual(@as(usize, 0), process.calls);
+                const executed = try backend.executeWorkflow(allocator, .{
+                    .operation = .remove,
+                    .mode = .execute,
+                    .selectors = &selectors,
+                    .options = options,
+                    .orchestration_id = owner_id,
+                });
+                try std.testing.expectEqual(api.ExitStatus.success, executed.exit_status);
+            }
+        } else {
+            backend.completion_crash = null;
+            const executed = try backend.executeWorkflow(allocator, .{
+                .operation = .remove,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = options,
+                .orchestration_id = owner_id,
+            });
+            try std.testing.expectEqual(api.ExitStatus.success, executed.exit_status);
+        }
+        try std.testing.expect(process.calls != 0);
+        try std.testing.expect((try backendRootRecord(
+            allocator,
+            &directory,
+        )) == null);
+        try std.testing.expect((try backendDeferredMarker(
+            allocator,
+            &directory,
+        )) == null);
+    }
 }
 
 test "production workflow successful recovery publishes honest completion evidence" {

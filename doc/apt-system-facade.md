@@ -316,8 +316,19 @@ owed provenance, it may only atomically transition that exact binding to
 owner. The pending marker makes the otherwise clearable completed/published
 record non-reclaimable by every ordinary mutation or recovery, including a
 request using a different profile or state path. An uninterrupted success or
-a proven pre-mutation abandonment clears its still-bound marker while holding
-the same root lock.
+a proven pre-mutation abandonment first transitions its binding to an
+owner-bound terminal state (`released` for completed mutation or `abandoned`
+for durable proof that mutation never began), clears and fsyncs the root
+record, then clears and fsyncs the marker while holding the same root lock.
+Every crash prefix converges: a terminal marker plus a record, or a marker
+alone after the record clear, continues to block foreign owners while allowing
+only the original outer attempt to finish cleanup idempotently. The outer
+engine retains verified transaction evidence before requesting `released`
+cleanup. An `abandoned` owner atomically rotates that terminal state into a
+fresh bound lower attempt and executes the exact retained lock once, without a
+clean ownership gap. Legacy record-only states retain their existing
+conservative recovery rules, and absence of both documents is the only fully
+clean state.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower
