@@ -236,13 +236,17 @@ the loaded profile.
 
 Confirmed execution reloads and revalidates the profile, rereads the active
 state with locked compare-and-set, revalidates the full exact-lock binding
-immediately before acquisition and again immediately before mutation, acquires
-the locked package closure, and invokes `ProductionWorkflow` execute with the
-same selectors and exact lock. A valid but different replacement is rejected,
-not merely a malformed lock. The only install-root spelling supplied to a
-backend is `live_root.logical_root_path`; `/` remains denied by product API v1
-and `live_root.host_root_allowed` remains false. Root, runtime, lock, or
-mountpoint replacement is surfaced as a typed conflict.
+immediately before acquisition and again immediately before mutation, and
+first invokes an internal reservation mode that durably binds the outer
+attempt identity under the lower root-operation lock without repository or
+package mutation. The outer state remains `downloaded` until that reservation
+returns. It is then advanced to `mutating` and `ProductionWorkflow` execute
+acquires the locked package closure with the same selectors and exact lock. A
+valid but different replacement is rejected, not merely a malformed lock. The
+only install-root spelling supplied to a backend is
+`live_root.logical_root_path`; `/` remains denied by product API v1 and
+`live_root.host_root_allowed` remains false. Root, runtime, lock, or mountpoint
+replacement is surfaced as a typed conflict.
 
 The trusted profile-reference lease is revalidated immediately before every
 read-only route and every plan, download, execute, and recovery workflow call.
@@ -309,42 +313,44 @@ lower-level root-operation state. A completed record with pending provenance
 is routed through `ProductionWorkflow` recovery to
 `dischargeOwedProvenance` without replaying package mutation. Ordinary product
 recovery still clears the record on success. The internal apt/system workflow
-instead supplies its outer attempt identity to the initial execute. While the
-root-operation lock is still held, before publishing the lower record and
-before preflight can enter a mutation bridge, the workflow publishes an exact root-local
-`root-operation-deferred-ack-v1.json` marker in the `bound` state. This binds
-the lower attempt to the originating outer apt/system attempt before mutation;
-a different prepared operation cannot adopt or replace it, even when its
-semantic request and exact lock are identical. If recovery must discharge
-owed provenance, it may only atomically transition that exact binding to
-`pending`, adding the completion and provenance digests without changing its
-owner. The pending marker makes the otherwise clearable completed/published
-record non-reclaimable by every ordinary mutation or recovery, including a
-request using a different profile or state path. An uninterrupted success or
-a proven pre-mutation abandonment first transitions its binding to an
-owner-bound terminal state (`released` for completed mutation or `abandoned`
-for durable proof that mutation never began), clears and fsyncs the root
-record, then clears and fsyncs the marker while holding the same root lock.
-Every crash prefix converges: a terminal marker plus a record, or a marker
-alone after the record clear, continues to block foreign owners while allowing
-only the original outer attempt to finish cleanup idempotently. The outer
-engine retains verified transaction evidence before requesting `released`
-cleanup. An `abandoned` owner atomically rotates that terminal state into a
-fresh bound lower attempt and executes the exact retained lock once, without a
-clean ownership gap. Legacy record-only states retain their existing
-conservative recovery rules, and absence of both documents is the only fully
-clean state.
+instead supplies its outer attempt identity to the reservation call. While the
+root-operation lock is held, before publishing the lower record and before
+preflight can enter a mutation bridge, the workflow publishes an exact
+root-local `root-operation-deferred-ack-v1.json` marker in the `bound` state.
+This binds the lower attempt to the originating outer apt/system attempt before
+mutation; a different prepared operation cannot adopt or replace it, even when
+its semantic request and exact lock are identical. A process death immediately
+after lower lock acquisition but before marker publication leaves the durable
+outer state in `downloaded`, so exact-owner recovery can repeat reservation
+without claiming that mutation began.
 
-The same centralized owner-aware cleanup primitive is used by normal finish,
-error/deinit abandonment, explicit ownership finalization, and deferred
-acknowledgment. It verifies owner and lower attempt under the root lock,
-transitions the binding to its terminal state, clears and fsyncs the record,
-reopens the store to prove record absence, then compare-and-unlinks and fsyncs
-the binding. A binding-only residue is valid both before initial record
-publication and after terminal record removal; foreign callers cannot remove
-or replace it. A newly observed record without a binding is never created by
-the orchestrated path and fails closed, while documented ordinary product
-legacy recovery remains separate.
+If recovery must discharge owed provenance, it may only atomically transition
+that exact binding to `pending`, adding the completion and provenance digests
+without changing its owner. The pending marker makes the otherwise clearable
+completed/published record non-reclaimable by every ordinary mutation or
+recovery, including a request using a different profile or state path. An
+uninterrupted success transitions its binding to `released`, clears and fsyncs
+the root record, then clears and fsyncs the marker while holding the same root
+lock. A proven pre-mutation failure instead transitions to `abandoned`, clears
+and fsyncs the record, and deliberately retains that terminal exact-owner
+marker. On retry, the old marker remains continuously durable until it is
+atomically replaced by a fresh `bound` attempt; no crash prefix exposes an
+unowned clean root. The outer engine retains verified transaction evidence
+before requesting `released` cleanup. Legacy record-only states retain their
+existing conservative recovery rules, and absence of both documents is the
+only fully clean state.
+
+The same centralized owner-aware terminalization primitive is used by normal
+finish, error/deinit abandonment, explicit ownership finalization, and
+deferred acknowledgment. It verifies owner and lower attempt under the root
+lock, transitions the binding to its terminal state, clears and fsyncs the
+record, and reopens the store to prove record absence. Completed cleanup then
+compare-and-unlinks and fsyncs the binding; pre-mutation abandonment retains it
+for atomic retry rotation. A binding-only residue is valid both before initial
+record publication and after terminal record removal; foreign callers cannot
+remove or replace it. A newly observed record without a binding is never
+created by the orchestrated path and fails closed, while documented ordinary
+product legacy recovery remains separate.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower

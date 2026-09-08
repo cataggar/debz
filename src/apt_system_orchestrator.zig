@@ -231,7 +231,13 @@ pub const BackendResult = struct {
 };
 
 pub const WorkflowOperation = enum { install, remove, upgrade_all };
-pub const WorkflowMode = enum { plan_only, download_only, execute, recover };
+pub const WorkflowMode = enum {
+    plan_only,
+    download_only,
+    reserve,
+    execute,
+    recover,
+};
 
 pub const RecoveryAcknowledgment =
     production_backend.WorkflowRecoveryAcknowledgment;
@@ -312,6 +318,7 @@ pub const ProductionBackend = struct {
             .mode = switch (request.mode) {
                 .plan_only => .plan_only,
                 .download_only => .download_only,
+                .reserve => .reserve,
                 .execute => .execute,
                 .recover => .recover,
             },
@@ -725,7 +732,7 @@ pub const PrivateLiveRootRunner = struct {
         const root_status: RootStatus = switch (invocation) {
             .route => .clean,
             .workflow => |workflow_invocation| switch (workflow_invocation.request.mode) {
-                .execute, .recover => if (decoded.result.exit_status == .success) status: {
+                .reserve, .execute, .recover => if (decoded.result.exit_status == .success) status: {
                     var inspection = try self.interface().inspect(allocator);
                     defer inspection.deinit();
                     if (workflow_invocation.request.mode == .recover and
@@ -1063,7 +1070,7 @@ fn workflowSurfaceOperation(
     return switch (mode) {
         .plan_only => .plan,
         .download_only => .download,
-        .execute => switch (operation) {
+        .reserve, .execute => switch (operation) {
             .install => .install,
             .remove => .remove,
             .upgrade_all => .upgrade_all,
@@ -2644,6 +2651,78 @@ pub const Engine = struct {
             .profile_untrusted,
             "trusted profile reference changed after download and before execution",
         );
+        var reserved = self.runner.workflow(allocator, self.backend, .{
+            .operation = workflow_operation,
+            .mode = .reserve,
+            .selectors = selectors,
+            .options = executeOptions(
+                loaded.view,
+                prepared.paths.exact_lock,
+            ),
+            .orchestration_id = prepared.attempt_id,
+        }) catch return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            false,
+            prepared.profile_state_path,
+        );
+        defer reserved.deinit();
+        if (reserved.result.exit_status != .success or
+            reserved.root_status != .recovery_required)
+            return recoveryDiagnostic(
+                allocator,
+                prepared.request,
+                prepared.profile,
+                current.state.exact_lock,
+                current.state.transaction_result,
+                current.state.root_operation_completion,
+                false,
+                prepared.profile_state_path,
+            );
+        const after_reserve_lock = self.verifier.verifyLockFn(
+            self.verifier.context,
+            allocator,
+            prepared.paths.exact_lock,
+            loaded.view.architecture,
+            try semanticDigestForRequest(allocator, prepared.request),
+        ) catch return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            false,
+            prepared.profile_state_path,
+        );
+        if (!lockMatchesPreparation(
+            after_reserve_lock.binding,
+            prepared,
+            current.state,
+        )) return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            false,
+            prepared.profile_state_path,
+        );
+        loaded.revalidate(allocator) catch return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            current.state.exact_lock,
+            current.state.transaction_result,
+            current.state.root_operation_completion,
+            false,
+            prepared.profile_state_path,
+        );
         try self.transition(
             allocator,
             loaded.view.state_path,
@@ -2769,13 +2848,17 @@ pub const Engine = struct {
                 "recovery",
                 "retained request does not bind the active operation",
             ) };
-        if (!active.state.mutation_started or active.state.exact_lock == null)
+        const retryable_preflight =
+            !active.state.mutation_started and
+            active.state.phase == .downloaded;
+        if ((!active.state.mutation_started and !retryable_preflight) or
+            active.state.exact_lock == null)
             return .{ .result = try api.failure(
                 retained.request,
                 .recovery,
                 .recovery_required,
                 "recovery",
-                "active state is not a recoverable post-mutation operation",
+                "active state is not a recoverable mutation or reserved preflight",
             ) };
         const verified = self.verifier.verifyLockFn(
             self.verifier.context,
@@ -2968,12 +3051,24 @@ pub const Engine = struct {
         }
         const owner_proven_pre_mutation =
             if (ownership_marker) |marker|
-                marker.state == .bound and
+                (marker.state == .bound or marker.state == .abandoned) and
                     (lower_inspection.record == null or
-                        lower_inspection.record.?.record.state.provenPreMutation())
+                        lower_inspection.record.?.record.state.provenPreMutation() or
+                        lower_inspection.record.?.record.outcome ==
+                            .abandoned_before_mutation)
             else
                 false;
-        if (lower_inspection.status == .clean or owner_proven_pre_mutation) {
+        const retry_unbound_preflight =
+            !current.state.mutation_started and
+            current.state.phase == .downloaded and
+            ownership_marker == null and
+            lower_inspection.status == .clean and
+            current.state.transaction_result == null and
+            current.state.root_operation_completion == null;
+        if (lower_inspection.status == .clean or
+            owner_proven_pre_mutation or
+            retry_unbound_preflight)
+        {
             const finalize_ownership = if (ownership_marker) |marker|
                 marker.state == .released or
                     (marker.state == .bound and
@@ -2990,7 +3085,7 @@ pub const Engine = struct {
                             lower_inspection.record.?.record.outcome ==
                                 .abandoned_before_mutation))
             else
-                false;
+                retry_unbound_preflight;
             const marker_acknowledgment: ?RecoveryAcknowledgment =
                 if (ownership_marker) |marker|
                     if (marker.state == .acknowledged and
@@ -3044,6 +3139,96 @@ pub const Engine = struct {
                     recovery.prepared.request,
                 );
                 defer allocator.free(selectors);
+                if (retry_unbound_preflight) {
+                    var reserved = self.runner.workflow(
+                        allocator,
+                        self.backend,
+                        .{
+                            .operation = semanticOperation(
+                                recovery.prepared.request.operation,
+                            ),
+                            .mode = .reserve,
+                            .selectors = selectors,
+                            .options = executeOptions(
+                                loaded.view,
+                                recovery.prepared.paths.exact_lock,
+                            ),
+                            .orchestration_id = recovery.prepared.attempt_id,
+                        },
+                    ) catch return recoveryDiagnostic(
+                        allocator,
+                        recovery.prepared.request,
+                        recovery.prepared.profile,
+                        current.state.exact_lock,
+                        current.state.transaction_result,
+                        current.state.root_operation_completion,
+                        false,
+                        recovery.prepared.profile_state_path,
+                    );
+                    defer reserved.deinit();
+                    if (reserved.result.exit_status != .success or
+                        reserved.root_status != .recovery_required)
+                        return recoveryDiagnostic(
+                            allocator,
+                            recovery.prepared.request,
+                            recovery.prepared.profile,
+                            current.state.exact_lock,
+                            current.state.transaction_result,
+                            current.state.root_operation_completion,
+                            false,
+                            recovery.prepared.profile_state_path,
+                        );
+                    const after_reserve = self.verifier.verifyLockFn(
+                        self.verifier.context,
+                        allocator,
+                        recovery.prepared.paths.exact_lock,
+                        loaded.view.architecture,
+                        try semanticDigestForRequest(
+                            allocator,
+                            recovery.prepared.request,
+                        ),
+                    ) catch return recoveryDiagnostic(
+                        allocator,
+                        recovery.prepared.request,
+                        recovery.prepared.profile,
+                        current.state.exact_lock,
+                        current.state.transaction_result,
+                        current.state.root_operation_completion,
+                        false,
+                        recovery.prepared.profile_state_path,
+                    );
+                    if (!lockMatchesPreparation(
+                        after_reserve.binding,
+                        recovery.prepared,
+                        current.state,
+                    )) return recoveryDiagnostic(
+                        allocator,
+                        recovery.prepared.request,
+                        recovery.prepared.profile,
+                        current.state.exact_lock,
+                        current.state.transaction_result,
+                        current.state.root_operation_completion,
+                        false,
+                        recovery.prepared.profile_state_path,
+                    );
+                    loaded.revalidate(allocator) catch
+                        return recoveryDiagnostic(
+                            allocator,
+                            recovery.prepared.request,
+                            recovery.prepared.profile,
+                            current.state.exact_lock,
+                            current.state.transaction_result,
+                            current.state.root_operation_completion,
+                            false,
+                            recovery.prepared.profile_state_path,
+                        );
+                    try self.transition(
+                        allocator,
+                        loaded.view.state_path,
+                        &current,
+                        .{ .phase = .mutating },
+                    );
+                }
                 var retried = self.runner.workflow(
                     allocator,
                     self.backend,
@@ -4350,6 +4535,7 @@ fn finalStateEquivalent(
 
 fn recoverableOuterPhase(phase: operation_state.Phase) bool {
     return switch (phase) {
+        .downloaded,
         .mutating,
         .verifying,
         .recovery_required,
@@ -5491,6 +5677,7 @@ const FakeProfileLoader = struct {
     fail_revalidate: bool = false,
     fail_revalidate_on: ?usize = null,
     drift_after_first: bool = false,
+    state_path: []const u8 = "/state",
     source_paths: [1][]const u8 = .{"/etc/debz/source"},
     keyring_paths: [1][]const u8 = .{"/etc/debz/keyring"},
 
@@ -5527,7 +5714,7 @@ const FakeProfileLoader = struct {
                 .foreign_architectures = &.{},
                 .repository_policy = .strict_priority,
                 .cache_path = "/cache",
-                .state_path = "/state",
+                .state_path = self.state_path,
                 .conffile = .keep_existing,
                 .proxy = null,
                 .credential_reference = null,
@@ -5553,6 +5740,7 @@ const FakeBackend = struct {
     workflow_calls: usize = 0,
     plan_calls: usize = 0,
     download_calls: usize = 0,
+    reserve_calls: usize = 0,
     execute_calls: usize = 0,
     recover_calls: usize = 0,
     recovery_ack_calls: usize = 0,
@@ -5633,6 +5821,10 @@ const FakeBackend = struct {
                 self.download_calls += 1;
                 break :status self.download_status;
             },
+            .reserve => status: {
+                self.reserve_calls += 1;
+                break :status .success;
+            },
             .execute => status: {
                 self.execute_calls += 1;
                 break :status self.execute_status;
@@ -5646,7 +5838,7 @@ const FakeBackend = struct {
             .operation = switch (request.mode) {
                 .plan_only => .plan,
                 .download_only => .download,
-                .execute => switch (request.operation) {
+                .reserve, .execute => switch (request.operation) {
                     .install => .install,
                     .remove => .remove,
                     .upgrade_all => .upgrade_all,
@@ -5853,6 +6045,9 @@ const FakeRunner = struct {
             return error.RootReplaced;
         }
         if (self.fail_mode == request.mode) {
+            if (request.mode == .execute and
+                self.inspect_deferred_acknowledgment != null)
+                try self.publishFakeMutatingRecord(allocator, request);
             if (request.mode == .execute or request.mode == .recover)
                 self.inspect_status = .recovery_required;
             return error.RootReplaced;
@@ -5861,11 +6056,24 @@ const FakeRunner = struct {
         var result: BackendResult = .{
             .result = backend_result,
             .root_status = switch (request.mode) {
+                .reserve => .recovery_required,
                 .execute => self.execute_root_status,
                 .recover => self.recover_root_status,
                 else => .clean,
             },
         };
+        if (request.mode == .reserve and
+            result.result.exit_status == .success)
+        {
+            self.inspect_deferred_acknowledgment =
+                try root_operation.createDeferredAcknowledgment(.{
+                    .state = .bound,
+                    .attempt_id = @splat(0x7f),
+                    .acknowledgment_id = request.orchestration_id orelse
+                        return error.MissingRecoveryAcknowledgment,
+                });
+            self.inspect_status = .recovery_required;
+        }
         if (request.finalize_ownership and
             result.result.exit_status == .success)
         {
@@ -5899,6 +6107,7 @@ const FakeRunner = struct {
                     .acknowledgment_id = request.orchestration_id orelse
                         return error.MissingRecoveryAcknowledgment,
                 });
+            try self.publishFakeAbandonedRecord(allocator, request);
             self.publish_abandoned_on_execute = false;
             self.inspect_status = .clean;
         } else if (request.mode == .execute and
@@ -5908,8 +6117,17 @@ const FakeRunner = struct {
                 self.inspect_deferred_acknowledgment.?.state == .bound))
         {
             self.inspect_deferred_acknowledgment = null;
+            if (self.inspect_record_source) |source|
+                self.allocator.free(source);
+            self.inspect_record_source = null;
             self.inspect_status = .clean;
         }
+        if (request.mode == .execute and
+            result.result.exit_status != .success and
+            self.inspect_deferred_acknowledgment != null and
+            self.inspect_deferred_acknowledgment.?.state == .bound and
+            !self.publish_abandoned_on_execute)
+            try self.publishFakeMutatingRecord(allocator, request);
         if (self.transport_roundtrip) {
             const source = try backend_result.canonicalJson(allocator);
             defer allocator.free(source);
@@ -5927,11 +6145,16 @@ const FakeRunner = struct {
                 if (self.inspect_record_source) |source|
                     self.allocator.free(source);
                 self.inspect_record_source = null;
+                self.inspect_deferred_acknowledgment = null;
             } else {
                 var completion = try fakeRecoveryCompletion(
                     allocator,
                     request,
                     self.recovery_completion_mismatch,
+                    if (self.inspect_deferred_acknowledgment) |marker|
+                        marker.attempt_id
+                    else
+                        null,
                 );
                 errdefer completion.deinit();
                 const source =
@@ -5949,6 +6172,15 @@ const FakeRunner = struct {
                 if (self.inspect_record_source) |previous|
                     self.allocator.free(previous);
                 self.inspect_record_source = record_source;
+                self.inspect_deferred_acknowledgment =
+                    try root_operation.createDeferredAcknowledgment(.{
+                        .state = .pending,
+                        .attempt_id = completion.document.attempt_id,
+                        .completion_sha256 = completion.document.digest_sha256,
+                        .provenance_sha256 = record.record.provenance_sha256.?,
+                        .acknowledgment_id = request.orchestration_id orelse
+                            return error.MissingRecoveryAcknowledgment,
+                    });
                 result.recovery_acknowledgment = .{
                     .attempt_id = completion.document.attempt_id,
                     .completion_sha256 = completion.document.digest_sha256,
@@ -5966,6 +6198,77 @@ const FakeRunner = struct {
         if (request.mode == .execute or request.mode == .recover)
             self.inspect_status = .clean;
         return result;
+    }
+
+    fn publishFakeMutatingRecord(
+        self: *FakeRunner,
+        allocator: std.mem.Allocator,
+        request: WorkflowRequest,
+    ) !void {
+        const marker = self.inspect_deferred_acknowledgment orelse return;
+        var record = try root_operation.create(allocator, .{
+            .attempt_id = marker.attempt_id,
+            .generation = 1,
+            .install_root = live_root.logical_root_path,
+            .backend = .legacy_dpkg,
+            .operation = .{ .package_transaction = switch (request.operation) {
+                .install => .install,
+                .remove => .remove,
+                .upgrade_all => .upgrade_all,
+            } },
+            .state = .mutating,
+            .phase = .mutation,
+            .step = 2,
+            .mutation_started = true,
+            .outcome = .pending,
+            .provenance = .pending,
+            .request_sha256 = @splat(0x31),
+            .policy_sha256 = @splat(0x32),
+            .target_architecture = request.options.architecture,
+            .reserved_unix = 90,
+            .updated_unix = 100,
+        });
+        defer record.deinit();
+        const source = try record.record.canonicalJson(self.allocator);
+        if (self.inspect_record_source) |previous|
+            self.allocator.free(previous);
+        self.inspect_record_source = source;
+        self.inspect_status = .recovery_required;
+    }
+
+    fn publishFakeAbandonedRecord(
+        self: *FakeRunner,
+        allocator: std.mem.Allocator,
+        request: WorkflowRequest,
+    ) !void {
+        const marker = self.inspect_deferred_acknowledgment orelse return;
+        var record = try root_operation.create(allocator, .{
+            .attempt_id = marker.attempt_id,
+            .generation = 2,
+            .install_root = live_root.logical_root_path,
+            .backend = .legacy_dpkg,
+            .operation = .{ .package_transaction = switch (request.operation) {
+                .install => .install,
+                .remove => .remove,
+                .upgrade_all => .upgrade_all,
+            } },
+            .state = .completed,
+            .phase = .provenance,
+            .step = 2,
+            .mutation_started = false,
+            .outcome = .abandoned_before_mutation,
+            .provenance = .not_required,
+            .request_sha256 = @splat(0x31),
+            .policy_sha256 = @splat(0x32),
+            .target_architecture = request.options.architecture,
+            .reserved_unix = 90,
+            .updated_unix = 100,
+        });
+        defer record.deinit();
+        const source = try record.record.canonicalJson(self.allocator);
+        if (self.inspect_record_source) |previous|
+            self.allocator.free(previous);
+        self.inspect_record_source = source;
     }
 
     fn inspect(
@@ -6026,6 +6329,7 @@ fn fakeRecoveryCompletion(
     allocator: std.mem.Allocator,
     request: WorkflowRequest,
     mismatch: FakeRunner.RecoveryCompletionMismatch,
+    retained_attempt_id: ?[32]u8,
 ) !root_operation_completion.OwnedDocument {
     const production_operation: production_backend.WorkflowSemanticOperation = switch (request.operation) {
         .install => .install,
@@ -6057,7 +6361,7 @@ fn fakeRecoveryCompletion(
         .attempt_id = if (mismatch == .attempt)
             @splat(0x92)
         else
-            @splat(0x91),
+            retained_attempt_id orelse @splat(0x91),
         .generation = 4,
         .install_root = live_root.logical_root_path,
         .backend = .legacy_dpkg,
@@ -6426,6 +6730,7 @@ const FakeVerifier = struct {
     transaction_valid: bool = true,
     lock_digest: [32]u8 = @splat(0x55),
     transaction_digest: [32]u8 = @splat(0x66),
+    transaction_source: ?[]const u8 = null,
     lock_checks: usize = 0,
     different_lock_check: ?usize = null,
     different_semantic_check: ?usize = null,
@@ -6478,7 +6783,10 @@ const FakeVerifier = struct {
         self.transaction_checks += 1;
         if (!self.transaction_valid) return error.LockEvidenceMismatch;
         return .{
-            .bytes = try allocator.dupe(u8, "{\"verified\":true}"),
+            .bytes = try allocator.dupe(
+                u8,
+                self.transaction_source orelse "{\"verified\":true}",
+            ),
             .binding = .{
                 .path = path,
                 .schema = transaction_provenance.schema_id,
@@ -6602,6 +6910,134 @@ fn expectReady(outcome: PrepareOutcome) !Preparation {
             return error.ExpectedPreparation;
         },
     };
+}
+
+test "apt_system_orchestrator.test.preflight lock-acquisition death replays from durable outer state" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-apt-preflight-restart-{d}",
+        .{std.os.linux.getpid()},
+    );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(state_path);
+
+    var profile: FakeProfileLoader = .{ .state_path = state_path };
+    var backend: FakeBackend = .{};
+    var runner: FakeRunner = .{
+        .allocator = std.testing.allocator,
+        .fail_mode = .reserve,
+    };
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var verifier: FakeVerifier = .{};
+    var sources: FakeSources = .{};
+    var engine: Engine = .{
+        .profiles = profile.interface(),
+        .runner = runner.interface(),
+        .backend = backend.interface(),
+        .store = store.interface(),
+        .verifier = verifier.interface(),
+        .ids = sources.ids(),
+        .clock = sources.clock(),
+    };
+    var prepared = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    var interrupted = try engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    try std.testing.expectEqual(api.Outcome.recovery, interrupted.outcome);
+    try std.testing.expectEqual(@as(usize, 0), backend.execute_calls);
+    runner.deinit();
+
+    var reopened_profile: FakeProfileLoader = .{ .state_path = state_path };
+    var reopened_runner: FakeRunner = .{
+        .allocator = std.testing.allocator,
+    };
+    defer reopened_runner.deinit();
+    var reopened_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var reopened_verifier: FakeVerifier = .{};
+    var transaction = try transaction_provenance.create(
+        std.testing.allocator,
+        .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(0x41),
+            .solver_policy_sha256 = @splat(0x42),
+            .executor_policy_sha256 = @splat(0x43),
+            .plan_sha256 = @splat(0x44),
+            .lock_sha256 = reopened_verifier.lock_digest,
+            .repositories = &.{},
+            .packages = &.{},
+            .commands = &.{},
+            .journal_steps = &.{},
+            .final_verification = .{
+                .status = .exact_match,
+                .installed_state_sha256 = @splat(0x45),
+                .package_origins_sha256 = @splat(0x46),
+                .detail = "verified",
+            },
+            .outcome = .succeeded,
+        },
+    );
+    defer transaction.deinit();
+    const transaction_source = try transaction.result.canonicalJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(transaction_source);
+    reopened_verifier.transaction_digest = transaction.result.digest_sha256;
+    reopened_verifier.transaction_source = transaction_source;
+    var reopened_sources: FakeSources = .{};
+    var reopened: Engine = .{
+        .profiles = reopened_profile.interface(),
+        .runner = reopened_runner.interface(),
+        .backend = backend.interface(),
+        .store = reopened_store.interface(),
+        .verifier = reopened_verifier.interface(),
+        .ids = reopened_sources.ids(),
+        .clock = reopened_sources.clock(),
+    };
+    var recovery = switch (try reopened.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    var completed = try reopened.executeRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    defer completed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), backend.reserve_calls);
+    try std.testing.expectEqual(@as(usize, 1), backend.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.recover_calls);
+    var active = try reopened_store.interface().readActive(
+        std.testing.allocator,
+        state_path,
+    );
+    defer if (active) |*owned| owned.deinit();
+    try std.testing.expect(active == null);
 }
 
 test "apt_system_orchestrator.test.update and list route through stable live root" {
@@ -7657,6 +8093,7 @@ fn expectSettledPublishedRecovery(
         std.testing.allocator,
         workflow_request,
         fixture,
+        null,
     );
     defer completion.deinit();
     var pending_record = try root_operation.create(
@@ -7722,10 +8159,20 @@ fn expectSettledPublishedRecovery(
         },
     );
     defer published_record.deinit();
+    if (harness.runner.inspect_record_source) |previous|
+        harness.runner.allocator.free(previous);
     harness.runner.inspect_record_source =
         try published_record.record.canonicalJson(
             harness.runner.allocator,
         );
+    harness.runner.inspect_deferred_acknowledgment =
+        try root_operation.createDeferredAcknowledgment(.{
+            .state = .pending,
+            .attempt_id = completion.document.attempt_id,
+            .completion_sha256 = completion.document.digest_sha256,
+            .provenance_sha256 = provenance_sha256,
+            .acknowledgment_id = prepared.attempt_id,
+        });
     harness.runner.recovery_completion_source =
         try completion.document.canonicalJson(
             harness.runner.allocator,
@@ -8204,6 +8651,7 @@ test "apt_system_orchestrator.test.post-recovery crashes use exact retained bind
                 ),
             },
             .attempt,
+            null,
         );
         defer stale_completion.deinit();
         harness.runner.recovery_completion_source =

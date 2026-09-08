@@ -135,9 +135,21 @@ class SecurityAuditTests(unittest.TestCase):
             if re.search(r"\blinux\.(?:fork|execve|chroot)\s*\(", text)
         )
         self.assertEqual(
-            ["src/live_root.zig", "src/maintainer_script.zig"],
+            [
+                "src/live_root.zig",
+                "src/maintainer_script.zig",
+                "src/production_backend.zig",
+            ],
             owners,
         )
+        production_backend = sources["src/production_backend.zig"]
+        self.assertEqual(production_backend.count("linux.fork()"), 1)
+        self.assertGreater(
+            production_backend.index("linux.fork()"),
+            production_backend.index('\ntest "'),
+        )
+        self.assertIn("_ = linux.kill(pid, .KILL);", production_backend)
+        self.assertIn("linux.waitpid(pid, &status, 0)", production_backend)
         runner = sources["src/maintainer_script.zig"]
         self.assertNotIn("std.process.run(", runner)
         self.assertIn('linux.open("/dev/null"', runner)

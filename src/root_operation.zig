@@ -1016,6 +1016,40 @@ pub const Store = struct {
         );
     }
 
+    /// Atomically replaces an exact owner's retryable marker while no record
+    /// exists. The old marker remains durable until the new bound attempt is
+    /// published, so process death cannot create a markerless retry window.
+    pub fn rotateDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        marker: DeferredAcknowledgment,
+    ) !void {
+        if (marker.state != .bound) return error.InvalidDocument;
+        const existing = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if ((existing.state != .bound and existing.state != .abandoned) or
+            !std.mem.eql(
+                u8,
+                &existing.acknowledgment_id,
+                &marker.acknowledgment_id,
+            ))
+            return error.DeferredAcknowledgmentMismatch;
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (record != null) return error.DeferredAcknowledgmentMismatch;
+        const bytes = try marker.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+    }
+
     pub fn acknowledgeDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
@@ -1082,13 +1116,38 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         cleanup: OwnershipCleanup,
     ) !void {
-        const marker = try self.readDeferredAcknowledgment(allocator);
-        var record = try self.read(allocator);
-        defer if (record) |*owned| owned.deinit();
-        if (marker == null) {
+        if (try self.readDeferredAcknowledgment(allocator) == null) {
+            var record = try self.read(allocator);
+            defer if (record) |*owned| owned.deinit();
             if (record != null) return error.NoDeferredAcknowledgment;
             return;
         }
+        const terminal = try self.retainOwnedTerminal(allocator, cleanup);
+        var reopened = try self.read(allocator);
+        defer if (reopened) |*owned| owned.deinit();
+        if (reopened != null) return error.DeferredAcknowledgmentMismatch;
+        if (cleanup.observer) |observer|
+            try observer.hit(.before_binding_clear);
+        try self.clearDeferredAcknowledgment(
+            allocator,
+            terminal.digest_sha256,
+        );
+        if (cleanup.observer) |observer|
+            try observer.hit(.after_binding_clear);
+    }
+
+    /// Durably settles the exact owned record while retaining its terminal
+    /// owner marker. This is the retry hand-off: a process may die after any
+    /// write and the root still carries continuous exact-owner proof.
+    pub fn retainOwnedTerminal(
+        self: Store,
+        allocator: std.mem.Allocator,
+        cleanup: OwnershipCleanup,
+    ) !DeferredAcknowledgment {
+        const marker = try self.readDeferredAcknowledgment(allocator);
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (marker == null) return error.NoDeferredAcknowledgment;
         const observed = marker.?;
         if (!std.mem.eql(
             u8,
@@ -1136,14 +1195,7 @@ pub const Store = struct {
         var reopened = try self.read(allocator);
         defer if (reopened) |*owned| owned.deinit();
         if (reopened != null) return error.DeferredAcknowledgmentMismatch;
-        if (cleanup.observer) |observer|
-            try observer.hit(.before_binding_clear);
-        try self.clearDeferredAcknowledgment(
-            allocator,
-            terminal.digest_sha256,
-        );
-        if (cleanup.observer) |observer|
-            try observer.hit(.after_binding_clear);
+        return terminal;
     }
 
     pub fn clearDeferredAcknowledgment(
@@ -1404,6 +1456,11 @@ pub const ExistingPolicy = enum {
 
 pub const AcquisitionPoint = enum {
     after_lock_acquired,
+    before_retry_terminal_publish,
+    after_retry_terminal_publish,
+    before_retry_record_clear,
+    after_retry_record_clear,
+    before_binding_published,
     after_binding_published,
 };
 
@@ -1413,6 +1470,34 @@ pub const AcquisitionObserver = struct {
 
     pub fn hit(self: AcquisitionObserver, point: AcquisitionPoint) !void {
         return self.hitFn(self.context, point);
+    }
+};
+
+const AcquisitionCleanupForwarder = struct {
+    observer: AcquisitionObserver,
+
+    fn interface(self: *AcquisitionCleanupForwarder) OwnershipCleanupObserver {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: OwnershipCleanupPoint) !void {
+        const self: *AcquisitionCleanupForwarder =
+            @ptrCast(@alignCast(context));
+        switch (point) {
+            .before_terminal_publish => try self.observer.hit(
+                .before_retry_terminal_publish,
+            ),
+            .after_terminal_publish => try self.observer.hit(
+                .after_retry_terminal_publish,
+            ),
+            .before_record_clear => try self.observer.hit(
+                .before_retry_record_clear,
+            ),
+            .after_record_clear => try self.observer.hit(
+                .after_retry_record_clear,
+            ),
+            .before_binding_clear, .after_binding_clear => unreachable,
+        }
     }
 };
 
@@ -1615,6 +1700,12 @@ pub const Coordinator = struct {
             observer.hit(.after_lock_acquired) catch return error.StoreFailed;
 
         const store_handle = self.store();
+        var cleanup_forwarder: AcquisitionCleanupForwarder = undefined;
+        const retry_cleanup_observer: ?OwnershipCleanupObserver =
+            if (request.acquisition_observer) |observer| blk: {
+                cleanup_forwarder = .{ .observer = observer };
+                break :blk cleanup_forwarder.interface();
+            } else null;
         var prior: ?OwnedRecord = store_handle.read(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.RecordCorrupt,
@@ -1634,7 +1725,7 @@ pub const Coordinator = struct {
         ) catch return error.RecordCorrupt;
         if (deferred) |marker| switch (marker.state) {
             .acknowledged => return error.RecoveryRequired,
-            .released, .abandoned => {
+            .released => {
                 const orchestration_id =
                     request.orchestration_id orelse
                     return error.RecoveryRequired;
@@ -1652,8 +1743,36 @@ pub const Coordinator = struct {
                     value.deinit();
                     prior = null;
                 }
-                if (marker.state == .released)
-                    return error.ResolvedAttemptPresent;
+                return error.ResolvedAttemptPresent;
+            },
+            .abandoned => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                )) return error.RecoveryRequired;
+                if (prior) |*value| {
+                    if (!recordMatchesDeferredAcknowledgment(
+                        value.record,
+                        marker,
+                        false,
+                    ) or
+                        (!value.record.state.provenPreMutation() and
+                            value.record.outcome !=
+                                .abandoned_before_mutation))
+                        return error.RecoveryRequired;
+                    _ = store_handle.retainOwnedTerminal(allocator, .{
+                        .attempt_id = marker.attempt_id,
+                        .acknowledgment_id = orchestration_id,
+                        .terminal_state = .abandoned,
+                        .observer = retry_cleanup_observer,
+                    }) catch return error.StoreFailed;
+                    value.deinit();
+                    prior = null;
+                }
             },
             .bound => {
                 const orchestration_id =
@@ -1665,11 +1784,8 @@ pub const Coordinator = struct {
                     &marker.acknowledgment_id,
                 )) return error.RecoveryRequired;
                 if (prior == null) {
-                    store_handle.cleanupOwned(allocator, .{
-                        .attempt_id = marker.attempt_id,
-                        .acknowledgment_id = orchestration_id,
-                        .terminal_state = .abandoned,
-                    }) catch return error.StoreFailed;
+                    // Keep the exact-owner marker continuously present. A
+                    // fresh binding replaces it atomically in publishNew.
                 } else if (!recordMatchesDeferredAcknowledgment(
                     prior.?.record,
                     marker,
@@ -1679,13 +1795,17 @@ pub const Coordinator = struct {
                 if (prior != null and prior.?.record.clearable()) {
                     const abandoned =
                         prior.?.record.outcome == .abandoned_before_mutation;
-                    store_handle.cleanupOwned(allocator, .{
+                    if (!abandoned) {
+                        store_handle.cleanupOwned(allocator, .{
+                            .attempt_id = marker.attempt_id,
+                            .acknowledgment_id = orchestration_id,
+                            .terminal_state = .released,
+                        }) catch return error.StoreFailed;
+                    } else _ = store_handle.retainOwnedTerminal(allocator, .{
                         .attempt_id = marker.attempt_id,
                         .acknowledgment_id = orchestration_id,
-                        .terminal_state = if (abandoned)
-                            .abandoned
-                        else
-                            .released,
+                        .terminal_state = .abandoned,
+                        .observer = retry_cleanup_observer,
                     }) catch return error.StoreFailed;
                     prior.?.deinit();
                     prior = null;
@@ -1907,15 +2027,27 @@ pub const Coordinator = struct {
                 .attempt_id = attempt_id,
                 .acknowledgment_id = orchestration_id,
             }) catch return error.StoreFailed;
-            self.store().publishDeferredAcknowledgment(
-                allocator,
-                binding,
-            ) catch return error.StoreFailed;
+            const store_handle = self.store();
+            if (request.acquisition_observer) |observer|
+                observer.hit(.before_binding_published) catch
+                    return error.StoreFailed;
+            if (store_handle.readDeferredAcknowledgment(allocator) catch
+                return error.StoreFailed) |_|
+                store_handle.rotateDeferredAcknowledgment(
+                    allocator,
+                    binding,
+                ) catch return error.StoreFailed
+            else
+                store_handle.publishDeferredAcknowledgment(
+                    allocator,
+                    binding,
+                ) catch return error.StoreFailed;
             if (request.acquisition_observer) |observer|
                 observer.hit(.after_binding_published) catch
                     return error.StoreFailed;
         }
-        self.store().writeAtomic(allocator, created.record) catch return error.StoreFailed;
+        self.store().writeAtomic(allocator, created.record) catch
+            return error.StoreFailed;
         return created;
     }
 };

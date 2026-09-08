@@ -28,7 +28,13 @@ pub const Executor = transaction_engine.Executor;
 /// facade for install and remove; orchestrators use this seam when one
 /// reviewed exact lock must bind a batch.
 pub const WorkflowSemanticOperation = enum { install, remove, upgrade_all };
-pub const WorkflowMode = enum { plan_only, download_only, execute, recover };
+pub const WorkflowMode = enum {
+    plan_only,
+    download_only,
+    reserve,
+    execute,
+    recover,
+};
 
 pub const WorkflowRecoveryAcknowledgment = struct {
     attempt_id: [32]u8,
@@ -76,6 +82,11 @@ const TransactionSemanticOperation = enum {
 pub const CompletionPoint = enum {
     after_root_lock_acquired,
     after_binding_published,
+    before_retry_terminal_publish,
+    after_retry_terminal_publish,
+    before_retry_record_clear,
+    after_retry_record_clear,
+    before_binding_published,
     /// The completed record is durable; nothing else has run.
     after_completed_record,
     /// The recovery intent has been removed from the state directory.
@@ -120,6 +131,11 @@ pub const CompletionCrash = struct {
 
 pub const RootBindingPoint = enum {
     after_root_lock_acquired,
+    before_retry_terminal_publish,
+    after_retry_terminal_publish,
+    before_retry_record_clear,
+    after_retry_record_clear,
+    before_binding_published,
     after_binding_published,
 };
 
@@ -191,7 +207,10 @@ pub const Backend = struct {
             return api.failure(operation, .usage, .invalid_request, "invalid workflow selector count");
         if (workflow.mode == .plan_only and workflow.options.lock_output_path == null)
             return api.failure(operation, .usage, .configuration_required, "plan-only workflow requires an exact-lock output path");
-        if (workflow.mode == .execute or workflow.mode == .recover) {
+        if (workflow.mode == .reserve or
+            workflow.mode == .execute or
+            workflow.mode == .recover)
+        {
             if (workflow.options.lock_input_path == null)
                 return api.failure(operation, .usage, .configuration_required, "execution and recovery require an exact-lock input");
             if (!workflow.options.assume_yes)
@@ -199,7 +218,10 @@ pub const Backend = struct {
             if (workflow.options.conffile == .unspecified)
                 return api.failure(operation, .usage, .conffile_policy_required, "execution and recovery require an explicit conffile policy");
         }
-        if (workflow.mode == .execute or workflow.mode == .recover) {
+        if (workflow.mode == .reserve or
+            workflow.mode == .execute or
+            workflow.mode == .recover)
+        {
             _ = self.selectedExecutor() catch return api.failure(
                 operation,
                 .unavailable,
@@ -660,6 +682,15 @@ pub const Backend = struct {
             );
         if (workflowRootOperation(request.operation, workflow)) |operation| {
             if (guard.open(allocator, request, operation)) |failure| return failure;
+        }
+        if (workflowMode(request.operation, workflow) == .reserve) {
+            guard.preserve_pre_mutation = true;
+            return success(
+                request.operation,
+                false,
+                "root operation ownership reserved",
+                &.{},
+            );
         }
 
         // A completed attempt that still owes provenance is resolved before any
@@ -2065,7 +2096,7 @@ fn workflowSurfaceOperation(
     return switch (mode) {
         .plan_only => .plan,
         .download_only => .download,
-        .execute => workflowSemanticSurface(operation),
+        .reserve, .execute => workflowSemanticSurface(operation),
         .recover => .recover,
     };
 }
@@ -2086,7 +2117,7 @@ fn workflowRootOperation(
 ) ?root_operation.Operation {
     if (workflow) |directive| return switch (directive.mode) {
         .plan_only, .download_only => null,
-        .execute, .recover => .{
+        .reserve, .execute, .recover => .{
             .package_transaction = workflowSemanticSurface(directive.operation),
         },
     };
@@ -2226,6 +2257,9 @@ const RootOperationGuard = struct {
     /// acknowledgment hand-off. The settled record remains until that outer
     /// coordinator retains and explicitly acknowledges its exact token.
     preserve_settled: bool = false,
+    /// Reservation-only workflow calls intentionally leave their exact
+    /// pre-mutation binding for the subsequent execute call to adopt.
+    preserve_pre_mutation: bool = false,
     orchestration_id: ?[32]u8 = null,
 
     const Completion = enum { succeeded, failed, recovered };
@@ -2260,12 +2294,22 @@ const RootOperationGuard = struct {
         const self: *RootOperationGuard = @ptrCast(@alignCast(context));
         const binding_point: RootBindingPoint = switch (point) {
             .after_lock_acquired => .after_root_lock_acquired,
+            .before_retry_terminal_publish => .before_retry_terminal_publish,
+            .after_retry_terminal_publish => .after_retry_terminal_publish,
+            .before_retry_record_clear => .before_retry_record_clear,
+            .after_retry_record_clear => .after_retry_record_clear,
+            .before_binding_published => .before_binding_published,
             .after_binding_published => .after_binding_published,
         };
         if (self.backend.root_binding_sync) |sync|
             try sync.hit(binding_point);
         try self.crash(switch (point) {
             .after_lock_acquired => .after_root_lock_acquired,
+            .before_retry_terminal_publish => .before_retry_terminal_publish,
+            .after_retry_terminal_publish => .after_retry_terminal_publish,
+            .before_retry_record_clear => .before_retry_record_clear,
+            .after_retry_record_clear => .after_retry_record_clear,
+            .before_binding_published => .before_binding_published,
             .after_binding_published => .after_binding_published,
         });
     }
@@ -2526,7 +2570,9 @@ const RootOperationGuard = struct {
             // here simply leaves the record, which the next attempt reports.
             // A simulated crash unwinds without any of this: the record must
             // survive exactly as the dead process left it.
-            if (value.locked() and !self.crashed) {
+            if (value.locked() and !self.crashed and
+                !self.preserve_pre_mutation)
+            {
                 if (value.record().state.provenPreMutation()) {
                     if (self.orchestration_id == null) {
                         value.abandonIfPreMutation(self.allocator) catch {};
@@ -2536,7 +2582,15 @@ const RootOperationGuard = struct {
                             .abandoned_before_mutation,
                         ) catch {};
                         if (value.record().clearable())
-                            self.finalizeOrchestrationOwnership(.abandoned) catch {};
+                            _ = self.coordinator.store().retainOwnedTerminal(
+                                self.allocator,
+                                .{
+                                    .attempt_id = value.record().attempt_id,
+                                    .acknowledgment_id = self.orchestration_id.?,
+                                    .terminal_state = .abandoned,
+                                    .observer = self.cleanupObserver(),
+                                },
+                            ) catch {};
                     }
                 } else if (value.record().clearable() and !self.preserve_settled) {
                     if (self.orchestration_id == null) {
@@ -4090,10 +4144,21 @@ const DeferredAckContender = struct {
     status: ?api.ExitStatus = null,
     started: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
+    stall: bool = false,
 
     fn run(self: *DeferredAckContender) void {
         self.started.store(true, .release);
         defer self.finished.store(true, .release);
+        if (self.stall) {
+            while (true) {
+                var request: std.os.linux.timespec = .{
+                    .sec = 1,
+                    .nsec = 0,
+                };
+                var remaining: std.os.linux.timespec = undefined;
+                _ = std.os.linux.nanosleep(&request, &remaining);
+            }
+        }
         const result = self.backend.executeWorkflow(
             std.heap.page_allocator,
             self.request,
@@ -4101,9 +4166,12 @@ const DeferredAckContender = struct {
             self.status = .internal;
             return;
         };
+
         self.status = result.exit_status;
     }
 };
+
+const OverlapStallRole = enum { none, owner, distinct, identical };
 
 fn waitForContender(
     flag: *const std.atomic.Value(bool),
@@ -5002,7 +5070,7 @@ test "production workflow deferred recovery cannot claim an unbound lower attemp
     );
 }
 
-test "production workflow root binding excludes overlapping foreign owners" {
+fn runRootBindingOverlapScenario(stall_role: OverlapStallRole) !void {
     inline for ([_]RootBindingPoint{
         .after_root_lock_acquired,
         .after_binding_published,
@@ -5052,6 +5120,7 @@ test "production workflow root binding excludes overlapping foreign owners" {
         const owner_id: [32]u8 = @splat(0xa1);
         var owner: DeferredAckContender = .{
             .backend = &backend,
+            .stall = stall_role == .owner,
             .request = .{
                 .operation = .remove,
                 .mode = .execute,
@@ -5090,6 +5159,7 @@ test "production workflow root binding excludes overlapping foreign owners" {
         );
         var distinct: DeferredAckContender = .{
             .backend = &backend,
+            .stall = stall_role == .distinct,
             .request = .{
                 .operation = .install,
                 .mode = .execute,
@@ -5100,6 +5170,7 @@ test "production workflow root binding excludes overlapping foreign owners" {
         };
         var identical: DeferredAckContender = .{
             .backend = &backend,
+            .stall = stall_role == .identical,
             .request = .{
                 .operation = .remove,
                 .mode = .execute,
@@ -5213,6 +5284,75 @@ test "production workflow root binding excludes overlapping foreign owners" {
         });
         try std.testing.expect(later.exit_status != .recovery);
     }
+}
+
+fn runOverlapWatchdog(
+    stall_role: OverlapStallRole,
+    timeout_ms: u64,
+    expect_timeout: bool,
+) !void {
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        runRootBindingOverlapScenario(stall_role) catch
+            linux.exit_group(101);
+        linux.exit_group(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    };
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (true) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => {
+                if (waited != 0) {
+                    reaped = true;
+                    if (expect_timeout)
+                        return error.StalledChildExitedBeforeWatchdog;
+                    if (!linux.W.IFEXITED(status) or
+                        linux.W.EXITSTATUS(status) != 0)
+                        return error.OverlapChildFailed;
+                    return;
+                }
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        const elapsed = started.durationTo(
+            std.Io.Clock.awake.now(std.testing.io),
+        ).toMilliseconds();
+        if (elapsed >= timeout_ms) {
+            _ = linux.kill(pid, .KILL);
+            while (true) {
+                const final_wait = linux.waitpid(pid, &status, 0);
+                switch (linux.errno(final_wait)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return error.WaitFailed,
+                }
+            }
+            reaped = true;
+            if (!expect_timeout) return error.OverlapChildTimedOut;
+            return;
+        }
+        var request: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        var remaining: linux.timespec = undefined;
+        _ = linux.nanosleep(&request, &remaining);
+    }
+}
+
+test "production workflow root binding excludes overlapping foreign owners" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try runOverlapWatchdog(.none, 15_000, false);
+    inline for (.{ OverlapStallRole.owner, .distinct, .identical }) |role|
+        try runOverlapWatchdog(role, 250, true);
 }
 
 test "production workflow ownership cleanup converges across every durable boundary" {
@@ -5363,8 +5503,6 @@ test "production workflow pre-mutation ownership abandon converges across every 
         .after_ownership_terminal_publish,
         .before_ownership_record_clear,
         .after_ownership_record_clear,
-        .before_ownership_marker_clear,
-        .after_ownership_marker_clear,
     }) |crash_point| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
@@ -5485,6 +5623,155 @@ test "production workflow pre-mutation ownership abandon converges across every 
             });
             try std.testing.expectEqual(api.ExitStatus.success, executed.exit_status);
         }
+        try std.testing.expect(process.calls != 0);
+        try std.testing.expect((try backendRootRecord(
+            allocator,
+            &directory,
+        )) == null);
+        try std.testing.expect((try backendDeferredMarker(
+            allocator,
+            &directory,
+        )) == null);
+    }
+}
+
+test "production workflow retry rotation preserves continuous owner proof across process death" {
+    inline for ([_]CompletionPoint{
+        .before_retry_terminal_publish,
+        .after_retry_terminal_publish,
+        .before_retry_record_clear,
+        .after_retry_record_clear,
+        .before_binding_published,
+        .after_binding_published,
+    }) |rotation_point| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        defer fixture.deinit();
+        var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+        var initial_crash: TestCompletionCrash = .{
+            .point = .before_ownership_terminal_publish,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+            .completion_crash = if (rotation_point == .before_binding_published or
+                rotation_point == .after_binding_published)
+                null
+            else
+                initial_crash.interface(),
+        };
+        const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        const valid_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "sources.list",
+            allocator,
+            .limited(4096),
+        );
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "sources.list",
+            .data = "not-an-apt-source\n",
+        });
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.noninteractive = true;
+        options.conffile = .keep_existing;
+        const owner_id: [32]u8 = @splat(0x37);
+        const failed = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+        });
+        try std.testing.expect(failed.exit_status != .success);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        if (backend.completion_crash != null) {
+            try std.testing.expect(initial_crash.triggered);
+        } else {
+            const abandoned = (try backendDeferredMarker(
+                allocator,
+                &directory,
+            )).?;
+            try std.testing.expectEqual(
+                root_operation.DeferredAcknowledgmentState.abandoned,
+                abandoned.state,
+            );
+            try std.testing.expect((try backendRootRecord(
+                allocator,
+                &directory,
+            )) == null);
+        }
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "sources.list",
+            .data = valid_source,
+        });
+
+        var rotation_crash: TestCompletionCrash = .{
+            .point = rotation_point,
+        };
+        backend.completion_crash = rotation_crash.interface();
+        const interrupted = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+        });
+        try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
+        try std.testing.expect(rotation_crash.triggered);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+        var reopened_backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+        };
+        var foreign_options = options;
+        foreign_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-foreign-rotation",
+            .{fixture.state_path},
+        );
+        const foreign = try reopened_backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = foreign_options,
+            .orchestration_id = @splat(0x48),
+        });
+        try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+
+        const completed = try reopened_backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, completed.exit_status);
         try std.testing.expect(process.calls != 0);
         try std.testing.expect((try backendRootRecord(
             allocator,
