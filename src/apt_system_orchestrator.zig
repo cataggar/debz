@@ -1436,6 +1436,8 @@ pub const DirectorySyncBoundary = enum {
     ancestor_parent,
     attempt_parent,
     publication_directory,
+    retained_operation_directory,
+    retained_attempt_parent,
 };
 
 pub const DirectorySync = struct {
@@ -1454,6 +1456,25 @@ pub const DirectorySync = struct {
         boundary: DirectorySyncBoundary,
     ) !void {
         try self.syncFn(self.context, io, dir, boundary);
+    }
+};
+
+pub const RetainedDurabilityBoundary = enum {
+    before_file_sync,
+};
+
+pub const RetainedDurability = struct {
+    context: *anyopaque,
+    hitFn: *const fn (
+        *anyopaque,
+        RetainedDurabilityBoundary,
+    ) anyerror!void,
+
+    pub fn hit(
+        self: RetainedDurability,
+        boundary: RetainedDurabilityBoundary,
+    ) !void {
+        try self.hitFn(self.context, boundary);
     }
 };
 
@@ -1476,6 +1497,7 @@ pub const SystemStateStore = struct {
     wait_ms: u64 = 30_000,
     finish_crash: ?FinishCrash = null,
     directory_sync: ?DirectorySync = null,
+    retained_durability: ?RetainedDurability = null,
     state_write_hooks: operation_state.WriteHooks = .{},
 
     const operation_lock_name = "operation.lock";
@@ -1690,23 +1712,14 @@ pub const SystemStateStore = struct {
             false,
         );
         defer operation_dir.close(self.io);
-        var retained: ?operation_state.OwnedState = null;
-        defer if (retained) |*owned| owned.deinit();
-        if (try readOptionalFile(
+        const existing = try readOptionalFile(
             allocator,
             self.io,
             operation_dir,
             retained_state_name,
-        )) |source| {
-            defer allocator.free(source);
-            retained = try operation_state.decode(
-                allocator,
-                source,
-                operation_state.maximum_document_bytes,
-            );
-            if (!finalStateEquivalent(retained.?.state, final))
-                return error.PublicationConflict;
-        } else {
+        );
+        defer if (existing) |source| allocator.free(source);
+        if (existing == null) {
             const final_bytes = try final.canonicalJson(allocator);
             defer allocator.free(final_bytes);
             try publishAtomic(
@@ -1716,15 +1729,17 @@ pub const SystemStateStore = struct {
                 retained_state_name,
                 final_bytes,
             );
-            retained = try operation_state.decode(
-                allocator,
-                final_bytes,
-                operation_state.maximum_document_bytes,
-            );
             if (self.finish_crash) |crash|
                 try crash.hit(.after_retained_publish);
         }
-        const durable_final = retained.?.state;
+        var retained = try ensureRetainedFinalDurable(
+            self,
+            allocator,
+            paths,
+            final,
+        );
+        defer retained.deinit();
+        const durable_final = retained.state;
 
         const state_path = std.fs.path.dirname(
             std.fs.path.dirname(paths.active_state) orelse
@@ -1750,6 +1765,82 @@ pub const SystemStateStore = struct {
             paths,
             operation_state.Expected.fromState(durable_final),
         );
+    }
+
+    fn ensureRetainedFinalDurable(
+        self: *SystemStateStore,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+        expected: operation_state.State,
+    ) !operation_state.OwnedState {
+        var operation_dir = try openSecureAbsoluteDirectory(
+            self,
+            allocator,
+            paths.directory,
+            false,
+        );
+        defer operation_dir.close(self.io);
+        var operation_lock: operation_state.SystemLockBackend = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .dir = operation_dir,
+            .name = operation_lock_name,
+        };
+        const lock = operation_lock.interface();
+        const token = try lock.acquire(self.wait_ms);
+        defer lock.release(token);
+        if (!lock.held(token)) return error.LockLost;
+
+        var file = try operation_dir.openFile(
+            self.io,
+            retained_state_name,
+            .{
+                .mode = .read_only,
+                .allow_directory = false,
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+            },
+        );
+        defer file.close(self.io);
+        if ((try file.stat(self.io)).kind != .file)
+            return error.InvalidDocument;
+        var reader = file.reader(self.io, &.{});
+        const source = try reader.interface.allocRemaining(
+            allocator,
+            .limited(operation_state.maximum_document_bytes),
+        );
+        defer allocator.free(source);
+        var retained = try operation_state.decode(
+            allocator,
+            source,
+            operation_state.maximum_document_bytes,
+        );
+        errdefer retained.deinit();
+        if (!finalStateEquivalent(retained.state, expected))
+            return error.PublicationConflict;
+        if (self.retained_durability) |durability|
+            try durability.hit(.before_file_sync);
+        try file.sync(self.io);
+        if (!lock.held(token)) return error.LockLost;
+        try self.syncDirectoryAt(
+            operation_dir,
+            .retained_operation_directory,
+        );
+        const attempt_parent_path = std.fs.path.dirname(paths.directory) orelse
+            return error.InvalidPath;
+        var attempt_parent = try openSecureAbsoluteDirectory(
+            self,
+            allocator,
+            attempt_parent_path,
+            false,
+        );
+        defer attempt_parent.close(self.io);
+        try self.syncDirectoryAt(
+            attempt_parent,
+            .retained_attempt_parent,
+        );
+        if (!lock.held(token)) return error.LockLost;
+        return retained;
     }
 
     fn ensureActiveDurable(
@@ -3738,11 +3829,6 @@ pub const Engine = struct {
             &acknowledgment.acknowledgment_id,
             &prepared.attempt_id,
         )) return error.LowerAcknowledgmentMismatch;
-        var inspection = try self.runner.inspect(allocator);
-        defer inspection.deinit();
-        const observed = inspection.deferred_acknowledgment orelse return;
-        if (!lowerAcknowledgmentMatches(acknowledgment, observed))
-            return error.LowerAcknowledgmentMismatch;
         const before_ack = try self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
@@ -4216,11 +4302,6 @@ pub const Engine = struct {
         if (!documentEqual(verified_lock.binding, prepared.exact_lock) or
             !documentEqual(verified_lock.binding, retained_lock))
             return error.LockEvidenceMismatch;
-        var lower = try self.runner.inspect(allocator);
-        defer lower.deinit();
-        if (lower.deferred_acknowledgment) |observed|
-            if (!lowerAcknowledgmentMatches(acknowledgment, observed))
-                return error.LowerAcknowledgmentMismatch;
 
         const binding = retained.transaction_result orelse
             return error.InvalidRetainedEvidence;
@@ -5038,6 +5119,11 @@ fn finalStateEquivalent(
     return retained.phase == .completed and
         proposed.phase == .completed and
         retained.generation == proposed.generation and
+        std.mem.eql(
+            u8,
+            &retained.digest_sha256,
+            &proposed.digest_sha256,
+        ) and
         retained.operation == proposed.operation and
         retained.mutation_started == proposed.mutation_started and
         retained.outcome == proposed.outcome and
@@ -6701,8 +6787,13 @@ const FakeRunner = struct {
         {
             const acknowledgment = request.ownership_acknowledgment orelse
                 return error.MissingOwnershipAcknowledgment;
-            const marker = self.inspect_deferred_acknowledgment orelse
-                return error.MissingOwnershipAcknowledgment;
+            const marker = self.inspect_deferred_acknowledgment orelse {
+                if (self.inspect_record_source != null)
+                    return error.MissingOwnershipAcknowledgment;
+                self.ownership_finalize_calls += 1;
+                self.inspect_status = .clean;
+                return result;
+            };
             if (!std.mem.eql(
                 u8,
                 &marker.digest_sha256,
@@ -6802,6 +6893,9 @@ const FakeRunner = struct {
             result.result.exit_status == .success)
         {
             if (request.recovery_acknowledgment) |_| {
+                if (self.inspect_deferred_acknowledgment == null and
+                    self.inspect_record_source != null)
+                    return error.MissingRecoveryAcknowledgment;
                 self.recovery_ack_calls += 1;
                 if (self.inspect_record_source) |source|
                     self.allocator.free(source);
@@ -7806,6 +7900,9 @@ const CommitDurabilityFault = struct {
     armed: bool = false,
     fail_after_rename: bool = false,
     fail_resync: bool = false,
+    fail_retained_publication_dir: bool = false,
+    fail_retained_file_sync: bool = false,
+    fail_retained_operation_dir_sync: bool = false,
 
     fn completionInterface(self: *CommitDurabilityFault) CompletionCrash {
         return .{ .context = self, .hitFn = hitCompletion };
@@ -7813,6 +7910,14 @@ const CommitDurabilityFault = struct {
 
     fn stateHooks(self: *CommitDurabilityFault) operation_state.WriteHooks {
         return .{ .context = self, .runFn = hitState };
+    }
+
+    fn directoryInterface(self: *CommitDurabilityFault) DirectorySync {
+        return .{ .context = self, .syncFn = syncDirectoryFault };
+    }
+
+    fn retainedInterface(self: *CommitDurabilityFault) RetainedDurability {
+        return .{ .context = self, .hitFn = hitRetained };
     }
 
     fn hitCompletion(
@@ -7838,6 +7943,34 @@ const CommitDurabilityFault = struct {
         }
         if (boundary == .before_durability_resync and self.fail_resync)
             return error.InjectedDurabilityResyncFailure;
+    }
+
+    fn syncDirectoryFault(
+        context: *anyopaque,
+        io: std.Io,
+        dir: std.Io.Dir,
+        boundary: DirectorySyncBoundary,
+    ) !void {
+        const self: *CommitDurabilityFault = @ptrCast(@alignCast(context));
+        if (boundary == .publication_directory and self.armed and
+            self.fail_retained_publication_dir)
+        {
+            self.fail_retained_publication_dir = false;
+            return error.InjectedRetainedPublicationSyncFailure;
+        }
+        if (boundary == .retained_operation_directory and
+            self.fail_retained_operation_dir_sync)
+            return error.InjectedRetainedDirectorySyncFailure;
+        try syncDirectory(io, dir);
+    }
+
+    fn hitRetained(
+        context: *anyopaque,
+        boundary: RetainedDurabilityBoundary,
+    ) !void {
+        const self: *CommitDurabilityFault = @ptrCast(@alignCast(context));
+        if (boundary == .before_file_sync and self.fail_retained_file_sync)
+            return error.InjectedRetainedFileSyncFailure;
     }
 };
 
@@ -7950,6 +8083,76 @@ fn expectForeignProductionReservationBlocked(
         product_api.ExitStatus.recovery,
         result.result.exit_status,
     );
+}
+
+const MarkerLossRecordKind = enum {
+    reserved,
+    preflight,
+    mutation_pending,
+    mutating,
+    verifying,
+    completed_pending,
+    completed_published,
+    recovery_required,
+    recovering,
+    unknown,
+};
+
+fn markerLossRecord(
+    allocator: std.mem.Allocator,
+    kind: MarkerLossRecordKind,
+) ![]u8 {
+    if (kind == .unknown)
+        return allocator.dupe(u8, "{\"legacy\":\"unknown\"}\n");
+    const state: root_operation.State = switch (kind) {
+        .reserved => .reserved,
+        .preflight => .preflight,
+        .mutation_pending => .mutation_pending,
+        .mutating => .mutating,
+        .verifying => .verifying,
+        .completed_pending, .completed_published => .completed,
+        .recovery_required => .recovery_required,
+        .recovering => .recovering,
+        .unknown => unreachable,
+    };
+    const completed = state == .completed;
+    const mutation_started = switch (state) {
+        .reserved, .preflight, .mutation_pending => false,
+        else => true,
+    };
+    const provenance: root_operation.ProvenanceState =
+        if (kind == .completed_published) .published else .pending;
+    var record = try root_operation.create(allocator, .{
+        .attempt_id = @splat(0xe1),
+        .generation = 1,
+        .install_root = live_root.logical_root_path,
+        .backend = .legacy_dpkg,
+        .operation = .{ .package_transaction = .remove },
+        .state = state,
+        .phase = switch (kind) {
+            .reserved => .reserved,
+            .preflight, .mutation_pending => .preflight,
+            .mutating, .recovery_required, .recovering => .mutation,
+            .verifying => .verification,
+            .completed_pending, .completed_published => .provenance,
+            .unknown => unreachable,
+        },
+        .step = 1,
+        .mutation_started = mutation_started,
+        .outcome = if (completed) .succeeded else .pending,
+        .provenance = provenance,
+        .provenance_sha256 = if (provenance == .published)
+            @splat(0xe2)
+        else
+            null,
+        .request_sha256 = @splat(0xe3),
+        .policy_sha256 = @splat(0xe4),
+        .target_architecture = "amd64",
+        .reserved_unix = 1,
+        .updated_unix = 2,
+    });
+    defer record.deinit();
+    return record.record.canonicalJson(allocator);
 }
 
 fn writeAbsoluteTestFile(path: []const u8, bytes: []const u8) !void {
@@ -8852,190 +9055,232 @@ test "apt_system_orchestrator.test.production runner retains successful ownershi
 test "apt_system_orchestrator.test.production restart resyncs visible final state before lower acknowledgment" {
     if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
         return error.SkipZigTest;
+    const Barrier = enum { active_state, retained_final };
     inline for (.{ false, true }) |recovering| {
-        var fixture = ProductionRunnerFixture.init(
-            std.testing.allocator,
-        ) catch |err| switch (err) {
-            error.NamespaceUnavailable => return error.SkipZigTest,
-            else => return err,
-        };
-        defer fixture.deinit();
-        var process: ProductionRunnerProcess = .{
-            .io = std.testing.io,
-            .dpkg = fixture.dpkg,
-        };
-        var production: production_backend.Backend = .{
-            .io = std.testing.io,
-            .now_unix = @import("fixtures/openpgp.zig").created + 30,
-            .process_runner = process.interface(),
-        };
-        var backend: ProductionBackend = .{ .backend = &production };
-        var private_runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
-        const runner = private_runner.interface();
-        var profile: FakeProfileLoader = .{
-            .state_path = fixture.state_path,
-            .cache_path = fixture.cache_path,
-            .source_paths = fixture.source_paths,
-            .keyring_paths = fixture.keyring_paths,
-        };
-        var verifier: SystemResultVerifier = .{ .io = std.testing.io };
-        var sources: FakeSources = .{};
-        var parent_store: SystemStateStore = .{
-            .allocator = std.testing.allocator,
-            .io = std.testing.io,
-        };
-        var parent_engine: Engine = .{
-            .profiles = profile.interface(),
-            .runner = runner,
-            .backend = backend.interface(),
-            .store = parent_store.interface(),
-            .verifier = verifier.interface(),
-            .ids = sources.ids(),
-            .clock = sources.clock(),
-        };
-        var prepared = try expectReady(try parent_engine.prepare(
-            std.testing.allocator,
-            mutationRequest(.remove, &.{"removable"}),
-        ));
-        defer prepared.deinit();
+        inline for (std.enums.values(Barrier)) |barrier| {
+            var fixture = ProductionRunnerFixture.init(
+                std.testing.allocator,
+            ) catch |err| switch (err) {
+                error.NamespaceUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer fixture.deinit();
+            var process: ProductionRunnerProcess = .{
+                .io = std.testing.io,
+                .dpkg = fixture.dpkg,
+            };
+            var production: production_backend.Backend = .{
+                .io = std.testing.io,
+                .now_unix = @import("fixtures/openpgp.zig").created + 30,
+                .process_runner = process.interface(),
+            };
+            var backend: ProductionBackend = .{ .backend = &production };
+            var private_runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+            const runner = private_runner.interface();
+            var profile: FakeProfileLoader = .{
+                .state_path = fixture.state_path,
+                .cache_path = fixture.cache_path,
+                .source_paths = fixture.source_paths,
+                .keyring_paths = fixture.keyring_paths,
+            };
+            var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+            var sources: FakeSources = .{};
+            var parent_store: SystemStateStore = .{
+                .allocator = std.testing.allocator,
+                .io = std.testing.io,
+            };
+            var parent_engine: Engine = .{
+                .profiles = profile.interface(),
+                .runner = runner,
+                .backend = backend.interface(),
+                .store = parent_store.interface(),
+                .verifier = verifier.interface(),
+                .ids = sources.ids(),
+                .clock = sources.clock(),
+            };
+            var prepared = try expectReady(try parent_engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.remove, &.{"removable"}),
+            ));
+            defer prepared.deinit();
 
-        if (recovering) {
-            const mutation_child = try live_root.testing.forkProcess();
-            if (mutation_child == 0) {
-                var crash: ProductionChildCrash = .{
-                    .boundary = .after_completed_record,
-                };
-                production.completion_crash = crash.interface();
-                _ = parent_engine.execute(
-                    std.heap.page_allocator,
-                    prepared,
-                    true,
-                ) catch {};
-                std.os.linux.exit_group(103);
+            if (recovering) {
+                const mutation_child = try live_root.testing.forkProcess();
+                if (mutation_child == 0) {
+                    var crash: ProductionChildCrash = .{
+                        .boundary = .after_completed_record,
+                    };
+                    production.completion_crash = crash.interface();
+                    _ = parent_engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                    std.os.linux.exit_group(103);
+                }
+                _ = try reapSignalTestProcess(mutation_child);
             }
-            _ = try reapSignalTestProcess(mutation_child);
-        }
 
-        var recovery: ?RecoveryPreparation = if (recovering)
-            switch (try parent_engine.prepareRecovery(
+            var recovery: ?RecoveryPreparation = if (recovering)
+                switch (try parent_engine.prepareRecovery(
+                    std.testing.allocator,
+                    "/profile.json",
+                )) {
+                    .ready => |value| value,
+                    .result => return error.ExpectedRecoveryPreparation,
+                }
+            else
+                null;
+            defer if (recovery) |*value| value.deinit();
+            const commit_child = try live_root.testing.forkProcess();
+            if (commit_child == 0) {
+                var fault: CommitDurabilityFault = .{
+                    .fail_after_rename = barrier == .active_state,
+                    .fail_retained_publication_dir = barrier == .retained_final,
+                };
+                var child_store: SystemStateStore = .{
+                    .allocator = std.heap.page_allocator,
+                    .io = std.testing.io,
+                    .directory_sync = fault.directoryInterface(),
+                    .retained_durability = fault.retainedInterface(),
+                    .state_write_hooks = fault.stateHooks(),
+                };
+                var child_engine: Engine = .{
+                    .profiles = profile.interface(),
+                    .runner = runner,
+                    .backend = backend.interface(),
+                    .store = child_store.interface(),
+                    .verifier = verifier.interface(),
+                    .ids = sources.ids(),
+                    .clock = sources.clock(),
+                    .completion_crash = fault.completionInterface(),
+                };
+                if (recovering) {
+                    _ = child_engine.executeRecovery(
+                        std.heap.page_allocator,
+                        recovery.?,
+                        true,
+                    ) catch {};
+                } else {
+                    _ = child_engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                }
+                std.os.linux.exit_group(104);
+            }
+            _ = try reapSignalTestProcess(commit_child);
+            try fixture.dpkg.access(std.testing.io, "mutation-observed", .{});
+            var protected = try runner.inspect(std.testing.allocator);
+            defer protected.deinit();
+            _ = protected.deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+
+            var restart_fault: CommitDurabilityFault = .{
+                .fail_resync = barrier == .active_state,
+                .fail_retained_file_sync = barrier == .retained_final,
+            };
+            var restart_store: SystemStateStore = .{
+                .allocator = std.testing.allocator,
+                .io = std.testing.io,
+                .directory_sync = restart_fault.directoryInterface(),
+                .retained_durability = restart_fault.retainedInterface(),
+                .state_write_hooks = restart_fault.stateHooks(),
+            };
+            var restart_engine: Engine = .{
+                .profiles = profile.interface(),
+                .runner = runner,
+                .backend = backend.interface(),
+                .store = restart_store.interface(),
+                .verifier = verifier.interface(),
+                .ids = sources.ids(),
+                .clock = sources.clock(),
+            };
+            var first_retry = switch (try restart_engine.prepareRecovery(
                 std.testing.allocator,
                 "/profile.json",
             )) {
                 .ready => |value| value,
                 .result => return error.ExpectedRecoveryPreparation,
-            }
-        else
-            null;
-        defer if (recovery) |*value| value.deinit();
-        const commit_child = try live_root.testing.forkProcess();
-        if (commit_child == 0) {
-            var fault: CommitDurabilityFault = .{
-                .fail_after_rename = true,
             };
-            var child_store: SystemStateStore = .{
-                .allocator = std.heap.page_allocator,
-                .io = std.testing.io,
-                .state_write_hooks = fault.stateHooks(),
-            };
-            var child_engine: Engine = .{
-                .profiles = profile.interface(),
-                .runner = runner,
-                .backend = backend.interface(),
-                .store = child_store.interface(),
-                .verifier = verifier.interface(),
-                .ids = sources.ids(),
-                .clock = sources.clock(),
-                .completion_crash = fault.completionInterface(),
-            };
-            if (recovering) {
-                _ = child_engine.executeRecovery(
-                    std.heap.page_allocator,
-                    recovery.?,
+            defer first_retry.deinit();
+            var unsynced = try restart_engine.executeRecovery(
+                std.testing.allocator,
+                first_retry,
+                true,
+            );
+            defer unsynced.deinit();
+            try std.testing.expect(unsynced.outcome != .success);
+            try expectForeignProductionReservationBlocked(
+                &fixture,
+                prepared,
+                runner,
+                backend.interface(),
+                @splat(0xc7),
+            );
+            var still_protected = try runner.inspect(std.testing.allocator);
+            defer still_protected.deinit();
+            _ = still_protected.deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+
+            restart_fault.fail_resync = false;
+            restart_fault.fail_retained_file_sync = false;
+            if (barrier == .retained_final) {
+                restart_fault.fail_retained_operation_dir_sync = true;
+                var directory_retry = switch (try restart_engine.prepareRecovery(
+                    std.testing.allocator,
+                    "/profile.json",
+                )) {
+                    .ready => |value| value,
+                    .result => return error.ExpectedRecoveryPreparation,
+                };
+                defer directory_retry.deinit();
+                var directory_unsynced = try restart_engine.executeRecovery(
+                    std.testing.allocator,
+                    directory_retry,
                     true,
-                ) catch {};
-            } else {
-                _ = child_engine.execute(
-                    std.heap.page_allocator,
+                );
+                defer directory_unsynced.deinit();
+                try std.testing.expect(directory_unsynced.outcome != .success);
+                try expectForeignProductionReservationBlocked(
+                    &fixture,
                     prepared,
-                    true,
-                ) catch {};
+                    runner,
+                    backend.interface(),
+                    @splat(0xc8),
+                );
+                var directory_protected = try runner.inspect(
+                    std.testing.allocator,
+                );
+                defer directory_protected.deinit();
+                _ = directory_protected.deferred_acknowledgment orelse
+                    return error.MissingOwnershipAcknowledgment;
+                restart_fault.fail_retained_operation_dir_sync = false;
             }
-            std.os.linux.exit_group(104);
+            var final_retry = switch (try restart_engine.prepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            )) {
+                .ready => |value| value,
+                .result => return error.ExpectedRecoveryPreparation,
+            };
+            defer final_retry.deinit();
+            var completed = try restart_engine.executeRecovery(
+                std.testing.allocator,
+                final_retry,
+                true,
+            );
+            defer completed.deinit();
+            try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+            try std.testing.expect((try restart_store.interface().readActive(
+                std.testing.allocator,
+                fixture.state_path,
+            )) == null);
+            var clean = try runner.inspect(std.testing.allocator);
+            defer clean.deinit();
+            try std.testing.expect(clean.deferred_acknowledgment == null);
         }
-        _ = try reapSignalTestProcess(commit_child);
-        try fixture.dpkg.access(std.testing.io, "mutation-observed", .{});
-        var protected = try runner.inspect(std.testing.allocator);
-        defer protected.deinit();
-        _ = protected.deferred_acknowledgment orelse
-            return error.MissingOwnershipAcknowledgment;
-
-        var restart_fault: CommitDurabilityFault = .{
-            .fail_resync = true,
-        };
-        var restart_store: SystemStateStore = .{
-            .allocator = std.testing.allocator,
-            .io = std.testing.io,
-            .state_write_hooks = restart_fault.stateHooks(),
-        };
-        var restart_engine: Engine = .{
-            .profiles = profile.interface(),
-            .runner = runner,
-            .backend = backend.interface(),
-            .store = restart_store.interface(),
-            .verifier = verifier.interface(),
-            .ids = sources.ids(),
-            .clock = sources.clock(),
-        };
-        var first_retry = switch (try restart_engine.prepareRecovery(
-            std.testing.allocator,
-            "/profile.json",
-        )) {
-            .ready => |value| value,
-            .result => return error.ExpectedRecoveryPreparation,
-        };
-        defer first_retry.deinit();
-        var unsynced = try restart_engine.executeRecovery(
-            std.testing.allocator,
-            first_retry,
-            true,
-        );
-        defer unsynced.deinit();
-        try std.testing.expect(unsynced.outcome != .success);
-        try expectForeignProductionReservationBlocked(
-            &fixture,
-            prepared,
-            runner,
-            backend.interface(),
-            @splat(0xc7),
-        );
-        var still_protected = try runner.inspect(std.testing.allocator);
-        defer still_protected.deinit();
-        _ = still_protected.deferred_acknowledgment orelse
-            return error.MissingOwnershipAcknowledgment;
-
-        restart_fault.fail_resync = false;
-        var final_retry = switch (try restart_engine.prepareRecovery(
-            std.testing.allocator,
-            "/profile.json",
-        )) {
-            .ready => |value| value,
-            .result => return error.ExpectedRecoveryPreparation,
-        };
-        defer final_retry.deinit();
-        var completed = try restart_engine.executeRecovery(
-            std.testing.allocator,
-            final_retry,
-            true,
-        );
-        defer completed.deinit();
-        try std.testing.expectEqual(api.Outcome.success, completed.outcome);
-        try std.testing.expect((try restart_store.interface().readActive(
-            std.testing.allocator,
-            fixture.state_path,
-        )) == null);
-        var clean = try runner.inspect(std.testing.allocator);
-        defer clean.deinit();
-        try std.testing.expect(clean.deferred_acknowledgment == null);
     }
 }
 
@@ -9262,6 +9507,195 @@ test "apt_system_orchestrator.test.production retained evidence corruption canno
             var clean = try runner.inspect(std.testing.allocator);
             defer clean.deinit();
             try std.testing.expect(clean.deferred_acknowledgment == null);
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.production missing marker never clears a retained lower record" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    inline for (.{ false, true }) |recovering| {
+        inline for (std.enums.values(MarkerLossRecordKind)) |record_kind| {
+            var fixture = ProductionRunnerFixture.init(
+                std.testing.allocator,
+            ) catch |err| switch (err) {
+                error.NamespaceUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer fixture.deinit();
+            var process: ProductionRunnerProcess = .{
+                .io = std.testing.io,
+                .dpkg = fixture.dpkg,
+            };
+            var production: production_backend.Backend = .{
+                .io = std.testing.io,
+                .now_unix = @import("fixtures/openpgp.zig").created + 30,
+                .process_runner = process.interface(),
+            };
+            var backend: ProductionBackend = .{ .backend = &production };
+            var private_runner: PrivateLiveRootRunner = .{
+                .io = std.testing.io,
+            };
+            const runner = private_runner.interface();
+            var profile: FakeProfileLoader = .{
+                .state_path = fixture.state_path,
+                .cache_path = fixture.cache_path,
+                .source_paths = fixture.source_paths,
+                .keyring_paths = fixture.keyring_paths,
+            };
+            var store: SystemStateStore = .{
+                .allocator = std.testing.allocator,
+                .io = std.testing.io,
+            };
+            var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+            var sources: FakeSources = .{};
+            var engine: Engine = .{
+                .profiles = profile.interface(),
+                .runner = runner,
+                .backend = backend.interface(),
+                .store = store.interface(),
+                .verifier = verifier.interface(),
+                .ids = sources.ids(),
+                .clock = sources.clock(),
+            };
+            var prepared = try expectReady(try engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.remove, &.{"removable"}),
+            ));
+            defer prepared.deinit();
+
+            if (recovering) {
+                const mutation_child = try live_root.testing.forkProcess();
+                if (mutation_child == 0) {
+                    var crash: ProductionChildCrash = .{
+                        .boundary = .after_completed_record,
+                    };
+                    production.completion_crash = crash.interface();
+                    _ = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                    std.os.linux.exit_group(107);
+                }
+                _ = try reapSignalTestProcess(mutation_child);
+            }
+            var recovery: ?RecoveryPreparation = if (recovering)
+                switch (try engine.prepareRecovery(
+                    std.testing.allocator,
+                    "/profile.json",
+                )) {
+                    .ready => |value| value,
+                    .result => return error.ExpectedRecoveryPreparation,
+                }
+            else
+                null;
+            defer if (recovery) |*value| value.deinit();
+            const commit_child = try live_root.testing.forkProcess();
+            if (commit_child == 0) {
+                var crash: ProcessDeathCompletionCrash = .{
+                    .boundary = .after_outer_committed,
+                };
+                engine.completion_crash = crash.interface();
+                if (recovering) {
+                    _ = engine.executeRecovery(
+                        std.heap.page_allocator,
+                        recovery.?,
+                        true,
+                    ) catch {};
+                } else {
+                    _ = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                }
+                std.os.linux.exit_group(108);
+            }
+            _ = try reapSignalTestProcess(commit_child);
+            try fixture.dpkg.access(std.testing.io, "mutation-observed", .{});
+
+            try std.Io.Dir.cwd().deleteFile(
+                std.testing.io,
+                "/" ++ root_operation.deferred_ack_path,
+            );
+            const record_source = try markerLossRecord(
+                std.testing.allocator,
+                record_kind,
+            );
+            defer std.testing.allocator.free(record_source);
+            try writeAbsoluteTestFile(
+                "/" ++ root_operation.record_path,
+                record_source,
+            );
+
+            var retry = switch (try engine.prepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            )) {
+                .ready => |value| value,
+                .result => return error.ExpectedRecoveryPreparation,
+            };
+            defer retry.deinit();
+            var blocked = try engine.executeRecovery(
+                std.testing.allocator,
+                retry,
+                true,
+            );
+            defer blocked.deinit();
+            try std.testing.expect(blocked.outcome != .success);
+            var active = (try store.interface().readActive(
+                std.testing.allocator,
+                fixture.state_path,
+            )) orelse return error.MissingActiveState;
+            defer active.deinit();
+            try std.testing.expectEqual(
+                operation_state.Phase.completed,
+                active.state.phase,
+            );
+            const record_after = try readTrustedOperationFile(
+                std.testing.io,
+                std.testing.allocator,
+                "/" ++ root_operation.record_path,
+                root_operation.maximum_document_bytes,
+            );
+            defer std.testing.allocator.free(record_after);
+            try std.testing.expectEqualSlices(
+                u8,
+                record_source,
+                record_after,
+            );
+            try expectForeignProductionReservationBlocked(
+                &fixture,
+                prepared,
+                runner,
+                backend.interface(),
+                @splat(0xe5),
+            );
+
+            try std.Io.Dir.cwd().deleteFile(
+                std.testing.io,
+                "/" ++ root_operation.record_path,
+            );
+            var clean_retry = switch (try engine.prepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            )) {
+                .ready => |value| value,
+                .result => return error.ExpectedRecoveryPreparation,
+            };
+            defer clean_retry.deinit();
+            var completed = try engine.executeRecovery(
+                std.testing.allocator,
+                clean_retry,
+                true,
+            );
+            defer completed.deinit();
+            try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+            try std.testing.expect((try store.interface().readActive(
+                std.testing.allocator,
+                fixture.state_path,
+            )) == null);
         }
     }
 }
@@ -10634,7 +11068,7 @@ test "apt_system_orchestrator.test.post-backend crashes reconcile without a seco
         try std.testing.expectEqual(api.Outcome.success, result.outcome);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.execute_calls);
         try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
-        try std.testing.expectEqual(@as(usize, 3), harness.runner.inspect_calls);
+        try std.testing.expectEqual(@as(usize, 2), harness.runner.inspect_calls);
         try std.testing.expect(harness.store.active_bytes == null);
     }
 }
@@ -10964,11 +11398,17 @@ test "apt_system_orchestrator.test.post-recovery crashes use exact retained bind
             try std.testing.expectEqual(api.Outcome.success, final.outcome);
         }
         try std.testing.expectEqual(
-            @as(usize, 1),
+            if (boundary == .after_recovery_acknowledged)
+                @as(usize, 2)
+            else
+                @as(usize, 1),
             harness.backend.recovery_ack_calls,
         );
         try std.testing.expectEqual(
-            @as(usize, 1),
+            if (boundary == .after_recovery_acknowledged)
+                @as(usize, 2)
+            else
+                @as(usize, 1),
             harness.runner.recovery_ack_calls,
         );
         try std.testing.expect(harness.store.active_bytes == null);
@@ -11158,7 +11598,7 @@ test "apt_system_orchestrator.test.retained final state reconciles without regen
     try std.testing.expectEqual(api.Outcome.success, result.outcome);
     try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
     try std.testing.expectEqual(
-        inspections_before + 2,
+        inspections_before,
         harness.runner.inspect_calls,
     );
     try std.testing.expectEqualSlices(

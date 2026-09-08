@@ -337,13 +337,17 @@ verifies and durably retains transaction evidence and the exact canonical lower
 marker as operation-local `lower-acknowledgment-v1.json`. It then publishes the
 outer completion, publishes the immutable retained final state, and CASes the
 active state to that exact completed outcome before compare-and-clearing the
-matching released marker. A visible matching active document is not by itself
-proof of durable commit: recovery reopens and syncs the exact active file and
-its parent directory while holding the state lock, even when generation and
-digest already equal the retained final state. A rename-visible state whose
-directory sync failed therefore cannot authorize lower acknowledgment until a
-later durability barrier succeeds. The completed active owner remains discoverable
-until acknowledgment finishes. A crash before the outer commit therefore
+matching released marker. Before the active-state CAS, recovery holds the
+operation lock, reopens the retained-final document without following links,
+decodes and compares its exact digest and bindings on that descriptor, fsyncs
+the file, then fsyncs its operation directory and durable attempt parent. A
+rename-visible retained final whose directory sync failed therefore cannot
+authorize active commit or lower acknowledgment. A visible matching active
+document is likewise not by itself proof of durable commit: recovery reopens
+and syncs the exact active file and its parent directory while holding the
+state lock, even when generation and digest already equal the retained final
+state. The completed active owner remains discoverable until acknowledgment
+finishes. A crash before the outer commit therefore
 leaves the root protected; a crash after commit but before acknowledgment
 replays the retained token idempotently; a crash after acknowledgment only
 clears the already committed active owner and cannot regenerate or reinterpret
@@ -388,6 +392,11 @@ therefore leaves the lower completed/published record available for retry; a
 crash after commit but before acknowledgment uses the retained binding and
 token and idempotently clears; a crash after acknowledgment performs no later
 success publication and only retires the committed active owner.
+If the lower marker is absent, acknowledgment is idempotently complete only
+when the lower backend acquires the root-operation lock and proves both marker
+and record are absent. Marker absence with any prepared, mutating, completed,
+recovery-required, legacy, or unreadable record fails closed without clearing
+the outer active state or changing the lower record.
 The acknowledgment rereads the marker, record, and global completion under the
 root-operation lock and first durably transitions the exact marker to
 `acknowledged`. It then clears the matching record and marker. A crash between
