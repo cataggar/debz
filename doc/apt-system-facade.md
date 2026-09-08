@@ -514,6 +514,16 @@ fabricate a transaction result. Crashes at every outer post-backend boundary
 converge through this reconciliation path exactly once, while canonical or
 binding mismatches remain recovery-required.
 
+Proving a failure happened before mutation uses a different internal marker:
+`pre_mutation_reconciliation_claim`. It binds the exact outer attempt, captured
+outer generation and state digest, trusted profile and reference digests,
+semantic request digest, and exact-lock digest. It is never interpreted as a
+released transaction or recovery completion. A restart can adopt only that
+exact claim, including after the retained failure or active-state CAS was
+published, finish the failed-before-mutation state, and exact-acknowledge the
+claim. Foreign attempts and inconsistent marker/record pairs retain all state
+and return UNKNOWN instead of clearing or entering transaction verification.
+
 Profile loading, live-root execution, workflow backend, state store,
 confirmation, result verifier, clock, and attempt-ID generation are explicit
 dependencies. Hermetic tests use injected fakes plus production-created

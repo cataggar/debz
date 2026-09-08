@@ -269,6 +269,17 @@ pub const DeferredAcknowledgmentState = enum {
     abandoned,
     pending,
     acknowledged,
+    pre_mutation_reconciliation_claim,
+};
+
+pub const PreMutationReconciliationClaimBinding = struct {
+    outer_attempt_id: [32]u8,
+    outer_generation: u64,
+    outer_state_sha256: [32]u8,
+    profile_sha256: [32]u8,
+    profile_reference_sha256: [32]u8,
+    exact_lock_sha256: [32]u8,
+    semantic_request_sha256: [32]u8,
 };
 
 /// Root-local ownership binding and non-reclaimable hand-off for an exact
@@ -278,6 +289,7 @@ pub const DeferredAcknowledgment = struct {
     attempt_id: [32]u8,
     completion_sha256: ?[32]u8 = null,
     provenance_sha256: ?[32]u8 = null,
+    pre_mutation_claim: ?PreMutationReconciliationClaimBinding = null,
     acknowledgment_id: [32]u8,
     digest_sha256: [32]u8 = @splat(0),
 
@@ -345,12 +357,229 @@ pub fn createDeferredAcknowledgment(
 
 fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
     return switch (marker.state) {
-        .bound, .released, .abandoned => marker.completion_sha256 == null and
-            marker.provenance_sha256 == null,
+        .bound,
+        .released,
+        .abandoned,
+        => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null and
+            marker.pre_mutation_claim == null,
+        .pre_mutation_reconciliation_claim => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null and
+            marker.pre_mutation_claim != null and
+            std.mem.eql(
+                u8,
+                &marker.attempt_id,
+                &preMutationReconciliationClaimId(
+                    marker.pre_mutation_claim.?,
+                ),
+            ) and
+            std.mem.eql(
+                u8,
+                &marker.acknowledgment_id,
+                &marker.pre_mutation_claim.?.outer_attempt_id,
+            ),
         .pending, .acknowledged => marker.completion_sha256 != null and
-            marker.provenance_sha256 != null,
+            marker.provenance_sha256 != null and
+            marker.pre_mutation_claim == null,
     };
 }
+
+pub fn preMutationReconciliationClaimId(
+    binding: PreMutationReconciliationClaimBinding,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-root-pre-mutation-reconciliation-claim-v1\x00");
+    hash.update(&binding.outer_attempt_id);
+    var generation: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation, binding.outer_generation, .little);
+    hash.update(&generation);
+    hash.update(&binding.outer_state_sha256);
+    hash.update(&binding.profile_sha256);
+    hash.update(&binding.profile_reference_sha256);
+    hash.update(&binding.exact_lock_sha256);
+    hash.update(&binding.semantic_request_sha256);
+    return hash.finalResult();
+}
+
+pub fn matchesPreMutationReconciliationClaim(
+    marker: DeferredAcknowledgment,
+    binding: PreMutationReconciliationClaimBinding,
+) bool {
+    return marker.state == .pre_mutation_reconciliation_claim and
+        marker.pre_mutation_claim != null and
+        preMutationClaimBindingEqual(marker.pre_mutation_claim.?, binding) and
+        std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &binding.outer_attempt_id,
+        ) and
+        std.mem.eql(
+            u8,
+            &marker.attempt_id,
+            &preMutationReconciliationClaimId(binding),
+        );
+}
+
+pub const DeferredRecordCompatibility = enum {
+    incompatible,
+    pre_mutation_reconciliation_claim,
+    bound_pre_mutation,
+    bound_ambiguous,
+    bound_mutating,
+    bound_completed_pending,
+    bound_completed_success,
+    bound_completed_abandoned,
+    released_without_record,
+    abandoned_without_record,
+    released_completed,
+    abandoned_pre_mutation,
+    pending_prepublication,
+    pending_published,
+    acknowledged_published,
+};
+
+pub fn deferredRecordCompatibility(
+    record: ?Record,
+    marker: DeferredAcknowledgment,
+    allow_pending_provenance: bool,
+) DeferredRecordCompatibility {
+    if (!validDeferredAcknowledgment(marker)) return .incompatible;
+    if (marker.state == .pre_mutation_reconciliation_claim)
+        return if (record == null)
+            .pre_mutation_reconciliation_claim
+        else
+            .incompatible;
+    const value = record orelse return switch (marker.state) {
+        .released => .released_without_record,
+        .abandoned => .abandoned_without_record,
+        else => .incompatible,
+    };
+    if (!std.mem.eql(u8, &value.attempt_id, &marker.attempt_id))
+        return .incompatible;
+    return switch (marker.state) {
+        .bound => if (value.state == .completed)
+            if (!value.mutation_started and
+                value.outcome == .abandoned_before_mutation and
+                value.provenance == .not_required and
+                value.provenance_sha256 == null)
+                .bound_completed_abandoned
+            else if (value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered) and
+                value.provenance == .published and
+                value.provenance_sha256 != null)
+                .bound_completed_success
+            else if (value.mutation_started and
+                (value.outcome == .succeeded or
+                    value.outcome == .recovered or
+                    value.outcome == .failed_after_mutation) and
+                value.provenance == .pending and
+                value.provenance_sha256 == null)
+                .bound_completed_pending
+            else
+                .incompatible
+        else if (value.state == .mutation_pending)
+            .bound_ambiguous
+        else if (value.mutation_started)
+            .bound_mutating
+        else if (value.state.provenPreMutation())
+            .bound_pre_mutation
+        else
+            .incompatible,
+        .released => if (value.state == .completed and
+            value.mutation_started and
+            (value.outcome == .succeeded or value.outcome == .recovered) and
+            value.provenance == .published and
+            value.provenance_sha256 != null)
+            .released_completed
+        else
+            .incompatible,
+        .abandoned => if (value.state == .completed and
+            !value.mutation_started and
+            value.outcome == .abandoned_before_mutation and
+            value.provenance == .not_required and
+            value.provenance_sha256 == null)
+            .abandoned_pre_mutation
+        else
+            .incompatible,
+        .pending => switch (value.provenance) {
+            .published => if (value.state == .completed and
+                value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered) and
+                value.provenance_sha256 != null and
+                marker.provenance_sha256 != null and
+                std.mem.eql(
+                    u8,
+                    &value.provenance_sha256.?,
+                    &marker.provenance_sha256.?,
+                ))
+                .pending_published
+            else
+                .incompatible,
+            .pending => if (allow_pending_provenance and
+                value.state == .completed and
+                value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered))
+                .pending_prepublication
+            else
+                .incompatible,
+            .not_required => .incompatible,
+        },
+        .acknowledged => if (value.state == .completed and
+            value.mutation_started and
+            (value.outcome == .succeeded or value.outcome == .recovered) and
+            value.provenance == .published and
+            value.provenance_sha256 != null and
+            marker.provenance_sha256 != null and
+            std.mem.eql(
+                u8,
+                &value.provenance_sha256.?,
+                &marker.provenance_sha256.?,
+            ))
+            .acknowledged_published
+        else
+            .incompatible,
+        .pre_mutation_reconciliation_claim => unreachable,
+    };
+}
+
+fn preMutationClaimBindingEqual(
+    left: PreMutationReconciliationClaimBinding,
+    right: PreMutationReconciliationClaimBinding,
+) bool {
+    return left.outer_generation == right.outer_generation and
+        std.mem.eql(u8, &left.outer_attempt_id, &right.outer_attempt_id) and
+        std.mem.eql(
+            u8,
+            &left.outer_state_sha256,
+            &right.outer_state_sha256,
+        ) and
+        std.mem.eql(u8, &left.profile_sha256, &right.profile_sha256) and
+        std.mem.eql(
+            u8,
+            &left.profile_reference_sha256,
+            &right.profile_reference_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.exact_lock_sha256,
+            &right.exact_lock_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.semantic_request_sha256,
+            &right.semantic_request_sha256,
+        );
+}
+
+const WirePreMutationReconciliationClaim = struct {
+    outer_attempt_id: []const u8,
+    outer_generation: u64,
+    outer_state_sha256: []const u8,
+    profile_sha256: []const u8,
+    profile_reference_sha256: []const u8,
+    exact_lock_sha256: []const u8,
+    semantic_request_sha256: []const u8,
+};
 
 const WireDeferredAcknowledgment = struct {
     schema: []const u8,
@@ -359,6 +588,7 @@ const WireDeferredAcknowledgment = struct {
     attempt_id: []const u8,
     completion_sha256: ?[]const u8,
     provenance_sha256: ?[]const u8,
+    pre_mutation_claim: ?WirePreMutationReconciliationClaim = null,
     acknowledgment_id: []const u8,
     digest_sha256: []const u8,
 };
@@ -384,6 +614,15 @@ pub fn decodeDeferredAcknowledgment(
         .attempt_id = try parseHex(32, wire.attempt_id),
         .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
         .provenance_sha256 = try parseOptionalHex(wire.provenance_sha256),
+        .pre_mutation_claim = if (wire.pre_mutation_claim) |claim| .{
+            .outer_attempt_id = try parseHex(32, claim.outer_attempt_id),
+            .outer_generation = claim.outer_generation,
+            .outer_state_sha256 = try parseHex(32, claim.outer_state_sha256),
+            .profile_sha256 = try parseHex(32, claim.profile_sha256),
+            .profile_reference_sha256 = try parseHex(32, claim.profile_reference_sha256),
+            .exact_lock_sha256 = try parseHex(32, claim.exact_lock_sha256),
+            .semantic_request_sha256 = try parseHex(32, claim.semantic_request_sha256),
+        } else null,
         .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
         .digest_sha256 = try parseHex(32, wire.digest_sha256),
     };
@@ -665,6 +904,17 @@ fn deferredAcknowledgmentDigest(
         hash.update(&digest)
     else
         hash.update("\x00");
+    if (marker.pre_mutation_claim) |claim| {
+        hash.update(&claim.outer_attempt_id);
+        var generation: [8]u8 = undefined;
+        std.mem.writeInt(u64, &generation, claim.outer_generation, .little);
+        hash.update(&generation);
+        hash.update(&claim.outer_state_sha256);
+        hash.update(&claim.profile_sha256);
+        hash.update(&claim.profile_reference_sha256);
+        hash.update(&claim.exact_lock_sha256);
+        hash.update(&claim.semantic_request_sha256);
+    }
     hash.update(&marker.acknowledgment_id);
     return hash.finalResult();
 }
@@ -685,6 +935,24 @@ fn writeDeferredAcknowledgment(
     try writeOptionalHex(writer, marker.completion_sha256);
     try writer.writeAll(",\"provenance_sha256\":");
     try writeOptionalHex(writer, marker.provenance_sha256);
+    if (marker.pre_mutation_claim) |claim| {
+        try writer.writeAll(",\"pre_mutation_claim\":{\"outer_attempt_id\":");
+        try writeHexString(writer, &claim.outer_attempt_id);
+        try writer.print(",\"outer_generation\":{}", .{
+            claim.outer_generation,
+        });
+        try writer.writeAll(",\"outer_state_sha256\":");
+        try writeHexString(writer, &claim.outer_state_sha256);
+        try writer.writeAll(",\"profile_sha256\":");
+        try writeHexString(writer, &claim.profile_sha256);
+        try writer.writeAll(",\"profile_reference_sha256\":");
+        try writeHexString(writer, &claim.profile_reference_sha256);
+        try writer.writeAll(",\"exact_lock_sha256\":");
+        try writeHexString(writer, &claim.exact_lock_sha256);
+        try writer.writeAll(",\"semantic_request_sha256\":");
+        try writeHexString(writer, &claim.semantic_request_sha256);
+        try writer.writeByte('}');
+    }
     try writer.writeAll(",\"acknowledgment_id\":");
     try writeHexString(writer, &marker.acknowledgment_id);
     try writer.writeAll(",\"digest_sha256\":");
@@ -1732,6 +2000,7 @@ pub const Coordinator = struct {
         ) catch return error.RecordCorrupt;
         if (deferred) |marker| switch (marker.state) {
             .acknowledged => return error.RecoveryRequired,
+            .pre_mutation_reconciliation_claim => return error.RecoveryRequired,
             .released => {
                 const orchestration_id =
                     request.orchestration_id orelse
@@ -2398,24 +2667,11 @@ fn recordMatchesDeferredAcknowledgment(
     marker: DeferredAcknowledgment,
     allow_pending_provenance: bool,
 ) bool {
-    if (!std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) or
-        (marker.state != .bound and record.state != .completed))
-        return false;
-    return switch (marker.state) {
-        .bound => true,
-        .released => record.outcome != .abandoned_before_mutation,
-        .abandoned => record.outcome == .abandoned_before_mutation,
-        .pending, .acknowledged => switch (record.provenance) {
-            .published => record.provenance_sha256 != null and
-                marker.provenance_sha256 != null and std.mem.eql(
-                u8,
-                &record.provenance_sha256.?,
-                &marker.provenance_sha256.?,
-            ),
-            .pending => allow_pending_provenance,
-            .not_required => false,
-        },
-    };
+    return deferredRecordCompatibility(
+        record,
+        marker,
+        allow_pending_provenance,
+    ) != .incompatible;
 }
 
 fn adoptedBridge(state: State) BridgeOrigin {
@@ -2738,6 +2994,204 @@ test "root_operation.test.record round trips through its canonical encoding" {
         error.NonCanonicalDocument,
         decode(testing.allocator, bytes[0 .. bytes.len / 2], maximum_document_bytes),
     );
+}
+
+test "root_operation.test.deferred marker and record compatibility matrix is exhaustive" {
+    const Shape = enum {
+        absent,
+        reserved,
+        mutation_pending,
+        mutating,
+        completed_success_pending,
+        completed_success_published,
+        completed_recovered_published,
+        completed_abandoned,
+        foreign_completed_success,
+    };
+    const claim: PreMutationReconciliationClaimBinding = .{
+        .outer_attempt_id = @splat(0xa0),
+        .outer_generation = 7,
+        .outer_state_sha256 = @splat(0xa1),
+        .profile_sha256 = @splat(0xa2),
+        .profile_reference_sha256 = @splat(0xa3),
+        .exact_lock_sha256 = @splat(0xa4),
+        .semantic_request_sha256 = @splat(0xa5),
+    };
+    for (std.enums.values(DeferredAcknowledgmentState)) |marker_state| {
+        for (std.enums.values(Shape)) |shape| {
+            var input = testInput();
+            switch (shape) {
+                .absent => {},
+                .reserved => {},
+                .mutation_pending => {
+                    input.state = .mutation_pending;
+                    input.phase = .mutation;
+                },
+                .mutating => {
+                    input.state = .mutating;
+                    input.phase = .mutation;
+                    input.mutation_started = true;
+                },
+                .completed_success_pending => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .succeeded;
+                },
+                .completed_success_published,
+                .foreign_completed_success,
+                => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .succeeded;
+                    input.provenance = .published;
+                    input.provenance_sha256 = @splat(0x91);
+                    if (shape == .foreign_completed_success)
+                        input.attempt_id = @splat(0x45);
+                },
+                .completed_recovered_published => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .recovered;
+                    input.provenance = .published;
+                    input.provenance_sha256 = @splat(0x91);
+                },
+                .completed_abandoned => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.outcome = .abandoned_before_mutation;
+                    input.provenance = .not_required;
+                },
+            }
+            var owned: ?OwnedRecord = if (shape == .absent)
+                null
+            else
+                try create(testing.allocator, input);
+            defer if (owned) |*record| record.deinit();
+            const marker = try createDeferredAcknowledgment(.{
+                .state = marker_state,
+                .attempt_id = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    preMutationReconciliationClaimId(claim)
+                else
+                    @splat(0x44),
+                .completion_sha256 = if (marker_state == .pending or
+                    marker_state == .acknowledged)
+                    @splat(0x92)
+                else
+                    null,
+                .provenance_sha256 = if (marker_state == .pending or
+                    marker_state == .acknowledged)
+                    @splat(0x91)
+                else
+                    null,
+                .pre_mutation_claim = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    claim
+                else
+                    null,
+                .acknowledgment_id = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    claim.outer_attempt_id
+                else
+                    @splat(0xb0),
+            });
+            const expected: DeferredRecordCompatibility =
+                if (shape == .foreign_completed_success)
+                    .incompatible
+                else switch (marker_state) {
+                    .pre_mutation_reconciliation_claim => if (shape == .absent)
+                        .pre_mutation_reconciliation_claim
+                    else
+                        .incompatible,
+                    .bound => switch (shape) {
+                        .reserved => .bound_pre_mutation,
+                        .mutation_pending => .bound_ambiguous,
+                        .mutating => .bound_mutating,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .bound_completed_success,
+                        .completed_success_pending => .bound_completed_pending,
+                        .completed_abandoned => .bound_completed_abandoned,
+                        else => .incompatible,
+                    },
+                    .released => switch (shape) {
+                        .absent => .released_without_record,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .released_completed,
+                        else => .incompatible,
+                    },
+                    .abandoned => if (shape == .absent)
+                        .abandoned_without_record
+                    else if (shape == .completed_abandoned)
+                        .abandoned_pre_mutation
+                    else
+                        .incompatible,
+                    .pending => switch (shape) {
+                        .completed_success_pending => .pending_prepublication,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .pending_published,
+                        else => .incompatible,
+                    },
+                    .acknowledged => switch (shape) {
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .acknowledged_published,
+                        else => .incompatible,
+                    },
+                };
+            try testing.expectEqual(
+                expected,
+                deferredRecordCompatibility(
+                    if (owned) |record| record.record else null,
+                    marker,
+                    true,
+                ),
+            );
+            if (marker_state == .pending and
+                shape == .completed_success_pending)
+                try testing.expectEqual(
+                    DeferredRecordCompatibility.incompatible,
+                    deferredRecordCompatibility(
+                        owned.?.record,
+                        marker,
+                        false,
+                    ),
+                );
+        }
+    }
+}
+
+test "root_operation.test.pre-mutation reconciliation claim round trips exact binding" {
+    const claim: PreMutationReconciliationClaimBinding = .{
+        .outer_attempt_id = @splat(0xc0),
+        .outer_generation = 42,
+        .outer_state_sha256 = @splat(0xc1),
+        .profile_sha256 = @splat(0xc2),
+        .profile_reference_sha256 = @splat(0xc3),
+        .exact_lock_sha256 = @splat(0xc4),
+        .semantic_request_sha256 = @splat(0xc5),
+    };
+    const marker = try createDeferredAcknowledgment(.{
+        .state = .pre_mutation_reconciliation_claim,
+        .attempt_id = preMutationReconciliationClaimId(claim),
+        .pre_mutation_claim = claim,
+        .acknowledgment_id = claim.outer_attempt_id,
+    });
+    const source = try marker.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    const decoded = try decodeDeferredAcknowledgment(
+        testing.allocator,
+        source,
+    );
+    try testing.expect(matchesPreMutationReconciliationClaim(
+        decoded,
+        claim,
+    ));
 }
 
 test "root_operation.test.records reject contradictory lifecycle combinations" {

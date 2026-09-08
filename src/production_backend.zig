@@ -49,9 +49,18 @@ pub const WorkflowOwnershipAcknowledgment = struct {
     acknowledgment_id: [32]u8,
 };
 
-pub const WorkflowReconciliationClaim = struct {
-    exact_lock_sha256: [32]u8,
-    evidence_sha256: [32]u8,
+pub const WorkflowReconciliationClaim = union(enum) {
+    pre_mutation: struct {
+        outer_generation: u64,
+        outer_state_sha256: [32]u8,
+        profile_sha256: [32]u8,
+        profile_reference_sha256: [32]u8,
+        exact_lock_sha256: [32]u8,
+    },
+    post_mutation: struct {
+        exact_lock_sha256: [32]u8,
+        evidence_sha256: [32]u8,
+    },
 };
 
 pub const WorkflowRequest = struct {
@@ -333,6 +342,7 @@ pub const Backend = struct {
             return self.finalizeWorkflowOwnership(
                 allocator,
                 request,
+                workflow.operation,
                 workflow.ownership_acknowledgment.?,
             );
         }
@@ -1705,6 +1715,7 @@ pub const Backend = struct {
         self: *Backend,
         allocator: std.mem.Allocator,
         request: api.Request,
+        workflow_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowOwnershipAcknowledgment,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
@@ -1759,14 +1770,85 @@ pub const Backend = struct {
             );
         }
         const observed = marker.?;
-        if ((observed.state != .bound and
-            observed.state != .released and
-            observed.state != .abandoned) or
-            !std.mem.eql(
-                u8,
-                &observed.digest_sha256,
-                &acknowledgment.marker_sha256,
-            ) or
+        if (observed.state == .pre_mutation_reconciliation_claim) {
+            const claim = observed.pre_mutation_claim orelse
+                return blockedRecovery(
+                    request.operation,
+                    "lower reconciliation claim binding is absent",
+                );
+            const selectors = try allocator.alloc(
+                solver.PackageSelector,
+                request.packages.len,
+            );
+            defer allocator.free(selectors);
+            for (request.packages, 0..) |package, index|
+                selectors[index] = parseSelector(package);
+            const semantic_sha256 = try workflowSemanticRequestDigest(
+                allocator,
+                workflow_operation,
+                selectors,
+            );
+            if (record != null or
+                !std.mem.eql(
+                    u8,
+                    &claim.outer_attempt_id,
+                    &acknowledgment.acknowledgment_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &claim.semantic_request_sha256,
+                    &semantic_sha256,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.digest_sha256,
+                    &acknowledgment.marker_sha256,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.attempt_id,
+                    &acknowledgment.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.acknowledgment_id,
+                    &acknowledgment.acknowledgment_id,
+                ))
+                return blockedRecovery(
+                    request.operation,
+                    "lower reconciliation claim belongs to another orchestrator",
+                );
+            if (self.completion_crash) |crash|
+                crash.hit(.before_ownership_marker_clear) catch
+                    return blockedRecovery(
+                        request.operation,
+                        "lower reconciliation claim acknowledgment was interrupted",
+                    );
+            store.clearDeferredAcknowledgment(
+                allocator,
+                acknowledgment.marker_sha256,
+            ) catch return blockedRecovery(
+                request.operation,
+                "lower reconciliation claim could not be acknowledged",
+            );
+            if (self.completion_crash) |crash|
+                crash.hit(.after_ownership_marker_clear) catch
+                    return blockedRecovery(
+                        request.operation,
+                        "lower reconciliation claim acknowledgment was interrupted",
+                    );
+            return success(
+                request.operation,
+                false,
+                "lower reconciliation claim finalized",
+                &.{},
+            );
+        }
+        if (!std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &acknowledgment.marker_sha256,
+        ) or
             !std.mem.eql(
                 u8,
                 &observed.attempt_id,
@@ -1781,28 +1863,31 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker belongs to another orchestrator",
             );
-        if (record) |owned| {
-            if (!owned.record.clearable() or
-                (observed.state == .released and
-                    owned.record.outcome == .abandoned_before_mutation) or
-                (observed.state == .abandoned and
-                    owned.record.outcome != .abandoned_before_mutation) or
-                !std.mem.eql(
-                    u8,
-                    &owned.record.attempt_id,
-                    &observed.attempt_id,
-                ))
-                return blockedRecovery(
-                    request.operation,
-                    "lower ownership record is unfinished or foreign",
-                );
-        }
+        const compatibility = root_operation.deferredRecordCompatibility(
+            if (record) |owned| owned.record else null,
+            observed,
+            false,
+        );
+        const finalizable = switch (compatibility) {
+            .released_without_record,
+            .abandoned_without_record,
+            .released_completed,
+            .abandoned_pre_mutation,
+            .bound_completed_success,
+            .bound_completed_abandoned,
+            => true,
+            else => false,
+        };
+        if (!finalizable) return blockedRecovery(
+            request.operation,
+            "lower ownership record is unfinished, incompatible, or foreign",
+        );
         store.cleanupOwned(allocator, .{
             .attempt_id = observed.attempt_id,
             .acknowledgment_id = acknowledgment.acknowledgment_id,
-            .terminal_state = if (observed.state == .abandoned or
-                (record != null and
-                    record.?.record.outcome == .abandoned_before_mutation))
+            .terminal_state = if (compatibility == .abandoned_without_record or
+                compatibility == .abandoned_pre_mutation or
+                compatibility == .bound_completed_abandoned)
                 .abandoned
             else
                 .released,
@@ -1877,23 +1962,54 @@ pub const Backend = struct {
                 request.operation,
                 "lower root is not clean for reconciliation",
             );
-        const semantic_sha256 = try workflowProductRequestDigest(
+        const execute_request_sha256 = try workflowProductRequestDigest(
             allocator,
             semantic_operation,
             .execute,
             selectors,
             request.options,
         );
-        const attempt_id = reconciliationAttemptId(
-            orchestration_id,
-            semantic_sha256,
-            claim.exact_lock_sha256,
-            claim.evidence_sha256,
+        const semantic_request_sha256 = try workflowSemanticRequestDigest(
+            allocator,
+            semantic_operation,
+            selectors,
         );
+        const attempt_id = switch (claim) {
+            .pre_mutation => |binding| root_operation.preMutationReconciliationClaimId(.{
+                .outer_attempt_id = orchestration_id,
+                .outer_generation = binding.outer_generation,
+                .outer_state_sha256 = binding.outer_state_sha256,
+                .profile_sha256 = binding.profile_sha256,
+                .profile_reference_sha256 = binding.profile_reference_sha256,
+                .exact_lock_sha256 = binding.exact_lock_sha256,
+                .semantic_request_sha256 = semantic_request_sha256,
+            }),
+            .post_mutation => |binding| reconciliationAttemptId(
+                orchestration_id,
+                execute_request_sha256,
+                binding.exact_lock_sha256,
+                binding.evidence_sha256,
+            ),
+        };
         const reconciliation = try root_operation.createDeferredAcknowledgment(
             .{
-                .state = .released,
+                .state = switch (claim) {
+                    .pre_mutation => .pre_mutation_reconciliation_claim,
+                    .post_mutation => .released,
+                },
                 .attempt_id = attempt_id,
+                .pre_mutation_claim = switch (claim) {
+                    .pre_mutation => |binding| .{
+                        .outer_attempt_id = orchestration_id,
+                        .outer_generation = binding.outer_generation,
+                        .outer_state_sha256 = binding.outer_state_sha256,
+                        .profile_sha256 = binding.profile_sha256,
+                        .profile_reference_sha256 = binding.profile_reference_sha256,
+                        .exact_lock_sha256 = binding.exact_lock_sha256,
+                        .semantic_request_sha256 = semantic_request_sha256,
+                    },
+                    .post_mutation => null,
+                },
                 .acknowledgment_id = orchestration_id,
             },
         );
@@ -1928,9 +2044,7 @@ pub const Backend = struct {
         hash.update(&semantic_sha256);
         hash.update(&exact_lock_sha256);
         hash.update(&evidence_sha256);
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        return digest;
+        return hash.finalResult();
     }
 
     fn ownershipCleanupObserver(
@@ -4425,14 +4539,33 @@ fn backendDeferredMarker(
     return try root_operation.decodeDeferredAcknowledgment(allocator, bytes);
 }
 
-test "production workflow clean reconciliation claim is durable exclusive and crash convergent" {
+test "production workflow reconciliation claims are distinct durable exclusive and crash convergent" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    inline for (.{
-        CompletionPoint.before_reconciliation_marker_publish,
-        CompletionPoint.after_reconciliation_marker_publish,
-    }) |point| {
+    const ClaimCase = struct {
+        point: CompletionPoint,
+        pre_mutation: bool,
+    };
+    inline for ([_]ClaimCase{
+        .{
+            .point = .before_reconciliation_marker_publish,
+            .pre_mutation = false,
+        },
+        .{
+            .point = .after_reconciliation_marker_publish,
+            .pre_mutation = false,
+        },
+        .{
+            .point = .before_reconciliation_marker_publish,
+            .pre_mutation = true,
+        },
+        .{
+            .point = .after_reconciliation_marker_publish,
+            .pre_mutation = true,
+        },
+    }) |claim_case| {
+        const point = claim_case.point;
         var directory = std.testing.tmpDir(.{});
         defer directory.cleanup();
         var fixture = try ProductionWorkflowFixture.init(
@@ -4461,16 +4594,38 @@ test "production workflow clean reconciliation claim is durable exclusive and cr
         claim_options.lock_input_path = fixture.lock_path;
         claim_options.assume_yes = true;
         claim_options.conffile = .keep_existing;
+        const pre_mutation_binding: root_operation.PreMutationReconciliationClaimBinding = .{
+            .outer_attempt_id = outer_id,
+            .outer_generation = 9,
+            .outer_state_sha256 = @splat(0xa2),
+            .profile_sha256 = @splat(0xa3),
+            .profile_reference_sha256 = @splat(0xa4),
+            .exact_lock_sha256 = @splat(0xb2),
+            .semantic_request_sha256 = try workflowSemanticRequestDigest(
+                allocator,
+                .remove,
+                &selectors,
+            ),
+        };
         const request: WorkflowRequest = .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
             .options = claim_options,
             .orchestration_id = outer_id,
-            .reconciliation_claim = .{
-                .exact_lock_sha256 = @splat(0xb2),
-                .evidence_sha256 = @splat(0xc3),
-            },
+            .reconciliation_claim = if (claim_case.pre_mutation)
+                .{ .pre_mutation = .{
+                    .outer_generation = pre_mutation_binding.outer_generation,
+                    .outer_state_sha256 = pre_mutation_binding.outer_state_sha256,
+                    .profile_sha256 = pre_mutation_binding.profile_sha256,
+                    .profile_reference_sha256 = pre_mutation_binding.profile_reference_sha256,
+                    .exact_lock_sha256 = pre_mutation_binding.exact_lock_sha256,
+                } }
+            else
+                .{ .post_mutation = .{
+                    .exact_lock_sha256 = @splat(0xb2),
+                    .evidence_sha256 = @splat(0xc3),
+                } },
         };
         try std.testing.expectError(
             error.InjectedCompletionCrash,
@@ -4496,9 +4651,20 @@ test "production workflow clean reconciliation claim is durable exclusive and cr
             const retained = marker orelse
                 return error.MissingDeferredAcknowledgment;
             try std.testing.expectEqual(
-                root_operation.DeferredAcknowledgmentState.released,
+                if (claim_case.pre_mutation)
+                    root_operation.DeferredAcknowledgmentState
+                        .pre_mutation_reconciliation_claim
+                else
+                    .released,
                 retained.state,
             );
+            if (claim_case.pre_mutation)
+                try std.testing.expect(
+                    root_operation.matchesPreMutationReconciliationClaim(
+                        retained,
+                        pre_mutation_binding,
+                    ),
+                );
             try std.testing.expectEqualSlices(
                 u8,
                 &outer_id,

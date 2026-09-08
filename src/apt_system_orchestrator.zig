@@ -623,7 +623,10 @@ pub const PrivateLiveRootRunner = struct {
         } else .{
             .status = switch (marker.?.state) {
                 .released, .abandoned, .acknowledged => .clean,
-                .bound, .pending => .recovery_required,
+                .bound,
+                .pending,
+                .pre_mutation_reconciliation_claim,
+                => .recovery_required,
             },
             .attempt_id = marker.?.attempt_id,
         };
@@ -799,7 +802,15 @@ pub const PrivateLiveRootRunner = struct {
                         const acknowledgment_id =
                             workflow_invocation.request.orchestration_id orelse
                             return error.MissingOwnershipAcknowledgment;
-                        if (marker.state != .released or
+                        const expected_marker_state: root_operation.DeferredAcknowledgmentState =
+                            if (workflow_invocation.request.reconciliation_claim) |claim|
+                                switch (claim) {
+                                    .pre_mutation => .pre_mutation_reconciliation_claim,
+                                    .post_mutation => .released,
+                                }
+                            else
+                                .released;
+                        if (marker.state != expected_marker_state or
                             inspection.record != null or
                             !std.mem.eql(
                                 u8,
@@ -813,6 +824,9 @@ pub const PrivateLiveRootRunner = struct {
                             .acknowledgment_id = marker.acknowledgment_id,
                         };
                     }
+                    if (workflow_invocation.request.reconciliation_claim !=
+                        null and ownership_acknowledgment != null)
+                        break :status .completed;
                     break :status switch (inspection.status) {
                         .clean, .completed => .completed,
                         .recovery_required => .recovery_required,
@@ -2411,6 +2425,12 @@ pub const VerifiedTransaction = struct {
     }
 };
 
+pub const VerificationError = error{
+    OutOfMemory,
+    OperationalVerificationFailure,
+    InvariantViolation,
+};
+
 pub const ResultVerifier = struct {
     context: *anyopaque,
     verifyLockFn: *const fn (
@@ -2419,14 +2439,14 @@ pub const ResultVerifier = struct {
         []const u8,
         []const u8,
         [32]u8,
-    ) anyerror!VerifiedLock,
+    ) VerificationError!VerifiedLock,
     verifyTransactionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         []const u8,
         api.DocumentBinding,
         []const u8,
-    ) anyerror!VerifiedTransaction,
+    ) VerificationError!VerifiedTransaction,
 };
 
 pub const SystemResultVerifier = struct {
@@ -2441,6 +2461,25 @@ pub const SystemResultVerifier = struct {
     }
 
     fn verifyLock(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        architecture: []const u8,
+        expected_request_sha256: [32]u8,
+    ) VerificationError!VerifiedLock {
+        return verifyLockInternal(
+            context,
+            allocator,
+            path,
+            architecture,
+            expected_request_sha256,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyLockInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         path: []const u8,
@@ -2483,6 +2522,25 @@ pub const SystemResultVerifier = struct {
     }
 
     fn verifyTransaction(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        lock_binding: api.DocumentBinding,
+        architecture: []const u8,
+    ) VerificationError!VerifiedTransaction {
+        return verifyTransactionInternal(
+            context,
+            allocator,
+            path,
+            lock_binding,
+            architecture,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyTransactionInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         path: []const u8,
@@ -2690,6 +2748,8 @@ pub const CompletionBoundary = enum {
     after_acknowledgment_retained,
     before_completion_published,
     after_outer_committed,
+    after_pre_mutation_claim_published,
+    after_pre_mutation_outer_rechecked,
     before_ownership_acknowledged,
     after_ownership_acknowledged,
     after_recovery_acknowledged,
@@ -2968,17 +3028,21 @@ pub const Engine = struct {
                 workflow_operation,
                 selectors,
             ),
-        ) catch {
-            return .{ .result = try self.failBeforeMutation(
-                allocator,
-                request,
-                profile.state_path,
-                generated_paths,
-                &current,
-                .planning,
-                .exact_lock_publication_failed,
-                "planned exact lock is missing, corrupt, or foreign",
-            ) };
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => {
+                return .{ .result = try self.failBeforeMutation(
+                    allocator,
+                    request,
+                    profile.state_path,
+                    generated_paths,
+                    &current,
+                    .planning,
+                    .exact_lock_publication_failed,
+                    "planned exact lock is missing, corrupt, or foreign",
+                ) };
+            },
         };
         if (!std.mem.eql(
             u8,
@@ -3083,14 +3147,11 @@ pub const Engine = struct {
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
-        ) catch return self.finishPreMutationFailure(
-            allocator,
-            prepared,
-            &current,
-            .planning,
-            .planning_failed,
-            "reviewed exact lock is no longer valid",
-        );
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcilePreparedError(allocator, prepared),
+        };
         if (!lockMatchesPreparation(
             before_download.binding,
             prepared,
@@ -3165,14 +3226,11 @@ pub const Engine = struct {
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
-        ) catch return self.finishPreMutationFailure(
-            allocator,
-            prepared,
-            &current,
-            .planning,
-            .planning_failed,
-            "reviewed exact lock is invalid before execution",
-        );
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcilePreparedError(allocator, prepared),
+        };
         if (!lockMatchesPreparation(
             before_execute.binding,
             prepared,
@@ -3222,7 +3280,8 @@ pub const Engine = struct {
             try semanticDigestForRequest(allocator, prepared.request),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(allocator, prepared),
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcilePreparedError(allocator, prepared),
         };
         if (!lockMatchesPreparation(
             after_reserve_lock.binding,
@@ -3338,6 +3397,7 @@ pub const Engine = struct {
             prepared.profile_state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -3362,6 +3422,7 @@ pub const Engine = struct {
             prepared.paths,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -3444,7 +3505,8 @@ pub const Engine = struct {
             try semanticDigestForRequest(allocator, prepared.request),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
                 "the pre-mutation exact lock could not be verified",
@@ -3476,6 +3538,15 @@ pub const Engine = struct {
         {
             const selectors = try selectorsFor(allocator, prepared.request);
             defer allocator.free(selectors);
+            const claim_binding: root_operation.PreMutationReconciliationClaimBinding = .{
+                .outer_attempt_id = prepared.attempt_id,
+                .outer_generation = snapshot.generation,
+                .outer_state_sha256 = snapshot.digest_sha256,
+                .profile_sha256 = snapshot.profile.sha256,
+                .profile_reference_sha256 = snapshot.profile.reference_evidence_sha256,
+                .exact_lock_sha256 = verified_lock.binding.digest_sha256,
+                .semantic_request_sha256 = verified_lock.semantic_request_sha256,
+            };
             var claimed = self.runner.workflow(
                 allocator,
                 self.backend,
@@ -3488,10 +3559,13 @@ pub const Engine = struct {
                         prepared.paths.exact_lock,
                     ),
                     .orchestration_id = prepared.attempt_id,
-                    .reconciliation_claim = .{
-                        .exact_lock_sha256 = verified_lock.binding.digest_sha256,
-                        .evidence_sha256 = snapshot.digest_sha256,
-                    },
+                    .reconciliation_claim = .{ .pre_mutation = .{
+                        .outer_generation = claim_binding.outer_generation,
+                        .outer_state_sha256 = claim_binding.outer_state_sha256,
+                        .profile_sha256 = claim_binding.profile_sha256,
+                        .profile_reference_sha256 = claim_binding.profile_reference_sha256,
+                        .exact_lock_sha256 = claim_binding.exact_lock_sha256,
+                    } },
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -3512,26 +3586,43 @@ pub const Engine = struct {
                 );
             const acknowledgment = claimed.ownership_acknowledgment.?;
             exclusion = .{
-                .state = .released,
+                .state = .pre_mutation_reconciliation_claim,
                 .attempt_id = acknowledgment.attempt_id,
+                .pre_mutation_claim = claim_binding,
                 .acknowledgment_id = acknowledgment.acknowledgment_id,
                 .digest_sha256 = acknowledgment.marker_sha256,
             };
+            self.hitCompletionBoundary(
+                .after_pre_mutation_claim_published,
+            ) catch return self.reconcileUnknownPreparedFailure(
+                allocator,
+                prepared,
+                "pre-mutation reconciliation was interrupted after the lower exclusion claim was published",
+            );
         } else if (lower.deferred_acknowledgment) |marker| {
-            if (marker.state != .abandoned or
-                lower.record == null or
-                !(try lowerAbandonedPreMutationMatches(
+            const exact_claim =
+                lower.record == null and
+                preMutationReconciliationClaimMatches(
+                    marker,
+                    prepared,
+                    snapshot,
+                    verified_lock,
+                );
+            const exact_abandoned =
+                lower.record != null and
+                try lowerAbandonedPreMutationMatches(
                     allocator,
                     lower.record.?.record,
                     marker,
                     prepared,
                     loaded.view,
                     verified_lock,
-                )))
+                );
+            if (!exact_claim and !exact_abandoned)
                 return self.reconcileUnknownPreparedFailure(
                     allocator,
                     prepared,
-                    "lower ownership marker and record do not prove an exact abandoned pre-mutation attempt",
+                    "lower ownership state does not prove an exact pre-mutation reconciliation owner",
                 );
             exclusion = marker;
         } else return self.reconcileUnknownPreparedFailure(
@@ -3574,6 +3665,13 @@ pub const Engine = struct {
                 prepared,
                 "active state changed while lower pre-mutation exclusion was established",
             );
+        self.hitCompletionBoundary(
+            .after_pre_mutation_outer_rechecked,
+        ) catch return self.reconcileUnknownPreparedFailure(
+            allocator,
+            prepared,
+            "pre-mutation reconciliation was interrupted after the outer state was rechecked",
+        );
 
         const message =
             "execution failed before mutation; stable outer state and an exact lower exclusion prove no package change occurred";
@@ -3635,6 +3733,7 @@ pub const Engine = struct {
             exclusion,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -3781,7 +3880,8 @@ pub const Engine = struct {
             semantic_request_sha256,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return unknownMutationDiagnostic(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return unknownMutationDiagnostic(
                 allocator,
                 prepared.request,
                 prepared.request.profile_path,
@@ -3827,6 +3927,22 @@ pub const Engine = struct {
                     prepared.request.profile_path,
                     "outer mutation state has no exact lower operation record",
                 );
+            var lower_completion: ?root_operation_completion.OwnedDocument =
+                if (marker.state == .pending or
+                marker.state == .acknowledged)
+                    self.runner.readRecoveryCompletion(allocator) catch |err|
+                        switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return unknownMutationDiagnostic(
+                                allocator,
+                                prepared.request,
+                                prepared.request.profile_path,
+                                "lower recovery completion could not be verified",
+                            ),
+                        }
+                else
+                    null;
+            defer if (lower_completion) |*owned| owned.deinit();
             if (!try lowerMutationMatches(
                 allocator,
                 record.record,
@@ -3834,6 +3950,7 @@ pub const Engine = struct {
                 prepared,
                 loaded.view,
                 verified_lock,
+                if (lower_completion) |owned| owned.document else null,
             )) return unknownMutationDiagnostic(
                 allocator,
                 prepared.request,
@@ -3852,7 +3969,8 @@ pub const Engine = struct {
                 loaded.view.architecture,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return recoveryDiagnostic(
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalVerificationFailure => return recoveryDiagnostic(
                     allocator,
                     prepared.request,
                     loaded.view.binding,
@@ -4014,10 +4132,14 @@ pub const Engine = struct {
                 profile_path,
                 "the retained semantic request does not bind the active operation",
             ) };
-        const retryable_preflight =
+        const reconcilable_pre_mutation =
             !active.state.mutation_started and
-            active.state.phase == .downloaded;
-        if ((!active.state.mutation_started and !retryable_preflight) or
+            (active.state.phase == .planned or
+                active.state.phase == .downloaded or
+                (active.state.phase == .completed and
+                    active.state.outcome == .failed_before_mutation));
+        if ((!active.state.mutation_started and
+            !reconcilable_pre_mutation) or
             active.state.exact_lock == null)
             return .{ .result = try unknownMutationDiagnostic(
                 allocator,
@@ -4033,7 +4155,8 @@ pub const Engine = struct {
             try semanticDigestForRequest(allocator, retained.request),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return .{ .result = try unknownMutationDiagnostic(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
                 profile_path,
@@ -4105,12 +4228,17 @@ pub const Engine = struct {
         };
         defer loaded.deinit();
         if (!profileEqual(loaded.view.binding, recovery.prepared.profile))
-            return self.reconcilePreparedError(allocator, recovery.prepared);
-        loaded.revalidate(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(
+            return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
+                "the trusted recovery profile binding changed",
+            );
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.reconcileUnknownPreparedFailure(
+                allocator,
+                recovery.prepared,
+                "the trusted recovery profile could not be revalidated",
             ),
         };
         var current = (self.store.readActive(
@@ -4141,7 +4269,8 @@ pub const Engine = struct {
             ),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcilePreparedError(
                 allocator,
                 recovery.prepared,
             ),
@@ -4153,9 +4282,10 @@ pub const Engine = struct {
         )) return self.reconcilePreparedError(allocator, recovery.prepared);
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(
+            else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
+                "the trusted recovery profile changed before retained state inspection",
             ),
         };
         var retained_final = self.store.readRetained(
@@ -4169,7 +4299,14 @@ pub const Engine = struct {
             ),
         };
         defer if (retained_final) |*owned| owned.deinit();
-        if (retained_final) |*retained|
+        if (retained_final) |*retained| {
+            if (retained.state.outcome == .failed_before_mutation)
+                return self.reconcileStablePreMutation(
+                    allocator,
+                    recovery.prepared,
+                    current.state,
+                    .clean_proves_pre_mutation,
+                );
             return self.reconcileRetainedFinal(
                 allocator,
                 recovery.prepared,
@@ -4178,12 +4315,13 @@ pub const Engine = struct {
                 retained.state,
                 recovery_lock,
             );
-        loaded.revalidate(allocator) catch return self.recoveryFailed(
-            allocator,
-            recovery.prepared,
-            &current,
-            "trusted profile reference changed before recovery inspection",
-        );
+        }
+        loaded.revalidate(allocator) catch
+            return self.reconcileUnknownPreparedFailure(
+                allocator,
+                recovery.prepared,
+                "trusted profile reference changed before recovery inspection",
+            );
         var lower_inspection = self.runner.inspect(allocator) catch
             return self.recoveryFailed(
                 allocator,
@@ -4192,6 +4330,12 @@ pub const Engine = struct {
                 "lower-level root-operation status could not be inspected",
             );
         defer lower_inspection.deinit();
+        loaded.revalidate(allocator) catch
+            return self.reconcileUnknownPreparedFailure(
+                allocator,
+                recovery.prepared,
+                "trusted profile reference changed while lower recovery state was inspected",
+            );
         const ownership_marker = lower_inspection.deferred_acknowledgment;
         if (ownership_marker) |marker| {
             if (!std.mem.eql(
@@ -4204,6 +4348,27 @@ pub const Engine = struct {
                 &current,
                 "lower-level root ownership belongs to another outer attempt",
             );
+            if (marker.state == .pre_mutation_reconciliation_claim) {
+                if (lower_inspection.record != null or
+                    !preMutationReconciliationClaimMatches(
+                        marker,
+                        recovery.prepared,
+                        current.state,
+                        recovery_lock,
+                    ))
+                    return unknownMutationDiagnostic(
+                        allocator,
+                        recovery.prepared.request,
+                        recovery.prepared.request.profile_path,
+                        "the lower pre-mutation reconciliation claim is foreign or inconsistent",
+                    );
+                return self.reconcileStablePreMutation(
+                    allocator,
+                    recovery.prepared,
+                    current.state,
+                    .clean_proves_pre_mutation,
+                );
+            }
         }
         const owner_proven_pre_mutation =
             if (ownership_marker) |marker|
@@ -4277,12 +4442,14 @@ pub const Engine = struct {
                         allocator,
                         recovery.prepared.request,
                     ),
-                ) catch return self.recoveryFailed(
-                    allocator,
-                    recovery.prepared,
-                    &current,
-                    "retained exact lock is invalid before retrying the proven pre-mutation attempt",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.OperationalVerificationFailure => return self.reconcilePreparedError(
+                        allocator,
+                        recovery.prepared,
+                    ),
+                };
                 if (!lockMatchesPreparation(
                     before_retry.binding,
                     recovery.prepared,
@@ -4294,10 +4461,9 @@ pub const Engine = struct {
                     "retained exact lock was replaced before retrying the proven pre-mutation attempt",
                 );
                 loaded.revalidate(allocator) catch
-                    return self.recoveryFailed(
+                    return self.reconcileUnknownPreparedFailure(
                         allocator,
                         recovery.prepared,
-                        &current,
                         "trusted profile reference changed before retrying the proven pre-mutation attempt",
                     );
                 const selectors = try selectorsFor(
@@ -4347,7 +4513,8 @@ pub const Engine = struct {
                         ),
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return self.reconcilePreparedError(
+                        error.InvariantViolation => return error.InvariantViolation,
+                        error.OperationalVerificationFailure => return self.reconcilePreparedError(
                             allocator,
                             recovery.prepared,
                         ),
@@ -4362,9 +4529,10 @@ pub const Engine = struct {
                     );
                     loaded.revalidate(allocator) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return self.reconcilePreparedError(
+                        else => return self.reconcileUnknownPreparedFailure(
                             allocator,
                             recovery.prepared,
+                            "the trusted profile changed after lower reservation",
                         ),
                     };
                 }
@@ -4457,12 +4625,14 @@ pub const Engine = struct {
                         shared_source,
                         recovery_lock.binding,
                         loaded.view.architecture,
-                    ) catch return self.recoveryFailed(
-                        allocator,
-                        recovery.prepared,
-                        &current,
-                        "clean lower root has no verifiable transaction evidence to reconcile",
-                    );
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.InvariantViolation => return error.InvariantViolation,
+                        error.OperationalVerificationFailure => return self.reconcilePreparedError(
+                            allocator,
+                            recovery.prepared,
+                        ),
+                    };
                     defer verified.deinit();
                     break :evidence verified.binding.digest_sha256;
                 };
@@ -4491,10 +4661,10 @@ pub const Engine = struct {
                             recovery.prepared.paths.exact_lock,
                         ),
                         .orchestration_id = recovery.prepared.attempt_id,
-                        .reconciliation_claim = .{
+                        .reconciliation_claim = .{ .post_mutation = .{
                             .exact_lock_sha256 = recovery_lock.binding.digest_sha256,
                             .evidence_sha256 = evidence_sha256,
-                        },
+                        } },
                     },
                 ) catch return self.recoveryFailed(
                     allocator,
@@ -4544,10 +4714,9 @@ pub const Engine = struct {
                     false;
             if (settled_lower_recovery)
                 loaded.revalidate(allocator) catch
-                    return self.recoveryFailed(
+                    return self.reconcileUnknownPreparedFailure(
                         allocator,
                         recovery.prepared,
-                        &current,
                         "trusted profile reference changed before settled recovery evidence reconciliation",
                     );
             var lower_completion = if (retained_lower_recovery)
@@ -4587,12 +4756,12 @@ pub const Engine = struct {
                     &current,
                     "settled lower-level recovery completion evidence is stale or foreign",
                 );
-            loaded.revalidate(allocator) catch return self.recoveryFailed(
-                allocator,
-                recovery.prepared,
-                &current,
-                "trusted profile reference changed before recovery evidence reconciliation",
-            );
+            loaded.revalidate(allocator) catch
+                return self.reconcileUnknownPreparedFailure(
+                    allocator,
+                    recovery.prepared,
+                    "trusted profile reference changed before recovery evidence reconciliation",
+                );
             return self.verifyAndComplete(
                 allocator,
                 recovery.prepared,
@@ -4643,12 +4812,14 @@ pub const Engine = struct {
                 allocator,
                 recovery.prepared.request,
             ),
-        ) catch return self.recoveryFailed(
-            allocator,
-            recovery.prepared,
-            &current,
-            "retained exact lock is invalid immediately before recovery",
-        );
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return self.reconcilePreparedError(
+                allocator,
+                recovery.prepared,
+            ),
+        };
         if (!lockMatchesPreparation(
             before_recovery.binding,
             recovery.prepared,
@@ -4659,12 +4830,12 @@ pub const Engine = struct {
             &current,
             "retained exact lock was replaced immediately before recovery",
         );
-        loaded.revalidate(allocator) catch return self.recoveryFailed(
-            allocator,
-            recovery.prepared,
-            &current,
-            "trusted profile reference changed immediately before recovery execution",
-        );
+        loaded.revalidate(allocator) catch
+            return self.reconcileUnknownPreparedFailure(
+                allocator,
+                recovery.prepared,
+                "trusted profile reference changed immediately before recovery execution",
+            );
         const selectors = try selectorsFor(
             allocator,
             recovery.prepared.request,
@@ -4705,12 +4876,12 @@ pub const Engine = struct {
                 allocator,
                 recovery.prepared,
             );
-        loaded.revalidate(allocator) catch return self.recoveryFailed(
-            allocator,
-            recovery.prepared,
-            &current,
-            "trusted profile reference changed before recovered evidence reconciliation",
-        );
+        loaded.revalidate(allocator) catch
+            return self.reconcileUnknownPreparedFailure(
+                allocator,
+                recovery.prepared,
+                "trusted profile reference changed before recovered evidence reconciliation",
+            );
         return self.verifyAndComplete(
             allocator,
             recovery.prepared,
@@ -4753,13 +4924,17 @@ pub const Engine = struct {
             &acknowledgment.acknowledgment_id,
             &prepared.attempt_id,
         )) return error.LowerAcknowledgmentMismatch;
-        const before_ack = try self.verifier.verifyLockFn(
+        const before_ack = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
-        );
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalVerificationFailure => return error.LockEvidenceMismatch,
+        };
         if (!lockMatchesPreparation(
             before_ack.binding,
             prepared,
@@ -4769,7 +4944,7 @@ pub const Engine = struct {
         const selectors = try selectorsFor(allocator, prepared.request);
         defer allocator.free(selectors);
         switch (acknowledgment.state) {
-            .released, .abandoned => {
+            .released, .abandoned, .pre_mutation_reconciliation_claim => {
                 try self.hitCompletionBoundary(.before_ownership_acknowledged);
                 var finalized = try self.runner.workflow(
                     allocator,
@@ -4919,12 +5094,16 @@ pub const Engine = struct {
                 source_path,
                 prepared.exact_lock,
                 profile.architecture,
-            ) catch return self.markRecoveryRequired(
-                allocator,
-                prepared,
-                current,
-                "transaction result does not verify against the exact lock",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalVerificationFailure => return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "transaction result does not verify against the exact lock",
+                ),
+            };
             defer verified.deinit();
             if (existing_retained and
                 (!std.mem.eql(
@@ -5106,6 +5285,8 @@ pub const Engine = struct {
                 acknowledgment,
             ) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.InvariantViolation)
+                    return error.InvariantViolation;
                 return self.reconcilePreparedError(allocator, prepared);
             };
         self.store.clearCommittedFn(
@@ -5115,6 +5296,7 @@ pub const Engine = struct {
             operation_state.Expected.fromState(durable_final.state),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.hitCompletionBoundary(.after_active_cleared) catch
@@ -5151,6 +5333,7 @@ pub const Engine = struct {
             completion,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         const retained_acknowledgment = self.store.readAcknowledgmentFn(
@@ -5159,6 +5342,7 @@ pub const Engine = struct {
             prepared.paths,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         const acknowledgment = retained_acknowledgment orelse
@@ -5172,6 +5356,7 @@ pub const Engine = struct {
             acknowledgment,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.store.commitFn(
@@ -5192,6 +5377,7 @@ pub const Engine = struct {
             acknowledgment,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.store.clearCommittedFn(
@@ -5247,13 +5433,17 @@ pub const Engine = struct {
                     ) or
                     binding.version != transaction_provenance.schema_version)
                     return error.InvalidRetainedEvidence;
-                var verified = try self.verifier.verifyTransactionFn(
+                var verified = self.verifier.verifyTransactionFn(
                     self.verifier.context,
                     allocator,
                     prepared.paths.transaction_result,
                     verified_lock.binding,
                     loaded.view.architecture,
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.OperationalVerificationFailure => return error.InvalidRetainedEvidence,
+                };
                 defer verified.deinit();
                 if (!documentEqual(verified.binding, binding))
                     return error.InvalidRetainedEvidence;
@@ -6261,6 +6451,7 @@ fn requiredCompletionEqual(
 
 fn recoverableOuterPhase(phase: operation_state.Phase) bool {
     return switch (phase) {
+        .planned,
         .downloaded,
         .mutating,
         .verifying,
@@ -6470,6 +6661,65 @@ fn recoveryCompletionMatches(
         std.mem.eql(u8, document.discharge.operation, "recover");
 }
 
+fn preMutationReconciliationClaimMatches(
+    marker: root_operation.DeferredAcknowledgment,
+    prepared: Preparation,
+    snapshot: operation_state.State,
+    verified_lock: VerifiedLock,
+) bool {
+    const claim = marker.pre_mutation_claim orelse return false;
+    const marker_match = root_operation.matchesPreMutationReconciliationClaim(
+        marker,
+        claim,
+    );
+    const attempt_match = std.mem.eql(
+        u8,
+        &claim.outer_attempt_id,
+        &prepared.attempt_id,
+    );
+    const profile_match = std.mem.eql(
+        u8,
+        &claim.profile_sha256,
+        &snapshot.profile.sha256,
+    );
+    const reference_match = std.mem.eql(
+        u8,
+        &claim.profile_reference_sha256,
+        &snapshot.profile.reference_evidence_sha256,
+    );
+    const lock_match = std.mem.eql(
+        u8,
+        &claim.exact_lock_sha256,
+        &verified_lock.binding.digest_sha256,
+    );
+    const semantic_match = std.mem.eql(
+        u8,
+        &claim.semantic_request_sha256,
+        &verified_lock.semantic_request_sha256,
+    );
+    if (!marker_match or !attempt_match or !profile_match or
+        !reference_match or !lock_match or !semantic_match)
+        return false;
+    if (snapshot.generation == claim.outer_generation and
+        std.mem.eql(
+            u8,
+            &snapshot.digest_sha256,
+            &claim.outer_state_sha256,
+        ))
+        return true;
+    const committed_generation = std.math.add(
+        u64,
+        claim.outer_generation,
+        1,
+    ) catch return false;
+    return snapshot.generation == committed_generation and
+        snapshot.phase == .completed and
+        snapshot.outcome == .failed_before_mutation and
+        !snapshot.mutation_started and
+        snapshot.transaction_result == null and
+        snapshot.root_operation_completion == null;
+}
+
 fn lowerAbandonedPreMutationMatches(
     allocator: std.mem.Allocator,
     record: root_operation.Record,
@@ -6478,7 +6728,11 @@ fn lowerAbandonedPreMutationMatches(
     profile: ProfileView,
     verified_lock: VerifiedLock,
 ) !bool {
-    if (marker.state != .abandoned or
+    if (root_operation.deferredRecordCompatibility(
+        record,
+        marker,
+        false,
+    ) != .abandoned_pre_mutation or
         !std.mem.eql(
             u8,
             &marker.acknowledgment_id,
@@ -6541,8 +6795,46 @@ fn lowerMutationMatches(
     prepared: Preparation,
     profile: ProfileView,
     verified_lock: VerifiedLock,
+    completion: ?root_operation_completion.Document,
 ) !bool {
-    if (marker.state == .abandoned or
+    const compatibility = root_operation.deferredRecordCompatibility(
+        record,
+        marker,
+        false,
+    );
+    const protocol_proves_mutation = switch (compatibility) {
+        .bound_mutating => true,
+        .released_completed => std.mem.eql(
+            u8,
+            &record.provenance_sha256.?,
+            &root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .journal_archived = true,
+            }),
+        ),
+        .pending_published, .acknowledged_published => proof: {
+            const document = completion orelse break :proof false;
+            if (marker.completion_sha256 == null or
+                !std.mem.eql(
+                    u8,
+                    &marker.completion_sha256.?,
+                    &document.digest_sha256,
+                ) or
+                !settledRecoveryProvenanceMatches(record, document) or
+                !try recoveryCompletionMatches(
+                    allocator,
+                    document,
+                    prepared,
+                    profile,
+                    verified_lock,
+                    marker.attempt_id,
+                ))
+                break :proof false;
+            break :proof true;
+        },
+        else => false,
+    };
+    if (!protocol_proves_mutation or
         !std.mem.eql(
             u8,
             &marker.acknowledgment_id,
@@ -7317,9 +7609,9 @@ test "apt_system_orchestrator.test.required_privileged.manifest covers every pri
         }
         cursor = next;
     }
-    try std.testing.expectEqual(@as(usize, 23), tagged_count);
+    try std.testing.expectEqual(@as(usize, 24), tagged_count);
     try std.testing.expectEqual(
-        @as(usize, 19),
+        @as(usize, 20),
         privilege_dependent_count,
     );
 }
@@ -8370,6 +8662,14 @@ const FakeBackend = struct {
                 .summary = "lower orchestration ownership finalized",
             };
         }
+        if (request.reconciliation_claim != null) {
+            return .{
+                .operation = .recover,
+                .exit_status = .success,
+                .changed = false,
+                .summary = "lower reconciliation claim published",
+            };
+        }
         const status = switch (request.mode) {
             .plan_only => status: {
                 self.plan_calls += 1;
@@ -8664,10 +8964,37 @@ const FakeRunner = struct {
             if (self.inspect_deferred_acknowledgment != null or
                 self.inspect_record_source != null)
                 return error.ReconciliationRootNotClean;
+            const claim_binding: ?root_operation
+                .PreMutationReconciliationClaimBinding =
+                switch (request.reconciliation_claim.?) {
+                    .pre_mutation => |claim| .{
+                        .outer_attempt_id = request.orchestration_id orelse
+                            return error.MissingOwnershipAcknowledgment,
+                        .outer_generation = claim.outer_generation,
+                        .outer_state_sha256 = claim.outer_state_sha256,
+                        .profile_sha256 = claim.profile_sha256,
+                        .profile_reference_sha256 = claim.profile_reference_sha256,
+                        .exact_lock_sha256 = claim.exact_lock_sha256,
+                        .semantic_request_sha256 = try workflowSemanticDigest(
+                            allocator,
+                            request.operation,
+                            request.selectors,
+                        ),
+                    },
+                    .post_mutation => null,
+                };
+            const claim_attempt_id = if (claim_binding) |binding|
+                root_operation.preMutationReconciliationClaimId(binding)
+            else
+                @as([32]u8, @splat(0x7e));
             self.inspect_deferred_acknowledgment =
                 try root_operation.createDeferredAcknowledgment(.{
-                    .state = .released,
-                    .attempt_id = @splat(0x7e),
+                    .state = switch (request.reconciliation_claim.?) {
+                        .pre_mutation => .pre_mutation_reconciliation_claim,
+                        .post_mutation => .released,
+                    },
+                    .attempt_id = claim_attempt_id,
+                    .pre_mutation_claim = claim_binding,
                     .acknowledgment_id = request.orchestration_id orelse
                         return error.MissingOwnershipAcknowledgment,
                 });
@@ -8987,7 +9314,10 @@ const FakeRunner = struct {
             .status = if (self.inspect_deferred_acknowledgment) |marker|
                 switch (marker.state) {
                     .released, .abandoned, .acknowledged => .clean,
-                    .bound, .pending => .recovery_required,
+                    .bound,
+                    .pending,
+                    .pre_mutation_reconciliation_claim,
+                    => .recovery_required,
                 }
             else
                 self.inspect_status,
@@ -9254,6 +9584,7 @@ const FakeStateStore = struct {
     completion_published: bool = false,
     fail_finish: bool = false,
     fail_after_retain_once: bool = false,
+    fail_after_active_cas_once: bool = false,
     fail_recovery_retain_once: bool = false,
     fail_inspect_active: bool = false,
     hide_inspected_active: bool = false,
@@ -9423,6 +9754,8 @@ const FakeStateStore = struct {
             self.retained_bytes = try final.canonicalJson(self.allocator);
             return error.InjectedFinishCrash;
         }
+        if (self.retained_bytes == null)
+            self.retained_bytes = try final.canonicalJson(self.allocator);
         if (expected.generation != final.generation or
             !std.mem.eql(
                 u8,
@@ -9430,8 +9763,10 @@ const FakeStateStore = struct {
                 &final.digest_sha256,
             ))
             try compareAndSet(context, allocator, "", expected, final);
-        if (self.retained_bytes) |bytes| self.allocator.free(bytes);
-        self.retained_bytes = try final.canonicalJson(self.allocator);
+        if (self.fail_after_active_cas_once) {
+            self.fail_after_active_cas_once = false;
+            return error.InjectedFinishCrash;
+        }
     }
 
     fn clearCommitted(
@@ -9630,6 +9965,16 @@ const FakeStateStore = struct {
 const FakeVerifier = struct {
     lock_valid: bool = true,
     transaction_valid: bool = true,
+    lock_failure: ?VerificationError = null,
+    transaction_failure: ?VerificationError = null,
+    lock_failure_on_check: ?struct {
+        check: usize,
+        failure: VerificationError,
+    } = null,
+    transaction_failure_on_check: ?struct {
+        check: usize,
+        failure: VerificationError,
+    } = null,
     lock_digest: [32]u8 = @splat(0x55),
     transaction_digest: [32]u8 = @splat(0x66),
     transaction_source: ?[]const u8 = null,
@@ -9652,10 +9997,14 @@ const FakeVerifier = struct {
         path: []const u8,
         _: []const u8,
         expected_request_sha256: [32]u8,
-    ) !VerifiedLock {
+    ) VerificationError!VerifiedLock {
         const self: *FakeVerifier = @ptrCast(@alignCast(context));
         self.lock_checks += 1;
-        if (!self.lock_valid) return error.DigestMismatch;
+        if (self.lock_failure_on_check) |injected|
+            if (injected.check == self.lock_checks)
+                return injected.failure;
+        if (self.lock_failure) |failure| return failure;
+        if (!self.lock_valid) return error.OperationalVerificationFailure;
         const digest = if (self.different_lock_check == self.lock_checks)
             [_]u8{0x77} ** 32
         else
@@ -9680,10 +10029,15 @@ const FakeVerifier = struct {
         path: []const u8,
         _: api.DocumentBinding,
         _: []const u8,
-    ) !VerifiedTransaction {
+    ) VerificationError!VerifiedTransaction {
         const self: *FakeVerifier = @ptrCast(@alignCast(context));
         self.transaction_checks += 1;
-        if (!self.transaction_valid) return error.LockEvidenceMismatch;
+        if (self.transaction_failure_on_check) |injected|
+            if (injected.check == self.transaction_checks)
+                return injected.failure;
+        if (self.transaction_failure) |failure| return failure;
+        if (!self.transaction_valid)
+            return error.OperationalVerificationFailure;
         return .{
             .bytes = try allocator.dupe(
                 u8,
@@ -9697,6 +10051,59 @@ const FakeVerifier = struct {
             },
             .allocator = allocator,
         };
+    }
+};
+
+const OneShotOperationalLockVerifier = struct {
+    inner: ResultVerifier,
+    failed: bool = false,
+
+    fn interface(self: *OneShotOperationalLockVerifier) ResultVerifier {
+        return .{
+            .context = self,
+            .verifyLockFn = verifyLock,
+            .verifyTransactionFn = verifyTransaction,
+        };
+    }
+
+    fn verifyLock(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        architecture: []const u8,
+        expected_request_sha256: [32]u8,
+    ) VerificationError!VerifiedLock {
+        const self: *OneShotOperationalLockVerifier =
+            @ptrCast(@alignCast(context));
+        if (!self.failed) {
+            self.failed = true;
+            return error.OperationalVerificationFailure;
+        }
+        return self.inner.verifyLockFn(
+            self.inner.context,
+            allocator,
+            path,
+            architecture,
+            expected_request_sha256,
+        );
+    }
+
+    fn verifyTransaction(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        lock: api.DocumentBinding,
+        architecture: []const u8,
+    ) VerificationError!VerifiedTransaction {
+        const self: *OneShotOperationalLockVerifier =
+            @ptrCast(@alignCast(context));
+        return self.inner.verifyTransactionFn(
+            self.inner.context,
+            allocator,
+            path,
+            lock,
+            architecture,
+        );
     }
 };
 
@@ -10310,6 +10717,32 @@ const ProcessDeathCompletionCrash = struct {
     }
 };
 
+const ProcessDeathFinishCrash = struct {
+    fn interface(self: *ProcessDeathFinishCrash) FinishCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(_: *anyopaque, _: FinishBoundary) !void {
+        std.os.linux.exit_group(91);
+    }
+};
+
+const ProcessDeathStateWriteCrash = struct {
+    fn interface(
+        self: *ProcessDeathStateWriteCrash,
+    ) operation_state.WriteHooks {
+        return .{ .context = self, .runFn = hit };
+    }
+
+    fn hit(
+        _: ?*anyopaque,
+        boundary: operation_state.WriteBoundary,
+    ) !void {
+        if (boundary == .after_rename)
+            std.os.linux.exit_group(91);
+    }
+};
+
 const CleanInspectionProcessBarrier = struct {
     ready_fd: i32,
     release_fd: i32,
@@ -10766,7 +11199,7 @@ test "apt_system_orchestrator.test.required_privileged.recovery preflight lock-a
     try std.testing.expectEqual(api.Outcome.success, completed.outcome);
     try std.testing.expectEqual(@as(usize, 1), backend.reserve_calls);
     try std.testing.expectEqual(@as(usize, 1), backend.execute_calls);
-    try std.testing.expectEqual(@as(usize, 1), backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.recover_calls);
     active = try store.interface().readActive(
         std.testing.allocator,
         state_path,
@@ -11259,6 +11692,196 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
         std.mem.asBytes(&original),
         std.mem.asBytes(&after_completion),
     );
+}
+
+test "apt_system_orchestrator.test.required_privileged.production pre-mutation reconciliation claim crash matrix converges without mutation" {
+    try requirePrivilegedProductionTest();
+    const CrashCase = enum {
+        after_claim_publish,
+        after_outer_recheck,
+        after_retained_publish,
+        after_active_cas,
+        before_claim_ack,
+        after_claim_ack,
+    };
+    inline for (std.enums.values(CrashCase)) |crash_case| {
+        var fixture = ProductionRunnerFixture.init(
+            std.testing.allocator,
+        ) catch |err| switch (err) {
+            error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
+            else => return err,
+        };
+        defer fixture.deinit();
+        var process: ProductionRunnerProcess = .{
+            .io = std.testing.io,
+            .dpkg = fixture.dpkg,
+        };
+        var production: production_backend.Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+        };
+        var backend: ProductionBackend = .{ .backend = &production };
+        var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+        var profile: FakeProfileLoader = .{
+            .state_path = fixture.state_path,
+            .cache_path = fixture.cache_path,
+            .source_paths = fixture.source_paths,
+            .keyring_paths = fixture.keyring_paths,
+        };
+        var system_verifier: SystemResultVerifier = .{
+            .io = std.testing.io,
+        };
+        var sources: FakeSources = .{};
+        var parent_store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+        };
+        var parent_engine: Engine = .{
+            .profiles = profile.interface(),
+            .runner = runner.interface(),
+            .backend = backend.interface(),
+            .store = parent_store.interface(),
+            .verifier = system_verifier.interface(),
+            .ids = sources.ids(),
+            .clock = sources.clock(),
+        };
+        var prepared = try expectReady(try parent_engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.remove, &.{"removable"}),
+        ));
+        defer prepared.deinit();
+
+        const child = try live_root.testing.forkProcess();
+        if (child == 0) {
+            var one_shot: OneShotOperationalLockVerifier = .{
+                .inner = system_verifier.interface(),
+            };
+            var completion_crash: ProcessDeathCompletionCrash = .{
+                .boundary = switch (crash_case) {
+                    .after_claim_publish => .after_pre_mutation_claim_published,
+                    .after_outer_recheck => .after_pre_mutation_outer_rechecked,
+                    .before_claim_ack => .before_ownership_acknowledged,
+                    .after_claim_ack => .after_ownership_acknowledged,
+                    .after_retained_publish,
+                    .after_active_cas,
+                    => .after_backend_success,
+                },
+            };
+            var finish_crash: ProcessDeathFinishCrash = .{};
+            var state_crash: ProcessDeathStateWriteCrash = .{};
+            var child_store: SystemStateStore = .{
+                .allocator = std.heap.page_allocator,
+                .io = std.testing.io,
+                .finish_crash = if (crash_case == .after_retained_publish)
+                    finish_crash.interface()
+                else
+                    null,
+                .state_write_hooks = if (crash_case == .after_active_cas)
+                    state_crash.interface()
+                else
+                    .{},
+            };
+            var child_engine: Engine = .{
+                .profiles = profile.interface(),
+                .runner = runner.interface(),
+                .backend = backend.interface(),
+                .store = child_store.interface(),
+                .verifier = one_shot.interface(),
+                .ids = sources.ids(),
+                .clock = sources.clock(),
+                .completion_crash = switch (crash_case) {
+                    .after_claim_publish,
+                    .after_outer_recheck,
+                    .before_claim_ack,
+                    .after_claim_ack,
+                    => completion_crash.interface(),
+                    .after_retained_publish, .after_active_cas => null,
+                },
+            };
+            _ = child_engine.execute(
+                std.heap.page_allocator,
+                prepared,
+                true,
+            ) catch {};
+            std.os.linux.exit_group(96);
+        }
+        const child_status = try reapSignalTestProcess(child);
+        try std.testing.expect(std.os.linux.W.IFEXITED(child_status));
+        try std.testing.expectEqual(
+            @as(u8, 91),
+            std.os.linux.W.EXITSTATUS(child_status),
+        );
+        var mutation_observed = true;
+        fixture.dpkg.access(
+            std.testing.io,
+            "mutation-observed",
+            .{},
+        ) catch {
+            mutation_observed = false;
+        };
+        try std.testing.expect(!mutation_observed);
+
+        var inspection = try runner.interface().inspect(
+            std.testing.allocator,
+        );
+        defer inspection.deinit();
+        if (crash_case == .after_claim_ack) {
+            try std.testing.expect(
+                inspection.deferred_acknowledgment == null,
+            );
+        } else {
+            const marker = inspection.deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+            try std.testing.expectEqual(
+                root_operation.DeferredAcknowledgmentState
+                    .pre_mutation_reconciliation_claim,
+                marker.state,
+            );
+        }
+
+        var recovery = switch (try parent_engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        var result = try parent_engine.executeRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            api.ExitStatus.configuration,
+            result.exit_status,
+        );
+        try std.testing.expect(!result.changed);
+        var final_active = try parent_store.interface().readActive(
+            std.testing.allocator,
+            fixture.state_path,
+        );
+        defer if (final_active) |*active| active.deinit();
+        try std.testing.expect(final_active == null);
+        var final_inspection = try runner.interface().inspect(
+            std.testing.allocator,
+        );
+        defer final_inspection.deinit();
+        try std.testing.expect(
+            final_inspection.deferred_acknowledgment == null,
+        );
+        mutation_observed = true;
+        fixture.dpkg.access(
+            std.testing.io,
+            "mutation-observed",
+            .{},
+        ) catch {
+            mutation_observed = false;
+        };
+        try std.testing.expect(!mutation_observed);
+    }
 }
 
 test "apt_system_orchestrator.test.required_privileged.production runner retains successful ownership through outer crash matrix" {
@@ -13366,6 +13989,333 @@ test "apt_system_orchestrator.test.finish pre-mutation fsync and CAS races never
     }
 }
 
+test "apt_system_orchestrator.test.pre-mutation reconciliation claims survive every outer crash boundary" {
+    const CrashCase = enum {
+        after_claim_publish,
+        after_outer_recheck,
+        after_retained_publish,
+        after_active_cas,
+        before_claim_ack,
+        after_claim_ack,
+    };
+    inline for (std.enums.values(CrashCase)) |crash_case| {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.verifier.lock_failure_on_check = .{
+            .check = harness.verifier.lock_checks + 1,
+            .failure = error.OperationalVerificationFailure,
+        };
+        var crash: FakeCompletionCrash = .{
+            .boundary = switch (crash_case) {
+                .after_claim_publish => .after_pre_mutation_claim_published,
+                .after_outer_recheck => .after_pre_mutation_outer_rechecked,
+                .before_claim_ack => .before_ownership_acknowledged,
+                .after_claim_ack => .after_ownership_acknowledged,
+                .after_retained_publish,
+                .after_active_cas,
+                => .after_backend_success,
+            },
+        };
+        switch (crash_case) {
+            .after_claim_publish,
+            .after_outer_recheck,
+            .before_claim_ack,
+            .after_claim_ack,
+            => harness.engine.completion_crash = crash.interface(),
+            .after_retained_publish => harness.store.fail_after_retain_once = true,
+            .after_active_cas => harness.store.fail_after_active_cas_once = true,
+        }
+        var interrupted = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer interrupted.deinit();
+        try std.testing.expectEqual(
+            api.ExitStatus.recovery,
+            interrupted.exit_status,
+        );
+        try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+        harness.engine.completion_crash = null;
+
+        if (crash_case == .after_active_cas) {
+            const marker = harness.runner.inspect_deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+            try std.testing.expectEqual(
+                root_operation.DeferredAcknowledgmentState
+                    .pre_mutation_reconciliation_claim,
+                marker.state,
+            );
+            const foreign = try harness.engine.prepareRecovery(
+                std.testing.allocator,
+                "/foreign-profile.json",
+            );
+            switch (foreign) {
+                .ready => |value| {
+                    var unexpected = value;
+                    unexpected.deinit();
+                    return error.UnexpectedForeignRecovery;
+                },
+                .result => |value| {
+                    var result = value;
+                    defer result.deinit();
+                    try std.testing.expectEqual(
+                        api.MutationStatus.unknown,
+                        result.mutation_status.?,
+                    );
+                },
+            }
+            try std.testing.expect(
+                harness.runner.inspect_deferred_acknowledgment != null,
+            );
+        }
+
+        var recovery = switch (try harness.engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => |result| {
+                var owned = result;
+                defer owned.deinit();
+                return error.ExpectedRecoveryPreparation;
+            },
+        };
+        defer recovery.deinit();
+        var converged = try harness.engine.executeRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        defer converged.deinit();
+        try std.testing.expectEqual(
+            api.ExitStatus.configuration,
+            converged.exit_status,
+        );
+        try std.testing.expect(!converged.changed);
+        try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+        try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(
+            harness.runner.inspect_deferred_acknowledgment == null,
+        );
+    }
+}
+
+test "apt_system_orchestrator.test.verifier OOM and invariant failures bypass reconciliation" {
+    inline for ([_]VerificationError{
+        error.OutOfMemory,
+        error.InvariantViolation,
+    }) |failure| {
+        var lock_harness = Harness.init(std.testing.allocator);
+        defer lock_harness.deinit();
+        lock_harness.rebind();
+        var lock_prepared = try expectReady(try lock_harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer lock_prepared.deinit();
+        const lock_inspections = lock_harness.runner.inspect_calls;
+        const lock_finish_calls = lock_harness.store.finish_calls;
+        lock_harness.verifier.lock_failure_on_check = .{
+            .check = lock_harness.verifier.lock_checks + 1,
+            .failure = failure,
+        };
+        if (failure == error.OutOfMemory)
+            try std.testing.expectError(
+                error.OutOfMemory,
+                lock_harness.engine.execute(
+                    std.testing.allocator,
+                    lock_prepared,
+                    true,
+                ),
+            )
+        else
+            try std.testing.expectError(
+                error.InvariantViolation,
+                lock_harness.engine.execute(
+                    std.testing.allocator,
+                    lock_prepared,
+                    true,
+                ),
+            );
+        try std.testing.expectEqual(
+            lock_inspections,
+            lock_harness.runner.inspect_calls,
+        );
+        try std.testing.expectEqual(
+            lock_finish_calls,
+            lock_harness.store.finish_calls,
+        );
+        try std.testing.expect(lock_harness.store.active_bytes != null);
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            lock_harness.backend.execute_calls,
+        );
+
+        var transaction_harness = Harness.init(std.testing.allocator);
+        defer transaction_harness.deinit();
+        transaction_harness.rebind();
+        var transaction_prepared = try expectReady(
+            try transaction_harness.engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.install, &.{"alpha"}),
+            ),
+        );
+        defer transaction_prepared.deinit();
+        transaction_harness.verifier.transaction_failure_on_check = .{
+            .check = transaction_harness.verifier.transaction_checks + 1,
+            .failure = failure,
+        };
+        const transaction_inspections =
+            transaction_harness.runner.inspect_calls;
+        if (failure == error.OutOfMemory)
+            try std.testing.expectError(
+                error.OutOfMemory,
+                transaction_harness.engine.execute(
+                    std.testing.allocator,
+                    transaction_prepared,
+                    true,
+                ),
+            )
+        else
+            try std.testing.expectError(
+                error.InvariantViolation,
+                transaction_harness.engine.execute(
+                    std.testing.allocator,
+                    transaction_prepared,
+                    true,
+                ),
+            );
+        try std.testing.expectEqual(
+            transaction_inspections,
+            transaction_harness.runner.inspect_calls,
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            transaction_harness.backend.execute_calls,
+        );
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            transaction_harness.runner.ownership_finalize_calls,
+        );
+        var active = try operation_state.decode(
+            std.testing.allocator,
+            transaction_harness.store.active_bytes.?,
+            operation_state.maximum_document_bytes,
+        );
+        defer active.deinit();
+        try std.testing.expect(active.state.mutation_started);
+
+        var acknowledgment_harness = Harness.init(std.testing.allocator);
+        defer acknowledgment_harness.deinit();
+        acknowledgment_harness.rebind();
+        var acknowledgment_prepared = try expectReady(
+            try acknowledgment_harness.engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.install, &.{"alpha"}),
+            ),
+        );
+        defer acknowledgment_prepared.deinit();
+        acknowledgment_harness.verifier.lock_failure_on_check = .{
+            .check = acknowledgment_harness.verifier.lock_checks + 4,
+            .failure = failure,
+        };
+        if (failure == error.OutOfMemory)
+            try std.testing.expectError(
+                error.OutOfMemory,
+                acknowledgment_harness.engine.execute(
+                    std.testing.allocator,
+                    acknowledgment_prepared,
+                    true,
+                ),
+            )
+        else
+            try std.testing.expectError(
+                error.InvariantViolation,
+                acknowledgment_harness.engine.execute(
+                    std.testing.allocator,
+                    acknowledgment_prepared,
+                    true,
+                ),
+            );
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            acknowledgment_harness.runner.ownership_finalize_calls,
+        );
+        try std.testing.expect(
+            acknowledgment_harness.store.active_bytes != null,
+        );
+    }
+}
+
+test "apt_system_orchestrator.test.operational verifier failures enter durable reconciliation" {
+    {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.verifier.lock_failure_on_check = .{
+            .check = harness.verifier.lock_checks + 1,
+            .failure = error.OperationalVerificationFailure,
+        };
+        var result = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            api.ExitStatus.configuration,
+            result.exit_status,
+        );
+        try std.testing.expect(!result.changed);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(
+            harness.runner.inspect_deferred_acknowledgment == null,
+        );
+    }
+    {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.verifier.transaction_failure_on_check = .{
+            .check = harness.verifier.transaction_checks + 1,
+            .failure = error.OperationalVerificationFailure,
+        };
+        const inspections = harness.runner.inspect_calls;
+        var result = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+        try std.testing.expectEqual(
+            api.MutationStatus.unknown,
+            result.mutation_status.?,
+        );
+        try std.testing.expect(harness.runner.inspect_calls > inspections);
+        try std.testing.expect(harness.store.active_bytes != null);
+        try std.testing.expectEqual(@as(usize, 1), harness.backend.execute_calls);
+    }
+}
+
 test "apt_system_orchestrator.test.lower marker and record matrix never infers mutation from acknowledgment alone" {
     for (std.enums.values(root_operation.DeferredAcknowledgmentState)) |state| {
         var harness = Harness.init(std.testing.allocator);
@@ -13376,10 +14326,23 @@ test "apt_system_orchestrator.test.lower marker and record matrix never infers m
             mutationRequest(.install, &.{"alpha"}),
         ));
         defer prepared.deinit();
+        const claim_binding: ?root_operation.PreMutationReconciliationClaimBinding =
+            if (state == .pre_mutation_reconciliation_claim) .{
+                .outer_attempt_id = prepared.attempt_id,
+                .outer_generation = 99,
+                .outer_state_sha256 = @splat(0x84),
+                .profile_sha256 = @splat(0x85),
+                .profile_reference_sha256 = @splat(0x86),
+                .exact_lock_sha256 = @splat(0x87),
+                .semantic_request_sha256 = @splat(0x88),
+            } else null;
         harness.runner.inspect_deferred_acknowledgment =
             try root_operation.createDeferredAcknowledgment(.{
                 .state = state,
-                .attempt_id = @splat(0x81),
+                .attempt_id = if (claim_binding) |claim|
+                    root_operation.preMutationReconciliationClaimId(claim)
+                else
+                    @splat(0x81),
                 .completion_sha256 = if (state == .pending or
                     state == .acknowledged)
                     @splat(0x82)
@@ -13390,6 +14353,7 @@ test "apt_system_orchestrator.test.lower marker and record matrix never infers m
                     @splat(0x83)
                 else
                     null,
+                .pre_mutation_claim = claim_binding,
                 .acknowledgment_id = prepared.attempt_id,
             });
         var result = try harness.engine.reconcilePreparedError(
@@ -13893,9 +14857,13 @@ test "apt_system_orchestrator.test.profile drift and exact-lock drift fail befor
         true,
     );
     defer lock_result.deinit();
-    try std.testing.expectEqual(api.Outcome.planning, lock_result.outcome);
+    try std.testing.expectEqual(api.Outcome.recovery, lock_result.outcome);
+    try std.testing.expectEqual(
+        api.MutationStatus.unknown,
+        lock_result.mutation_status.?,
+    );
     try std.testing.expectEqual(@as(usize, 0), lock_harness.backend.execute_calls);
-    try std.testing.expect(lock_harness.store.active_bytes == null);
+    try std.testing.expect(lock_harness.store.active_bytes != null);
 }
 
 test "apt_system_orchestrator.test.valid lock replacement is rejected before download and execute" {
@@ -14564,6 +15532,8 @@ test "apt_system_orchestrator.test.profile replacement blocks recovery and recon
         );
         defer crashed.deinit();
         try std.testing.expectEqual(api.Outcome.recovery, crashed.outcome);
+        const completion_reads_before_profile_replacement =
+            harness.runner.recovery_completion_reads;
         harness.engine.completion_crash = null;
         var reconciliation = switch (try harness.engine.prepareRecovery(
             std.testing.allocator,
@@ -14584,7 +15554,7 @@ test "apt_system_orchestrator.test.profile replacement blocks recovery and recon
         try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
         try std.testing.expectEqual(
-            @as(usize, 0),
+            completion_reads_before_profile_replacement,
             harness.runner.recovery_completion_reads,
         );
     }
