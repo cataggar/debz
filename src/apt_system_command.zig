@@ -532,11 +532,7 @@ fn confirmationResult(
 fn recoveryConfirmationResult(
     recovery: orchestrator.RecoveryPreparation,
 ) !api.Result {
-    var result = try recovery.prepared.confirmationResult();
-    result.changed = recovery.mutation_status == .changed;
-    result.summary = recovery.action;
-    result.diagnostics[0].message = recovery.action;
-    return api.complete(result);
+    return recovery.confirmationResult();
 }
 
 fn unknownRecoveryReviewResult(

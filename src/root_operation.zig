@@ -277,6 +277,7 @@ pub const RecoveryReviewClaim = struct {
     outer_attempt_id: [32]u8,
     outer_generation: u64,
     outer_state_sha256: [32]u8,
+    profile_path_sha256: [32]u8,
     profile_sha256: [32]u8,
     profile_reference_sha256: [32]u8,
     exact_lock_sha256: [32]u8,
@@ -671,6 +672,7 @@ const WireRecoveryReviewClaim = struct {
     outer_attempt_id: []const u8,
     outer_generation: u64,
     outer_state_sha256: []const u8,
+    profile_path_sha256: []const u8,
     profile_sha256: []const u8,
     profile_reference_sha256: []const u8,
     exact_lock_sha256: []const u8,
@@ -750,6 +752,7 @@ pub fn decodeRecoveryReviewClaim(
         .outer_attempt_id = try parseHex(32, wire.outer_attempt_id),
         .outer_generation = wire.outer_generation,
         .outer_state_sha256 = try parseHex(32, wire.outer_state_sha256),
+        .profile_path_sha256 = try parseHex(32, wire.profile_path_sha256),
         .profile_sha256 = try parseHex(32, wire.profile_sha256),
         .profile_reference_sha256 = try parseHex(
             32,
@@ -1071,6 +1074,7 @@ fn recoveryReviewClaimDigest(claim: RecoveryReviewClaim) [32]u8 {
     std.mem.writeInt(u64, &generation, claim.outer_generation, .little);
     hash.update(&generation);
     hash.update(&claim.outer_state_sha256);
+    hash.update(&claim.profile_path_sha256);
     hash.update(&claim.profile_sha256);
     hash.update(&claim.profile_reference_sha256);
     hash.update(&claim.exact_lock_sha256);
@@ -1110,6 +1114,8 @@ fn writeRecoveryReviewClaim(
     try writer.print(",\"outer_generation\":{}", .{claim.outer_generation});
     try writer.writeAll(",\"outer_state_sha256\":");
     try writeHexString(writer, &claim.outer_state_sha256);
+    try writer.writeAll(",\"profile_path_sha256\":");
+    try writeHexString(writer, &claim.profile_path_sha256);
     try writer.writeAll(",\"profile_sha256\":");
     try writeHexString(writer, &claim.profile_sha256);
     try writer.writeAll(",\"profile_reference_sha256\":");
@@ -2258,8 +2264,11 @@ pub const Coordinator = struct {
             observer.hit(.after_lock_acquired) catch return error.StoreFailed;
 
         const store_handle = self.store();
-        if (store_handle.readRecoveryReviewClaim(allocator) catch
-            return error.RecordCorrupt) |review|
+        if (store_handle.readRecoveryReviewClaim(allocator) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.RecordCorrupt,
+            }) |review|
         {
             const expected = request.recovery_review_claim_sha256 orelse
                 return error.RecoveryRequired;
@@ -2277,7 +2286,10 @@ pub const Coordinator = struct {
             store_handle.clearRecoveryReviewClaim(
                 allocator,
                 expected,
-            ) catch return error.StoreFailed;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.StoreFailed,
+            };
         } else if (request.recovery_review_claim_sha256 != null) {
             return error.RecoveryRequired;
         }
@@ -3506,6 +3518,7 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
             .outer_attempt_id = @splat(0xd0),
             .outer_generation = 7,
             .outer_state_sha256 = @splat(0xd1),
+            .profile_path_sha256 = @splat(0xd7),
             .profile_sha256 = @splat(0xd2),
             .profile_reference_sha256 = @splat(0xd3),
             .exact_lock_sha256 = @splat(0xd4),
@@ -3517,6 +3530,7 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
             .outer_attempt_id = @splat(0xe0),
             .outer_generation = 8,
             .outer_state_sha256 = @splat(0xe1),
+            .profile_path_sha256 = @splat(0xe8),
             .profile_sha256 = @splat(0xe2),
             .profile_reference_sha256 = @splat(0xe3),
             .exact_lock_sha256 = @splat(0xe4),
@@ -3541,6 +3555,7 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
         .outer_attempt_id = @splat(0xf0),
         .outer_generation = 9,
         .outer_state_sha256 = @splat(0xf1),
+        .profile_path_sha256 = @splat(0xf7),
         .profile_sha256 = @splat(0xf2),
         .profile_reference_sha256 = @splat(0xf3),
         .exact_lock_sha256 = @splat(0xf4),

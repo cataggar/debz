@@ -1574,10 +1574,15 @@ pub const Backend = struct {
                 store,
                 acknowledgment.acknowledgment_id,
                 digest,
-            ) catch return blockedRecovery(
-                request.operation,
-                "the confirmed recovery review is stale or foreign",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalFailure => return blockedRecovery(
+                    request.operation,
+                    "the confirmed recovery review is stale or foreign",
+                ),
+            };
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -1775,10 +1780,15 @@ pub const Backend = struct {
                 store,
                 acknowledgment.acknowledgment_id,
                 digest,
-            ) catch return blockedRecovery(
-                request.operation,
-                "the confirmed recovery review is stale or foreign",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalFailure => return blockedRecovery(
+                    request.operation,
+                    "the confirmed recovery review is stale or foreign",
+                ),
+            };
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -1986,10 +1996,15 @@ pub const Backend = struct {
                 store,
                 orchestration_id,
                 digest,
-            ) catch return blockedRecovery(
-                request.operation,
-                "the confirmed recovery review is stale or foreign",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalFailure => return blockedRecovery(
+                    request.operation,
+                    "the confirmed recovery review is stale or foreign",
+                ),
+            };
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -2438,14 +2453,24 @@ fn workflowMode(operation: api.Operation, workflow: ?WorkflowDirective) Workflow
     };
 }
 
+const ConsumeRecoveryReviewClaimError = error{
+    OutOfMemory,
+    ContractViolation,
+    InvariantViolation,
+    OperationalFailure,
+};
+
 fn consumeRecoveryReviewClaim(
     allocator: std.mem.Allocator,
     store: root_operation.Store,
     orchestration_id: [32]u8,
     expected_digest: [32]u8,
-) !void {
-    const review = try store.readRecoveryReviewClaim(allocator) orelse
-        return error.RecoveryReviewClaimMissing;
+) ConsumeRecoveryReviewClaimError!void {
+    const review = store.readRecoveryReviewClaim(allocator) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.OperationalFailure,
+        } orelse return error.OperationalFailure;
     if (!std.mem.eql(
         u8,
         &review.outer_attempt_id,
@@ -2454,8 +2479,12 @@ fn consumeRecoveryReviewClaim(
         u8,
         &review.digest_sha256,
         &expected_digest,
-    )) return error.RecoveryReviewClaimMismatch;
-    try store.clearRecoveryReviewClaim(allocator, expected_digest);
+    )) return error.OperationalFailure;
+    store.clearRecoveryReviewClaim(allocator, expected_digest) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.OperationalFailure,
+        };
 }
 
 fn workflowRootOperation(
