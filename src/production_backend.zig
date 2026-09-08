@@ -45,7 +45,9 @@ pub const WorkflowRequest = struct {
     /// Internal cross-layer protocol. Ordinary product recovery keeps its
     /// historical clear-on-success behavior.
     defer_recovery_clear: bool = false,
-    deferred_acknowledgment_id: ?[32]u8 = null,
+    /// Internal outer-attempt identity, bound into the lower root record
+    /// namespace before an orchestrated mutation can begin.
+    orchestration_id: ?[32]u8 = null,
     recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
 };
 
@@ -53,7 +55,7 @@ const WorkflowDirective = struct {
     operation: WorkflowSemanticOperation,
     mode: WorkflowMode,
     defer_recovery_clear: bool = false,
-    deferred_acknowledgment_id: ?[32]u8 = null,
+    orchestration_id: ?[32]u8 = null,
 };
 
 const TransactionSemanticOperation = enum {
@@ -204,10 +206,10 @@ pub const Backend = struct {
         };
         if (workflow.recovery_acknowledgment) |acknowledgment| {
             if (workflow.mode != .recover or !workflow.defer_recovery_clear or
-                workflow.deferred_acknowledgment_id == null or
+                workflow.orchestration_id == null or
                 !std.mem.eql(
                     u8,
-                    &workflow.deferred_acknowledgment_id.?,
+                    &workflow.orchestration_id.?,
                     &acknowledgment.acknowledgment_id,
                 ))
                 return api.failure(
@@ -227,7 +229,7 @@ pub const Backend = struct {
             .operation = workflow.operation,
             .mode = workflow.mode,
             .defer_recovery_clear = workflow.defer_recovery_clear,
-            .deferred_acknowledgment_id = workflow.deferred_acknowledgment_id,
+            .orchestration_id = workflow.orchestration_id,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -598,12 +600,12 @@ pub const Backend = struct {
             directive.mode == .recover and directive.defer_recovery_clear
         else
             false;
-        guard.deferred_acknowledgment_id = if (workflow) |directive|
-            directive.deferred_acknowledgment_id
+        guard.orchestration_id = if (workflow) |directive|
+            directive.orchestration_id
         else
             null;
         if (guard.preserve_settled and
-            guard.deferred_acknowledgment_id == null)
+            guard.orchestration_id == null)
             return api.failure(
                 request.operation,
                 .internal,
@@ -631,7 +633,7 @@ pub const Backend = struct {
                 else
                     false,
                 if (workflow) |directive|
-                    directive.deferred_acknowledgment_id
+                    directive.orchestration_id
                 else
                     null,
             )) |result|
@@ -1042,7 +1044,7 @@ pub const Backend = struct {
                 else
                     false,
                 if (workflow) |directive|
-                    directive.deferred_acknowledgment_id
+                    directive.orchestration_id
                 else
                     null,
             )) |result| return result;
@@ -1238,6 +1240,35 @@ pub const Backend = struct {
             request.operation,
             "the interrupted root attempt was executed by a different transaction backend",
         );
+        const orchestration_binding =
+            if (defer_clear)
+                root_operation.Store.init(
+                    guard.owned_root.?.root,
+                ).readDeferredAcknowledgment(allocator) catch
+                    return blockedRecovery(
+                        request.operation,
+                        "lower orchestration binding is unreadable",
+                    )
+            else
+                null;
+        if (defer_clear and
+            (orchestration_binding == null or acknowledgment_id == null or
+                (orchestration_binding.?.state != .bound and
+                    orchestration_binding.?.state != .pending) or
+                !std.mem.eql(
+                    u8,
+                    &orchestration_binding.?.attempt_id,
+                    &record.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &orchestration_binding.?.acknowledgment_id,
+                    &acknowledgment_id.?,
+                )))
+            return blockedRecovery(
+                request.operation,
+                "lower orchestration binding is missing, stale, or foreign",
+            );
 
         const evidence = try self.collectOwedEvidence(allocator, request, record);
         if (evidence.blocked) |message| return blockedRecovery(request.operation, message);
@@ -1285,11 +1316,12 @@ pub const Backend = struct {
             .journal_archived = evidence.journal.status == .archived,
         });
         if (defer_clear) {
-            const marker = root_operation.createDeferredAcknowledgment(.{
+            const marker = try root_operation.createDeferredAcknowledgment(.{
+                .state = .pending,
                 .attempt_id = record.attempt_id,
                 .completion_sha256 = statement.document.digest_sha256,
                 .provenance_sha256 = provenance_sha256,
-                .acknowledgment_id = acknowledgment_id.?,
+                .acknowledgment_id = orchestration_binding.?.acknowledgment_id,
             });
             root_operation.Store.init(
                 guard.owned_root.?.root,
@@ -1411,19 +1443,22 @@ pub const Backend = struct {
             );
         }
         const observed_marker = marker.?;
-        if (!std.mem.eql(
-            u8,
-            &observed_marker.attempt_id,
-            &acknowledgment.attempt_id,
-        ) or
+        if (observed_marker.state == .bound or
+            observed_marker.completion_sha256 == null or
+            observed_marker.provenance_sha256 == null or
             !std.mem.eql(
                 u8,
-                &observed_marker.completion_sha256,
+                &observed_marker.attempt_id,
+                &acknowledgment.attempt_id,
+            ) or
+            !std.mem.eql(
+                u8,
+                &observed_marker.completion_sha256.?,
                 &acknowledgment.completion_sha256,
             ) or
             !std.mem.eql(
                 u8,
-                &observed_marker.provenance_sha256,
+                &observed_marker.provenance_sha256.?,
                 &acknowledgment.provenance_sha256,
             ) or
             !std.mem.eql(
@@ -1937,15 +1972,17 @@ fn deferredMarkerMatches(
 ) bool {
     const provenance_sha256 = record.provenance_sha256 orelse return false;
     return marker.state == .pending and
+        marker.completion_sha256 != null and
+        marker.provenance_sha256 != null and
         std.mem.eql(u8, &marker.attempt_id, &record.attempt_id) and
         std.mem.eql(
             u8,
-            &marker.completion_sha256,
+            &marker.completion_sha256.?,
             &document.digest_sha256,
         ) and
         std.mem.eql(
             u8,
-            &marker.provenance_sha256,
+            &marker.provenance_sha256.?,
             &provenance_sha256,
         ) and
         std.mem.eql(
@@ -1962,11 +1999,12 @@ fn recordMatchesAcknowledgment(
     return record.state == .completed and
         record.provenance == .published and
         record.provenance_sha256 != null and
+        marker.provenance_sha256 != null and
         std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) and
         std.mem.eql(
             u8,
             &record.provenance_sha256.?,
-            &marker.provenance_sha256,
+            &marker.provenance_sha256.?,
         );
 }
 
@@ -1990,7 +2028,7 @@ const RootOperationGuard = struct {
     /// acknowledgment hand-off. The settled record remains until that outer
     /// coordinator retains and explicitly acknowledges its exact token.
     preserve_settled: bool = false,
-    deferred_acknowledgment_id: ?[32]u8 = null,
+    orchestration_id: ?[32]u8 = null,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -2055,8 +2093,57 @@ const RootOperationGuard = struct {
             .target_architecture = request.options.architecture,
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
-            .deferred_acknowledgment_id = self.deferred_acknowledgment_id,
+            .orchestration_id = self.orchestration_id,
         }) catch |err| return mapRootOperationError(request.operation, err);
+        if (self.orchestration_id) |orchestration_id| {
+            const store = self.coordinator.store();
+            const existing = store.readDeferredAcknowledgment(
+                allocator,
+            ) catch return api.failure(
+                request.operation,
+                .internal,
+                .internal_error,
+                "lower orchestration binding is unreadable",
+            );
+            if (existing) |binding| {
+                if (!std.mem.eql(
+                    u8,
+                    &binding.attempt_id,
+                    &self.attempt.?.record().attempt_id,
+                ) or !std.mem.eql(
+                    u8,
+                    &binding.acknowledgment_id,
+                    &orchestration_id,
+                )) return blockedRecovery(
+                    request.operation,
+                    "lower operation belongs to a different outer orchestrator attempt",
+                );
+            } else {
+                if (self.preserve_settled) return blockedRecovery(
+                    request.operation,
+                    "lower operation has no originating outer orchestration binding",
+                );
+                const binding = root_operation.createDeferredAcknowledgment(.{
+                    .state = .bound,
+                    .attempt_id = self.attempt.?.record().attempt_id,
+                    .acknowledgment_id = orchestration_id,
+                }) catch return api.failure(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    "lower orchestration binding is invalid",
+                );
+                store.publishDeferredAcknowledgment(
+                    allocator,
+                    binding,
+                ) catch return api.failure(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    "lower orchestration binding could not be published",
+                );
+            }
+        }
         return null;
     }
 
@@ -2180,8 +2267,39 @@ const RootOperationGuard = struct {
             }),
         ) catch |err| return mapRootOperationError(operation, err);
         try self.crash(.after_provenance_published);
+        self.clearBoundOrchestrationBinding() catch
+            return blockedRecovery(
+                operation,
+                "completed lower operation orchestration binding could not be cleared",
+            );
         attempt.clear() catch |err| return mapRootOperationError(operation, err);
         return null;
+    }
+
+    fn clearBoundOrchestrationBinding(
+        self: *RootOperationGuard,
+    ) !void {
+        const orchestration_id = self.orchestration_id orelse return;
+        const attempt = self.active() orelse return;
+        const store = self.coordinator.store();
+        const binding = try store.readDeferredAcknowledgment(self.allocator) orelse
+            return error.MissingOrchestrationBinding;
+        if (binding.state != .bound or
+            !std.mem.eql(
+                u8,
+                &binding.attempt_id,
+                &attempt.record().attempt_id,
+            ) or
+            !std.mem.eql(
+                u8,
+                &binding.acknowledgment_id,
+                &orchestration_id,
+            ))
+            return error.OrchestrationBindingMismatch;
+        try store.clearDeferredAcknowledgment(
+            self.allocator,
+            binding.digest_sha256,
+        );
     }
 
     fn deinit(self: *RootOperationGuard) void {
@@ -2195,10 +2313,25 @@ const RootOperationGuard = struct {
             // A simulated crash unwinds without any of this: the record must
             // survive exactly as the dead process left it.
             if (value.locked() and !self.crashed) {
-                if (value.record().state.provenPreMutation())
-                    value.abandonIfPreMutation(self.allocator) catch {}
-                else if (value.record().clearable() and !self.preserve_settled)
-                    value.clear() catch {};
+                if (value.record().state.provenPreMutation()) {
+                    const binding_cleared = if (self.orchestration_id == null)
+                        true
+                    else blk: {
+                        self.clearBoundOrchestrationBinding() catch break :blk false;
+                        break :blk true;
+                    };
+                    if (binding_cleared)
+                        value.abandonIfPreMutation(self.allocator) catch {};
+                } else if (value.record().clearable() and !self.preserve_settled) {
+                    const binding_cleared = if (self.orchestration_id == null)
+                        true
+                    else blk: {
+                        self.clearBoundOrchestrationBinding() catch break :blk false;
+                        break :blk true;
+                    };
+                    if (binding_cleared)
+                        value.clear() catch {};
+                }
             }
             value.release();
         }
@@ -4150,15 +4283,66 @@ test "production workflow deferred recovery completion survives every handoff cr
         options.assume_yes = true;
         options.noninteractive = true;
         options.conffile = .keep_existing;
+        const acknowledgment_id: [32]u8 = @splat(0x6a);
         const interrupted = try backend.executeWorkflow(allocator, .{
             .operation = .remove,
             .mode = .execute,
             .selectors = &selectors,
             .options = options,
+            .orchestration_id = acknowledgment_id,
         });
         try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
         const mutation_calls = process.calls;
-        const acknowledgment_id: [32]u8 = @splat(0x6a);
+        const competing_orchestration_id: [32]u8 = @splat(0x7b);
+        var competing_options = options;
+        competing_options.state_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}-competing",
+            .{fixture.state_path},
+        );
+        const competing_execute = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = competing_options,
+            .orchestration_id = competing_orchestration_id,
+        });
+        try std.testing.expectEqual(
+            api.ExitStatus.recovery,
+            competing_execute.exit_status,
+        );
+        const competing_recovery = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = competing_options,
+            .defer_recovery_clear = true,
+            .orchestration_id = competing_orchestration_id,
+        });
+        try std.testing.expectEqual(
+            api.ExitStatus.recovery,
+            competing_recovery.exit_status,
+        );
+        try std.testing.expectEqual(mutation_calls, process.calls);
+        const bound_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation.deferred_ack_path,
+            allocator,
+            .limited(root_operation.maximum_document_bytes),
+        );
+        const bound = try root_operation.decodeDeferredAcknowledgment(
+            allocator,
+            bound_source,
+        );
+        try std.testing.expectEqual(
+            root_operation.DeferredAcknowledgmentState.bound,
+            bound.state,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            &acknowledgment_id,
+            &bound.acknowledgment_id,
+        );
 
         var recovery_crash: TestCompletionCrash = .{
             .point = recovery_crash_point,
@@ -4170,7 +4354,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = acknowledgment_id,
+            .orchestration_id = acknowledgment_id,
         });
         try std.testing.expectEqual(
             api.ExitStatus.internal,
@@ -4186,7 +4370,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = acknowledgment_id,
+            .orchestration_id = acknowledgment_id,
         });
         try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
         try std.testing.expectEqual(mutation_calls, process.calls);
@@ -4227,19 +4411,14 @@ test "production workflow deferred recovery completion survives every handoff cr
             "root/" ++ root_operation.deferred_ack_path,
             .{},
         );
-        var foreign_options = options;
-        foreign_options.state_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}-foreign",
-            .{fixture.state_path},
-        );
         var contender: DeferredAckContender = .{
             .backend = &backend,
             .request = .{
                 .operation = .remove,
                 .mode = .execute,
                 .selectors = &selectors,
-                .options = foreign_options,
+                .options = competing_options,
+                .orchestration_id = competing_orchestration_id,
             },
         };
         const contender_thread = try std.Thread.spawn(
@@ -4262,7 +4441,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = acknowledgment_id,
+            .orchestration_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = wrong_completion,
@@ -4276,19 +4455,18 @@ test "production workflow deferred recovery completion survives every handoff cr
             "root/" ++ root_operation.record_path,
             .{},
         );
-        const foreign_acknowledgment_id: [32]u8 = @splat(0x7b);
         const foreign_ack = try backend.executeWorkflow(allocator, .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = foreign_acknowledgment_id,
+            .orchestration_id = competing_orchestration_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = completion.document.digest_sha256,
                 .provenance_sha256 = record.record.provenance_sha256.?,
-                .acknowledgment_id = foreign_acknowledgment_id,
+                .acknowledgment_id = competing_orchestration_id,
             },
         });
         try std.testing.expectEqual(
@@ -4318,7 +4496,7 @@ test "production workflow deferred recovery completion survives every handoff cr
                 .selectors = &selectors,
                 .options = options,
                 .defer_recovery_clear = true,
-                .deferred_acknowledgment_id = acknowledgment_id,
+                .orchestration_id = acknowledgment_id,
                 .recovery_acknowledgment = .{
                     .attempt_id = record.record.attempt_id,
                     .completion_sha256 = completion.document.digest_sha256,
@@ -4340,7 +4518,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = acknowledgment_id,
+            .orchestration_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = completion.document.digest_sha256,
@@ -4375,7 +4553,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             .selectors = &selectors,
             .options = options,
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = acknowledgment_id,
+            .orchestration_id = acknowledgment_id,
             .recovery_acknowledgment = .{
                 .attempt_id = record.record.attempt_id,
                 .completion_sha256 = completion.document.digest_sha256,
@@ -4389,10 +4567,79 @@ test "production workflow deferred recovery completion survives every handoff cr
             .operation = .remove,
             .mode = .execute,
             .selectors = &selectors,
-            .options = foreign_options,
+            .options = competing_options,
+            .orchestration_id = competing_orchestration_id,
         });
         try std.testing.expect(future.exit_status != .recovery);
     }
+}
+
+test "production workflow deferred recovery cannot claim an unbound lower attempt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var crash: TestCompletionCrash = .{ .point = .after_completed_record };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+        .completion_crash = crash.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const interrupted = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
+    const mutation_calls = process.calls;
+
+    backend.completion_crash = null;
+    const rejected = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+        .defer_recovery_clear = true,
+        .orchestration_id = @splat(0x5c),
+    });
+    try std.testing.expectEqual(api.ExitStatus.recovery, rejected.exit_status);
+    try std.testing.expectEqual(mutation_calls, process.calls);
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.access(
+            std.testing.io,
+            "root/" ++ root_operation.deferred_ack_path,
+            .{},
+        ),
+    );
 }
 
 test "production workflow successful recovery publishes honest completion evidence" {

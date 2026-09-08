@@ -304,13 +304,20 @@ lower-level root-operation state. A completed record with pending provenance
 is routed through `ProductionWorkflow` recovery to
 `dischargeOwedProvenance` without replaying package mutation. Ordinary product
 recovery still clears the record on success. The internal apt/system workflow
-instead requests deferred clearing: discharge publishes the completion and
-an exact root-local `root-operation-deferred-ack-v1.json` marker before
-publishing the completed record's provenance. The marker binds the lower
-attempt, completion digest, provenance digest, and outer apt/system attempt.
-It makes the otherwise clearable completed/published record non-reclaimable by
-every ordinary mutation or recovery, including a request using a different
-profile or state path.
+instead supplies its outer attempt identity to the initial execute. While the
+root-operation lock is still held, and before preflight can enter a mutation
+bridge, the workflow publishes an exact root-local
+`root-operation-deferred-ack-v1.json` marker in the `bound` state. This binds
+the lower attempt to the originating outer apt/system attempt before mutation;
+a different prepared operation cannot adopt or replace it, even when its
+semantic request and exact lock are identical. If recovery must discharge
+owed provenance, it may only atomically transition that exact binding to
+`pending`, adding the completion and provenance digests without changing its
+owner. The pending marker makes the otherwise clearable completed/published
+record non-reclaimable by every ordinary mutation or recovery, including a
+request using a different profile or state path. An uninterrupted success or
+a proven pre-mutation abandonment clears its still-bound marker while holding
+the same root lock.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower

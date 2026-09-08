@@ -241,7 +241,7 @@ pub const WorkflowRequest = struct {
     selectors: []const solver.PackageSelector,
     options: product_api.CommonOptions,
     defer_recovery_clear: bool = false,
-    deferred_acknowledgment_id: ?[32]u8 = null,
+    orchestration_id: ?[32]u8 = null,
     recovery_acknowledgment: ?RecoveryAcknowledgment = null,
 };
 
@@ -316,7 +316,7 @@ pub const ProductionBackend = struct {
             .selectors = request.selectors,
             .options = request.options,
             .defer_recovery_clear = request.defer_recovery_clear,
-            .deferred_acknowledgment_id = request.deferred_acknowledgment_id,
+            .orchestration_id = request.orchestration_id,
             .recovery_acknowledgment = request.recovery_acknowledgment,
         });
     }
@@ -716,7 +716,7 @@ pub const PrivateLiveRootRunner = struct {
                             .completion_sha256 = completion.document.digest_sha256,
                             .provenance_sha256 = record.provenance_sha256.?,
                             .acknowledgment_id = workflow_invocation.request
-                                .deferred_acknowledgment_id orelse
+                                .orchestration_id orelse
                                 return error.MissingRecoveryAcknowledgment,
                         };
                     }
@@ -2607,6 +2607,7 @@ pub const Engine = struct {
                 loaded.view,
                 prepared.paths.exact_lock,
             ),
+            .orchestration_id = prepared.attempt_id,
         }) catch |err| return self.markRecoveryRequired(
             allocator,
             prepared,
@@ -3047,7 +3048,7 @@ pub const Engine = struct {
                 recovery.prepared.paths.exact_lock,
             ),
             .defer_recovery_clear = true,
-            .deferred_acknowledgment_id = recovery.prepared.attempt_id,
+            .orchestration_id = recovery.prepared.attempt_id,
         }) catch return self.recoveryFailed(
             allocator,
             recovery.prepared,
@@ -3245,7 +3246,7 @@ pub const Engine = struct {
                             prepared.paths.exact_lock,
                         ),
                         .defer_recovery_clear = true,
-                        .deferred_acknowledgment_id = prepared.attempt_id,
+                        .orchestration_id = prepared.attempt_id,
                         .recovery_acknowledgment = acknowledgment,
                     },
                 ) catch return self.markRecoveryRequired(
@@ -5630,7 +5631,7 @@ const FakeRunner = struct {
                     .attempt_id = completion.document.attempt_id,
                     .completion_sha256 = completion.document.digest_sha256,
                     .provenance_sha256 = record.record.provenance_sha256.?,
-                    .acknowledgment_id = request.deferred_acknowledgment_id orelse
+                    .acknowledgment_id = request.orchestration_id orelse
                         return error.MissingRecoveryAcknowledgment,
                 };
                 if (self.fail_after_recovery_transport) {

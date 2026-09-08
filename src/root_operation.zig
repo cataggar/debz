@@ -264,17 +264,18 @@ pub const deferred_ack_schema_id =
 pub const deferred_ack_schema_version: u32 = 1;
 
 pub const DeferredAcknowledgmentState = enum {
+    bound,
     pending,
     acknowledged,
 };
 
-/// Root-local non-reclaimable hand-off from a deferred lower recovery to its
-/// exact outer orchestrator attempt.
+/// Root-local ownership binding and non-reclaimable hand-off for an exact
+/// outer orchestrator attempt.
 pub const DeferredAcknowledgment = struct {
-    state: DeferredAcknowledgmentState = .pending,
+    state: DeferredAcknowledgmentState = .bound,
     attempt_id: [32]u8,
-    completion_sha256: [32]u8,
-    provenance_sha256: [32]u8,
+    completion_sha256: ?[32]u8 = null,
+    provenance_sha256: ?[32]u8 = null,
     acknowledgment_id: [32]u8,
     digest_sha256: [32]u8 = @splat(0),
 
@@ -282,6 +283,8 @@ pub const DeferredAcknowledgment = struct {
         self: DeferredAcknowledgment,
         allocator: std.mem.Allocator,
     ) ![]u8 {
+        if (!validDeferredAcknowledgment(self))
+            return error.InvalidDocument;
         if (!std.mem.eql(
             u8,
             &self.digest_sha256,
@@ -301,10 +304,21 @@ pub const DeferredAcknowledgment = struct {
 
 pub fn createDeferredAcknowledgment(
     input: DeferredAcknowledgment,
-) DeferredAcknowledgment {
+) !DeferredAcknowledgment {
+    if (!validDeferredAcknowledgment(input))
+        return error.InvalidDocument;
     var result = input;
     result.digest_sha256 = deferredAcknowledgmentDigest(result);
     return result;
+}
+
+fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
+    return switch (marker.state) {
+        .bound => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null,
+        .pending, .acknowledged => marker.completion_sha256 != null and
+            marker.provenance_sha256 != null,
+    };
 }
 
 const WireDeferredAcknowledgment = struct {
@@ -312,8 +326,8 @@ const WireDeferredAcknowledgment = struct {
     version: u32,
     state: DeferredAcknowledgmentState,
     attempt_id: []const u8,
-    completion_sha256: []const u8,
-    provenance_sha256: []const u8,
+    completion_sha256: ?[]const u8,
+    provenance_sha256: ?[]const u8,
     acknowledgment_id: []const u8,
     digest_sha256: []const u8,
 };
@@ -337,11 +351,13 @@ pub fn decodeDeferredAcknowledgment(
     const decoded: DeferredAcknowledgment = .{
         .state = wire.state,
         .attempt_id = try parseHex(32, wire.attempt_id),
-        .completion_sha256 = try parseHex(32, wire.completion_sha256),
-        .provenance_sha256 = try parseHex(32, wire.provenance_sha256),
+        .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
+        .provenance_sha256 = try parseOptionalHex(wire.provenance_sha256),
         .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
         .digest_sha256 = try parseHex(32, wire.digest_sha256),
     };
+    if (!validDeferredAcknowledgment(decoded))
+        return error.InvalidDocument;
     if (!std.mem.eql(
         u8,
         &decoded.digest_sha256,
@@ -610,8 +626,14 @@ fn deferredAcknowledgmentDigest(
     hash.update(@tagName(marker.state));
     hash.update("\x00");
     hash.update(&marker.attempt_id);
-    hash.update(&marker.completion_sha256);
-    hash.update(&marker.provenance_sha256);
+    if (marker.completion_sha256) |digest|
+        hash.update(&digest)
+    else
+        hash.update("\x00");
+    if (marker.provenance_sha256) |digest|
+        hash.update(&digest)
+    else
+        hash.update("\x00");
     hash.update(&marker.acknowledgment_id);
     return hash.finalResult();
 }
@@ -629,9 +651,9 @@ fn writeDeferredAcknowledgment(
     try writer.writeAll(",\"attempt_id\":");
     try writeHexString(writer, &marker.attempt_id);
     try writer.writeAll(",\"completion_sha256\":");
-    try writeHexString(writer, &marker.completion_sha256);
+    try writeOptionalHex(writer, marker.completion_sha256);
     try writer.writeAll(",\"provenance_sha256\":");
-    try writeHexString(writer, &marker.provenance_sha256);
+    try writeOptionalHex(writer, marker.provenance_sha256);
     try writer.writeAll(",\"acknowledgment_id\":");
     try writeHexString(writer, &marker.acknowledgment_id);
     try writer.writeAll(",\"digest_sha256\":");
@@ -926,7 +948,30 @@ pub const Store = struct {
                 &existing.digest_sha256,
                 &marker.digest_sha256,
             )) return;
-            return error.DeferredAcknowledgmentPresent;
+            if (existing.state != .bound or marker.state != .pending or
+                !std.mem.eql(
+                    u8,
+                    &existing.attempt_id,
+                    &marker.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &existing.acknowledgment_id,
+                    &marker.acknowledgment_id,
+                ))
+                return error.DeferredAcknowledgmentPresent;
+            const bytes = try marker.canonicalJson(allocator);
+            defer allocator.free(bytes);
+            try self.root.publishFile(
+                try root_fs.Path.init(deferred_ack_path),
+                bytes,
+                .{
+                    .permissions = record_permissions,
+                    .overwrite = .replace,
+                    .durable = true,
+                },
+            );
+            return;
         }
         const bytes = try marker.canonicalJson(allocator);
         defer allocator.free(bytes);
@@ -1242,7 +1287,9 @@ pub const Request = struct {
     /// record so its completion can be returned to an outer coordinator
     /// without reclaiming it into a new attempt.
     adopt_settled_for_acknowledgment: bool = false,
-    deferred_acknowledgment_id: ?[32]u8 = null,
+    /// Optional internal outer-attempt identity. Initial acquisition binds it
+    /// durably before mutation and recovery must present the same identity.
+    orchestration_id: ?[32]u8 = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
     attempt_id: ?[32]u8 = null,
@@ -1454,22 +1501,53 @@ pub const Coordinator = struct {
                     marker.digest_sha256,
                 ) catch return error.StoreFailed;
             },
-            .pending => {
-                const acknowledgment_id =
-                    request.deferred_acknowledgment_id orelse
-                    return error.RecoveryRequired;
-                if (!request.adopt_settled_for_acknowledgment or
-                    !std.mem.eql(
+            .bound => {
+                if (prior != null and prior.?.record.clearable() and
+                    recordMatchesDeferredAcknowledgment(
+                        prior.?.record,
+                        marker,
+                        false,
+                    ))
+                {
+                    store_handle.clearDeferredAcknowledgment(
+                        allocator,
+                        marker.digest_sha256,
+                    ) catch return error.StoreFailed;
+                } else {
+                    const orchestration_id =
+                        request.orchestration_id orelse
+                        return error.RecoveryRequired;
+                    if (!std.mem.eql(
                         u8,
-                        &acknowledgment_id,
+                        &orchestration_id,
                         &marker.acknowledgment_id,
                     ) or
+                        prior == null or
+                        !recordMatchesDeferredAcknowledgment(
+                            prior.?.record,
+                            marker,
+                            true,
+                        ))
+                        return error.RecoveryRequired;
+                }
+            },
+            .pending => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                ) or
                     prior == null or
                     !recordMatchesDeferredAcknowledgment(
                         prior.?.record,
                         marker,
                         true,
                     ))
+                    return error.RecoveryRequired;
+                if (!request.adopt_settled_for_acknowledgment)
                     return error.RecoveryRequired;
             },
         };
@@ -1990,16 +2068,20 @@ fn recordMatchesDeferredAcknowledgment(
     allow_pending_provenance: bool,
 ) bool {
     if (!std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) or
-        record.state != .completed)
+        (marker.state != .bound and record.state != .completed))
         return false;
-    return switch (record.provenance) {
-        .published => record.provenance_sha256 != null and std.mem.eql(
-            u8,
-            &record.provenance_sha256.?,
-            &marker.provenance_sha256,
-        ),
-        .pending => allow_pending_provenance,
-        .not_required => false,
+    return switch (marker.state) {
+        .bound => true,
+        .pending, .acknowledged => switch (record.provenance) {
+            .published => record.provenance_sha256 != null and
+                marker.provenance_sha256 != null and std.mem.eql(
+                u8,
+                &record.provenance_sha256.?,
+                &marker.provenance_sha256.?,
+            ),
+            .pending => allow_pending_provenance,
+            .not_required => false,
+        },
     };
 }
 
