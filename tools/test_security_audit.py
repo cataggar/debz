@@ -136,6 +136,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
         self.assertEqual(
             [
+                "src/apt_system_orchestrator.zig",
                 "src/live_root.zig",
                 "src/maintainer_script.zig",
                 "src/production_backend.zig",
@@ -147,6 +148,18 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertGreater(
             production_backend.index("linux.fork()"),
             production_backend.index('\ntest "'),
+        )
+        apt_system_orchestrator = sources["src/apt_system_orchestrator.zig"]
+        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 2)
+        first_test = apt_system_orchestrator.index('\ntest "')
+        self.assertTrue(
+            all(
+                match.start() > first_test
+                for match in re.finditer(
+                    r"\blinux\.fork\s*\(",
+                    apt_system_orchestrator,
+                )
+            )
         )
         self.assertIn("_ = linux.kill(pid, .KILL);", production_backend)
         self.assertIn("linux.waitpid(pid, &status, 0)", production_backend)

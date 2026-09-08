@@ -340,7 +340,11 @@ active state to that exact completed outcome before compare-and-clearing the
 matching released marker. Before the active-state CAS, recovery holds the
 operation lock, reopens the retained-final document without following links,
 decodes and compares its exact digest and bindings on that descriptor, fsyncs
-the file, then fsyncs its operation directory and durable attempt parent. A
+the file, then fsyncs its operation directory and durable attempt parent. That
+same operation lock remains continuously held through the descriptor
+revalidation immediately before CAS, active-state CAS, and active-state
+durability barrier. The enforced nesting order is operation lock before
+active-state lock; no active-state-locked path acquires an operation lock. A
 rename-visible retained final whose directory sync failed therefore cannot
 authorize active commit or lower acknowledgment. A visible matching active
 document is likewise not by itself proof of durable commit: recovery reopens
@@ -411,8 +415,18 @@ transaction whose provenance discharge was interrupted are accepted without a
 lower workflow replay, recovery request, or fabricated transaction result. It
 never infers recovery from the outer phase or accepts a global completion that
 may belong to an older identical request. Without either durable binding,
-clean reconciliation uses ordinary exact-lock-bound transaction evidence and
-does not claim that lower recovery occurred. The root record request digest is
+an unlocked clean inspection is only advisory. Clean reconciliation reopens
+ordinary exact-lock-bound transaction evidence, then calls an internal lower
+reservation that acquires the root-operation lock, proves both marker and
+record absent, and durably publishes an exact-owner `released` reconciliation
+marker before releasing the lock. The marker attempt binds the outer attempt,
+semantic execute request, exact-lock digest, and evidence digest. If an
+ordinary mutation wins the lower lock, reconciliation fails closed and keeps
+the outer active state; if reconciliation wins, later mutations remain blocked
+until the normal verify, retain, commit, and exact acknowledgment sequence
+finishes. No mutating or recovery completion clears outer state from a null or
+unlocked lower proof. Clean reconciliation does not claim that lower recovery
+occurred. The root record request digest is
 checked against the original execute-mode production
 product request, the discharge digest against the recover-mode production
 product request, and the exact lock's request digest against the separately

@@ -189,7 +189,10 @@ def audit_production_sources() -> None:
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
             if (
-                relative == "src/production_backend.zig"
+                relative in (
+                    "src/apt_system_orchestrator.zig",
+                    "src/production_backend.zig",
+                )
                 and first_test >= 0
                 and match.start() > first_test
                 and match.group() == "linux.fork("

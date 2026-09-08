@@ -11,8 +11,18 @@ pub fn build(b: *std.Build) void {
         std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.3.0 or 1.2.3-rc.1)", .{version});
     };
 
+    const require_privileged_orchestration_tests = b.option(
+        bool,
+        "require-privileged-orchestration-tests",
+        "Fail instead of skipping privileged production orchestration tests",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(
+        bool,
+        "require_privileged_orchestration_tests",
+        require_privileged_orchestration_tests,
+    );
 
     const zstd_dependency = b.dependency("zstd", .{
         .target = target,
@@ -354,7 +364,10 @@ pub fn build(b: *std.Build) void {
     apt_system_orchestrator_test_module.link_libc = true;
     const apt_system_orchestrator_tests = b.addTest(.{
         .root_module = apt_system_orchestrator_test_module,
-        .filters = &.{"apt_system_orchestrator.test."},
+        .filters = if (require_privileged_orchestration_tests)
+            &.{"apt_system_orchestrator.test.production"}
+        else
+            &.{"apt_system_orchestrator.test."},
     });
     const run_apt_system_orchestrator_tests = b.addRunArtifact(
         apt_system_orchestrator_tests,

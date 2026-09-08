@@ -6,6 +6,7 @@
 //! tests cannot accidentally inspect or mutate `/`.
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("debz_build_options");
 const api = @import("apt_system_api.zig");
 const operation_state = @import("apt_system_state.zig");
 const exact_lock = @import("exact_lock.zig");
@@ -245,6 +246,8 @@ pub const RecoveryAcknowledgment =
     production_backend.WorkflowRecoveryAcknowledgment;
 pub const OwnershipAcknowledgment =
     production_backend.WorkflowOwnershipAcknowledgment;
+pub const ReconciliationClaim =
+    production_backend.WorkflowReconciliationClaim;
 
 pub const WorkflowRequest = struct {
     operation: WorkflowOperation,
@@ -253,6 +256,7 @@ pub const WorkflowRequest = struct {
     options: product_api.CommonOptions,
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
+    reconciliation_claim: ?ReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?OwnershipAcknowledgment = null,
     recovery_acknowledgment: ?RecoveryAcknowledgment = null,
@@ -331,6 +335,7 @@ pub const ProductionBackend = struct {
             .options = request.options,
             .defer_recovery_clear = request.defer_recovery_clear,
             .orchestration_id = request.orchestration_id,
+            .reconciliation_claim = request.reconciliation_claim,
             .finalize_ownership = request.finalize_ownership,
             .ownership_acknowledgment = request.ownership_acknowledgment,
             .recovery_acknowledgment = request.recovery_acknowledgment,
@@ -739,6 +744,7 @@ pub const PrivateLiveRootRunner = struct {
         if (invocation == .workflow and
             invocation.workflow.request.mode == .recover and
             !invocation.workflow.request.finalize_ownership and
+            invocation.workflow.request.reconciliation_claim == null and
             invocation.workflow.request.recovery_acknowledgment == null and
             decoded.result.exit_status == .success)
         {
@@ -757,6 +763,7 @@ pub const PrivateLiveRootRunner = struct {
                     if (workflow_invocation.request.mode == .recover and
                         workflow_invocation.request.defer_recovery_clear and
                         !workflow_invocation.request.finalize_ownership and
+                        workflow_invocation.request.reconciliation_claim == null and
                         workflow_invocation.request.recovery_acknowledgment == null)
                     {
                         const record = if (inspection.record) |owned|
@@ -781,7 +788,8 @@ pub const PrivateLiveRootRunner = struct {
                                 return error.MissingRecoveryAcknowledgment,
                         };
                     }
-                    if (workflow_invocation.request.mode == .execute and
+                    if ((workflow_invocation.request.mode == .execute or
+                        workflow_invocation.request.reconciliation_claim != null) and
                         workflow_invocation.request.orchestration_id != null and
                         decoded.result.exit_status == .success)
                     {
@@ -1461,6 +1469,7 @@ pub const DirectorySync = struct {
 
 pub const RetainedDurabilityBoundary = enum {
     before_file_sync,
+    before_active_commit,
 };
 
 pub const RetainedDurability = struct {
@@ -1712,6 +1721,16 @@ pub const SystemStateStore = struct {
             false,
         );
         defer operation_dir.close(self.io);
+        var operation_lock: operation_state.SystemLockBackend = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .dir = operation_dir,
+            .name = operation_lock_name,
+        };
+        const lock = operation_lock.interface();
+        const operation_token = try lock.acquire(self.wait_ms);
+        defer lock.release(operation_token);
+        if (!lock.held(operation_token)) return error.LockLost;
         const existing = try readOptionalFile(
             allocator,
             self.io,
@@ -1722,75 +1741,17 @@ pub const SystemStateStore = struct {
         if (existing == null) {
             const final_bytes = try final.canonicalJson(allocator);
             defer allocator.free(final_bytes);
-            try publishAtomic(
-                self,
+            try self.publishAtomicHeld(
                 allocator,
                 operation_dir,
                 retained_state_name,
                 final_bytes,
+                lock,
+                operation_token,
             );
             if (self.finish_crash) |crash|
                 try crash.hit(.after_retained_publish);
         }
-        var retained = try ensureRetainedFinalDurable(
-            self,
-            allocator,
-            paths,
-            final,
-        );
-        defer retained.deinit();
-        const durable_final = retained.state;
-
-        const state_path = std.fs.path.dirname(
-            std.fs.path.dirname(paths.active_state) orelse
-                return error.InvalidPath,
-        ) orelse return error.InvalidPath;
-        const already_final = expected.generation == durable_final.generation and
-            std.mem.eql(
-                u8,
-                &expected.digest_sha256,
-                &durable_final.digest_sha256,
-            );
-        if (!already_final)
-            try compareAndSet(
-                context,
-                allocator,
-                state_path,
-                expected,
-                durable_final,
-            );
-        try ensureActiveDurable(
-            self,
-            allocator,
-            paths,
-            operation_state.Expected.fromState(durable_final),
-        );
-    }
-
-    fn ensureRetainedFinalDurable(
-        self: *SystemStateStore,
-        allocator: std.mem.Allocator,
-        paths: OperationPaths,
-        expected: operation_state.State,
-    ) !operation_state.OwnedState {
-        var operation_dir = try openSecureAbsoluteDirectory(
-            self,
-            allocator,
-            paths.directory,
-            false,
-        );
-        defer operation_dir.close(self.io);
-        var operation_lock: operation_state.SystemLockBackend = .{
-            .allocator = self.allocator,
-            .io = self.io,
-            .dir = operation_dir,
-            .name = operation_lock_name,
-        };
-        const lock = operation_lock.interface();
-        const token = try lock.acquire(self.wait_ms);
-        defer lock.release(token);
-        if (!lock.held(token)) return error.LockLost;
-
         var file = try operation_dir.openFile(
             self.io,
             retained_state_name,
@@ -1815,13 +1776,13 @@ pub const SystemStateStore = struct {
             source,
             operation_state.maximum_document_bytes,
         );
-        errdefer retained.deinit();
-        if (!finalStateEquivalent(retained.state, expected))
+        defer retained.deinit();
+        if (!finalStateEquivalent(retained.state, final))
             return error.PublicationConflict;
         if (self.retained_durability) |durability|
             try durability.hit(.before_file_sync);
         try file.sync(self.io);
-        if (!lock.held(token)) return error.LockLost;
+        if (!lock.held(operation_token)) return error.LockLost;
         try self.syncDirectoryAt(
             operation_dir,
             .retained_operation_directory,
@@ -1839,8 +1800,53 @@ pub const SystemStateStore = struct {
             attempt_parent,
             .retained_attempt_parent,
         );
-        if (!lock.held(token)) return error.LockLost;
-        return retained;
+        if (!lock.held(operation_token)) return error.LockLost;
+
+        if (self.retained_durability) |durability|
+            try durability.hit(.before_active_commit);
+        try reader.seekTo(0);
+        const revalidated_source = try reader.interface.allocRemaining(
+            allocator,
+            .limited(operation_state.maximum_document_bytes),
+        );
+        defer allocator.free(revalidated_source);
+        var revalidated = try operation_state.decode(
+            allocator,
+            revalidated_source,
+            operation_state.maximum_document_bytes,
+        );
+        defer revalidated.deinit();
+        if (!finalStateEquivalent(revalidated.state, final))
+            return error.PublicationConflict;
+        const durable_final = revalidated.state;
+
+        // Lock ordering is operation lock, then active-state lock. No caller
+        // may acquire an operation lock while holding the active-state lock.
+        const state_path = std.fs.path.dirname(
+            std.fs.path.dirname(paths.active_state) orelse
+                return error.InvalidPath,
+        ) orelse return error.InvalidPath;
+        const already_final = expected.generation == durable_final.generation and
+            std.mem.eql(
+                u8,
+                &expected.digest_sha256,
+                &durable_final.digest_sha256,
+            );
+        if (!already_final)
+            try compareAndSet(
+                context,
+                allocator,
+                state_path,
+                expected,
+                durable_final,
+            );
+        try ensureActiveDurable(
+            self,
+            allocator,
+            paths,
+            operation_state.Expected.fromState(durable_final),
+        );
+        if (!lock.held(operation_token)) return error.LockLost;
     }
 
     fn ensureActiveDurable(
@@ -2248,6 +2254,25 @@ pub const SystemStateStore = struct {
         const lock = operation_lock.interface();
         const token = try lock.acquire(self.wait_ms);
         defer lock.release(token);
+        try self.publishAtomicHeld(
+            allocator,
+            dir,
+            name,
+            source,
+            lock,
+            token,
+        );
+    }
+
+    fn publishAtomicHeld(
+        self: *SystemStateStore,
+        allocator: std.mem.Allocator,
+        dir: std.Io.Dir,
+        name: []const u8,
+        source: []const u8,
+        lock: operation_state.LockBackend,
+        token: operation_state.LockToken,
+    ) !void {
         if (!lock.held(token)) return error.LockLost;
         if (try readOptionalFile(allocator, self.io, dir, name)) |existing| {
             defer allocator.free(existing);
@@ -2497,6 +2522,7 @@ pub const CompletionBoundary = enum {
     after_downloaded_state,
     after_ownership_reserved,
     after_mutating_state,
+    after_clean_recovery_inspection,
     after_backend_success,
     after_transaction_verified,
     after_transaction_retained,
@@ -3606,6 +3632,83 @@ pub const Engine = struct {
                         ),
                 );
             }
+            var reconciliation_acknowledgment: ?OwnershipAcknowledgment = null;
+            if (ownership_marker == null) {
+                const evidence_sha256 = if (current.state.transaction_result) |binding|
+                    binding.digest_sha256
+                else evidence: {
+                    const shared_source = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/{s}",
+                        .{ loaded.view.state_path, transaction_result_name },
+                    );
+                    defer allocator.free(shared_source);
+                    var verified = self.verifier.verifyTransactionFn(
+                        self.verifier.context,
+                        allocator,
+                        shared_source,
+                        recovery_lock.binding,
+                        loaded.view.architecture,
+                    ) catch return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "clean lower root has no verifiable transaction evidence to reconcile",
+                    );
+                    defer verified.deinit();
+                    break :evidence verified.binding.digest_sha256;
+                };
+                try self.hitCompletionBoundary(
+                    .after_clean_recovery_inspection,
+                );
+                const selectors = try selectorsFor(
+                    allocator,
+                    recovery.prepared.request,
+                );
+                defer allocator.free(selectors);
+                var claimed = self.runner.workflow(
+                    allocator,
+                    self.backend,
+                    .{
+                        .operation = semanticOperation(
+                            recovery.prepared.request.operation,
+                        ),
+                        .mode = .recover,
+                        .selectors = selectors,
+                        .options = executeOptions(
+                            loaded.view,
+                            recovery.prepared.paths.exact_lock,
+                        ),
+                        .orchestration_id = recovery.prepared.attempt_id,
+                        .reconciliation_claim = .{
+                            .exact_lock_sha256 = recovery_lock.binding.digest_sha256,
+                            .evidence_sha256 = evidence_sha256,
+                        },
+                    },
+                ) catch return self.recoveryFailed(
+                    allocator,
+                    recovery.prepared,
+                    &current,
+                    "clean lower root reconciliation reservation was interrupted",
+                );
+                defer claimed.deinit();
+                if (claimed.result.exit_status != .success or
+                    claimed.root_status != .completed)
+                    return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "clean lower root could not be reserved for reconciliation",
+                    );
+                reconciliation_acknowledgment =
+                    claimed.ownership_acknowledgment orelse
+                    return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "clean lower root reservation returned no durable ownership token",
+                    );
+            }
             const retained_lower_recovery =
                 if (current.state.transaction_result) |binding|
                     std.mem.eql(
@@ -3705,7 +3808,7 @@ pub const Engine = struct {
                         recovery.prepared.attempt_id,
                     )
                 else
-                    null,
+                    reconciliation_acknowledgment,
             );
         }
         try self.transition(
@@ -5852,6 +5955,20 @@ fn testInitialState(
     });
 }
 
+fn requirePrivilegedProductionTest() !void {
+    if (builtin.os.tag == .linux and std.os.linux.geteuid() == 0) return;
+    if (build_options.require_privileged_orchestration_tests)
+        return error.RequiredPrivilegedOrchestrationCoverageUnavailable;
+    return error.SkipZigTest;
+}
+
+fn privilegedCoverageUnavailable() anyerror {
+    return if (build_options.require_privileged_orchestration_tests)
+        error.RequiredPrivilegedOrchestrationCoverageUnavailable
+    else
+        error.SkipZigTest;
+}
+
 test "apt_system_orchestrator.test.selector parsing preserves one batch" {
     const request: api.Request = .{
         .operation = .install,
@@ -5951,8 +6068,7 @@ test "apt_system_orchestrator.test.active publication requires the complete dire
 }
 
 test "apt_system_orchestrator.test.operation directory parent is durable before active publication" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     {
         const root_path = try std.fmt.allocPrint(
             std.testing.allocator,
@@ -6081,8 +6197,6 @@ test "apt_system_orchestrator.test.operation directory parent is durable before 
 }
 
 test "apt_system_orchestrator.test.system finish reuses retained final after pre-CAS crash" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -6191,8 +6305,6 @@ test "apt_system_orchestrator.test.system finish reuses retained final after pre
 }
 
 test "apt_system_orchestrator.test.system finish rejects foreign retained final" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -6293,6 +6405,11 @@ test "apt_system_orchestrator.test.system finish rejects foreign retained final"
         states.current.state.digest_sha256,
         active.state.digest_sha256,
     );
+}
+
+test "apt_system_orchestrator.test.production retained commit lock excludes evidence republish through active CAS" {
+    try requirePrivilegedProductionTest();
+    try runRetainedCommitOverlapWatchdog(10_000);
 }
 
 test "apt_system_orchestrator.test.ordinary completion uses a distinct lock-bound schema" {
@@ -6629,6 +6746,32 @@ fn reapSignalTestProcess(pid: i32) !u32 {
     }
 }
 
+fn reapTestProcessWithDeadline(pid: i32, timeout_ms: u64) !u32 {
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (true) {
+        var status: u32 = 0;
+        const waited = std.os.linux.waitpid(
+            pid,
+            &status,
+            std.os.linux.W.NOHANG,
+        );
+        switch (std.os.linux.errno(waited)) {
+            .SUCCESS => if (waited != 0) return status,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        if (started.durationTo(
+            std.Io.Clock.awake.now(std.testing.io),
+        ).toMilliseconds() >= timeout_ms) return error.ProcessTimedOut;
+        var request: std.os.linux.timespec = .{
+            .sec = 0,
+            .nsec = 1_000_000,
+        };
+        var remaining: std.os.linux.timespec = undefined;
+        _ = std.os.linux.nanosleep(&request, &remaining);
+    }
+}
+
 fn waitForSignalTestByte(fd: i32, timeout_ms: u64) !bool {
     var elapsed: u64 = 0;
     while (elapsed < timeout_ms) : (elapsed += 5) {
@@ -6782,6 +6925,21 @@ const FakeRunner = struct {
                 });
             self.inspect_status = .recovery_required;
         }
+        if (request.reconciliation_claim != null and
+            result.result.exit_status == .success)
+        {
+            if (self.inspect_deferred_acknowledgment != null or
+                self.inspect_record_source != null)
+                return error.ReconciliationRootNotClean;
+            self.inspect_deferred_acknowledgment =
+                try root_operation.createDeferredAcknowledgment(.{
+                    .state = .released,
+                    .attempt_id = @splat(0x7e),
+                    .acknowledgment_id = request.orchestration_id orelse
+                        return error.MissingOwnershipAcknowledgment,
+                });
+            self.inspect_status = .clean;
+        }
         if (request.finalize_ownership and
             result.result.exit_status == .success)
         {
@@ -6890,6 +7048,7 @@ const FakeRunner = struct {
         }
         if (request.mode == .recover and
             !request.finalize_ownership and
+            request.reconciliation_claim == null and
             result.result.exit_status == .success)
         {
             if (request.recovery_acknowledgment) |_| {
@@ -7675,6 +7834,339 @@ const TestFinishCrash = struct {
     }
 };
 
+const RetainedCommitBarrier = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    reached: bool = false,
+    released: bool = false,
+    aborted: bool = false,
+
+    fn interface(self: *RetainedCommitBarrier) RetainedDurability {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(
+        context: *anyopaque,
+        boundary: RetainedDurabilityBoundary,
+    ) !void {
+        if (boundary != .before_active_commit) return;
+        const self: *RetainedCommitBarrier = @ptrCast(@alignCast(context));
+        self.mutex.lockUncancelable(std.testing.io);
+        defer self.mutex.unlock(std.testing.io);
+        self.reached = true;
+        self.condition.broadcast(std.testing.io);
+        while (!self.released)
+            self.condition.waitUncancelable(std.testing.io, &self.mutex);
+    }
+
+    fn waitReached(self: *RetainedCommitBarrier) bool {
+        self.mutex.lockUncancelable(std.testing.io);
+        defer self.mutex.unlock(std.testing.io);
+        while (!self.reached and !self.aborted)
+            self.condition.waitUncancelable(std.testing.io, &self.mutex);
+        return self.reached;
+    }
+
+    fn release(self: *RetainedCommitBarrier) void {
+        self.mutex.lockUncancelable(std.testing.io);
+        defer self.mutex.unlock(std.testing.io);
+        self.released = true;
+        self.condition.broadcast(std.testing.io);
+    }
+
+    fn abort(self: *RetainedCommitBarrier) void {
+        self.mutex.lockUncancelable(std.testing.io);
+        defer self.mutex.unlock(std.testing.io);
+        self.aborted = true;
+        self.condition.broadcast(std.testing.io);
+    }
+};
+
+fn runRetainedCommitOverlapScenario() !void {
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-retained-commit-overlap-{d}",
+        .{std.os.linux.getpid()},
+    );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(state_path);
+    const attempt_id: [32]u8 = @splat(0x4b);
+    var paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        attempt_id,
+    );
+    defer paths.deinit(std.testing.allocator);
+    var initial = try testInitialState(
+        std.testing.allocator,
+        attempt_id,
+    );
+    defer initial.deinit();
+    var profile_loaded = try nextState(
+        std.testing.allocator,
+        initial.state,
+        .{
+            .phase = .profile_loaded,
+            .updated_unix = 105,
+        },
+    );
+    defer profile_loaded.deinit();
+    var authenticated = try nextState(
+        std.testing.allocator,
+        profile_loaded.state,
+        .{
+            .phase = .authenticated,
+            .updated_unix = 108,
+        },
+    );
+    defer authenticated.deinit();
+    var downloaded = try nextState(
+        std.testing.allocator,
+        authenticated.state,
+        .{
+            .phase = .downloaded,
+            .exact_lock = .{
+                .path = paths.exact_lock,
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = @splat(0x51),
+            },
+            .updated_unix = 110,
+        },
+    );
+    defer downloaded.deinit();
+    var mutating = try nextState(
+        std.testing.allocator,
+        downloaded.state,
+        .{
+            .phase = .mutating,
+            .updated_unix = 120,
+        },
+    );
+    defer mutating.deinit();
+    var verifying = try nextState(
+        std.testing.allocator,
+        mutating.state,
+        .{
+            .phase = .verifying,
+            .transaction_result = .{
+                .path = paths.transaction_result,
+                .schema = transaction_provenance.schema_id,
+                .version = transaction_provenance.schema_version,
+                .digest_sha256 = @splat(0x52),
+            },
+            .updated_unix = 130,
+        },
+    );
+    defer verifying.deinit();
+    var final = try nextState(
+        std.testing.allocator,
+        verifying.state,
+        .{
+            .phase = .completed,
+            .outcome = .succeeded,
+            .root_operation_completion = .{
+                .document = .{
+                    .path = paths.completion,
+                    .schema = completion_schema_id,
+                    .version = completion_schema_version,
+                    .digest_sha256 = @splat(0x56),
+                },
+                .completed_attempt_id = attempt_id,
+            },
+            .updated_unix = 200,
+        },
+    );
+    defer final.deinit();
+    var barrier: RetainedCommitBarrier = .{};
+    var owner_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .retained_durability = barrier.interface(),
+    };
+    const owner = owner_store.interface();
+    try owner.reserveFn(
+        owner.context,
+        std.testing.allocator,
+        paths,
+        "{}",
+        initial.state,
+    );
+    try owner.compareAndSetFn(
+        owner.context,
+        std.testing.allocator,
+        state_path,
+        operation_state.Expected.fromState(initial.state),
+        profile_loaded.state,
+    );
+    try owner.compareAndSetFn(
+        owner.context,
+        std.testing.allocator,
+        state_path,
+        operation_state.Expected.fromState(profile_loaded.state),
+        authenticated.state,
+    );
+    try owner.compareAndSetFn(
+        owner.context,
+        std.testing.allocator,
+        state_path,
+        operation_state.Expected.fromState(authenticated.state),
+        downloaded.state,
+    );
+    try owner.compareAndSetFn(
+        owner.context,
+        std.testing.allocator,
+        state_path,
+        operation_state.Expected.fromState(downloaded.state),
+        mutating.state,
+    );
+    try owner.compareAndSetFn(
+        owner.context,
+        std.testing.allocator,
+        state_path,
+        operation_state.Expected.fromState(mutating.state),
+        verifying.state,
+    );
+    const OwnerContext = struct {
+        store: StateStore,
+        paths: OperationPaths,
+        expected: operation_state.Expected,
+        final: operation_state.State,
+        barrier: *RetainedCommitBarrier,
+        failure: ?anyerror = null,
+
+        fn run(context: *@This()) void {
+            context.store.commitFn(
+                context.store.context,
+                std.heap.page_allocator,
+                context.paths,
+                context.expected,
+                context.final,
+            ) catch |err| {
+                context.failure = err;
+                context.barrier.abort();
+            };
+        }
+    };
+    var owner_context: OwnerContext = .{
+        .store = owner,
+        .paths = paths,
+        .expected = operation_state.Expected.fromState(verifying.state),
+        .final = final.state,
+        .barrier = &barrier,
+    };
+    const owner_thread = try std.Thread.spawn(
+        .{},
+        OwnerContext.run,
+        .{&owner_context},
+    );
+    if (!barrier.waitReached()) {
+        owner_thread.join();
+        return owner_context.failure orelse error.OwnerCommitAborted;
+    }
+    var contender_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .wait_ms = 0,
+    };
+    const contender = contender_store.interface();
+    try std.testing.expectError(
+        error.LockTimeout,
+        contender.commitFn(
+            contender.context,
+            std.testing.allocator,
+            paths,
+            operation_state.Expected.fromState(verifying.state),
+            final.state,
+        ),
+    );
+    barrier.release();
+    owner_thread.join();
+    if (owner_context.failure) |failure| return failure;
+    var active = (try owner.readActive(
+        std.testing.allocator,
+        state_path,
+    )) orelse return error.MissingActiveState;
+    defer active.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &final.state.digest_sha256,
+        &active.state.digest_sha256,
+    );
+    var retained = (try owner.readRetained(
+        std.testing.allocator,
+        paths,
+    )) orelse return error.MissingRetainedState;
+    defer retained.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &final.state.digest_sha256,
+        &retained.state.digest_sha256,
+    );
+}
+
+fn runRetainedCommitOverlapWatchdog(timeout_ms: u64) !void {
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        runRetainedCommitOverlapScenario() catch |err| {
+            std.debug.print("retained commit overlap failed: {s}\n", .{
+                @errorName(err),
+            });
+            linux.exit_group(111);
+        };
+        linux.exit_group(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    };
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (true) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => if (waited != 0) {
+                reaped = true;
+                if (!linux.W.IFEXITED(status) or
+                    linux.W.EXITSTATUS(status) != 0)
+                    return error.RetainedCommitOverlapFailed;
+                return;
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        if (started.durationTo(
+            std.Io.Clock.awake.now(std.testing.io),
+        ).toMilliseconds() >= timeout_ms) {
+            _ = linux.kill(pid, .KILL);
+            while (true) {
+                const final_wait = linux.waitpid(pid, &status, 0);
+                switch (linux.errno(final_wait)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return error.WaitFailed,
+                }
+            }
+            reaped = true;
+            return error.RetainedCommitOverlapTimedOut;
+        }
+        var request: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        var remaining: linux.timespec = undefined;
+        _ = linux.nanosleep(&request, &remaining);
+    }
+}
+
 const ProductionRunnerProcess = struct {
     io: std.Io,
     dpkg: std.Io.Dir,
@@ -7893,6 +8385,34 @@ const ProcessDeathCompletionCrash = struct {
             @ptrCast(@alignCast(context));
         if (boundary == self.boundary)
             std.os.linux.exit_group(91);
+    }
+};
+
+const CleanInspectionProcessBarrier = struct {
+    ready_fd: i32,
+    release_fd: i32,
+
+    fn interface(self: *CleanInspectionProcessBarrier) CompletionCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, boundary: CompletionBoundary) !void {
+        if (boundary != .after_clean_recovery_inspection) return;
+        const self: *CleanInspectionProcessBarrier =
+            @ptrCast(@alignCast(context));
+        try PrivateLiveRootRunner.writeTransport(self.ready_fd, "R");
+        var byte: [1]u8 = undefined;
+        while (true) {
+            const read = std.os.linux.read(self.release_fd, &byte, 1);
+            switch (std.os.linux.errno(read)) {
+                .SUCCESS => {
+                    if (read != 1) return error.BarrierClosed;
+                    return;
+                },
+                .INTR => continue,
+                else => return error.BarrierReadFailed,
+            }
+        }
     }
 };
 
@@ -8222,8 +8742,7 @@ fn expectReady(outcome: PrepareOutcome) !Preparation {
 }
 
 test "apt_system_orchestrator.test.preflight lock-acquisition death replays from durable outer state" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     const root_path = try std.fmt.allocPrint(
         std.testing.allocator,
         "/root/debz-apt-preflight-restart-{d}",
@@ -8416,9 +8935,8 @@ test "apt_system_orchestrator.test.completed lower root requires recovery only w
     try std.testing.expectEqual(RootStatus.recovery_required, active.status);
 }
 
-test "apt_system_orchestrator.test.private runner transfers canonical result through live-root namespace" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+test "apt_system_orchestrator.test.production private runner transfers canonical result through live-root namespace" {
+    try requirePrivilegedProductionTest();
     var original_mask: std.os.linux.sigset_t = undefined;
     try std.testing.expectEqual(
         std.os.linux.E.SUCCESS,
@@ -8446,7 +8964,7 @@ test "apt_system_orchestrator.test.private runner transfers canonical result thr
         error.NotPrivileged,
         error.NamespaceUnavailable,
         error.UnsafeRuntimeDirectory,
-        => return error.SkipZigTest,
+        => return privilegedCoverageUnavailable(),
         else => return err,
     };
     defer result.deinit();
@@ -8473,9 +8991,8 @@ test "apt_system_orchestrator.test.private runner transfers canonical result thr
     );
 }
 
-test "apt_system_orchestrator.test.private runner validates every workflow mode transport operation" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+test "apt_system_orchestrator.test.production private runner validates every workflow mode transport operation" {
+    try requirePrivilegedProductionTest();
     inline for (std.meta.tags(WorkflowMode)) |mode| {
         var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
         var backend: FakeBackend = .{};
@@ -8498,7 +9015,7 @@ test "apt_system_orchestrator.test.private runner validates every workflow mode 
             error.NotPrivileged,
             error.NamespaceUnavailable,
             error.UnsafeRuntimeDirectory,
-            => return error.SkipZigTest,
+            => return privilegedCoverageUnavailable(),
             else => return err,
         };
         defer result.deinit();
@@ -8533,7 +9050,7 @@ test "apt_system_orchestrator.test.private runner validates every workflow mode 
         error.NotPrivileged,
         error.NamespaceUnavailable,
         error.UnsafeRuntimeDirectory,
-        => return error.SkipZigTest,
+        => return privilegedCoverageUnavailable(),
         else => return err,
     };
     defer finalized.deinit();
@@ -8544,9 +9061,8 @@ test "apt_system_orchestrator.test.private runner validates every workflow mode 
     try std.testing.expectEqual(RootStatus.completed, finalized.root_status);
 }
 
-test "apt_system_orchestrator.test.private transport signal is supervised and releases live-root lock" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+test "apt_system_orchestrator.test.production private transport signal is supervised and releases live-root lock" {
+    try requirePrivilegedProductionTest();
     var preflight_runner: PrivateLiveRootRunner = .{
         .io = std.testing.io,
         .termination_grace_ms = 50,
@@ -8568,7 +9084,7 @@ test "apt_system_orchestrator.test.private transport signal is supervised and re
         error.NotPrivileged,
         error.NamespaceUnavailable,
         error.UnsafeRuntimeDirectory,
-        => return error.SkipZigTest,
+        => return privilegedCoverageUnavailable(),
         else => return err,
     };
     preflight.deinit();
@@ -8729,8 +9245,7 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
 }
 
 test "apt_system_orchestrator.test.production runner retains successful ownership through outer crash matrix" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     const CrashCase = union(enum) {
         lower: production_backend.CompletionPoint,
         transport,
@@ -8754,7 +9269,7 @@ test "apt_system_orchestrator.test.production runner retains successful ownershi
         var fixture = ProductionRunnerFixture.init(
             std.testing.allocator,
         ) catch |err| switch (err) {
-            error.NamespaceUnavailable => return error.SkipZigTest,
+            error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
             else => return err,
         };
         defer fixture.deinit();
@@ -9053,15 +9568,14 @@ test "apt_system_orchestrator.test.production runner retains successful ownershi
 }
 
 test "apt_system_orchestrator.test.production restart resyncs visible final state before lower acknowledgment" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     const Barrier = enum { active_state, retained_final };
     inline for (.{ false, true }) |recovering| {
         inline for (std.enums.values(Barrier)) |barrier| {
             var fixture = ProductionRunnerFixture.init(
                 std.testing.allocator,
             ) catch |err| switch (err) {
-                error.NamespaceUnavailable => return error.SkipZigTest,
+                error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
                 else => return err,
             };
             defer fixture.deinit();
@@ -9285,8 +9799,7 @@ test "apt_system_orchestrator.test.production restart resyncs visible final stat
 }
 
 test "apt_system_orchestrator.test.production retained evidence corruption cannot acknowledge lower ownership" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     const Fault = enum {
         missing_evidence,
         corrupt_evidence,
@@ -9298,7 +9811,7 @@ test "apt_system_orchestrator.test.production retained evidence corruption canno
             var fixture = ProductionRunnerFixture.init(
                 std.testing.allocator,
             ) catch |err| switch (err) {
-                error.NamespaceUnavailable => return error.SkipZigTest,
+                error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
                 else => return err,
             };
             defer fixture.deinit();
@@ -9511,15 +10024,202 @@ test "apt_system_orchestrator.test.production retained evidence corruption canno
     }
 }
 
+test "apt_system_orchestrator.test.production clean reconciliation race never clears outer state after foreign reservation" {
+    try requirePrivilegedProductionTest();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture = ProductionRunnerFixture.init(
+        std.testing.allocator,
+    ) catch |err| switch (err) {
+        error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
+        else => return err,
+    };
+    defer fixture.deinit();
+    var process: ProductionRunnerProcess = .{
+        .io = std.testing.io,
+        .dpkg = fixture.dpkg,
+    };
+    var production: production_backend.Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    var backend: ProductionBackend = .{ .backend = &production };
+    var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var profile: FakeProfileLoader = .{
+        .state_path = fixture.state_path,
+        .cache_path = fixture.cache_path,
+        .source_paths = fixture.source_paths,
+        .keyring_paths = fixture.keyring_paths,
+    };
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+    var sources: FakeSources = .{};
+    var engine: Engine = .{
+        .profiles = profile.interface(),
+        .runner = runner.interface(),
+        .backend = backend.interface(),
+        .store = store.interface(),
+        .verifier = verifier.interface(),
+        .ids = sources.ids(),
+        .clock = sources.clock(),
+    };
+    var loaded = try profile.interface().load(
+        std.testing.allocator,
+        "/profile.json",
+    );
+    defer loaded.deinit();
+    var prepared = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.remove, &.{"removable"}),
+    ));
+    defer prepared.deinit();
+    const crash_pid = try live_root.testing.forkProcess();
+    if (crash_pid == 0) {
+        var crash: ProcessDeathCompletionCrash = .{
+            .boundary = .after_backend_success,
+        };
+        engine.completion_crash = crash.interface();
+        _ = engine.execute(
+            std.heap.page_allocator,
+            prepared,
+            true,
+        ) catch std.os.linux.exit_group(111);
+        std.os.linux.exit_group(112);
+    }
+    const crash_status = try reapSignalTestProcess(crash_pid);
+    try std.testing.expect(std.os.linux.W.IFEXITED(crash_status));
+    try std.testing.expectEqual(
+        @as(u8, 91),
+        std.os.linux.W.EXITSTATUS(crash_status),
+    );
+    try std.Io.Dir.cwd().deleteFile(
+        std.testing.io,
+        "/" ++ root_operation.deferred_ack_path,
+    );
+    var root_status = try runner.interface().inspect(std.testing.allocator);
+    defer root_status.deinit();
+    try std.testing.expectEqual(.clean, root_status.status);
+    var recovery = switch (try engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    var ready_fds: [2]i32 = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(
+        &ready_fds,
+        .{ .CLOEXEC = true, .NONBLOCK = true },
+    )) != .SUCCESS) return error.PipeFailed;
+    defer {
+        if (ready_fds[0] >= 0) _ = std.os.linux.close(ready_fds[0]);
+        if (ready_fds[1] >= 0) _ = std.os.linux.close(ready_fds[1]);
+    }
+    var release_fds: [2]i32 = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(
+        &release_fds,
+        .{ .CLOEXEC = true },
+    )) != .SUCCESS) return error.PipeFailed;
+    defer {
+        if (release_fds[0] >= 0) _ = std.os.linux.close(release_fds[0]);
+        if (release_fds[1] >= 0) _ = std.os.linux.close(release_fds[1]);
+    }
+    const recovery_pid_raw = std.os.linux.fork();
+    if (std.os.linux.errno(recovery_pid_raw) != .SUCCESS)
+        return error.ForkFailed;
+    const recovery_pid: i32 = @intCast(recovery_pid_raw);
+    var recovery_reaped = false;
+    defer if (!recovery_reaped) {
+        _ = std.os.linux.kill(recovery_pid, .KILL);
+        _ = reapSignalTestProcess(recovery_pid) catch {};
+    };
+    if (recovery_pid == 0) {
+        _ = std.os.linux.close(ready_fds[0]);
+        _ = std.os.linux.close(release_fds[1]);
+        var barrier: CleanInspectionProcessBarrier = .{
+            .ready_fd = ready_fds[1],
+            .release_fd = release_fds[0],
+        };
+        engine.completion_crash = barrier.interface();
+        var child_result = engine.executeRecovery(
+            std.heap.page_allocator,
+            recovery,
+            true,
+        ) catch std.os.linux.exit_group(113);
+        const outcome = child_result.outcome;
+        child_result.deinit();
+        std.os.linux.exit_group(if (outcome == .recovery) 0 else 114);
+    }
+    _ = std.os.linux.close(ready_fds[1]);
+    ready_fds[1] = -1;
+    _ = std.os.linux.close(release_fds[0]);
+    release_fds[0] = -1;
+    try std.testing.expect(try waitForSignalTestByte(
+        ready_fds[0],
+        5_000,
+    ));
+    const foreign_id: [32]u8 = @splat(0xb7);
+    var foreign_reservation = try runner.interface().workflow(
+        std.testing.allocator,
+        backend.interface(),
+        .{
+            .operation = .remove,
+            .mode = .reserve,
+            .selectors = &.{.{ .name = "removable" }},
+            .options = executeOptions(
+                loaded.view,
+                prepared.paths.exact_lock,
+            ),
+            .orchestration_id = foreign_id,
+        },
+    );
+    defer foreign_reservation.deinit();
+    try std.testing.expectEqual(
+        product_api.ExitStatus.success,
+        foreign_reservation.result.exit_status,
+    );
+    try PrivateLiveRootRunner.writeTransport(release_fds[1], "G");
+    const recovery_status = try reapTestProcessWithDeadline(
+        recovery_pid,
+        10_000,
+    );
+    recovery_reaped = true;
+    try std.testing.expect(std.os.linux.W.IFEXITED(recovery_status));
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        std.os.linux.W.EXITSTATUS(recovery_status),
+    );
+    var active = (try store.interface().readActive(
+        std.testing.allocator,
+        fixture.state_path,
+    )) orelse return error.MissingActiveState;
+    defer active.deinit();
+    try std.testing.expect(active.state.mutation_started);
+    var contested_status = try runner.interface().inspect(
+        std.testing.allocator,
+    );
+    defer contested_status.deinit();
+    const acknowledgment = contested_status.deferred_acknowledgment orelse
+        return error.MissingDeferredAcknowledgment;
+    try std.testing.expectEqualSlices(
+        u8,
+        &foreign_id,
+        &acknowledgment.acknowledgment_id,
+    );
+}
+
 test "apt_system_orchestrator.test.production missing marker never clears a retained lower record" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     inline for (.{ false, true }) |recovering| {
         inline for (std.enums.values(MarkerLossRecordKind)) |record_kind| {
             var fixture = ProductionRunnerFixture.init(
                 std.testing.allocator,
             ) catch |err| switch (err) {
-                error.NamespaceUnavailable => return error.SkipZigTest,
+                error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
                 else => return err,
             };
             defer fixture.deinit();
@@ -9701,8 +10401,7 @@ test "apt_system_orchestrator.test.production missing marker never clears a reta
 }
 
 test "apt_system_orchestrator.test.production recovery commits unavailable provenance before acknowledgment" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     inline for ([_]CompletionBoundary{
         .before_completion_published,
         .after_completion_published,
@@ -9712,7 +10411,7 @@ test "apt_system_orchestrator.test.production recovery commits unavailable prove
         var fixture = ProductionRunnerFixture.init(
             std.testing.allocator,
         ) catch |err| switch (err) {
-            error.NamespaceUnavailable => return error.SkipZigTest,
+            error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
             else => return err,
         };
         defer fixture.deinit();
@@ -9901,8 +10600,7 @@ test "apt_system_orchestrator.test.production recovery commits unavailable prove
 }
 
 test "apt_system_orchestrator.test.production runner retries every durable pre-mutation classification" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
-        return error.SkipZigTest;
+    try requirePrivilegedProductionTest();
     const RetryCase = enum {
         downloaded_unbound,
         reserved_bound,
@@ -9918,7 +10616,7 @@ test "apt_system_orchestrator.test.production runner retries every durable pre-m
         var fixture = ProductionRunnerFixture.init(
             std.testing.allocator,
         ) catch |err| switch (err) {
-            error.NamespaceUnavailable => return error.SkipZigTest,
+            error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
             else => return err,
         };
         defer fixture.deinit();
