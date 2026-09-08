@@ -57,7 +57,9 @@ pub const maximum_schema_bytes: usize = 256;
 pub const namespace_path = "var/lib/debz";
 pub const lock_name = "root-operation.lock";
 pub const record_name = "root-operation-v1.json";
+pub const deferred_ack_name = "root-operation-deferred-ack-v1.json";
 pub const record_path = namespace_path ++ "/" ++ record_name;
+pub const deferred_ack_path = namespace_path ++ "/" ++ deferred_ack_name;
 pub const lock_path = namespace_path ++ "/" ++ lock_name;
 
 /// Transaction backend the attempt is bound to. A record written for one
@@ -256,6 +258,147 @@ pub const OwnedRecord = struct {
         self.* = undefined;
     }
 };
+
+pub const deferred_ack_schema_id =
+    "https://debz.dev/schema/root-operation-deferred-ack-v1";
+pub const deferred_ack_schema_version: u32 = 1;
+
+pub const DeferredAcknowledgmentState = enum {
+    bound,
+    released,
+    abandoned,
+    pending,
+    acknowledged,
+};
+
+/// Root-local ownership binding and non-reclaimable hand-off for an exact
+/// outer orchestrator attempt.
+pub const DeferredAcknowledgment = struct {
+    state: DeferredAcknowledgmentState = .bound,
+    attempt_id: [32]u8,
+    completion_sha256: ?[32]u8 = null,
+    provenance_sha256: ?[32]u8 = null,
+    acknowledgment_id: [32]u8,
+    digest_sha256: [32]u8 = @splat(0),
+
+    pub fn canonicalJson(
+        self: DeferredAcknowledgment,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (!validDeferredAcknowledgment(self))
+            return error.InvalidDocument;
+        if (!std.mem.eql(
+            u8,
+            &self.digest_sha256,
+            &deferredAcknowledgmentDigest(self),
+        )) return error.DigestMismatch;
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try writeDeferredAcknowledgment(self, &output.writer);
+        const bytes = try output.toOwnedSlice();
+        if (bytes.len > maximum_document_bytes) {
+            allocator.free(bytes);
+            return error.DocumentTooLarge;
+        }
+        return bytes;
+    }
+};
+
+pub const OwnershipCleanupPoint = enum {
+    before_terminal_publish,
+    after_terminal_publish,
+    before_record_clear,
+    after_record_clear,
+    before_binding_clear,
+    after_binding_clear,
+};
+
+pub const OwnershipCleanupObserver = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, OwnershipCleanupPoint) anyerror!void,
+
+    pub fn hit(
+        self: OwnershipCleanupObserver,
+        point: OwnershipCleanupPoint,
+    ) !void {
+        return self.hitFn(self.context, point);
+    }
+};
+
+pub const OwnershipCleanup = struct {
+    attempt_id: [32]u8,
+    acknowledgment_id: [32]u8,
+    terminal_state: DeferredAcknowledgmentState,
+    expected_marker_sha256: ?[32]u8 = null,
+    observer: ?OwnershipCleanupObserver = null,
+};
+
+pub fn createDeferredAcknowledgment(
+    input: DeferredAcknowledgment,
+) !DeferredAcknowledgment {
+    if (!validDeferredAcknowledgment(input))
+        return error.InvalidDocument;
+    var result = input;
+    result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    return result;
+}
+
+fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
+    return switch (marker.state) {
+        .bound, .released, .abandoned => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null,
+        .pending, .acknowledged => marker.completion_sha256 != null and
+            marker.provenance_sha256 != null,
+    };
+}
+
+const WireDeferredAcknowledgment = struct {
+    schema: []const u8,
+    version: u32,
+    state: DeferredAcknowledgmentState,
+    attempt_id: []const u8,
+    completion_sha256: ?[]const u8,
+    provenance_sha256: ?[]const u8,
+    acknowledgment_id: []const u8,
+    digest_sha256: []const u8,
+};
+
+pub fn decodeDeferredAcknowledgment(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !DeferredAcknowledgment {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(
+        WireDeferredAcknowledgment,
+        allocator,
+        source,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+    ) catch return error.NonCanonicalDocument;
+    defer parsed.deinit();
+    const wire = parsed.value;
+    if (!std.mem.eql(u8, wire.schema, deferred_ack_schema_id) or
+        wire.version != deferred_ack_schema_version)
+        return error.UnsupportedSchema;
+    const decoded: DeferredAcknowledgment = .{
+        .state = wire.state,
+        .attempt_id = try parseHex(32, wire.attempt_id),
+        .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
+        .provenance_sha256 = try parseOptionalHex(wire.provenance_sha256),
+        .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
+        .digest_sha256 = try parseHex(32, wire.digest_sha256),
+    };
+    if (!validDeferredAcknowledgment(decoded))
+        return error.InvalidDocument;
+    if (!std.mem.eql(
+        u8,
+        &decoded.digest_sha256,
+        &deferredAcknowledgmentDigest(decoded),
+    )) return error.DigestMismatch;
+    const canonical = try decoded.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return decoded;
+}
 
 pub const Input = struct {
     attempt_id: [32]u8,
@@ -502,6 +645,50 @@ fn writeDocument(record: Record, writer: *std.Io.Writer) !void {
     writer.undo(1);
     try writer.writeAll(",\"digest_sha256\":");
     try writeHexString(writer, &record.digest_sha256);
+    try writer.writeByte('}');
+}
+
+fn deferredAcknowledgmentDigest(
+    marker: DeferredAcknowledgment,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(deferred_ack_schema_id);
+    hash.update("\x001");
+    hash.update(@tagName(marker.state));
+    hash.update("\x00");
+    hash.update(&marker.attempt_id);
+    if (marker.completion_sha256) |digest|
+        hash.update(&digest)
+    else
+        hash.update("\x00");
+    if (marker.provenance_sha256) |digest|
+        hash.update(&digest)
+    else
+        hash.update("\x00");
+    hash.update(&marker.acknowledgment_id);
+    return hash.finalResult();
+}
+
+fn writeDeferredAcknowledgment(
+    marker: DeferredAcknowledgment,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeAll("{\"schema\":");
+    try writeJsonString(writer, deferred_ack_schema_id);
+    try writer.print(",\"version\":{},\"state\":", .{
+        deferred_ack_schema_version,
+    });
+    try writeJsonString(writer, @tagName(marker.state));
+    try writer.writeAll(",\"attempt_id\":");
+    try writeHexString(writer, &marker.attempt_id);
+    try writer.writeAll(",\"completion_sha256\":");
+    try writeOptionalHex(writer, marker.completion_sha256);
+    try writer.writeAll(",\"provenance_sha256\":");
+    try writeOptionalHex(writer, marker.provenance_sha256);
+    try writer.writeAll(",\"acknowledgment_id\":");
+    try writeHexString(writer, &marker.acknowledgment_id);
+    try writer.writeAll(",\"digest_sha256\":");
+    try writeHexString(writer, &marker.digest_sha256);
     try writer.writeByte('}');
 }
 
@@ -764,6 +951,281 @@ pub const Store = struct {
         });
     }
 
+    pub fn readDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+    ) !?DeferredAcknowledgment {
+        const path = try root_fs.Path.init(deferred_ack_path);
+        const bytes = self.root.readFileAlloc(
+            allocator,
+            path,
+            maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        return try decodeDeferredAcknowledgment(allocator, bytes);
+    }
+
+    pub fn publishDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        marker: DeferredAcknowledgment,
+    ) !void {
+        if (try self.readDeferredAcknowledgment(allocator)) |existing| {
+            if (std.mem.eql(
+                u8,
+                &existing.digest_sha256,
+                &marker.digest_sha256,
+            )) return;
+            if (existing.state != .bound or marker.state != .pending or
+                !std.mem.eql(
+                    u8,
+                    &existing.attempt_id,
+                    &marker.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &existing.acknowledgment_id,
+                    &marker.acknowledgment_id,
+                ))
+                return error.DeferredAcknowledgmentPresent;
+            const bytes = try marker.canonicalJson(allocator);
+            defer allocator.free(bytes);
+            try self.root.publishFile(
+                try root_fs.Path.init(deferred_ack_path),
+                bytes,
+                .{
+                    .permissions = record_permissions,
+                    .overwrite = .replace,
+                    .durable = true,
+                },
+            );
+            return;
+        }
+        const bytes = try marker.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .fail_if_exists,
+                .durable = true,
+            },
+        );
+    }
+
+    /// Atomically replaces an exact owner's retryable marker while no record
+    /// exists. The old marker remains durable until the new bound attempt is
+    /// published, so process death cannot create a markerless retry window.
+    pub fn rotateDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        marker: DeferredAcknowledgment,
+    ) !void {
+        if (marker.state != .bound) return error.InvalidDocument;
+        const existing = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if ((existing.state != .bound and existing.state != .abandoned) or
+            !std.mem.eql(
+                u8,
+                &existing.acknowledgment_id,
+                &marker.acknowledgment_id,
+            ))
+            return error.DeferredAcknowledgmentMismatch;
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (record != null) return error.DeferredAcknowledgmentMismatch;
+        const bytes = try marker.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+    }
+
+    pub fn acknowledgeDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+    ) !DeferredAcknowledgment {
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if (observed.state != .pending or !std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var next = observed;
+        next.state = .acknowledged;
+        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        const bytes = try next.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+        return next;
+    }
+
+    pub fn terminalizeDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+        terminal_state: DeferredAcknowledgmentState,
+    ) !DeferredAcknowledgment {
+        if (terminal_state != .released and terminal_state != .abandoned)
+            return error.InvalidDocument;
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return error.NoDeferredAcknowledgment;
+        if (observed.state != .bound or !std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var next = observed;
+        next.state = terminal_state;
+        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        const bytes = try next.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(deferred_ack_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+            },
+        );
+        return next;
+    }
+
+    pub fn cleanupOwned(
+        self: Store,
+        allocator: std.mem.Allocator,
+        cleanup: OwnershipCleanup,
+    ) !void {
+        if (try self.readDeferredAcknowledgment(allocator) == null) {
+            var record = try self.read(allocator);
+            defer if (record) |*owned| owned.deinit();
+            if (record != null) return error.NoDeferredAcknowledgment;
+            return;
+        }
+        const terminal = try self.retainOwnedTerminal(allocator, cleanup);
+        var reopened = try self.read(allocator);
+        defer if (reopened) |*owned| owned.deinit();
+        if (reopened != null) return error.DeferredAcknowledgmentMismatch;
+        if (cleanup.observer) |observer|
+            try observer.hit(.before_binding_clear);
+        try self.clearDeferredAcknowledgment(
+            allocator,
+            terminal.digest_sha256,
+        );
+        if (cleanup.observer) |observer|
+            try observer.hit(.after_binding_clear);
+    }
+
+    /// Durably settles the exact owned record while retaining its terminal
+    /// owner marker. This is the retry hand-off: a process may die after any
+    /// write and the root still carries continuous exact-owner proof.
+    pub fn retainOwnedTerminal(
+        self: Store,
+        allocator: std.mem.Allocator,
+        cleanup: OwnershipCleanup,
+    ) !DeferredAcknowledgment {
+        const marker = try self.readDeferredAcknowledgment(allocator);
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (marker == null) return error.NoDeferredAcknowledgment;
+        const observed = marker.?;
+        if (cleanup.expected_marker_sha256) |expected|
+            if (!std.mem.eql(
+                u8,
+                &observed.digest_sha256,
+                &expected,
+            )) return error.DeferredAcknowledgmentMismatch;
+        if (!std.mem.eql(
+            u8,
+            &observed.attempt_id,
+            &cleanup.attempt_id,
+        ) or !std.mem.eql(
+            u8,
+            &observed.acknowledgment_id,
+            &cleanup.acknowledgment_id,
+        )) return error.DeferredAcknowledgmentMismatch;
+        if (record) |owned| {
+            var expected_terminal = observed;
+            expected_terminal.state = cleanup.terminal_state;
+            if (!owned.record.clearable() or
+                !recordMatchesDeferredAcknowledgment(
+                    owned.record,
+                    expected_terminal,
+                    false,
+                ))
+                return error.DeferredAcknowledgmentMismatch;
+        }
+        var terminal = observed;
+        if (observed.state == .bound) {
+            if (cleanup.observer) |observer|
+                try observer.hit(.before_terminal_publish);
+            terminal = try self.terminalizeDeferredAcknowledgment(
+                allocator,
+                observed.digest_sha256,
+                cleanup.terminal_state,
+            );
+            if (cleanup.observer) |observer|
+                try observer.hit(.after_terminal_publish);
+        } else if (observed.state != cleanup.terminal_state) {
+            return error.DeferredAcknowledgmentMismatch;
+        }
+        if (record) |*owned| {
+            if (cleanup.observer) |observer|
+                try observer.hit(.before_record_clear);
+            try self.clear();
+            if (cleanup.observer) |observer|
+                try observer.hit(.after_record_clear);
+            owned.deinit();
+            record = null;
+        }
+        var reopened = try self.read(allocator);
+        defer if (reopened) |*owned| owned.deinit();
+        if (reopened != null) return error.DeferredAcknowledgmentMismatch;
+        return terminal;
+    }
+
+    pub fn clearDeferredAcknowledgment(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_digest: [32]u8,
+    ) !void {
+        const observed = try self.readDeferredAcknowledgment(allocator) orelse
+            return;
+        if (!std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_digest,
+        )) return error.DeferredAcknowledgmentMismatch;
+        self.root.removeFile(
+            try root_fs.Path.init(deferred_ack_path),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.root.syncDirectory(try root_fs.Path.init(namespace_path));
+    }
+
     /// Removes the active record and fsyncs the namespace so the removal
     /// survives power loss.
     pub fn clear(self: Store) !void {
@@ -999,6 +1461,53 @@ pub const ExistingPolicy = enum {
     reclaim_resolved,
 };
 
+pub const AcquisitionPoint = enum {
+    after_lock_acquired,
+    before_retry_terminal_publish,
+    after_retry_terminal_publish,
+    before_retry_record_clear,
+    after_retry_record_clear,
+    before_binding_published,
+    after_binding_published,
+};
+
+pub const AcquisitionObserver = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, AcquisitionPoint) anyerror!void,
+
+    pub fn hit(self: AcquisitionObserver, point: AcquisitionPoint) !void {
+        return self.hitFn(self.context, point);
+    }
+};
+
+const AcquisitionCleanupForwarder = struct {
+    observer: AcquisitionObserver,
+
+    fn interface(self: *AcquisitionCleanupForwarder) OwnershipCleanupObserver {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: OwnershipCleanupPoint) !void {
+        const self: *AcquisitionCleanupForwarder =
+            @ptrCast(@alignCast(context));
+        switch (point) {
+            .before_terminal_publish => try self.observer.hit(
+                .before_retry_terminal_publish,
+            ),
+            .after_terminal_publish => try self.observer.hit(
+                .after_retry_terminal_publish,
+            ),
+            .before_record_clear => try self.observer.hit(
+                .before_retry_record_clear,
+            ),
+            .after_record_clear => try self.observer.hit(
+                .after_retry_record_clear,
+            ),
+            .before_binding_clear, .after_binding_clear => unreachable,
+        }
+    }
+};
+
 pub const Request = struct {
     intent: Intent = .mutation,
     existing: ExistingPolicy = .fail,
@@ -1011,6 +1520,14 @@ pub const Request = struct {
     foreign_architectures: []const []const u8 = &.{},
     wait_ms: u64 = 0,
     cancellation: transaction_executor.Cancellation = transaction_executor.Cancellation.never(),
+    /// Internal hand-off: recovery may adopt an exact settled/published
+    /// record so its completion can be returned to an outer coordinator
+    /// without reclaiming it into a new attempt.
+    adopt_settled_for_acknowledgment: bool = false,
+    /// Optional internal outer-attempt identity. Initial acquisition binds it
+    /// durably before mutation and recovery must present the same identity.
+    orchestration_id: ?[32]u8 = null,
+    acquisition_observer: ?AcquisitionObserver = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
     attempt_id: ?[32]u8 = null,
@@ -1186,8 +1703,16 @@ pub const Coordinator = struct {
             .cancellation = request.cancellation,
         });
         errdefer self.locks.release(token);
+        if (request.acquisition_observer) |observer|
+            observer.hit(.after_lock_acquired) catch return error.StoreFailed;
 
         const store_handle = self.store();
+        var cleanup_forwarder: AcquisitionCleanupForwarder = undefined;
+        const retry_cleanup_observer: ?OwnershipCleanupObserver =
+            if (request.acquisition_observer) |observer| blk: {
+                cleanup_forwarder = .{ .observer = observer };
+                break :blk cleanup_forwarder.interface();
+            } else null;
         var prior: ?OwnedRecord = store_handle.read(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.RecordCorrupt,
@@ -1202,6 +1727,136 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
+        const deferred = store_handle.readDeferredAcknowledgment(
+            allocator,
+        ) catch return error.RecordCorrupt;
+        if (deferred) |marker| switch (marker.state) {
+            .acknowledged => return error.RecoveryRequired,
+            .released => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                )) return error.RecoveryRequired;
+                store_handle.cleanupOwned(allocator, .{
+                    .attempt_id = marker.attempt_id,
+                    .acknowledgment_id = orchestration_id,
+                    .terminal_state = marker.state,
+                }) catch return error.StoreFailed;
+                if (prior) |*value| {
+                    value.deinit();
+                    prior = null;
+                }
+                return error.ResolvedAttemptPresent;
+            },
+            .abandoned => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                )) return error.RecoveryRequired;
+                if (prior) |*value| {
+                    if (!recordMatchesDeferredAcknowledgment(
+                        value.record,
+                        marker,
+                        false,
+                    ) or
+                        (!value.record.state.provenPreMutation() and
+                            value.record.outcome !=
+                                .abandoned_before_mutation))
+                        return error.RecoveryRequired;
+                    _ = store_handle.retainOwnedTerminal(allocator, .{
+                        .attempt_id = marker.attempt_id,
+                        .acknowledgment_id = orchestration_id,
+                        .terminal_state = .abandoned,
+                        .observer = retry_cleanup_observer,
+                    }) catch return error.StoreFailed;
+                    value.deinit();
+                    prior = null;
+                }
+            },
+            .bound => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                )) return error.RecoveryRequired;
+                if (prior == null) {
+                    // Keep the exact-owner marker continuously present. A
+                    // fresh binding replaces it atomically in publishNew.
+                } else if (!recordMatchesDeferredAcknowledgment(
+                    prior.?.record,
+                    marker,
+                    true,
+                ))
+                    return error.RecoveryRequired;
+                if (prior != null and prior.?.record.clearable()) {
+                    const abandoned =
+                        prior.?.record.outcome == .abandoned_before_mutation;
+                    if (!abandoned) {
+                        store_handle.cleanupOwned(allocator, .{
+                            .attempt_id = marker.attempt_id,
+                            .acknowledgment_id = orchestration_id,
+                            .terminal_state = .released,
+                        }) catch return error.StoreFailed;
+                    } else _ = store_handle.retainOwnedTerminal(allocator, .{
+                        .attempt_id = marker.attempt_id,
+                        .acknowledgment_id = orchestration_id,
+                        .terminal_state = .abandoned,
+                        .observer = retry_cleanup_observer,
+                    }) catch return error.StoreFailed;
+                    prior.?.deinit();
+                    prior = null;
+                    if (!abandoned)
+                        return error.ResolvedAttemptPresent;
+                }
+                if (prior != null and prior.?.record.state.provenPreMutation()) {
+                    const adopted = prior.?;
+                    prior = null;
+                    return .{
+                        .coordinator = self,
+                        .token = token,
+                        .owned = adopted,
+                        .entered = .initEmpty(),
+                        .highest = .root_operation,
+                        .adopted = true,
+                        .bridge = .none,
+                    };
+                }
+            },
+            .pending => {
+                const orchestration_id =
+                    request.orchestration_id orelse
+                    return error.RecoveryRequired;
+                if (!std.mem.eql(
+                    u8,
+                    &orchestration_id,
+                    &marker.acknowledgment_id,
+                ) or
+                    prior == null or
+                    !recordMatchesDeferredAcknowledgment(
+                        prior.?.record,
+                        marker,
+                        true,
+                    ))
+                    return error.RecoveryRequired;
+                if (!request.adopt_settled_for_acknowledgment)
+                    return error.RecoveryRequired;
+            },
+        };
+        if (deferred == null and request.orchestration_id != null and
+            prior != null)
+            return error.RecoveryRequired;
+
         // A durably settled record — completed with its provenance obligation
         // discharged — describes an operation that is over. No intent may
         // adopt it: continuing under a record that already says the mutation
@@ -1210,6 +1865,25 @@ pub const Coordinator = struct {
         // behind as proof the rerun never happened. Settling it here, before
         // any adoption, keeps one rule for every intent: reclaim it into a
         // fresh attempt, or report it, exactly as the plain mutation rules do.
+        if (prior) |*value| {
+            if (request.intent == .recovery and
+                request.adopt_settled_for_acknowledgment and
+                value.record.clearable() and
+                value.record.provenance == .published)
+            {
+                const adopted = value.*;
+                prior = null;
+                return .{
+                    .coordinator = self,
+                    .token = token,
+                    .owned = adopted,
+                    .entered = .initEmpty(),
+                    .highest = .root_operation,
+                    .adopted = true,
+                    .bridge = adoptedBridge(adopted.record.state),
+                };
+            }
+        }
         var reclaimed: ?u64 = null;
         if (prior) |*value| {
             if (value.record.clearable()) {
@@ -1354,7 +2028,33 @@ pub const Coordinator = struct {
             .updated_unix = timestamp,
         });
         errdefer created.deinit();
-        self.store().writeAtomic(allocator, created.record) catch return error.StoreFailed;
+        if (request.orchestration_id) |orchestration_id| {
+            const binding = createDeferredAcknowledgment(.{
+                .state = .bound,
+                .attempt_id = attempt_id,
+                .acknowledgment_id = orchestration_id,
+            }) catch return error.StoreFailed;
+            const store_handle = self.store();
+            if (request.acquisition_observer) |observer|
+                observer.hit(.before_binding_published) catch
+                    return error.StoreFailed;
+            if (store_handle.readDeferredAcknowledgment(allocator) catch
+                return error.StoreFailed) |_|
+                store_handle.rotateDeferredAcknowledgment(
+                    allocator,
+                    binding,
+                ) catch return error.StoreFailed
+            else
+                store_handle.publishDeferredAcknowledgment(
+                    allocator,
+                    binding,
+                ) catch return error.StoreFailed;
+            if (request.acquisition_observer) |observer|
+                observer.hit(.after_binding_published) catch
+                    return error.StoreFailed;
+        }
+        self.store().writeAtomic(allocator, created.record) catch
+            return error.StoreFailed;
         return created;
     }
 };
@@ -1693,6 +2393,31 @@ fn startsMutation(state: State) bool {
 /// The bridge origin an adopted record implies. A record that already sits at
 /// the executor bridge was handed over by some earlier run, so this one
 /// inherits it and can never prove what that hand-over did.
+fn recordMatchesDeferredAcknowledgment(
+    record: Record,
+    marker: DeferredAcknowledgment,
+    allow_pending_provenance: bool,
+) bool {
+    if (!std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) or
+        (marker.state != .bound and record.state != .completed))
+        return false;
+    return switch (marker.state) {
+        .bound => true,
+        .released => record.outcome != .abandoned_before_mutation,
+        .abandoned => record.outcome == .abandoned_before_mutation,
+        .pending, .acknowledged => switch (record.provenance) {
+            .published => record.provenance_sha256 != null and
+                marker.provenance_sha256 != null and std.mem.eql(
+                u8,
+                &record.provenance_sha256.?,
+                &marker.provenance_sha256.?,
+            ),
+            .pending => allow_pending_provenance,
+            .not_required => false,
+        },
+    };
+}
+
 fn adoptedBridge(state: State) BridgeOrigin {
     return if (state == .mutation_pending) .inherited else .none;
 }

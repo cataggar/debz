@@ -135,9 +135,34 @@ class SecurityAuditTests(unittest.TestCase):
             if re.search(r"\blinux\.(?:fork|execve|chroot)\s*\(", text)
         )
         self.assertEqual(
-            ["src/live_root.zig", "src/maintainer_script.zig"],
+            [
+                "src/apt_system_orchestrator.zig",
+                "src/live_root.zig",
+                "src/maintainer_script.zig",
+                "src/production_backend.zig",
+            ],
             owners,
         )
+        production_backend = sources["src/production_backend.zig"]
+        self.assertEqual(production_backend.count("linux.fork()"), 1)
+        self.assertGreater(
+            production_backend.index("linux.fork()"),
+            production_backend.index('\ntest "'),
+        )
+        apt_system_orchestrator = sources["src/apt_system_orchestrator.zig"]
+        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 2)
+        first_test = apt_system_orchestrator.index('\ntest "')
+        self.assertTrue(
+            all(
+                match.start() > first_test
+                for match in re.finditer(
+                    r"\blinux\.fork\s*\(",
+                    apt_system_orchestrator,
+                )
+            )
+        )
+        self.assertIn("_ = linux.kill(pid, .KILL);", production_backend)
+        self.assertIn("linux.waitpid(pid, &status, 0)", production_backend)
         runner = sources["src/maintainer_script.zig"]
         self.assertNotIn("std.process.run(", runner)
         self.assertIn('linux.open("/dev/null"', runner)
@@ -149,9 +174,21 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn(".open_tree,", live_root)
         self.assertIn(".mount_setattr,", live_root)
         self.assertIn("linux.move_mount(", live_root)
+        orchestrator = sources["src/apt_system_orchestrator.zig"]
+        first_orchestrator_test = orchestrator.index('\ntest "')
+        self.assertTrue(
+            all(
+                match.start() > first_orchestrator_test
+                for match in re.finditer(
+                    r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
+                    orchestrator,
+                )
+            )
+        )
         namespace_owners = sorted(
             relative
             for relative, text in sources.items()
+            if relative != "src/apt_system_orchestrator.zig"
             if re.search(
                 r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
                 text,

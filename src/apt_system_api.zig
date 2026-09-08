@@ -11,9 +11,13 @@ const system_profile = @import("system_profile.zig");
 pub const api_version: u32 = 1;
 pub const request_schema_id = "https://debz.dev/schema/apt-system-request-v1";
 pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
+pub const result_items_schema_id =
+    "https://debz.dev/schema/apt-system-result-v2";
 pub const schema_version: u32 = 1;
+pub const result_items_schema_version: u32 = 2;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
+pub const maximum_result_items: usize = 4096;
 pub const maximum_diagnostics: usize = 8;
 pub const maximum_summary_characters: usize = 4096;
 pub const maximum_path_bytes: usize = system_profile.maximum_path_bytes;
@@ -63,6 +67,78 @@ pub const Request = struct {
         return requestDigestUnchecked(self);
     }
 };
+
+pub const OwnedRequest = struct {
+    request: Request,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedRequest) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+const WireRequest = struct {
+    schema: []const u8,
+    version: u32,
+    api_version: u32,
+    operation: Operation,
+    profile_path: []const u8,
+    packages: []const []const u8,
+    assume_yes: bool,
+};
+
+/// Decodes the canonical request retained with an operation. Recovery uses
+/// this boundary instead of reconstructing selectors from human diagnostics
+/// or mutable caller input.
+pub fn decodeRequest(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedRequest {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(WireRequest, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidDocument;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.schema, request_schema_id) or
+        parsed.value.version != schema_version)
+        return error.UnsupportedSchema;
+    const decoded: Request = .{
+        .api_version = parsed.value.api_version,
+        .operation = parsed.value.operation,
+        .profile_path = parsed.value.profile_path,
+        .packages = parsed.value.packages,
+        .assume_yes = parsed.value.assume_yes,
+    };
+    try validateRequest(decoded);
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const packages = try owned.alloc([]const u8, decoded.packages.len);
+    for (decoded.packages, 0..) |package, index|
+        packages[index] = try owned.dupe(u8, package);
+    var result: OwnedRequest = .{
+        .request = .{
+            .api_version = decoded.api_version,
+            .operation = decoded.operation,
+            .profile_path = try owned.dupe(u8, decoded.profile_path),
+            .packages = packages,
+            .assume_yes = decoded.assume_yes,
+        },
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+    const canonical = try result.request.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return result;
+}
 
 pub const Outcome = enum {
     success,
@@ -141,6 +217,13 @@ pub const Evidence = struct {
     active_operation_state: ?[]const u8 = null,
 };
 
+pub const Item = struct {
+    package: []const u8,
+    version: ?[]const u8 = null,
+    architecture: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -150,6 +233,7 @@ pub const Result = struct {
     exit_status: ExitStatus,
     changed: bool = false,
     summary: []const u8,
+    items: []const Item = &.{},
     evidence: Evidence = .{},
     diagnostics: [maximum_diagnostics]Diagnostic = undefined,
     diagnostic_count: usize = 0,
@@ -326,6 +410,16 @@ pub fn ownResult(
     const owned = owner.arena.allocator();
     var result = input;
     result.summary = try owned.dupe(u8, input.summary);
+    const items = try owned.alloc(Item, input.items.len);
+    for (input.items, 0..) |item, index| {
+        items[index] = .{
+            .package = try owned.dupe(u8, item.package),
+            .version = try dupeOptional(owned, item.version),
+            .architecture = try dupeOptional(owned, item.architecture),
+            .detail = try dupeOptional(owned, item.detail),
+        };
+    }
+    result.items = items;
     if (input.profile) |profile| result.profile = .{
         .path = try owned.dupe(u8, profile.path),
         .sha256 = profile.sha256,
@@ -365,6 +459,19 @@ pub fn validateResult(result: Result) !void {
     if (result.api_version != api_version) return error.UnsupportedApiVersion;
     if (!validText(result.summary, maximum_summary_characters))
         return error.InvalidSummary;
+    if (result.items.len > maximum_result_items) return error.TooManyItems;
+    if (result.operation != .list_installed and result.items.len != 0)
+        return error.UnexpectedItems;
+    for (result.items) |item| {
+        if (!validPackage(item.package)) return error.InvalidItem;
+        if (item.version) |version|
+            if (!validText(version, 1024)) return error.InvalidItem;
+        if (item.architecture) |architecture|
+            if (!validText(architecture, 64)) return error.InvalidItem;
+        if (item.detail) |detail|
+            if (!validText(detail, maximum_summary_characters))
+                return error.InvalidItem;
+    }
     if (result.diagnostic_count > maximum_diagnostics)
         return error.TooManyDiagnostics;
     if (result.exit_status != exitStatus(result.outcome))
@@ -400,6 +507,8 @@ pub fn validateResult(result: Result) !void {
     } else {
         if (result.diagnostic_count == 0) return error.MissingDiagnostic;
     }
+    if (encodedDocumentSize(result) > maximum_document_bytes)
+        return error.DocumentTooLarge;
 }
 
 pub fn validateCompleteResult(result: Result) !void {
@@ -527,18 +636,38 @@ fn writeRequest(request: Request, writer: *std.Io.Writer) !void {
 }
 
 fn writeResultDocument(result: Result, writer: *std.Io.Writer) !void {
-    try writeResultPayload(result, writer);
-    writer.undo(1);
+    try writeResultPayloadPrefix(result, writer);
     try writer.writeAll(",\"digest_sha256\":");
     try writeHex(writer, &result.digest_sha256);
     try writer.writeByte('}');
 }
 
+fn encodedDocumentSize(result: Result) usize {
+    var buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&buffer);
+    writeResultDocument(result, &discarding.writer) catch unreachable;
+    return @intCast(discarding.fullCount());
+}
+
 fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
+    try writeResultPayloadPrefix(result, writer);
+    try writer.writeByte('}');
+}
+
+fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    try writeString(writer, result_schema_id);
+    try writeString(
+        writer,
+        if (result.items.len == 0)
+            result_schema_id
+        else
+            result_items_schema_id,
+    );
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
-        schema_version,
+        if (result.items.len == 0)
+            schema_version
+        else
+            result_items_schema_version,
         result.api_version,
     });
     try writeString(writer, @tagName(result.operation));
@@ -561,6 +690,22 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
         result.changed,
     });
     try writeString(writer, result.summary);
+    if (result.items.len != 0) {
+        try writer.writeAll(",\"items\":[");
+        for (result.items, 0..) |item, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"package\":");
+            try writeString(writer, item.package);
+            try writer.writeAll(",\"version\":");
+            try writeOptionalString(writer, item.version);
+            try writer.writeAll(",\"architecture\":");
+            try writeOptionalString(writer, item.architecture);
+            try writer.writeAll(",\"detail\":");
+            try writeOptionalString(writer, item.detail);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
     try writer.writeAll(",\"evidence\":");
     try writeEvidence(writer, result.evidence);
     try writer.writeAll(",\"diagnostics\":[");
@@ -576,7 +721,7 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
         try writeString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
 }
 
 fn writeEvidence(writer: *std.Io.Writer, evidence: Evidence) !void {
@@ -1124,6 +1269,150 @@ test "apt_system_api.test.text validation stops at bounded limits" {
     );
 }
 
+test "apt_system_api.test.list items are owned and bind the canonical digest" {
+    var package = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
+    var version = [_]u8{ '1', '.', '2' };
+    var architecture = [_]u8{ 'a', 'm', 'd', '6', '4' };
+    const items = [_]Item{.{
+        .package = &package,
+        .version = &version,
+        .architecture = &architecture,
+    }};
+    const input = try complete(.{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "one installed package",
+        .items = &items,
+    });
+    var owned = try ownResult(std.testing.allocator, input);
+    defer owned.deinit();
+    @memset(&package, 'x');
+    @memset(&version, 'x');
+    @memset(&architecture, 'x');
+    try std.testing.expectEqualStrings("alpha", owned.items[0].package);
+    try std.testing.expectEqualStrings("1.2", owned.items[0].version.?);
+    try std.testing.expectEqualStrings("amd64", owned.items[0].architecture.?);
+    const canonical = try owned.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v2\",\"version\":2",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "\"items\":[{\"package\":\"alpha\",\"version\":\"1.2\",\"architecture\":\"amd64\",\"detail\":null}]",
+    ) != null);
+
+    var changed = owned;
+    const replacement = [_]Item{.{ .package = "beta" }};
+    changed.items = &replacement;
+    try std.testing.expectError(
+        error.DigestMismatch,
+        changed.canonicalJson(std.testing.allocator),
+    );
+    var non_list = input;
+    non_list.operation = .update;
+    try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+}
+
+test "apt_system_api.test.itemless results preserve exact v1 wire contract" {
+    const result = try complete(.{
+        .operation = .update,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .changed = true,
+        .summary = "updated",
+    });
+    const canonical = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        canonical,
+        "{\"schema\":\"https://debz.dev/schema/apt-system-result-v1\",\"version\":1,",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"items\"") == null);
+}
+
+test "apt_system_api.test.result encoded-size budget accepts maximum and rejects one over" {
+    var items: [64]Item = undefined;
+    for (&items) |*item| item.* = .{ .package = "p" };
+    const full_detail = try std.testing.allocator.alloc(
+        u8,
+        maximum_summary_characters,
+    );
+    defer std.testing.allocator.free(full_detail);
+    @memset(full_detail, 'd');
+
+    var candidate: Result = .{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "x",
+        .items = &items,
+    };
+    var index: usize = 0;
+    while (index < items.len) : (index += 1) {
+        items[index].detail = full_detail;
+        if (encodedDocumentSize(candidate) > maximum_document_bytes) {
+            items[index].detail = null;
+            break;
+        }
+    }
+    const remainder = maximum_document_bytes - encodedDocumentSize(candidate);
+    const exact_summary = try std.testing.allocator.alloc(u8, 1 + remainder);
+    defer std.testing.allocator.free(exact_summary);
+    @memset(exact_summary, 's');
+    candidate.summary = exact_summary;
+    try std.testing.expectEqual(
+        maximum_document_bytes,
+        encodedDocumentSize(candidate),
+    );
+    const completed = try complete(candidate);
+    var owned = try ownResult(std.testing.allocator, completed);
+    defer owned.deinit();
+    const source = try owned.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqual(maximum_document_bytes, source.len);
+
+    const oversized_summary = try std.testing.allocator.alloc(
+        u8,
+        exact_summary.len + 1,
+    );
+    defer std.testing.allocator.free(oversized_summary);
+    @memset(oversized_summary, 's');
+    candidate.summary = oversized_summary;
+    try std.testing.expectEqual(
+        maximum_document_bytes + 1,
+        encodedDocumentSize(candidate),
+    );
+    try std.testing.expectError(error.DocumentTooLarge, complete(candidate));
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        ownResult(std.testing.allocator, candidate),
+    );
+}
+
 test "apt_system_api.test.result schema matches enums and absolute paths" {
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1135,6 +1424,12 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, source, .{});
     defer parsed.deinit();
     const definitions = parsed.value.object.get("$defs").?.object;
+    const required = parsed.value.object.get("required").?.array.items;
+    for (required) |field|
+        try std.testing.expect(!std.mem.eql(u8, field.string, "items"));
+    try std.testing.expect(
+        parsed.value.object.get("properties").?.object.get("items") == null,
+    );
     try std.testing.expectEqualStrings(
         absolute_path.schema_pattern,
         definitions.get("absolutePath").?.object.get("pattern").?.string,
@@ -1184,9 +1479,44 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
                     diagnostic_outcome,
                 ));
             }
+
             found = true;
             break;
         }
         try std.testing.expect(found);
     }
+}
+
+test "apt_system_api.test.result v2 schema is an explicit bounded item extension" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-result-v2.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(source);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        result_items_schema_id,
+        parsed.value.object.get("$id").?.string,
+    );
+    const properties = parsed.value.object.get("properties").?.object;
+    try std.testing.expectEqual(
+        @as(i64, result_items_schema_version),
+        properties.get("version").?.object.get("const").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(i64, @intCast(maximum_result_items)),
+        properties.get("items").?.object.get("maxItems").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        properties.get("items").?.object.get("minItems").?.integer,
+    );
 }

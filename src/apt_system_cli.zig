@@ -553,6 +553,14 @@ fn writeHumanResult(result: api.Result, writer: *std.Io.Writer) !void {
         },
     );
     try writer.print("Plan/change details: {s}\n", .{result.summary});
+    for (result.items) |item| {
+        try writer.print("Installed package: {s}", .{item.package});
+        if (item.version) |version| try writer.print(" version={s}", .{version});
+        if (item.architecture) |architecture|
+            try writer.print(" architecture={s}", .{architecture});
+        if (item.detail) |detail| try writer.print(" detail={s}", .{detail});
+        try writer.writeByte('\n');
+    }
     try writer.writeAll("Request SHA-256: ");
     try writeHex(writer, &result.request_sha256);
     try writer.writeByte('\n');
@@ -1047,6 +1055,75 @@ test "apt_system_cli.test.human rendering is stable complete and routed by outco
         u8,
         stderr.written(),
         "Diagnostic [planning_failed] (planning) phase=plan: no candidate version",
+    ) != null);
+}
+
+test "apt_system_cli.test.list rendering preserves installed package fields" {
+    const request: api.Request = .{
+        .operation = .list_installed,
+        .profile_path = "/profile.json",
+    };
+    const items = [_]api.Item{
+        .{
+            .package = "alpha",
+            .version = "1.2-3",
+            .architecture = "amd64",
+        },
+        .{
+            .package = "beta",
+            .version = "2",
+            .architecture = "all",
+            .detail = "installed",
+        },
+    };
+    const result = try api.complete(.{
+        .operation = .list_installed,
+        .request_sha256 = try request.digest(),
+        .profile = .{
+            .path = request.profile_path,
+            .sha256 = @splat(0x11),
+            .reference_evidence_sha256 = @splat(0x22),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "2 installed packages",
+        .items = &items,
+    });
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    try writeResult(
+        std.testing.allocator,
+        result,
+        .human,
+        &stdout.writer,
+        &stderr.writer,
+    );
+    try std.testing.expectEqualStrings("", stderr.written());
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout.written(),
+        "Installed package: alpha version=1.2-3 architecture=amd64\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout.written(),
+        "Installed package: beta version=2 architecture=all detail=installed\n",
+    ) != null);
+
+    stdout.clearRetainingCapacity();
+    try writeResult(
+        std.testing.allocator,
+        result,
+        .json,
+        &stdout.writer,
+        &stderr.writer,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout.written(),
+        "\"package\":\"alpha\",\"version\":\"1.2-3\",\"architecture\":\"amd64\"",
     ) != null);
 }
 

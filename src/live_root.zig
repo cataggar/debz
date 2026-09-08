@@ -94,21 +94,81 @@ pub fn platformSupported(os: std.Target.Os.Tag) bool {
     return os == .linux;
 }
 
+pub const SignalMaskGuard = struct {
+    previous: linux.sigset_t,
+    active: bool = true,
+
+    pub fn restore(self: *SignalMaskGuard) Error!void {
+        if (!self.active) return;
+        if (linux.errno(linux.sigprocmask(
+            linux.SIG.SETMASK,
+            &self.previous,
+            null,
+        )) != .SUCCESS) return error.SignalSetupFailed;
+        self.active = false;
+    }
+};
+
+pub const testing = struct {
+    pub fn forkProcess() Error!i32 {
+        if (!builtin.is_test) return error.ForkFailed;
+        const forked = linux.fork();
+        if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+        return @intCast(forked);
+    }
+};
+
+/// Blocks every signal supervised by `run` in the calling thread. Threads
+/// created while this guard is active inherit the blocked mask.
+pub fn blockWatchedSignals() Error!SignalMaskGuard {
+    if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    var watched = interruptSet();
+    var previous: linux.sigset_t = undefined;
+    if (linux.errno(linux.sigprocmask(
+        linux.SIG.BLOCK,
+        &watched,
+        &previous,
+    )) != .SUCCESS) return error.SignalSetupFailed;
+    return .{ .previous = previous };
+}
+
 /// Runs `request.child` with the host root available only at
 /// `logical_root_path`.  The callback is trusted product code: it must not
 /// change signal masks or attempt to join another PID or mount namespace.
 pub fn run(request: Request) Error!Result {
+    var signal_guard = try blockWatchedSignals();
+    const result = runSignalsBlocked(request, &signal_guard) catch |err| {
+        signal_guard.restore() catch return error.SignalSetupFailed;
+        return err;
+    };
+    try signal_guard.restore();
+    return result;
+}
+
+/// Runs with the watched signals already blocked by `blockWatchedSignals`.
+/// The guard's original mask is restored in the privileged workload so relayed
+/// signals keep their ordinary disposition there. The caller owns restoration.
+pub fn runSignalsBlocked(
+    request: Request,
+    signal_guard: *const SignalMaskGuard,
+) Error!Result {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (!signal_guard.active) return error.SignalSetupFailed;
+    var current_mask: linux.sigset_t = undefined;
+    if (linux.errno(linux.sigprocmask(
+        linux.SIG.SETMASK,
+        null,
+        &current_mask,
+    )) != .SUCCESS) return error.SignalSetupFailed;
+    inline for ([_]linux.SIG{ .INT, .QUIT, .HUP, .TERM }) |signal|
+        if (!linux.sigismember(&current_mask, signal))
+            return error.SignalSetupFailed;
     if (linux.geteuid() != 0) return error.NotPrivileged;
 
     var pinned = try PinnedPaths.open();
     defer pinned.close();
 
     var watched = interruptSet();
-    var old_mask: linux.sigset_t = undefined;
-    if (linux.errno(linux.sigprocmask(linux.SIG.BLOCK, &watched, &old_mask)) != .SUCCESS)
-        return error.SignalSetupFailed;
-    defer _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
 
     const signal_fd_raw = linux.signalfd(
         -1,
@@ -147,7 +207,7 @@ pub fn run(request: Request) Error!Result {
         supervisorMain(
             request,
             pinned,
-            old_mask,
+            signal_guard.previous,
             signal_fd,
             report_pipe,
             control_pipe,
@@ -1540,6 +1600,48 @@ test "live_root.test.interruption orders signal kill and reap" {
         Event,
         &.{ .signal, .reap },
         polite.events[0..polite.count],
+    );
+}
+
+test "live_root.test.watched signal guard is inherited and restores caller mask" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var original: linux.sigset_t = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.sigprocmask(
+            linux.SIG.SETMASK,
+            null,
+            &original,
+        )),
+    );
+    var guard = try blockWatchedSignals();
+    var inherited: linux.sigset_t = undefined;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn readMask(output: *linux.sigset_t) void {
+            _ = linux.sigprocmask(linux.SIG.SETMASK, null, output);
+        }
+    }.readMask, .{&inherited});
+    thread.join();
+    inline for ([_]linux.SIG{ .INT, .QUIT, .HUP, .TERM }) |signal|
+        try std.testing.expect(linux.sigismember(&inherited, signal));
+    try guard.restore();
+    var restored: linux.sigset_t = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.sigprocmask(
+            linux.SIG.SETMASK,
+            null,
+            &restored,
+        )),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&original),
+        std.mem.asBytes(&restored),
+    );
+    try std.testing.expectError(
+        error.SignalSetupFailed,
+        runSignalsBlocked(.{ .child = integrationChild }, &guard),
     );
 }
 

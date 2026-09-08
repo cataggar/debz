@@ -188,10 +188,26 @@ def audit_production_sources() -> None:
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
+            if (
+                relative in (
+                    "src/apt_system_orchestrator.zig",
+                    "src/production_backend.zig",
+                )
+                and first_test >= 0
+                and match.start() > first_test
+                and match.group() == "linux.fork("
+            ):
+                continue
             child_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(
             r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(", text
         ):
+            if (
+                relative == "src/apt_system_orchestrator.zig"
+                and first_test >= 0
+                and match.start() > first_test
+            ):
+                continue
             namespace_calls.append(
                 f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
             )

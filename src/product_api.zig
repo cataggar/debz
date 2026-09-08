@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub const api_version: u32 = 1;
 pub const json_schema = "io.github.cataggar.debz.command.v1";
+pub const maximum_result_document_bytes: usize = 4 * 1024 * 1024;
+pub const maximum_result_items: usize = 4096;
 
 pub const Operation = enum {
     refresh,
@@ -184,6 +186,112 @@ pub const Result = struct {
     }
 };
 
+pub const OwnedResult = struct {
+    result: Result,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedResult) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+const WireItem = struct {
+    package: []const u8,
+    version: ?[]const u8,
+    architecture: ?[]const u8,
+    detail: ?[]const u8,
+};
+
+const WireDiagnostic = struct {
+    id: []const u8,
+    message: []const u8,
+};
+
+const WireResult = struct {
+    schema: []const u8,
+    api_version: u32,
+    operation: []const u8,
+    exit_status: u8,
+    changed: bool,
+    summary: []const u8,
+    items: []const WireItem,
+    diagnostics: []const WireDiagnostic,
+};
+
+/// Decodes the canonical bounded result transported out of the private
+/// live-root namespace.
+pub fn decodeResult(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedResult {
+    if (source.len == 0 or source.len > maximum_result_document_bytes)
+        return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(WireResult, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidDocument;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.schema, json_schema) or
+        parsed.value.api_version != api_version)
+        return error.UnsupportedSchema;
+    if (parsed.value.items.len > maximum_result_items or
+        parsed.value.diagnostics.len > 1)
+        return error.InvalidDocument;
+    const operation = parseOperation(parsed.value.operation) orelse
+        return error.InvalidDocument;
+    const exit_status = parseExitStatus(parsed.value.exit_status) orelse
+        return error.InvalidDocument;
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const items = try owned.alloc(Item, parsed.value.items.len);
+    for (parsed.value.items, 0..) |item, index| {
+        items[index] = .{
+            .package = try owned.dupe(u8, item.package),
+            .version = try dupeOptional(owned, item.version),
+            .architecture = try dupeOptional(owned, item.architecture),
+            .detail = try dupeOptional(owned, item.detail),
+        };
+    }
+    var diagnostics: [1]Diagnostic = undefined;
+    if (parsed.value.diagnostics.len == 1) {
+        diagnostics[0] = .{
+            .id = std.meta.stringToEnum(
+                ErrorId,
+                parsed.value.diagnostics[0].id,
+            ) orelse return error.InvalidDocument,
+            .message = try owned.dupe(
+                u8,
+                parsed.value.diagnostics[0].message,
+            ),
+        };
+    }
+    var result: OwnedResult = .{
+        .result = .{
+            .operation = operation,
+            .exit_status = exit_status,
+            .changed = parsed.value.changed,
+            .summary = try owned.dupe(u8, parsed.value.summary),
+            .items = items,
+            .diagnostics = diagnostics,
+            .diagnostic_count = parsed.value.diagnostics.len,
+        },
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+    const canonical = try result.result.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source))
+        return error.NonCanonicalDocument;
+    return result;
+}
+
 pub const Backend = struct {
     context: *anyopaque,
     executeFn: *const fn (*anyopaque, std.mem.Allocator, Request) anyerror!Result,
@@ -259,7 +367,64 @@ fn validPackages(request: Request) bool {
             character == '+' or character == '-' or character == '.' or character == ':' or character == '='))
             return false;
     }
+
     return true;
+}
+
+fn parseOperation(value: []const u8) ?Operation {
+    inline for (std.meta.fields(Operation)) |field| {
+        const operation: Operation = @enumFromInt(field.value);
+        if (std.mem.eql(u8, value, operation.spelling())) return operation;
+    }
+    return null;
+}
+
+fn parseExitStatus(value: u8) ?ExitStatus {
+    inline for (std.meta.fields(ExitStatus)) |field| {
+        if (field.value == value) return @enumFromInt(value);
+    }
+    return null;
+}
+
+fn dupeOptional(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !?[]const u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
+}
+
+test "product_api.test.canonical transported result preserves installed items" {
+    const items = [_]Item{
+        .{
+            .package = "alpha",
+            .version = "1.2-3",
+            .architecture = "amd64",
+        },
+        .{
+            .package = "beta",
+            .version = "2",
+            .architecture = "all",
+            .detail = "installed",
+        },
+    };
+    const source = try (Result{
+        .operation = .list_installed,
+        .exit_status = .success,
+        .summary = "2 installed packages",
+        .items = &items,
+    }).canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var decoded = try decodeResult(std.testing.allocator, source);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), decoded.result.items.len);
+    try std.testing.expectEqualStrings(
+        "1.2-3",
+        decoded.result.items[0].version.?,
+    );
+    try std.testing.expectEqualStrings(
+        "all",
+        decoded.result.items[1].architecture.?,
+    );
 }
 
 fn validAbsolutePath(path: []const u8) bool {

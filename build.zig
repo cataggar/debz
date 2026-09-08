@@ -11,8 +11,18 @@ pub fn build(b: *std.Build) void {
         std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.3.0 or 1.2.3-rc.1)", .{version});
     };
 
+    const require_privileged_orchestration_tests = b.option(
+        bool,
+        "require-privileged-orchestration-tests",
+        "Fail instead of skipping privileged production orchestration tests",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(
+        bool,
+        "require_privileged_orchestration_tests",
+        require_privileged_orchestration_tests,
+    );
 
     const zstd_dependency = b.dependency("zstd", .{
         .target = target,
@@ -329,18 +339,54 @@ pub fn build(b: *std.Build) void {
     });
     const run_apt_system_state_tests = b.addRunArtifact(apt_system_state_tests);
 
+    const apt_system_orchestrator_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_orchestrator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apt_system_orchestrator_test_module.addOptions(
+        "debz_build_options",
+        build_options,
+    );
+    apt_system_orchestrator_test_module.addIncludePath(
+        libsolv_dependency.path("src"),
+    );
+    apt_system_orchestrator_test_module.addIncludePath(
+        xz_dependency.path("src/liblzma/api"),
+    );
+    apt_system_orchestrator_test_module.addIncludePath(
+        zstd_dependency.path("lib"),
+    );
+    apt_system_orchestrator_test_module.addCMacro("LZMA_API_STATIC", "1");
+    apt_system_orchestrator_test_module.linkLibrary(libsolv);
+    apt_system_orchestrator_test_module.linkLibrary(liblzma);
+    apt_system_orchestrator_test_module.linkLibrary(zstd);
+    apt_system_orchestrator_test_module.link_libc = true;
+    const apt_system_orchestrator_tests = b.addTest(.{
+        .root_module = apt_system_orchestrator_test_module,
+        .filters = if (require_privileged_orchestration_tests)
+            &.{"apt_system_orchestrator.test.required_privileged."}
+        else
+            &.{"apt_system_orchestrator.test."},
+    });
+    const run_apt_system_orchestrator_tests = b.addRunArtifact(
+        apt_system_orchestrator_tests,
+    );
+
     const apt_system_test_step = b.step(
         "test-apt-system",
-        "Run trusted profile and apt/system contract tests",
+        "Run trusted profile, apt/system contract, and orchestration tests",
     );
     apt_system_test_step.dependOn(&run_system_profile_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
     test_step.dependOn(&run_system_profile_tests.step);
     test_step.dependOn(&run_apt_system_api_tests.step);
     test_step.dependOn(&run_apt_system_cli_tests.step);
     test_step.dependOn(&run_apt_system_state_tests.step);
+    test_step.dependOn(&run_apt_system_orchestrator_tests.step);
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,
@@ -619,9 +665,11 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",
         "apt-system-request-v1.json",
         "apt-system-result-v1.json",
+        "apt-system-result-v2.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",

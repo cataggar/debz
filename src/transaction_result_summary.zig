@@ -169,7 +169,7 @@ fn verifyPackages(
     values: std.json.Array,
     expected: []const exact_lock.Package,
 ) !void {
-    if (values.items.len != expected.len or values.items.len == 0)
+    if (values.items.len != expected.len)
         return error.LockEvidenceMismatch;
     for (values.items, expected) |value, package| {
         const object = try asObject(value);
@@ -511,4 +511,65 @@ test "transaction result summary binds successful canonical evidence to the exac
         error.LockEvidenceMismatch,
         verify(std.testing.allocator, json, wrong_package, "amd64"),
     );
+}
+
+test "transaction result summary accepts an exact empty package closure" {
+    const repository_id: [64]u8 = @splat('a');
+    const repositories = [_]exact_lock.Repository{.{
+        .id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    }};
+    var lock = try exact_lock.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &repositories,
+        .packages = &.{},
+        .authenticated_metadata = true,
+    });
+    defer lock.deinit();
+    const evidence_repositories = [_]transaction_provenance.RepositoryEvidence{.{
+        .source_config_id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = @splat(8),
+        .metadata_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+        .signature_verified = true,
+    }};
+    const commands = [_]transaction_provenance.CommandEvidence{.{
+        .phase = "remove",
+        .package = "demo",
+        .argv = &.{ "dpkg", "--remove", "demo" },
+        .environment = &.{},
+        .command_sha256 = @splat(9),
+        .artifact_sha256 = null,
+    }};
+    var result = try transaction_provenance.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = lock.lock.request_sha256,
+        .solver_policy_sha256 = lock.lock.policy_sha256,
+        .executor_policy_sha256 = @splat(10),
+        .plan_sha256 = @splat(11),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .repositories = &evidence_repositories,
+        .packages = &.{},
+        .commands = &commands,
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(12),
+            .package_origins_sha256 = lock.lock.digest_sha256,
+            .detail = "verified empty closure",
+        },
+        .outcome = .succeeded,
+    });
+    defer result.deinit();
+    const json = try result.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    const summary = try verify(std.testing.allocator, json, lock.lock, "amd64");
+    try std.testing.expectEqual(@as(usize, 0), summary.package_count);
 }

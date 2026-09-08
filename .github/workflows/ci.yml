@@ -578,6 +578,22 @@ jobs:
           zig build -Doptimize=ReleaseSafe test
           zig build -Doptimize=ReleaseSafe fuzz
           zig build run -- --help
+      - name: Run required privileged orchestration crash suite
+        run: |
+          sudo rm -rf /run/debz
+          sudo env \
+            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache-orchestration-required" \
+            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache-orchestration-required" \
+            "$(command -v zig)" build test-apt-system \
+              -Drequire-privileged-orchestration-tests=true \
+              --summary all
+      - name: Normalize privileged orchestration diagnostics
+        if: always()
+        run: |
+          sudo chown -R "$USER:$USER" \
+            .zig-cache-orchestration-required \
+            .zig-global-cache-orchestration-required 2>/dev/null || true
+          sudo rm -rf /run/debz
       - name: Prepare native download action fixture
         id: download-fixture
         env:
