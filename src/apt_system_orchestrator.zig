@@ -204,6 +204,17 @@ pub const RootStatus = enum {
     recovery_required,
 };
 
+pub const RootInspection = struct {
+    status: RootStatus,
+    attempt_id: ?[32]u8 = null,
+    record: ?root_operation.OwnedRecord = null,
+
+    pub fn deinit(self: *RootInspection) void {
+        if (self.record) |*record| record.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const BackendResult = struct {
     result: product_api.Result,
     root_status: RootStatus,
@@ -320,7 +331,10 @@ pub const LiveRootRunner = struct {
         Backend,
         WorkflowRequest,
     ) anyerror!BackendResult,
-    inspectFn: *const fn (*anyopaque) anyerror!RootStatus,
+    inspectFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+    ) anyerror!RootInspection,
     readRecoveryCompletionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -354,8 +368,11 @@ pub const LiveRootRunner = struct {
         return self.workflowFn(self.context, allocator, backend, request);
     }
 
-    pub fn inspect(self: LiveRootRunner) !RootStatus {
-        return self.inspectFn(self.context);
+    pub fn inspect(
+        self: LiveRootRunner,
+        allocator: std.mem.Allocator,
+    ) !RootInspection {
+        return self.inspectFn(self.context, allocator);
     }
 
     pub fn readRecoveryCompletion(
@@ -435,24 +452,83 @@ pub const PrivateLiveRootRunner = struct {
         } });
     }
 
-    fn inspect(context: *anyopaque) !RootStatus {
+    fn inspect(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) !RootInspection {
         const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
+        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        const linux = std.os.linux;
+        var pipe: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS)
+            return error.PipeFailed;
+        var read_open = true;
+        var write_open = true;
+        defer {
+            if (read_open) _ = linux.close(pipe[0]);
+            if (write_open) _ = linux.close(pipe[1]);
+        }
+        const buffer = try allocator.alloc(
+            u8,
+            root_operation.maximum_document_bytes,
+        );
+        defer allocator.free(buffer);
+        var reader_context: ReaderContext = .{
+            .fd = pipe[0],
+            .buffer = buffer,
+        };
+        const reader = try std.Thread.spawn(
+            .{},
+            readTransport,
+            .{&reader_context},
+        );
+        var joined = false;
+        defer if (!joined) {
+            if (write_open) {
+                _ = linux.close(pipe[1]);
+                write_open = false;
+            }
+            reader.join();
+        };
+        var child_context: CompletionReadContext = .{
+            .runner = self,
+            .output_fd = pipe[1],
+        };
         const result = try live_root.run(.{
-            .context = self,
+            .context = &child_context,
             .child = inspectChild,
             .termination_grace_ms = self.termination_grace_ms,
         });
-        return switch (result) {
+        _ = linux.close(pipe[1]);
+        write_open = false;
+        reader.join();
+        joined = true;
+        _ = linux.close(pipe[0]);
+        read_open = false;
+        if (reader_context.failure) |failure| return failure;
+        switch (result) {
             .exited => |code| switch (code) {
-                0 => .clean,
-                10 => .recovery_required,
-                20 => .completed,
-                else => error.LiveRootChildFailed,
+                0 => return .{ .status = .clean },
+                10 => {},
+                else => return error.LiveRootChildFailed,
             },
-            .signaled => error.LiveRootChildSignaled,
-            .interrupted => error.LiveRootInterrupted,
-            .setup_failed => |failure| mapSetupFailure(failure),
-        };
+            .signaled => return error.LiveRootChildSignaled,
+            .interrupted => return error.LiveRootInterrupted,
+            .setup_failed => |failure| return mapSetupFailure(failure),
+        }
+        var record = try root_operation.decode(
+            allocator,
+            buffer[0..reader_context.length],
+            root_operation.maximum_document_bytes,
+        );
+        errdefer record.deinit();
+        var inspection = classifyRootRecord(
+            record.record.state,
+            record.record.provenance,
+            record.record.attempt_id,
+        );
+        inspection.record = record;
+        return inspection;
     }
 
     fn invoke(
@@ -553,13 +629,14 @@ pub const PrivateLiveRootRunner = struct {
         const root_status: RootStatus = switch (invocation) {
             .route => .clean,
             .workflow => |workflow_invocation| switch (workflow_invocation.request.mode) {
-                .execute, .recover => if (decoded.result.exit_status == .success)
-                    switch (try self.interface().inspect()) {
+                .execute, .recover => if (decoded.result.exit_status == .success) status: {
+                    var inspection = try self.interface().inspect(allocator);
+                    defer inspection.deinit();
+                    break :status switch (inspection.status) {
                         .clean, .completed => .completed,
                         .recovery_required => .recovery_required,
-                    }
-                else
-                    .recovery_required,
+                    };
+                } else .recovery_required,
                 .plan_only, .download_only => .clean,
             },
         };
@@ -604,14 +681,22 @@ pub const PrivateLiveRootRunner = struct {
     ) anyerror!u8 {
         if (!std.mem.eql(u8, install_root, live_root.logical_root_path))
             return error.UnsafeInstallRoot;
-        const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(raw.?));
-        var owned_root = try root_fs.openAbsoluteRoot(self.io, install_root);
+        const context: *CompletionReadContext = @ptrCast(@alignCast(raw.?));
+        var owned_root = try root_fs.openAbsoluteRoot(
+            context.runner.io,
+            install_root,
+        );
         defer owned_root.close();
         var record = (try root_operation.Store.init(
             owned_root.root,
         ).read(std.heap.page_allocator)) orelse return 0;
         defer record.deinit();
-        return if (record.record.state == .completed) 20 else 10;
+        const source = try record.record.canonicalJson(
+            std.heap.page_allocator,
+        );
+        defer std.heap.page_allocator.free(source);
+        try writeTransport(context.output_fd, source);
+        return 10;
     }
 
     fn readRecoveryCompletion(
@@ -787,6 +872,23 @@ pub const PrivateLiveRootRunner = struct {
         };
     }
 };
+
+fn classifyRootRecord(
+    state: root_operation.State,
+    provenance: root_operation.ProvenanceState,
+    attempt_id: [32]u8,
+) RootInspection {
+    return .{
+        .status = if (state == .completed)
+            switch (provenance) {
+                .pending => .completed,
+                .published, .not_required => .clean,
+            }
+        else
+            .recovery_required,
+        .attempt_id = attempt_id,
+    };
+}
 
 fn workflowSurfaceOperation(
     operation: WorkflowOperation,
@@ -1032,6 +1134,12 @@ pub const StateStore = struct {
         []const u8,
         [32]u8,
     ) anyerror!api.DocumentBinding,
+    readRecoveryCompletionFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        OperationPaths,
+        api.DocumentBinding,
+    ) anyerror!root_operation_completion.OwnedDocument,
     publishCompletionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -1093,6 +1201,7 @@ pub const SystemStateStore = struct {
             .readRetainedFn = readRetained,
             .retainTransactionFn = retainTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
+            .readRecoveryCompletionFn = readRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
             .verifyCompletionFn = verifyCompletion,
         };
@@ -1475,6 +1584,42 @@ pub const SystemStateStore = struct {
             .version = root_operation_completion.schema_version,
             .digest_sha256 = digest,
         };
+    }
+
+    fn readRecoveryCompletion(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+        binding: api.DocumentBinding,
+    ) !root_operation_completion.OwnedDocument {
+        const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, binding.path, paths.recovery_completion) or
+            !std.mem.eql(
+                u8,
+                binding.schema,
+                root_operation_completion.schema_id,
+            ) or
+            binding.version != root_operation_completion.schema_version)
+            return error.RecoveryCompletionMismatch;
+        const bytes = try readTrustedOperationFile(
+            self.io,
+            allocator,
+            paths.recovery_completion,
+            root_operation_completion.maximum_document_bytes,
+        );
+        defer allocator.free(bytes);
+        var document = try root_operation_completion.decode(
+            allocator,
+            bytes,
+            root_operation_completion.maximum_document_bytes,
+        );
+        errdefer document.deinit();
+        if (!std.mem.eql(
+            u8,
+            &document.document.digest_sha256,
+            &binding.digest_sha256,
+        )) return error.RecoveryCompletionMismatch;
+        return document;
     }
 
     fn publishCompletion(
@@ -1876,9 +2021,10 @@ pub const Engine = struct {
             "trusted profile reference changed before use",
         ) };
         if (request.operation != .list_installed) {
-            const lower_status = self.runner.inspect() catch |err|
+            var lower_status = self.runner.inspect(allocator) catch |err|
                 return .{ .result = try liveRootFailure(request, err) };
-            if (lower_status != .clean)
+            defer lower_status.deinit();
+            if (lower_status.status != .clean)
                 return .{ .result = try api.failure(
                     request,
                     .recovery,
@@ -2318,6 +2464,7 @@ pub const Engine = struct {
             false,
             null,
             null,
+            null,
         );
     }
 
@@ -2570,25 +2717,80 @@ pub const Engine = struct {
             &current,
             "trusted profile reference changed before recovery inspection",
         );
-        const lower_status = self.runner.inspect() catch
+        var lower_inspection = self.runner.inspect(allocator) catch
             return self.recoveryFailed(
                 allocator,
                 recovery.prepared,
                 &current,
                 "lower-level root-operation status could not be inspected",
             );
-        if (lower_status == .clean) {
-            const lower_recovery_completed =
-                current.state.phase == .recovering;
-            if (current.state.phase == .recovery_required)
-                try self.transition(
+        defer lower_inspection.deinit();
+        if (lower_inspection.status == .clean) {
+            const retained_lower_recovery =
+                if (current.state.transaction_result) |binding|
+                    std.mem.eql(
+                        u8,
+                        binding.schema,
+                        root_operation_completion.schema_id,
+                    ) and std.mem.eql(
+                        u8,
+                        binding.path,
+                        recovery.prepared.paths.recovery_completion,
+                    )
+                else
+                    false;
+            const settled_lower_recovery =
+                !retained_lower_recovery and
+                if (lower_inspection.record) |record|
+                    record.record.state == .completed and
+                        record.record.provenance == .published and
+                        record.record.outcome == .recovered
+                else
+                    false;
+            if (settled_lower_recovery)
+                loaded.revalidate(allocator) catch
+                    return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "trusted profile reference changed before settled recovery evidence reconciliation",
+                    );
+            var lower_completion = if (retained_lower_recovery)
+                self.store.readRecoveryCompletionFn(
+                    self.store.context,
                     allocator,
-                    loaded.view.state_path,
+                    recovery.prepared.paths,
+                    current.state.transaction_result.?,
+                ) catch {
+                    return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "retained lower-level recovery completion evidence is invalid",
+                    );
+                }
+            else if (settled_lower_recovery)
+                self.runner.readRecoveryCompletion(allocator) catch
+                    return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "settled lower-level recovery completion evidence is unavailable",
+                    )
+            else
+                null;
+            defer if (lower_completion) |*owned| owned.deinit();
+            if (settled_lower_recovery and
+                (lower_completion == null or
+                    !settledRecoveryProvenanceMatches(
+                        lower_inspection.record.?.record,
+                        lower_completion.?.document,
+                    )))
+                return self.recoveryFailed(
+                    allocator,
+                    recovery.prepared,
                     &current,
-                    .{
-                        .phase = .recovering,
-                        .diagnostic = "reconciling completed transaction",
-                    },
+                    "settled lower-level recovery completion evidence is stale or foreign",
                 );
             loaded.revalidate(allocator) catch return self.recoveryFailed(
                 allocator,
@@ -2596,25 +2798,18 @@ pub const Engine = struct {
                 &current,
                 "trusted profile reference changed before recovery evidence reconciliation",
             );
-            var lower_completion = if (lower_recovery_completed)
-                self.runner.readRecoveryCompletion(allocator) catch
-                    return self.recoveryFailed(
-                        allocator,
-                        recovery.prepared,
-                        &current,
-                        "lower-level recovery completion evidence could not be read",
-                    )
-            else
-                null;
-            defer if (lower_completion) |*owned| owned.deinit();
             return self.verifyAndComplete(
                 allocator,
                 recovery.prepared,
                 loaded.view,
                 &current,
-                lower_recovery_completed,
+                retained_lower_recovery or settled_lower_recovery,
                 if (lower_completion) |owned| owned.document else null,
                 recovery_lock,
+                if (settled_lower_recovery)
+                    lower_inspection.attempt_id
+                else
+                    null,
             );
         }
         try self.transition(
@@ -2693,7 +2888,6 @@ pub const Engine = struct {
             &current,
             "trusted profile reference changed before recovered evidence reconciliation",
         );
-        try self.hitCompletionBoundary(.after_backend_success);
         return self.verifyAndComplete(
             allocator,
             recovery.prepared,
@@ -2705,6 +2899,13 @@ pub const Engine = struct {
             else
                 null,
             before_recovery,
+            lower_inspection.attempt_id orelse
+                return self.recoveryFailed(
+                    allocator,
+                    recovery.prepared,
+                    &current,
+                    "lower-level recovery attempt identity is unavailable",
+                ),
         );
     }
 
@@ -2717,6 +2918,7 @@ pub const Engine = struct {
         recovered: bool,
         recovery_document: ?root_operation_completion.Document,
         recovery_lock: ?VerifiedLock,
+        expected_recovery_attempt: ?[32]u8,
     ) !api.Result {
         var retained: api.DocumentBinding = undefined;
         if (recovered and recovery_document != null) {
@@ -2728,6 +2930,7 @@ pub const Engine = struct {
                 profile,
                 recovery_lock orelse
                     return error.MissingRecoveryLockVerification,
+                expected_recovery_attempt,
             )) return self.markRecoveryRequired(
                 allocator,
                 prepared,
@@ -2736,7 +2939,6 @@ pub const Engine = struct {
             );
             const source = try document.canonicalJson(allocator);
             defer allocator.free(source);
-            try self.hitCompletionBoundary(.after_transaction_verified);
             retained = self.store.retainRecoveryCompletionFn(
                 self.store.context,
                 allocator,
@@ -2783,18 +2985,14 @@ pub const Engine = struct {
                 "verified transaction result could not be retained",
             );
         }
-        try self.hitCompletionBoundary(.after_transaction_retained);
+        if (!recovered)
+            try self.hitCompletionBoundary(.after_transaction_retained);
         try self.transition(
             allocator,
             profile.state_path,
             current,
             .{
-                .phase = if (recovered or
-                    current.state.phase == .recovery_required or
-                    current.state.phase == .recovering)
-                    .recovering
-                else
-                    .verifying,
+                .phase = if (recovered) .recovering else .verifying,
                 .transaction_result = retained,
                 .diagnostic = if (recovered)
                     "lower-level recovery completed"
@@ -2802,6 +3000,11 @@ pub const Engine = struct {
                     "",
             },
         );
+        if (recovered) {
+            try self.hitCompletionBoundary(.after_backend_success);
+            try self.hitCompletionBoundary(.after_transaction_verified);
+            try self.hitCompletionBoundary(.after_transaction_retained);
+        }
         try self.hitCompletionBoundary(.after_verifying_state);
         const completion = self.store.publishCompletionFn(
             self.store.context,
@@ -3728,7 +3931,11 @@ fn recoveryCompletionMatches(
     prepared: Preparation,
     profile: ProfileView,
     verified_lock: VerifiedLock,
+    expected_attempt_id: ?[32]u8,
 ) !bool {
+    if (expected_attempt_id) |attempt_id|
+        if (!std.mem.eql(u8, &document.attempt_id, &attempt_id))
+            return false;
     const lock = document.exact_lock orelse return false;
     const expected_operation: product_api.Operation = switch (prepared.request.operation) {
         .install => .install,
@@ -3797,6 +4004,21 @@ fn recoveryCompletionMatches(
         ) and
         document.discharge.surface == .package_transaction and
         std.mem.eql(u8, document.discharge.operation, "recover");
+}
+
+fn settledRecoveryProvenanceMatches(
+    record: root_operation.Record,
+    document: root_operation_completion.Document,
+) bool {
+    const provenance_sha256 = record.provenance_sha256 orelse return false;
+    if (!std.mem.eql(u8, &record.attempt_id, &document.attempt_id))
+        return false;
+    const expected = root_operation.provenanceDigest(record, .{
+        .outcome = record.outcome,
+        .document_sha256 = document.digest_sha256,
+        .journal_archived = document.journal.status == .archived,
+    });
+    return std.mem.eql(u8, &provenance_sha256, &expected);
 }
 
 fn copyRequest(
@@ -4689,6 +4911,7 @@ const FakeRunner = struct {
     inspect_status: RootStatus = .clean,
     fail_mode: ?WorkflowMode = null,
     transport_roundtrip: bool = false,
+    inspect_record_source: ?[]u8 = null,
     recovery_completion_source: ?[]u8 = null,
     recovery_completion_reads: usize = 0,
     recovery_completion_mismatch: RecoveryCompletionMismatch = .none,
@@ -4697,9 +4920,12 @@ const FakeRunner = struct {
         none,
         original_request,
         discharge_request,
+        attempt,
     };
 
     fn deinit(self: *FakeRunner) void {
+        if (self.inspect_record_source) |source|
+            self.allocator.free(source);
         if (self.recovery_completion_source) |source|
             self.allocator.free(source);
         self.* = undefined;
@@ -4797,10 +5023,34 @@ const FakeRunner = struct {
         return result;
     }
 
-    fn inspect(context: *anyopaque) !RootStatus {
+    fn inspect(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) !RootInspection {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         self.inspect_calls += 1;
-        return self.inspect_status;
+        if (self.inspect_record_source) |source| {
+            var record = try root_operation.decode(
+                allocator,
+                source,
+                root_operation.maximum_document_bytes,
+            );
+            errdefer record.deinit();
+            var inspection = classifyRootRecord(
+                record.record.state,
+                record.record.provenance,
+                record.record.attempt_id,
+            );
+            inspection.record = record;
+            return inspection;
+        }
+        return .{
+            .status = self.inspect_status,
+            .attempt_id = if (self.inspect_status == .clean)
+                null
+            else
+                @splat(0x91),
+        };
     }
 
     fn readRecoveryCompletion(
@@ -4850,7 +5100,10 @@ fn fakeRecoveryCompletion(
     if (mismatch == .original_request) original_request_digest[0] ^= 0xff;
     if (mismatch == .discharge_request) recovery_request_digest[0] ^= 0xff;
     var record = try root_operation.create(allocator, .{
-        .attempt_id = @splat(0x91),
+        .attempt_id = if (mismatch == .attempt)
+            @splat(0x92)
+        else
+            @splat(0x91),
         .generation = 4,
         .install_root = live_root.logical_root_path,
         .backend = .legacy_dpkg,
@@ -4896,6 +5149,7 @@ const FakeStateStore = struct {
     active_bytes: ?[]u8 = null,
     retained_bytes: ?[]u8 = null,
     request_bytes: ?[]u8 = null,
+    recovery_completion_bytes: ?[]u8 = null,
     reserve_calls: usize = 0,
     transition_calls: usize = 0,
     finish_calls: usize = 0,
@@ -4908,6 +5162,8 @@ const FakeStateStore = struct {
         if (self.active_bytes) |bytes| self.allocator.free(bytes);
         if (self.retained_bytes) |bytes| self.allocator.free(bytes);
         if (self.request_bytes) |bytes| self.allocator.free(bytes);
+        if (self.recovery_completion_bytes) |bytes|
+            self.allocator.free(bytes);
         self.* = undefined;
     }
 
@@ -4922,6 +5178,7 @@ const FakeStateStore = struct {
             .readRetainedFn = readRetained,
             .retainTransactionFn = retainTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
+            .readRecoveryCompletionFn = readRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
             .verifyCompletionFn = verifyCompletion,
         };
@@ -5054,15 +5311,46 @@ const FakeStateStore = struct {
         };
     }
 
+    fn readRecoveryCompletion(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+        binding: api.DocumentBinding,
+    ) !root_operation_completion.OwnedDocument {
+        const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, binding.path, paths.recovery_completion))
+            return error.RecoveryCompletionMismatch;
+        const source = self.recovery_completion_bytes orelse
+            return error.FileNotFound;
+        var document = try root_operation_completion.decode(
+            allocator,
+            source,
+            root_operation_completion.maximum_document_bytes,
+        );
+        errdefer document.deinit();
+        if (!std.mem.eql(
+            u8,
+            &document.document.digest_sha256,
+            &binding.digest_sha256,
+        )) return error.RecoveryCompletionMismatch;
+        return document;
+    }
+
     fn retainRecoveryCompletion(
         context: *anyopaque,
         _: std.mem.Allocator,
         paths: OperationPaths,
-        _: []const u8,
+        source: []const u8,
         digest: [32]u8,
     ) !api.DocumentBinding {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
         self.retained_transaction = true;
+        if (self.recovery_completion_bytes) |previous|
+            self.allocator.free(previous);
+        self.recovery_completion_bytes = try self.allocator.dupe(
+            u8,
+            source,
+        );
         return .{
             .path = paths.recovery_completion,
             .schema = root_operation_completion.schema_id,
@@ -5339,6 +5627,24 @@ test "apt_system_orchestrator.test.update and list route through stable live roo
     try std.testing.expectEqual(@as(usize, 0), harness.backend.workflow_calls);
 }
 
+test "apt_system_orchestrator.test.completed lower root requires recovery only while provenance is pending" {
+    const attempt: [32]u8 = @splat(0x57);
+    const pending = classifyRootRecord(.completed, .pending, attempt);
+    try std.testing.expectEqual(RootStatus.completed, pending.status);
+    try std.testing.expectEqualSlices(u8, &attempt, &pending.attempt_id.?);
+
+    const published = classifyRootRecord(.completed, .published, attempt);
+    try std.testing.expectEqual(RootStatus.clean, published.status);
+    const not_required = classifyRootRecord(
+        .completed,
+        .not_required,
+        attempt,
+    );
+    try std.testing.expectEqual(RootStatus.clean, not_required.status);
+    const active = classifyRootRecord(.mutating, .pending, attempt);
+    try std.testing.expectEqual(RootStatus.recovery_required, active.status);
+}
+
 test "apt_system_orchestrator.test.private runner transfers canonical result through live-root namespace" {
     if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
         return error.SkipZigTest;
@@ -5370,6 +5676,10 @@ test "apt_system_orchestrator.test.private runner transfers canonical result thr
     try std.testing.expectEqualStrings("installed-a", result.result.items[0].package);
     try std.testing.expectEqualStrings("1", result.result.items[0].version.?);
     try std.testing.expectEqualStrings("amd64", result.result.items[0].architecture.?);
+    var inspection = try runner.interface().inspect(std.testing.allocator);
+    defer inspection.deinit();
+    try std.testing.expectEqual(RootStatus.clean, inspection.status);
+    try std.testing.expect(inspection.attempt_id == null);
 }
 
 test "apt_system_orchestrator.test.private runner validates every workflow mode transport operation" {
@@ -5979,8 +6289,8 @@ test "apt_system_orchestrator.test.completed lower record is discharged before o
     try std.testing.expectEqual(@as(usize, 2), harness.backend.plan_calls);
 }
 
-test "apt_system_orchestrator.test.production recovery digest domains fail closed independently" {
-    inline for (.{ "original", "discharge", "semantic" }) |domain| {
+test "apt_system_orchestrator.test.production recovery bindings fail closed independently" {
+    inline for (.{ "original", "discharge", "semantic", "attempt" }) |domain| {
         var harness = Harness.init(std.testing.allocator);
         defer harness.deinit();
         harness.rebind();
@@ -6009,6 +6319,8 @@ test "apt_system_orchestrator.test.production recovery digest domains fail close
             harness.runner.recovery_completion_mismatch = .original_request
         else if (std.mem.eql(u8, domain, "discharge"))
             harness.runner.recovery_completion_mismatch = .discharge_request
+        else if (std.mem.eql(u8, domain, "attempt"))
+            harness.runner.recovery_completion_mismatch = .attempt
         else
             harness.verifier.different_semantic_check =
                 harness.verifier.lock_checks + 2;
@@ -6023,6 +6335,150 @@ test "apt_system_orchestrator.test.production recovery digest domains fail close
         try std.testing.expect(harness.store.active_bytes != null);
         try std.testing.expect(!harness.store.completion_published);
     }
+}
+
+test "apt_system_orchestrator.test.settled published recovery reconciles without lower workflow replay" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+
+    var loaded = try harness.profile.interface().load(
+        std.testing.allocator,
+        "/profile.json",
+    );
+    defer loaded.deinit();
+    const selectors = try selectorsFor(
+        std.testing.allocator,
+        prepared.request,
+    );
+    defer std.testing.allocator.free(selectors);
+    const workflow_request: WorkflowRequest = .{
+        .operation = .install,
+        .mode = .recover,
+        .selectors = selectors,
+        .options = executeOptions(
+            loaded.view,
+            prepared.paths.exact_lock,
+        ),
+    };
+    var completion = try fakeRecoveryCompletion(
+        std.testing.allocator,
+        workflow_request,
+        .none,
+    );
+    defer completion.deinit();
+    var pending_record = try root_operation.create(
+        std.testing.allocator,
+        .{
+            .attempt_id = completion.document.attempt_id,
+            .generation = 4,
+            .install_root = live_root.logical_root_path,
+            .backend = .legacy_dpkg,
+            .operation = .{ .package_transaction = .install },
+            .state = .completed,
+            .phase = .provenance,
+            .step = 4,
+            .mutation_started = true,
+            .outcome = .recovered,
+            .provenance = .pending,
+            .evidence = .{ .exact_lock = .{
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = @splat(0x55),
+            } },
+            .request_sha256 = completion.document.request_sha256,
+            .policy_sha256 = @splat(0x92),
+            .target_architecture = "amd64",
+            .reserved_unix = 90,
+            .updated_unix = 100,
+        },
+    );
+    defer pending_record.deinit();
+    const provenance_sha256 = root_operation.provenanceDigest(
+        pending_record.record,
+        .{
+            .outcome = .recovered,
+            .document_sha256 = completion.document.digest_sha256,
+            .journal_archived = false,
+        },
+    );
+    var published_record = try root_operation.create(
+        std.testing.allocator,
+        .{
+            .attempt_id = completion.document.attempt_id,
+            .generation = 5,
+            .install_root = live_root.logical_root_path,
+            .backend = .legacy_dpkg,
+            .operation = .{ .package_transaction = .install },
+            .state = .completed,
+            .phase = .provenance,
+            .step = 5,
+            .mutation_started = true,
+            .outcome = .recovered,
+            .provenance = .published,
+            .provenance_sha256 = provenance_sha256,
+            .evidence = .{ .exact_lock = .{
+                .schema = exact_lock.schema_id,
+                .version = exact_lock.schema_version,
+                .digest_sha256 = @splat(0x55),
+            } },
+            .request_sha256 = completion.document.request_sha256,
+            .policy_sha256 = @splat(0x92),
+            .target_architecture = "amd64",
+            .reserved_unix = 90,
+            .updated_unix = 101,
+        },
+    );
+    defer published_record.deinit();
+    harness.runner.inspect_record_source =
+        try published_record.record.canonicalJson(
+            harness.runner.allocator,
+        );
+    harness.runner.recovery_completion_source =
+        try completion.document.canonicalJson(
+            harness.runner.allocator,
+        );
+
+    var result = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(api.Outcome.success, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        harness.runner.recovery_completion_reads,
+    );
+    try std.testing.expect(harness.store.active_bytes == null);
+    var next = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.remove, &.{"beta"}),
+    ));
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
 }
 
 test "apt_system_orchestrator.test.valid lock replacement is rejected before recovery mutation" {
@@ -6208,7 +6664,7 @@ test "apt_system_orchestrator.test.post-backend crashes reconcile without a seco
     }
 }
 
-test "apt_system_orchestrator.test.post-recovery crashes reconcile without a second recovery" {
+test "apt_system_orchestrator.test.post-recovery crashes use exact retained binding and ignore stale global completion" {
     inline for (std.meta.tags(CompletionBoundary)) |boundary| {
         var harness = Harness.init(std.testing.allocator);
         defer harness.deinit();
@@ -6248,6 +6704,36 @@ test "apt_system_orchestrator.test.post-recovery crashes reconcile without a sec
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
         harness.engine.completion_crash = null;
         harness.runner.inspect_status = .clean;
+        if (harness.runner.recovery_completion_source) |source|
+            harness.runner.allocator.free(source);
+        var stale_profile = try harness.profile.interface().load(
+            std.testing.allocator,
+            "/profile.json",
+        );
+        defer stale_profile.deinit();
+        const stale_selectors = try selectorsFor(
+            std.testing.allocator,
+            prepared.request,
+        );
+        defer std.testing.allocator.free(stale_selectors);
+        var stale_completion = try fakeRecoveryCompletion(
+            std.testing.allocator,
+            .{
+                .operation = .install,
+                .mode = .recover,
+                .selectors = stale_selectors,
+                .options = executeOptions(
+                    stale_profile.view,
+                    prepared.paths.exact_lock,
+                ),
+            },
+            .attempt,
+        );
+        defer stale_completion.deinit();
+        harness.runner.recovery_completion_source =
+            try stale_completion.document.canonicalJson(
+                harness.runner.allocator,
+            );
 
         var reconciliation = switch (try harness.engine.prepareRecovery(
             std.testing.allocator,
@@ -6265,7 +6751,7 @@ test "apt_system_orchestrator.test.post-recovery crashes reconcile without a sec
         defer result.deinit();
         try std.testing.expectEqual(api.Outcome.success, result.outcome);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
-        try std.testing.expectEqual(@as(usize, 1), harness.runner.recovery_completion_reads);
+        try std.testing.expectEqual(@as(usize, 0), harness.runner.recovery_completion_reads);
         try std.testing.expect(harness.store.active_bytes == null);
     }
 }

@@ -290,20 +290,32 @@ mismatches fail closed. A recoverable plan reports the stable action
 the original semantic `ProductionWorkflow` recovery request, rechecks the full
 lock binding immediately before recovery mutation, and verifies and retains its
 result through the same boundaries. Recovery first inspects the retained
-lower-level root-operation state. Only a clean lower root can enter direct
-outer reconciliation. A completed lower record may still owe provenance, so it
+lower-level root-operation state. A completed record with pending provenance
 is routed through `ProductionWorkflow` recovery to
 `dischargeOwedProvenance`, which publishes the discharge and clears the record
-without replaying package mutation. Once the lower root is clean after
-recovery, the engine strictly decodes the retained
-`root-operation-completion-v1.json`, checks the semantic request, architecture,
-exact-lock schema/version/digest, operation, outcome, and recovery discharge,
-then retains that honest evidence and finalizes the outer state without
-rerunning lower-level recovery. The root record request digest is checked
-against the original execute-mode production product request, the discharge
-digest against the recover-mode production product request, and the exact
-lock's request digest against the separately computed semantic transaction
-request. These digest domains are never substituted for one another. The
+without replaying package mutation. A completed record whose provenance is
+already published or not required is settled and can enter direct outer
+reconciliation even if the lower record has not yet been cleared.
+
+After a real lower recovery, the engine strictly decodes and retains the
+operation-local `root-operation-completion-v1.json`, checks the observed lower
+attempt ID, semantic request, architecture, exact-lock schema/version/digest,
+operation, outcome, and recovery discharge, then CAS-publishes that exact
+binding before any injectable outer post-backend boundary. If a process died
+after lower provenance publication but before returning, the still-present
+settled root record supplies the exact attempt and provenance digest used to
+validate the global completion once and retain the same operation-local
+binding; no lower workflow replay or recovery request is needed. Once the
+record is absent, reconciliation consumes only that operation-local path and
+digest. It never infers recovery from the outer phase or accepts a global
+completion that may belong to an older identical request. Without either
+durable binding, clean reconciliation uses ordinary exact-lock-bound
+transaction evidence and does not claim that lower recovery occurred. The root
+record request digest is checked against the original execute-mode production
+product request, the discharge digest against the recover-mode production
+product request, and the exact lock's request digest against the separately
+computed semantic transaction request. These digest domains are never
+substituted for one another. The
 discharge can truthfully classify detailed transaction provenance as
 unavailable when publication was the interrupted boundary; it does not
 fabricate a transaction result. Crashes at every outer post-backend boundary

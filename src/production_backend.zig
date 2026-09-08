@@ -3550,6 +3550,100 @@ test "production workflow recovery reconciles completion without a second mutati
     try std.testing.expect(future.exit_status != .recovery);
 }
 
+test "production recovery crash after provenance publication leaves a settled clearable record" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var initial_crash: TestCompletionCrash = .{
+        .point = .after_completed_record,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+        .completion_crash = initial_crash.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const interrupted = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
+    try std.testing.expect(initial_crash.triggered);
+    const mutation_calls = process.calls;
+
+    var published_crash: TestCompletionCrash = .{
+        .point = .after_provenance_published,
+    };
+    backend.completion_crash = published_crash.interface();
+    const discharge = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.internal, discharge.exit_status);
+    try std.testing.expect(published_crash.triggered);
+    try std.testing.expectEqual(mutation_calls, process.calls);
+
+    const record_source = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "root/" ++ root_operation.record_path,
+        allocator,
+        .limited(root_operation.maximum_document_bytes),
+    );
+    defer allocator.free(record_source);
+    var record = try root_operation.decode(
+        allocator,
+        record_source,
+        root_operation.maximum_document_bytes,
+    );
+    defer record.deinit();
+    try std.testing.expectEqual(root_operation.State.completed, record.record.state);
+    try std.testing.expectEqual(
+        root_operation.ProvenanceState.published,
+        record.record.provenance,
+    );
+
+    backend.completion_crash = null;
+    const future = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expect(future.exit_status != .recovery);
+}
+
 test "production workflow successful recovery publishes honest completion evidence" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

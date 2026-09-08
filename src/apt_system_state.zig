@@ -700,7 +700,7 @@ fn canTransition(current: Phase, next: Phase) bool {
         .downloaded => next == .mutating or next == .completed,
         .mutating => next == .verifying or next == .recovery_required,
         .verifying => next == .completed or next == .recovery_required,
-        .recovery_required => next == .recovering,
+        .recovery_required => next == .recovering or next == .verifying,
         .recovering => next == .verifying or next == .recovery_required or
             next == .completed,
         .completed => false,
@@ -1233,23 +1233,23 @@ test "apt_system_state.test.transitions are monotonic and evidence is sticky" {
     defer recovery.deinit();
     try validateTransition(mutating.state, recovery.state);
 
-    var illegal_input = recovery.state;
-    illegal_input.generation += 1;
-    illegal_input.phase = .verifying;
-    illegal_input.diagnostic = "";
-    illegal_input.transaction_result = .{
+    var reconciliation_input = recovery.state;
+    reconciliation_input.generation += 1;
+    reconciliation_input.phase = .verifying;
+    reconciliation_input.diagnostic = "";
+    reconciliation_input.transaction_result = .{
         .path = "/var/lib/debz/result.json",
         .schema = "result",
         .version = 1,
         .digest_sha256 = @splat(0x44),
     };
-    illegal_input.updated_unix += 1;
-    var illegal = try create(std.testing.allocator, illegal_input);
-    defer illegal.deinit();
-    try std.testing.expectError(
-        error.InvalidTransition,
-        validateTransition(recovery.state, illegal.state),
+    reconciliation_input.updated_unix += 1;
+    var reconciliation = try create(
+        std.testing.allocator,
+        reconciliation_input,
     );
+    defer reconciliation.deinit();
+    try validateTransition(recovery.state, reconciliation.state);
 }
 
 test "apt_system_state.test.locked compare-and-set rejects concurrent and stale writers" {
