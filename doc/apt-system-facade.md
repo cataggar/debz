@@ -85,17 +85,33 @@ debz recover [--json] --system-profile PATH
 Human recovery prepares and renders the retained exact action before a
 recovery-specific TTY-only confirmation. The review carries verified
 tri-state mutation status derived from a generation-stable outer-state read
-and a root-locked compatible lower marker/record snapshot; the outer
-`mutation_started` bit alone is not evidence. An exact bound prepared record
-with no lower mutation evidence may prove pre-mutation. A verified
-mutating/completed lower record may prove mutation, while missing, foreign, or
-inconsistent evidence is UNKNOWN. A verified pre-mutation state may say that no
-package mutation occurred. A verified mutating or post-mutation state says
-that package mutation occurred or may be incomplete and that convergence may
-make further changes. UNKNOWN says that prior mutation status is unknown and
-fails closed without prompting or executing. Negative answers, EOF, and
-non-TTY input never invoke recovery. JSON recovery prepares but never prompts
-or mutates.
+and a root-locked compatible lower marker, record, and referenced completion;
+the outer `mutation_started` bit alone is not evidence. An exact bound prepared
+record with no lower mutation evidence may prove pre-mutation. Verified
+mutating, completed-success, released, pending-published, and
+acknowledged-published states prove mutation only with their exact compatible
+record and completion/provenance bindings. Missing, corrupt, swapped, foreign,
+or inconsistent evidence is UNKNOWN.
+
+A known-status review durably publishes a separate
+`root-operation-recovery-review-v1.json` claim under the lower root-operation
+lock. The claim binds the outer attempt, generation and digest, trusted profile
+and reference, semantic request, exact lock, reviewed mutation status, nonce,
+the digest of any verified retained outer transaction, and exact lower
+evidence digests. It excludes a competing reservation while
+the prompt is open. Confirmed recovery must consume that exact claim under the
+same lower lock before any reviewed action; changed evidence returns
+`confirmation_required` with phase `review_stale` and requires a fresh review.
+A prompt-time crash can adopt only the exact claim. Negative answers and EOF
+exact-release it without changing active operation state; JSON and UNKNOWN
+paths also release it and never strand prompt authorization.
+
+A verified pre-mutation state may say that no package mutation occurred. A
+verified mutating or post-mutation state says that package mutation occurred or
+may be incomplete and that convergence may make further changes. UNKNOWN says
+that prior mutation status is unknown and fails closed without prompting or
+executing. Non-TTY input never invokes recovery. JSON recovery prepares but
+never prompts or mutates.
 Malformed recovery syntax is rejected before profile or operation-state I/O.
 Parse failures carry the output mode recognized from the valid canonical
 option prefix. Rejected command arguments, misplaced `--json`, and a

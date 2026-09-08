@@ -54,10 +54,7 @@ pub const Engine = struct {
         request: api.Request,
     ) EngineError!orchestrator.PrepareOutcome {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.prepare(allocator, request) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvariantViolation,
-        };
+        return engine.invokePrepare(allocator, request);
     }
 
     fn productionExecute(
@@ -80,13 +77,10 @@ pub const Engine = struct {
         profile_path: []const u8,
     ) EngineError!orchestrator.RecoveryPrepareOutcome {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.prepareRecovery(
+        return engine.invokePrepareRecovery(
             allocator,
             profile_path,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvariantViolation,
-        };
+        );
     }
 
     fn productionExecuteRecovery(
@@ -109,13 +103,10 @@ pub const Engine = struct {
         prepared: orchestrator.Preparation,
     ) EngineError!api.Result {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.reconcilePreparedError(
+        return engine.invokeReconcilePreparedError(
             allocator,
             prepared,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvariantViolation,
-        };
+        );
     }
 };
 
@@ -358,6 +349,31 @@ pub fn runRecovery(
                 try streams.stdout.flush();
             }
             if (recovery.mutation_status == .unknown) {
+                const cancellation = try engine.executeRecoveryFn(
+                    engine.context,
+                    allocator,
+                    recovery.*,
+                    false,
+                );
+                var cancellation_result = switch (cancellation) {
+                    .result => |value| value,
+                    .operational_failure => try engine.reconcilePreparedErrorFn(
+                        engine.context,
+                        allocator,
+                        recovery.prepared,
+                    ),
+                };
+                defer cancellation_result.deinit();
+                if (cancellation_result.exit_status == .recovery) {
+                    try cli.writeResult(
+                        allocator,
+                        cancellation_result,
+                        output,
+                        streams.stdout,
+                        streams.stderr,
+                    );
+                    return cancellation_result.exit_status;
+                }
                 var result = try unknownRecoveryReviewResult(recovery.*);
                 defer result.deinit();
                 try cli.writeResult(
@@ -377,12 +393,12 @@ pub fn runRecovery(
                     streams.stderr,
                     .recovery,
                 ) catch .unavailable) == .confirmed;
-            var result = if (confirmed) result: {
+            var result = result: {
                 const invocation = try engine.executeRecoveryFn(
                     engine.context,
                     allocator,
                     recovery.*,
-                    true,
+                    confirmed,
                 );
                 break :result switch (invocation) {
                     .result => |value| value,
@@ -392,7 +408,7 @@ pub fn runRecovery(
                         recovery.prepared,
                     ),
                 };
-            } else try recoveryConfirmationResult(recovery.*);
+            };
             defer result.deinit();
             try cli.writeResult(
                 allocator,
@@ -583,6 +599,7 @@ const TestContext = struct {
     unknown_reconciliation: bool = false,
     recovery_prepare_unknown: bool = false,
     recovery_mutation_status: orchestrator.VerifiedMutationStatus = .unchanged,
+    recovery_cancel_count: usize = 0,
     reconcile_count: usize = 0,
 
     fn interface(self: *TestContext) Engine {
@@ -729,8 +746,12 @@ const TestContext = struct {
         confirmed: bool,
     ) EngineError!ExecutionInvocation {
         const self: *TestContext = @ptrCast(@alignCast(context));
+        if (!confirmed) {
+            self.recovery_cancel_count += 1;
+            return .{ .result = recoveryConfirmationResult(recovery) catch |err|
+                return testEngineError(err) };
+        }
         self.recovery_execute_count += 1;
-        if (!confirmed) return error.ContractViolation;
         if (self.execute_engine_error) |err| return err;
         if (self.operational_failure) |failure|
             return .{ .operational_failure = failure };
@@ -1164,6 +1185,7 @@ test "apt_system_command.test.PTY confirmation parses the complete recovery answ
         );
         try std.testing.expectEqual(api.ExitStatus.success, status);
         try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
+        try std.testing.expectEqual(@as(usize, 0), context.recovery_cancel_count);
     }
 }
 
@@ -1519,6 +1541,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
         expected_text: []const u8,
         prompts: usize,
         executions: usize,
+        cancellations: usize,
     }{
         .{
             .mutation_status = .unchanged,
@@ -1527,6 +1550,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
             .expected_text = "no package mutation has occurred",
             .prompts = 1,
             .executions = 0,
+            .cancellations = 1,
         },
         .{
             .mutation_status = .unchanged,
@@ -1535,6 +1559,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
             .expected_text = "no package mutation has occurred",
             .prompts = 1,
             .executions = 0,
+            .cancellations = 1,
         },
         .{
             .mutation_status = .changed,
@@ -1543,6 +1568,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
             .expected_text = "package mutation has occurred or may be incomplete",
             .prompts = 1,
             .executions = 0,
+            .cancellations = 1,
         },
         .{
             .mutation_status = .changed,
@@ -1551,6 +1577,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
             .expected_text = "package mutation has occurred or may be incomplete",
             .prompts = 1,
             .executions = 0,
+            .cancellations = 1,
         },
         .{
             .mutation_status = .unknown,
@@ -1559,6 +1586,7 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
             .expected_text = "prior package mutation status is unknown",
             .prompts = 0,
             .executions = 0,
+            .cancellations = 1,
         },
     };
     for (cases) |case| {
@@ -1585,6 +1613,10 @@ test "apt_system_command.test.recovery review truthfully renders mutation status
         try std.testing.expectEqual(
             case.executions,
             context.recovery_execute_count,
+        );
+        try std.testing.expectEqual(
+            case.cancellations,
+            context.recovery_cancel_count,
         );
         try std.testing.expect(std.mem.indexOf(
             u8,
@@ -1653,6 +1685,7 @@ test "apt_system_command.test.changed recovery confirmation may execute and JSON
         try std.testing.expectEqual(api.ExitStatus.usage, status);
         try std.testing.expectEqual(@as(usize, 0), terminal.call_count);
         try std.testing.expectEqual(@as(usize, 0), context.recovery_execute_count);
+        try std.testing.expectEqual(@as(usize, 1), context.recovery_cancel_count);
         try std.testing.expectEqual(@as(usize, 0), stderr.written().len);
         try std.testing.expectEqual(
             @as(usize, 1),

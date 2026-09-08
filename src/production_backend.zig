@@ -74,6 +74,7 @@ pub const WorkflowRequest = struct {
     /// Internal outer-attempt identity, bound into the lower root record
     /// namespace before an orchestrated mutation can begin.
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim_sha256: ?[32]u8 = null,
     reconciliation_claim: ?WorkflowReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?WorkflowOwnershipAcknowledgment = null,
@@ -85,6 +86,7 @@ const WorkflowDirective = struct {
     mode: WorkflowMode,
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim_sha256: ?[32]u8 = null,
 };
 
 const TransactionSemanticOperation = enum {
@@ -299,6 +301,7 @@ pub const Backend = struct {
                 workflow.selectors,
                 workflow.orchestration_id.?,
                 claim,
+                workflow.recovery_review_claim_sha256,
             );
         }
         if (workflow.recovery_acknowledgment) |acknowledgment| {
@@ -320,6 +323,7 @@ pub const Backend = struct {
                 request,
                 workflow.operation,
                 acknowledgment,
+                workflow.recovery_review_claim_sha256,
             ) catch |err| mapRuntimeError(operation, err);
         }
         if (workflow.finalize_ownership) {
@@ -344,6 +348,7 @@ pub const Backend = struct {
                 request,
                 workflow.operation,
                 workflow.ownership_acknowledgment.?,
+                workflow.recovery_review_claim_sha256,
             );
         }
         if (workflow.ownership_acknowledgment != null)
@@ -358,6 +363,7 @@ pub const Backend = struct {
             .mode = workflow.mode,
             .defer_recovery_clear = workflow.defer_recovery_clear,
             .orchestration_id = workflow.orchestration_id,
+            .recovery_review_claim_sha256 = workflow.recovery_review_claim_sha256,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -730,6 +736,10 @@ pub const Backend = struct {
             false;
         guard.orchestration_id = if (workflow) |directive|
             directive.orchestration_id
+        else
+            null;
+        guard.recovery_review_claim_sha256 = if (workflow) |directive|
+            directive.recovery_review_claim_sha256
         else
             null;
         if (guard.preserve_settled and
@@ -1527,6 +1537,7 @@ pub const Backend = struct {
         request: api.Request,
         semantic_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowRecoveryAcknowledgment,
+        recovery_review_claim_sha256: ?[32]u8,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1557,6 +1568,16 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
+        if (recovery_review_claim_sha256) |digest|
+            consumeRecoveryReviewClaim(
+                allocator,
+                store,
+                acknowledgment.acknowledgment_id,
+                digest,
+            ) catch return blockedRecovery(
+                request.operation,
+                "the confirmed recovery review is stale or foreign",
+            );
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -1717,6 +1738,7 @@ pub const Backend = struct {
         request: api.Request,
         workflow_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowOwnershipAcknowledgment,
+        recovery_review_claim_sha256: ?[32]u8,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1747,6 +1769,16 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
+        if (recovery_review_claim_sha256) |digest|
+            consumeRecoveryReviewClaim(
+                allocator,
+                store,
+                acknowledgment.acknowledgment_id,
+                digest,
+            ) catch return blockedRecovery(
+                request.operation,
+                "the confirmed recovery review is stale or foreign",
+            );
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -1917,6 +1949,7 @@ pub const Backend = struct {
         selectors: []const solver.PackageSelector,
         orchestration_id: [32]u8,
         claim: WorkflowReconciliationClaim,
+        recovery_review_claim_sha256: ?[32]u8,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1947,6 +1980,16 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
+        if (recovery_review_claim_sha256) |digest|
+            consumeRecoveryReviewClaim(
+                allocator,
+                store,
+                orchestration_id,
+                digest,
+            ) catch return blockedRecovery(
+                request.operation,
+                "the confirmed recovery review is stale or foreign",
+            );
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -2395,6 +2438,26 @@ fn workflowMode(operation: api.Operation, workflow: ?WorkflowDirective) Workflow
     };
 }
 
+fn consumeRecoveryReviewClaim(
+    allocator: std.mem.Allocator,
+    store: root_operation.Store,
+    orchestration_id: [32]u8,
+    expected_digest: [32]u8,
+) !void {
+    const review = try store.readRecoveryReviewClaim(allocator) orelse
+        return error.RecoveryReviewClaimMissing;
+    if (!std.mem.eql(
+        u8,
+        &review.outer_attempt_id,
+        &orchestration_id,
+    ) or !std.mem.eql(
+        u8,
+        &review.digest_sha256,
+        &expected_digest,
+    )) return error.RecoveryReviewClaimMismatch;
+    try store.clearRecoveryReviewClaim(allocator, expected_digest);
+}
+
 fn workflowRootOperation(
     operation: api.Operation,
     workflow: ?WorkflowDirective,
@@ -2545,6 +2608,7 @@ const RootOperationGuard = struct {
     /// pre-mutation binding for the subsequent execute call to adopt.
     preserve_pre_mutation: bool = false,
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim_sha256: ?[32]u8 = null,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -2643,6 +2707,7 @@ const RootOperationGuard = struct {
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
             .orchestration_id = self.orchestration_id,
+            .recovery_review_claim_sha256 = self.recovery_review_claim_sha256,
             .acquisition_observer = self.acquisitionObserver(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         if (self.orchestration_id) |orchestration_id| {

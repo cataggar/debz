@@ -157,7 +157,7 @@ class SecurityAuditTests(unittest.TestCase):
             apt_system_command.index('\ntest "'),
         )
         apt_system_orchestrator = sources["src/apt_system_orchestrator.zig"]
-        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 2)
+        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 1)
         first_test = apt_system_orchestrator.index('\ntest "')
         self.assertTrue(
             all(
