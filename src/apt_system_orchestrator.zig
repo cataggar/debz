@@ -2969,8 +2969,8 @@ pub const Engine = struct {
         const owner_proven_pre_mutation =
             if (ownership_marker) |marker|
                 marker.state == .bound and
-                    lower_inspection.record != null and
-                    lower_inspection.record.?.record.state.provenPreMutation()
+                    (lower_inspection.record == null or
+                        lower_inspection.record.?.record.state.provenPreMutation())
             else
                 false;
         if (lower_inspection.status == .clean or owner_proven_pre_mutation) {
@@ -2984,9 +2984,9 @@ pub const Engine = struct {
             const retry_abandoned = if (ownership_marker) |marker|
                 marker.state == .abandoned or
                     (marker.state == .bound and
-                        lower_inspection.record != null and
-                        (lower_inspection.record.?.record.state
-                            .provenPreMutation() or
+                        (lower_inspection.record == null or
+                            lower_inspection.record.?.record.state
+                                .provenPreMutation() or
                             lower_inspection.record.?.record.outcome ==
                                 .abandoned_before_mutation))
             else
@@ -4117,19 +4117,23 @@ fn mapProductResult(
             "backend",
             result.summary,
         );
-    if (request.operation != .list_installed and result.items.len != 0)
+    if (request.operation != .list_installed and
+        request.operation != .update and
+        result.items.len != 0)
         return error.UnexpectedItems;
     var items: []api.Item = &.{};
     if (request.operation == .list_installed)
         items = try allocator.alloc(api.Item, result.items.len);
     defer if (items.len != 0) allocator.free(items);
-    for (result.items, 0..) |item, index| {
-        items[index] = .{
-            .package = item.package,
-            .version = item.version,
-            .architecture = item.architecture,
-            .detail = item.detail,
-        };
+    if (request.operation == .list_installed) {
+        for (result.items, 0..) |item, index| {
+            items[index] = .{
+                .package = item.package,
+                .version = item.version,
+                .architecture = item.architecture,
+                .detail = item.detail,
+            };
+        }
     }
 
     var mapped: api.Result = .{
@@ -5594,7 +5598,8 @@ const FakeBackend = struct {
                 "metadata refreshed"
             else
                 "installed packages listed",
-            .items = if (request.operation == .list_installed)
+            .items = if (request.operation == .list_installed or
+                request.operation == .refresh)
                 &self.installed_items
             else
                 &.{},
@@ -5762,6 +5767,7 @@ const FakeRunner = struct {
     recovery_ack_calls: usize = 0,
     ownership_finalize_calls: usize = 0,
     publish_released_on_execute: bool = false,
+    publish_bound_on_execute: bool = false,
     publish_abandoned_on_execute: bool = false,
     fail_after_recovery_transport: bool = false,
     recovery_completion_mismatch: RecoveryCompletionMismatch = .none,
@@ -5834,6 +5840,18 @@ const FakeRunner = struct {
             request.options.install_root,
             live_root.logical_root_path,
         );
+        if (request.mode == .execute and self.publish_bound_on_execute) {
+            self.publish_bound_on_execute = false;
+            self.inspect_deferred_acknowledgment =
+                try root_operation.createDeferredAcknowledgment(.{
+                    .state = .bound,
+                    .attempt_id = @splat(0x80),
+                    .acknowledgment_id = request.orchestration_id orelse
+                        return error.MissingRecoveryAcknowledgment,
+                });
+            self.inspect_status = .recovery_required;
+            return error.RootReplaced;
+        }
         if (self.fail_mode == request.mode) {
             if (request.mode == .execute or request.mode == .recover)
                 self.inspect_status = .recovery_required;
@@ -5886,7 +5904,8 @@ const FakeRunner = struct {
         } else if (request.mode == .execute and
             result.result.exit_status == .success and
             self.inspect_deferred_acknowledgment != null and
-            self.inspect_deferred_acknowledgment.?.state == .abandoned)
+            (self.inspect_deferred_acknowledgment.?.state == .abandoned or
+                self.inspect_deferred_acknowledgment.?.state == .bound))
         {
             self.inspect_deferred_acknowledgment = null;
             self.inspect_status = .clean;
@@ -6589,6 +6608,7 @@ test "apt_system_orchestrator.test.update and list route through stable live roo
     var harness = Harness.init(std.testing.allocator);
     defer harness.deinit();
     harness.rebind();
+    harness.runner.transport_roundtrip = true;
     const update = try harness.engine.prepare(std.testing.allocator, .{
         .operation = .update,
         .profile_path = "/profile.json",
@@ -8022,6 +8042,84 @@ test "apt_system_orchestrator.test.owner-bound pre-mutation abandon retries exac
     defer result.deinit();
     try std.testing.expectEqual(api.Outcome.success, result.outcome);
     try std.testing.expectEqual(@as(usize, 2), harness.backend.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
+    try std.testing.expect(
+        harness.runner.inspect_deferred_acknowledgment == null,
+    );
+    try std.testing.expect(harness.store.active_bytes == null);
+}
+
+test "apt_system_orchestrator.test.owner-bound publication crash retries execution without recovery intent" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    harness.runner.publish_bound_on_execute = true;
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    try std.testing.expectEqual(api.Outcome.recovery, interrupted.outcome);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+    try std.testing.expectEqual(
+        root_operation.DeferredAcknowledgmentState.bound,
+        harness.runner.inspect_deferred_acknowledgment.?.state,
+    );
+
+    const exact_marker = harness.runner.inspect_deferred_acknowledgment.?;
+    const foreign_id: [32]u8 = @splat(0xf1);
+    harness.runner.inspect_deferred_acknowledgment =
+        try root_operation.createDeferredAcknowledgment(.{
+            .state = .bound,
+            .attempt_id = exact_marker.attempt_id,
+            .acknowledgment_id = foreign_id,
+        });
+    var foreign_recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer foreign_recovery.deinit();
+    var rejected = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        foreign_recovery,
+        true,
+    );
+    defer rejected.deinit();
+    try std.testing.expectEqual(api.Outcome.recovery, rejected.outcome);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
+    try std.testing.expectEqualSlices(
+        u8,
+        &foreign_id,
+        &harness.runner.inspect_deferred_acknowledgment.?.acknowledgment_id,
+    );
+    harness.runner.inspect_deferred_acknowledgment = exact_marker;
+
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    var result = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(api.Outcome.success, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
     try std.testing.expect(
         harness.runner.inspect_deferred_acknowledgment == null,

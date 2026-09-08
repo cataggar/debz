@@ -15,7 +15,6 @@
     "exit_status",
     "changed",
     "summary",
-    "items",
     "evidence",
     "diagnostics",
     "digest_sha256"
@@ -36,11 +35,6 @@
     "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
     "changed": { "type": "boolean" },
     "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
-    "items": {
-      "type": "array",
-      "maxItems": 4096,
-      "items": { "$ref": "#/$defs/item" }
-    },
     "evidence": { "$ref": "#/$defs/evidence" },
     "diagnostics": {
       "type": "array",
@@ -50,17 +44,6 @@
     "digest_sha256": { "$ref": "#/$defs/sha256" }
   },
   "allOf": [
-    {
-      "if": {
-        "not": {
-          "properties": { "operation": { "const": "list_installed" } },
-          "required": ["operation"]
-        }
-      },
-      "then": {
-        "properties": { "items": { "maxItems": 0 } }
-      }
-    },
     {
       "if": {
         "properties": { "outcome": { "const": "usage" } },
@@ -336,37 +319,6 @@
         "path": { "$ref": "#/$defs/absolutePath" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "reference_evidence_sha256": { "$ref": "#/$defs/sha256" }
-      }
-    },
-    "item": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["package", "version", "architecture", "detail"],
-      "properties": {
-        "package": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 255,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9+.:=-]*$"
-        },
-        "version": {
-          "oneOf": [
-            { "type": "string", "minLength": 1, "maxLength": 1024 },
-            { "type": "null" }
-          ]
-        },
-        "architecture": {
-          "oneOf": [
-            { "type": "string", "minLength": 1, "maxLength": 64 },
-            { "type": "null" }
-          ]
-        },
-        "detail": {
-          "oneOf": [
-            { "type": "string", "minLength": 1, "maxLength": 4096 },
-            { "type": "null" }
-          ]
-        }
       }
     },
     "documentBinding": {

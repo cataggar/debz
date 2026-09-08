@@ -11,7 +11,10 @@ const system_profile = @import("system_profile.zig");
 pub const api_version: u32 = 1;
 pub const request_schema_id = "https://debz.dev/schema/apt-system-request-v1";
 pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
+pub const result_items_schema_id =
+    "https://debz.dev/schema/apt-system-result-v2";
 pub const schema_version: u32 = 1;
+pub const result_items_schema_version: u32 = 2;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
 pub const maximum_result_items: usize = 4096;
@@ -653,9 +656,18 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
 
 fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    try writeString(writer, result_schema_id);
+    try writeString(
+        writer,
+        if (result.items.len == 0)
+            result_schema_id
+        else
+            result_items_schema_id,
+    );
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
-        schema_version,
+        if (result.items.len == 0)
+            schema_version
+        else
+            result_items_schema_version,
         result.api_version,
     });
     try writeString(writer, @tagName(result.operation));
@@ -678,20 +690,22 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
         result.changed,
     });
     try writeString(writer, result.summary);
-    try writer.writeAll(",\"items\":[");
-    for (result.items, 0..) |item, index| {
-        if (index != 0) try writer.writeByte(',');
-        try writer.writeAll("{\"package\":");
-        try writeString(writer, item.package);
-        try writer.writeAll(",\"version\":");
-        try writeOptionalString(writer, item.version);
-        try writer.writeAll(",\"architecture\":");
-        try writeOptionalString(writer, item.architecture);
-        try writer.writeAll(",\"detail\":");
-        try writeOptionalString(writer, item.detail);
-        try writer.writeByte('}');
+    if (result.items.len != 0) {
+        try writer.writeAll(",\"items\":[");
+        for (result.items, 0..) |item, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"package\":");
+            try writeString(writer, item.package);
+            try writer.writeAll(",\"version\":");
+            try writeOptionalString(writer, item.version);
+            try writer.writeAll(",\"architecture\":");
+            try writeOptionalString(writer, item.architecture);
+            try writer.writeAll(",\"detail\":");
+            try writeOptionalString(writer, item.detail);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
     }
-    try writer.writeByte(']');
     try writer.writeAll(",\"evidence\":");
     try writeEvidence(writer, result.evidence);
     try writer.writeAll(",\"diagnostics\":[");
@@ -1290,6 +1304,11 @@ test "apt_system_api.test.list items are owned and bind the canonical digest" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         canonical,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v2\",\"version\":2",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
         "\"items\":[{\"package\":\"alpha\",\"version\":\"1.2\",\"architecture\":\"amd64\",\"detail\":null}]",
     ) != null);
 
@@ -1303,6 +1322,30 @@ test "apt_system_api.test.list items are owned and bind the canonical digest" {
     var non_list = input;
     non_list.operation = .update;
     try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+}
+
+test "apt_system_api.test.itemless results preserve exact v1 wire contract" {
+    const result = try complete(.{
+        .operation = .update,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .changed = true,
+        .summary = "updated",
+    });
+    const canonical = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        canonical,
+        "{\"schema\":\"https://debz.dev/schema/apt-system-result-v1\",\"version\":1,",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"items\"") == null);
 }
 
 test "apt_system_api.test.result encoded-size budget accepts maximum and rejects one over" {
@@ -1382,17 +1425,10 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
     defer parsed.deinit();
     const definitions = parsed.value.object.get("$defs").?.object;
     const required = parsed.value.object.get("required").?.array.items;
-    var items_required = false;
     for (required) |field|
-        if (std.mem.eql(u8, field.string, "items")) {
-            items_required = true;
-            break;
-        };
-    try std.testing.expect(items_required);
-    try std.testing.expectEqual(
-        @as(i64, @intCast(maximum_result_items)),
-        parsed.value.object.get("properties").?.object
-            .get("items").?.object.get("maxItems").?.integer,
+        try std.testing.expect(!std.mem.eql(u8, field.string, "items"));
+    try std.testing.expect(
+        parsed.value.object.get("properties").?.object.get("items") == null,
     );
     try std.testing.expectEqualStrings(
         absolute_path.schema_pattern,
@@ -1443,9 +1479,44 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
                     diagnostic_outcome,
                 ));
             }
+
             found = true;
             break;
         }
         try std.testing.expect(found);
     }
+}
+
+test "apt_system_api.test.result v2 schema is an explicit bounded item extension" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-result-v2.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(source);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        result_items_schema_id,
+        parsed.value.object.get("$id").?.string,
+    );
+    const properties = parsed.value.object.get("properties").?.object;
+    try std.testing.expectEqual(
+        @as(i64, result_items_schema_version),
+        properties.get("version").?.object.get("const").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(i64, @intCast(maximum_result_items)),
+        properties.get("items").?.object.get("maxItems").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        properties.get("items").?.object.get("minItems").?.integer,
+    );
 }

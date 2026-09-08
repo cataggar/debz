@@ -5068,7 +5068,11 @@ test "production workflow root binding excludes overlapping foreign owners" {
         var owner_joined = false;
         defer {
             barrier.release();
-            if (!owner_joined) owner_thread.join();
+            if (!owner_joined) {
+                waitForContender(&owner.finished, 5_000) catch
+                    @panic("owner thread exceeded deterministic watchdog");
+                owner_thread.join();
+            }
         }
         try barrier.wait(5_000);
 
@@ -5135,6 +5139,7 @@ test "production workflow root binding excludes overlapping foreign owners" {
         barrier.release();
         distinct_thread.join();
         identical_thread.join();
+        try waitForContender(&owner.finished, 5_000);
         owner_thread.join();
         owner_joined = true;
         try std.testing.expectEqual(api.ExitStatus.internal, owner.status.?);

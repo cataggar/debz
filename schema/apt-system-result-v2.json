@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-system-result-v2",
+  "title": "debz apt-shaped system facade result v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "api_version",
+    "operation",
+    "request_sha256",
+    "profile",
+    "outcome",
+    "exit_status",
+    "changed",
+    "summary",
+    "items",
+    "evidence",
+    "diagnostics",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-system-result-v2" },
+    "version": { "const": 2 },
+    "api_version": { "const": 1 },
+    "operation": {
+      "$ref": "apt-system-result-v1.json#/$defs/operation"
+    },
+    "request_sha256": {
+      "$ref": "apt-system-result-v1.json#/$defs/sha256"
+    },
+    "profile": {
+      "oneOf": [
+        {
+          "$ref": "apt-system-result-v1.json#/$defs/profileBinding"
+        },
+        { "type": "null" }
+      ]
+    },
+    "outcome": {
+      "$ref": "apt-system-result-v1.json#/$defs/outcome"
+    },
+    "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
+    "changed": { "type": "boolean" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/item" }
+    },
+    "evidence": {
+      "$ref": "apt-system-result-v1.json#/$defs/evidence"
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "apt-system-result-v1.json#/$defs/diagnostic"
+      }
+    },
+    "digest_sha256": {
+      "$ref": "apt-system-result-v1.json#/$defs/sha256"
+    }
+  },
+  "allOf": [
+    { "$ref": "apt-system-result-v1.json#/allOf/0" },
+    { "$ref": "apt-system-result-v1.json#/allOf/1" },
+    { "$ref": "apt-system-result-v1.json#/allOf/2" },
+    { "$ref": "apt-system-result-v1.json#/allOf/3" },
+    { "$ref": "apt-system-result-v1.json#/allOf/4" },
+    { "$ref": "apt-system-result-v1.json#/allOf/5" },
+    { "$ref": "apt-system-result-v1.json#/allOf/6" },
+    { "$ref": "apt-system-result-v1.json#/allOf/7" },
+    { "$ref": "apt-system-result-v1.json#/allOf/8" },
+    { "$ref": "apt-system-result-v1.json#/allOf/9" },
+    { "$ref": "apt-system-result-v1.json#/allOf/10" },
+    {
+      "properties": {
+        "operation": { "const": "list_installed" }
+      }
+    }
+  ],
+  "$defs": {
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "version", "architecture", "detail"],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9+.:=-]*$"
+        },
+        "version": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 1024 },
+            { "type": "null" }
+          ]
+        },
+        "architecture": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 64 },
+            { "type": "null" }
+          ]
+        },
+        "detail": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 4096 },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1030,7 +1030,7 @@ test "apt_system_cli.test.human rendering is stable complete and routed by outco
             "Root operation completion SHA-256: 5555555555555555555555555555555555555555555555555555555555555555\n" ++
             "Completed attempt ID: 6666666666666666666666666666666666666666666666666666666666666666\n" ++
             "Active operation state: /var/lib/debz/active-operation.json\n" ++
-            "Result SHA-256: 7ec4763a5ecfe301ccb6c78dfbaba054e59398cd79cabda97fc0fb0477808a14\n",
+            "Result SHA-256: dabe23ea1aac8f4b4dd7a23b9ebfb181408e7a0834ddb77ebad934709485f915\n",
         stdout.written(),
     );
 

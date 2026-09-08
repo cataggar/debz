@@ -656,6 +656,7 @@ fn installReleaseFiles(
         "apt-system-operation-state-v1.json",
         "apt-system-request-v1.json",
         "apt-system-result-v1.json",
+        "apt-system-result-v2.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",

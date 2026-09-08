@@ -148,13 +148,18 @@ digest; it is not a sequence of singleton product API calls.
 `success`, `usage`, `configuration`, `authentication`, `planning`, `download`,
 `transaction`, `recovery`, and `internal` outcomes. Diagnostics carry a stable
 identifier and the same outcome classification. Human summary text is not a
-machine interface. `list_installed` success additionally carries a bounded,
-owned `items` array preserving each package name and optional version,
-architecture, and detail. Other operations cannot return items, and the items
-participate in the canonical result digest. Runtime validation also measures
-the complete canonical encoding and rejects any result over the 256 KiB
-document ceiling, even when every individual item and the item count are
-otherwise valid.
+machine interface. Itemless results retain the exact v1 wire format and digest.
+[`apt-system-result-v2.json`](../schema/apt-system-result-v2.json) is the
+explicit additive result extension used when `list_installed` returns a
+non-empty bounded, owned `items` array preserving each package name and
+optional version, architecture, and detail. It keeps apt-system API version 1;
+no v1 document is emitted with a field that old v1 validators reject. Other
+operations cannot expose items, and v2 items participate in the canonical
+result digest. Runtime validation also measures the complete canonical
+encoding and rejects any result over the 256 KiB document ceiling, even when
+every individual item and the item count are otherwise valid.
+Production refresh repository-detail items are validated at the product
+boundary but intentionally not projected into the apt-system `update` result.
 
 Every result binds the canonical request digest. `apt_system_api.execute`
 rejects any backend result whose operation or request digest differs from the
