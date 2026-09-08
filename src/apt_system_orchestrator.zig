@@ -220,6 +220,7 @@ pub const BackendResult = struct {
     root_status: RootStatus,
     owned_result: ?product_api.OwnedResult = null,
     recovery_completion: ?root_operation_completion.OwnedDocument = null,
+    recovery_acknowledgment: ?RecoveryAcknowledgment = null,
 
     pub fn deinit(self: *BackendResult) void {
         if (self.owned_result) |*owned| owned.deinit();
@@ -231,11 +232,16 @@ pub const BackendResult = struct {
 pub const WorkflowOperation = enum { install, remove, upgrade_all };
 pub const WorkflowMode = enum { plan_only, download_only, execute, recover };
 
+pub const RecoveryAcknowledgment =
+    production_backend.WorkflowRecoveryAcknowledgment;
+
 pub const WorkflowRequest = struct {
     operation: WorkflowOperation,
     mode: WorkflowMode,
     selectors: []const solver.PackageSelector,
     options: product_api.CommonOptions,
+    defer_recovery_clear: bool = false,
+    recovery_acknowledgment: ?RecoveryAcknowledgment = null,
 };
 
 pub const Backend = struct {
@@ -308,6 +314,8 @@ pub const ProductionBackend = struct {
             },
             .selectors = request.selectors,
             .options = request.options,
+            .defer_recovery_clear = request.defer_recovery_clear,
+            .recovery_acknowledgment = request.recovery_acknowledgment,
         });
     }
 };
@@ -670,18 +678,43 @@ pub const PrivateLiveRootRunner = struct {
         errdefer if (recovery_completion) |*owned| owned.deinit();
         if (invocation == .workflow and
             invocation.workflow.request.mode == .recover and
+            invocation.workflow.request.recovery_acknowledgment == null and
             decoded.result.exit_status == .success)
         {
             recovery_completion = try self.interface()
                 .readRecoveryCompletion(allocator) orelse
                 return error.MissingRecoveryCompletion;
         }
+        var recovery_acknowledgment: ?RecoveryAcknowledgment = null;
         const root_status: RootStatus = switch (invocation) {
             .route => .clean,
             .workflow => |workflow_invocation| switch (workflow_invocation.request.mode) {
                 .execute, .recover => if (decoded.result.exit_status == .success) status: {
                     var inspection = try self.interface().inspect(allocator);
                     defer inspection.deinit();
+                    if (workflow_invocation.request.mode == .recover and
+                        workflow_invocation.request.defer_recovery_clear and
+                        workflow_invocation.request.recovery_acknowledgment == null)
+                    {
+                        const record = if (inspection.record) |owned|
+                            owned.record
+                        else
+                            return error.MissingRecoveryAcknowledgment;
+                        const completion = recovery_completion orelse
+                            return error.MissingRecoveryCompletion;
+                        if (record.state != .completed or
+                            record.provenance != .published or
+                            !settledRecoveryProvenanceMatches(
+                                record,
+                                completion.document,
+                            ))
+                            return error.InvalidRecoveryAcknowledgment;
+                        recovery_acknowledgment = .{
+                            .attempt_id = record.attempt_id,
+                            .completion_sha256 = completion.document.digest_sha256,
+                            .provenance_sha256 = record.provenance_sha256.?,
+                        };
+                    }
                     break :status switch (inspection.status) {
                         .clean, .completed => .completed,
                         .recovery_required => .recovery_required,
@@ -695,6 +728,7 @@ pub const PrivateLiveRootRunner = struct {
             .root_status = root_status,
             .owned_result = decoded,
             .recovery_completion = recovery_completion,
+            .recovery_acknowledgment = recovery_acknowledgment,
         };
     }
 
@@ -2095,6 +2129,7 @@ pub const CompletionBoundary = enum {
     after_transaction_verified,
     after_transaction_retained,
     after_verifying_state,
+    after_recovery_acknowledged,
     after_completion_published,
 };
 
@@ -2592,9 +2627,10 @@ pub const Engine = struct {
         return self.verifyAndComplete(
             allocator,
             prepared,
-            loaded.view,
+            &loaded,
             &current,
             false,
+            null,
             null,
             null,
             null,
@@ -2873,7 +2909,6 @@ pub const Engine = struct {
                 else
                     false;
             const settled_lower_recovery =
-                !retained_lower_recovery and
                 if (lower_inspection.record) |record|
                     record.record.state == .completed and
                         record.record.provenance == .published and
@@ -2935,13 +2970,20 @@ pub const Engine = struct {
             return self.verifyAndComplete(
                 allocator,
                 recovery.prepared,
-                loaded.view,
+                &loaded,
                 &current,
                 retained_lower_recovery or settled_lower_recovery,
                 if (lower_completion) |owned| owned.document else null,
                 recovery_lock,
+                if (lower_completion) |owned|
+                    owned.document.attempt_id
+                else
+                    null,
                 if (settled_lower_recovery)
-                    lower_inspection.attempt_id
+                    acknowledgmentForSettledRecovery(
+                        lower_inspection.record.?.record,
+                        lower_completion.?.document,
+                    )
                 else
                     null,
             );
@@ -2998,6 +3040,7 @@ pub const Engine = struct {
                 loaded.view,
                 recovery.prepared.paths.exact_lock,
             ),
+            .defer_recovery_clear = true,
         }) catch return self.recoveryFailed(
             allocator,
             recovery.prepared,
@@ -3016,6 +3059,7 @@ pub const Engine = struct {
                 else
                     executed.result.summary,
             );
+        try self.hitCompletionBoundary(.after_backend_success);
         loaded.revalidate(allocator) catch return self.recoveryFailed(
             allocator,
             recovery.prepared,
@@ -3025,7 +3069,7 @@ pub const Engine = struct {
         return self.verifyAndComplete(
             allocator,
             recovery.prepared,
-            loaded.view,
+            &loaded,
             &current,
             true,
             if (executed.recovery_completion) |owned|
@@ -3040,6 +3084,13 @@ pub const Engine = struct {
                     &current,
                     "lower-level recovery attempt identity is unavailable",
                 ),
+            executed.recovery_acknowledgment orelse
+                return self.recoveryFailed(
+                    allocator,
+                    recovery.prepared,
+                    &current,
+                    "lower-level recovery did not return a durable acknowledgment token",
+                ),
         );
     }
 
@@ -3047,13 +3098,15 @@ pub const Engine = struct {
         self: *Engine,
         allocator: std.mem.Allocator,
         prepared: Preparation,
-        profile: ProfileView,
+        loaded: *LoadedProfile,
         current: *operation_state.OwnedState,
         recovered: bool,
         recovery_document: ?root_operation_completion.Document,
         recovery_lock: ?VerifiedLock,
         expected_recovery_attempt: ?[32]u8,
+        recovery_acknowledgment: ?RecoveryAcknowledgment,
     ) !api.Result {
+        const profile = loaded.view;
         var retained: api.DocumentBinding = undefined;
         if (recovered and recovery_document != null) {
             const document = recovery_document.?;
@@ -3071,6 +3124,7 @@ pub const Engine = struct {
                 current,
                 "lower-level recovery completion does not bind the exact lock and semantic request",
             );
+            try self.hitCompletionBoundary(.after_transaction_verified);
             const source = try document.canonicalJson(allocator);
             defer allocator.free(source);
             retained = self.store.retainRecoveryCompletionFn(
@@ -3119,8 +3173,7 @@ pub const Engine = struct {
                 "verified transaction result could not be retained",
             );
         }
-        if (!recovered)
-            try self.hitCompletionBoundary(.after_transaction_retained);
+        try self.hitCompletionBoundary(.after_transaction_retained);
         try self.transition(
             allocator,
             profile.state_path,
@@ -3134,12 +3187,77 @@ pub const Engine = struct {
                     "",
             },
         );
-        if (recovered) {
-            try self.hitCompletionBoundary(.after_backend_success);
-            try self.hitCompletionBoundary(.after_transaction_verified);
-            try self.hitCompletionBoundary(.after_transaction_retained);
-        }
         try self.hitCompletionBoundary(.after_verifying_state);
+        if (recovered) {
+            if (recovery_acknowledgment) |acknowledgment| {
+                const before_ack = self.verifier.verifyLockFn(
+                    self.verifier.context,
+                    allocator,
+                    prepared.paths.exact_lock,
+                    profile.architecture,
+                    try semanticDigestForRequest(allocator, prepared.request),
+                ) catch return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "retained exact lock is invalid before lower recovery acknowledgment",
+                );
+                if (!lockMatchesPreparation(
+                    before_ack.binding,
+                    prepared,
+                    current.state,
+                )) return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "retained exact lock was replaced before lower recovery acknowledgment",
+                );
+                loaded.revalidate(allocator) catch
+                    return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "trusted profile reference changed before lower recovery acknowledgment",
+                    );
+                const selectors = try selectorsFor(
+                    allocator,
+                    prepared.request,
+                );
+                defer allocator.free(selectors);
+                var acknowledged = self.runner.workflow(
+                    allocator,
+                    self.backend,
+                    .{
+                        .operation = semanticOperation(
+                            prepared.request.operation,
+                        ),
+                        .mode = .recover,
+                        .selectors = selectors,
+                        .options = executeOptions(
+                            profile,
+                            prepared.paths.exact_lock,
+                        ),
+                        .defer_recovery_clear = true,
+                        .recovery_acknowledgment = acknowledgment,
+                    },
+                ) catch return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "lower recovery acknowledgment was interrupted",
+                );
+                defer acknowledged.deinit();
+                if (acknowledged.result.exit_status != .success or
+                    acknowledged.root_status != .completed)
+                    return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "lower recovery acknowledgment did not clear the exact settled attempt",
+                    );
+            }
+            try self.hitCompletionBoundary(.after_recovery_acknowledged);
+        }
         const completion = self.store.publishCompletionFn(
             self.store.context,
             allocator,
@@ -4155,6 +4273,17 @@ fn settledRecoveryProvenanceMatches(
     return std.mem.eql(u8, &provenance_sha256, &expected);
 }
 
+fn acknowledgmentForSettledRecovery(
+    record: root_operation.Record,
+    document: root_operation_completion.Document,
+) RecoveryAcknowledgment {
+    return .{
+        .attempt_id = record.attempt_id,
+        .completion_sha256 = document.digest_sha256,
+        .provenance_sha256 = record.provenance_sha256.?,
+    };
+}
+
 fn copyRequest(
     allocator: std.mem.Allocator,
     request: api.Request,
@@ -5158,6 +5287,7 @@ const FakeBackend = struct {
     download_calls: usize = 0,
     execute_calls: usize = 0,
     recover_calls: usize = 0,
+    recovery_ack_calls: usize = 0,
     last_route: ?product_api.Operation = null,
     last_selector_count: usize = 0,
     last_operation: ?WorkflowOperation = null,
@@ -5216,6 +5346,15 @@ const FakeBackend = struct {
         self.workflow_calls += 1;
         self.last_selector_count = request.selectors.len;
         self.last_operation = request.operation;
+        if (request.recovery_acknowledgment != null) {
+            self.recovery_ack_calls += 1;
+            return .{
+                .operation = .recover,
+                .exit_status = .success,
+                .changed = false,
+                .summary = "lower recovery acknowledgment finalized",
+            };
+        }
         const status = switch (request.mode) {
             .plan_only => status: {
                 self.plan_calls += 1;
@@ -5355,6 +5494,8 @@ const FakeRunner = struct {
     inspect_record_source: ?[]u8 = null,
     recovery_completion_source: ?[]u8 = null,
     recovery_completion_reads: usize = 0,
+    recovery_ack_calls: usize = 0,
+    fail_after_recovery_transport: bool = false,
     recovery_completion_mismatch: RecoveryCompletionMismatch = .none,
 
     const RecoveryCompletionMismatch = enum {
@@ -5448,17 +5589,44 @@ const FakeRunner = struct {
             result.owned_result = decoded;
         }
         if (request.mode == .recover and result.result.exit_status == .success) {
-            var completion = try fakeRecoveryCompletion(
-                allocator,
-                request,
-                self.recovery_completion_mismatch,
-            );
-            errdefer completion.deinit();
-            const source = try completion.document.canonicalJson(self.allocator);
-            if (self.recovery_completion_source) |previous|
-                self.allocator.free(previous);
-            self.recovery_completion_source = source;
-            result.recovery_completion = completion;
+            if (request.recovery_acknowledgment) |_| {
+                self.recovery_ack_calls += 1;
+                if (self.inspect_record_source) |source|
+                    self.allocator.free(source);
+                self.inspect_record_source = null;
+            } else {
+                var completion = try fakeRecoveryCompletion(
+                    allocator,
+                    request,
+                    self.recovery_completion_mismatch,
+                );
+                errdefer completion.deinit();
+                const source =
+                    try completion.document.canonicalJson(self.allocator);
+                if (self.recovery_completion_source) |previous|
+                    self.allocator.free(previous);
+                self.recovery_completion_source = source;
+                var record = try fakePublishedRecoveryRecord(
+                    allocator,
+                    completion.document,
+                );
+                defer record.deinit();
+                const record_source =
+                    try record.record.canonicalJson(self.allocator);
+                if (self.inspect_record_source) |previous|
+                    self.allocator.free(previous);
+                self.inspect_record_source = record_source;
+                result.recovery_acknowledgment = .{
+                    .attempt_id = completion.document.attempt_id,
+                    .completion_sha256 = completion.document.digest_sha256,
+                    .provenance_sha256 = record.record.provenance_sha256.?,
+                };
+                if (self.fail_after_recovery_transport) {
+                    self.fail_after_recovery_transport = false;
+                    return error.TransportReadFailed;
+                }
+                result.recovery_completion = completion;
+            }
         }
         if (request.mode == .execute or request.mode == .recover)
             self.inspect_status = .clean;
@@ -5589,6 +5757,69 @@ fn fakeRecoveryCompletion(
     });
 }
 
+fn fakePublishedRecoveryRecord(
+    allocator: std.mem.Allocator,
+    document: root_operation_completion.Document,
+) !root_operation.OwnedRecord {
+    var pending = try root_operation.create(allocator, .{
+        .attempt_id = document.attempt_id,
+        .generation = document.record_generation,
+        .install_root = document.install_root,
+        .backend = document.backend,
+        .operation = document.operation,
+        .state = .completed,
+        .phase = .provenance,
+        .step = document.step,
+        .mutation_started = true,
+        .outcome = document.outcome,
+        .provenance = .pending,
+        .evidence = .{
+            .authorization_sha256 = document.authorization_sha256,
+            .program_sha256 = document.program_sha256,
+            .plan_sha256 = document.plan_sha256,
+            .exact_lock = document.exact_lock,
+            .database_generation_sha256 = document.database_generation_sha256,
+            .artifact_evidence_sha256 = document.artifact_evidence_sha256,
+        },
+        .request_sha256 = document.request_sha256,
+        .policy_sha256 = document.policy_sha256,
+        .target_architecture = document.target_architecture,
+        .foreign_architectures = document.foreign_architectures,
+        .reserved_unix = document.reserved_unix,
+        .updated_unix = document.updated_unix,
+    });
+    defer pending.deinit();
+    const provenance_sha256 = root_operation.provenanceDigest(
+        pending.record,
+        .{
+            .outcome = document.outcome,
+            .document_sha256 = document.digest_sha256,
+            .journal_archived = document.journal.status == .archived,
+        },
+    );
+    return root_operation.create(allocator, .{
+        .attempt_id = document.attempt_id,
+        .generation = document.record_generation + 1,
+        .install_root = document.install_root,
+        .backend = document.backend,
+        .operation = document.operation,
+        .state = .completed,
+        .phase = .provenance,
+        .step = document.step + 1,
+        .mutation_started = true,
+        .outcome = document.outcome,
+        .provenance = .published,
+        .provenance_sha256 = provenance_sha256,
+        .evidence = pending.record.evidence(),
+        .request_sha256 = document.request_sha256,
+        .policy_sha256 = document.policy_sha256,
+        .target_architecture = document.target_architecture,
+        .foreign_architectures = document.foreign_architectures,
+        .reserved_unix = document.reserved_unix,
+        .updated_unix = document.updated_unix + 1,
+    });
+}
+
 const FakeStateStore = struct {
     allocator: std.mem.Allocator,
     active_bytes: ?[]u8 = null,
@@ -5602,6 +5833,7 @@ const FakeStateStore = struct {
     completion_published: bool = false,
     fail_finish: bool = false,
     fail_after_retain_once: bool = false,
+    fail_recovery_retain_once: bool = false,
 
     fn deinit(self: *FakeStateStore) void {
         if (self.active_bytes) |bytes| self.allocator.free(bytes);
@@ -5789,6 +6021,10 @@ const FakeStateStore = struct {
         digest: [32]u8,
     ) !api.DocumentBinding {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        if (self.fail_recovery_retain_once) {
+            self.fail_recovery_retain_once = false;
+            return error.InjectedRecoveryRetainFailure;
+        }
         self.retained_transaction = true;
         if (self.recovery_completion_bytes) |previous|
             self.allocator.free(previous);
@@ -7129,6 +7365,10 @@ fn expectSettledPublishedRecovery(
     try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
     try std.testing.expectEqual(
         @as(usize, 1),
+        harness.backend.recovery_ack_calls,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
         harness.runner.recovery_completion_reads,
     );
     try std.testing.expect(harness.store.active_bytes == null);
@@ -7281,7 +7521,13 @@ test "apt_system_orchestrator.test.profile replacement blocks recovery and recon
 }
 
 test "apt_system_orchestrator.test.post-backend crashes reconcile without a second mutation" {
-    inline for (std.meta.tags(CompletionBoundary)) |boundary| {
+    inline for (.{
+        CompletionBoundary.after_backend_success,
+        .after_transaction_verified,
+        .after_transaction_retained,
+        .after_verifying_state,
+        .after_completion_published,
+    }) |boundary| {
         var harness = Harness.init(std.testing.allocator);
         defer harness.deinit();
         harness.rebind();
@@ -7361,8 +7607,21 @@ test "apt_system_orchestrator.test.post-recovery crashes use exact retained bind
         );
         try std.testing.expect(crash.triggered);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+        if (boundary == .after_recovery_acknowledged or
+            boundary == .after_completion_published)
+        {
+            try std.testing.expectEqual(
+                @as(usize, 1),
+                harness.backend.recovery_ack_calls,
+            );
+        }
         harness.engine.completion_crash = null;
         harness.runner.inspect_status = .clean;
+        const genuine_completion = if (harness.runner.recovery_completion_source) |source|
+            try harness.runner.allocator.dupe(u8, source)
+        else
+            return error.MissingRecoveryCompletion;
+        defer harness.runner.allocator.free(genuine_completion);
         if (harness.runner.recovery_completion_source) |source|
             harness.runner.allocator.free(source);
         var stale_profile = try harness.profile.interface().load(
@@ -7408,11 +7667,170 @@ test "apt_system_orchestrator.test.post-recovery crashes use exact retained bind
             true,
         );
         defer result.deinit();
-        try std.testing.expectEqual(api.Outcome.success, result.outcome);
+        const outer_binding_committed =
+            boundary == .after_verifying_state or
+            boundary == .after_recovery_acknowledged or
+            boundary == .after_completion_published;
+        try std.testing.expectEqual(
+            if (outer_binding_committed)
+                api.Outcome.success
+            else
+                api.Outcome.recovery,
+            result.outcome,
+        );
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
-        try std.testing.expectEqual(@as(usize, 0), harness.runner.recovery_completion_reads);
+        if (!outer_binding_committed) {
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                harness.backend.recovery_ack_calls,
+            );
+            harness.runner.allocator.free(
+                harness.runner.recovery_completion_source.?,
+            );
+            harness.runner.recovery_completion_source =
+                try harness.runner.allocator.dupe(u8, genuine_completion);
+            var final_recovery = switch (try harness.engine.prepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            )) {
+                .ready => |value| value,
+                .result => return error.ExpectedRecoveryPreparation,
+            };
+            defer final_recovery.deinit();
+            var final = try harness.engine.executeRecovery(
+                std.testing.allocator,
+                final_recovery,
+                true,
+            );
+            defer final.deinit();
+            try std.testing.expectEqual(api.Outcome.success, final.outcome);
+        }
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            harness.backend.recovery_ack_calls,
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            harness.runner.recovery_ack_calls,
+        );
         try std.testing.expect(harness.store.active_bytes == null);
     }
+}
+
+test "apt_system_orchestrator.test.recovery transport failure preserves lower token for retry without second mutation" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+
+    var first_recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer first_recovery.deinit();
+    harness.runner.fail_after_recovery_transport = true;
+    var failed = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        first_recovery,
+        true,
+    );
+    defer failed.deinit();
+    try std.testing.expectEqual(api.Outcome.recovery, failed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recovery_ack_calls);
+
+    var retry = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer retry.deinit();
+    var completed = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        retry,
+        true,
+    );
+    defer completed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recovery_ack_calls);
+    try std.testing.expectEqual(@as(usize, 1), harness.runner.recovery_ack_calls);
+    try std.testing.expect(harness.store.active_bytes == null);
+}
+
+test "apt_system_orchestrator.test.recovery retention failure preserves lower token for retry without second mutation" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+
+    var first_recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer first_recovery.deinit();
+    harness.store.fail_recovery_retain_once = true;
+    var failed = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        first_recovery,
+        true,
+    );
+    defer failed.deinit();
+    try std.testing.expectEqual(api.Outcome.recovery, failed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.recovery_ack_calls);
+
+    var retry = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer retry.deinit();
+    var completed = try harness.engine.executeRecovery(
+        std.testing.allocator,
+        retry,
+        true,
+    );
+    defer completed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recovery_ack_calls);
+    try std.testing.expectEqual(@as(usize, 1), harness.runner.recovery_ack_calls);
+    try std.testing.expect(harness.store.active_bytes == null);
 }
 
 test "apt_system_orchestrator.test.finish failure leaves completion evidence active for deterministic reconciliation" {

@@ -302,28 +302,33 @@ lock binding immediately before recovery mutation, and verifies and retains its
 result through the same boundaries. Recovery first inspects the retained
 lower-level root-operation state. A completed record with pending provenance
 is routed through `ProductionWorkflow` recovery to
-`dischargeOwedProvenance`, which publishes the discharge and clears the record
-without replaying package mutation. A completed record whose provenance is
-already published or not required is settled and can enter direct outer
-reconciliation even if the lower record has not yet been cleared.
+`dischargeOwedProvenance` without replaying package mutation. Ordinary product
+recovery still clears the record on success. The internal apt/system workflow
+instead requests deferred clearing: discharge publishes the completion and
+the completed/published lower record, then returns their exact attempt,
+completion, and provenance token while leaving that record durable.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower
 attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
-binding before any injectable outer post-backend boundary. If a process died
-after lower provenance publication but before returning, the still-present
-settled root record supplies the exact attempt, outcome, and provenance digest
-used to validate the global completion once and retain the same operation-local
-binding. Both an originally recovered transaction and an originally successful
+binding before explicitly acknowledging the exact lower token and clearing its
+record. A crash before outer retention therefore leaves the lower
+completed/published record available for retry; a crash after retention but
+before acknowledgment uses the retained binding and idempotently clears; a
+crash after acknowledgment uses only the retained operation-local evidence.
+The acknowledgment rereads the global completion under the root-operation
+lock and rejects any attempt, completion, provenance, request, operation, or
+exact-lock mismatch before clearing. Transport and signal interruption follow
+the same path because the lower record is not cleared before acknowledgment.
+Both an originally recovered transaction and an originally successful
 transaction whose provenance discharge was interrupted are accepted without a
-lower workflow replay, recovery request, or fabricated transaction result.
-Once the record is absent, reconciliation consumes only that operation-local
-path and digest. It never infers recovery from the outer phase or accepts a
-global completion that may belong to an older identical request. Without either
-durable binding, clean reconciliation uses ordinary exact-lock-bound
-transaction evidence and does not claim that lower recovery occurred. The root
-record request digest is checked against the original execute-mode production
+lower workflow replay, recovery request, or fabricated transaction result. It
+never infers recovery from the outer phase or accepts a global completion that
+may belong to an older identical request. Without either durable binding,
+clean reconciliation uses ordinary exact-lock-bound transaction evidence and
+does not claim that lower recovery occurred. The root record request digest is
+checked against the original execute-mode production
 product request, the discharge digest against the recover-mode production
 product request, and the exact lock's request digest against the separately
 computed semantic transaction request. These digest domains are never

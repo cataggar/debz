@@ -1011,9 +1011,20 @@ pub const Request = struct {
     foreign_architectures: []const []const u8 = &.{},
     wait_ms: u64 = 0,
     cancellation: transaction_executor.Cancellation = transaction_executor.Cancellation.never(),
+    /// Internal hand-off: recovery may adopt an exact settled/published
+    /// record so its completion can be returned to an outer coordinator
+    /// without reclaiming it into a new attempt.
+    adopt_settled_for_acknowledgment: bool = false,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
     attempt_id: ?[32]u8 = null,
+};
+
+/// Exact identity of a settled attempt that a higher-level coordinator has
+/// durably retained and is now permitted to acknowledge.
+pub const SettledAcknowledgment = struct {
+    attempt_id: [32]u8,
+    provenance_sha256: [32]u8,
 };
 
 pub const Transition = struct {
@@ -1210,6 +1221,25 @@ pub const Coordinator = struct {
         // behind as proof the rerun never happened. Settling it here, before
         // any adoption, keeps one rule for every intent: reclaim it into a
         // fresh attempt, or report it, exactly as the plain mutation rules do.
+        if (prior) |*value| {
+            if (request.intent == .recovery and
+                request.adopt_settled_for_acknowledgment and
+                value.record.clearable() and
+                value.record.provenance == .published)
+            {
+                const adopted = value.*;
+                prior = null;
+                return .{
+                    .coordinator = self,
+                    .token = token,
+                    .owned = adopted,
+                    .entered = .initEmpty(),
+                    .highest = .root_operation,
+                    .adopted = true,
+                    .bridge = adoptedBridge(adopted.record.state),
+                };
+            }
+        }
         var reclaimed: ?u64 = null;
         if (prior) |*value| {
             if (value.record.clearable()) {
@@ -1315,6 +1345,60 @@ pub const Coordinator = struct {
             .highest = .root_operation,
             .adopted = false,
             .bridge = .none,
+        };
+    }
+
+    /// Locks and returns the exact settled record named by an outer durable
+    /// acknowledgment. No record means a prior identical acknowledgment
+    /// already cleared it. A different record is never reclaimed or adopted.
+    pub fn resumeSettledForAcknowledgment(
+        self: *Coordinator,
+        allocator: std.mem.Allocator,
+        expected: SettledAcknowledgment,
+        wait_ms: u64,
+    ) Error!?Attempt {
+        const token = try self.locks.acquire(.{
+            .rank = .root_operation,
+            .root = self.root,
+            .identity = self.identity,
+            .path = lock_path,
+            .wait_ms = wait_ms,
+            .cancellation = transaction_executor.Cancellation.never(),
+        });
+        errdefer self.locks.release(token);
+
+        var owned = (self.store().read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.RecordCorrupt,
+        }) orelse {
+            self.locks.release(token);
+            return null;
+        };
+        errdefer owned.deinit();
+        const record = owned.record;
+        if (!std.mem.eql(
+            u8,
+            &record.root_identity_sha256,
+            &self.identity.install_root_sha256,
+        )) return error.RootIdentityMismatch;
+        if (!record.clearable() or record.provenance != .published)
+            return error.ProvenancePending;
+        if (!std.mem.eql(u8, &record.attempt_id, &expected.attempt_id) or
+            record.provenance_sha256 == null or
+            !std.mem.eql(
+                u8,
+                &record.provenance_sha256.?,
+                &expected.provenance_sha256,
+            ))
+            return error.AttemptMismatch;
+        return .{
+            .coordinator = self,
+            .token = token,
+            .owned = owned,
+            .entered = .initEmpty(),
+            .highest = .root_operation,
+            .adopted = true,
+            .bridge = adoptedBridge(record.state),
         };
     }
 

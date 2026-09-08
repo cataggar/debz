@@ -30,16 +30,27 @@ pub const Executor = transaction_engine.Executor;
 pub const WorkflowSemanticOperation = enum { install, remove, upgrade_all };
 pub const WorkflowMode = enum { plan_only, download_only, execute, recover };
 
+pub const WorkflowRecoveryAcknowledgment = struct {
+    attempt_id: [32]u8,
+    completion_sha256: [32]u8,
+    provenance_sha256: [32]u8,
+};
+
 pub const WorkflowRequest = struct {
     operation: WorkflowSemanticOperation,
     mode: WorkflowMode,
     selectors: []const solver.PackageSelector = &.{},
     options: api.CommonOptions,
+    /// Internal cross-layer protocol. Ordinary product recovery keeps its
+    /// historical clear-on-success behavior.
+    defer_recovery_clear: bool = false,
+    recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
 };
 
 const WorkflowDirective = struct {
     operation: WorkflowSemanticOperation,
     mode: WorkflowMode,
+    defer_recovery_clear: bool = false,
 };
 
 const TransactionSemanticOperation = enum {
@@ -69,6 +80,9 @@ pub const CompletionPoint = enum {
     /// The record carries its provenance digest but the active intent has not
     /// been cleared yet.
     after_provenance_published,
+    /// A deferred recovery has prepared its success result while the exact
+    /// completed/published lower record still remains durable.
+    before_deferred_recovery_return,
 };
 
 /// Test seam that reproduces a process death at a completion boundary. A
@@ -183,9 +197,25 @@ pub const Backend = struct {
             .packages = packages,
             .options = workflow.options,
         };
+        if (workflow.recovery_acknowledgment) |acknowledgment| {
+            if (workflow.mode != .recover or !workflow.defer_recovery_clear)
+                return api.failure(
+                    operation,
+                    .usage,
+                    .invalid_request,
+                    "invalid internal recovery acknowledgment",
+                );
+            return self.acknowledgeWorkflowRecovery(
+                allocator,
+                request,
+                workflow.operation,
+                acknowledgment,
+            ) catch |err| mapRuntimeError(operation, err);
+        }
         return self.withRepositories(allocator, request, .{
             .operation = workflow.operation,
             .mode = workflow.mode,
+            .defer_recovery_clear = workflow.defer_recovery_clear,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -552,6 +582,10 @@ pub const Backend = struct {
         // root access.
         var guard: RootOperationGuard = .{ .backend = self, .allocator = allocator };
         defer guard.deinit();
+        guard.preserve_settled = if (workflow) |directive|
+            directive.mode == .recover and directive.defer_recovery_clear
+        else
+            false;
         if (workflowRootOperation(request.operation, workflow)) |operation| {
             if (guard.open(allocator, request, operation)) |failure| return failure;
         }
@@ -564,7 +598,15 @@ pub const Backend = struct {
         // the legacy journal about a transaction it already archived and
         // answer with a failure that can never discharge the obligation.
         if (workflowMode(request.operation, workflow) == .recover) {
-            if (try self.dischargeOwedProvenance(allocator, &guard, request)) |result|
+            if (try self.dischargeOwedProvenance(
+                allocator,
+                &guard,
+                request,
+                if (workflow) |directive|
+                    directive.defer_recovery_clear
+                else
+                    false,
+            )) |result|
                 return result;
         }
 
@@ -967,6 +1009,10 @@ pub const Backend = struct {
                 allocator,
                 &guard,
                 request,
+                if (workflow) |directive|
+                    directive.defer_recovery_clear
+                else
+                    false,
             )) |result| return result;
             return blockedRecovery(
                 request.operation,
@@ -1059,10 +1105,12 @@ pub const Backend = struct {
     /// record, a versioned root-operation completion statement that says
     /// exactly what was witnessed and what the crash interrupted is published
     /// inside the root, the record is transitioned to `published` bound to
-    /// that statement, and only then is the active intent cleared. Nothing
-    /// about the interrupted transaction's commands, scripts, or packages is
-    /// invented, and any mismatch, corruption, or I/O failure leaves the
-    /// record exactly as it was with an actionable diagnostic.
+    /// that statement. Ordinary product recovery then clears the active
+    /// intent. The internal apt/system workflow may defer that clear until its
+    /// outer state durably retains and acknowledges the exact completion
+    /// token. Nothing about the interrupted transaction's commands, scripts,
+    /// or packages is invented, and any mismatch, corruption, or I/O failure
+    /// leaves the record exactly as it was with an actionable diagnostic.
     ///
     /// `null` means nothing is owed, so the ordinary recovery path continues.
     fn dischargeOwedProvenance(
@@ -1070,9 +1118,58 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         guard: *RootOperationGuard,
         request: api.Request,
+        defer_clear: bool,
     ) !?api.Result {
         var attempt = guard.active() orelse return null;
         const record = attempt.record();
+        if (defer_clear and record.state == .completed and
+            record.provenance == .published)
+        {
+            var completion = (root_operation_completion.Store.init(
+                guard.owned_root.?.root,
+            ).read(allocator) catch return blockedRecovery(
+                request.operation,
+                "settled lower recovery completion evidence is unreadable",
+            )) orelse return blockedRecovery(
+                request.operation,
+                "settled lower recovery completion evidence is missing",
+            );
+            defer completion.deinit();
+            if (!recoveryCompletionMatchesRecord(
+                completion.document,
+                record,
+                request,
+            )) return blockedRecovery(
+                request.operation,
+                "settled lower recovery completion evidence is stale or foreign",
+            );
+            guard.preserve_settled = true;
+            const items = try allocator.alloc(api.Item, 1);
+            items[0] = .{
+                .package = "root-operation",
+                .detail = try std.fmt.allocPrint(
+                    allocator,
+                    "outcome={s} transaction_provenance={s} statement_sha256={s}",
+                    .{
+                        @tagName(completion.document.outcome),
+                        @tagName(
+                            completion.document.transaction_provenance.status,
+                        ),
+                        &std.fmt.bytesToHex(
+                            completion.document.digest_sha256,
+                            .lower,
+                        ),
+                    },
+                ),
+            };
+            try guard.crash(.before_deferred_recovery_return);
+            return success(
+                request.operation,
+                false,
+                "settled lower recovery completion awaits outer acknowledgment",
+                items,
+            );
+        }
         if (record.state != .completed or record.provenance != .pending) return null;
 
         // Only the surface and backend that published the record may finish
@@ -1137,7 +1234,11 @@ pub const Backend = struct {
             .journal_archived = evidence.journal.status == .archived,
         })) catch |err| return mapRootOperationError(request.operation, err);
         try guard.crash(.after_provenance_published);
-        attempt.clear() catch |err| return mapRootOperationError(request.operation, err);
+        if (defer_clear) {
+            guard.preserve_settled = true;
+        } else {
+            attempt.clear() catch |err| return mapRootOperationError(request.operation, err);
+        }
 
         // Removing the recovery intent is the last step the crashed run never
         // reached, and the transaction it described is now definitively over.
@@ -1164,7 +1265,7 @@ pub const Backend = struct {
                 },
             ),
         };
-        return success(
+        const result = success(
             request.operation,
             true,
             switch (evidence.transaction.status) {
@@ -1172,6 +1273,103 @@ pub const Backend = struct {
                 .unavailable => "interrupted transaction completion recovered; detailed transaction provenance was interrupted",
             },
             items,
+        );
+        if (defer_clear) try guard.crash(.before_deferred_recovery_return);
+        return result;
+    }
+
+    /// Clears a deferred completed/published lower record only after the
+    /// orchestrator has durably retained the exact completion token.
+    fn acknowledgeWorkflowRecovery(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        semantic_operation: WorkflowSemanticOperation,
+        acknowledgment: WorkflowRecoveryAcknowledgment,
+    ) !api.Result {
+        var owned_root = root_fs.openAbsoluteRoot(
+            self.io,
+            request.options.install_root,
+        ) catch return blockedRecovery(
+            request.operation,
+            "the live root is unavailable while acknowledging recovery",
+        );
+        defer owned_root.close();
+        var locks: root_operation.SystemLockBackend = .{
+            .allocator = allocator,
+            .io = self.io,
+        };
+        var coordinator = root_operation.Coordinator.open(
+            self.io,
+            owned_root.root,
+            request.options.install_root,
+            locks.interface(),
+        ) catch |err| return mapRootOperationError(request.operation, err);
+        coordinator.now_unix = self.now_unix;
+        var attempt = (try coordinator.resumeSettledForAcknowledgment(
+            allocator,
+            .{
+                .attempt_id = acknowledgment.attempt_id,
+                .provenance_sha256 = acknowledgment.provenance_sha256,
+            },
+            request.options.lock_wait_ms,
+        )) orelse return success(
+            request.operation,
+            false,
+            "lower recovery acknowledgment was already finalized",
+            &.{},
+        );
+        defer attempt.release();
+        const record = attempt.record();
+        const expected_operation: api.Operation =
+            workflowSemanticSurface(semantic_operation);
+        if (record.operation != .package_transaction or
+            record.operation.package_transaction != expected_operation or
+            record.backend != self.transaction_backend)
+            return blockedRecovery(
+                request.operation,
+                "deferred lower recovery acknowledgment names a foreign operation",
+            );
+
+        var completion = (root_operation_completion.Store.init(
+            owned_root.root,
+        ).read(allocator) catch return blockedRecovery(
+            request.operation,
+            "deferred lower recovery completion evidence is unreadable",
+        )) orelse return blockedRecovery(
+            request.operation,
+            "deferred lower recovery completion evidence is missing",
+        );
+        defer completion.deinit();
+        const document = completion.document;
+        const expected_provenance = root_operation.provenanceDigest(record, .{
+            .outcome = record.outcome,
+            .document_sha256 = document.digest_sha256,
+            .journal_archived = document.journal.status == .archived,
+        });
+        if (!std.mem.eql(
+            u8,
+            &document.digest_sha256,
+            &acknowledgment.completion_sha256,
+        ) or
+            !recoveryCompletionMatchesRecord(document, record, request) or
+            !std.mem.eql(
+                u8,
+                &expected_provenance,
+                &acknowledgment.provenance_sha256,
+            ))
+            return blockedRecovery(
+                request.operation,
+                "deferred lower recovery acknowledgment token is stale or foreign",
+            );
+        attempt.clear() catch |err|
+            return mapRootOperationError(request.operation, err);
+        _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
+        return success(
+            request.operation,
+            false,
+            "lower recovery acknowledgment finalized",
+            &.{},
         );
     }
 
@@ -1536,6 +1734,53 @@ fn productRequestDigest(request: api.Request) [32]u8 {
     return hash.finalResult();
 }
 
+fn recoveryCompletionMatchesRecord(
+    document: root_operation_completion.Document,
+    record: root_operation.Record,
+    recovery_request: api.Request,
+) bool {
+    const original_operation: api.Operation = switch (record.operation) {
+        .package_transaction => |operation| operation,
+        .repository_bootstrap => return false,
+    };
+    var original_request = recovery_request;
+    original_request.operation = original_operation;
+    const lock_matches = if (record.exact_lock) |record_lock|
+        if (document.exact_lock) |document_lock|
+            std.mem.eql(u8, record_lock.schema, document_lock.schema) and
+                record_lock.version == document_lock.version and
+                std.mem.eql(
+                    u8,
+                    &record_lock.digest_sha256,
+                    &document_lock.digest_sha256,
+                )
+        else
+            false
+    else
+        false;
+    const provenance_sha256 = record.provenance_sha256 orelse return false;
+    const expected_provenance = root_operation.provenanceDigest(record, .{
+        .outcome = record.outcome,
+        .document_sha256 = document.digest_sha256,
+        .journal_archived = document.journal.status == .archived,
+    });
+    return std.mem.eql(u8, &document.attempt_id, &record.attempt_id) and
+        std.mem.eql(
+            u8,
+            &document.request_sha256,
+            &productRequestDigest(original_request),
+        ) and
+        std.mem.eql(
+            u8,
+            &document.discharge.request_sha256,
+            &productRequestDigest(recovery_request),
+        ) and
+        document.discharge.surface == .package_transaction and
+        std.mem.eql(u8, document.discharge.operation, "recover") and
+        lock_matches and
+        std.mem.eql(u8, &expected_provenance, &provenance_sha256);
+}
+
 /// Owns rank 0 of the lock order for one product mutation. It is deliberately
 /// a thin bridge: it reserves the root, publishes each durable boundary the
 /// current command-oriented executor can justify, and resolves the pending
@@ -1552,6 +1797,10 @@ const RootOperationGuard = struct {
     /// durable record then stays exactly as it was published, because a dead
     /// process cannot complete, clear, or abandon anything.
     crashed: bool = false,
+    /// The apt-system orchestrator has requested a durable lower
+    /// acknowledgment hand-off. The settled record remains until that outer
+    /// coordinator retains and explicitly acknowledges its exact token.
+    preserve_settled: bool = false,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -1615,6 +1864,7 @@ const RootOperationGuard = struct {
             ),
             .target_architecture = request.options.architecture,
             .wait_ms = request.options.lock_wait_ms,
+            .adopt_settled_for_acknowledgment = self.preserve_settled,
         }) catch |err| return mapRootOperationError(request.operation, err);
         return null;
     }
@@ -1756,7 +2006,8 @@ const RootOperationGuard = struct {
             if (value.locked() and !self.crashed) {
                 if (value.record().state.provenPreMutation())
                     value.abandonIfPreMutation(self.allocator) catch {}
-                else if (value.record().clearable()) value.clear() catch {};
+                else if (value.record().clearable() and !self.preserve_settled)
+                    value.clear() catch {};
             }
             value.release();
         }
@@ -2320,6 +2571,7 @@ pub fn workflowSemanticRequestDigest(
         .{
             .operation = operation,
             .mode = .recover,
+            .defer_recovery_clear = false,
         },
         selectors,
     );
@@ -3643,6 +3895,183 @@ test "production recovery crash after provenance publication leaves a settled cl
         .options = options,
     });
     try std.testing.expect(future.exit_status != .recovery);
+}
+
+test "production workflow deferred recovery completion survives every handoff crash and acknowledges once" {
+    inline for (.{
+        CompletionPoint.after_owed_provenance_document,
+        .after_provenance_published,
+        .before_deferred_recovery_return,
+    }) |recovery_crash_point| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        defer fixture.deinit();
+        var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+        var initial_crash: TestCompletionCrash = .{
+            .point = .after_completed_record,
+        };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+            .completion_crash = initial_crash.interface(),
+        };
+        const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.noninteractive = true;
+        options.conffile = .keep_existing;
+        const interrupted = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.internal, interrupted.exit_status);
+        const mutation_calls = process.calls;
+
+        var recovery_crash: TestCompletionCrash = .{
+            .point = recovery_crash_point,
+        };
+        backend.completion_crash = recovery_crash.interface();
+        const first_recovery = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+        });
+        try std.testing.expectEqual(
+            api.ExitStatus.internal,
+            first_recovery.exit_status,
+        );
+        try std.testing.expect(recovery_crash.triggered);
+        try std.testing.expectEqual(mutation_calls, process.calls);
+
+        backend.completion_crash = null;
+        const recovered = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
+        try std.testing.expectEqual(mutation_calls, process.calls);
+        const record_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation.record_path,
+            allocator,
+            .limited(root_operation.maximum_document_bytes),
+        );
+        var record = try root_operation.decode(
+            allocator,
+            record_source,
+            root_operation.maximum_document_bytes,
+        );
+        defer record.deinit();
+        const completion_source = try directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation_completion.document_path,
+            allocator,
+            .limited(root_operation_completion.maximum_document_bytes),
+        );
+        var completion = try root_operation_completion.decode(
+            allocator,
+            completion_source,
+            root_operation_completion.maximum_document_bytes,
+        );
+        defer completion.deinit();
+        try std.testing.expectEqual(
+            root_operation.ProvenanceState.published,
+            record.record.provenance,
+        );
+        try std.testing.expectEqual(
+            root_operation_completion.TransactionProvenanceStatus.unavailable,
+            completion.document.transaction_provenance.status,
+        );
+
+        var wrong_completion = completion.document.digest_sha256;
+        wrong_completion[0] ^= 0xff;
+        const rejected = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .recovery_acknowledgment = .{
+                .attempt_id = record.record.attempt_id,
+                .completion_sha256 = wrong_completion,
+                .provenance_sha256 = record.record.provenance_sha256.?,
+            },
+        });
+        try std.testing.expectEqual(api.ExitStatus.recovery, rejected.exit_status);
+        try directory.dir.access(
+            std.testing.io,
+            "root/" ++ root_operation.record_path,
+            .{},
+        );
+        const acknowledged = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .recovery_acknowledgment = .{
+                .attempt_id = record.record.attempt_id,
+                .completion_sha256 = completion.document.digest_sha256,
+                .provenance_sha256 = record.record.provenance_sha256.?,
+            },
+        });
+        try std.testing.expectEqual(
+            api.ExitStatus.success,
+            acknowledged.exit_status,
+        );
+        try std.testing.expectEqual(mutation_calls, process.calls);
+        try std.testing.expectError(
+            error.FileNotFound,
+            directory.dir.access(
+                std.testing.io,
+                "root/" ++ root_operation.record_path,
+                .{},
+            ),
+        );
+        const repeated = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .defer_recovery_clear = true,
+            .recovery_acknowledgment = .{
+                .attempt_id = record.record.attempt_id,
+                .completion_sha256 = completion.document.digest_sha256,
+                .provenance_sha256 = record.record.provenance_sha256.?,
+            },
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, repeated.exit_status);
+        try std.testing.expectEqual(mutation_calls, process.calls);
+    }
 }
 
 test "production workflow successful recovery publishes honest completion evidence" {
