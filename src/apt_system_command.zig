@@ -125,9 +125,18 @@ pub const Confirmation = enum {
     unavailable,
 };
 
+pub const ConfirmationPrompt = enum {
+    apt_execution,
+    recovery,
+};
+
 pub const Terminal = struct {
     context: *anyopaque,
-    confirmFn: *const fn (*anyopaque, *std.Io.Writer) anyerror!Confirmation,
+    confirmFn: *const fn (
+        *anyopaque,
+        *std.Io.Writer,
+        ConfirmationPrompt,
+    ) anyerror!Confirmation,
 
     pub fn unavailable() Terminal {
         return .{
@@ -139,10 +148,81 @@ pub const Terminal = struct {
     fn alwaysUnavailable(
         _: *anyopaque,
         _: *std.Io.Writer,
+        _: ConfirmationPrompt,
     ) !Confirmation {
         return .unavailable;
     }
 };
+
+pub const ProductionTerminal = struct {
+    io: std.Io,
+
+    pub fn interface(self: *ProductionTerminal) Terminal {
+        return .{
+            .context = self,
+            .confirmFn = confirm,
+        };
+    }
+
+    fn confirm(
+        context: *anyopaque,
+        stderr: *std.Io.Writer,
+        prompt: ConfirmationPrompt,
+    ) !Confirmation {
+        const self: *ProductionTerminal = @ptrCast(@alignCast(context));
+        return confirmFiles(
+            self.io,
+            std.Io.File.stdin(),
+            std.Io.File.stdout(),
+            std.Io.File.stderr(),
+            stderr,
+            prompt,
+        );
+    }
+
+    fn confirmFiles(
+        io: std.Io,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
+        stderr_file: std.Io.File,
+        stderr: *std.Io.Writer,
+        prompt: ConfirmationPrompt,
+    ) !Confirmation {
+        if (!try stdin_file.isTty(io) or
+            !try stdout_file.isTty(io) or
+            !try stderr_file.isTty(io))
+            return .unavailable;
+
+        try stderr.writeAll(confirmationPromptText(prompt));
+        try stderr.flush();
+        var answer: [8]u8 = undefined;
+        var length: usize = 0;
+        while (length < answer.len) {
+            var byte: [1]u8 = undefined;
+            const read = stdin_file.readStreaming(
+                io,
+                &.{byte[0..]},
+            ) catch return .unavailable;
+            if (read == 0) return .unavailable;
+            if (byte[0] == '\n' or byte[0] == '\r') break;
+            answer[length] = byte[0];
+            length += 1;
+        }
+        try stderr.writeByte('\n');
+        const value = std.mem.trim(u8, answer[0..length], " \t");
+        if (std.ascii.eqlIgnoreCase(value, "y") or
+            std.ascii.eqlIgnoreCase(value, "yes"))
+            return .confirmed;
+        return .declined;
+    }
+};
+
+pub fn confirmationPromptText(prompt: ConfirmationPrompt) []const u8 {
+    return switch (prompt) {
+        .apt_execution => "Proceed with this exact lock? [y/N] ",
+        .recovery => "Proceed with this reviewed recovery action? [y/N] ",
+    };
+}
 
 pub const Streams = struct {
     stdout: *std.Io.Writer,
@@ -187,6 +267,7 @@ pub fn runApt(
                 .request_tty_confirmation => (terminal.confirmFn(
                     terminal.context,
                     streams.stderr,
+                    .apt_execution,
                 ) catch .unavailable) == .confirmed,
                 .return_confirmation_required => false,
                 .await_plan => unreachable,
@@ -259,12 +340,20 @@ pub fn runRecovery(
         .ready => |*recovery| {
             defer recovery.deinit();
             if (output == .human) {
-                try writeReview(
-                    recovery.prepared,
-                    recovery.action,
-                    streams.stdout,
-                );
+                try writeRecoveryReview(recovery.*, streams.stdout);
                 try streams.stdout.flush();
+            }
+            if (recovery.mutation_status == .unknown) {
+                var result = try unknownRecoveryReviewResult(recovery.*);
+                defer result.deinit();
+                try cli.writeResult(
+                    allocator,
+                    result,
+                    output,
+                    streams.stdout,
+                    streams.stderr,
+                );
+                return result.exit_status;
             }
             const confirmed = if (output == .json)
                 false
@@ -272,12 +361,8 @@ pub fn runRecovery(
                 (terminal.confirmFn(
                     terminal.context,
                     streams.stderr,
+                    .recovery,
                 ) catch .unavailable) == .confirmed;
-            const items = if (!confirmed and output == .json)
-                try copyReviewItems(allocator, recovery.prepared.review)
-            else
-                null;
-            defer if (items) |value| allocator.free(value);
             var result = if (confirmed) result: {
                 const invocation = try engine.executeRecoveryFn(
                     engine.context,
@@ -293,11 +378,7 @@ pub fn runRecovery(
                         recovery.prepared,
                     ),
                 };
-            } else try confirmationResult(
-                recovery.prepared,
-                recovery.action,
-                if (items) |value| value else &.{},
-            );
+            } else try recoveryConfirmationResult(recovery.*);
             defer result.deinit();
             try cli.writeResult(
                 allocator,
@@ -313,7 +394,7 @@ pub fn runRecovery(
 
 fn writeReview(
     prepared: orchestrator.Preparation,
-    action: ?[]const u8,
+    _: ?[]const u8,
     writer: *std.Io.Writer,
 ) !void {
     try writer.writeAll(
@@ -322,7 +403,6 @@ fn writeReview(
     try writer.print("Operation: {s}\n", .{
         @tagName(prepared.request.operation),
     });
-    if (action) |value| try writer.print("Recovery action: {s}\n", .{value});
     for (prepared.review) |item| {
         try writer.print("Planned package: {s}", .{item.package});
         if (item.version) |version| try writer.print(
@@ -357,6 +437,49 @@ fn writeReview(
     try writer.writeAll("No package mutation has occurred.\n");
 }
 
+fn writeRecoveryReview(
+    recovery: orchestrator.RecoveryPreparation,
+    writer: *std.Io.Writer,
+) !void {
+    const prepared = recovery.prepared;
+    try writer.writeAll("debz recover: reviewed retained recovery action\n");
+    try writer.print("Original operation: {s}\nRecovery action: {s}\n", .{
+        @tagName(prepared.request.operation),
+        recovery.action,
+    });
+    try writer.print("Profile: {s}\nProfile SHA-256: ", .{
+        prepared.profile.path,
+    });
+    try writeHex(writer, &prepared.profile.sha256);
+    try writer.writeAll("\nProfile reference evidence SHA-256: ");
+    try writeHex(writer, &prepared.profile.reference_evidence_sha256);
+    try writer.writeAll("\nRequest SHA-256: ");
+    try writeHex(writer, &prepared.request_sha256);
+    try writer.print("\nExact lock: {s}\nExact lock SHA-256: ", .{
+        prepared.exact_lock.path,
+    });
+    try writeHex(writer, &prepared.exact_lock.digest_sha256);
+    try writer.print("\nActive operation state: {s}\n", .{
+        prepared.paths.active_state,
+    });
+    switch (recovery.mutation_status) {
+        .unchanged => try writer.writeAll(
+            "Verified mutation status: no package mutation has occurred. " ++
+                "Recovery will finalize the retained pre-mutation operation.\n",
+        ),
+        .changed => try writer.writeAll(
+            "Verified mutation status: package mutation has occurred or may " ++
+                "be incomplete. Recovery may make further package changes " ++
+                "to converge the retained exact action.\n",
+        ),
+        .unknown => try writer.writeAll(
+            "Verified mutation status: prior package mutation status is " ++
+                "unknown. Recovery is blocked until durable evidence is " ++
+                "restored or investigated.\n",
+        ),
+    }
+}
+
 fn writeHex(writer: *std.Io.Writer, digest: *const [32]u8) !void {
     const encoded = std.fmt.bytesToHex(digest.*, .lower);
     try writer.writeAll(&encoded);
@@ -373,6 +496,45 @@ fn confirmationResult(
         result.summary = value;
         result.diagnostics[0].message = value;
     }
+    return api.complete(result);
+}
+
+fn recoveryConfirmationResult(
+    recovery: orchestrator.RecoveryPreparation,
+) !api.Result {
+    var result = try recovery.prepared.confirmationResult();
+    result.changed = recovery.mutation_status == .changed;
+    result.summary = recovery.action;
+    result.diagnostics[0].message = recovery.action;
+    return api.complete(result);
+}
+
+fn unknownRecoveryReviewResult(
+    recovery: orchestrator.RecoveryPreparation,
+) !api.Result {
+    const context: api.RecoveryContext = .{
+        .profile_path = recovery.prepared.request.profile_path,
+        .requested_operation = recovery.prepared.request.operation,
+    };
+    const summary =
+        "prior package mutation status is unknown; recovery is blocked until durable evidence is restored or investigated";
+    var result: api.Result = .{
+        .operation = .recover,
+        .request_sha256 = try api.recoveryRequestDigest(context),
+        .outcome = .recovery,
+        .exit_status = .recovery,
+        .mutation_status = .unknown,
+        .recovery_context = context,
+        .summary = summary,
+        .diagnostics = undefined,
+    };
+    result.diagnostics[0] = .{
+        .id = .recovery_required,
+        .outcome = .recovery,
+        .phase = "recovery",
+        .message = summary,
+    };
+    result.diagnostic_count = 1;
     return api.complete(result);
 }
 
@@ -406,6 +568,7 @@ const TestContext = struct {
     return_recovery_result: bool = false,
     unknown_reconciliation: bool = false,
     recovery_prepare_unknown: bool = false,
+    recovery_mutation_status: orchestrator.VerifiedMutationStatus = .unchanged,
     reconcile_count: usize = 0,
 
     fn interface(self: *TestContext) Engine {
@@ -541,6 +704,7 @@ const TestContext = struct {
                 request,
             ) catch |err| return testEngineError(err),
             .action = "debz recover --system-profile /profile.json",
+            .mutation_status = self.recovery_mutation_status,
         } };
     }
 
@@ -694,6 +858,7 @@ const TestTerminal = struct {
     answer: Confirmation,
     call_count: usize = 0,
     stdout: ?*std.Io.Writer.Allocating = null,
+    last_prompt: ?ConfirmationPrompt = null,
 
     fn interface(self: *TestTerminal) Terminal {
         return .{ .context = self, .confirmFn = confirm };
@@ -702,19 +867,122 @@ const TestTerminal = struct {
     fn confirm(
         context: *anyopaque,
         _: *std.Io.Writer,
+        prompt: ConfirmationPrompt,
     ) !Confirmation {
         const self: *TestTerminal = @ptrCast(@alignCast(context));
         self.call_count += 1;
+        self.last_prompt = prompt;
         if (self.stdout) |output| {
             if (std.mem.indexOf(
                 u8,
                 output.written(),
-                "reviewed atomic plan",
+                switch (prompt) {
+                    .apt_execution => "reviewed atomic plan",
+                    .recovery => "reviewed retained recovery action",
+                },
             ) == null) return error.PlanNotRendered;
         }
         return self.answer;
     }
 };
+
+extern fn posix_openpt(flags: c_int) c_int;
+extern fn grantpt(fd: c_int) c_int;
+extern fn unlockpt(fd: c_int) c_int;
+extern fn ptsname_r(fd: c_int, buffer: [*]u8, length: usize) c_int;
+
+const TestPty = struct {
+    master: std.Io.File,
+    slave: std.Io.File,
+
+    fn open() !TestPty {
+        const flags: c_int = @intCast(@as(u32, @bitCast(std.os.linux.O{
+            .ACCMODE = .RDWR,
+            .NOCTTY = true,
+            .CLOEXEC = true,
+        })));
+        const master_fd = posix_openpt(flags);
+        if (master_fd < 0) return error.PtyOpenFailed;
+        errdefer _ = std.os.linux.close(master_fd);
+        if (grantpt(master_fd) != 0 or unlockpt(master_fd) != 0)
+            return error.PtySetupFailed;
+        var path_buffer: [128]u8 = undefined;
+        if (ptsname_r(
+            master_fd,
+            &path_buffer,
+            path_buffer.len,
+        ) != 0) return error.PtyNameFailed;
+        const path = std.mem.sliceTo(&path_buffer, 0);
+        const slave_fd = try std.posix.openat(
+            std.os.linux.AT.FDCWD,
+            path,
+            .{
+                .ACCMODE = .RDWR,
+                .NOCTTY = true,
+                .CLOEXEC = true,
+            },
+            0,
+        );
+        return .{
+            .master = .{
+                .handle = master_fd,
+                .flags = .{ .nonblocking = false },
+            },
+            .slave = .{
+                .handle = slave_fd,
+                .flags = .{ .nonblocking = false },
+            },
+        };
+    }
+
+    fn close(self: *TestPty) void {
+        self.master.close(std.testing.io);
+        self.slave.close(std.testing.io);
+        self.* = undefined;
+    }
+};
+
+test "apt_system_command.test.production recovery prompt uses PTY yes no and EOF semantics" {
+    inline for (.{
+        .{ "yes\n", Confirmation.confirmed },
+        .{ "no\n", Confirmation.declined },
+    }) |case| {
+        var pty = try TestPty.open();
+        defer pty.close();
+        try pty.master.writeStreamingAll(std.testing.io, case[0]);
+        var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer prompt.deinit();
+        const answer = try ProductionTerminal.confirmFiles(
+            std.testing.io,
+            pty.slave,
+            pty.slave,
+            pty.slave,
+            &prompt.writer,
+            .recovery,
+        );
+        try std.testing.expectEqual(case[1], answer);
+        try std.testing.expectEqualStrings(
+            "Proceed with this reviewed recovery action? [y/N] \n",
+            prompt.written(),
+        );
+    }
+
+    var pty = try TestPty.open();
+    pty.master.close(std.testing.io);
+    var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer prompt.deinit();
+    const answer = try ProductionTerminal.confirmFiles(
+        std.testing.io,
+        pty.slave,
+        pty.slave,
+        pty.slave,
+        &prompt.writer,
+        .recovery,
+    );
+    pty.slave.close(std.testing.io);
+    try std.testing.expectEqual(Confirmation.unavailable, answer);
+    try std.testing.expectEqual(@as(usize, 0), prompt.written().len);
+}
 
 test "apt_system_command.test.JSON confirmation is one document and never mutates" {
     const parsed = switch (cli.parse(&.{
@@ -960,6 +1228,10 @@ test "apt_system_command.test.human recovery confirms exact retained action once
     );
     try std.testing.expectEqual(api.ExitStatus.success, status);
     try std.testing.expectEqual(@as(usize, 1), terminal.call_count);
+    try std.testing.expectEqual(
+        ConfirmationPrompt.recovery,
+        terminal.last_prompt.?,
+    );
     try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
     try std.testing.expectEqual(@as(usize, 0), context.execute_count);
     try std.testing.expectEqual(@as(usize, 0), context.mutation_count);
@@ -968,6 +1240,161 @@ test "apt_system_command.test.human recovery confirms exact retained action once
         stdout.written(),
         "Recovery action: debz recover --system-profile /profile.json",
     ) != null);
+}
+
+test "apt_system_command.test.recovery review truthfully renders mutation status and declines safely" {
+    const cases = [_]struct {
+        mutation_status: orchestrator.VerifiedMutationStatus,
+        answer: Confirmation,
+        expected_status: api.ExitStatus,
+        expected_text: []const u8,
+        prompts: usize,
+        executions: usize,
+    }{
+        .{
+            .mutation_status = .unchanged,
+            .answer = .declined,
+            .expected_status = .usage,
+            .expected_text = "no package mutation has occurred",
+            .prompts = 1,
+            .executions = 0,
+        },
+        .{
+            .mutation_status = .unchanged,
+            .answer = .unavailable,
+            .expected_status = .usage,
+            .expected_text = "no package mutation has occurred",
+            .prompts = 1,
+            .executions = 0,
+        },
+        .{
+            .mutation_status = .changed,
+            .answer = .declined,
+            .expected_status = .usage,
+            .expected_text = "package mutation has occurred or may be incomplete",
+            .prompts = 1,
+            .executions = 0,
+        },
+        .{
+            .mutation_status = .changed,
+            .answer = .unavailable,
+            .expected_status = .usage,
+            .expected_text = "package mutation has occurred or may be incomplete",
+            .prompts = 1,
+            .executions = 0,
+        },
+        .{
+            .mutation_status = .unknown,
+            .answer = .confirmed,
+            .expected_status = .recovery,
+            .expected_text = "prior package mutation status is unknown",
+            .prompts = 0,
+            .executions = 0,
+        },
+    };
+    for (cases) |case| {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .recovery_mutation_status = case.mutation_status,
+        };
+        var terminal: TestTerminal = .{ .answer = case.answer };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        terminal.stdout = &stdout;
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(case.expected_status, status);
+        try std.testing.expectEqual(case.prompts, terminal.call_count);
+        try std.testing.expectEqual(
+            case.executions,
+            context.recovery_execute_count,
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stdout.written(),
+            case.expected_text,
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stdout.written(),
+            "reviewed atomic plan",
+        ) == null);
+        if (case.prompts != 0)
+            try std.testing.expectEqual(
+                ConfirmationPrompt.recovery,
+                terminal.last_prompt.?,
+            );
+    }
+}
+
+test "apt_system_command.test.changed recovery confirmation may execute and JSON never prompts" {
+    {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .recovery_mutation_status = .changed,
+        };
+        var terminal: TestTerminal = .{ .answer = .confirmed };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        terminal.stdout = &stdout;
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.success, status);
+        try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stdout.written(),
+            "Recovery may make further package changes",
+        ) != null);
+    }
+    {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .recovery_mutation_status = .changed,
+        };
+        var terminal: TestTerminal = .{ .answer = .confirmed };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .json,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.usage, status);
+        try std.testing.expectEqual(@as(usize, 0), terminal.call_count);
+        try std.testing.expectEqual(@as(usize, 0), context.recovery_execute_count);
+        try std.testing.expectEqual(@as(usize, 0), stderr.written().len);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, stdout.written(), "\n"),
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stdout.written(),
+            "\"changed\":true",
+        ) != null);
+    }
 }
 
 test "apt_system_command.test.post-mutation execute errors render recovery evidence in human and JSON" {

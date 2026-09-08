@@ -49,16 +49,28 @@ pub const ProfileView = struct {
     credential_reference: ?[]const u8,
 };
 
+pub const BoundaryError = error{
+    OutOfMemory,
+    OperationalBoundaryFailure,
+    PrivilegeUnavailable,
+    RootReplacement,
+    ContractViolation,
+    InvariantViolation,
+};
+
 pub const LoadedProfile = struct {
     context: ?*anyopaque,
     view: ProfileView,
-    revalidateFn: *const fn (?*anyopaque, std.mem.Allocator) anyerror!void,
+    revalidateFn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+    ) BoundaryError!void,
     deinitFn: *const fn (?*anyopaque) void,
 
     pub fn revalidate(
         self: LoadedProfile,
         allocator: std.mem.Allocator,
-    ) !void {
+    ) BoundaryError!void {
         try self.revalidateFn(self.context, allocator);
     }
 
@@ -74,13 +86,13 @@ pub const ProfileLoader = struct {
         *anyopaque,
         std.mem.Allocator,
         []const u8,
-    ) anyerror!LoadedProfile,
+    ) BoundaryError!LoadedProfile,
 
     pub fn load(
         self: ProfileLoader,
         allocator: std.mem.Allocator,
         path: []const u8,
-    ) !LoadedProfile {
+    ) BoundaryError!LoadedProfile {
         return self.loadFn(self.context, allocator, path);
     }
 };
@@ -105,6 +117,17 @@ pub const SystemProfileLoader = struct {
     }
 
     fn load(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) BoundaryError!LoadedProfile {
+        return loadInternal(context, allocator, path) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.OperationalBoundaryFailure,
+        };
+    }
+
+    fn loadInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         path: []const u8,
@@ -175,7 +198,20 @@ pub const SystemProfileLoader = struct {
         };
     }
 
-    fn revalidate(context: ?*anyopaque, allocator: std.mem.Allocator) !void {
+    fn revalidate(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!void {
+        return revalidateInternal(context, allocator) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.OperationalBoundaryFailure,
+        };
+    }
+
+    fn revalidateInternal(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+    ) !void {
         const lease: *Lease = @ptrCast(@alignCast(context.?));
         for (lease.loaded.trusted_files) |evidence| {
             const bytes = try lease.loaded.readTrustedFile(
@@ -356,33 +392,33 @@ pub const LiveRootRunner = struct {
         std.mem.Allocator,
         Backend,
         product_api.Request,
-    ) anyerror!BackendResult,
+    ) BoundaryError!BackendResult,
     workflowFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         Backend,
         WorkflowRequest,
-    ) anyerror!BackendResult,
+    ) BoundaryError!BackendResult,
     inspectFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
-    ) anyerror!RootInspection,
+    ) BoundaryError!RootInspection,
     readRecoveryCompletionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
-    ) anyerror!?root_operation_completion.OwnedDocument,
+    ) BoundaryError!?root_operation_completion.OwnedDocument,
 
     pub fn route(
         self: LiveRootRunner,
         allocator: std.mem.Allocator,
         backend: Backend,
         request: product_api.Request,
-    ) !BackendResult {
+    ) BoundaryError!BackendResult {
         if (!std.mem.eql(
             u8,
             request.options.install_root,
             live_root.logical_root_path,
-        )) return error.UnsafeInstallRoot;
+        )) return error.ContractViolation;
         return self.routeFn(self.context, allocator, backend, request);
     }
 
@@ -391,26 +427,26 @@ pub const LiveRootRunner = struct {
         allocator: std.mem.Allocator,
         backend: Backend,
         request: WorkflowRequest,
-    ) !BackendResult {
+    ) BoundaryError!BackendResult {
         if (!std.mem.eql(
             u8,
             request.options.install_root,
             live_root.logical_root_path,
-        )) return error.UnsafeInstallRoot;
+        )) return error.ContractViolation;
         return self.workflowFn(self.context, allocator, backend, request);
     }
 
     pub fn inspect(
         self: LiveRootRunner,
         allocator: std.mem.Allocator,
-    ) !RootInspection {
+    ) BoundaryError!RootInspection {
         return self.inspectFn(self.context, allocator);
     }
 
     pub fn readRecoveryCompletion(
         self: LiveRootRunner,
         allocator: std.mem.Allocator,
-    ) !?root_operation_completion.OwnedDocument {
+    ) BoundaryError!?root_operation_completion.OwnedDocument {
         return self.readRecoveryCompletionFn(self.context, allocator);
     }
 };
@@ -475,7 +511,7 @@ pub const PrivateLiveRootRunner = struct {
         allocator: std.mem.Allocator,
         backend: Backend,
         request: product_api.Request,
-    ) !BackendResult {
+    ) BoundaryError!BackendResult {
         const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
         return self.invoke(allocator, .{ .route = .{
             .backend = backend,
@@ -488,7 +524,7 @@ pub const PrivateLiveRootRunner = struct {
         allocator: std.mem.Allocator,
         backend: Backend,
         request: WorkflowRequest,
-    ) !BackendResult {
+    ) BoundaryError!BackendResult {
         const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
         return self.invoke(allocator, .{ .workflow = .{
             .backend = backend,
@@ -497,6 +533,26 @@ pub const PrivateLiveRootRunner = struct {
     }
 
     fn inspect(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!RootInspection {
+        return inspectInternal(context, allocator) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotPrivileged,
+            error.NamespaceUnavailable,
+            error.UnsafeRuntimeDirectory,
+            => error.PrivilegeUnavailable,
+            error.RootReplaced,
+            error.RuntimeReplaced,
+            error.LockReplaced,
+            error.MountpointReplaced,
+            error.ActiveHostMount,
+            => error.RootReplacement,
+            else => error.OperationalBoundaryFailure,
+        };
+    }
+
+    fn inspectInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
     ) !RootInspection {
@@ -635,6 +691,27 @@ pub const PrivateLiveRootRunner = struct {
     }
 
     fn invoke(
+        self: *PrivateLiveRootRunner,
+        allocator: std.mem.Allocator,
+        invocation: Invocation,
+    ) BoundaryError!BackendResult {
+        return self.invokeInternal(allocator, invocation) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotPrivileged,
+            error.NamespaceUnavailable,
+            error.UnsafeRuntimeDirectory,
+            => error.PrivilegeUnavailable,
+            error.RootReplaced,
+            error.RuntimeReplaced,
+            error.LockReplaced,
+            error.MountpointReplaced,
+            error.ActiveHostMount,
+            => error.RootReplacement,
+            else => error.OperationalBoundaryFailure,
+        };
+    }
+
+    fn invokeInternal(
         self: *PrivateLiveRootRunner,
         allocator: std.mem.Allocator,
         invocation: Invocation,
@@ -917,6 +994,29 @@ pub const PrivateLiveRootRunner = struct {
     }
 
     fn readRecoveryCompletion(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!?root_operation_completion.OwnedDocument {
+        return readRecoveryCompletionInternal(
+            context,
+            allocator,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotPrivileged,
+            error.NamespaceUnavailable,
+            error.UnsafeRuntimeDirectory,
+            => error.PrivilegeUnavailable,
+            error.RootReplaced,
+            error.RuntimeReplaced,
+            error.LockReplaced,
+            error.MountpointReplaced,
+            error.ActiveHostMount,
+            => error.RootReplacement,
+            else => error.OperationalBoundaryFailure,
+        };
+    }
+
+    fn readRecoveryCompletionInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
     ) !?root_operation_completion.OwnedDocument {
@@ -2651,9 +2751,16 @@ pub const PrepareOutcome = union(enum) {
     result: api.Result,
 };
 
+pub const VerifiedMutationStatus = enum {
+    unchanged,
+    changed,
+    unknown,
+};
+
 pub const RecoveryPreparation = struct {
     prepared: Preparation,
     action: []const u8,
+    mutation_status: VerifiedMutationStatus,
 
     pub fn deinit(self: *RecoveryPreparation) void {
         self.prepared.deinit();
@@ -2680,6 +2787,7 @@ pub const ExecutionError = error{
 
 const InternalExecutionError = error{
     OutOfMemory,
+    ContractViolation,
     UnconfirmedExecution,
     UnsupportedApiVersion,
     InvalidProfilePath,
@@ -2820,8 +2928,18 @@ pub const Engine = struct {
             "invalid apt/system request",
         ) };
 
-        var loaded = self.profiles.load(allocator, request.profile_path) catch
-            return .{ .result = try profileFailure(request) };
+        var loaded = self.profiles.load(
+            allocator,
+            request.profile_path,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return .{ .result = try profileFailure(request) },
+        };
         defer loaded.deinit();
         if (!profileMatchesPath(loaded.view.binding, request.profile_path))
             return .{ .result = try api.failure(
@@ -2833,16 +2951,31 @@ pub const Engine = struct {
             ) };
 
         if (try self.blockedByActive(allocator, request, loaded.view)) |blocked| return .{ .result = blocked };
-        loaded.revalidate(allocator) catch return .{ .result = try api.failure(
-            request,
-            .configuration,
-            .profile_untrusted,
-            "profile",
-            "trusted profile reference changed before use",
-        ) };
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return .{ .result = try api.failure(
+                request,
+                .configuration,
+                .profile_untrusted,
+                "profile",
+                "trusted profile reference changed before use",
+            ) },
+        };
         if (request.operation != .list_installed) {
-            var lower_status = self.runner.inspect(allocator) catch |err|
-                return .{ .result = try liveRootFailure(request, err) };
+            var lower_status = self.runner.inspect(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return .{ .result = try liveRootFailure(request, err) },
+            };
             defer lower_status.deinit();
             if (lower_status.status != .clean)
                 return .{ .result = try api.failure(
@@ -2879,18 +3012,34 @@ pub const Engine = struct {
             .list_installed => .list_installed,
             else => unreachable,
         };
-        loaded.revalidate(allocator) catch return ownedFailure(
-            allocator,
-            request,
-            .configuration,
-            .profile_untrusted,
-            "profile",
-            "trusted profile reference changed immediately before backend routing",
-        );
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return ownedFailure(
+                allocator,
+                request,
+                .configuration,
+                .profile_untrusted,
+                "profile",
+                "trusted profile reference changed immediately before backend routing",
+            ),
+        };
         var run = self.runner.route(allocator, self.backend, .{
             .operation = operation,
             .options = commonOptions(profile, null, null),
-        }) catch |err| return liveRootFailure(request, err);
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return liveRootFailure(request, err),
+        };
         defer run.deinit();
         return mapProductResult(
             allocator,
@@ -2959,8 +3108,14 @@ pub const Engine = struct {
         const selectors = try selectorsFor(allocator, request);
         defer allocator.free(selectors);
         const workflow_operation = semanticOperation(request.operation);
-        loaded.revalidate(allocator) catch return .{
-            .result = try self.failBeforeMutation(
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return .{ .result = try self.failBeforeMutation(
                 allocator,
                 request,
                 profile.state_path,
@@ -2969,15 +3124,21 @@ pub const Engine = struct {
                 .configuration,
                 .profile_untrusted,
                 "trusted profile reference changed immediately before planning",
-            ),
+            ) },
         };
         var planned = self.runner.workflow(allocator, self.backend, .{
             .operation = workflow_operation,
             .mode = .plan_only,
             .selectors = selectors,
             .options = commonOptions(profile, null, generated_paths.exact_lock),
-        }) catch |err| {
-            return .{ .result = try self.failBeforeMutation(
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return .{ .result = try self.failBeforeMutation(
                 allocator,
                 request,
                 profile.state_path,
@@ -2992,7 +3153,7 @@ pub const Engine = struct {
                     "private live-root identity changed during planning"
                 else
                     "private live-root planning failed",
-            ) };
+            ) },
         };
         defer planned.deinit();
         if (planned.result.exit_status != .success) {
@@ -3118,7 +3279,12 @@ pub const Engine = struct {
             prepared.request.profile_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcilePreparedError(
                 allocator,
                 prepared,
             ),
@@ -3128,7 +3294,12 @@ pub const Engine = struct {
             return self.reconcilePreparedError(allocator, prepared);
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(allocator, prepared),
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcilePreparedError(allocator, prepared),
         };
 
         var current = (self.store.readActive(
@@ -3164,14 +3335,22 @@ pub const Engine = struct {
             .planning_failed,
             "reviewed exact lock was replaced before download",
         );
-        loaded.revalidate(allocator) catch return self.finishPreMutationFailure(
-            allocator,
-            prepared,
-            &current,
-            .configuration,
-            .profile_untrusted,
-            "trusted profile reference changed immediately before download",
-        );
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.finishPreMutationFailure(
+                allocator,
+                prepared,
+                &current,
+                .configuration,
+                .profile_untrusted,
+                "trusted profile reference changed immediately before download",
+            ),
+        };
 
         const selectors = try selectorsFor(allocator, prepared.request);
         defer allocator.free(selectors);
@@ -3185,20 +3364,28 @@ pub const Engine = struct {
                 prepared.paths.exact_lock,
                 null,
             ),
-        }) catch |err| return self.finishPreMutationFailure(
-            allocator,
-            prepared,
-            &current,
-            if (isRootIdentityError(err)) .configuration else .download,
-            if (isRootIdentityError(err))
-                .root_operation_conflict
-            else
-                .download_failed,
-            if (isRootIdentityError(err))
-                "private live-root identity changed before mutation"
-            else
-                "package acquisition failed before mutation",
-        );
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.finishPreMutationFailure(
+                allocator,
+                prepared,
+                &current,
+                if (isRootIdentityError(err)) .configuration else .download,
+                if (isRootIdentityError(err))
+                    .root_operation_conflict
+                else
+                    .download_failed,
+                if (isRootIdentityError(err))
+                    "private live-root identity changed before mutation"
+                else
+                    "package acquisition failed before mutation",
+            ),
+        };
         defer downloaded.deinit();
         if (downloaded.result.exit_status != .success)
             return self.finishPreMutationFailure(
@@ -3243,14 +3430,22 @@ pub const Engine = struct {
             .planning_failed,
             "reviewed exact lock was replaced before execution",
         );
-        loaded.revalidate(allocator) catch return self.finishPreMutationFailure(
-            allocator,
-            prepared,
-            &current,
-            .configuration,
-            .profile_untrusted,
-            "trusted profile reference changed after download and before execution",
-        );
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.finishPreMutationFailure(
+                allocator,
+                prepared,
+                &current,
+                .configuration,
+                .profile_untrusted,
+                "trusted profile reference changed after download and before execution",
+            ),
+        };
         var reserved = self.runner.workflow(allocator, self.backend, .{
             .operation = workflow_operation,
             .mode = .reserve,
@@ -3262,7 +3457,12 @@ pub const Engine = struct {
             .orchestration_id = prepared.attempt_id,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedErrorWithPolicy(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcilePreparedErrorWithPolicy(
                 allocator,
                 prepared,
                 .reservation_outcome_ambiguous,
@@ -3290,7 +3490,12 @@ pub const Engine = struct {
         )) return self.reconcilePreparedError(allocator, prepared);
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcilePreparedError(allocator, prepared),
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcilePreparedError(allocator, prepared),
         };
         self.hitCompletionBoundary(.after_ownership_reserved) catch
             return self.reconcilePreparedErrorWithPolicy(
@@ -3323,15 +3528,23 @@ pub const Engine = struct {
                 prepared.paths.exact_lock,
             ),
             .orchestration_id = prepared.attempt_id,
-        }) catch |err| return self.markRecoveryRequired(
-            allocator,
-            prepared,
-            &current,
-            if (isRootIdentityError(err))
-                "private live-root identity changed during transaction"
-            else
-                "transaction execution was interrupted",
-        );
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                &current,
+                if (isRootIdentityError(err))
+                    "private live-root identity changed during transaction"
+                else
+                    "transaction execution was interrupted",
+            ),
+        };
         defer executed.deinit();
         if (executed.result.exit_status != .success or
             executed.root_status != .completed)
@@ -3398,6 +3611,7 @@ pub const Engine = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -3476,7 +3690,12 @@ pub const Engine = struct {
             snapshot.profile.path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
                 "the pre-mutation profile binding could not be reopened",
@@ -3491,7 +3710,12 @@ pub const Engine = struct {
             );
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
                 "the pre-mutation profile evidence could not be revalidated",
@@ -3524,7 +3748,12 @@ pub const Engine = struct {
 
         var lower = self.runner.inspect(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
                 "lower root-operation state could not be verified",
@@ -3569,7 +3798,12 @@ pub const Engine = struct {
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return self.reconcileUnknownPreparedFailure(
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return self.reconcileUnknownPreparedFailure(
                     allocator,
                     prepared,
                     "the lower clean-state exclusion claim failed",
@@ -3837,7 +4071,12 @@ pub const Engine = struct {
             state.profile.path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return unknownMutationDiagnostic(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return unknownMutationDiagnostic(
                 allocator,
                 prepared.request,
                 prepared.request.profile_path,
@@ -3854,7 +4093,12 @@ pub const Engine = struct {
             );
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return unknownMutationDiagnostic(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return unknownMutationDiagnostic(
                 allocator,
                 prepared.request,
                 prepared.request.profile_path,
@@ -3905,7 +4149,12 @@ pub const Engine = struct {
         if (state.root_operation_completion == null) {
             var lower = self.runner.inspect(allocator) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return unknownMutationDiagnostic(
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return unknownMutationDiagnostic(
                     allocator,
                     prepared.request,
                     prepared.request.profile_path,
@@ -3933,7 +4182,12 @@ pub const Engine = struct {
                     self.runner.readRecoveryCompletion(allocator) catch |err|
                         switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
-                            else => return unknownMutationDiagnostic(
+                            error.InvariantViolation => return error.InvariantViolation,
+                            error.ContractViolation => return error.ContractViolation,
+                            error.OperationalBoundaryFailure,
+                            error.PrivilegeUnavailable,
+                            error.RootReplacement,
+                            => return unknownMutationDiagnostic(
                                 allocator,
                                 prepared.request,
                                 prepared.request.profile_path,
@@ -4054,7 +4308,12 @@ pub const Engine = struct {
         var loaded = self.profiles.load(allocator, profile_path) catch |err|
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return .{ .result = try unknownMutationDiagnostic(
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return .{ .result = try unknownMutationDiagnostic(
                     allocator,
                     null,
                     profile_path,
@@ -4064,7 +4323,12 @@ pub const Engine = struct {
         defer loaded.deinit();
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return .{ .result = try unknownMutationDiagnostic(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
                 profile_path,
@@ -4205,6 +4469,10 @@ pub const Engine = struct {
         return .{ .ready = .{
             .prepared = preparation,
             .action = action,
+            .mutation_status = if (active.state.mutation_started)
+                .changed
+            else
+                .unchanged,
         } };
     }
 
@@ -4235,7 +4503,12 @@ pub const Engine = struct {
             );
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "the trusted recovery profile could not be revalidated",
@@ -4282,7 +4555,12 @@ pub const Engine = struct {
         )) return self.reconcilePreparedError(allocator, recovery.prepared);
         loaded.revalidate(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return self.reconcileUnknownPreparedFailure(
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "the trusted recovery profile changed before retained state inspection",
@@ -4316,26 +4594,47 @@ pub const Engine = struct {
                 recovery_lock,
             );
         }
-        loaded.revalidate(allocator) catch
-            return self.reconcileUnknownPreparedFailure(
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "trusted profile reference changed before recovery inspection",
-            );
-        var lower_inspection = self.runner.inspect(allocator) catch
-            return self.recoveryFailed(
+            ),
+        };
+        var lower_inspection = self.runner.inspect(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.recoveryFailed(
                 allocator,
                 recovery.prepared,
                 &current,
                 "lower-level root-operation status could not be inspected",
-            );
+            ),
+        };
         defer lower_inspection.deinit();
-        loaded.revalidate(allocator) catch
-            return self.reconcileUnknownPreparedFailure(
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "trusted profile reference changed while lower recovery state was inspected",
-            );
+            ),
+        };
         const ownership_marker = lower_inspection.deferred_acknowledgment;
         if (ownership_marker) |marker| {
             if (!std.mem.eql(
@@ -4460,12 +4759,19 @@ pub const Engine = struct {
                     &current,
                     "retained exact lock was replaced before retrying the proven pre-mutation attempt",
                 );
-                loaded.revalidate(allocator) catch
-                    return self.reconcileUnknownPreparedFailure(
+                loaded.revalidate(allocator) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return self.reconcileUnknownPreparedFailure(
                         allocator,
                         recovery.prepared,
                         "trusted profile reference changed before retrying the proven pre-mutation attempt",
-                    );
+                    ),
+                };
                 const selectors = try selectorsFor(
                     allocator,
                     recovery.prepared.request,
@@ -4489,7 +4795,12 @@ pub const Engine = struct {
                         },
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return self.reconcilePreparedError(
+                        error.InvariantViolation => return error.InvariantViolation,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.OperationalBoundaryFailure,
+                        error.PrivilegeUnavailable,
+                        error.RootReplacement,
+                        => return self.reconcilePreparedError(
                             allocator,
                             recovery.prepared,
                         ),
@@ -4529,7 +4840,12 @@ pub const Engine = struct {
                     );
                     loaded.revalidate(allocator) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return self.reconcileUnknownPreparedFailure(
+                        error.InvariantViolation => return error.InvariantViolation,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.OperationalBoundaryFailure,
+                        error.PrivilegeUnavailable,
+                        error.RootReplacement,
+                        => return self.reconcileUnknownPreparedFailure(
                             allocator,
                             recovery.prepared,
                             "the trusted profile changed after lower reservation",
@@ -4569,12 +4885,20 @@ pub const Engine = struct {
                         ),
                         .orchestration_id = recovery.prepared.attempt_id,
                     },
-                ) catch return self.recoveryFailed(
-                    allocator,
-                    recovery.prepared,
-                    &current,
-                    "proven pre-mutation attempt retry was interrupted",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "proven pre-mutation attempt retry was interrupted",
+                    ),
+                };
                 defer retried.deinit();
                 if (retried.result.exit_status != .success or
                     retried.root_status != .completed)
@@ -4666,12 +4990,20 @@ pub const Engine = struct {
                             .evidence_sha256 = evidence_sha256,
                         } },
                     },
-                ) catch return self.recoveryFailed(
-                    allocator,
-                    recovery.prepared,
-                    &current,
-                    "clean lower root reconciliation reservation was interrupted",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return self.recoveryFailed(
+                        allocator,
+                        recovery.prepared,
+                        &current,
+                        "clean lower root reconciliation reservation was interrupted",
+                    ),
+                };
                 defer claimed.deinit();
                 if (claimed.result.exit_status != .success or
                     claimed.root_status != .completed)
@@ -4713,12 +5045,19 @@ pub const Engine = struct {
                 else
                     false;
             if (settled_lower_recovery)
-                loaded.revalidate(allocator) catch
-                    return self.reconcileUnknownPreparedFailure(
+                loaded.revalidate(allocator) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return self.reconcileUnknownPreparedFailure(
                         allocator,
                         recovery.prepared,
                         "trusted profile reference changed before settled recovery evidence reconciliation",
-                    );
+                    ),
+                };
             var lower_completion = if (retained_lower_recovery)
                 self.store.readRecoveryCompletionFn(
                     self.store.context,
@@ -4734,13 +5073,20 @@ pub const Engine = struct {
                     );
                 }
             else if (settled_lower_recovery)
-                self.runner.readRecoveryCompletion(allocator) catch
-                    return self.recoveryFailed(
+                self.runner.readRecoveryCompletion(allocator) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return self.recoveryFailed(
                         allocator,
                         recovery.prepared,
                         &current,
                         "settled lower-level recovery completion evidence is unavailable",
-                    )
+                    ),
+                }
             else
                 null;
             defer if (lower_completion) |*owned| owned.deinit();
@@ -4756,12 +5102,19 @@ pub const Engine = struct {
                     &current,
                     "settled lower-level recovery completion evidence is stale or foreign",
                 );
-            loaded.revalidate(allocator) catch
-                return self.reconcileUnknownPreparedFailure(
+            loaded.revalidate(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return self.reconcileUnknownPreparedFailure(
                     allocator,
                     recovery.prepared,
                     "trusted profile reference changed before recovery evidence reconciliation",
-                );
+                ),
+            };
             return self.verifyAndComplete(
                 allocator,
                 recovery.prepared,
@@ -4830,12 +5183,19 @@ pub const Engine = struct {
             &current,
             "retained exact lock was replaced immediately before recovery",
         );
-        loaded.revalidate(allocator) catch
-            return self.reconcileUnknownPreparedFailure(
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "trusted profile reference changed immediately before recovery execution",
-            );
+            ),
+        };
         const selectors = try selectorsFor(
             allocator,
             recovery.prepared.request,
@@ -4853,12 +5213,20 @@ pub const Engine = struct {
             ),
             .defer_recovery_clear = true,
             .orchestration_id = recovery.prepared.attempt_id,
-        }) catch return self.recoveryFailed(
-            allocator,
-            recovery.prepared,
-            &current,
-            "recovery execution was interrupted",
-        );
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.recoveryFailed(
+                allocator,
+                recovery.prepared,
+                &current,
+                "recovery execution was interrupted",
+            ),
+        };
         defer executed.deinit();
         if (executed.result.exit_status != .success or
             executed.root_status != .completed)
@@ -4876,12 +5244,19 @@ pub const Engine = struct {
                 allocator,
                 recovery.prepared,
             );
-        loaded.revalidate(allocator) catch
-            return self.reconcileUnknownPreparedFailure(
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 recovery.prepared,
                 "trusted profile reference changed before recovered evidence reconciliation",
-            );
+            ),
+        };
         return self.verifyAndComplete(
             allocator,
             recovery.prepared,
@@ -4940,13 +5315,21 @@ pub const Engine = struct {
             prepared,
             committed,
         )) return error.LockEvidenceMismatch;
-        try loaded.revalidate(allocator);
+        loaded.revalidate(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => return error.InvalidEvidence,
+        };
         const selectors = try selectorsFor(allocator, prepared.request);
         defer allocator.free(selectors);
         switch (acknowledgment.state) {
             .released, .abandoned, .pre_mutation_reconciliation_claim => {
                 try self.hitCompletionBoundary(.before_ownership_acknowledged);
-                var finalized = try self.runner.workflow(
+                var finalized = self.runner.workflow(
                     allocator,
                     self.backend,
                     .{
@@ -4967,7 +5350,15 @@ pub const Engine = struct {
                             .acknowledgment_id = acknowledgment.acknowledgment_id,
                         },
                     },
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return error.InvalidEvidence,
+                };
                 defer finalized.deinit();
                 if (finalized.result.exit_status != .success or
                     finalized.root_status != .completed)
@@ -4975,7 +5366,7 @@ pub const Engine = struct {
                 try self.hitCompletionBoundary(.after_ownership_acknowledged);
             },
             .pending => {
-                var finalized = try self.runner.workflow(
+                var finalized = self.runner.workflow(
                     allocator,
                     self.backend,
                     .{
@@ -4997,7 +5388,15 @@ pub const Engine = struct {
                             .acknowledgment_id = acknowledgment.acknowledgment_id,
                         },
                     },
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return error.InvalidEvidence,
+                };
                 defer finalized.deinit();
                 if (finalized.result.exit_status != .success or
                     finalized.root_status != .completed)
@@ -5287,6 +5686,8 @@ pub const Engine = struct {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.InvariantViolation)
                     return error.InvariantViolation;
+                if (err == error.ContractViolation)
+                    return error.ContractViolation;
                 return self.reconcilePreparedError(allocator, prepared);
             };
         self.store.clearCommittedFn(
@@ -5297,6 +5698,7 @@ pub const Engine = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.hitCompletionBoundary(.after_active_cleared) catch
@@ -5992,6 +6394,7 @@ fn executionInvocationFailure(
         error.BackendOperationMismatch,
         error.InvalidPath,
         error.UnsupportedPlatform,
+        error.ContractViolation,
         => error.ContractViolation,
         error.InvalidInitialState,
         error.InvalidTransition,
@@ -6174,7 +6577,8 @@ fn liveRootFailure(request: api.Request, err: anyerror) !api.Result {
 }
 
 fn isRootIdentityError(err: anyerror) bool {
-    return err == error.RootReplaced or
+    return err == error.RootReplacement or
+        err == error.RootReplaced or
         err == error.RuntimeReplaced or
         err == error.LockReplaced or
         err == error.MountpointReplaced or
@@ -8510,11 +8914,32 @@ test "apt_system_orchestrator.test.request decoder rejects noncanonical recovery
     );
 }
 
+fn testBoundaryError(err: anyerror) BoundaryError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvariantViolation => error.InvariantViolation,
+        error.ContractViolation => error.ContractViolation,
+        error.NotPrivileged,
+        error.PrivilegeUnavailable,
+        error.NamespaceUnavailable,
+        error.UnsafeRuntimeDirectory,
+        => error.PrivilegeUnavailable,
+        error.RootReplaced,
+        error.RuntimeReplaced,
+        error.LockReplaced,
+        error.MountpointReplaced,
+        error.ActiveHostMount,
+        => error.RootReplacement,
+        else => error.OperationalBoundaryFailure,
+    };
+}
+
 const FakeProfileLoader = struct {
     load_count: usize = 0,
     revalidate_count: usize = 0,
     fail_revalidate: bool = false,
     fail_revalidate_on: ?usize = null,
+    revalidate_boundary_error: ?BoundaryError = null,
     drift_after_first: bool = false,
     state_path: []const u8 = "/state",
     cache_path: []const u8 = "/cache",
@@ -8524,7 +8949,16 @@ const FakeProfileLoader = struct {
     reference_digest: u8 = 0x22,
 
     fn interface(self: *FakeProfileLoader) ProfileLoader {
-        return .{ .context = self, .loadFn = load };
+        return .{ .context = self, .loadFn = loadBoundary };
+    }
+
+    fn loadBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) BoundaryError!LoadedProfile {
+        return load(context, allocator, path) catch |err|
+            return testBoundaryError(err);
     }
 
     fn load(
@@ -8561,9 +8995,22 @@ const FakeProfileLoader = struct {
                 .proxy = null,
                 .credential_reference = null,
             },
-            .revalidateFn = revalidate,
+            .revalidateFn = revalidateBoundary,
             .deinitFn = deinit,
         };
+    }
+
+    fn revalidateBoundary(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!void {
+        const self: *FakeProfileLoader = @ptrCast(@alignCast(context.?));
+        self.revalidate_count += 1;
+        if (self.revalidate_boundary_error) |failure| return failure;
+        if (self.fail_revalidate or
+            self.fail_revalidate_on == self.revalidate_count)
+            return error.OperationalBoundaryFailure;
+        _ = allocator;
     }
 
     fn revalidate(context: ?*anyopaque, _: std.mem.Allocator) !void {
@@ -8842,6 +9289,8 @@ const FakeRunner = struct {
     recovery_completion_reads: usize = 0,
     recovery_ack_calls: usize = 0,
     ownership_finalize_calls: usize = 0,
+    boundary_failure_point: ?BoundaryFailurePoint = null,
+    boundary_failure: BoundaryError = error.OperationalBoundaryFailure,
     publish_released_on_execute: bool = false,
     publish_bound_on_execute: bool = false,
     publish_abandoned_on_execute: bool = false,
@@ -8856,6 +9305,14 @@ const FakeRunner = struct {
         successful_outcome,
     };
 
+    const BoundaryFailurePoint = enum {
+        download,
+        execute,
+        recover,
+        inspect,
+        acknowledgment,
+    };
+
     fn deinit(self: *FakeRunner) void {
         if (self.inspect_record_source) |source|
             self.allocator.free(source);
@@ -8867,11 +9324,62 @@ const FakeRunner = struct {
     fn interface(self: *FakeRunner) LiveRootRunner {
         return .{
             .context = self,
-            .routeFn = route,
-            .workflowFn = workflow,
-            .inspectFn = inspect,
-            .readRecoveryCompletionFn = readRecoveryCompletion,
+            .routeFn = routeBoundary,
+            .workflowFn = workflowBoundary,
+            .inspectFn = inspectBoundary,
+            .readRecoveryCompletionFn = readRecoveryCompletionBoundary,
         };
+    }
+
+    fn routeBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: Backend,
+        request: product_api.Request,
+    ) BoundaryError!BackendResult {
+        return route(context, allocator, backend, request) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn workflowBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: Backend,
+        request: WorkflowRequest,
+    ) BoundaryError!BackendResult {
+        const self: *FakeRunner = @ptrCast(@alignCast(context));
+        const point: ?BoundaryFailurePoint = if (request.finalize_ownership or
+            request.recovery_acknowledgment != null)
+            .acknowledgment
+        else switch (request.mode) {
+            .download_only => .download,
+            .execute => .execute,
+            .recover => .recover,
+            else => null,
+        };
+        if (point != null and self.boundary_failure_point == point)
+            return self.boundary_failure;
+        return workflow(context, allocator, backend, request) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn inspectBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!RootInspection {
+        const self: *FakeRunner = @ptrCast(@alignCast(context));
+        if (self.boundary_failure_point == .inspect)
+            return self.boundary_failure;
+        return inspect(context, allocator) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn readRecoveryCompletionBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!?root_operation_completion.OwnedDocument {
+        return readRecoveryCompletion(context, allocator) catch |err|
+            return testBoundaryError(err);
     }
 
     fn route(
@@ -9496,11 +10004,47 @@ const OuterGenerationRaceRunner = struct {
     fn interface(self: *OuterGenerationRaceRunner) LiveRootRunner {
         return .{
             .context = self,
-            .routeFn = route,
-            .workflowFn = workflow,
-            .inspectFn = inspect,
-            .readRecoveryCompletionFn = readRecoveryCompletion,
+            .routeFn = routeBoundary,
+            .workflowFn = workflowBoundary,
+            .inspectFn = inspectBoundary,
+            .readRecoveryCompletionFn = readRecoveryCompletionBoundary,
         };
+    }
+
+    fn routeBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: Backend,
+        request: product_api.Request,
+    ) BoundaryError!BackendResult {
+        return route(context, allocator, backend, request) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn workflowBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: Backend,
+        request: WorkflowRequest,
+    ) BoundaryError!BackendResult {
+        return workflow(context, allocator, backend, request) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn inspectBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!RootInspection {
+        return inspect(context, allocator) catch |err|
+            return testBoundaryError(err);
+    }
+
+    fn readRecoveryCompletionBoundary(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) BoundaryError!?root_operation_completion.OwnedDocument {
+        return readRecoveryCompletion(context, allocator) catch |err|
+            return testBoundaryError(err);
     }
 
     fn route(
@@ -11411,10 +11955,7 @@ test "apt_system_orchestrator.test.required_privileged.production private runner
             },
         },
     ) catch |err| switch (err) {
-        error.NotPrivileged,
-        error.NamespaceUnavailable,
-        error.UnsafeRuntimeDirectory,
-        => return privilegedCoverageUnavailable(),
+        error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
         else => return err,
     };
     defer result.deinit();
@@ -11462,10 +12003,7 @@ test "apt_system_orchestrator.test.required_privileged.production private runner
                 },
             },
         ) catch |err| switch (err) {
-            error.NotPrivileged,
-            error.NamespaceUnavailable,
-            error.UnsafeRuntimeDirectory,
-            => return privilegedCoverageUnavailable(),
+            error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
             else => return err,
         };
         defer result.deinit();
@@ -11497,10 +12035,7 @@ test "apt_system_orchestrator.test.required_privileged.production private runner
             .finalize_ownership = true,
         },
     ) catch |err| switch (err) {
-        error.NotPrivileged,
-        error.NamespaceUnavailable,
-        error.UnsafeRuntimeDirectory,
-        => return privilegedCoverageUnavailable(),
+        error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
         else => return err,
     };
     defer finalized.deinit();
@@ -11531,10 +12066,7 @@ test "apt_system_orchestrator.test.required_privileged.production private transp
             },
         },
     ) catch |err| switch (err) {
-        error.NotPrivileged,
-        error.NamespaceUnavailable,
-        error.UnsafeRuntimeDirectory,
-        => return privilegedCoverageUnavailable(),
+        error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
         else => return err,
     };
     preflight.deinit();
@@ -11572,7 +12104,7 @@ test "apt_system_orchestrator.test.required_privileged.production private transp
                 },
             },
         ) catch |err| switch (err) {
-            error.LiveRootInterrupted => std.os.linux.exit_group(0),
+            error.OperationalBoundaryFailure => std.os.linux.exit_group(0),
             else => std.os.linux.exit_group(121),
         };
         result.deinit();
@@ -11634,7 +12166,7 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
     var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
     var backend: FakeBackend = .{};
     try std.testing.expectError(
-        error.NotPrivileged,
+        error.PrivilegeUnavailable,
         runner.interface().route(
             std.testing.allocator,
             backend.interface(),
@@ -11661,7 +12193,7 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
         std.mem.asBytes(&after_route),
     );
     try std.testing.expectError(
-        error.NotPrivileged,
+        error.PrivilegeUnavailable,
         runner.interface().inspect(std.testing.allocator),
     );
     var after_inspect: std.os.linux.sigset_t = undefined;
@@ -11676,7 +12208,7 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
         std.mem.asBytes(&after_inspect),
     );
     try std.testing.expectError(
-        error.NotPrivileged,
+        error.PrivilegeUnavailable,
         runner.interface().readRecoveryCompletion(
             std.testing.allocator,
         ),
@@ -14252,6 +14784,197 @@ test "apt_system_orchestrator.test.verifier OOM and invariant failures bypass re
         try std.testing.expect(
             acknowledgment_harness.store.active_bytes != null,
         );
+    }
+}
+
+test "apt_system_orchestrator.test.profile and execution boundary fatal errors never finalize or reconcile" {
+    inline for ([_]BoundaryError{
+        error.OutOfMemory,
+        error.InvariantViolation,
+        error.ContractViolation,
+    }) |failure| {
+        {
+            var harness = Harness.init(std.testing.allocator);
+            defer harness.deinit();
+            harness.rebind();
+            var prepared = try expectReady(try harness.engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.install, &.{"alpha"}),
+            ));
+            defer prepared.deinit();
+            const finish_calls = harness.store.finish_calls;
+            const inspections = harness.runner.inspect_calls;
+            harness.profile.revalidate_boundary_error = failure;
+            try std.testing.expectError(
+                failure,
+                harness.engine.execute(
+                    std.testing.allocator,
+                    prepared,
+                    true,
+                ),
+            );
+            try std.testing.expectEqual(finish_calls, harness.store.finish_calls);
+            try std.testing.expectEqual(inspections, harness.runner.inspect_calls);
+            try std.testing.expect(harness.store.active_bytes != null);
+            try std.testing.expectEqual(@as(usize, 0), harness.backend.download_calls);
+            try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+        }
+        inline for ([_]FakeRunner.BoundaryFailurePoint{
+            .download,
+            .execute,
+        }) |point| {
+            var harness = Harness.init(std.testing.allocator);
+            defer harness.deinit();
+            harness.rebind();
+            var prepared = try expectReady(try harness.engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.install, &.{"alpha"}),
+            ));
+            defer prepared.deinit();
+            const finish_calls = harness.store.finish_calls;
+            harness.runner.boundary_failure_point = point;
+            harness.runner.boundary_failure = failure;
+            try std.testing.expectError(
+                failure,
+                harness.engine.execute(
+                    std.testing.allocator,
+                    prepared,
+                    true,
+                ),
+            );
+            try std.testing.expectEqual(finish_calls, harness.store.finish_calls);
+            try std.testing.expect(harness.store.active_bytes != null);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                harness.runner.ownership_finalize_calls,
+            );
+            switch (point) {
+                .download, .inspect => try std.testing.expectEqual(
+                    @as(usize, 0),
+                    harness.backend.execute_calls,
+                ),
+                .execute => try std.testing.expectEqual(
+                    @as(usize, 0),
+                    harness.backend.execute_calls,
+                ),
+                .acknowledgment, .recover => unreachable,
+            }
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.recovery boundary fatal errors preserve active operation without second mutation" {
+    inline for ([_]BoundaryError{
+        error.OutOfMemory,
+        error.InvariantViolation,
+        error.ContractViolation,
+    }) |failure| {
+        inline for ([_]FakeRunner.BoundaryFailurePoint{
+            .recover,
+            .inspect,
+            .acknowledgment,
+        }) |point| {
+            var harness = Harness.init(std.testing.allocator);
+            defer harness.deinit();
+            harness.rebind();
+            var prepared = try expectReady(try harness.engine.prepare(
+                std.testing.allocator,
+                mutationRequest(.install, &.{"alpha"}),
+            ));
+            defer prepared.deinit();
+            harness.runner.fail_mode = .execute;
+            var interrupted = try harness.engine.execute(
+                std.testing.allocator,
+                prepared,
+                true,
+            );
+            defer interrupted.deinit();
+            harness.runner.fail_mode = null;
+            var recovery = switch (try harness.engine.prepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            )) {
+                .ready => |value| value,
+                .result => return error.ExpectedRecoveryPreparation,
+            };
+            defer recovery.deinit();
+            const finish_calls = harness.store.finish_calls;
+            const mutation_calls = harness.backend.execute_calls;
+            harness.runner.boundary_failure_point = point;
+            harness.runner.boundary_failure = failure;
+            try std.testing.expectError(
+                failure,
+                harness.engine.executeRecovery(
+                    std.testing.allocator,
+                    recovery,
+                    true,
+                ),
+            );
+            try std.testing.expectEqual(finish_calls, harness.store.finish_calls);
+            try std.testing.expect(harness.store.active_bytes != null);
+            try std.testing.expectEqual(
+                mutation_calls,
+                harness.backend.execute_calls,
+            );
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                harness.runner.recovery_ack_calls,
+            );
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                harness.runner.ownership_finalize_calls,
+            );
+            try std.testing.expectEqual(
+                @as(usize, if (point == .acknowledgment) 1 else 0),
+                harness.backend.recover_calls,
+            );
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.operational profile and runner boundary failures use durable results" {
+    {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.profile.revalidate_boundary_error =
+            error.OperationalBoundaryFailure;
+        var result = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expect(result.outcome != .success);
+        try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
+    }
+    inline for ([_]FakeRunner.BoundaryFailurePoint{
+        .download,
+        .execute,
+    }) |point| {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.runner.boundary_failure_point = point;
+        var result = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expect(result.outcome != .success);
+        if (point == .execute or point == .acknowledgment)
+            try std.testing.expect(harness.store.active_bytes != null);
     }
 }
 

@@ -79,8 +79,15 @@ System recovery has the separate strict spelling:
 debz recover [--json] --system-profile PATH
 ```
 
-Human recovery prepares and renders the retained exact action before the same
-TTY-only confirmation. JSON recovery prepares but never prompts or mutates.
+Human recovery prepares and renders the retained exact action before a
+recovery-specific TTY-only confirmation. The review carries verified
+tri-state mutation status. A verified pre-mutation state may say that no
+package mutation occurred. A verified mutating or post-mutation state says
+that package mutation occurred or may be incomplete and that convergence may
+make further changes. UNKNOWN says that prior mutation status is unknown and
+fails closed without prompting or executing. Negative answers, EOF, and
+non-TTY input never invoke recovery. JSON recovery prepares but never prompts
+or mutates.
 Malformed recovery syntax is rejected before profile or operation-state I/O.
 Parse failures carry the output mode recognized from the valid canonical
 option prefix. Rejected command arguments, misplaced `--json`, and a
@@ -533,3 +540,11 @@ production adapters cover the strict profile loader, `ProductionWorkflow`,
 durable system store, and lock/provenance verifier. Only the capability-gated
 private-runner integration test enters the real namespace supervisor; it skips
 when the required Linux root namespace capabilities are unavailable.
+
+Trusted-profile revalidation and every private live-root invocation,
+inspection, completion read, and acknowledgment cross a finite typed boundary.
+Operational trust replacement, I/O, lock, transport, signal, privilege, and
+root-replacement failures enter the durable failure/reconciliation policy.
+Allocation failures and invariant or contract violations propagate to the
+top-level internal-failure path without publishing a failed outcome, clearing
+active state, or fabricating recovery evidence.

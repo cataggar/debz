@@ -525,7 +525,9 @@ fn runAptSystem(
                 init.io,
                 &backend,
             );
-            var terminal_context = ProductionTerminal{ .io = init.io };
+            var terminal_context = apt_command.ProductionTerminal{
+                .io = init.io,
+            };
             const status = try apt_command.runApt(
                 init.arena.allocator(),
                 command,
@@ -583,7 +585,7 @@ fn runAptSystemRecovery(
     var composition: debz.apt_system_orchestrator.ProductionComposition =
         undefined;
     composition.init(init.arena.allocator(), init.io, &backend);
-    var terminal_context = ProductionTerminal{ .io = init.io };
+    var terminal_context = apt_command.ProductionTerminal{ .io = init.io };
     const status = try apt_command.runRecovery(
         init.arena.allocator(),
         parsed.profile_path,
@@ -609,53 +611,6 @@ fn isSystemRecovery(init: std.process.Init) bool {
     }
     return false;
 }
-
-const ProductionTerminal = struct {
-    io: std.Io,
-
-    fn interface(self: *ProductionTerminal) apt_command.Terminal {
-        return .{
-            .context = self,
-            .confirmFn = confirm,
-        };
-    }
-
-    fn confirm(
-        context: *anyopaque,
-        stderr: *std.Io.Writer,
-    ) !apt_command.Confirmation {
-        const self: *ProductionTerminal = @ptrCast(@alignCast(context));
-        const stdin_file = std.Io.File.stdin();
-        const stdout_file = std.Io.File.stdout();
-        const stderr_file = std.Io.File.stderr();
-        if (!try stdin_file.isTty(self.io) or
-            !try stdout_file.isTty(self.io) or
-            !try stderr_file.isTty(self.io))
-            return .unavailable;
-
-        try stderr.writeAll("Proceed with this exact lock? [y/N] ");
-        try stderr.flush();
-        var answer: [8]u8 = undefined;
-        var length: usize = 0;
-        while (length < answer.len) {
-            var byte: [1]u8 = undefined;
-            const read = stdin_file.readStreaming(
-                self.io,
-                &.{byte[0..]},
-            ) catch return .unavailable;
-            if (read == 0) return .unavailable;
-            if (byte[0] == '\n' or byte[0] == '\r') break;
-            answer[length] = byte[0];
-            length += 1;
-        }
-        try stderr.writeByte('\n');
-        const value = std.mem.trim(u8, answer[0..length], " \t");
-        if (std.ascii.eqlIgnoreCase(value, "y") or
-            std.ascii.eqlIgnoreCase(value, "yes"))
-            return .confirmed;
-        return .declined;
-    }
-};
 
 const TransactionResultSingleOption = enum {
     state_path,
