@@ -337,7 +337,12 @@ verifies and durably retains transaction evidence and the exact canonical lower
 marker as operation-local `lower-acknowledgment-v1.json`. It then publishes the
 outer completion, publishes the immutable retained final state, and CASes the
 active state to that exact completed outcome before compare-and-clearing the
-matching released marker. The completed active owner remains discoverable
+matching released marker. A visible matching active document is not by itself
+proof of durable commit: recovery reopens and syncs the exact active file and
+its parent directory while holding the state lock, even when generation and
+digest already equal the retained final state. A rename-visible state whose
+directory sync failed therefore cannot authorize lower acknowledgment until a
+later durability barrier succeeds. The completed active owner remains discoverable
 until acknowledgment finishes. A crash before the outer commit therefore
 leaves the root protected; a crash after commit but before acknowledgment
 replays the retained token idempotently; a crash after acknowledgment only
@@ -368,6 +373,15 @@ attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
 binding together with the immutable final outcome before explicitly
 acknowledging the exact lower token and clearing its record and marker. The
+retained-final path reopens and hashes the operation-local evidence before
+that commit and acknowledgment. Ordinary success is reverified through the
+transaction-result verifier against the exact lock; recovered success decodes
+the retained recovery-completion document and rechecks its completed attempt,
+provenance status and digest, original and discharge request domains, lock,
+profile, outer acknowledgment identity, and operation-local path. Missing,
+corrupt, replaced, or foreign evidence leaves the lower marker in place.
+Only after evidence reverification and the active-state durability barrier
+both succeed may acknowledgment proceed. The
 same operation-local lower acknowledgment document is used when detailed
 transaction provenance is honestly unavailable. A crash before outer commit
 therefore leaves the lower completed/published record available for retry; a

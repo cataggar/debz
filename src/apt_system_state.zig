@@ -302,6 +302,26 @@ pub const Store = struct {
         try self.writeAtomicLocked(allocator, next, maximum_bytes, token);
     }
 
+    pub fn ensureDurable(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected: Expected,
+        maximum_bytes: usize,
+        wait_ms: u64,
+    ) !void {
+        const token = try self.locks.acquire(wait_ms);
+        defer self.locks.release(token);
+        if (!self.locks.held(token)) return error.LockLost;
+        var current = try self.read(allocator, maximum_bytes);
+        defer current.deinit();
+        if (!expected.matches(current.state)) return error.StaleState;
+        var file = try openRegularNoFollow(self.dir, self.io, self.name);
+        defer file.close(self.io);
+        try file.sync(self.io);
+        try self.write_hooks.run(.before_durability_resync);
+        try syncDirectory(self.io, self.dir);
+    }
+
     fn writeAtomicLocked(
         self: Store,
         allocator: std.mem.Allocator,
@@ -535,6 +555,7 @@ pub const SystemLockBackend = struct {
 pub const WriteBoundary = enum {
     before_stage,
     after_rename,
+    before_durability_resync,
 };
 
 pub const WriteHooks = struct {
@@ -1344,9 +1365,17 @@ test "apt_system_state.test.locked compare-and-set rejects concurrent and stale 
 test "apt_system_state.test.post-rename errors preserve published state" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const Hooks = struct {
-        fn run(_: ?*anyopaque, boundary: WriteBoundary) !void {
-            if (boundary == .after_rename)
+        fail_after_rename: bool = true,
+        fail_resync: bool = false,
+
+        fn run(context: ?*anyopaque, boundary: WriteBoundary) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (boundary == .after_rename and self.fail_after_rename) {
+                self.fail_after_rename = false;
                 return error.InjectedPostRenameFailure;
+            }
+            if (boundary == .before_durability_resync and self.fail_resync)
+                return error.InjectedDurabilityResyncFailure;
         }
     };
 
@@ -1374,7 +1403,8 @@ test "apt_system_state.test.post-rename errors preserve published state" {
     next_input.updated_unix += 1;
     var next = try create(std.testing.allocator, next_input);
     defer next.deinit();
-    store.write_hooks = .{ .runFn = Hooks.run };
+    var hooks: Hooks = .{};
+    store.write_hooks = .{ .context = &hooks, .runFn = Hooks.run };
     try std.testing.expectError(
         error.InjectedPostRenameFailure,
         store.compareAndSet(
@@ -1397,6 +1427,23 @@ test "apt_system_state.test.post-rename errors preserve published state" {
         u8,
         &next.state.digest_sha256,
         &published.state.digest_sha256,
+    );
+    hooks.fail_resync = true;
+    try std.testing.expectError(
+        error.InjectedDurabilityResyncFailure,
+        store.ensureDurable(
+            std.testing.allocator,
+            Expected.fromState(next.state),
+            maximum_document_bytes,
+            0,
+        ),
+    );
+    hooks.fail_resync = false;
+    try store.ensureDurable(
+        std.testing.allocator,
+        Expected.fromState(next.state),
+        maximum_document_bytes,
+        0,
     );
 }
 
