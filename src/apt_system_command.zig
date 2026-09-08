@@ -156,6 +156,7 @@ pub const Terminal = struct {
 
 pub const ProductionTerminal = struct {
     io: std.Io,
+    const maximum_confirmation_bytes = 64;
 
     pub fn interface(self: *ProductionTerminal) Terminal {
         return .{
@@ -195,16 +196,29 @@ pub const ProductionTerminal = struct {
 
         try stderr.writeAll(confirmationPromptText(prompt));
         try stderr.flush();
-        var answer: [8]u8 = undefined;
+        var answer: [maximum_confirmation_bytes]u8 = undefined;
         var length: usize = 0;
-        while (length < answer.len) {
+        var saw_input = false;
+        while (true) {
             var byte: [1]u8 = undefined;
             const read = stdin_file.readStreaming(
                 io,
                 &.{byte[0..]},
             ) catch return .unavailable;
-            if (read == 0) return .unavailable;
+            if (read == 0) {
+                if (!saw_input) return .unavailable;
+                break;
+            }
             if (byte[0] == '\n' or byte[0] == '\r') break;
+            saw_input = true;
+            if ((byte[0] < 0x20 and byte[0] != '\t') or byte[0] == 0x7f) {
+                try stderr.writeByte('\n');
+                return .declined;
+            }
+            if (length == answer.len) {
+                try stderr.writeByte('\n');
+                return .declined;
+            }
             answer[length] = byte[0];
             length += 1;
         }
@@ -942,10 +956,40 @@ const TestPty = struct {
     }
 };
 
+const TestPtyTerminal = struct {
+    file: std.Io.File,
+
+    fn interface(self: *TestPtyTerminal) Terminal {
+        return .{
+            .context = self,
+            .confirmFn = confirm,
+        };
+    }
+
+    fn confirm(
+        context: *anyopaque,
+        stderr: *std.Io.Writer,
+        prompt: ConfirmationPrompt,
+    ) !Confirmation {
+        const self: *TestPtyTerminal = @ptrCast(@alignCast(context));
+        return ProductionTerminal.confirmFiles(
+            std.testing.io,
+            self.file,
+            self.file,
+            self.file,
+            stderr,
+            prompt,
+        );
+    }
+};
+
 test "apt_system_command.test.production recovery prompt uses PTY yes no and EOF semantics" {
     inline for (.{
         .{ "yes\n", Confirmation.confirmed },
+        .{ "y\r\n", Confirmation.confirmed },
         .{ "no\n", Confirmation.declined },
+        .{ "yes     no\n", Confirmation.declined },
+        .{ "yes\x00\n", Confirmation.declined },
     }) |case| {
         var pty = try TestPty.open();
         defer pty.close();
@@ -967,6 +1011,94 @@ test "apt_system_command.test.production recovery prompt uses PTY yes no and EOF
         );
     }
 
+    inline for (.{ ConfirmationPrompt.apt_execution, .recovery }) |kind| {
+        var pty = try TestPty.open();
+        defer pty.close();
+        var overlong: [ProductionTerminal.maximum_confirmation_bytes + 2]u8 =
+            undefined;
+        @memset(&overlong, ' ');
+        @memcpy(overlong[0..3], "yes");
+        overlong[overlong.len - 1] = '\n';
+        try pty.master.writeStreamingAll(std.testing.io, &overlong);
+        const started = std.Io.Clock.awake.now(std.testing.io);
+        var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer prompt.deinit();
+        const answer = try ProductionTerminal.confirmFiles(
+            std.testing.io,
+            pty.slave,
+            pty.slave,
+            pty.slave,
+            &prompt.writer,
+            kind,
+        );
+        try std.testing.expectEqual(Confirmation.declined, answer);
+        try std.testing.expect(
+            started.durationTo(
+                std.Io.Clock.awake.now(std.testing.io),
+            ).toMilliseconds() < 1_000,
+        );
+    }
+
+    {
+        var pty = try TestPty.open();
+        defer pty.close();
+        var exact: [ProductionTerminal.maximum_confirmation_bytes + 1]u8 =
+            undefined;
+        @memset(exact[0..ProductionTerminal.maximum_confirmation_bytes], ' ');
+        @memcpy(exact[0..3], "yes");
+        exact[ProductionTerminal.maximum_confirmation_bytes] = '\n';
+        try pty.master.writeStreamingAll(std.testing.io, &exact);
+        var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer prompt.deinit();
+        try std.testing.expectEqual(
+            Confirmation.confirmed,
+            try ProductionTerminal.confirmFiles(
+                std.testing.io,
+                pty.slave,
+                pty.slave,
+                pty.slave,
+                &prompt.writer,
+                .recovery,
+            ),
+        );
+    }
+
+    {
+        var pty = try TestPty.open();
+        try pty.master.writeStreamingAll(std.testing.io, "yes");
+        const CloseContext = struct {
+            file: std.Io.File,
+
+            fn close(context: @This()) void {
+                var delay: std.os.linux.timespec = .{
+                    .sec = 0,
+                    .nsec = 10_000_000,
+                };
+                var remaining: std.os.linux.timespec = undefined;
+                _ = std.os.linux.nanosleep(&delay, &remaining);
+                context.file.close(std.testing.io);
+            }
+        };
+        const closer = try std.Thread.spawn(
+            .{},
+            CloseContext.close,
+            .{CloseContext{ .file = pty.master }},
+        );
+        var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer prompt.deinit();
+        const answer = try ProductionTerminal.confirmFiles(
+            std.testing.io,
+            pty.slave,
+            pty.slave,
+            pty.slave,
+            &prompt.writer,
+            .recovery,
+        );
+        closer.join();
+        pty.slave.close(std.testing.io);
+        try std.testing.expectEqual(Confirmation.unavailable, answer);
+    }
+
     var pty = try TestPty.open();
     pty.master.close(std.testing.io);
     var prompt: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -982,6 +1114,143 @@ test "apt_system_command.test.production recovery prompt uses PTY yes no and EOF
     pty.slave.close(std.testing.io);
     try std.testing.expectEqual(Confirmation.unavailable, answer);
     try std.testing.expectEqual(@as(usize, 0), prompt.written().len);
+}
+
+test "apt_system_command.test.PTY confirmation parses the complete recovery answer before execution" {
+    inline for (.{
+        "no\n",
+        "yes     no\n",
+        "yes\x00\n",
+        "yes                                                                 \n",
+    }) |input| {
+        var pty = try TestPty.open();
+        defer pty.close();
+        try pty.master.writeStreamingAll(std.testing.io, input);
+        var terminal: TestPtyTerminal = .{ .file = pty.slave };
+        var context: TestContext = .{ .allocator = std.testing.allocator };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.usage, status);
+        try std.testing.expectEqual(@as(usize, 0), context.recovery_execute_count);
+    }
+
+    inline for (.{ "yes\n", "y\r\n" }) |input| {
+        var pty = try TestPty.open();
+        defer pty.close();
+        try pty.master.writeStreamingAll(std.testing.io, input);
+        var terminal: TestPtyTerminal = .{ .file = pty.slave };
+        var context: TestContext = .{ .allocator = std.testing.allocator };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.success, status);
+        try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
+    }
+}
+
+test "apt_system_command.test.PTY confirmation rejects an install yes prefix with a non-yes suffix" {
+    const parsed = switch (cli.parse(&.{
+        "--profile",
+        "/profile.json",
+        "install",
+        "alpha",
+    })) {
+        .command => |command| command,
+        else => return error.UnexpectedParseResult,
+    };
+    var pty = try TestPty.open();
+    defer pty.close();
+    try pty.master.writeStreamingAll(std.testing.io, "yes     no\n");
+    var terminal: TestPtyTerminal = .{ .file = pty.slave };
+    var context: TestContext = .{ .allocator = std.testing.allocator };
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    const status = try runApt(
+        std.testing.allocator,
+        parsed,
+        context.interface(),
+        terminal.interface(),
+        .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+    );
+    try std.testing.expectEqual(api.ExitStatus.usage, status);
+    try std.testing.expectEqual(@as(usize, 0), context.execute_count);
+}
+
+test "apt_system_command.test.PTY incomplete line cannot confirm before a process deadline" {
+    var pty = try TestPty.open();
+    const fork_result = std.os.linux.fork();
+    switch (std.os.linux.errno(fork_result)) {
+        .SUCCESS => {},
+        else => {
+            pty.close();
+            return error.ForkFailed;
+        },
+    }
+    if (fork_result == 0) {
+        pty.master.close(std.testing.io);
+        var prompt_buffer: [256]u8 = undefined;
+        var prompt = std.Io.Writer.fixed(&prompt_buffer);
+        const answer = ProductionTerminal.confirmFiles(
+            std.testing.io,
+            pty.slave,
+            pty.slave,
+            pty.slave,
+            &prompt,
+            .recovery,
+        ) catch .unavailable;
+        pty.slave.close(std.testing.io);
+        std.os.linux.exit_group(if (answer == .confirmed) 2 else 0);
+    }
+    pty.slave.close(std.testing.io);
+    try pty.master.writeStreamingAll(
+        std.testing.io,
+        "yes                                                                 ",
+    );
+    var delay: std.os.linux.timespec = .{ .sec = 0, .nsec = 20_000_000 };
+    var remaining: std.os.linux.timespec = undefined;
+    _ = std.os.linux.nanosleep(&delay, &remaining);
+    var status: u32 = 0;
+    const early = std.os.linux.waitpid(
+        @intCast(fork_result),
+        &status,
+        std.os.linux.W.NOHANG,
+    );
+    try std.testing.expectEqual(@as(usize, 0), early);
+    pty.master.close(std.testing.io);
+    while (true) {
+        const waited = std.os.linux.waitpid(@intCast(fork_result), &status, 0);
+        switch (std.os.linux.errno(waited)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    try std.testing.expect(std.os.linux.W.IFEXITED(status));
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        std.os.linux.W.EXITSTATUS(status),
+    );
 }
 
 test "apt_system_command.test.JSON confirmation is one document and never mutates" {

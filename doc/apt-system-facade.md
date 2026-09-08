@@ -71,7 +71,10 @@ non-TTY returns a typed
 returns one canonical result-v3 document containing the reviewed change items
 and can never prompt. Result-v2 remains reserved for `list_installed`; result-v3
 is used for mutating `confirmation_required` reviews. `-y` is solely the
-caller's confirmation signal; profile conffile policy is unchanged.
+caller's confirmation signal; profile conffile policy is unchanged. Terminal
+confirmation reads one complete bounded line (64 content bytes maximum) and
+accepts only a trimmed whole-line `y` or `yes`. A yes-looking prefix, control
+bytes, or an overlong or incomplete line cannot authorize execution.
 
 System recovery has the separate strict spelling:
 
@@ -81,7 +84,12 @@ debz recover [--json] --system-profile PATH
 
 Human recovery prepares and renders the retained exact action before a
 recovery-specific TTY-only confirmation. The review carries verified
-tri-state mutation status. A verified pre-mutation state may say that no
+tri-state mutation status derived from a generation-stable outer-state read
+and a root-locked compatible lower marker/record snapshot; the outer
+`mutation_started` bit alone is not evidence. An exact bound prepared record
+with no lower mutation evidence may prove pre-mutation. A verified
+mutating/completed lower record may prove mutation, while missing, foreign, or
+inconsistent evidence is UNKNOWN. A verified pre-mutation state may say that no
 package mutation occurred. A verified mutating or post-mutation state says
 that package mutation occurred or may be incomplete and that convergence may
 make further changes. UNKNOWN says that prior mutation status is unknown and
@@ -543,6 +551,11 @@ when the required Linux root namespace capabilities are unavailable.
 
 Trusted-profile revalidation and every private live-root invocation,
 inspection, completion read, and acknowledgment cross a finite typed boundary.
+The production child reports backend failures in a fixed-size versioned,
+allocation-free envelope. The parent validates its category and allowlisted
+code before mapping operational failures to reconciliation or propagating
+out-of-memory, contract, and invariant failures unchanged; malformed envelopes
+fail closed as transport contract failures.
 Operational trust replacement, I/O, lock, transport, signal, privilege, and
 root-replacement failures enter the durable failure/reconciliation policy.
 Allocation failures and invariant or contract violations propagate to the
