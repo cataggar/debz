@@ -1573,34 +1573,22 @@ pub const Backend = struct {
             if (self.completion_crash) |crash|
                 try crash.hit(.after_deferred_acknowledged);
         }
-        if (record) |*owned| {
-            if (!recordMatchesAcknowledgment(owned.record, acknowledged_marker))
-                return blockedRecovery(
-                    request.operation,
-                    "deferred lower recovery record changed before clear",
-                );
-            if (self.completion_crash) |crash|
-                try crash.hit(.before_deferred_record_cleared);
-            store.clear() catch return blockedRecovery(
+        store.cleanupOwned(allocator, .{
+            .attempt_id = acknowledged_marker.attempt_id,
+            .acknowledgment_id = acknowledged_marker.acknowledgment_id,
+            .terminal_state = .acknowledged,
+            .observer = self.deferredCleanupObserver(),
+        }) catch |err| {
+            if (err == error.InjectedCompletionCrash) return err;
+            return blockedRecovery(
                 request.operation,
-                "deferred lower recovery record could not be cleared",
+                "deferred lower recovery ownership could not be cleared",
             );
+        };
+        if (record) |*owned| {
             owned.deinit();
             record = null;
-            if (self.completion_crash) |crash|
-                try crash.hit(.after_deferred_record_cleared);
         }
-        if (self.completion_crash) |crash|
-            try crash.hit(.before_deferred_marker_cleared);
-        store.clearDeferredAcknowledgment(
-            allocator,
-            acknowledged_marker.digest_sha256,
-        ) catch return blockedRecovery(
-            request.operation,
-            "deferred lower recovery marker could not be cleared",
-        );
-        if (self.completion_crash) |crash|
-            try crash.hit(.after_deferred_marker_cleared);
         _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
         return success(
             request.operation,
@@ -1608,6 +1596,28 @@ pub const Backend = struct {
             "lower recovery acknowledgment finalized",
             &.{},
         );
+    }
+
+    fn deferredCleanupObserver(
+        self: *Backend,
+    ) root_operation.OwnershipCleanupObserver {
+        return .{ .context = self, .hitFn = observeDeferredCleanup };
+    }
+
+    fn observeDeferredCleanup(
+        context: *anyopaque,
+        point: root_operation.OwnershipCleanupPoint,
+    ) !void {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        const crash = self.completion_crash orelse return;
+        try crash.hit(switch (point) {
+            .before_terminal_publish => .before_deferred_acknowledged,
+            .after_terminal_publish => .after_deferred_acknowledged,
+            .before_record_clear => .before_deferred_record_cleared,
+            .after_record_clear => .after_deferred_record_cleared,
+            .before_binding_clear => .before_deferred_marker_cleared,
+            .after_binding_clear => .after_deferred_marker_cleared,
+        });
     }
 
     fn finalizeWorkflowOwnership(
@@ -1696,54 +1706,52 @@ pub const Backend = struct {
                     "lower ownership record is unfinished or foreign",
                 );
         }
-        const terminal = if (observed.state == .bound) blk: {
-            if (self.completion_crash) |crash|
-                try crash.hit(.before_ownership_terminal_publish);
-            const released = store.terminalizeDeferredAcknowledgment(
-                allocator,
-                observed.digest_sha256,
-                if (record != null and
-                    record.?.record.outcome == .abandoned_before_mutation)
-                    .abandoned
-                else
-                    .released,
-            ) catch return blockedRecovery(
-                request.operation,
-                "lower ownership terminal marker could not be published",
-            );
-            if (self.completion_crash) |crash|
-                try crash.hit(.after_ownership_terminal_publish);
-            break :blk released;
-        } else observed;
+        store.cleanupOwned(allocator, .{
+            .attempt_id = observed.attempt_id,
+            .acknowledgment_id = orchestration_id,
+            .terminal_state = if (observed.state == .abandoned or
+                (record != null and
+                    record.?.record.outcome == .abandoned_before_mutation))
+                .abandoned
+            else
+                .released,
+            .observer = self.ownershipCleanupObserver(),
+        }) catch return blockedRecovery(
+            request.operation,
+            "lower ownership could not be finalized",
+        );
         if (record) |*owned| {
-            if (self.completion_crash) |crash|
-                try crash.hit(.before_ownership_record_clear);
-            store.clear() catch return blockedRecovery(
-                request.operation,
-                "lower ownership record could not be cleared",
-            );
             owned.deinit();
             record = null;
-            if (self.completion_crash) |crash|
-                try crash.hit(.after_ownership_record_clear);
         }
-        if (self.completion_crash) |crash|
-            try crash.hit(.before_ownership_marker_clear);
-        store.clearDeferredAcknowledgment(
-            allocator,
-            terminal.digest_sha256,
-        ) catch return blockedRecovery(
-            request.operation,
-            "lower ownership marker could not be cleared",
-        );
-        if (self.completion_crash) |crash|
-            try crash.hit(.after_ownership_marker_clear);
         return success(
             request.operation,
             false,
             "lower orchestration ownership finalized",
             &.{},
         );
+    }
+
+    fn ownershipCleanupObserver(
+        self: *Backend,
+    ) root_operation.OwnershipCleanupObserver {
+        return .{ .context = self, .hitFn = observeOwnershipCleanup };
+    }
+
+    fn observeOwnershipCleanup(
+        context: *anyopaque,
+        point: root_operation.OwnershipCleanupPoint,
+    ) !void {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        const crash = self.completion_crash orelse return;
+        try crash.hit(switch (point) {
+            .before_terminal_publish => .before_ownership_terminal_publish,
+            .after_terminal_publish => .after_ownership_terminal_publish,
+            .before_record_clear => .before_ownership_record_clear,
+            .after_record_clear => .after_ownership_record_clear,
+            .before_binding_clear => .before_ownership_marker_clear,
+            .after_binding_clear => .after_ownership_marker_clear,
+        });
     }
 
     /// Reads back what survived of a completed attempt's evidence.
@@ -2239,6 +2247,29 @@ const RootOperationGuard = struct {
         };
     }
 
+    fn acquisitionObserver(
+        self: *RootOperationGuard,
+    ) root_operation.AcquisitionObserver {
+        return .{ .context = self, .hitFn = observeAcquisition };
+    }
+
+    fn observeAcquisition(
+        context: *anyopaque,
+        point: root_operation.AcquisitionPoint,
+    ) !void {
+        const self: *RootOperationGuard = @ptrCast(@alignCast(context));
+        const binding_point: RootBindingPoint = switch (point) {
+            .after_lock_acquired => .after_root_lock_acquired,
+            .after_binding_published => .after_binding_published,
+        };
+        if (self.backend.root_binding_sync) |sync|
+            try sync.hit(binding_point);
+        try self.crash(switch (point) {
+            .after_lock_acquired => .after_root_lock_acquired,
+            .after_binding_published => .after_binding_published,
+        });
+    }
+
     fn open(
         self: *RootOperationGuard,
         allocator: std.mem.Allocator,
@@ -2284,20 +2315,8 @@ const RootOperationGuard = struct {
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
             .orchestration_id = self.orchestration_id,
+            .acquisition_observer = self.acquisitionObserver(),
         }) catch |err| return mapRootOperationError(request.operation, err);
-        self.crash(.after_root_lock_acquired) catch return api.failure(
-            request.operation,
-            .internal,
-            .internal_error,
-            "injected crash after root lock acquisition",
-        );
-        if (self.backend.root_binding_sync) |sync|
-            sync.hit(.after_root_lock_acquired) catch return api.failure(
-                request.operation,
-                .internal,
-                .internal_error,
-                "root binding synchronization failed",
-            );
         if (self.orchestration_id) |orchestration_id| {
             const store = self.coordinator.store();
             const existing = store.readDeferredAcknowledgment(
@@ -2321,43 +2340,9 @@ const RootOperationGuard = struct {
                     request.operation,
                     "lower operation belongs to a different outer orchestrator attempt",
                 );
-            } else {
-                if (self.preserve_settled) return blockedRecovery(
-                    request.operation,
-                    "lower operation has no originating outer orchestration binding",
-                );
-                const binding = root_operation.createDeferredAcknowledgment(.{
-                    .state = .bound,
-                    .attempt_id = self.attempt.?.record().attempt_id,
-                    .acknowledgment_id = orchestration_id,
-                }) catch return api.failure(
-                    request.operation,
-                    .internal,
-                    .internal_error,
-                    "lower orchestration binding is invalid",
-                );
-                store.publishDeferredAcknowledgment(
-                    allocator,
-                    binding,
-                ) catch return api.failure(
-                    request.operation,
-                    .internal,
-                    .internal_error,
-                    "lower orchestration binding could not be published",
-                );
-            }
-            if (self.backend.root_binding_sync) |sync|
-                sync.hit(.after_binding_published) catch return api.failure(
-                    request.operation,
-                    .internal,
-                    .internal_error,
-                    "root binding synchronization failed",
-                );
-            self.crash(.after_binding_published) catch return api.failure(
+            } else return blockedRecovery(
                 request.operation,
-                .internal,
-                .internal_error,
-                "injected crash after root ownership binding",
+                "lower operation has no originating outer orchestration binding",
             );
         }
         return null;
@@ -2502,41 +2487,33 @@ const RootOperationGuard = struct {
     ) !void {
         const orchestration_id = self.orchestration_id orelse return;
         const attempt = self.active() orelse return;
-        const store = self.coordinator.store();
-        const observed = try store.readDeferredAcknowledgment(self.allocator) orelse
-            return error.MissingOrchestrationBinding;
-        if ((observed.state != .bound and
-            observed.state != terminal_state) or
-            !std.mem.eql(
-                u8,
-                &observed.attempt_id,
-                &attempt.record().attempt_id,
-            ) or
-            !std.mem.eql(
-                u8,
-                &observed.acknowledgment_id,
-                &orchestration_id,
-            ))
-            return error.OrchestrationBindingMismatch;
-        const terminal = if (observed.state == .bound) blk: {
-            try self.crash(.before_ownership_terminal_publish);
-            const released = try store.terminalizeDeferredAcknowledgment(
-                self.allocator,
-                observed.digest_sha256,
-                terminal_state,
-            );
-            try self.crash(.after_ownership_terminal_publish);
-            break :blk released;
-        } else observed;
-        try self.crash(.before_ownership_record_clear);
-        try attempt.clear();
-        try self.crash(.after_ownership_record_clear);
-        try self.crash(.before_ownership_marker_clear);
-        try store.clearDeferredAcknowledgment(
-            self.allocator,
-            terminal.digest_sha256,
-        );
-        try self.crash(.after_ownership_marker_clear);
+        try self.coordinator.store().cleanupOwned(self.allocator, .{
+            .attempt_id = attempt.record().attempt_id,
+            .acknowledgment_id = orchestration_id,
+            .terminal_state = terminal_state,
+            .observer = self.cleanupObserver(),
+        });
+    }
+
+    fn cleanupObserver(
+        self: *RootOperationGuard,
+    ) root_operation.OwnershipCleanupObserver {
+        return .{ .context = self, .hitFn = observeCleanup };
+    }
+
+    fn observeCleanup(
+        context: *anyopaque,
+        point: root_operation.OwnershipCleanupPoint,
+    ) !void {
+        const self: *RootOperationGuard = @ptrCast(@alignCast(context));
+        try self.crash(switch (point) {
+            .before_terminal_publish => .before_ownership_terminal_publish,
+            .after_terminal_publish => .after_ownership_terminal_publish,
+            .before_record_clear => .before_ownership_record_clear,
+            .after_record_clear => .after_ownership_record_clear,
+            .before_binding_clear => .before_ownership_marker_clear,
+            .after_binding_clear => .after_ownership_marker_clear,
+        });
     }
 
     fn deinit(self: *RootOperationGuard) void {
@@ -3975,11 +3952,7 @@ const TestRootBindingBarrier = struct {
                 std.Io.Clock.awake.now(std.testing.io),
             ).toMilliseconds();
             if (elapsed >= wait_ms) return error.TestTimedOut;
-            try std.Io.sleep(
-                std.testing.io,
-                .fromMilliseconds(1),
-                .awake,
-            );
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -4115,8 +4088,12 @@ const DeferredAckContender = struct {
     backend: *Backend,
     request: WorkflowRequest,
     status: ?api.ExitStatus = null,
+    started: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *DeferredAckContender) void {
+        self.started.store(true, .release);
+        defer self.finished.store(true, .release);
         const result = self.backend.executeWorkflow(
             std.heap.page_allocator,
             self.request,
@@ -4127,6 +4104,20 @@ const DeferredAckContender = struct {
         self.status = result.exit_status;
     }
 };
+
+fn waitForContender(
+    flag: *const std.atomic.Value(bool),
+    wait_ms: u64,
+) !void {
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (!flag.load(.acquire)) {
+        const elapsed = started.durationTo(
+            std.Io.Clock.awake.now(std.testing.io),
+        ).toMilliseconds();
+        if (elapsed >= wait_ms) return error.TestTimedOut;
+        std.atomic.spinLoopHint();
+    }
+}
 
 fn backendRootRecord(
     allocator: std.mem.Allocator,
@@ -5123,13 +5114,27 @@ test "production workflow root binding excludes overlapping foreign owners" {
             DeferredAckContender.run,
             .{&identical},
         );
-        distinct_thread.join();
-        identical_thread.join();
+        try waitForContender(&distinct.started, 5_000);
+        try waitForContender(&identical.started, 5_000);
+        try waitForContender(&distinct.finished, 5_000);
+        try waitForContender(&identical.finished, 5_000);
         try std.testing.expect(distinct.status.? != .success);
         try std.testing.expect(identical.status.? != .success);
         try std.testing.expectEqual(@as(usize, 0), process.calls);
-
+        if (binding_point == .after_binding_published) {
+            const held_marker = (try backendDeferredMarker(
+                allocator,
+                &directory,
+            )).?;
+            try std.testing.expectEqualSlices(
+                u8,
+                &owner_id,
+                &held_marker.acknowledgment_id,
+            );
+        }
         barrier.release();
+        distinct_thread.join();
+        identical_thread.join();
         owner_thread.join();
         owner_joined = true;
         try std.testing.expectEqual(api.ExitStatus.internal, owner.status.?);

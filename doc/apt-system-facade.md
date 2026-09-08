@@ -305,8 +305,8 @@ is routed through `ProductionWorkflow` recovery to
 `dischargeOwedProvenance` without replaying package mutation. Ordinary product
 recovery still clears the record on success. The internal apt/system workflow
 instead supplies its outer attempt identity to the initial execute. While the
-root-operation lock is still held, and before preflight can enter a mutation
-bridge, the workflow publishes an exact root-local
+root-operation lock is still held, before publishing the lower record and
+before preflight can enter a mutation bridge, the workflow publishes an exact root-local
 `root-operation-deferred-ack-v1.json` marker in the `bound` state. This binds
 the lower attempt to the originating outer apt/system attempt before mutation;
 a different prepared operation cannot adopt or replace it, even when its
@@ -329,6 +329,17 @@ fresh bound lower attempt and executes the exact retained lock once, without a
 clean ownership gap. Legacy record-only states retain their existing
 conservative recovery rules, and absence of both documents is the only fully
 clean state.
+
+The same centralized owner-aware cleanup primitive is used by normal finish,
+error/deinit abandonment, explicit ownership finalization, and deferred
+acknowledgment. It verifies owner and lower attempt under the root lock,
+transitions the binding to its terminal state, clears and fsyncs the record,
+reopens the store to prove record absence, then compare-and-unlinks and fsyncs
+the binding. A binding-only residue is valid both before initial record
+publication and after terminal record removal; foreign callers cannot remove
+or replace it. A newly observed record without a binding is never created by
+the orchestrated path and fails closed, while documented ordinary product
+legacy recovery remains separate.
 
 After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower
