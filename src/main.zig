@@ -3,6 +3,8 @@ const debz = @import("debz");
 const repository_cli = @import("repository_cli");
 const api = debz.product_api;
 const repository_api = debz.repository_api;
+const apt_cli = debz.apt_system_cli;
+const apt_command = debz.apt_system_command;
 
 const root_help =
     \\debz - deterministic Debian package operations
@@ -11,6 +13,7 @@ const root_help =
     \\  debz <command> [options] [packages...]
     \\
     \\Commands:
+    \\  apt                          Apt-shaped live-system package facade
     \\  repo                         Manage repository descriptors
     \\  package-cache                Prepare an exact-lock package CAS
     \\  transaction-result           Verify a completed transaction result
@@ -268,6 +271,7 @@ const HelpTopic = union(enum) {
     transaction_result,
     package_family_capabilities,
     version,
+    system_recovery,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -329,6 +333,14 @@ pub fn main(init: std.process.Init) !void {
         try runTransactionResult(init, &args, stdout, stderr);
         return;
     }
+    if (std.mem.eql(u8, command, "apt")) {
+        try runAptSystem(init, &args, stdout, stderr);
+        return;
+    }
+    if (std.mem.eql(u8, command, "recover") and isSystemRecovery(init)) {
+        try runAptSystemRecovery(init, &args, stdout, stderr);
+        return;
+    }
     const operation = debz.parseOperation(command) orelse {
         try stderr.print("debz: unknown command '{s}'\n", .{command});
         try stderr.writeAll(root_help);
@@ -370,6 +382,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpTopic {
     if (isHelpFlag(command)) return .root;
+    if (std.mem.eql(u8, command, "apt")) return null;
 
     if (std.mem.eql(u8, command, "repo")) {
         const subcommand = args.next() orelse return null;
@@ -404,6 +417,21 @@ fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpT
         if (!has_help) return null;
         if (isHelpFlag(subcommand) or std.mem.eql(u8, subcommand, "verify"))
             return .transaction_result;
+        return null;
+    }
+    if (std.mem.eql(u8, command, "recover")) {
+        var has_help = false;
+        var system_recovery = false;
+        while (args.next()) |argument| {
+            if (isHelpFlag(argument)) has_help = true;
+            if (std.mem.eql(u8, argument, "--system-profile"))
+                system_recovery = true;
+        }
+        if (system_recovery) {
+            if (has_help) return .system_recovery;
+            return null;
+        }
+        if (has_help) return .{ .operation = .recover };
         return null;
     }
 
@@ -454,8 +482,190 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\  -h, --help  Show this help
             \\
         ),
+        .system_recovery => try stdout.writeAll(
+            apt_cli.helpText(.recovery),
+        ),
     }
 }
+
+fn runAptSystem(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    var arguments: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |argument|
+        try arguments.append(init.arena.allocator(), argument);
+
+    const parsed = apt_cli.parse(arguments.items);
+    switch (parsed) {
+        .help => |topic| {
+            try stdout.writeAll(apt_cli.helpText(topic));
+            return;
+        },
+        .failure => |usage_failure| {
+            if (aptArgumentsRequestJson(arguments.items))
+                try apt_cli.writeUsageFailureJson(stdout, usage_failure)
+            else
+                try apt_cli.writeUsageFailure(stderr, usage_failure);
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(@intFromEnum(debz.AptSystemExitStatus.usage));
+        },
+        .command => |command| {
+            var backend: debz.ProductionBackend = .{ .io = init.io };
+            var composition: debz.apt_system_orchestrator.ProductionComposition =
+                undefined;
+            composition.init(
+                init.arena.allocator(),
+                init.io,
+                &backend,
+            );
+            var terminal_context = ProductionTerminal{ .io = init.io };
+            const status = try apt_command.runApt(
+                init.arena.allocator(),
+                command,
+                apt_command.Engine.production(composition.orchestrator()),
+                terminal_context.interface(),
+                .{ .stdout = stdout, .stderr = stderr },
+            );
+            if (status != .success) {
+                try stdout.flush();
+                try stderr.flush();
+                std.process.exit(@intFromEnum(status));
+            }
+        },
+    }
+}
+
+fn aptArgumentsRequestJson(arguments: []const []const u8) bool {
+    for (arguments) |argument| {
+        if (std.mem.eql(u8, argument, "--json")) return true;
+    }
+    return false;
+}
+
+fn runAptSystemRecovery(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    var arguments: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |argument|
+        try arguments.append(init.arena.allocator(), argument);
+
+    const parsed = switch (apt_cli.parseRecovery(arguments.items)) {
+        .help => {
+            try stdout.writeAll(apt_cli.helpText(.recovery));
+            return;
+        },
+        .failure => |usage_failure| {
+            if (aptArgumentsRequestJson(arguments.items))
+                try apt_cli.writeUsageFailureJson(stdout, usage_failure)
+            else
+                try apt_cli.writeRecoveryUsageFailure(
+                    stderr,
+                    usage_failure,
+                );
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(@intFromEnum(debz.AptSystemExitStatus.usage));
+        },
+        .command => |command| command,
+    };
+
+    var backend: debz.ProductionBackend = .{ .io = init.io };
+    var composition: debz.apt_system_orchestrator.ProductionComposition =
+        undefined;
+    composition.init(init.arena.allocator(), init.io, &backend);
+    var terminal_context = ProductionTerminal{ .io = init.io };
+    const status = apt_command.runRecovery(
+        init.arena.allocator(),
+        parsed.profile_path,
+        parsed.output,
+        apt_command.Engine.production(composition.orchestrator()),
+        terminal_context.interface(),
+        .{ .stdout = stdout, .stderr = stderr },
+    ) catch {
+        if (parsed.output == .json) {
+            try stdout.writeAll(
+                "{\"schema\":\"io.github.cataggar.debz.apt-system-cli-diagnostic.v1\",\"version\":1,\"exit_status\":70,\"id\":\"internal_error\",\"topic\":\"recover\",\"message\":\"internal apt-system recovery failure\"}\n",
+            );
+        } else {
+            try stderr.writeAll(
+                "debz recover: internal apt-system recovery failure\n",
+            );
+        }
+        try stdout.flush();
+        try stderr.flush();
+        std.process.exit(@intFromEnum(debz.AptSystemExitStatus.internal));
+    };
+    if (status != .success) {
+        try stdout.flush();
+        try stderr.flush();
+        std.process.exit(@intFromEnum(status));
+    }
+}
+
+fn isSystemRecovery(init: std.process.Init) bool {
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const command = args.next() orelse return false;
+    if (!std.mem.eql(u8, command, "recover")) return false;
+    while (args.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--system-profile")) return true;
+    }
+    return false;
+}
+
+const ProductionTerminal = struct {
+    io: std.Io,
+
+    fn interface(self: *ProductionTerminal) apt_command.Terminal {
+        return .{
+            .context = self,
+            .confirmFn = confirm,
+        };
+    }
+
+    fn confirm(
+        context: *anyopaque,
+        stderr: *std.Io.Writer,
+    ) !apt_command.Confirmation {
+        const self: *ProductionTerminal = @ptrCast(@alignCast(context));
+        const stdin_file = std.Io.File.stdin();
+        const stdout_file = std.Io.File.stdout();
+        const stderr_file = std.Io.File.stderr();
+        if (!try stdin_file.isTty(self.io) or
+            !try stdout_file.isTty(self.io) or
+            !try stderr_file.isTty(self.io))
+            return .unavailable;
+
+        try stderr.writeAll("Proceed with this exact lock? [y/N] ");
+        try stderr.flush();
+        var answer: [8]u8 = undefined;
+        var length: usize = 0;
+        while (length < answer.len) {
+            var byte: [1]u8 = undefined;
+            const read = stdin_file.readStreaming(
+                self.io,
+                &.{byte[0..]},
+            ) catch return .unavailable;
+            if (read == 0) return .unavailable;
+            if (byte[0] == '\n' or byte[0] == '\r') break;
+            answer[length] = byte[0];
+            length += 1;
+        }
+        try stderr.writeByte('\n');
+        const value = std.mem.trim(u8, answer[0..length], " \t");
+        if (std.ascii.eqlIgnoreCase(value, "y") or
+            std.ascii.eqlIgnoreCase(value, "yes"))
+            return .confirmed;
+        return .declined;
+    }
+};
 
 const TransactionResultSingleOption = enum {
     state_path,

@@ -1,14 +1,13 @@
 # Apt-shaped system facade contracts
 
-`debz.apt_system_api` is a separate versioned orchestration contract for a
-future deliberately limited `debz apt` interface. `debz.apt_system_cli` now
+`debz.apt_system_api` is a separate versioned orchestration contract for the
+deliberately limited `debz apt` interface. `debz.apt_system_cli`
 defines its pure parsing, help, rendering, and confirmation-decision contract.
 `debz.apt_system_orchestrator` implements the reusable profile-bound engine
-behind that contract. Product API v1 and the existing root CLI remain
-unchanged. Neither module is wired into `main.zig`, so this document does not
-claim that the commands are currently exposed; the pure CLI module itself
-performs no dependency-solver, namespace, live-root, or production
-orchestration work.
+behind that contract, and `debz.apt_system_command` connects the strict parser
+to that engine. Product API v1 and its existing commands remain unchanged. The
+pure parser still performs no dependency-solver, namespace, live-root,
+terminal, or production orchestration work.
 
 The interface is **apt-shaped, not apt-compatible**. It promises no apt output,
 wording, exit-code convention, option aliases, configuration discovery, or
@@ -64,8 +63,25 @@ prompts.
 
 The exported confirmation seam deliberately performs no terminal calls.
 Non-`-y` mutation requests wait until a plan exists. A human request may then
-ask later integration for TTY confirmation; a JSON request instead requires a
-typed `confirmation_required` result and can never request a prompt.
+ask the executable integration for confirmation only when its input, plan
+output, and diagnostic streams are terminals. The complete atomic plan and
+exact-lock path are printed and flushed first. A negative answer, EOF, or
+non-TTY returns a typed
+`confirmation_required` result without executing. A JSON request instead
+returns one canonical result-v2 document containing the reviewed change items
+and can never prompt. Result-v2 item arrays are allowed only for
+`list_installed` results and mutating `confirmation_required` reviews. `-y` is
+solely the caller's confirmation signal; profile conffile policy is unchanged.
+
+System recovery has the separate strict spelling:
+
+```text
+debz recover [--json] --system-profile PATH
+```
+
+Human recovery prepares and renders the retained exact action before the same
+TTY-only confirmation. JSON recovery prepares but never prompts or mutates.
+Malformed recovery syntax is rejected before profile or operation-state I/O.
 
 ## Trusted system profile
 

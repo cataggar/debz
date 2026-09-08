@@ -1,9 +1,8 @@
 //! Pure CLI contract for the deliberately limited `debz apt` facade.
 //!
 //! This module performs no filesystem, profile, repository, root, mount,
-//! environment, terminal, or backend I/O. It is intentionally not wired into
-//! `main.zig`; later integration can consume the typed request and confirmation
-//! decision defined here.
+//! environment, terminal, or backend I/O. `main.zig` consumes only its typed
+//! apt and apt-system recovery parse results and confirmation decision.
 const std = @import("std");
 const api = @import("apt_system_api.zig");
 const system_profile = @import("system_profile.zig");
@@ -23,6 +22,7 @@ pub const HelpTopic = enum {
     remove,
     upgrade,
     list,
+    recovery,
 };
 
 pub const UsageDiagnosticId = enum {
@@ -44,6 +44,7 @@ pub const UsageDiagnosticId = enum {
     unsupported_list_option,
     mixed_list_options,
     misplaced_facade_option,
+    missing_system_profile,
 };
 
 pub const UsageFailure = struct {
@@ -60,6 +61,17 @@ pub const ParsedCommand = struct {
 pub const ParseResult = union(enum) {
     help: HelpTopic,
     command: ParsedCommand,
+    failure: UsageFailure,
+};
+
+pub const RecoveryCommand = struct {
+    profile_path: []const u8,
+    output: OutputFormat,
+};
+
+pub const RecoveryParseResult = union(enum) {
+    help,
+    command: RecoveryCommand,
     failure: UsageFailure,
 };
 
@@ -150,6 +162,23 @@ const list_help =
     \\
 ;
 
+const recovery_help =
+    \\debz recover --system-profile PATH - recover an apt-system operation
+    \\
+    \\Usage:
+    \\  debz recover [--json] --system-profile PATH
+    \\
+    \\Options:
+    \\  --system-profile PATH  Load the exact trusted system profile
+    \\  --json                 Emit one canonical apt-system result object
+    \\  -h, --help             Show this help
+    \\
+    \\Human recovery prompts only after retained evidence has been prepared.
+    \\JSON recovery never prompts or mutates. This apt-shaped recovery does not
+    \\inherit APT configuration, proxies, credentials, or keyrings.
+    \\
+;
+
 pub fn helpText(topic: HelpTopic) []const u8 {
     return switch (topic) {
         .apt => apt_help,
@@ -158,7 +187,55 @@ pub fn helpText(topic: HelpTopic) []const u8 {
         .remove => remove_help,
         .upgrade => upgrade_help,
         .list => list_help,
+        .recovery => recovery_help,
     };
+}
+
+pub fn parseRecovery(arguments: []const []const u8) RecoveryParseResult {
+    if (arguments.len > maximum_arguments)
+        return recoveryFailure(.too_many_arguments);
+    for (arguments) |argument| {
+        if (isHelpArgument(argument)) return .help;
+    }
+    for (arguments) |argument| {
+        if (argument.len > maximum_argument_bytes)
+            return recoveryFailure(.argument_too_long);
+    }
+
+    var profile_path: ?[]const u8 = null;
+    var output: OutputFormat = .human;
+    var index: usize = 0;
+    while (index < arguments.len) : (index += 1) {
+        const argument = arguments[index];
+        if (std.mem.eql(u8, argument, "--json")) {
+            if (output == .json)
+                return recoveryFailure(.duplicate_option);
+            output = .json;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--system-profile")) {
+            if (profile_path != null)
+                return recoveryFailure(.duplicate_option);
+            index += 1;
+            if (index == arguments.len)
+                return recoveryFailure(.missing_option_value);
+            const value = arguments[index];
+            if (!validProfilePath(value))
+                return recoveryFailure(.invalid_profile_path);
+            profile_path = value;
+            continue;
+        }
+        return recoveryFailure(.unknown_option);
+    }
+    return .{ .command = .{
+        .profile_path = profile_path orelse
+            return recoveryFailure(.missing_system_profile),
+        .output = output,
+    } };
+}
+
+fn recoveryFailure(id: UsageDiagnosticId) RecoveryParseResult {
+    return .{ .failure = .{ .id = id, .topic = .recovery } };
 }
 
 pub fn parse(arguments: []const []const u8) ParseResult {
@@ -238,6 +315,7 @@ pub fn parse(arguments: []const []const u8) ParseResult {
         .list => parseList(profile_path, output, trailing) catch |err|
             return parseFailure(err, topic),
         .apt => unreachable,
+        .recovery => unreachable,
     };
     api.validateRequest(request) catch |err| {
         return validationFailure(err, topic);
@@ -446,6 +524,19 @@ fn startsWithDash(argument: []const u8) bool {
     return argument.len != 0 and argument[0] == '-';
 }
 
+fn isHelpArgument(argument: []const u8) bool {
+    return std.mem.eql(u8, argument, "-h") or
+        std.mem.eql(u8, argument, "--help");
+}
+
+fn validProfilePath(path: []const u8) bool {
+    api.validateRequest(.{
+        .operation = .update,
+        .profile_path = path,
+    }) catch return false;
+    return true;
+}
+
 fn isFacadeOption(argument: []const u8) bool {
     return std.mem.eql(u8, argument, "--profile") or
         std.mem.eql(u8, argument, "--json");
@@ -494,6 +585,34 @@ pub fn writeUsageFailure(
     try writer.writeAll(helpText(usage_failure.topic));
 }
 
+pub fn writeRecoveryUsageFailure(
+    writer: *std.Io.Writer,
+    usage_failure: UsageFailure,
+) !void {
+    try writer.print(
+        "debz recover: usage error [{s}]: {s}\n",
+        .{
+            @tagName(usage_failure.id),
+            diagnosticMessage(usage_failure.id),
+        },
+    );
+    try writer.writeAll(helpText(.recovery));
+}
+
+pub fn writeUsageFailureJson(
+    writer: *std.Io.Writer,
+    usage_failure: UsageFailure,
+) !void {
+    try writer.print(
+        "{{\"schema\":\"io.github.cataggar.debz.apt-system-cli-diagnostic.v1\",\"version\":1,\"exit_status\":2,\"id\":\"{s}\",\"topic\":\"{s}\",\"message\":\"{s}\"}}\n",
+        .{
+            @tagName(usage_failure.id),
+            @tagName(usage_failure.topic),
+            diagnosticMessage(usage_failure.id),
+        },
+    );
+}
+
 fn diagnosticMessage(id: UsageDiagnosticId) []const u8 {
     return switch (id) {
         .too_many_arguments => "too many arguments",
@@ -514,6 +633,7 @@ fn diagnosticMessage(id: UsageDiagnosticId) []const u8 {
         .unsupported_list_option => "unsupported list option",
         .mixed_list_options => "--installed cannot be mixed with other list options",
         .misplaced_facade_option => "--profile and --json must precede the command",
+        .missing_system_profile => "--system-profile PATH is required",
     };
 }
 
@@ -1234,4 +1354,40 @@ test "apt_system_cli.test.confirmation decisions never prompt early or in JSON" 
         error.ConfirmationNotRequired,
         confirmationRequiredResult(non_mutating),
     );
+}
+
+test "apt_system_cli.test.recovery grammar is strict pure and help decisive" {
+    const parsed = parseRecovery(&.{
+        "--json",
+        "--system-profile",
+        "/etc/debz/default.json",
+    });
+    switch (parsed) {
+        .command => |command| {
+            try std.testing.expectEqual(OutputFormat.json, command.output);
+            try std.testing.expectEqualStrings(
+                "/etc/debz/default.json",
+                command.profile_path,
+            );
+        },
+        else => return error.UnexpectedParseResult,
+    }
+
+    const help = parseRecovery(&.{
+        "--system-profile",
+        "/profile.json",
+        "--unknown-secret",
+        "--help",
+    });
+    try std.testing.expect(help == .help);
+
+    for ([_][]const []const u8{
+        &.{},
+        &.{"--system-profile"},
+        &.{ "--system-profile", "relative" },
+        &.{ "--system-profile", "/profile.json", "--json", "--json" },
+        &.{ "--system-profile", "/profile.json", "--assume-yes" },
+    }) |arguments| {
+        try std.testing.expect(parseRecovery(arguments) == .failure);
+    }
 }

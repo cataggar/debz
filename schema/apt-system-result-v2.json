@@ -77,9 +77,29 @@
     { "$ref": "apt-system-result-v1.json#/allOf/9" },
     { "$ref": "apt-system-result-v1.json#/allOf/10" },
     {
-      "properties": {
-        "operation": { "const": "list_installed" }
-      }
+      "anyOf": [
+        {
+          "properties": {
+            "operation": { "const": "list_installed" }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": ["install", "remove", "upgrade"]
+            },
+            "outcome": { "const": "usage" },
+            "diagnostics": {
+              "contains": {
+                "properties": {
+                  "id": { "const": "confirmation_required" }
+                },
+                "required": ["id"]
+              }
+            }
+          }
+        }
+      ]
     }
   ],
   "$defs": {

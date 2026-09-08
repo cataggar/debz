@@ -19,6 +19,72 @@ for help in -h --help; do
     printf '%s' "$output" | grep -q 'debz <command> \[options\] \[packages\.\.\.\]'
 done
 test "$("$debz" version)" = "$expected_version"
+
+for arguments in \
+    "apt" \
+    "apt --help" \
+    "apt update --help ignored-secret" \
+    "apt install --bad --help ignored-secret" \
+    "apt remove --help ignored-secret" \
+    "apt upgrade --help ignored-secret" \
+    "apt list --help ignored-secret"
+do
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q 'debz apt'
+    printf '%s' "$output" | grep -vq 'ignored-secret'
+done
+
+secret='rejected-cli-secret'
+for arguments in \
+    "apt --profile /missing-profile.json --json install --$secret" \
+    "apt --profile /missing-profile.json --json list --available" \
+    "apt --profile /missing-profile.json --json upgrade extra" \
+    "apt --profile /missing-profile.json --json update --json"
+do
+    set +e
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    test "$(printf '%s\n' "$output" | wc -l)" -eq 1
+    printf '%s' "$output" | grep -q 'apt-system-cli-diagnostic.v1'
+    printf '%s' "$output" | grep -vq "$secret"
+done
+
+for arguments in \
+    "apt --profile /missing-profile.json --json update" \
+    "apt --json --profile /missing-profile.json install -y alpha beta" \
+    "apt --profile /missing-profile.json --json remove -y alpha beta" \
+    "apt --profile /missing-profile.json --json upgrade -y" \
+    "apt --profile /missing-profile.json --json list --installed"
+do
+    set +e
+    output=$("$debz" $arguments 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 3
+    test ! -s cli-test-stderr
+    test "$(printf '%s\n' "$output" | wc -l)" -eq 1
+    printf '%s' "$output" | grep -q 'apt-system-result.v'
+    printf '%s' "$output" | grep -q '"id":"profile_invalid"'
+done
+
+output=$("$debz" recover --system-profile /missing-profile.json --help ignored-secret 2>cli-test-stderr)
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q 'apt-system operation'
+printf '%s' "$output" | grep -vq 'ignored-secret'
+
+set +e
+output=$("$debz" recover --json --system-profile relative 2>cli-test-stderr)
+status_code=$?
+set -e
+test "$status_code" -eq 2
+test ! -s cli-test-stderr
+test "$(printf '%s\n' "$output" | wc -l)" -eq 1
+printf '%s' "$output" | grep -q 'invalid_profile_path'
+
 set +e
 "$debz" --version >/dev/null 2>cli-test-stderr
 status_code=$?

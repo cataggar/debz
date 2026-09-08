@@ -460,7 +460,7 @@ pub fn validateResult(result: Result) !void {
     if (!validText(result.summary, maximum_summary_characters))
         return error.InvalidSummary;
     if (result.items.len > maximum_result_items) return error.TooManyItems;
-    if (result.operation != .list_installed and result.items.len != 0)
+    if (result.items.len != 0 and !resultAllowsItems(result))
         return error.UnexpectedItems;
     for (result.items) |item| {
         if (!validPackage(item.package)) return error.InvalidItem;
@@ -472,6 +472,7 @@ pub fn validateResult(result: Result) !void {
             if (!validText(detail, maximum_summary_characters))
                 return error.InvalidItem;
     }
+
     if (result.diagnostic_count > maximum_diagnostics)
         return error.TooManyDiagnostics;
     if (result.exit_status != exitStatus(result.outcome))
@@ -509,6 +510,15 @@ pub fn validateResult(result: Result) !void {
     }
     if (encodedDocumentSize(result) > maximum_document_bytes)
         return error.DocumentTooLarge;
+}
+
+fn resultAllowsItems(result: Result) bool {
+    if (result.operation == .list_installed) return true;
+    if (!result.operation.mutatesRoot() or
+        result.outcome != .usage or
+        result.diagnostic_count != 1)
+        return false;
+    return result.diagnostics[0].id == .confirmation_required;
 }
 
 pub fn validateCompleteResult(result: Result) !void {
@@ -1269,7 +1279,7 @@ test "apt_system_api.test.text validation stops at bounded limits" {
     );
 }
 
-test "apt_system_api.test.list items are owned and bind the canonical digest" {
+test "apt_system_api.test.item-bearing results are owned and bind the canonical digest" {
     var package = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
     var version = [_]u8{ '1', '.', '2' };
     var architecture = [_]u8{ 'a', 'm', 'd', '6', '4' };
@@ -1322,6 +1332,27 @@ test "apt_system_api.test.list items are owned and bind the canonical digest" {
     var non_list = input;
     non_list.operation = .update;
     try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+
+    var confirmation = try failure(
+        .{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{"alpha"},
+        },
+        .usage,
+        .confirmation_required,
+        "confirmation",
+        "confirmation required",
+    );
+    confirmation.profile = input.profile;
+    confirmation.items = &items;
+    confirmation.evidence.exact_lock = .{
+        .path = "/state/exact-lock.json",
+        .schema = "io.github.cataggar.debz.exact-closure-lock.v2",
+        .version = 2,
+        .digest_sha256 = @splat(0x44),
+    };
+    _ = try complete(confirmation);
 }
 
 test "apt_system_api.test.itemless results preserve exact v1 wire contract" {

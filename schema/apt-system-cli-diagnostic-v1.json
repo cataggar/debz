@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cataggar.github.io/debz/schema/apt-system-cli-diagnostic-v1.json",
+  "title": "debz apt-system CLI diagnostic v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "exit_status",
+    "id",
+    "topic",
+    "message"
+  ],
+  "properties": {
+    "schema": {
+      "const": "io.github.cataggar.debz.apt-system-cli-diagnostic.v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "exit_status": {
+      "enum": [2, 70]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    }
+  }
+}

@@ -127,6 +127,9 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "package-cache", "prepare" }, .usage = "debz package-cache prepare --lock-input PATH" },
         .{ .args = &.{"transaction-result"}, .usage = "debz transaction-result verify --state-path PATH" },
         .{ .args = &.{ "transaction-result", "verify" }, .usage = "debz transaction-result verify --state-path PATH" },
+        .{ .args = &.{"apt"}, .usage = "debz apt [--profile PATH] [--json] <command>" },
+        .{ .args = &.{ "apt", "install" }, .usage = "debz apt [--profile PATH] [--json] install [-y] PACKAGE..." },
+        .{ .args = &.{ "recover", "--system-profile", "/profile.json" }, .usage = "debz recover [--json] --system-profile PATH" },
         .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
         .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
         .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
@@ -328,6 +331,40 @@ pub fn build(b: *std.Build) void {
     });
     const run_apt_system_cli_tests = b.addRunArtifact(apt_system_cli_tests);
 
+    const apt_system_command_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apt_system_command_test_module.addOptions(
+        "debz_build_options",
+        build_options,
+    );
+    apt_system_command_test_module.addIncludePath(
+        libsolv_dependency.path("src"),
+    );
+    apt_system_command_test_module.addIncludePath(
+        xz_dependency.path("src/liblzma/api"),
+    );
+    apt_system_command_test_module.addIncludePath(
+        zstd_dependency.path("lib"),
+    );
+    apt_system_command_test_module.addCMacro("LZMA_API_STATIC", "1");
+    apt_system_command_test_module.linkLibrary(libsolv);
+    apt_system_command_test_module.linkLibrary(liblzma);
+    apt_system_command_test_module.linkLibrary(zstd);
+    apt_system_command_test_module.link_libc = true;
+    const apt_system_command_tests = b.addTest(.{
+        .root_module = apt_system_command_test_module,
+        .filters = if (require_privileged_orchestration_tests)
+            &.{"apt_system_command.test.required_privileged."}
+        else
+            &.{"apt_system_command.test."},
+    });
+    const run_apt_system_command_tests = b.addRunArtifact(
+        apt_system_command_tests,
+    );
+
     const apt_system_state_test_module = b.createModule(.{
         .root_source_file = b.path("src/apt_system_state.zig"),
         .target = target,
@@ -380,11 +417,13 @@ pub fn build(b: *std.Build) void {
     apt_system_test_step.dependOn(&run_system_profile_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_command_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
     test_step.dependOn(&run_system_profile_tests.step);
     test_step.dependOn(&run_apt_system_api_tests.step);
     test_step.dependOn(&run_apt_system_cli_tests.step);
+    test_step.dependOn(&run_apt_system_command_tests.step);
     test_step.dependOn(&run_apt_system_state_tests.step);
     test_step.dependOn(&run_apt_system_orchestrator_tests.step);
 
@@ -665,6 +704,7 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-system-cli-diagnostic-v1.json",
         "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",
         "apt-system-request-v1.json",

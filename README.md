@@ -105,11 +105,20 @@ Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
 metadata refresh. See
 [`doc/repository-management.md`](doc/repository-management.md).
 
-The versioned contracts and reusable profile-bound orchestration engine for a
-future limited `debz apt` system facade are documented in
+The installed CLI exposes the limited profile-bound system facade:
+
+```sh
+sudo debz apt update
+sudo debz apt install -y PACKAGE...
+debz apt list --installed
+sudo debz recover --system-profile /etc/debz/default.json
+```
+
+Its versioned contracts and reusable orchestration engine are documented in
 [`doc/apt-system-facade.md`](doc/apt-system-facade.md). The interface is
-**apt-shaped, not apt-compatible**. The engine is not wired into command-line
-parsing yet.
+**apt-shaped, not apt-compatible**. It accepts only the documented grammar,
+uses an explicit trusted profile, and never inherits host APT configuration,
+proxies, credentials, or keyrings.
 
 `-Dversion` must be a SemVer value and defaults to the package version in `build.zig.zon`. An ordinary install places the target-selected CLI in `bin/`, documentation under `share/doc/debz/`, and schemas under `share/debz/`. The dedicated static-musl `release-install` graph additionally installs reviewed release runtime metadata.
 
