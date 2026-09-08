@@ -1353,6 +1353,12 @@ test "apt_system_api.test.item-bearing results are owned and bind the canonical 
         .digest_sha256 = @splat(0x44),
     };
     _ = try complete(confirmation);
+    confirmation.diagnostic_count = 2;
+    confirmation.diagnostics[1] = confirmation.diagnostics[0];
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(confirmation),
+    );
 }
 
 test "apt_system_api.test.itemless results preserve exact v1 wire contract" {

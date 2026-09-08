@@ -90,6 +90,8 @@
             },
             "outcome": { "const": "usage" },
             "diagnostics": {
+              "minItems": 1,
+              "maxItems": 1,
               "contains": {
                 "properties": {
                   "id": { "const": "confirmation_required" }

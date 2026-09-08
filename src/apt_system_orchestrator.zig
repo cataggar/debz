@@ -1323,6 +1323,11 @@ pub const StateStore = struct {
         std.mem.Allocator,
         []const u8,
     ) anyerror!?operation_state.OwnedState,
+    inspectActiveLockedFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        []const u8,
+    ) anyerror!?operation_state.OwnedState,
     reserveFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -1418,6 +1423,18 @@ pub const StateStore = struct {
         state_path: []const u8,
     ) !?operation_state.OwnedState {
         return self.readActiveFn(self.context, allocator, state_path);
+    }
+
+    pub fn inspectActiveLocked(
+        self: StateStore,
+        allocator: std.mem.Allocator,
+        state_path: []const u8,
+    ) !?operation_state.OwnedState {
+        return self.inspectActiveLockedFn(
+            self.context,
+            allocator,
+            state_path,
+        );
     }
 
     pub fn readRetained(
@@ -1525,6 +1542,7 @@ pub const SystemStateStore = struct {
         return .{
             .context = self,
             .readActiveFn = readActive,
+            .inspectActiveLockedFn = inspectActiveLocked,
             .reserveFn = reserve,
             .compareAndSetFn = compareAndSet,
             .finishFn = finish,
@@ -1574,6 +1592,52 @@ pub const SystemStateStore = struct {
             dir,
             operation_state.document_name,
             locks.interface(),
+        );
+        return store.read(
+            allocator,
+            operation_state.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    fn inspectActiveLocked(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        state_path: []const u8,
+    ) !?operation_state.OwnedState {
+        const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        const apt_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/apt",
+            .{state_path},
+        );
+        defer allocator.free(apt_path);
+        var dir = openSecureAbsoluteDirectory(
+            self,
+            allocator,
+            apt_path,
+            false,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer dir.close(self.io);
+        var locks: operation_state.SystemLockBackend = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .dir = dir,
+        };
+        const lock = locks.interface();
+        const token = try lock.acquire(self.wait_ms);
+        defer lock.release(token);
+        if (!lock.held(token)) return error.LockLost;
+        const store = try operation_state.Store.init(
+            self.io,
+            dir,
+            operation_state.document_name,
+            lock,
         );
         return store.read(
             allocator,
@@ -3144,6 +3208,61 @@ pub const Engine = struct {
                     &current,
                     "successful lower transaction did not retain its exact ownership token",
                 ),
+        );
+    }
+
+    /// Converts an unexpected post-prepare execution error into an
+    /// evidence-bound recovery result. Integrations must use this instead of
+    /// inferring whether mutation began.
+    pub fn reconcilePreparedError(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        prepared: Preparation,
+    ) !api.Result {
+        var active = self.store.inspectActiveLocked(
+            allocator,
+            prepared.profile_state_path,
+        ) catch return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            prepared.exact_lock,
+            null,
+            null,
+            true,
+            prepared.profile_state_path,
+        );
+        defer if (active) |*owned| owned.deinit();
+        const state = if (active) |owned| owned.state else return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            prepared.profile,
+            prepared.exact_lock,
+            null,
+            null,
+            true,
+            prepared.profile_state_path,
+        );
+        if (!stateMatchesPreparation(state, prepared))
+            return recoveryDiagnostic(
+                allocator,
+                prepared.request,
+                prepared.profile,
+                prepared.exact_lock,
+                null,
+                null,
+                true,
+                prepared.profile_state_path,
+            );
+        return recoveryDiagnostic(
+            allocator,
+            prepared.request,
+            state.profile,
+            state.exact_lock,
+            state.transaction_result,
+            state.root_operation_completion,
+            state.mutation_started,
+            prepared.profile_state_path,
         );
     }
 
@@ -5206,6 +5325,7 @@ fn recoveryDiagnostic(
         message,
     );
     result.profile = profile;
+    result.changed = mutation_started;
     result.evidence = .{
         .exact_lock = lock,
         .transaction_result = transaction,
@@ -6244,9 +6364,9 @@ test "apt_system_orchestrator.test.required_privileged.manifest covers every pri
         }
         cursor = next;
     }
-    try std.testing.expectEqual(@as(usize, 21), tagged_count);
+    try std.testing.expectEqual(@as(usize, 22), tagged_count);
     try std.testing.expectEqual(
-        @as(usize, 17),
+        @as(usize, 18),
         privilege_dependent_count,
     );
 }
@@ -8058,6 +8178,7 @@ const FakeStateStore = struct {
         return .{
             .context = self,
             .readActiveFn = readActive,
+            .inspectActiveLockedFn = readActive,
             .reserveFn = reserve,
             .compareAndSetFn = compareAndSet,
             .finishFn = finish,
@@ -11556,6 +11677,82 @@ test "apt_system_orchestrator.test.required_privileged.production composition in
     );
 }
 
+test "apt_system_orchestrator.test.required_privileged.production CLI reconciliation reads exact active state under lock" {
+    try requirePrivilegedProductionTest();
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-apt-cli-reconciliation-{d}",
+        .{std.os.linux.getpid()},
+    );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(state_path);
+    const attempt_id: [32]u8 = @splat(0x61);
+    var paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        attempt_id,
+    );
+    defer paths.deinit(std.testing.allocator);
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const state_store = store.interface();
+    var states = try reserveVerifyingTestState(
+        std.testing.allocator,
+        state_store,
+        state_path,
+        paths,
+        attempt_id,
+    );
+    defer states.deinit();
+    const prepared: Preparation = .{
+        .request = .{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{"alpha"},
+        },
+        .request_sha256 = @splat(0x53),
+        .profile = states.current.state.profile,
+        .profile_state_path = state_path,
+        .attempt_id = attempt_id,
+        .paths = paths,
+        .exact_lock = states.current.state.exact_lock.?,
+        .review = &.{},
+        .arena = undefined,
+        .backing_allocator = std.testing.allocator,
+    };
+    var engine: Engine = undefined;
+    engine.store = state_store;
+    var result = try engine.reconcilePreparedError(
+        std.testing.allocator,
+        prepared,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expect(result.changed);
+    try std.testing.expectEqual(
+        api.DiagnosticId.recovery_required,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expect(result.evidence.exact_lock != null);
+    try std.testing.expect(result.evidence.transaction_result != null);
+    try std.testing.expect(
+        result.evidence.active_operation_state != null,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.summary,
+        "debz recover --system-profile /profile.json",
+    ) != null);
+}
+
 test "apt_system_orchestrator.test.multi-package prepare makes one plan and one lock without mutation" {
     var harness = Harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -12394,6 +12591,22 @@ test "apt_system_orchestrator.test.post-backend crashes reconcile without a seco
         );
         try std.testing.expect(crash.triggered);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.execute_calls);
+        var diagnostic = try harness.engine.reconcilePreparedError(
+            std.testing.allocator,
+            prepared,
+        );
+        defer diagnostic.deinit();
+        try std.testing.expectEqual(api.Outcome.recovery, diagnostic.outcome);
+        try std.testing.expect(diagnostic.changed);
+        try std.testing.expectEqual(
+            api.DiagnosticId.recovery_required,
+            diagnostic.diagnostics[0].id,
+        );
+        try std.testing.expect(diagnostic.profile != null);
+        try std.testing.expect(diagnostic.evidence.exact_lock != null);
+        try std.testing.expect(
+            diagnostic.evidence.active_operation_state != null,
+        );
         harness.engine.completion_crash = null;
 
         var recovery = switch (try harness.engine.prepareRecovery(

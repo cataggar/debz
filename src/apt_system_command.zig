@@ -27,6 +27,11 @@ pub const Engine = struct {
         orchestrator.RecoveryPreparation,
         bool,
     ) anyerror!api.Result,
+    reconcilePreparedErrorFn: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        orchestrator.Preparation,
+    ) anyerror!api.Result,
 
     pub fn production(engine: *orchestrator.Engine) Engine {
         return .{
@@ -35,6 +40,7 @@ pub const Engine = struct {
             .executeFn = productionExecute,
             .prepareRecoveryFn = productionPrepareRecovery,
             .executeRecoveryFn = productionExecuteRecovery,
+            .reconcilePreparedErrorFn = productionReconcilePreparedError,
         };
     }
 
@@ -74,6 +80,15 @@ pub const Engine = struct {
     ) !api.Result {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
         return engine.executeRecovery(allocator, prepared, confirmed);
+    }
+
+    fn productionReconcilePreparedError(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        prepared: orchestrator.Preparation,
+    ) !api.Result {
+        const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
+        return engine.reconcilePreparedError(allocator, prepared);
     }
 };
 
@@ -177,7 +192,11 @@ pub fn runApt(
                     allocator,
                     prepared.*,
                     true,
-                ) catch try internalFailure(command.request);
+                ) catch try engine.reconcilePreparedErrorFn(
+                    engine.context,
+                    allocator,
+                    prepared.*,
+                );
             defer result.deinit();
             try cli.writeResult(
                 allocator,
@@ -244,7 +263,11 @@ pub fn runRecovery(
                     allocator,
                     recovery.*,
                     true,
-                ) catch try internalFailure(recovery.prepared.request)
+                ) catch try engine.reconcilePreparedErrorFn(
+                    engine.context,
+                    allocator,
+                    recovery.prepared,
+                )
             else
                 try confirmationResult(
                     recovery.prepared,
@@ -361,7 +384,9 @@ const TestContext = struct {
     execute_count: usize = 0,
     recovery_prepare_count: usize = 0,
     recovery_execute_count: usize = 0,
+    mutation_count: usize = 0,
     last_package_count: usize = 0,
+    fail_execute: bool = false,
 
     fn interface(self: *TestContext) Engine {
         return .{
@@ -370,6 +395,7 @@ const TestContext = struct {
             .executeFn = execute,
             .prepareRecoveryFn = prepareRecovery,
             .executeRecoveryFn = executeRecovery,
+            .reconcilePreparedErrorFn = reconcilePreparedError,
         };
     }
 
@@ -418,6 +444,14 @@ const TestContext = struct {
         const self: *TestContext = @ptrCast(@alignCast(context));
         if (!confirmed) return error.UnconfirmedExecution;
         self.execute_count += 1;
+        self.mutation_count += 1;
+        if (self.fail_execute) return error.InjectedPostMutationFailure;
+        return successfulTestResult(prepared);
+    }
+
+    fn successfulTestResult(
+        prepared: orchestrator.Preparation,
+    ) !api.Result {
         return api.complete(.{
             .operation = prepared.request.operation,
             .request_sha256 = prepared.request_sha256,
@@ -474,7 +508,32 @@ const TestContext = struct {
     ) !api.Result {
         const self: *TestContext = @ptrCast(@alignCast(context));
         self.recovery_execute_count += 1;
-        return execute(context, allocator, recovery.prepared, confirmed);
+        _ = allocator;
+        if (!confirmed) return error.UnconfirmedExecution;
+        if (self.fail_execute) return error.InjectedRecoveryDurabilityFailure;
+        return successfulTestResult(recovery.prepared);
+    }
+
+    fn reconcilePreparedError(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        prepared: orchestrator.Preparation,
+    ) !api.Result {
+        var result = try api.failure(
+            prepared.request,
+            .recovery,
+            .recovery_required,
+            "recovery",
+            "recovery required; mutation may have occurred; run debz recover --system-profile /profile.json",
+        );
+        result.changed = true;
+        result.profile = prepared.profile;
+        result.evidence = .{
+            .exact_lock = prepared.exact_lock,
+            .active_operation_state = prepared.paths.active_state,
+        };
+        result = try api.complete(result);
+        return api.ownResult(allocator, result);
     }
 };
 
@@ -788,11 +847,138 @@ test "apt_system_command.test.human recovery confirms exact retained action once
     try std.testing.expectEqual(api.ExitStatus.success, status);
     try std.testing.expectEqual(@as(usize, 1), terminal.call_count);
     try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
-    try std.testing.expectEqual(@as(usize, 1), context.execute_count);
+    try std.testing.expectEqual(@as(usize, 0), context.execute_count);
+    try std.testing.expectEqual(@as(usize, 0), context.mutation_count);
     try std.testing.expect(std.mem.indexOf(
         u8,
         stdout.written(),
         "Recovery action: debz recover --system-profile /profile.json",
+    ) != null);
+}
+
+test "apt_system_command.test.post-mutation execute errors render recovery evidence in human and JSON" {
+    for ([_]cli.OutputFormat{ .human, .json }) |output| {
+        const arguments: []const []const u8 = if (output == .json)
+            &.{
+                "--profile",
+                "/profile.json",
+                "--json",
+                "install",
+                "-y",
+                "alpha",
+            }
+        else
+            &.{
+                "--profile",
+                "/profile.json",
+                "install",
+                "-y",
+                "alpha",
+            };
+        const parsed = switch (cli.parse(arguments)) {
+            .command => |command| command,
+            else => return error.UnexpectedParseResult,
+        };
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .fail_execute = true,
+        };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runApt(
+            std.testing.allocator,
+            parsed,
+            context.interface(),
+            Terminal.unavailable(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.recovery, status);
+        const rendered = if (output == .json)
+            stdout.written()
+        else
+            stderr.written();
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rendered,
+            "recovery_required",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rendered,
+            if (output == .json)
+                "\"active_operation_state\":\"/state/apt/"
+            else
+                "Active operation state: /state/apt/",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rendered,
+            if (output == .json)
+                "\"exact_lock\":{\"path\":\"/state/apt/"
+            else
+                "Exact lock: /state/apt/",
+        ) != null);
+        if (output == .json) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                rendered,
+                "\"changed\":true",
+            ) != null);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+                u8,
+                rendered,
+                "\n",
+            ));
+        }
+
+        context.fail_execute = false;
+        var recovery_terminal: TestTerminal = .{ .answer = .confirmed };
+        const recovery_status = try runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            recovery_terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(
+            api.ExitStatus.success,
+            recovery_status,
+        );
+        try std.testing.expectEqual(@as(usize, 1), context.mutation_count);
+    }
+}
+
+test "apt_system_command.test.recovery execution errors retain recovery-required evidence" {
+    var context: TestContext = .{
+        .allocator = std.testing.allocator,
+        .fail_execute = true,
+    };
+    var terminal: TestTerminal = .{ .answer = .confirmed };
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    const status = try runRecovery(
+        std.testing.allocator,
+        "/profile.json",
+        .human,
+        context.interface(),
+        terminal.interface(),
+        .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+    );
+    try std.testing.expectEqual(api.ExitStatus.recovery, status);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stderr.written(),
+        "mutation may have occurred",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stderr.written(),
+        "active-operation-v1.json",
     ) != null);
 }
 

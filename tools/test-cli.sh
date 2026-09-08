@@ -35,6 +35,60 @@ do
     printf '%s' "$output" | grep -vq 'ignored-secret'
 done
 
+set +e
+"$debz" apt --json update extra >cli-test-stdout 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+test ! -s cli-test-stderr
+test "$(wc -l <cli-test-stdout)" -eq 1
+grep -q 'apt-system-cli-diagnostic.v1' cli-test-stdout
+
+secret='misplaced-json-control-secret'
+for arguments in \
+    "apt update --json" \
+    "apt --profile --json update" \
+    "apt --$secret --json update"
+do
+    set +e
+    "$debz" $arguments >cli-test-stdout 2>cli-test-stderr
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stdout
+    grep -q 'usage error' cli-test-stderr
+    grep -vq "$secret" cli-test-stderr
+done
+
+set +e
+"$debz" recover --system-profile --json >cli-test-stdout 2>cli-test-stderr
+status_code=$?
+set -e
+test "$status_code" -eq 2
+test ! -s cli-test-stdout
+grep -q 'usage error' cli-test-stderr
+
+python3 - "$debz" <<'PY'
+import subprocess
+import sys
+
+debz = sys.argv[1]
+dangerous = "--credential=decisive-help-secret"
+result = subprocess.run(
+    [debz, "apt", "update", "--help", dangerous]
+    + ["ignored"] * 260,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=5,
+    check=False,
+)
+assert result.returncode == 0, result
+assert b"debz apt update" in result.stdout
+assert dangerous.encode() not in result.stdout
+assert not result.stderr
+PY
+
 secret='rejected-cli-secret'
 for arguments in \
     "apt --profile /missing-profile.json --json install --$secret" \

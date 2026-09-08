@@ -505,7 +505,7 @@ fn runAptSystem(
             return;
         },
         .failure => |usage_failure| {
-            if (aptArgumentsRequestJson(arguments.items))
+            if (usage_failure.output == .json)
                 try apt_cli.writeUsageFailureJson(stdout, usage_failure)
             else
                 try apt_cli.writeUsageFailure(stderr, usage_failure);
@@ -539,13 +539,6 @@ fn runAptSystem(
     }
 }
 
-fn aptArgumentsRequestJson(arguments: []const []const u8) bool {
-    for (arguments) |argument| {
-        if (std.mem.eql(u8, argument, "--json")) return true;
-    }
-    return false;
-}
-
 fn runAptSystemRecovery(
     init: std.process.Init,
     args: *std.process.Args.Iterator,
@@ -562,7 +555,7 @@ fn runAptSystemRecovery(
             return;
         },
         .failure => |usage_failure| {
-            if (aptArgumentsRequestJson(arguments.items))
+            if (usage_failure.output == .json)
                 try apt_cli.writeUsageFailureJson(stdout, usage_failure)
             else
                 try apt_cli.writeRecoveryUsageFailure(

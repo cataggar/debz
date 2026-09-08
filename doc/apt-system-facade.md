@@ -82,6 +82,11 @@ debz recover [--json] --system-profile PATH
 Human recovery prepares and renders the retained exact action before the same
 TTY-only confirmation. JSON recovery prepares but never prompts or mutates.
 Malformed recovery syntax is rejected before profile or operation-state I/O.
+Parse failures carry the output mode recognized from the valid canonical
+option prefix. Rejected command arguments, misplaced `--json`, and a
+`--json` token consumed as an invalid profile value cannot switch rendering.
+Decisive help for a recognized command returns before counting or inspecting
+the ignored suffix.
 
 ## Trusted system profile
 
@@ -246,9 +251,9 @@ runner. Install, remove, and upgrade-all preparation instead:
 
 Preparation never executes a package transaction. The caller can render the
 review and either pass explicit confirmation to `execute` or return the
-versioned `confirmation_required` result. `-y` is therefore only a future
-caller's confirmation source; execution always takes conffile behavior from
-the loaded profile.
+versioned `confirmation_required` result. `-y` is therefore only a caller
+confirmation source; execution always takes conffile behavior from the loaded
+profile.
 
 Confirmed execution reloads and revalidates the profile, rereads the active
 state with locked compare-and-set, revalidates the full exact-lock binding
@@ -263,6 +268,15 @@ only install-root spelling supplied to a backend is
 `live_root.logical_root_path`; `/` remains denied by product API v1 and
 `live_root.host_root_allowed` remains false. Root, runtime, lock, or mountpoint
 replacement is surfaced as a typed conflict.
+
+If confirmed execution returns an unexpected transport, verification,
+publication, durability, CAS, or acknowledgment error, the CLI does not infer
+that mutation was absent. It asks the engine to inspect the exact active state
+while holding the state lock and emits an owned recovery result carrying the
+profile, exact lock, active-state path, and any retained transaction or
+completion evidence. A mutation-started state is rendered with `changed=true`
+and the exact `debz recover --system-profile PATH` action. The same
+reconciliation applies to errors during confirmed recovery.
 
 The trusted profile-reference lease is revalidated immediately before every
 read-only route and every plan, download, execute, and recovery workflow call.

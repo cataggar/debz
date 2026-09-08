@@ -260,6 +260,11 @@ pub fn build(b: *std.Build) void {
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
     release_test_step.dependOn(&release_tests.step);
+    const apt_system_schema_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_apt_system_schema.py" },
+    );
+    release_test_step.dependOn(&apt_system_schema_tests.step);
+    test_step.dependOn(&apt_system_schema_tests.step);
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
