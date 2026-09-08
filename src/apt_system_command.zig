@@ -3,22 +3,9 @@ const api = @import("apt_system_api.zig");
 const cli = @import("apt_system_cli.zig");
 const orchestrator = @import("apt_system_orchestrator.zig");
 
-pub const EngineError = error{
-    OutOfMemory,
-    ContractViolation,
-    InvariantViolation,
-};
-
-pub const OperationalFailure = enum {
-    interruption,
-    state_io_or_durability,
-    transport,
-};
-
-pub const ExecutionInvocation = union(enum) {
-    result: api.Result,
-    operational_failure: OperationalFailure,
-};
+pub const EngineError = orchestrator.ExecutionError;
+pub const OperationalFailure = orchestrator.OperationalFailure;
+pub const ExecutionInvocation = orchestrator.ExecutionInvocation;
 
 pub const Engine = struct {
     context: *anyopaque,
@@ -80,21 +67,11 @@ pub const Engine = struct {
         confirmed: bool,
     ) EngineError!ExecutionInvocation {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        const result = engine.execute(
+        return engine.invokeExecute(
             allocator,
             prepared,
             confirmed,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.UnconfirmedExecution => return error.ContractViolation,
-            else => {
-                if (engineBoundaryError(err)) |boundary| return boundary;
-                if (classifyOperationalFailure(err)) |failure|
-                    return .{ .operational_failure = failure };
-                return error.InvariantViolation;
-            },
-        };
-        return .{ .result = result };
+        );
     }
 
     fn productionPrepareRecovery(
@@ -119,21 +96,11 @@ pub const Engine = struct {
         confirmed: bool,
     ) EngineError!ExecutionInvocation {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        const result = engine.executeRecovery(
+        return engine.invokeExecuteRecovery(
             allocator,
             prepared,
             confirmed,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.UnconfirmedExecution => return error.ContractViolation,
-            else => {
-                if (engineBoundaryError(err)) |boundary| return boundary;
-                if (classifyOperationalFailure(err)) |failure|
-                    return .{ .operational_failure = failure };
-                return error.InvariantViolation;
-            },
-        };
-        return .{ .result = result };
+        );
     }
 
     fn productionReconcilePreparedError(
@@ -151,115 +118,6 @@ pub const Engine = struct {
         };
     }
 };
-
-fn engineBoundaryError(err: anyerror) ?EngineError {
-    return switch (err) {
-        error.UnsupportedApiVersion,
-        error.InvalidProfilePath,
-        error.InvalidPackageCount,
-        error.InvalidPackage,
-        error.DuplicatePackage,
-        error.UnconfirmedExecution,
-        error.UnsafeInstallRoot,
-        error.ArchitectureMismatch,
-        error.BackendOperationMismatch,
-        error.InvalidPath,
-        error.UnsupportedPlatform,
-        => error.ContractViolation,
-        error.InvalidInitialState,
-        error.InvalidTransition,
-        error.InvalidGeneration,
-        error.InvalidTimestamp,
-        error.AttemptMismatch,
-        error.MutationEvidenceRollback,
-        error.EvidenceRollback,
-        error.UnexpectedItems,
-        => error.InvariantViolation,
-        else => null,
-    };
-}
-
-fn classifyOperationalFailure(err: anyerror) ?OperationalFailure {
-    return switch (err) {
-        error.InjectedCompletionCrash,
-        error.InjectedProductionChildCrash,
-        error.LiveRootInterrupted,
-        error.LiveRootChildSignaled,
-        => .interruption,
-        error.RootReplaced,
-        error.RuntimeReplaced,
-        error.LockReplaced,
-        error.MountpointReplaced,
-        error.ActiveHostMount,
-        error.TransportReadFailed,
-        error.TransportWriteFailed,
-        error.LiveRootChildFailed,
-        => .transport,
-        error.AccessDenied,
-        error.BrokenPipe,
-        error.CompletionMismatch,
-        error.DeviceBusy,
-        error.DigestMismatch,
-        error.DirectoryNotEmpty,
-        error.DiskQuota,
-        error.DocumentTooLarge,
-        error.FileBusy,
-        error.FileNotFound,
-        error.FileTooBig,
-        error.InjectedActiveReadFailure,
-        error.InjectedDirectorySyncFailure,
-        error.InjectedDurabilityResyncFailure,
-        error.InjectedFinishCrash,
-        error.InjectedFinishFailure,
-        error.InjectedPostRenameFailure,
-        error.InjectedRecoveryRetainFailure,
-        error.InjectedRetainedDirectorySyncFailure,
-        error.InjectedRetainedFileSyncFailure,
-        error.InjectedRetainedPublicationSyncFailure,
-        error.InputOutput,
-        error.InvalidCompletion,
-        error.InvalidDocument,
-        error.InvalidDirectoryHandle,
-        error.InvalidLowerAcknowledgment,
-        error.InvalidOwnershipAcknowledgment,
-        error.InvalidRecoveryAcknowledgment,
-        error.InvalidRetainedEvidence,
-        error.IsDir,
-        error.LockEvidenceMismatch,
-        error.LockLost,
-        error.LowerAcknowledgmentFailed,
-        error.LowerAcknowledgmentMismatch,
-        error.MissingCompletion,
-        error.MissingOwnershipAcknowledgment,
-        error.MissingRecoveryAcknowledgment,
-        error.MissingRecoveryCompletion,
-        error.MissingRecoveryLockVerification,
-        error.NameTooLong,
-        error.NoDevice,
-        error.NoSpaceLeft,
-        error.NotDir,
-        error.NotOpenForReading,
-        error.NotOpenForWriting,
-        error.OperationDirectoryNotDurable,
-        error.OperationUnsupported,
-        error.PathAlreadyExists,
-        error.ProcessFdQuotaExceeded,
-        error.PublicationConflict,
-        error.ReadOnlyFileSystem,
-        error.RecoveryCompletionMismatch,
-        error.RequestDigestMismatch,
-        error.SignalSetupFailed,
-        error.StaleState,
-        error.StateAlreadyExists,
-        error.SymLinkLoop,
-        error.SystemFdQuotaExceeded,
-        error.SystemResources,
-        error.Unexpected,
-        error.WouldBlock,
-        => .state_io_or_durability,
-        else => null,
-    };
-}
 
 pub const Confirmation = enum {
     confirmed,
@@ -435,12 +293,11 @@ pub fn runRecovery(
                         recovery.prepared,
                     ),
                 };
-            } else
-                try confirmationResult(
-                    recovery.prepared,
-                    recovery.action,
-                    if (items) |value| value else &.{},
-                );
+            } else try confirmationResult(
+                recovery.prepared,
+                recovery.action,
+                if (items) |value| value else &.{},
+            );
             defer result.deinit();
             try cli.writeResult(
                 allocator,
@@ -675,7 +532,8 @@ const TestContext = struct {
         if (self.recovery_prepare_unknown)
             return .{ .result = unknownTestResult(
                 allocator,
-                request,
+                profile_path,
+                null,
             ) catch |err| return testEngineError(err) };
         return .{ .ready = .{
             .prepared = testPreparation(
@@ -720,7 +578,8 @@ const TestContext = struct {
         if (self.unknown_reconciliation)
             return unknownTestResult(
                 allocator,
-                prepared.request,
+                prepared.request.profile_path,
+                prepared.request.operation,
             ) catch |err| return testEngineError(err);
         return recoveryTestResult(
             allocator,
@@ -751,16 +610,30 @@ const TestContext = struct {
 
     fn unknownTestResult(
         allocator: std.mem.Allocator,
-        request: api.Request,
+        profile_path: []const u8,
+        requested_operation: ?api.Operation,
     ) !api.Result {
-        var result = try api.failure(
-            request,
-            .recovery,
-            .recovery_required,
-            "recovery",
-            "mutation status unknown; recovery required; run debz recover --system-profile /profile.json",
-        );
-        result.mutation_status = .unknown;
+        const context: api.RecoveryContext = .{
+            .profile_path = profile_path,
+            .requested_operation = requested_operation,
+        };
+        var result: api.Result = .{
+            .operation = .recover,
+            .request_sha256 = try api.recoveryRequestDigest(context),
+            .outcome = .recovery,
+            .exit_status = .recovery,
+            .summary = "mutation status unknown; inspect durable recovery state",
+            .mutation_status = .unknown,
+            .recovery_context = context,
+            .diagnostics = undefined,
+        };
+        result.diagnostics[0] = .{
+            .id = .recovery_required,
+            .outcome = .recovery,
+            .phase = "recovery",
+            .message = result.summary,
+        };
+        result.diagnostic_count = 1;
         result = try api.complete(result);
         return api.ownResult(allocator, result);
     }
@@ -1346,32 +1219,6 @@ test "apt_system_command.test.engine OOM and contract errors bypass reconciliati
         try std.testing.expectEqual(@as(usize, 0), context.reconcile_count);
         try std.testing.expectEqual(@as(usize, 0), context.mutation_count);
     }
-}
-
-test "apt_system_command.test.production boundary reconciles only allowlisted operational errors" {
-    try std.testing.expectEqual(
-        OperationalFailure.interruption,
-        classifyOperationalFailure(error.LiveRootInterrupted).?,
-    );
-    try std.testing.expectEqual(
-        OperationalFailure.transport,
-        classifyOperationalFailure(error.TransportReadFailed).?,
-    );
-    try std.testing.expectEqual(
-        OperationalFailure.state_io_or_durability,
-        classifyOperationalFailure(error.PublicationConflict).?,
-    );
-    try std.testing.expect(classifyOperationalFailure(
-        error.UnclassifiedProgrammerFault,
-    ) == null);
-    try std.testing.expectEqual(
-        EngineError.ContractViolation,
-        engineBoundaryError(error.UnsafeInstallRoot).?,
-    );
-    try std.testing.expectEqual(
-        EngineError.InvariantViolation,
-        engineBoundaryError(error.InvalidTransition).?,
-    );
 }
 
 test "apt_system_command.test.only tagged operational failures invoke reconciliation" {

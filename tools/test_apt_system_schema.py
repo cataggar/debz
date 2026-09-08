@@ -45,8 +45,35 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         cls.request = json.loads(
             (ROOT / "schema/apt-system-request-v1.json").read_text()
         )
+        cls.frozen_request = json.loads(
+            (
+                ROOT
+                / "tools/fixtures/apt-system-request-v1-origin-main.schema.json"
+            ).read_text()
+        )
+        cls.frozen_request_document = json.loads(
+            (
+                ROOT
+                / "tools/fixtures/apt-system-request-v1-origin-main.document.json"
+            ).read_text()
+        )
+        cls.generated_v3_documents = [
+            json.loads(
+                (
+                    ROOT
+                    / "tools/fixtures/apt-system-result-v3-confirmation.document.json"
+                ).read_text()
+            ),
+            json.loads(
+                (
+                    ROOT
+                    / "tools/fixtures/apt-system-result-v3-unknown.document.json"
+                ).read_text()
+            ),
+        ]
         if Registry is not None and Resource is not None:
             v1_resource = Resource.from_contents(cls.v1)
+            request_resource = Resource.from_contents(cls.request)
             registry = Registry().with_resources(
                 [
                     (cls.v1["$id"], v1_resource),
@@ -54,6 +81,12 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                         "https://debz.dev/schema/apt-system-result-v1.json",
                         v1_resource,
                     ),
+                    (cls.request["$id"], request_resource),
+                    (
+                        "https://debz.dev/schema/apt-system-request-v1.json",
+                        request_resource,
+                    ),
+                    ("apt-system-request-v1.json", request_resource),
                 ]
             )
             cls.v2_validator = jsonschema.Draft202012Validator(
@@ -72,6 +105,9 @@ class AptSystemResultSchemaTests(unittest.TestCase):
             store = {
                 cls.v1["$id"]: cls.v1,
                 "https://debz.dev/schema/apt-system-result-v1.json": cls.v1,
+                cls.request["$id"]: cls.request,
+                "https://debz.dev/schema/apt-system-request-v1.json": cls.request,
+                "apt-system-request-v1.json": cls.request,
             }
             cls.v2_validator = jsonschema.Draft202012Validator(
                 cls.v2,
@@ -95,6 +131,9 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                 ),
             )
         cls.request_validator = jsonschema.Draft202012Validator(cls.request)
+        cls.frozen_request_validator = jsonschema.Draft202012Validator(
+            cls.frozen_request
+        )
 
     @staticmethod
     def confirmation() -> dict:
@@ -114,6 +153,7 @@ class AptSystemResultSchemaTests(unittest.TestCase):
             "exit_status": 2,
             "changed": False,
             "mutation_status": "unchanged",
+            "recovery_context": None,
             "summary": "confirmation required",
             "items": [
                 {
@@ -185,6 +225,10 @@ class AptSystemResultSchemaTests(unittest.TestCase):
 
     def test_exactly_one_confirmation_diagnostic_passes(self) -> None:
         self.validate(self.confirmation())
+        wrong_phase = self.confirmation()
+        wrong_phase["diagnostics"][0]["phase"] = "request"
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(wrong_phase)
 
     def test_additional_confirmation_diagnostic_fails(self) -> None:
         document = copy.deepcopy(self.confirmation())
@@ -203,13 +247,15 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(document)
 
-    def test_request_and_result_package_grammar_match_boundaries(self) -> None:
+    def test_request_and_result_package_grammar_preserve_distinct_contracts(self) -> None:
         punctuation = "+-.:="
-        valid = ["a", "Z", "0"] + [f"a{value}" for value in punctuation]
-        invalid = list(punctuation) + ["é", "\x1f", "a/b", "a_"]
-        invalid.append("a" * 256)
+        request_only = ["+", ".", ":", "="]
+        shared_valid = ["a", "Z", "0"] + [
+            f"a{value}" for value in punctuation
+        ]
+        shared_invalid = ["-", "é", "\x1f", "a/b", "a_", "a" * 256]
 
-        for package in valid + invalid:
+        for package in request_only + shared_valid + shared_invalid:
             request = {
                 "schema": "https://debz.dev/schema/apt-system-request-v1",
                 "version": 1,
@@ -222,13 +268,23 @@ class AptSystemResultSchemaTests(unittest.TestCase):
             result = self.list_result(package)
             request_valid = self.request_validator.is_valid(request)
             result_valid = self.v2_validator.is_valid(result)
-            self.assertEqual(request_valid, result_valid, package)
-            self.assertEqual(package in valid, request_valid, package)
+            self.assertEqual(
+                package in request_only + shared_valid,
+                request_valid,
+                package,
+            )
+            self.assertEqual(package in shared_valid, result_valid, package)
 
     def test_unknown_mutation_status_is_v3_without_fabricated_evidence(self) -> None:
         document = self.confirmation()
         document.pop("items")
+        document["operation"] = "recover"
         document["mutation_status"] = "unknown"
+        document["recovery_context"] = {
+            "profile_path": "/profile.json",
+            "requested_operation": None,
+            "action": None,
+        }
         document["profile"] = None
         document["outcome"] = "recovery"
         document["exit_status"] = 8
@@ -256,6 +312,20 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         }
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(document)
+        document["profile"] = None
+        document["recovery_context"]["action"] = (
+            "debz recover --system-profile /profile.json"
+        )
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(document)
+        document["recovery_context"]["action"] = None
+        document["diagnostics"][0]["phase"] = "state"
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(document)
+
+    def test_runtime_generated_v3_documents_validate(self) -> None:
+        for document in self.generated_v3_documents:
+            self.validate(document)
 
     def test_v2_is_frozen_and_cross_validates_old_and_new_consumers(self) -> None:
         self.assertEqual(self.frozen_v2, self.v2)
@@ -273,6 +343,16 @@ class AptSystemResultSchemaTests(unittest.TestCase):
     def test_v3_does_not_reinterpret_list_result_v2(self) -> None:
         with self.assertRaises(jsonschema.ValidationError):
             self.v3_validator.validate(self.list_result())
+
+    def test_request_v1_is_frozen_across_old_and_new_consumers(self) -> None:
+        self.assertEqual(self.frozen_request, self.request)
+        self.request_validator.validate(self.frozen_request_document)
+        self.frozen_request_validator.validate(self.frozen_request_document)
+        for package in ["+alpha", ".alpha", ":alpha", "=alpha"]:
+            document = copy.deepcopy(self.frozen_request_document)
+            document["packages"] = [package]
+            self.request_validator.validate(document)
+            self.frozen_request_validator.validate(document)
 
 
 if __name__ == "__main__":

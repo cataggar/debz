@@ -10,6 +10,8 @@ const system_profile = @import("system_profile.zig");
 
 pub const api_version: u32 = 1;
 pub const request_schema_id = "https://debz.dev/schema/apt-system-request-v1";
+pub const recovery_request_schema_id =
+    "https://debz.dev/schema/apt-system-recovery-request-v1";
 pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
 pub const result_items_schema_id =
     "https://debz.dev/schema/apt-system-result-v2";
@@ -33,11 +35,12 @@ pub const Operation = enum {
     remove,
     upgrade,
     list_installed,
+    recover,
 
     pub fn mutatesRoot(self: Operation) bool {
         return switch (self) {
             .install, .remove, .upgrade => true,
-            .update, .list_installed => false,
+            .update, .list_installed, .recover => false,
         };
     }
 };
@@ -224,6 +227,12 @@ pub const Evidence = struct {
     active_operation_state: ?[]const u8 = null,
 };
 
+pub const RecoveryContext = struct {
+    profile_path: []const u8,
+    requested_operation: ?Operation = null,
+    action: ?[]const u8 = null,
+};
+
 pub const Item = struct {
     package: []const u8,
     version: ?[]const u8 = null,
@@ -240,6 +249,7 @@ pub const Result = struct {
     exit_status: ExitStatus,
     changed: bool = false,
     mutation_status: ?MutationStatus = null,
+    recovery_context: ?RecoveryContext = null,
     summary: []const u8,
     items: []const Item = &.{},
     evidence: Evidence = .{},
@@ -428,6 +438,11 @@ pub fn ownResult(
         };
     }
     result.items = items;
+    if (input.recovery_context) |context| result.recovery_context = .{
+        .profile_path = try owned.dupe(u8, context.profile_path),
+        .requested_operation = context.requested_operation,
+        .action = try dupeOptional(owned, context.action),
+    };
     if (input.profile) |profile| result.profile = .{
         .path = try owned.dupe(u8, profile.path),
         .sha256 = profile.sha256,
@@ -444,6 +459,7 @@ pub fn ownResult(
 
 pub fn validateRequest(request: Request) !void {
     if (request.api_version != api_version) return error.UnsupportedApiVersion;
+    if (request.operation == .recover) return error.InvalidOperation;
     if (!absolute_path.nonRootBounded(
         request.profile_path,
         maximum_path_bytes,
@@ -453,10 +469,11 @@ pub fn validateRequest(request: Request) !void {
         .install, .remove => request.packages.len != 0 and
             request.packages.len <= maximum_packages,
         .update, .upgrade, .list_installed => request.packages.len == 0,
+        .recover => false,
     };
     if (!count_valid) return error.InvalidPackageCount;
     for (request.packages, 0..) |package, index| {
-        if (!validPackage(package)) return error.InvalidPackage;
+        if (!validRequestPackage(package)) return error.InvalidPackage;
         for (request.packages[0..index]) |previous|
             if (std.mem.eql(u8, package, previous))
                 return error.DuplicatePackage;
@@ -470,21 +487,39 @@ pub fn validateResult(result: Result) !void {
     if (result.items.len > maximum_result_items) return error.TooManyItems;
     if (result.items.len != 0 and !resultAllowsItems(result))
         return error.UnexpectedItems;
+    if (result.recovery_context != null and result.mutation_status == null)
+        return error.InvalidRecoveryContext;
     if (result.mutation_status) |status| switch (status) {
         .unknown => {
-            if (result.changed or result.outcome != .recovery or
+            if (result.operation != .recover or
+                result.items.len != 0 or
+                result.changed or result.outcome != .recovery or
                 result.profile != null or
                 result.evidence.exact_lock != null or
                 result.evidence.transaction_result != null or
                 result.evidence.root_operation_completion != null or
                 result.evidence.active_operation_state != null or
+                result.recovery_context == null or
+                result.recovery_context.?.action != null or
                 result.diagnostic_count != 1 or
-                result.diagnostics[0].id != .recovery_required)
+                result.diagnostics[0].id != .recovery_required or
+                result.diagnostics[0].phase == null or
+                !std.mem.eql(
+                    u8,
+                    result.diagnostics[0].phase.?,
+                    "recovery",
+                ))
                 return error.InvalidMutationStatus;
+            try validateRecoveryContext(result.recovery_context.?);
+            if (!std.mem.eql(
+                u8,
+                &result.request_sha256,
+                &(try recoveryRequestDigest(result.recovery_context.?)),
+            )) return error.InvalidRecoveryContext;
         },
     };
     for (result.items) |item| {
-        if (!validPackage(item.package)) return error.InvalidItem;
+        if (!validResultPackage(item.package)) return error.InvalidItem;
         if (item.version) |version|
             if (!validText(version, 1024)) return error.InvalidItem;
         if (item.architecture) |architecture|
@@ -537,9 +572,18 @@ fn resultAllowsItems(result: Result) bool {
     if (result.operation == .list_installed) return true;
     if (!result.operation.mutatesRoot() or
         result.outcome != .usage or
+        result.changed or
+        result.mutation_status != null or
+        result.recovery_context != null or
         result.diagnostic_count != 1)
         return false;
-    return result.diagnostics[0].id == .confirmation_required;
+    return result.diagnostics[0].id == .confirmation_required and
+        result.diagnostics[0].phase != null and
+        std.mem.eql(
+            u8,
+            result.diagnostics[0].phase.?,
+            "confirmation",
+        );
 }
 
 pub fn validateCompleteResult(result: Result) !void {
@@ -554,6 +598,22 @@ pub fn validateProfileBinding(profile: ProfileBinding) !void {
         maximum_path_bytes,
     ))
         return error.InvalidProfileBinding;
+}
+
+fn validateRecoveryContext(context: RecoveryContext) !void {
+    if (!absolute_path.nonRootBounded(
+        context.profile_path,
+        maximum_path_bytes,
+    )) return error.InvalidRecoveryContext;
+    if (context.requested_operation) |operation|
+        if (operation == .recover)
+            return error.InvalidRecoveryContext;
+    if (context.action) |action| {
+        const prefix = "debz recover --system-profile ";
+        if (!std.mem.startsWith(u8, action, prefix) or
+            !std.mem.eql(u8, action[prefix.len..], context.profile_path))
+            return error.InvalidRecoveryContext;
+    }
 }
 
 pub fn validateEvidence(evidence: Evidence) !void {
@@ -595,7 +655,16 @@ fn exitStatus(outcome: Outcome) ExitStatus {
     };
 }
 
-fn validPackage(package: []const u8) bool {
+fn validRequestPackage(package: []const u8) bool {
+    if (package.len == 0 or package.len > 255 or package[0] == '-') return false;
+    for (package) |byte|
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or
+            byte == '.' or byte == ':' or byte == '='))
+            return false;
+    return true;
+}
+
+fn validResultPackage(package: []const u8) bool {
     if (package.len == 0 or package.len > 255 or
         !std.ascii.isAlphanumeric(package[0]))
         return false;
@@ -648,6 +717,33 @@ fn requestDigestUnchecked(request: Request) [32]u8 {
     writeRequest(request, &sink.writer) catch unreachable;
     sink.writer.flush() catch unreachable;
     return sink.hasher.finalResult();
+}
+
+pub fn recoveryRequestDigest(context: RecoveryContext) ![32]u8 {
+    try validateRecoveryContext(context);
+    var buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(
+        &buffer,
+    );
+    writeRecoveryRequest(context, &sink.writer) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn writeRecoveryRequest(
+    context: RecoveryContext,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeAll("{\"schema\":");
+    try writeString(writer, recovery_request_schema_id);
+    try writer.writeAll(",\"version\":1,\"profile_path\":");
+    try writeString(writer, context.profile_path);
+    try writer.writeAll(",\"requested_operation\":");
+    if (context.requested_operation) |operation|
+        try writeString(writer, @tagName(operation))
+    else
+        try writer.writeAll("null");
+    try writer.writeByte('}');
 }
 
 fn writeRequest(request: Request, writer: *std.Io.Writer) !void {
@@ -734,6 +830,19 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
             else
                 "unchanged",
         );
+        try writer.writeAll(",\"recovery_context\":");
+        if (result.recovery_context) |context| {
+            try writer.writeAll("{\"profile_path\":");
+            try writeString(writer, context.profile_path);
+            try writer.writeAll(",\"requested_operation\":");
+            if (context.requested_operation) |operation|
+                try writeString(writer, @tagName(operation))
+            else
+                try writer.writeAll("null");
+            try writer.writeAll(",\"action\":");
+            try writeOptionalString(writer, context.action);
+            try writer.writeByte('}');
+        } else try writer.writeAll("null");
     }
     try writer.writeAll(",\"summary\":");
     try writeString(writer, result.summary);
@@ -779,7 +888,10 @@ const ResultWireVersion = enum {
 };
 
 fn resultWireVersion(result: Result) ResultWireVersion {
-    if (result.mutation_status != null) return .v3;
+    if (result.mutation_status != null or
+        result.recovery_context != null or
+        result.operation == .recover)
+        return .v3;
     if (result.items.len == 0) return .v1;
     return if (result.operation == .list_installed) .v2 else .v3;
 }
@@ -1407,6 +1519,17 @@ test "apt_system_api.test.item-bearing results are owned and bind the canonical 
         std.testing.allocator,
     );
     defer std.testing.allocator.free(confirmation_document);
+    const confirmation_fixture = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v3-confirmation.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(confirmation_fixture);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, confirmation_fixture, "\r\n"),
+        confirmation_document,
+    );
     try std.testing.expect(std.mem.indexOf(
         u8,
         confirmation_document,
@@ -1417,6 +1540,12 @@ test "apt_system_api.test.item-bearing results are owned and bind the canonical 
         confirmation_document,
         "\"mutation_status\":\"unchanged\"",
     ) != null);
+    confirmation.changed = true;
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(confirmation),
+    );
+    confirmation.changed = false;
     confirmation.diagnostic_count = 2;
     confirmation.diagnostics[1] = confirmation.diagnostics[0];
     try std.testing.expectError(
@@ -1463,19 +1592,71 @@ test "apt_system_api.test.result v2 canonical bytes and digest remain frozen" {
     ) == null);
 }
 
-test "apt_system_api.test.package grammar requires alphanumeric first byte across requests and items" {
-    const valid = [_][]const u8{
+test "apt_system_api.test.request v1 canonical bytes and schema remain frozen" {
+    const request: Request = .{
+        .operation = .install,
+        .profile_path = "/profile.json",
+        .packages = &.{"+alpha"},
+    };
+    const canonical = try request.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    const frozen_document = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-request-v1-origin-main.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen_document);
+    try std.testing.expectEqualStrings(frozen_document, canonical);
+    var decoded = try decodeRequest(std.testing.allocator, frozen_document);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(
+        "+alpha",
+        decoded.request.packages[0],
+    );
+    const schema = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-request-v1.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(schema);
+    const frozen_schema = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-request-v1-origin-main.schema.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen_schema);
+    try std.testing.expectEqualStrings(frozen_schema, schema);
+}
+
+test "apt_system_api.test.request v1 and result item package grammars remain distinct" {
+    const result_valid = [_][]const u8{
         "a", "Z", "0", "a+", "a-", "a.", "a:", "a=",
     };
-    const invalid = [_][]const u8{
+    const result_invalid = [_][]const u8{
         "+a", "-a", ".a", ":a", "=a", "a_b", "a/b", "\xc3\xa9", "\x1f",
     };
-    for (valid) |package| {
+    const request_valid = [_][]const u8{
+        "a", "+a", ".a", ":a", "=a", "a+", "a-", "a.", "a:", "a=",
+    };
+    const request_invalid = [_][]const u8{
+        "-a", "a_b", "a/b", "\xc3\xa9", "\x1f",
+    };
+    for (request_valid) |package|
         try validateRequest(.{
             .operation = .install,
             .profile_path = "/profile.json",
             .packages = &.{package},
         });
+    for (request_invalid) |package|
+        try std.testing.expectError(error.InvalidPackage, validateRequest(.{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{package},
+        }));
+    for (result_valid) |package| {
         const result = try complete(.{
             .operation = .list_installed,
             .request_sha256 = @splat(0x11),
@@ -1502,12 +1683,7 @@ test "apt_system_api.test.package grammar requires alphanumeric first byte acros
             "\"mutation_status\"",
         ) == null);
     }
-    for (invalid) |package| {
-        try std.testing.expectError(error.InvalidPackage, validateRequest(.{
-            .operation = .install,
-            .profile_path = "/profile.json",
-            .packages = &.{package},
-        }));
+    for (result_invalid) |package|
         try std.testing.expectError(error.InvalidItem, validateResult(.{
             .operation = .list_installed,
             .request_sha256 = @splat(0x11),
@@ -1521,7 +1697,6 @@ test "apt_system_api.test.package grammar requires alphanumeric first byte acros
             .summary = "installed",
             .items = &.{.{ .package = package }},
         }));
-    }
     const too_long = "a" ** 256;
     try std.testing.expectError(error.InvalidPackage, validateRequest(.{
         .operation = .install,
@@ -1531,22 +1706,41 @@ test "apt_system_api.test.package grammar requires alphanumeric first byte acros
 }
 
 test "apt_system_api.test.unknown mutation status rejects all unverified evidence" {
-    const request: Request = .{
-        .operation = .install,
+    const context: RecoveryContext = .{
         .profile_path = "/profile.json",
-        .packages = &.{"alpha"},
+        .requested_operation = .install,
     };
-    var unknown = try failure(
-        request,
-        .recovery,
-        .recovery_required,
-        "recovery",
-        "mutation status unknown",
-    );
-    unknown.mutation_status = .unknown;
+    var unknown: Result = .{
+        .operation = .recover,
+        .request_sha256 = try recoveryRequestDigest(context),
+        .outcome = .recovery,
+        .exit_status = .recovery,
+        .summary = "mutation status unknown",
+        .mutation_status = .unknown,
+        .recovery_context = context,
+        .diagnostics = undefined,
+    };
+    unknown.diagnostics[0] = .{
+        .id = .recovery_required,
+        .outcome = .recovery,
+        .phase = "recovery",
+        .message = "mutation status unknown",
+    };
+    unknown.diagnostic_count = 1;
     const completed = try complete(unknown);
     const document = try completed.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(document);
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v3-unknown.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(fixture);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, fixture, "\r\n"),
+        document,
+    );
     try std.testing.expect(std.mem.indexOf(
         u8,
         document,
@@ -1556,6 +1750,16 @@ test "apt_system_api.test.unknown mutation status rejects all unverified evidenc
         u8,
         document,
         "\"mutation_status\":\"unknown\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"operation\":\"recover\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"recovery_context\":{\"profile_path\":\"/profile.json\",\"requested_operation\":\"install\",\"action\":null}",
     ) != null);
     unknown.profile = .{
         .path = "/profile.json",
@@ -1567,7 +1771,23 @@ test "apt_system_api.test.unknown mutation status rejects all unverified evidenc
         validateResult(unknown),
     );
     unknown.profile = null;
+    unknown.items = &.{.{ .package = "alpha" }};
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(unknown),
+    );
+    unknown.items = &.{};
     unknown.diagnostics[0].id = .internal_error;
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
+    );
+    unknown.diagnostics[0].id = .recovery_required;
+    unknown.recovery_context = .{
+        .profile_path = "/profile.json",
+        .requested_operation = .install,
+        .action = "debz recover --system-profile /profile.json",
+    };
     try std.testing.expectError(
         error.InvalidMutationStatus,
         validateResult(unknown),

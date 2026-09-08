@@ -15,6 +15,7 @@
     "exit_status",
     "changed",
     "mutation_status",
+    "recovery_context",
     "summary",
     "evidence",
     "diagnostics",
@@ -25,7 +26,7 @@
     "version": { "const": 3 },
     "api_version": { "const": 1 },
     "operation": {
-      "$ref": "apt-system-result-v1.json#/$defs/operation"
+      "enum": ["update", "install", "remove", "upgrade", "list_installed", "recover"]
     },
     "request_sha256": {
       "$ref": "apt-system-result-v1.json#/$defs/sha256"
@@ -45,6 +46,14 @@
     "changed": { "type": "boolean" },
     "mutation_status": {
       "enum": ["unchanged", "unknown"]
+    },
+    "recovery_context": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/recoveryContext"
+        },
+        { "type": "null" }
+      ]
     },
     "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "items": {
@@ -89,14 +98,16 @@
             "outcome": { "const": "usage" },
             "changed": { "const": false },
             "mutation_status": { "const": "unchanged" },
+            "recovery_context": { "type": "null" },
             "diagnostics": {
               "minItems": 1,
               "maxItems": 1,
               "contains": {
                 "properties": {
-                  "id": { "const": "confirmation_required" }
+                  "id": { "const": "confirmation_required" },
+                  "phase": { "const": "confirmation" }
                 },
-                "required": ["id"]
+                "required": ["id", "phase"]
               }
             }
           },
@@ -104,9 +115,20 @@
         },
         {
           "properties": {
+            "operation": { "const": "recover" },
             "outcome": { "const": "recovery" },
             "changed": { "const": false },
             "mutation_status": { "const": "unknown" },
+            "recovery_context": {
+              "allOf": [
+                { "$ref": "#/$defs/recoveryContext" },
+                {
+                  "properties": {
+                    "action": { "type": "null" }
+                  }
+                }
+              ]
+            },
             "profile": { "type": "null" },
             "evidence": {
               "properties": {
@@ -121,9 +143,10 @@
               "maxItems": 1,
               "contains": {
                 "properties": {
-                  "id": { "const": "recovery_required" }
+                  "id": { "const": "recovery_required" },
+                  "phase": { "const": "recovery" }
                 },
-                "required": ["id"]
+                "required": ["id", "phase"]
               }
             }
           },
@@ -133,6 +156,35 @@
     }
   ],
   "$defs": {
+    "recoveryContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_path", "requested_operation", "action"],
+      "properties": {
+        "profile_path": {
+          "$ref": "apt-system-request-v1.json#/$defs/absolutePath"
+        },
+        "requested_operation": {
+          "oneOf": [
+            {
+              "enum": ["update", "install", "remove", "upgrade", "list_installed"]
+            },
+            { "type": "null" }
+          ]
+        },
+        "action": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "pattern": "^debz recover --system-profile /"
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
     "item": {
       "type": "object",
       "additionalProperties": false,

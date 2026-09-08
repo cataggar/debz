@@ -183,7 +183,12 @@ exactly compatible with the original result-v2 contract. No
 only for an item-bearing mutating `confirmation_required` review or an
 itemless fail-closed result with `mutation_status: "unknown"`. It cannot
 reinterpret a `list_installed` result. All item and status fields participate
-in the canonical result digest. Runtime validation also measures the complete canonical
+in the canonical result digest. An UNKNOWN result uses operation `recover`
+with a digest-bound recovery context containing only the requested profile
+path and, when known, the original requested operation. Its action is null:
+without verified active evidence it must give restoration/investigation
+guidance rather than loop by recommending the same recovery command. Runtime
+validation also measures the complete canonical
 encoding and rejects any result over the 256 KiB document ceiling, even when
 every individual item and the item count are otherwise valid.
 Production refresh repository-detail items are validated at the product
@@ -281,25 +286,35 @@ publication, durability, CAS, or acknowledgment error, the CLI does not infer
 that mutation was absent. It asks the engine to inspect the exact active state
 while holding the state lock and emits an owned recovery result carrying the
 profile, exact lock, active-state path, and any retained transaction or
-completion evidence. A mutation-started state is rendered with `changed=true`
-and the exact `debz recover --system-profile PATH` action. The same
-reconciliation applies to errors during confirmed recovery.
+completion evidence. `changed=true` requires either deeply verified completion
+evidence or a matching outer profile/lock together with an exact lower
+ownership marker and root-operation record that bind the same attempt,
+semantic workflow request, and observed mutation. A marker acknowledgment ID
+or outer `mutation_started` bit alone is never mutation proof. The exact
+`debz recover --system-profile PATH` action is emitted only with that verified
+actionable evidence. The same reconciliation applies to errors during
+confirmed recovery.
 
 If durable state inspection is unavailable, corrupt, absent, or foreign and
 no exact lower owner proves mutation, result v3 reports
 `mutation_status: "unknown"`, carries no unverified profile, lock, or active
 state evidence, and human output says `Changed: unknown (recovery required)`.
 A matching durable pre-mutation outer state plus a provably clean lower state
-is the only path that reports a clean internal failure. Recovery preparation
+is the only path that reports a clean internal failure. That proof publishes a
+root-locked exact-owner exclusion and then rechecks the identical outer
+generation and digest under its state lock before finalizing; a concurrent
+advance yields UNKNOWN. Recovery preparation
 uses the same fail-closed distinction instead of converting state I/O errors
 to a generic internal diagnostic.
-The command adapter reconciles only explicitly tagged interruption,
-transport, and state-durability failures. Allocation, invariant, and contract
-errors propagate to the internal-failure boundary and never fabricate recovery
-evidence.
+Production execution reconciles lock, state, transport, interruption, and
+durability failures at the engine boundary where durable context remains
+available. Allocation, invariant, and contract errors propagate to the
+internal-failure boundary and never fabricate recovery evidence.
 
-Package selectors and item names share one grammar: the first byte is ASCII
-alphanumeric, and remaining bytes are ASCII alphanumeric or one of
+Request-v1 package selectors retain their frozen grammar: any nonempty
+sequence of ASCII alphanumeric bytes or `+ - . : =` is accepted except a
+leading `-`. Result-v2/v3 item names are deliberately stricter: the first byte
+must be ASCII alphanumeric, and remaining bytes may additionally be one of
 `+ - . : =`.
 
 The trusted profile-reference lease is revalidated immediately before every
