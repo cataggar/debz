@@ -3,35 +3,52 @@ const api = @import("apt_system_api.zig");
 const cli = @import("apt_system_cli.zig");
 const orchestrator = @import("apt_system_orchestrator.zig");
 
+pub const EngineError = error{
+    OutOfMemory,
+    ContractViolation,
+    InvariantViolation,
+};
+
+pub const OperationalFailure = enum {
+    interruption,
+    state_io_or_durability,
+    transport,
+};
+
+pub const ExecutionInvocation = union(enum) {
+    result: api.Result,
+    operational_failure: OperationalFailure,
+};
+
 pub const Engine = struct {
     context: *anyopaque,
     prepareFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         api.Request,
-    ) anyerror!orchestrator.PrepareOutcome,
+    ) EngineError!orchestrator.PrepareOutcome,
     executeFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         orchestrator.Preparation,
         bool,
-    ) anyerror!api.Result,
+    ) EngineError!ExecutionInvocation,
     prepareRecoveryFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         []const u8,
-    ) anyerror!orchestrator.RecoveryPrepareOutcome,
+    ) EngineError!orchestrator.RecoveryPrepareOutcome,
     executeRecoveryFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         orchestrator.RecoveryPreparation,
         bool,
-    ) anyerror!api.Result,
+    ) EngineError!ExecutionInvocation,
     reconcilePreparedErrorFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         orchestrator.Preparation,
-    ) anyerror!api.Result,
+    ) EngineError!api.Result,
 
     pub fn production(engine: *orchestrator.Engine) Engine {
         return .{
@@ -48,9 +65,12 @@ pub const Engine = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         request: api.Request,
-    ) !orchestrator.PrepareOutcome {
+    ) EngineError!orchestrator.PrepareOutcome {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.prepare(allocator, request);
+        return engine.prepare(allocator, request) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvariantViolation,
+        };
     }
 
     fn productionExecute(
@@ -58,18 +78,38 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         prepared: orchestrator.Preparation,
         confirmed: bool,
-    ) !api.Result {
+    ) EngineError!ExecutionInvocation {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.execute(allocator, prepared, confirmed);
+        const result = engine.execute(
+            allocator,
+            prepared,
+            confirmed,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnconfirmedExecution => return error.ContractViolation,
+            else => {
+                if (engineBoundaryError(err)) |boundary| return boundary;
+                if (classifyOperationalFailure(err)) |failure|
+                    return .{ .operational_failure = failure };
+                return error.InvariantViolation;
+            },
+        };
+        return .{ .result = result };
     }
 
     fn productionPrepareRecovery(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         profile_path: []const u8,
-    ) !orchestrator.RecoveryPrepareOutcome {
+    ) EngineError!orchestrator.RecoveryPrepareOutcome {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.prepareRecovery(allocator, profile_path);
+        return engine.prepareRecovery(
+            allocator,
+            profile_path,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvariantViolation,
+        };
     }
 
     fn productionExecuteRecovery(
@@ -77,20 +117,149 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         prepared: orchestrator.RecoveryPreparation,
         confirmed: bool,
-    ) !api.Result {
+    ) EngineError!ExecutionInvocation {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.executeRecovery(allocator, prepared, confirmed);
+        const result = engine.executeRecovery(
+            allocator,
+            prepared,
+            confirmed,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnconfirmedExecution => return error.ContractViolation,
+            else => {
+                if (engineBoundaryError(err)) |boundary| return boundary;
+                if (classifyOperationalFailure(err)) |failure|
+                    return .{ .operational_failure = failure };
+                return error.InvariantViolation;
+            },
+        };
+        return .{ .result = result };
     }
 
     fn productionReconcilePreparedError(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         prepared: orchestrator.Preparation,
-    ) !api.Result {
+    ) EngineError!api.Result {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
-        return engine.reconcilePreparedError(allocator, prepared);
+        return engine.reconcilePreparedError(
+            allocator,
+            prepared,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvariantViolation,
+        };
     }
 };
+
+fn engineBoundaryError(err: anyerror) ?EngineError {
+    return switch (err) {
+        error.UnsupportedApiVersion,
+        error.InvalidProfilePath,
+        error.InvalidPackageCount,
+        error.InvalidPackage,
+        error.DuplicatePackage,
+        error.UnconfirmedExecution,
+        error.UnsafeInstallRoot,
+        error.ArchitectureMismatch,
+        error.BackendOperationMismatch,
+        error.InvalidPath,
+        error.UnsupportedPlatform,
+        => error.ContractViolation,
+        error.InvalidInitialState,
+        error.InvalidTransition,
+        error.InvalidGeneration,
+        error.InvalidTimestamp,
+        error.AttemptMismatch,
+        error.MutationEvidenceRollback,
+        error.EvidenceRollback,
+        error.UnexpectedItems,
+        => error.InvariantViolation,
+        else => null,
+    };
+}
+
+fn classifyOperationalFailure(err: anyerror) ?OperationalFailure {
+    return switch (err) {
+        error.InjectedCompletionCrash,
+        error.InjectedProductionChildCrash,
+        error.LiveRootInterrupted,
+        error.LiveRootChildSignaled,
+        => .interruption,
+        error.RootReplaced,
+        error.RuntimeReplaced,
+        error.LockReplaced,
+        error.MountpointReplaced,
+        error.ActiveHostMount,
+        error.TransportReadFailed,
+        error.TransportWriteFailed,
+        error.LiveRootChildFailed,
+        => .transport,
+        error.AccessDenied,
+        error.BrokenPipe,
+        error.CompletionMismatch,
+        error.DeviceBusy,
+        error.DigestMismatch,
+        error.DirectoryNotEmpty,
+        error.DiskQuota,
+        error.DocumentTooLarge,
+        error.FileBusy,
+        error.FileNotFound,
+        error.FileTooBig,
+        error.InjectedActiveReadFailure,
+        error.InjectedDirectorySyncFailure,
+        error.InjectedDurabilityResyncFailure,
+        error.InjectedFinishCrash,
+        error.InjectedFinishFailure,
+        error.InjectedPostRenameFailure,
+        error.InjectedRecoveryRetainFailure,
+        error.InjectedRetainedDirectorySyncFailure,
+        error.InjectedRetainedFileSyncFailure,
+        error.InjectedRetainedPublicationSyncFailure,
+        error.InputOutput,
+        error.InvalidCompletion,
+        error.InvalidDocument,
+        error.InvalidDirectoryHandle,
+        error.InvalidLowerAcknowledgment,
+        error.InvalidOwnershipAcknowledgment,
+        error.InvalidRecoveryAcknowledgment,
+        error.InvalidRetainedEvidence,
+        error.IsDir,
+        error.LockEvidenceMismatch,
+        error.LockLost,
+        error.LowerAcknowledgmentFailed,
+        error.LowerAcknowledgmentMismatch,
+        error.MissingCompletion,
+        error.MissingOwnershipAcknowledgment,
+        error.MissingRecoveryAcknowledgment,
+        error.MissingRecoveryCompletion,
+        error.MissingRecoveryLockVerification,
+        error.NameTooLong,
+        error.NoDevice,
+        error.NoSpaceLeft,
+        error.NotDir,
+        error.NotOpenForReading,
+        error.NotOpenForWriting,
+        error.OperationDirectoryNotDurable,
+        error.OperationUnsupported,
+        error.PathAlreadyExists,
+        error.ProcessFdQuotaExceeded,
+        error.PublicationConflict,
+        error.ReadOnlyFileSystem,
+        error.RecoveryCompletionMismatch,
+        error.RequestDigestMismatch,
+        error.SignalSetupFailed,
+        error.StaleState,
+        error.StateAlreadyExists,
+        error.SymLinkLoop,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        error.Unexpected,
+        error.WouldBlock,
+        => .state_io_or_durability,
+        else => null,
+    };
+}
 
 pub const Confirmation = enum {
     confirmed,
@@ -175,17 +344,22 @@ pub fn runApt(
                     null,
                     if (items) |value| value else &.{},
                 )
-            else
-                engine.executeFn(
+            else result: {
+                const invocation = try engine.executeFn(
                     engine.context,
                     allocator,
                     prepared.*,
                     true,
-                ) catch try engine.reconcilePreparedErrorFn(
-                    engine.context,
-                    allocator,
-                    prepared.*,
                 );
+                break :result switch (invocation) {
+                    .result => |value| value,
+                    .operational_failure => try engine.reconcilePreparedErrorFn(
+                        engine.context,
+                        allocator,
+                        prepared.*,
+                    ),
+                };
+            };
             defer result.deinit();
             try cli.writeResult(
                 allocator,
@@ -246,18 +420,22 @@ pub fn runRecovery(
             else
                 null;
             defer if (items) |value| allocator.free(value);
-            var result = if (confirmed)
-                engine.executeRecoveryFn(
+            var result = if (confirmed) result: {
+                const invocation = try engine.executeRecoveryFn(
                     engine.context,
                     allocator,
                     recovery.*,
                     true,
-                ) catch try engine.reconcilePreparedErrorFn(
-                    engine.context,
-                    allocator,
-                    recovery.prepared,
-                )
-            else
+                );
+                break :result switch (invocation) {
+                    .result => |value| value,
+                    .operational_failure => try engine.reconcilePreparedErrorFn(
+                        engine.context,
+                        allocator,
+                        recovery.prepared,
+                    ),
+                };
+            } else
                 try confirmationResult(
                     recovery.prepared,
                     recovery.action,
@@ -366,9 +544,12 @@ const TestContext = struct {
     mutation_count: usize = 0,
     last_package_count: usize = 0,
     fail_execute: bool = false,
+    execute_engine_error: ?EngineError = null,
+    operational_failure: ?OperationalFailure = null,
     return_recovery_result: bool = false,
     unknown_reconciliation: bool = false,
     recovery_prepare_unknown: bool = false,
+    reconcile_count: usize = 0,
 
     fn interface(self: *TestContext) Engine {
         return .{
@@ -385,7 +566,7 @@ const TestContext = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         request: api.Request,
-    ) !orchestrator.PrepareOutcome {
+    ) EngineError!orchestrator.PrepareOutcome {
         const self: *TestContext = @ptrCast(@alignCast(context));
         self.prepare_count += 1;
         self.last_package_count = request.packages.len;
@@ -399,9 +580,10 @@ const TestContext = struct {
                 }}
             else
                 &.{};
-            return .{ .result = try api.complete(.{
+            return .{ .result = api.complete(.{
                 .operation = request.operation,
-                .request_sha256 = try request.digest(),
+                .request_sha256 = request.digest() catch |err|
+                    return testEngineError(err),
                 .profile = .{
                     .path = request.profile_path,
                     .sha256 = @splat(0x21),
@@ -412,9 +594,12 @@ const TestContext = struct {
                 .summary = "read-only result",
                 .items = items,
                 .diagnostics = undefined,
-            }) };
+            }) catch |err| return testEngineError(err) };
         }
-        return .{ .ready = try testPreparation(allocator, request) };
+        return .{ .ready = testPreparation(
+            allocator,
+            request,
+        ) catch |err| return testEngineError(err) };
     }
 
     fn execute(
@@ -422,15 +607,24 @@ const TestContext = struct {
         allocator: std.mem.Allocator,
         prepared: orchestrator.Preparation,
         confirmed: bool,
-    ) !api.Result {
+    ) EngineError!ExecutionInvocation {
         const self: *TestContext = @ptrCast(@alignCast(context));
-        if (!confirmed) return error.UnconfirmedExecution;
+        if (!confirmed) return error.ContractViolation;
         self.execute_count += 1;
+        if (self.execute_engine_error) |err| return err;
         self.mutation_count += 1;
-        if (self.fail_execute) return error.InjectedPostMutationFailure;
+        if (self.operational_failure) |failure|
+            return .{ .operational_failure = failure };
+        if (self.fail_execute)
+            return .{ .operational_failure = .state_io_or_durability };
         if (self.return_recovery_result)
-            return recoveryTestResult(allocator, prepared);
-        return successfulTestResult(prepared);
+            return .{ .result = recoveryTestResult(
+                allocator,
+                prepared,
+            ) catch |err| return testEngineError(err) };
+        return .{ .result = successfulTestResult(
+            prepared,
+        ) catch |err| return testEngineError(err) };
     }
 
     fn successfulTestResult(
@@ -470,7 +664,7 @@ const TestContext = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         profile_path: []const u8,
-    ) !orchestrator.RecoveryPrepareOutcome {
+    ) EngineError!orchestrator.RecoveryPrepareOutcome {
         const self: *TestContext = @ptrCast(@alignCast(context));
         self.recovery_prepare_count += 1;
         const request: api.Request = .{
@@ -479,9 +673,15 @@ const TestContext = struct {
             .packages = &.{"alpha"},
         };
         if (self.recovery_prepare_unknown)
-            return .{ .result = try unknownTestResult(allocator, request) };
+            return .{ .result = unknownTestResult(
+                allocator,
+                request,
+            ) catch |err| return testEngineError(err) };
         return .{ .ready = .{
-            .prepared = try testPreparation(allocator, request),
+            .prepared = testPreparation(
+                allocator,
+                request,
+            ) catch |err| return testEngineError(err),
             .action = "debz recover --system-profile /profile.json",
         } };
     }
@@ -491,25 +691,41 @@ const TestContext = struct {
         allocator: std.mem.Allocator,
         recovery: orchestrator.RecoveryPreparation,
         confirmed: bool,
-    ) !api.Result {
+    ) EngineError!ExecutionInvocation {
         const self: *TestContext = @ptrCast(@alignCast(context));
         self.recovery_execute_count += 1;
-        if (!confirmed) return error.UnconfirmedExecution;
-        if (self.fail_execute) return error.InjectedRecoveryDurabilityFailure;
+        if (!confirmed) return error.ContractViolation;
+        if (self.execute_engine_error) |err| return err;
+        if (self.operational_failure) |failure|
+            return .{ .operational_failure = failure };
+        if (self.fail_execute)
+            return .{ .operational_failure = .state_io_or_durability };
         if (self.return_recovery_result)
-            return recoveryTestResult(allocator, recovery.prepared);
-        return successfulTestResult(recovery.prepared);
+            return .{ .result = recoveryTestResult(
+                allocator,
+                recovery.prepared,
+            ) catch |err| return testEngineError(err) };
+        return .{ .result = successfulTestResult(
+            recovery.prepared,
+        ) catch |err| return testEngineError(err) };
     }
 
     fn reconcilePreparedError(
         context: *anyopaque,
         allocator: std.mem.Allocator,
         prepared: orchestrator.Preparation,
-    ) !api.Result {
+    ) EngineError!api.Result {
         const self: *TestContext = @ptrCast(@alignCast(context));
+        self.reconcile_count += 1;
         if (self.unknown_reconciliation)
-            return unknownTestResult(allocator, prepared.request);
-        return recoveryTestResult(allocator, prepared);
+            return unknownTestResult(
+                allocator,
+                prepared.request,
+            ) catch |err| return testEngineError(err);
+        return recoveryTestResult(
+            allocator,
+            prepared,
+        ) catch |err| return testEngineError(err);
     }
 
     fn recoveryTestResult(
@@ -549,6 +765,13 @@ const TestContext = struct {
         return api.ownResult(allocator, result);
     }
 };
+
+fn testEngineError(err: anyerror) EngineError {
+    return if (err == error.OutOfMemory)
+        error.OutOfMemory
+    else
+        error.InvariantViolation;
+}
 
 fn testPreparation(
     allocator: std.mem.Allocator,
@@ -657,6 +880,11 @@ test "apt_system_command.test.JSON confirmation is one document and never mutate
         u8,
         stdout.written(),
         "\"id\":\"confirmation_required\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout.written(),
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1056,6 +1284,11 @@ test "apt_system_command.test.unknown mutation status is truthful and exposes no
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 rendered,
+                "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\"",
+            ) != null);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                rendered,
                 "\"mutation_status\":\"unknown\"",
             ) != null);
             try std.testing.expect(std.mem.indexOf(
@@ -1080,6 +1313,120 @@ test "apt_system_command.test.unknown mutation status is truthful and exposes no
                 "Profile: none",
             ) != null);
         }
+    }
+}
+
+test "apt_system_command.test.engine OOM and contract errors bypass reconciliation" {
+    const parsed = switch (cli.parse(
+        &.{ "--profile", "/profile.json", "install", "-y", "alpha" },
+    )) {
+        .command => |command| command,
+        else => return error.UnexpectedParseResult,
+    };
+    for ([_]EngineError{
+        error.OutOfMemory,
+        error.ContractViolation,
+        error.InvariantViolation,
+    }) |expected| {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .execute_engine_error = expected,
+        };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        try std.testing.expectError(expected, runApt(
+            std.testing.allocator,
+            parsed,
+            context.interface(),
+            Terminal.unavailable(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        ));
+        try std.testing.expectEqual(@as(usize, 0), context.reconcile_count);
+        try std.testing.expectEqual(@as(usize, 0), context.mutation_count);
+    }
+}
+
+test "apt_system_command.test.production boundary reconciles only allowlisted operational errors" {
+    try std.testing.expectEqual(
+        OperationalFailure.interruption,
+        classifyOperationalFailure(error.LiveRootInterrupted).?,
+    );
+    try std.testing.expectEqual(
+        OperationalFailure.transport,
+        classifyOperationalFailure(error.TransportReadFailed).?,
+    );
+    try std.testing.expectEqual(
+        OperationalFailure.state_io_or_durability,
+        classifyOperationalFailure(error.PublicationConflict).?,
+    );
+    try std.testing.expect(classifyOperationalFailure(
+        error.UnclassifiedProgrammerFault,
+    ) == null);
+    try std.testing.expectEqual(
+        EngineError.ContractViolation,
+        engineBoundaryError(error.UnsafeInstallRoot).?,
+    );
+    try std.testing.expectEqual(
+        EngineError.InvariantViolation,
+        engineBoundaryError(error.InvalidTransition).?,
+    );
+}
+
+test "apt_system_command.test.only tagged operational failures invoke reconciliation" {
+    const parsed = switch (cli.parse(
+        &.{ "--profile", "/profile.json", "install", "-y", "alpha" },
+    )) {
+        .command => |command| command,
+        else => return error.UnexpectedParseResult,
+    };
+    for (std.enums.values(OperationalFailure)) |failure| {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .operational_failure = failure,
+        };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        const status = try runApt(
+            std.testing.allocator,
+            parsed,
+            context.interface(),
+            Terminal.unavailable(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        );
+        try std.testing.expectEqual(api.ExitStatus.recovery, status);
+        try std.testing.expectEqual(@as(usize, 1), context.reconcile_count);
+        try std.testing.expectEqual(@as(usize, 1), context.mutation_count);
+    }
+}
+
+test "apt_system_command.test.recovery engine errors bypass reconciliation" {
+    for ([_]EngineError{
+        error.OutOfMemory,
+        error.ContractViolation,
+        error.InvariantViolation,
+    }) |expected| {
+        var context: TestContext = .{
+            .allocator = std.testing.allocator,
+            .execute_engine_error = expected,
+        };
+        var terminal: TestTerminal = .{ .answer = .confirmed };
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        try std.testing.expectError(expected, runRecovery(
+            std.testing.allocator,
+            "/profile.json",
+            .human,
+            context.interface(),
+            terminal.interface(),
+            .{ .stdout = &stdout.writer, .stderr = &stderr.writer },
+        ));
+        try std.testing.expectEqual(@as(usize, 0), context.reconcile_count);
     }
 }
 

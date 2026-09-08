@@ -27,6 +27,21 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         cls.v2 = json.loads(
             (ROOT / "schema/apt-system-result-v2.json").read_text()
         )
+        cls.v3 = json.loads(
+            (ROOT / "schema/apt-system-result-v3.json").read_text()
+        )
+        cls.frozen_v2 = json.loads(
+            (
+                ROOT
+                / "tools/fixtures/apt-system-result-v2-origin-main.schema.json"
+            ).read_text()
+        )
+        cls.frozen_v2_document = json.loads(
+            (
+                ROOT
+                / "tools/fixtures/apt-system-result-v2-origin-main.document.json"
+            ).read_text()
+        )
         cls.request = json.loads(
             (ROOT / "schema/apt-system-request-v1.json").read_text()
         )
@@ -41,21 +56,43 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                     ),
                 ]
             )
-            cls.validator = jsonschema.Draft202012Validator(
+            cls.v2_validator = jsonschema.Draft202012Validator(
                 cls.v2,
                 registry=registry,
             )
-        else:
-            resolver = jsonschema.RefResolver.from_schema(
-                cls.v2,
-                store={
-                    cls.v1["$id"]: cls.v1,
-                    "https://debz.dev/schema/apt-system-result-v1.json": cls.v1,
-                },
+            cls.v3_validator = jsonschema.Draft202012Validator(
+                cls.v3,
+                registry=registry,
             )
-            cls.validator = jsonschema.Draft202012Validator(
+            cls.frozen_v2_validator = jsonschema.Draft202012Validator(
+                cls.frozen_v2,
+                registry=registry,
+            )
+        else:
+            store = {
+                cls.v1["$id"]: cls.v1,
+                "https://debz.dev/schema/apt-system-result-v1.json": cls.v1,
+            }
+            cls.v2_validator = jsonschema.Draft202012Validator(
                 cls.v2,
-                resolver=resolver,
+                resolver=jsonschema.RefResolver.from_schema(
+                    cls.v2,
+                    store=store,
+                ),
+            )
+            cls.v3_validator = jsonschema.Draft202012Validator(
+                cls.v3,
+                resolver=jsonschema.RefResolver.from_schema(
+                    cls.v3,
+                    store=store,
+                ),
+            )
+            cls.frozen_v2_validator = jsonschema.Draft202012Validator(
+                cls.frozen_v2,
+                resolver=jsonschema.RefResolver.from_schema(
+                    cls.frozen_v2,
+                    store=store,
+                ),
             )
         cls.request_validator = jsonschema.Draft202012Validator(cls.request)
 
@@ -63,8 +100,8 @@ class AptSystemResultSchemaTests(unittest.TestCase):
     def confirmation() -> dict:
         digest = "11" * 32
         return {
-            "schema": "https://debz.dev/schema/apt-system-result-v2",
-            "version": 2,
+            "schema": "https://debz.dev/schema/apt-system-result-v3",
+            "version": 3,
             "api_version": 1,
             "operation": "install",
             "request_sha256": digest,
@@ -109,7 +146,42 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         }
 
     def validate(self, document: dict) -> None:
-        self.validator.validate(document)
+        self.v3_validator.validate(document)
+
+    @staticmethod
+    def list_result(package: str = "alpha") -> dict:
+        return {
+            "schema": "https://debz.dev/schema/apt-system-result-v2",
+            "version": 2,
+            "api_version": 1,
+            "operation": "list_installed",
+            "request_sha256": "11" * 32,
+            "profile": {
+                "path": "/profile.json",
+                "sha256": "22" * 32,
+                "reference_evidence_sha256": "33" * 32,
+            },
+            "outcome": "success",
+            "exit_status": 0,
+            "changed": False,
+            "summary": "installed packages",
+            "items": [
+                {
+                    "package": package,
+                    "version": "1",
+                    "architecture": "amd64",
+                    "detail": None,
+                }
+            ],
+            "evidence": {
+                "exact_lock": None,
+                "transaction_result": None,
+                "root_operation_completion": None,
+                "active_operation_state": None,
+            },
+            "diagnostics": [],
+            "digest_sha256": "44" * 32,
+        }
 
     def test_exactly_one_confirmation_diagnostic_passes(self) -> None:
         self.validate(self.confirmation())
@@ -124,6 +196,10 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                 "message": "extra diagnostic",
             }
         )
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(document)
+        document["evidence"]["active_operation_state"] = None
+        document["diagnostics"].append(copy.deepcopy(document["diagnostics"][0]))
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(document)
 
@@ -143,14 +219,13 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                 "packages": [package],
                 "assume_yes": False,
             }
-            result = self.confirmation()
-            result["items"][0]["package"] = package
+            result = self.list_result(package)
             request_valid = self.request_validator.is_valid(request)
-            result_valid = self.validator.is_valid(result)
+            result_valid = self.v2_validator.is_valid(result)
             self.assertEqual(request_valid, result_valid, package)
             self.assertEqual(package in valid, request_valid, package)
 
-    def test_unknown_mutation_status_is_v2_without_fabricated_evidence(self) -> None:
+    def test_unknown_mutation_status_is_v3_without_fabricated_evidence(self) -> None:
         document = self.confirmation()
         document.pop("items")
         document["mutation_status"] = "unknown"
@@ -181,6 +256,23 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         }
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(document)
+
+    def test_v2_is_frozen_and_cross_validates_old_and_new_consumers(self) -> None:
+        self.assertEqual(self.frozen_v2, self.v2)
+        frozen_document = self.frozen_v2_document
+        self.v2_validator.validate(frozen_document)
+        self.frozen_v2_validator.validate(frozen_document)
+
+        with_status = copy.deepcopy(frozen_document)
+        with_status["mutation_status"] = "unchanged"
+        with self.assertRaises(jsonschema.ValidationError):
+            self.v2_validator.validate(with_status)
+        with self.assertRaises(jsonschema.ValidationError):
+            self.frozen_v2_validator.validate(with_status)
+
+    def test_v3_does_not_reinterpret_list_result_v2(self) -> None:
+        with self.assertRaises(jsonschema.ValidationError):
+            self.v3_validator.validate(self.list_result())
 
 
 if __name__ == "__main__":

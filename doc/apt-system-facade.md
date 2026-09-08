@@ -68,10 +68,10 @@ output, and diagnostic streams are terminals. The complete atomic plan and
 exact-lock path are printed and flushed first. A negative answer, EOF, or
 non-TTY returns a typed
 `confirmation_required` result without executing. A JSON request instead
-returns one canonical result-v2 document containing the reviewed change items
-and can never prompt. Result-v2 item arrays are allowed only for
-`list_installed` results and mutating `confirmation_required` reviews. `-y` is
-solely the caller's confirmation signal; profile conffile policy is unchanged.
+returns one canonical result-v3 document containing the reviewed change items
+and can never prompt. Result-v2 remains reserved for `list_installed`; result-v3
+is used for mutating `confirmation_required` reviews. `-y` is solely the
+caller's confirmation signal; profile conffile policy is unchanged.
 
 System recovery has the separate strict spelling:
 
@@ -176,9 +176,14 @@ machine interface. Itemless results retain the exact v1 wire format and digest.
 explicit additive result extension used when `list_installed` returns a
 non-empty bounded, owned `items` array preserving each package name and
 optional version, architecture, and detail. It keeps apt-system API version 1;
-no v1 document is emitted with a field that old v1 validators reject. Other
-operations cannot expose items, and v2 items participate in the canonical
-result digest. Runtime validation also measures the complete canonical
+its schema, required fields, canonical field order, bytes, and digest remain
+exactly compatible with the original result-v2 contract. No
+`mutation_status` field is added to v2.
+[`apt-system-result-v3.json`](../schema/apt-system-result-v3.json) is selected
+only for an item-bearing mutating `confirmation_required` review or an
+itemless fail-closed result with `mutation_status: "unknown"`. It cannot
+reinterpret a `list_installed` result. All item and status fields participate
+in the canonical result digest. Runtime validation also measures the complete canonical
 encoding and rejects any result over the 256 KiB document ceiling, even when
 every individual item and the item count are otherwise valid.
 Production refresh repository-detail items are validated at the product
@@ -281,13 +286,17 @@ and the exact `debz recover --system-profile PATH` action. The same
 reconciliation applies to errors during confirmed recovery.
 
 If durable state inspection is unavailable, corrupt, absent, or foreign and
-no exact lower owner proves mutation, result v2 reports
+no exact lower owner proves mutation, result v3 reports
 `mutation_status: "unknown"`, carries no unverified profile, lock, or active
 state evidence, and human output says `Changed: unknown (recovery required)`.
 A matching durable pre-mutation outer state plus a provably clean lower state
 is the only path that reports a clean internal failure. Recovery preparation
 uses the same fail-closed distinction instead of converting state I/O errors
 to a generic internal diagnostic.
+The command adapter reconciles only explicitly tagged interruption,
+transport, and state-durability failures. Allocation, invariant, and contract
+errors propagate to the internal-failure boundary and never fabricate recovery
+evidence.
 
 Package selectors and item names share one grammar: the first byte is ASCII
 alphanumeric, and remaining bytes are ASCII alphanumeric or one of

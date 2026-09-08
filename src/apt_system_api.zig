@@ -13,8 +13,11 @@ pub const request_schema_id = "https://debz.dev/schema/apt-system-request-v1";
 pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
 pub const result_items_schema_id =
     "https://debz.dev/schema/apt-system-result-v2";
+pub const result_status_schema_id =
+    "https://debz.dev/schema/apt-system-result-v3";
 pub const schema_version: u32 = 1;
 pub const result_items_schema_version: u32 = 2;
+pub const result_status_schema_version: u32 = 3;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
 pub const maximum_result_items: usize = 4096;
@@ -474,7 +477,9 @@ pub fn validateResult(result: Result) !void {
                 result.evidence.exact_lock != null or
                 result.evidence.transaction_result != null or
                 result.evidence.root_operation_completion != null or
-                result.evidence.active_operation_state != null)
+                result.evidence.active_operation_state != null or
+                result.diagnostic_count != 1 or
+                result.diagnostics[0].id != .recovery_required)
                 return error.InvalidMutationStatus;
         },
     };
@@ -683,19 +688,22 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
 }
 
 fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
+    const wire_version = resultWireVersion(result);
     try writer.writeAll("{\"schema\":");
     try writeString(
         writer,
-        if (result.items.len == 0 and result.mutation_status == null)
-            result_schema_id
-        else
-            result_items_schema_id,
+        switch (wire_version) {
+            .v1 => result_schema_id,
+            .v2 => result_items_schema_id,
+            .v3 => result_status_schema_id,
+        },
     );
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
-        if (result.items.len == 0 and result.mutation_status == null)
-            schema_version
-        else
-            result_items_schema_version,
+        switch (wire_version) {
+            .v1 => schema_version,
+            .v2 => result_items_schema_version,
+            .v3 => result_status_schema_version,
+        },
         result.api_version,
     });
     try writeString(writer, @tagName(result.operation));
@@ -717,14 +725,12 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
         @intFromEnum(result.exit_status),
         result.changed,
     });
-    if (result.items.len != 0 or result.mutation_status != null) {
+    if (wire_version == .v3) {
         try writer.writeAll(",\"mutation_status\":");
         try writeString(
             writer,
             if (result.mutation_status != null)
                 "unknown"
-            else if (result.changed)
-                "changed"
             else
                 "unchanged",
         );
@@ -762,7 +768,20 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
         try writeString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
+
     try writer.writeByte(']');
+}
+
+const ResultWireVersion = enum {
+    v1,
+    v2,
+    v3,
+};
+
+fn resultWireVersion(result: Result) ResultWireVersion {
+    if (result.mutation_status != null) return .v3;
+    if (result.items.len == 0) return .v1;
+    return if (result.operation == .list_installed) .v2 else .v3;
 }
 
 fn writeEvidence(writer: *std.Io.Writer, evidence: Evidence) !void {
@@ -1383,13 +1402,65 @@ test "apt_system_api.test.item-bearing results are owned and bind the canonical 
         .version = 2,
         .digest_sha256 = @splat(0x44),
     };
-    _ = try complete(confirmation);
+    const completed_confirmation = try complete(confirmation);
+    const confirmation_document = try completed_confirmation.canonicalJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(confirmation_document);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        confirmation_document,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\",\"version\":3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        confirmation_document,
+        "\"mutation_status\":\"unchanged\"",
+    ) != null);
     confirmation.diagnostic_count = 2;
     confirmation.diagnostics[1] = confirmation.diagnostics[0];
     try std.testing.expectError(
         error.UnexpectedItems,
         validateResult(confirmation),
     );
+}
+
+test "apt_system_api.test.result v2 canonical bytes and digest remain frozen" {
+    const result = try complete(.{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "installed packages",
+        .items = &.{.{
+            .package = "alpha",
+            .version = "1",
+            .architecture = "amd64",
+        }},
+    });
+    const canonical = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    const frozen = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v2-origin-main.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, frozen, "\r\n"),
+        canonical,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "\"mutation_status\"",
+    ) == null);
 }
 
 test "apt_system_api.test.package grammar requires alphanumeric first byte across requests and items" {
@@ -1423,8 +1494,13 @@ test "apt_system_api.test.package grammar requires alphanumeric first byte acros
         try std.testing.expect(std.mem.indexOf(
             u8,
             document,
-            "\"mutation_status\":\"unchanged\"",
+            "\"schema\":\"https://debz.dev/schema/apt-system-result-v2\",\"version\":2",
         ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"mutation_status\"",
+        ) == null);
     }
     for (invalid) |package| {
         try std.testing.expectError(error.InvalidPackage, validateRequest(.{
@@ -1468,12 +1544,30 @@ test "apt_system_api.test.unknown mutation status rejects all unverified evidenc
         "mutation status unknown",
     );
     unknown.mutation_status = .unknown;
-    _ = try complete(unknown);
+    const completed = try complete(unknown);
+    const document = try completed.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(document);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\",\"version\":3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"mutation_status\":\"unknown\"",
+    ) != null);
     unknown.profile = .{
         .path = "/profile.json",
         .sha256 = @splat(0x11),
         .reference_evidence_sha256 = @splat(0x22),
     };
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
+    );
+    unknown.profile = null;
+    unknown.diagnostics[0].id = .internal_error;
     try std.testing.expectError(
         error.InvalidMutationStatus,
         validateResult(unknown),
@@ -1651,6 +1745,14 @@ test "apt_system_api.test.result v2 schema is an explicit bounded item extension
         .limited(maximum_document_bytes),
     );
     defer std.testing.allocator.free(source);
+    const frozen = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v2-origin-main.schema.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen);
+    try std.testing.expectEqualStrings(frozen, source);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -1675,4 +1777,34 @@ test "apt_system_api.test.result v2 schema is an explicit bounded item extension
         @as(i64, 1),
         properties.get("items").?.object.get("minItems").?.integer,
     );
+    try std.testing.expect(properties.get("mutation_status") == null);
+}
+
+test "apt_system_api.test.result v3 exclusively carries confirmation items or unknown status" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-result-v3.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(source);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        result_status_schema_id,
+        parsed.value.object.get("$id").?.string,
+    );
+    const properties = parsed.value.object.get("properties").?.object;
+    try std.testing.expectEqual(
+        @as(i64, result_status_schema_version),
+        properties.get("version").?.object.get("const").?.integer,
+    );
+    const statuses = properties.get("mutation_status").?.object
+        .get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
 }

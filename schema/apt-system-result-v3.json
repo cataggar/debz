@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://debz.dev/schema/apt-system-result-v2",
-  "title": "debz apt-shaped system facade result v2",
+  "$id": "https://debz.dev/schema/apt-system-result-v3",
+  "title": "debz apt-shaped system facade result v3",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,15 +14,15 @@
     "outcome",
     "exit_status",
     "changed",
+    "mutation_status",
     "summary",
-    "items",
     "evidence",
     "diagnostics",
     "digest_sha256"
   ],
   "properties": {
-    "schema": { "const": "https://debz.dev/schema/apt-system-result-v2" },
-    "version": { "const": 2 },
+    "schema": { "const": "https://debz.dev/schema/apt-system-result-v3" },
+    "version": { "const": 3 },
     "api_version": { "const": 1 },
     "operation": {
       "$ref": "apt-system-result-v1.json#/$defs/operation"
@@ -43,6 +43,9 @@
     },
     "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
     "changed": { "type": "boolean" },
+    "mutation_status": {
+      "enum": ["unchanged", "unknown"]
+    },
     "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "items": {
       "type": "array",
@@ -77,9 +80,56 @@
     { "$ref": "apt-system-result-v1.json#/allOf/9" },
     { "$ref": "apt-system-result-v1.json#/allOf/10" },
     {
-      "properties": {
-        "operation": { "const": "list_installed" }
-      }
+      "oneOf": [
+        {
+          "properties": {
+            "operation": {
+              "enum": ["install", "remove", "upgrade"]
+            },
+            "outcome": { "const": "usage" },
+            "changed": { "const": false },
+            "mutation_status": { "const": "unchanged" },
+            "diagnostics": {
+              "minItems": 1,
+              "maxItems": 1,
+              "contains": {
+                "properties": {
+                  "id": { "const": "confirmation_required" }
+                },
+                "required": ["id"]
+              }
+            }
+          },
+          "required": ["items"]
+        },
+        {
+          "properties": {
+            "outcome": { "const": "recovery" },
+            "changed": { "const": false },
+            "mutation_status": { "const": "unknown" },
+            "profile": { "type": "null" },
+            "evidence": {
+              "properties": {
+                "exact_lock": { "type": "null" },
+                "transaction_result": { "type": "null" },
+                "root_operation_completion": { "type": "null" },
+                "active_operation_state": { "type": "null" }
+              }
+            },
+            "diagnostics": {
+              "minItems": 1,
+              "maxItems": 1,
+              "contains": {
+                "properties": {
+                  "id": { "const": "recovery_required" }
+                },
+                "required": ["id"]
+              }
+            }
+          },
+          "not": { "required": ["items"] }
+        }
+      ]
     }
   ],
   "$defs": {
