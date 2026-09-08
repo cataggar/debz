@@ -287,10 +287,17 @@ removed only after the final state is durable. A crash before removal therefore
 leaves a deterministic active or completed record rather than an ambiguous
 symlink or cross-filesystem pointer. If the retained final state was published
 but active-state compare-and-set was interrupted, retry strictly decodes that
-immutable document, verifies the same attempt, request, profile, lock,
-transaction, and completion bindings, and advances and clears the matching
-active state with the retained generation and timestamps. It never regenerates
-a competing final document; stale or foreign retained state fails closed.
+immutable document and verifies an outcome-specific evidence matrix before
+advancing and clearing the matching active state with the retained generation,
+timestamp, and diagnostic. A pre-mutation failure must match the exact
+attempt, request, profile, and optional plan/lock evidence inherited from its
+failure phase, while transaction and root-completion evidence must both be
+absent. A post-mutation failure requires its exact lock and transaction result
+but forbids success completion evidence. Successful and recovered mutating
+outcomes continue to require matching lock, transaction, and completion
+bindings; non-mutating terminal outcomes forbid all three. Retry adopts the
+exact first retained document rather than regenerating volatile terminal
+fields. Stale, foreign, or outcome-incompatible retained state fails closed.
 
 After a successful backend return, `SystemResultVerifier` rereads the canonical
 exact lock and validates `transaction-result.json` through

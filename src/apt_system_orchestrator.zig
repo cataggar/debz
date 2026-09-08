@@ -1713,6 +1713,22 @@ pub const SystemStateStore = struct {
         expected: operation_state.Expected,
         final: operation_state.State,
     ) !void {
+        _ = try commitRetained(
+            context,
+            allocator,
+            paths,
+            expected,
+            final,
+        );
+    }
+
+    fn commitRetained(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
+        expected: operation_state.Expected,
+        final: operation_state.State,
+    ) !operation_state.Expected {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
         var operation_dir = try openSecureAbsoluteDirectory(
             self,
@@ -1847,6 +1863,7 @@ pub const SystemStateStore = struct {
             operation_state.Expected.fromState(durable_final),
         );
         if (!lock.held(operation_token)) return error.LockLost;
+        return operation_state.Expected.fromState(durable_final);
     }
 
     fn ensureActiveDurable(
@@ -1936,12 +1953,18 @@ pub const SystemStateStore = struct {
         expected: operation_state.Expected,
         final: operation_state.State,
     ) !void {
-        try commit(context, allocator, paths, expected, final);
+        const durable_final = try commitRetained(
+            context,
+            allocator,
+            paths,
+            expected,
+            final,
+        );
         try clearCommitted(
             context,
             allocator,
             paths,
-            operation_state.Expected.fromState(final),
+            durable_final,
         );
     }
 
@@ -4214,22 +4237,42 @@ pub const Engine = struct {
             "completion is verified but durable committed-state publication failed",
         );
         try self.hitCompletionBoundary(.after_outer_committed);
+        var durable_final = (self.store.readRetainedFn(
+            self.store.context,
+            allocator,
+            prepared.paths,
+        ) catch null) orelse return api.failure(
+            prepared.request,
+            .configuration,
+            .state_persistence_failed,
+            "state",
+            "committed retained state could not be reopened",
+        );
+        defer durable_final.deinit();
+        if (!finalStateEquivalent(durable_final.state, final.state))
+            return api.failure(
+                prepared.request,
+                .configuration,
+                .state_persistence_failed,
+                "state",
+                "committed retained state no longer matches the verified outcome",
+            );
         if (durable_acknowledgment) |acknowledgment|
             self.acknowledgeCommittedLower(
                 allocator,
                 prepared,
                 loaded,
-                final.state,
+                durable_final.state,
                 acknowledgment,
             ) catch |err| {
                 if (err == error.InjectedCompletionCrash) return err;
                 return recoveryDiagnostic(
                     allocator,
                     prepared.request,
-                    final.state.profile,
-                    final.state.exact_lock,
-                    final.state.transaction_result,
-                    final.state.root_operation_completion,
+                    durable_final.state.profile,
+                    durable_final.state.exact_lock,
+                    durable_final.state.transaction_result,
+                    durable_final.state.root_operation_completion,
                     true,
                     prepared.profile_state_path,
                 );
@@ -4238,7 +4281,7 @@ pub const Engine = struct {
             self.store.context,
             allocator,
             prepared.paths,
-            operation_state.Expected.fromState(final.state),
+            operation_state.Expected.fromState(durable_final.state),
         ) catch return api.failure(
             prepared.request,
             .configuration,
@@ -4247,7 +4290,7 @@ pub const Engine = struct {
             "completion is committed but the active owner could not be cleared",
         );
         try self.hitCompletionBoundary(.after_active_cleared);
-        return completedResult(allocator, prepared, final.state);
+        return completedResult(allocator, prepared, durable_final.state);
     }
 
     fn reconcileRetainedFinal(
@@ -5219,39 +5262,92 @@ fn finalStateEquivalent(
     retained: operation_state.State,
     proposed: operation_state.State,
 ) bool {
-    return retained.phase == .completed and
-        proposed.phase == .completed and
-        retained.generation == proposed.generation and
-        std.mem.eql(
-            u8,
-            &retained.digest_sha256,
-            &proposed.digest_sha256,
-        ) and
-        retained.operation == proposed.operation and
-        retained.mutation_started == proposed.mutation_started and
-        retained.outcome == proposed.outcome and
-        std.mem.eql(u8, &retained.attempt_id, &proposed.attempt_id) and
-        std.mem.eql(
+    operation_state.validate(retained) catch return false;
+    operation_state.validate(proposed) catch return false;
+    if (retained.phase != .completed or proposed.phase != .completed or
+        retained.operation != proposed.operation or
+        retained.mutation_started != proposed.mutation_started or
+        retained.outcome != proposed.outcome or
+        !std.mem.eql(u8, &retained.attempt_id, &proposed.attempt_id) or
+        !std.mem.eql(
             u8,
             &retained.request_sha256,
             &proposed.request_sha256,
-        ) and
-        profileEqual(retained.profile, proposed.profile) and
-        retained.exact_lock != null and
-        proposed.exact_lock != null and
-        documentEqual(retained.exact_lock.?, proposed.exact_lock.?) and
-        retained.transaction_result != null and
-        proposed.transaction_result != null and
-        documentEqual(
-            retained.transaction_result.?,
-            proposed.transaction_result.?,
-        ) and
-        retained.root_operation_completion != null and
-        proposed.root_operation_completion != null and
-        completionEqual(
-            retained.root_operation_completion.?,
-            proposed.root_operation_completion.?,
-        );
+        ) or
+        !profileEqual(retained.profile, proposed.profile))
+        return false;
+    return switch (retained.outcome) {
+        .pending => false,
+        .failed_before_mutation => failedBeforeEvidenceEqual(
+            retained,
+            proposed,
+        ),
+        .failed_after_mutation => retained.operation.mutatesRoot() and
+            requiredDocumentEqual(retained.exact_lock, proposed.exact_lock) and
+            requiredDocumentEqual(
+                retained.transaction_result,
+                proposed.transaction_result,
+            ) and
+            retained.root_operation_completion == null and
+            proposed.root_operation_completion == null,
+        .succeeded => if (retained.operation.mutatesRoot())
+            requiredDocumentEqual(retained.exact_lock, proposed.exact_lock) and
+                requiredDocumentEqual(
+                    retained.transaction_result,
+                    proposed.transaction_result,
+                ) and
+                requiredCompletionEqual(
+                    retained.root_operation_completion,
+                    proposed.root_operation_completion,
+                )
+        else
+            retained.exact_lock == null and proposed.exact_lock == null and
+                retained.transaction_result == null and
+                proposed.transaction_result == null and
+                retained.root_operation_completion == null and
+                proposed.root_operation_completion == null,
+        .recovered => retained.operation.mutatesRoot() and
+            requiredDocumentEqual(retained.exact_lock, proposed.exact_lock) and
+            requiredDocumentEqual(
+                retained.transaction_result,
+                proposed.transaction_result,
+            ) and
+            requiredCompletionEqual(
+                retained.root_operation_completion,
+                proposed.root_operation_completion,
+            ),
+    };
+}
+
+fn failedBeforeEvidenceEqual(
+    retained: operation_state.State,
+    proposed: operation_state.State,
+) bool {
+    if (retained.mutation_started or proposed.mutation_started or
+        retained.transaction_result != null or
+        proposed.transaction_result != null or
+        retained.root_operation_completion != null or
+        proposed.root_operation_completion != null)
+        return false;
+    if (!retained.operation.mutatesRoot())
+        return retained.exact_lock == null and proposed.exact_lock == null;
+    if (retained.exact_lock == null or proposed.exact_lock == null)
+        return retained.exact_lock == null and proposed.exact_lock == null;
+    return documentEqual(retained.exact_lock.?, proposed.exact_lock.?);
+}
+
+fn requiredDocumentEqual(
+    left: ?api.DocumentBinding,
+    right: ?api.DocumentBinding,
+) bool {
+    return left != null and right != null and documentEqual(left.?, right.?);
+}
+
+fn requiredCompletionEqual(
+    left: ?api.CompletionBinding,
+    right: ?api.CompletionBinding,
+) bool {
+    return left != null and right != null and completionEqual(left.?, right.?);
 }
 
 fn recoverableOuterPhase(phase: operation_state.Phase) bool {
@@ -6039,6 +6135,57 @@ fn reserveVerifyingTestState(
     return .{ .current = verifying, .final = final };
 }
 
+fn reserveDownloadedTestState(
+    allocator: std.mem.Allocator,
+    store: StateStore,
+    state_path: []const u8,
+    paths: OperationPaths,
+    attempt_id: [32]u8,
+) !operation_state.OwnedState {
+    var initial = try testInitialState(allocator, attempt_id);
+    defer initial.deinit();
+    var profile_loaded = try nextState(allocator, initial.state, .{
+        .phase = .profile_loaded,
+        .updated_unix = 110,
+    });
+    defer profile_loaded.deinit();
+    var authenticated = try nextState(allocator, profile_loaded.state, .{
+        .phase = .authenticated,
+        .updated_unix = 120,
+    });
+    defer authenticated.deinit();
+    var downloaded = try nextState(allocator, authenticated.state, .{
+        .phase = .downloaded,
+        .exact_lock = .{
+            .path = paths.exact_lock,
+            .schema = exact_lock.schema_id,
+            .version = exact_lock.schema_version,
+            .digest_sha256 = @splat(0x51),
+        },
+        .updated_unix = 130,
+    });
+    errdefer downloaded.deinit();
+    try store.reserveFn(
+        store.context,
+        allocator,
+        paths,
+        "{}",
+        initial.state,
+    );
+    inline for (.{
+        .{ initial.state, profile_loaded.state },
+        .{ profile_loaded.state, authenticated.state },
+        .{ authenticated.state, downloaded.state },
+    }) |transition| try store.compareAndSetFn(
+        store.context,
+        allocator,
+        state_path,
+        operation_state.Expected.fromState(transition[0]),
+        transition[1],
+    );
+    return downloaded;
+}
+
 fn requirePrivilegedProductionTest() !void {
     if (builtin.os.tag == .linux and std.os.linux.geteuid() == 0) return;
     if (build_options.require_privileged_orchestration_tests)
@@ -6097,9 +6244,9 @@ test "apt_system_orchestrator.test.required_privileged.manifest covers every pri
         }
         cursor = next;
     }
-    try std.testing.expectEqual(@as(usize, 19), tagged_count);
+    try std.testing.expectEqual(@as(usize, 21), tagged_count);
     try std.testing.expectEqual(
-        @as(usize, 15),
+        @as(usize, 17),
         privilege_dependent_count,
     );
 }
@@ -6329,6 +6476,406 @@ test "apt_system_orchestrator.test.required_privileged.durability operation dire
             ),
         );
     }
+}
+
+test "apt_system_orchestrator.test.required_privileged.durability failBeforeMutation retains and repeats without active wedge" {
+    try requirePrivilegedProductionTest();
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-fail-before-mutation-{d}",
+        .{std.os.linux.getpid()},
+    );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(state_path);
+    var profile: FakeProfileLoader = .{ .state_path = state_path };
+    var backend: FakeBackend = .{ .download_status = .download };
+    var runner: FakeRunner = .{ .allocator = std.testing.allocator };
+    defer runner.deinit();
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var verifier: FakeVerifier = .{};
+    var sources: FakeSources = .{};
+    var engine: Engine = .{
+        .profiles = profile.interface(),
+        .runner = runner.interface(),
+        .backend = backend.interface(),
+        .store = store.interface(),
+        .verifier = verifier.interface(),
+        .ids = sources.ids(),
+        .clock = sources.clock(),
+    };
+    sources.next_id = @splat(0x33);
+    {
+        var prepared = try expectReady(try engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        var result = try engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(api.Outcome.download, result.outcome);
+        try std.testing.expect((try store.interface().readActive(
+            std.testing.allocator,
+            state_path,
+        )) == null);
+        var retained = (try store.interface().readRetainedFn(
+            store.interface().context,
+            std.testing.allocator,
+            prepared.paths,
+        )) orelse return error.MissingRetainedState;
+        defer retained.deinit();
+        try std.testing.expectEqual(
+            operation_state.Outcome.failed_before_mutation,
+            retained.state.outcome,
+        );
+        try std.testing.expect(retained.state.exact_lock != null);
+        try std.testing.expect(retained.state.transaction_result == null);
+        try std.testing.expect(retained.state.root_operation_completion == null);
+        try std.testing.expectEqualStrings(
+            result.summary,
+            retained.state.diagnostic,
+        );
+    }
+    sources.next_id = @splat(0x34);
+    var crash: TestFinishCrash = .{};
+    store.finish_crash = crash.interface();
+    var interrupted = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer interrupted.deinit();
+    var interrupted_result = try engine.execute(
+        std.testing.allocator,
+        interrupted,
+        true,
+    );
+    defer interrupted_result.deinit();
+    try std.testing.expectEqual(
+        api.DiagnosticId.state_persistence_failed,
+        interrupted_result.diagnostics[0].id,
+    );
+    var interrupted_active = (try store.interface().readActive(
+        std.testing.allocator,
+        state_path,
+    )) orelse return error.MissingActiveState;
+    defer interrupted_active.deinit();
+    try std.testing.expect(!interrupted_active.state.mutation_started);
+    var interrupted_retained = (try store.interface().readRetainedFn(
+        store.interface().context,
+        std.testing.allocator,
+        interrupted.paths,
+    )) orelse return error.MissingRetainedState;
+    defer interrupted_retained.deinit();
+    const retained_digest = interrupted_retained.state.digest_sha256;
+    const retained_generation = interrupted_retained.state.generation;
+    const retained_timestamp = interrupted_retained.state.updated_unix;
+    store.finish_crash = null;
+    sources.next_id = @splat(0x35);
+    var repeated = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer repeated.deinit();
+    var reconciled_retained = (try store.interface().readRetainedFn(
+        store.interface().context,
+        std.testing.allocator,
+        interrupted.paths,
+    )) orelse return error.MissingRetainedState;
+    defer reconciled_retained.deinit();
+    try std.testing.expectEqual(
+        retained_digest,
+        reconciled_retained.state.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        retained_generation,
+        reconciled_retained.state.generation,
+    );
+    try std.testing.expectEqual(
+        retained_timestamp,
+        reconciled_retained.state.updated_unix,
+    );
+    var repeated_result = try engine.execute(
+        std.testing.allocator,
+        repeated,
+        true,
+    );
+    defer repeated_result.deinit();
+    try std.testing.expectEqual(
+        api.Outcome.download,
+        repeated_result.outcome,
+    );
+    try std.testing.expect((try store.interface().readActive(
+        std.testing.allocator,
+        state_path,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 3), backend.download_calls);
+}
+
+test "apt_system_orchestrator.test.required_privileged.durability retained failure restart adopts exact state and rejects foreign evidence" {
+    try requirePrivilegedProductionTest();
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-retained-failure-{d}",
+        .{std.os.linux.getpid()},
+    );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+    const state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/restart/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(state_path);
+    const attempt_id: [32]u8 = @splat(0x71);
+    var paths = try pathsFor(
+        std.testing.allocator,
+        state_path,
+        attempt_id,
+    );
+    defer paths.deinit(std.testing.allocator);
+    var crash: TestFinishCrash = .{};
+    var crashing_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .finish_crash = crash.interface(),
+    };
+    const crashing = crashing_store.interface();
+    var downloaded = try reserveDownloadedTestState(
+        std.testing.allocator,
+        crashing,
+        state_path,
+        paths,
+        attempt_id,
+    );
+    defer downloaded.deinit();
+    var original = try nextState(
+        std.testing.allocator,
+        downloaded.state,
+        .{
+            .phase = .completed,
+            .outcome = .failed_before_mutation,
+            .diagnostic = "original retained failure",
+            .updated_unix = 200,
+        },
+    );
+    defer original.deinit();
+    try std.testing.expectError(
+        error.InjectedFinishCrash,
+        crashing.finishFn(
+            crashing.context,
+            std.testing.allocator,
+            paths,
+            operation_state.Expected.fromState(downloaded.state),
+            original.state,
+        ),
+    );
+    var reopened_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    const reopened = reopened_store.interface();
+    var active = (try reopened.readActive(
+        std.testing.allocator,
+        state_path,
+    )) orelse return error.MissingActiveState;
+    defer active.deinit();
+    var regenerated = try nextState(
+        std.testing.allocator,
+        active.state,
+        .{
+            .phase = .completed,
+            .outcome = .failed_before_mutation,
+            .diagnostic = "regenerated after restart",
+            .updated_unix = 999,
+        },
+    );
+    defer regenerated.deinit();
+    try reopened.finishFn(
+        reopened.context,
+        std.testing.allocator,
+        paths,
+        operation_state.Expected.fromState(active.state),
+        regenerated.state,
+    );
+    try std.testing.expect((try reopened.readActive(
+        std.testing.allocator,
+        state_path,
+    )) == null);
+    var retained = (try reopened.readRetainedFn(
+        reopened.context,
+        std.testing.allocator,
+        paths,
+    )) orelse return error.MissingRetainedState;
+    defer retained.deinit();
+    try std.testing.expectEqual(
+        original.state.digest_sha256,
+        retained.state.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        original.state.generation,
+        retained.state.generation,
+    );
+    try std.testing.expectEqual(
+        original.state.updated_unix,
+        retained.state.updated_unix,
+    );
+    try std.testing.expectEqualStrings(
+        original.state.diagnostic,
+        retained.state.diagnostic,
+    );
+
+    const foreign_state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/foreign/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(foreign_state_path);
+    const owner_attempt: [32]u8 = @splat(0x72);
+    var foreign_paths = try pathsFor(
+        std.testing.allocator,
+        foreign_state_path,
+        owner_attempt,
+    );
+    defer foreign_paths.deinit(std.testing.allocator);
+    var owner = try reserveDownloadedTestState(
+        std.testing.allocator,
+        reopened,
+        foreign_state_path,
+        foreign_paths,
+        owner_attempt,
+    );
+    defer owner.deinit();
+    var owner_final = try nextState(
+        std.testing.allocator,
+        owner.state,
+        .{
+            .phase = .completed,
+            .outcome = .failed_before_mutation,
+            .diagnostic = "owner failure",
+            .updated_unix = 200,
+        },
+    );
+    defer owner_final.deinit();
+    var foreign_final = try operation_state.create(
+        std.testing.allocator,
+        .{
+            .attempt_id = @splat(0x73),
+            .generation = owner_final.state.generation,
+            .operation = owner_final.state.operation,
+            .phase = .completed,
+            .mutation_started = false,
+            .outcome = .failed_before_mutation,
+            .request_sha256 = owner_final.state.request_sha256,
+            .profile = owner_final.state.profile,
+            .exact_lock = owner_final.state.exact_lock,
+            .updated_unix = owner_final.state.updated_unix,
+            .diagnostic = "foreign failure",
+        },
+    );
+    defer foreign_final.deinit();
+    const foreign_source = try foreign_final.state.canonicalJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(foreign_source);
+    try writeAbsoluteTestFile(
+        foreign_paths.retained_state,
+        foreign_source,
+    );
+    try std.testing.expectError(
+        error.PublicationConflict,
+        reopened.finishFn(
+            reopened.context,
+            std.testing.allocator,
+            foreign_paths,
+            operation_state.Expected.fromState(owner.state),
+            owner_final.state,
+        ),
+    );
+    var foreign_active = (try reopened.readActive(
+        std.testing.allocator,
+        foreign_state_path,
+    )) orelse return error.MissingActiveState;
+    defer foreign_active.deinit();
+    try std.testing.expectEqual(
+        owner.state.digest_sha256,
+        foreign_active.state.digest_sha256,
+    );
+
+    const evidence_state_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/evidence/state",
+        .{root_path},
+    );
+    defer std.testing.allocator.free(evidence_state_path);
+    const evidence_attempt: [32]u8 = @splat(0x74);
+    var evidence_paths = try pathsFor(
+        std.testing.allocator,
+        evidence_state_path,
+        evidence_attempt,
+    );
+    defer evidence_paths.deinit(std.testing.allocator);
+    var evidence_owner = try reserveDownloadedTestState(
+        std.testing.allocator,
+        reopened,
+        evidence_state_path,
+        evidence_paths,
+        evidence_attempt,
+    );
+    defer evidence_owner.deinit();
+    var evidence_final = try nextState(
+        std.testing.allocator,
+        evidence_owner.state,
+        .{
+            .phase = .completed,
+            .outcome = .failed_before_mutation,
+            .diagnostic = "failure with forbidden evidence",
+            .updated_unix = 200,
+        },
+    );
+    defer evidence_final.deinit();
+    var invalid_evidence = evidence_final.state;
+    invalid_evidence.transaction_result = .{
+        .path = evidence_paths.transaction_result,
+        .schema = transaction_provenance.schema_id,
+        .version = transaction_provenance.schema_version,
+        .digest_sha256 = @splat(0x75),
+    };
+    try std.testing.expectError(
+        error.UnexpectedTransactionEvidence,
+        reopened.finishFn(
+            reopened.context,
+            std.testing.allocator,
+            evidence_paths,
+            operation_state.Expected.fromState(evidence_owner.state),
+            invalid_evidence,
+        ),
+    );
+    var evidence_active = (try reopened.readActive(
+        std.testing.allocator,
+        evidence_state_path,
+    )) orelse return error.MissingActiveState;
+    defer evidence_active.deinit();
+    try std.testing.expectEqual(
+        evidence_owner.state.digest_sha256,
+        evidence_active.state.digest_sha256,
+    );
+    try std.testing.expect((try reopened.readRetainedFn(
+        reopened.context,
+        std.testing.allocator,
+        evidence_paths,
+    )) == null);
 }
 
 test "apt_system_orchestrator.test.required_privileged.durability system finish reuses retained final after pre-CAS crash" {
