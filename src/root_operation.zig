@@ -329,6 +329,7 @@ pub const OwnershipCleanup = struct {
     attempt_id: [32]u8,
     acknowledgment_id: [32]u8,
     terminal_state: DeferredAcknowledgmentState,
+    expected_marker_sha256: ?[32]u8 = null,
     observer: ?OwnershipCleanupObserver = null,
 };
 
@@ -1149,6 +1150,12 @@ pub const Store = struct {
         defer if (record) |*owned| owned.deinit();
         if (marker == null) return error.NoDeferredAcknowledgment;
         const observed = marker.?;
+        if (cleanup.expected_marker_sha256) |expected|
+            if (!std.mem.eql(
+                u8,
+                &observed.digest_sha256,
+                &expected,
+            )) return error.DeferredAcknowledgmentMismatch;
         if (!std.mem.eql(
             u8,
             &observed.attempt_id,

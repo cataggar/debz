@@ -161,9 +161,21 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn(".open_tree,", live_root)
         self.assertIn(".mount_setattr,", live_root)
         self.assertIn("linux.move_mount(", live_root)
+        orchestrator = sources["src/apt_system_orchestrator.zig"]
+        first_orchestrator_test = orchestrator.index('\ntest "')
+        self.assertTrue(
+            all(
+                match.start() > first_orchestrator_test
+                for match in re.finditer(
+                    r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
+                    orchestrator,
+                )
+            )
+        )
         namespace_owners = sorted(
             relative
             for relative, text in sources.items()
+            if relative != "src/apt_system_orchestrator.zig"
             if re.search(
                 r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
                 text,

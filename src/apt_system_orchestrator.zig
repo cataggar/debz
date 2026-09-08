@@ -222,6 +222,7 @@ pub const BackendResult = struct {
     owned_result: ?product_api.OwnedResult = null,
     recovery_completion: ?root_operation_completion.OwnedDocument = null,
     recovery_acknowledgment: ?RecoveryAcknowledgment = null,
+    ownership_acknowledgment: ?OwnershipAcknowledgment = null,
 
     pub fn deinit(self: *BackendResult) void {
         if (self.owned_result) |*owned| owned.deinit();
@@ -241,6 +242,8 @@ pub const WorkflowMode = enum {
 
 pub const RecoveryAcknowledgment =
     production_backend.WorkflowRecoveryAcknowledgment;
+pub const OwnershipAcknowledgment =
+    production_backend.WorkflowOwnershipAcknowledgment;
 
 pub const WorkflowRequest = struct {
     operation: WorkflowOperation,
@@ -250,6 +253,7 @@ pub const WorkflowRequest = struct {
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
     finalize_ownership: bool = false,
+    ownership_acknowledgment: ?OwnershipAcknowledgment = null,
     recovery_acknowledgment: ?RecoveryAcknowledgment = null,
 };
 
@@ -327,6 +331,7 @@ pub const ProductionBackend = struct {
             .defer_recovery_clear = request.defer_recovery_clear,
             .orchestration_id = request.orchestration_id,
             .finalize_ownership = request.finalize_ownership,
+            .ownership_acknowledgment = request.ownership_acknowledgment,
             .recovery_acknowledgment = request.recovery_acknowledgment,
         });
     }
@@ -403,9 +408,21 @@ pub const LiveRootRunner = struct {
     }
 };
 
+pub const TransportBoundary = enum { before_return };
+
+pub const TransportCrash = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, TransportBoundary) anyerror!void,
+
+    pub fn hit(self: TransportCrash, boundary: TransportBoundary) !void {
+        try self.hitFn(self.context, boundary);
+    }
+};
+
 pub const PrivateLiveRootRunner = struct {
     io: std.Io,
     termination_grace_ms: u64 = 1_000,
+    transport_crash: ?TransportCrash = null,
 
     const Invocation = union(enum) {
         route: struct {
@@ -729,6 +746,7 @@ pub const PrivateLiveRootRunner = struct {
                 return error.MissingRecoveryCompletion;
         }
         var recovery_acknowledgment: ?RecoveryAcknowledgment = null;
+        var ownership_acknowledgment: ?OwnershipAcknowledgment = null;
         const root_status: RootStatus = switch (invocation) {
             .route => .clean,
             .workflow => |workflow_invocation| switch (workflow_invocation.request.mode) {
@@ -762,6 +780,29 @@ pub const PrivateLiveRootRunner = struct {
                                 return error.MissingRecoveryAcknowledgment,
                         };
                     }
+                    if (workflow_invocation.request.mode == .execute and
+                        workflow_invocation.request.orchestration_id != null and
+                        decoded.result.exit_status == .success)
+                    {
+                        const marker = inspection.deferred_acknowledgment orelse
+                            return error.MissingOwnershipAcknowledgment;
+                        const acknowledgment_id =
+                            workflow_invocation.request.orchestration_id orelse
+                            return error.MissingOwnershipAcknowledgment;
+                        if (marker.state != .released or
+                            inspection.record != null or
+                            !std.mem.eql(
+                                u8,
+                                &marker.acknowledgment_id,
+                                &acknowledgment_id,
+                            ))
+                            return error.InvalidOwnershipAcknowledgment;
+                        ownership_acknowledgment = .{
+                            .attempt_id = marker.attempt_id,
+                            .marker_sha256 = marker.digest_sha256,
+                            .acknowledgment_id = marker.acknowledgment_id,
+                        };
+                    }
                     break :status switch (inspection.status) {
                         .clean, .completed => .completed,
                         .recovery_required => .recovery_required,
@@ -770,12 +811,15 @@ pub const PrivateLiveRootRunner = struct {
                 .plan_only, .download_only => .clean,
             },
         };
+        if (self.transport_crash) |crash|
+            try crash.hit(.before_return);
         return .{
             .result = decoded.result,
             .root_status = root_status,
             .owned_result = decoded,
             .recovery_completion = recovery_completion,
             .recovery_acknowledgment = recovery_acknowledgment,
+            .ownership_acknowledgment = ownership_acknowledgment,
         };
     }
 
@@ -799,6 +843,7 @@ pub const PrivateLiveRootRunner = struct {
                 invocation.request,
             ),
         };
+
         const source = try result.canonicalJson(allocator);
         if (source.len > product_api.maximum_result_document_bytes)
             return error.DocumentTooLarge;
@@ -2189,10 +2234,15 @@ pub const RecoveryPrepareOutcome = union(enum) {
 };
 
 pub const CompletionBoundary = enum {
+    after_downloaded_state,
+    after_ownership_reserved,
+    after_mutating_state,
     after_backend_success,
     after_transaction_verified,
     after_transaction_retained,
     after_verifying_state,
+    before_ownership_acknowledged,
+    after_ownership_acknowledged,
     after_recovery_acknowledged,
     after_completion_published,
 };
@@ -2617,6 +2667,7 @@ pub const Engine = struct {
             &current,
             .{ .phase = .downloaded },
         );
+        try self.hitCompletionBoundary(.after_downloaded_state);
         const before_execute = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
@@ -2723,12 +2774,14 @@ pub const Engine = struct {
             false,
             prepared.profile_state_path,
         );
+        try self.hitCompletionBoundary(.after_ownership_reserved);
         try self.transition(
             allocator,
             loaded.view.state_path,
             &current,
             .{ .phase = .mutating },
         );
+        try self.hitCompletionBoundary(.after_mutating_state);
 
         var executed = self.runner.workflow(allocator, self.backend, .{
             .operation = workflow_operation,
@@ -2771,7 +2824,13 @@ pub const Engine = struct {
             null,
             null,
             null,
-            false,
+            executed.ownership_acknowledgment orelse
+                return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    &current,
+                    "successful lower transaction did not retain its exact ownership token",
+                ),
         );
     }
 
@@ -3222,13 +3281,15 @@ pub const Engine = struct {
                             false,
                             recovery.prepared.profile_state_path,
                         );
+                }
+                if (!current.state.mutation_started)
                     try self.transition(
                         allocator,
                         loaded.view.state_path,
                         &current,
                         .{ .phase = .mutating },
                     );
-                }
+                try self.hitCompletionBoundary(.after_mutating_state);
                 var retried = self.runner.workflow(
                     allocator,
                     self.backend,
@@ -3270,7 +3331,13 @@ pub const Engine = struct {
                     null,
                     null,
                     null,
-                    false,
+                    retried.ownership_acknowledgment orelse
+                        return self.recoveryFailed(
+                            allocator,
+                            recovery.prepared,
+                            &current,
+                            "retried lower transaction did not retain its exact ownership token",
+                        ),
                 );
             }
             const retained_lower_recovery =
@@ -3366,7 +3433,13 @@ pub const Engine = struct {
                     )
                 else
                     marker_acknowledgment,
-                finalize_ownership,
+                if (finalize_ownership)
+                    ownershipAcknowledgment(
+                        ownership_marker.?,
+                        recovery.prepared.attempt_id,
+                    )
+                else
+                    null,
             );
         }
         try self.transition(
@@ -3473,7 +3546,7 @@ pub const Engine = struct {
                     &current,
                     "lower-level recovery did not return a durable acknowledgment token",
                 ),
-            false,
+            null,
         );
     }
 
@@ -3488,7 +3561,7 @@ pub const Engine = struct {
         recovery_lock: ?VerifiedLock,
         expected_recovery_attempt: ?[32]u8,
         recovery_acknowledgment: ?RecoveryAcknowledgment,
-        finalize_ownership: bool,
+        ownership_acknowledgment: ?OwnershipAcknowledgment,
     ) !api.Result {
         const profile = loaded.view;
         var retained: api.DocumentBinding = undefined;
@@ -3524,12 +3597,33 @@ pub const Engine = struct {
                 "verified recovery completion evidence could not be retained",
             );
         } else {
-            const source_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}",
-                .{ profile.state_path, transaction_result_name },
-            );
-            defer allocator.free(source_path);
+            const existing_retained = if (current.state.transaction_result) |binding|
+                std.mem.eql(
+                    u8,
+                    binding.schema,
+                    transaction_provenance.schema_id,
+                ) and
+                    binding.version == transaction_provenance.schema_version and
+                    std.mem.eql(
+                        u8,
+                        binding.path,
+                        prepared.paths.transaction_result,
+                    )
+            else
+                false;
+            const shared_source = if (!existing_retained)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ profile.state_path, transaction_result_name },
+                )
+            else
+                null;
+            defer if (shared_source) |source| allocator.free(source);
+            const source_path = if (existing_retained)
+                current.state.transaction_result.?.path
+            else
+                shared_source.?;
             var verified = self.verifier.verifyTransactionFn(
                 self.verifier.context,
                 allocator,
@@ -3543,19 +3637,39 @@ pub const Engine = struct {
                 "transaction result does not verify against the exact lock",
             );
             defer verified.deinit();
+            if (existing_retained and
+                (!std.mem.eql(
+                    u8,
+                    &verified.binding.digest_sha256,
+                    &current.state.transaction_result.?.digest_sha256,
+                ) or
+                    !std.mem.eql(
+                        u8,
+                        verified.binding.path,
+                        current.state.transaction_result.?.path,
+                    )))
+                return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "retained transaction result binding changed before completion",
+                );
             try self.hitCompletionBoundary(.after_transaction_verified);
-            retained = self.store.retainTransactionFn(
-                self.store.context,
-                allocator,
-                prepared.paths,
-                verified.bytes,
-                verified.binding.digest_sha256,
-            ) catch return self.markRecoveryRequired(
-                allocator,
-                prepared,
-                current,
-                "verified transaction result could not be retained",
-            );
+            retained = if (existing_retained)
+                current.state.transaction_result.?
+            else
+                self.store.retainTransactionFn(
+                    self.store.context,
+                    allocator,
+                    prepared.paths,
+                    verified.bytes,
+                    verified.binding.digest_sha256,
+                ) catch return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "verified transaction result could not be retained",
+                );
         }
         try self.hitCompletionBoundary(.after_transaction_retained);
         try self.transition(
@@ -3572,7 +3686,7 @@ pub const Engine = struct {
             },
         );
         try self.hitCompletionBoundary(.after_verifying_state);
-        if (finalize_ownership) {
+        if (ownership_acknowledgment) |acknowledgment| {
             const before_finalize = self.verifier.verifyLockFn(
                 self.verifier.context,
                 allocator,
@@ -3604,6 +3718,7 @@ pub const Engine = struct {
                 );
             const selectors = try selectorsFor(allocator, prepared.request);
             defer allocator.free(selectors);
+            try self.hitCompletionBoundary(.before_ownership_acknowledged);
             var finalized = self.runner.workflow(
                 allocator,
                 self.backend,
@@ -3617,6 +3732,7 @@ pub const Engine = struct {
                     ),
                     .orchestration_id = prepared.attempt_id,
                     .finalize_ownership = true,
+                    .ownership_acknowledgment = acknowledgment,
                 },
             ) catch return self.markRecoveryRequired(
                 allocator,
@@ -3633,6 +3749,7 @@ pub const Engine = struct {
                     current,
                     "lower ownership finalization did not clear the exact owner-bound state",
                 );
+            try self.hitCompletionBoundary(.after_ownership_acknowledged);
         }
         if (recovered) {
             if (recovery_acknowledgment) |acknowledgment| {
@@ -3829,6 +3946,33 @@ pub const Engine = struct {
             active.state.attempt_id,
         );
         defer paths.deinit(allocator);
+        if (!active.state.mutation_started) {
+            var lower = self.runner.inspect(allocator) catch
+                return try recoveryDiagnostic(
+                    allocator,
+                    request,
+                    active.state.profile,
+                    active.state.exact_lock,
+                    active.state.transaction_result,
+                    active.state.root_operation_completion,
+                    false,
+                    profile.state_path,
+                );
+            defer lower.deinit();
+            if (lower.status != .clean or
+                lower.record != null or
+                lower.deferred_acknowledgment != null)
+                return try recoveryDiagnostic(
+                    allocator,
+                    request,
+                    active.state.profile,
+                    active.state.exact_lock,
+                    active.state.transaction_result,
+                    active.state.root_operation_completion,
+                    false,
+                    profile.state_path,
+                );
+        }
         if (active.state.phase == .completed and
             active.state.outcome != .failed_after_mutation)
         {
@@ -4734,6 +4878,17 @@ fn acknowledgmentForSettledRecovery(
         .attempt_id = record.attempt_id,
         .completion_sha256 = document.digest_sha256,
         .provenance_sha256 = record.provenance_sha256.?,
+        .acknowledgment_id = acknowledgment_id,
+    };
+}
+
+fn ownershipAcknowledgment(
+    marker: root_operation.DeferredAcknowledgment,
+    acknowledgment_id: [32]u8,
+) OwnershipAcknowledgment {
+    return .{
+        .attempt_id = marker.attempt_id,
+        .marker_sha256 = marker.digest_sha256,
         .acknowledgment_id = acknowledgment_id,
     };
 }
@@ -5678,6 +5833,7 @@ const FakeProfileLoader = struct {
     fail_revalidate_on: ?usize = null,
     drift_after_first: bool = false,
     state_path: []const u8 = "/state",
+    cache_path: []const u8 = "/cache",
     source_paths: [1][]const u8 = .{"/etc/debz/source"},
     keyring_paths: [1][]const u8 = .{"/etc/debz/keyring"},
 
@@ -5713,7 +5869,7 @@ const FakeProfileLoader = struct {
                 .architecture = "amd64",
                 .foreign_architectures = &.{},
                 .repository_policy = .strict_priority,
-                .cache_path = "/cache",
+                .cache_path = self.cache_path,
                 .state_path = self.state_path,
                 .conffile = .keep_existing,
                 .proxy = null,
@@ -5810,6 +5966,14 @@ const FakeBackend = struct {
                 .exit_status = .success,
                 .changed = false,
                 .summary = "lower recovery acknowledgment finalized",
+            };
+        }
+        if (request.finalize_ownership) {
+            return .{
+                .operation = .recover,
+                .exit_status = .success,
+                .changed = false,
+                .summary = "lower orchestration ownership finalized",
             };
         }
         const status = switch (request.mode) {
@@ -6077,6 +6241,26 @@ const FakeRunner = struct {
         if (request.finalize_ownership and
             result.result.exit_status == .success)
         {
+            const acknowledgment = request.ownership_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+            const marker = self.inspect_deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+            if (!std.mem.eql(
+                u8,
+                &marker.digest_sha256,
+                &acknowledgment.marker_sha256,
+            ) or
+                !std.mem.eql(
+                    u8,
+                    &marker.attempt_id,
+                    &acknowledgment.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &marker.acknowledgment_id,
+                    &acknowledgment.acknowledgment_id,
+                ))
+                return error.InvalidOwnershipAcknowledgment;
             self.ownership_finalize_calls += 1;
             if (self.inspect_record_source) |source|
                 self.allocator.free(source);
@@ -6116,11 +6300,30 @@ const FakeRunner = struct {
             (self.inspect_deferred_acknowledgment.?.state == .abandoned or
                 self.inspect_deferred_acknowledgment.?.state == .bound))
         {
-            self.inspect_deferred_acknowledgment = null;
+            const marker = self.inspect_deferred_acknowledgment.?;
+            self.inspect_deferred_acknowledgment =
+                try root_operation.createDeferredAcknowledgment(.{
+                    .state = .released,
+                    .attempt_id = marker.attempt_id,
+                    .acknowledgment_id = marker.acknowledgment_id,
+                });
             if (self.inspect_record_source) |source|
                 self.allocator.free(source);
             self.inspect_record_source = null;
             self.inspect_status = .clean;
+        }
+        if (request.mode == .execute and
+            result.result.exit_status == .success)
+        {
+            const marker = self.inspect_deferred_acknowledgment orelse
+                return error.MissingOwnershipAcknowledgment;
+            if (marker.state != .released)
+                return error.InvalidOwnershipAcknowledgment;
+            result.ownership_acknowledgment = ownershipAcknowledgment(
+                marker,
+                request.orchestration_id orelse
+                    return error.MissingOwnershipAcknowledgment,
+            );
         }
         if (request.mode == .execute and
             result.result.exit_status != .success and
@@ -6854,6 +7057,301 @@ const TestFinishCrash = struct {
     }
 };
 
+const ProductionRunnerProcess = struct {
+    io: std.Io,
+    dpkg: std.Io.Dir,
+
+    fn interface(
+        self: *ProductionRunnerProcess,
+    ) @import("transaction_executor.zig").ProcessRunner {
+        return .{ .context = self, .runFn = run };
+    }
+
+    fn run(
+        context: *anyopaque,
+        invocation: @import("transaction_executor.zig").Invocation,
+    ) !@import("transaction_executor.zig").ProcessResult {
+        const self: *ProductionRunnerProcess = @ptrCast(@alignCast(context));
+        if (invocation.phase == .remove) {
+            if (self.dpkg.access(self.io, "mutation-observed", .{})) {
+                return .{ .termination = .{ .exited = 99 } };
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            }
+            try self.dpkg.writeFile(self.io, .{
+                .sub_path = "mutation-observed",
+                .data = "once",
+            });
+            try self.dpkg.writeFile(self.io, .{
+                .sub_path = "status",
+                .data = "",
+            });
+        }
+        return .{ .termination = .{ .exited = 0 } };
+    }
+};
+
+const ProductionRunnerFixture = struct {
+    allocator: std.mem.Allocator,
+    root_path: []u8,
+    source_path: []u8,
+    keyring_path: []u8,
+    cache_path: []u8,
+    state_path: []u8,
+    source_paths: [1][]const u8,
+    keyring_paths: [1][]const u8,
+    dpkg: std.Io.Dir,
+    mounted: bool = true,
+
+    fn init(allocator: std.mem.Allocator) !ProductionRunnerFixture {
+        const fixture = @import("fixtures/openpgp.zig");
+        cleanupProductionRootArtifacts();
+        const root_path = try std.fmt.allocPrint(
+            allocator,
+            "/run/debz-orchestrator-production-{d}",
+            .{std.os.linux.getpid()},
+        );
+        errdefer allocator.free(root_path);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
+        const repository_packages_directory = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repo/dists/stable/main/binary-amd64",
+            .{root_path},
+        );
+        defer allocator.free(repository_packages_directory);
+        try std.Io.Dir.cwd().createDirPath(
+            std.testing.io,
+            repository_packages_directory,
+        );
+        const dpkg_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/dpkg",
+            .{root_path},
+        );
+        defer allocator.free(dpkg_path);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, dpkg_path);
+        const state_path = try std.fmt.allocPrint(
+            allocator,
+            "/root/debz-orchestrator-production-state-{d}",
+            .{std.os.linux.getpid()},
+        );
+        errdefer allocator.free(state_path);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, state_path) catch {};
+        const cache_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/cache",
+            .{root_path},
+        );
+        errdefer allocator.free(cache_path);
+        const source_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/sources.list",
+            .{root_path},
+        );
+        errdefer allocator.free(source_path);
+        const keyring_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/keyring.gpg",
+            .{root_path},
+        );
+        errdefer allocator.free(keyring_path);
+        const repository_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repo",
+            .{root_path},
+        );
+        defer allocator.free(repository_path);
+        const source = try std.fmt.allocPrint(
+            allocator,
+            "deb [arch=amd64 signed-by={s}] file://{s} stable main\n",
+            .{ keyring_path, repository_path },
+        );
+        defer allocator.free(source);
+        try writeAbsoluteTestFile(source_path, source);
+        try writeAbsoluteTestFile(keyring_path, &fixture.keyring);
+        const in_release_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repo/dists/stable/InRelease",
+            .{root_path},
+        );
+        defer allocator.free(in_release_path);
+        try writeAbsoluteTestFile(
+            in_release_path,
+            &fixture.repository_in_release,
+        );
+        const packages_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repo/dists/stable/main/binary-amd64/Packages",
+            .{root_path},
+        );
+        defer allocator.free(packages_path);
+        try writeAbsoluteTestFile(packages_path, &fixture.repository_packages);
+        const status_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/status",
+            .{dpkg_path},
+        );
+        defer allocator.free(status_path);
+        try writeAbsoluteTestFile(status_path,
+            \\Package: removable
+            \\Status: install ok installed
+            \\Priority: optional
+            \\Architecture: amd64
+            \\Version: 1
+            \\
+        );
+        const source_z = try allocator.dupeZ(u8, dpkg_path);
+        defer allocator.free(source_z);
+        switch (std.os.linux.errno(std.os.linux.mount(
+            source_z,
+            "/var/lib/dpkg",
+            null,
+            std.os.linux.MS.BIND,
+            0,
+        ))) {
+            .SUCCESS => {},
+            else => return error.NamespaceUnavailable,
+        }
+        errdefer _ = std.os.linux.umount2("/var/lib/dpkg", std.os.linux.MNT.DETACH);
+        var dpkg = try std.Io.Dir.cwd().openDir(
+            std.testing.io,
+            dpkg_path,
+            .{},
+        );
+        errdefer dpkg.close(std.testing.io);
+        return .{
+            .allocator = allocator,
+            .root_path = root_path,
+            .source_path = source_path,
+            .keyring_path = keyring_path,
+            .cache_path = cache_path,
+            .state_path = state_path,
+            .source_paths = .{source_path},
+            .keyring_paths = .{keyring_path},
+            .dpkg = dpkg,
+        };
+    }
+
+    fn deinit(self: *ProductionRunnerFixture) void {
+        if (self.mounted) {
+            _ = std.os.linux.umount2(
+                "/var/lib/dpkg",
+                std.os.linux.MNT.DETACH,
+            );
+            self.mounted = false;
+        }
+        self.dpkg.close(std.testing.io);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.root_path) catch {};
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.state_path) catch {};
+        self.allocator.free(self.root_path);
+        self.allocator.free(self.source_path);
+        self.allocator.free(self.keyring_path);
+        self.allocator.free(self.cache_path);
+        self.allocator.free(self.state_path);
+        cleanupProductionRootArtifacts();
+        self.* = undefined;
+    }
+};
+
+fn cleanupProductionRootArtifacts() void {
+    inline for (.{
+        "/" ++ root_operation.record_path,
+        "/" ++ root_operation.deferred_ack_path,
+        "/" ++ root_operation_completion.document_path,
+    }) |path|
+        std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+}
+
+const ProcessDeathCompletionCrash = struct {
+    boundary: CompletionBoundary,
+
+    fn interface(self: *ProcessDeathCompletionCrash) CompletionCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, boundary: CompletionBoundary) !void {
+        const self: *ProcessDeathCompletionCrash =
+            @ptrCast(@alignCast(context));
+        if (boundary == self.boundary)
+            std.os.linux.exit_group(91);
+    }
+};
+
+const ProcessDeathTransportCrash = struct {
+    calls_to_skip: usize = 0,
+
+    fn interface(self: *ProcessDeathTransportCrash) TransportCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, _: TransportBoundary) !void {
+        const self: *ProcessDeathTransportCrash =
+            @ptrCast(@alignCast(context));
+        if (self.calls_to_skip != 0) {
+            self.calls_to_skip -= 1;
+            return;
+        }
+        std.os.linux.exit_group(92);
+    }
+};
+
+const AbandonAfterReservationTransport = struct {
+    io: std.Io,
+    disrupted_path: []const u8,
+    held_path: []const u8,
+    calls_to_skip: usize = 1,
+    moved: bool = false,
+
+    fn interface(self: *AbandonAfterReservationTransport) TransportCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, _: TransportBoundary) !void {
+        const self: *AbandonAfterReservationTransport =
+            @ptrCast(@alignCast(context));
+        if (self.calls_to_skip != 0) {
+            self.calls_to_skip -= 1;
+            return;
+        }
+        if (self.moved) return;
+        try std.Io.Dir.cwd().rename(
+            self.disrupted_path,
+            std.Io.Dir.cwd(),
+            self.held_path,
+            self.io,
+        );
+        self.moved = true;
+    }
+};
+
+const ProductionChildCrash = struct {
+    boundary: production_backend.CompletionPoint,
+
+    fn interface(
+        self: *ProductionChildCrash,
+    ) production_backend.CompletionCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(
+        context: *anyopaque,
+        boundary: production_backend.CompletionPoint,
+    ) !void {
+        const self: *ProductionChildCrash = @ptrCast(@alignCast(context));
+        if (boundary == self.boundary)
+            return error.InjectedProductionChildCrash;
+    }
+};
+
+fn writeAbsoluteTestFile(path: []const u8, bytes: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{
+        .truncate = true,
+    });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, bytes);
+}
+
 const Harness = struct {
     profile: FakeProfileLoader = .{},
     backend: FakeBackend = .{},
@@ -7417,6 +7915,407 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
         std.mem.asBytes(&original),
         std.mem.asBytes(&after_completion),
     );
+}
+
+test "apt_system_orchestrator.test.production runner retains successful ownership through outer crash matrix" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    const CrashCase = union(enum) {
+        lower: production_backend.CompletionPoint,
+        transport,
+        outer: CompletionBoundary,
+    };
+    inline for ([_]CrashCase{
+        .{ .lower = .after_completed_record },
+        .{ .lower = .after_transaction_provenance },
+        .{ .lower = .after_ownership_record_clear },
+        .transport,
+        .{ .outer = .after_backend_success },
+        .{ .outer = .after_transaction_verified },
+        .{ .outer = .after_transaction_retained },
+        .{ .outer = .before_ownership_acknowledged },
+        .{ .outer = .after_ownership_acknowledged },
+    }) |crash_case| {
+        var fixture = ProductionRunnerFixture.init(
+            std.testing.allocator,
+        ) catch |err| switch (err) {
+            error.NamespaceUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer fixture.deinit();
+        var process: ProductionRunnerProcess = .{
+            .io = std.testing.io,
+            .dpkg = fixture.dpkg,
+        };
+        var production: production_backend.Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+        };
+        var backend: ProductionBackend = .{ .backend = &production };
+        var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+        var profile: FakeProfileLoader = .{
+            .state_path = fixture.state_path,
+            .cache_path = fixture.cache_path,
+            .source_paths = fixture.source_paths,
+            .keyring_paths = fixture.keyring_paths,
+        };
+        var store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+        };
+        var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+        var sources: FakeSources = .{};
+        var engine: Engine = .{
+            .profiles = profile.interface(),
+            .runner = runner.interface(),
+            .backend = backend.interface(),
+            .store = store.interface(),
+            .verifier = verifier.interface(),
+            .ids = sources.ids(),
+            .clock = sources.clock(),
+        };
+        var prepared = try expectReady(try engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.remove, &.{"removable"}),
+        ));
+        defer prepared.deinit();
+
+        const child = try live_root.testing.forkProcess();
+        if (child == 0) {
+            switch (crash_case) {
+                .lower => |boundary| {
+                    var crash: ProductionChildCrash = .{
+                        .boundary = boundary,
+                    };
+                    production.completion_crash = crash.interface();
+                    var result = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch std.os.linux.exit_group(93);
+                    result.deinit();
+                    std.os.linux.exit_group(91);
+                },
+                .transport => {
+                    var crash: ProcessDeathTransportCrash = .{
+                        .calls_to_skip = 2,
+                    };
+                    runner.transport_crash = crash.interface();
+                    _ = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                    std.os.linux.exit_group(94);
+                },
+                .outer => |boundary| {
+                    var crash: ProcessDeathCompletionCrash = .{
+                        .boundary = boundary,
+                    };
+                    engine.completion_crash = crash.interface();
+                    _ = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                    std.os.linux.exit_group(95);
+                },
+            }
+        }
+        const child_status = try reapSignalTestProcess(child);
+        try std.testing.expect(std.os.linux.W.IFEXITED(child_status));
+        try fixture.dpkg.access(
+            std.testing.io,
+            "mutation-observed",
+            .{},
+        );
+
+        var active = (try store.interface().readActive(
+            std.testing.allocator,
+            fixture.state_path,
+        )).?;
+        defer active.deinit();
+        try std.testing.expect(active.state.mutation_started);
+
+        var inspection = try runner.interface().inspect(
+            std.testing.allocator,
+        );
+        defer inspection.deinit();
+        if (inspection.deferred_acknowledgment) |marker| {
+            var loaded_profile = try profile.interface().load(
+                std.testing.allocator,
+                "/profile.json",
+            );
+            defer loaded_profile.deinit();
+            var foreign = try runner.interface().workflow(
+                std.testing.allocator,
+                backend.interface(),
+                .{
+                    .operation = .remove,
+                    .mode = .execute,
+                    .selectors = &.{.{ .name = "removable" }},
+                    .options = executeOptions(
+                        loaded_profile.view,
+                        prepared.paths.exact_lock,
+                    ),
+                    .orchestration_id = @splat(0xa7),
+                },
+            );
+            defer foreign.deinit();
+            try std.testing.expectEqual(
+                product_api.ExitStatus.recovery,
+                foreign.result.exit_status,
+            );
+            var after_foreign = try runner.interface().inspect(
+                std.testing.allocator,
+            );
+            defer after_foreign.deinit();
+            try std.testing.expectEqualSlices(
+                u8,
+                &marker.acknowledgment_id,
+                &after_foreign.deferred_acknowledgment.?.acknowledgment_id,
+            );
+        }
+
+        var blocked = try engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.remove, &.{"removable"}),
+        );
+        switch (blocked) {
+            .result => |*result| {
+                defer result.deinit();
+                try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
+            },
+            .ready => |*unexpected| {
+                unexpected.deinit();
+                return error.ExpectedRecoveryDiagnostic;
+            },
+        }
+        var recovery = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        var completed = try engine.executeRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        defer completed.deinit();
+        try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+        try std.testing.expect((try store.interface().readActive(
+            std.testing.allocator,
+            fixture.state_path,
+        )) == null);
+        var clean = try runner.interface().inspect(std.testing.allocator);
+        defer clean.deinit();
+        try std.testing.expectEqual(RootStatus.clean, clean.status);
+        try std.testing.expect(clean.deferred_acknowledgment == null);
+    }
+}
+
+test "apt_system_orchestrator.test.production runner retries every durable pre-mutation classification" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    const RetryCase = enum {
+        downloaded_unbound,
+        reserved_bound,
+        mutating_bound,
+        abandoned,
+    };
+    inline for ([_]RetryCase{
+        .downloaded_unbound,
+        .reserved_bound,
+        .mutating_bound,
+        .abandoned,
+    }) |retry_case| {
+        var fixture = ProductionRunnerFixture.init(
+            std.testing.allocator,
+        ) catch |err| switch (err) {
+            error.NamespaceUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer fixture.deinit();
+        var process: ProductionRunnerProcess = .{
+            .io = std.testing.io,
+            .dpkg = fixture.dpkg,
+        };
+        var production: production_backend.Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+        };
+        var backend: ProductionBackend = .{ .backend = &production };
+        var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+        var profile: FakeProfileLoader = .{
+            .state_path = fixture.state_path,
+            .cache_path = fixture.cache_path,
+            .source_paths = fixture.source_paths,
+            .keyring_paths = fixture.keyring_paths,
+        };
+        var store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+        };
+        var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+        var sources: FakeSources = .{};
+        var engine: Engine = .{
+            .profiles = profile.interface(),
+            .runner = runner.interface(),
+            .backend = backend.interface(),
+            .store = store.interface(),
+            .verifier = verifier.interface(),
+            .ids = sources.ids(),
+            .clock = sources.clock(),
+        };
+        var prepared = try expectReady(try engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.remove, &.{"removable"}),
+        ));
+        defer prepared.deinit();
+        const held_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}.held",
+            .{fixture.source_path},
+        );
+        defer std.testing.allocator.free(held_path);
+
+        const child = try live_root.testing.forkProcess();
+        if (child == 0) {
+            switch (retry_case) {
+                .downloaded_unbound, .reserved_bound, .mutating_bound => {
+                    var crash: ProcessDeathCompletionCrash = .{
+                        .boundary = switch (retry_case) {
+                            .downloaded_unbound => .after_downloaded_state,
+                            .reserved_bound => .after_ownership_reserved,
+                            .mutating_bound => .after_mutating_state,
+                            .abandoned => unreachable,
+                        },
+                    };
+                    engine.completion_crash = crash.interface();
+                    _ = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch {};
+                    std.os.linux.exit_group(96);
+                },
+                .abandoned => {
+                    var abandon: AbandonAfterReservationTransport = .{
+                        .io = std.testing.io,
+                        .disrupted_path = fixture.source_path,
+                        .held_path = held_path,
+                    };
+                    runner.transport_crash = abandon.interface();
+                    var result = engine.execute(
+                        std.heap.page_allocator,
+                        prepared,
+                        true,
+                    ) catch std.os.linux.exit_group(97);
+                    result.deinit();
+                    std.os.linux.exit_group(98);
+                },
+            }
+        }
+        const child_status = try reapSignalTestProcess(child);
+        try std.testing.expect(std.os.linux.W.IFEXITED(child_status));
+        if (retry_case == .abandoned) {
+            try std.Io.Dir.cwd().rename(
+                held_path,
+                std.Io.Dir.cwd(),
+                fixture.source_path,
+                std.testing.io,
+            );
+        }
+        try std.testing.expectError(
+            error.FileNotFound,
+            fixture.dpkg.access(
+                std.testing.io,
+                "mutation-observed",
+                .{},
+            ),
+        );
+
+        var active = (try store.interface().readActive(
+            std.testing.allocator,
+            fixture.state_path,
+        )).?;
+        defer active.deinit();
+        try std.testing.expectEqual(
+            retry_case != .downloaded_unbound and
+                retry_case != .reserved_bound,
+            active.state.mutation_started,
+        );
+        const original_attempt = active.state.attempt_id;
+
+        if (retry_case != .downloaded_unbound) {
+            inline for ([_][]const []const u8{
+                &.{"removable"},
+                &.{"foreign"},
+            }) |selectors| {
+                var blocked = try engine.prepare(
+                    std.testing.allocator,
+                    mutationRequest(.remove, selectors),
+                );
+                switch (blocked) {
+                    .result => |*result| {
+                        defer result.deinit();
+                        try std.testing.expectEqual(
+                            api.Outcome.recovery,
+                            result.outcome,
+                        );
+                    },
+                    .ready => |*unexpected| {
+                        unexpected.deinit();
+                        return error.ExpectedRecoveryDiagnostic;
+                    },
+                }
+                var still_active = (try store.interface().readActive(
+                    std.testing.allocator,
+                    fixture.state_path,
+                )).?;
+                defer still_active.deinit();
+                try std.testing.expectEqualSlices(
+                    u8,
+                    &original_attempt,
+                    &still_active.state.attempt_id,
+                );
+            }
+        }
+
+        var recovery = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        var completed = try engine.executeRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        defer completed.deinit();
+        try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+        try fixture.dpkg.access(
+            std.testing.io,
+            "mutation-observed",
+            .{},
+        );
+        try std.testing.expect((try store.interface().readActive(
+            std.testing.allocator,
+            fixture.state_path,
+        )) == null);
+        var clean = try runner.interface().inspect(std.testing.allocator);
+        defer clean.deinit();
+        try std.testing.expectEqual(RootStatus.clean, clean.status);
+        try std.testing.expect(clean.deferred_acknowledgment == null);
+    }
 }
 
 test "apt_system_orchestrator.test.backend failure text survives transport destruction" {
@@ -8575,7 +9474,14 @@ test "apt_system_orchestrator.test.owner-bound publication crash retries executi
 }
 
 test "apt_system_orchestrator.test.post-recovery crashes use exact retained binding and ignore stale global completion" {
-    inline for (std.meta.tags(CompletionBoundary)) |boundary| {
+    inline for ([_]CompletionBoundary{
+        .after_backend_success,
+        .after_transaction_verified,
+        .after_transaction_retained,
+        .after_verifying_state,
+        .after_recovery_acknowledged,
+        .after_completion_published,
+    }) |boundary| {
         var harness = Harness.init(std.testing.allocator);
         defer harness.deinit();
         harness.rebind();

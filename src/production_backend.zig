@@ -43,6 +43,12 @@ pub const WorkflowRecoveryAcknowledgment = struct {
     acknowledgment_id: [32]u8,
 };
 
+pub const WorkflowOwnershipAcknowledgment = struct {
+    attempt_id: [32]u8,
+    marker_sha256: [32]u8,
+    acknowledgment_id: [32]u8,
+};
+
 pub const WorkflowRequest = struct {
     operation: WorkflowSemanticOperation,
     mode: WorkflowMode,
@@ -55,6 +61,7 @@ pub const WorkflowRequest = struct {
     /// namespace before an orchestrated mutation can begin.
     orchestration_id: ?[32]u8 = null,
     finalize_ownership: bool = false,
+    ownership_acknowledgment: ?WorkflowOwnershipAcknowledgment = null,
     recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
 };
 
@@ -280,7 +287,13 @@ pub const Backend = struct {
             if (workflow.mode != .recover or
                 workflow.orchestration_id == null or
                 workflow.defer_recovery_clear or
-                workflow.recovery_acknowledgment != null)
+                workflow.recovery_acknowledgment != null or
+                workflow.ownership_acknowledgment == null or
+                !std.mem.eql(
+                    u8,
+                    &workflow.orchestration_id.?,
+                    &workflow.ownership_acknowledgment.?.acknowledgment_id,
+                ))
                 return api.failure(
                     operation,
                     .internal,
@@ -290,9 +303,16 @@ pub const Backend = struct {
             return self.finalizeWorkflowOwnership(
                 allocator,
                 request,
-                workflow.orchestration_id.?,
+                workflow.ownership_acknowledgment.?,
             );
         }
+        if (workflow.ownership_acknowledgment != null)
+            return api.failure(
+                operation,
+                .usage,
+                .invalid_request,
+                "unexpected orchestration ownership acknowledgment",
+            );
         return self.withRepositories(allocator, request, .{
             .operation = workflow.operation,
             .mode = workflow.mode,
@@ -1655,7 +1675,7 @@ pub const Backend = struct {
         self: *Backend,
         allocator: std.mem.Allocator,
         request: api.Request,
-        orchestration_id: [32]u8,
+        acknowledgment: WorkflowOwnershipAcknowledgment,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1714,8 +1734,18 @@ pub const Backend = struct {
             observed.state != .abandoned) or
             !std.mem.eql(
                 u8,
+                &observed.digest_sha256,
+                &acknowledgment.marker_sha256,
+            ) or
+            !std.mem.eql(
+                u8,
+                &observed.attempt_id,
+                &acknowledgment.attempt_id,
+            ) or
+            !std.mem.eql(
+                u8,
                 &observed.acknowledgment_id,
-                &orchestration_id,
+                &acknowledgment.acknowledgment_id,
             ))
             return blockedRecovery(
                 request.operation,
@@ -1739,13 +1769,14 @@ pub const Backend = struct {
         }
         store.cleanupOwned(allocator, .{
             .attempt_id = observed.attempt_id,
-            .acknowledgment_id = orchestration_id,
+            .acknowledgment_id = acknowledgment.acknowledgment_id,
             .terminal_state = if (observed.state == .abandoned or
                 (record != null and
                     record.?.record.outcome == .abandoned_before_mutation))
                 .abandoned
             else
                 .released,
+            .expected_marker_sha256 = acknowledgment.marker_sha256,
             .observer = self.ownershipCleanupObserver(),
         }) catch return blockedRecovery(
             request.operation,
@@ -2516,11 +2547,20 @@ const RootOperationGuard = struct {
             attempt.clear() catch |err|
                 return mapRootOperationError(operation, err);
         } else {
-            self.finalizeOrchestrationOwnership(.released) catch
+            _ = self.coordinator.store().retainOwnedTerminal(
+                allocator,
+                .{
+                    .attempt_id = attempt.record().attempt_id,
+                    .acknowledgment_id = self.orchestration_id.?,
+                    .terminal_state = .released,
+                    .observer = self.cleanupObserver(),
+                },
+            ) catch
                 return blockedRecovery(
                     operation,
-                    "completed lower operation ownership could not be finalized",
+                    "completed lower operation ownership could not be retained",
                 );
+            self.preserve_settled = true;
         }
         return null;
     }
@@ -5361,8 +5401,6 @@ test "production workflow ownership cleanup converges across every durable bound
         .after_ownership_terminal_publish,
         .before_ownership_record_clear,
         .after_ownership_record_clear,
-        .before_ownership_marker_clear,
-        .after_ownership_marker_clear,
     }) |crash_point| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
@@ -5446,6 +5484,11 @@ test "production workflow ownership cleanup converges across every durable bound
                 .options = foreign_options,
                 .orchestration_id = @splat(0xe5),
                 .finalize_ownership = true,
+                .ownership_acknowledgment = .{
+                    .attempt_id = marker.attempt_id,
+                    .marker_sha256 = marker.digest_sha256,
+                    .acknowledgment_id = @splat(0xe5),
+                },
             });
             try std.testing.expectEqual(
                 api.ExitStatus.recovery,
@@ -5461,6 +5504,11 @@ test "production workflow ownership cleanup converges across every durable bound
                 .options = options,
                 .orchestration_id = owner_id,
                 .finalize_ownership = true,
+                .ownership_acknowledgment = .{
+                    .attempt_id = marker.attempt_id,
+                    .marker_sha256 = marker.digest_sha256,
+                    .acknowledgment_id = owner_id,
+                },
             });
             try std.testing.expectEqual(api.ExitStatus.success, finalized.exit_status);
             try std.testing.expectEqual(mutation_calls, process.calls);
@@ -5628,6 +5676,28 @@ test "production workflow pre-mutation ownership abandon converges across every 
             allocator,
             &directory,
         )) == null);
+        const released = (try backendDeferredMarker(
+            allocator,
+            &directory,
+        )).?;
+        try std.testing.expectEqual(
+            root_operation.DeferredAcknowledgmentState.released,
+            released.state,
+        );
+        const acknowledged = try backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+            .finalize_ownership = true,
+            .ownership_acknowledgment = .{
+                .attempt_id = released.attempt_id,
+                .marker_sha256 = released.digest_sha256,
+                .acknowledgment_id = owner_id,
+            },
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, acknowledged.exit_status);
         try std.testing.expect((try backendDeferredMarker(
             allocator,
             &directory,
@@ -5777,6 +5847,28 @@ test "production workflow retry rotation preserves continuous owner proof across
             allocator,
             &directory,
         )) == null);
+        const released = (try backendDeferredMarker(
+            allocator,
+            &directory,
+        )).?;
+        try std.testing.expectEqual(
+            root_operation.DeferredAcknowledgmentState.released,
+            released.state,
+        );
+        const acknowledged = try reopened_backend.executeWorkflow(allocator, .{
+            .operation = .remove,
+            .mode = .recover,
+            .selectors = &selectors,
+            .options = options,
+            .orchestration_id = owner_id,
+            .finalize_ownership = true,
+            .ownership_acknowledgment = .{
+                .attempt_id = released.attempt_id,
+                .marker_sha256 = released.digest_sha256,
+                .acknowledgment_id = owner_id,
+            },
+        });
+        try std.testing.expectEqual(api.ExitStatus.success, acknowledged.exit_status);
         try std.testing.expect((try backendDeferredMarker(
             allocator,
             &directory,

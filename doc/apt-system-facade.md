@@ -328,15 +328,22 @@ If recovery must discharge owed provenance, it may only atomically transition
 that exact binding to `pending`, adding the completion and provenance digests
 without changing its owner. The pending marker makes the otherwise clearable
 completed/published record non-reclaimable by every ordinary mutation or
-recovery, including a request using a different profile or state path. An
-uninterrupted success transitions its binding to `released`, clears and fsyncs
-the root record, then clears and fsyncs the marker while holding the same root
-lock. A proven pre-mutation failure instead transitions to `abandoned`, clears
-and fsyncs the record, and deliberately retains that terminal exact-owner
-marker. On retry, the old marker remains continuously durable until it is
-atomically replaced by a fresh `bound` attempt; no crash prefix exposes an
-unowned clean root. The outer engine retains verified transaction evidence
-before requesting `released` cleanup. Legacy record-only states retain their
+recovery, including a request using a different profile or state path.
+Ordinary non-orchestrated product success keeps its existing clear-on-success
+behavior. Orchestrated success instead transitions its binding to `released`,
+clears and fsyncs the root record, and returns the exact attempt, marker digest,
+and outer acknowledgment identity while retaining the marker. The outer engine
+verifies and durably retains transaction evidence, CAS-publishes that binding,
+then compare-and-clears only the matching released marker. A crash before
+outer retention therefore leaves the root protected and the transaction
+evidence available for exact-owner reconciliation; a crash after retention but
+before acknowledgment clears idempotently from the retained binding; a crash
+after acknowledgment completes from operation-local evidence without trusting
+a replaceable global result. A proven pre-mutation failure instead transitions
+to `abandoned`, clears and fsyncs the record, and deliberately retains that
+terminal exact-owner marker. On retry, the old marker remains continuously
+durable until it is atomically replaced by a fresh `bound` attempt; no crash
+prefix exposes an unowned clean root. Legacy record-only states retain their
 existing conservative recovery rules, and absence of both documents is the
 only fully clean state.
 
