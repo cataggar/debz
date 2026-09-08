@@ -86,7 +86,9 @@ Parse failures carry the output mode recognized from the valid canonical
 option prefix. Rejected command arguments, misplaced `--json`, and a
 `--json` token consumed as an invalid profile value cannot switch rendering.
 Decisive help for a recognized command returns before counting or inspecting
-the ignored suffix.
+the ignored suffix. The executable uses the same pure prefix scanner while
+collecting at most the parser limit plus one sentinel argument, so help does
+not require allocating or reading an unbounded suffix.
 
 ## Trusted system profile
 
@@ -277,6 +279,19 @@ profile, exact lock, active-state path, and any retained transaction or
 completion evidence. A mutation-started state is rendered with `changed=true`
 and the exact `debz recover --system-profile PATH` action. The same
 reconciliation applies to errors during confirmed recovery.
+
+If durable state inspection is unavailable, corrupt, absent, or foreign and
+no exact lower owner proves mutation, result v2 reports
+`mutation_status: "unknown"`, carries no unverified profile, lock, or active
+state evidence, and human output says `Changed: unknown (recovery required)`.
+A matching durable pre-mutation outer state plus a provably clean lower state
+is the only path that reports a clean internal failure. Recovery preparation
+uses the same fail-closed distinction instead of converting state I/O errors
+to a generic internal diagnostic.
+
+Package selectors and item names share one grammar: the first byte is ASCII
+alphanumeric, and remaining bytes are ASCII alphanumeric or one of
+`+ - . : =`.
 
 The trusted profile-reference lease is revalidated immediately before every
 read-only route and every plan, download, execute, and recovery workflow call.

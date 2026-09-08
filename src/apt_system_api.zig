@@ -192,6 +192,10 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+pub const MutationStatus = enum {
+    unknown,
+};
+
 pub const ProfileBinding = struct {
     path: []const u8,
     sha256: [32]u8,
@@ -232,6 +236,7 @@ pub const Result = struct {
     outcome: Outcome,
     exit_status: ExitStatus,
     changed: bool = false,
+    mutation_status: ?MutationStatus = null,
     summary: []const u8,
     items: []const Item = &.{},
     evidence: Evidence = .{},
@@ -462,6 +467,17 @@ pub fn validateResult(result: Result) !void {
     if (result.items.len > maximum_result_items) return error.TooManyItems;
     if (result.items.len != 0 and !resultAllowsItems(result))
         return error.UnexpectedItems;
+    if (result.mutation_status) |status| switch (status) {
+        .unknown => {
+            if (result.changed or result.outcome != .recovery or
+                result.profile != null or
+                result.evidence.exact_lock != null or
+                result.evidence.transaction_result != null or
+                result.evidence.root_operation_completion != null or
+                result.evidence.active_operation_state != null)
+                return error.InvalidMutationStatus;
+        },
+    };
     for (result.items) |item| {
         if (!validPackage(item.package)) return error.InvalidItem;
         if (item.version) |version|
@@ -575,8 +591,10 @@ fn exitStatus(outcome: Outcome) ExitStatus {
 }
 
 fn validPackage(package: []const u8) bool {
-    if (package.len == 0 or package.len > 255 or package[0] == '-') return false;
-    for (package) |byte|
+    if (package.len == 0 or package.len > 255 or
+        !std.ascii.isAlphanumeric(package[0]))
+        return false;
+    for (package[1..]) |byte|
         if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or
             byte == '.' or byte == ':' or byte == '='))
             return false;
@@ -668,13 +686,13 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
     try writeString(
         writer,
-        if (result.items.len == 0)
+        if (result.items.len == 0 and result.mutation_status == null)
             result_schema_id
         else
             result_items_schema_id,
     );
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
-        if (result.items.len == 0)
+        if (result.items.len == 0 and result.mutation_status == null)
             schema_version
         else
             result_items_schema_version,
@@ -695,10 +713,23 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     } else try writer.writeAll("null");
     try writer.writeAll(",\"outcome\":");
     try writeString(writer, @tagName(result.outcome));
-    try writer.print(",\"exit_status\":{},\"changed\":{},\"summary\":", .{
+    try writer.print(",\"exit_status\":{},\"changed\":{}", .{
         @intFromEnum(result.exit_status),
         result.changed,
     });
+    if (result.items.len != 0 or result.mutation_status != null) {
+        try writer.writeAll(",\"mutation_status\":");
+        try writeString(
+            writer,
+            if (result.mutation_status != null)
+                "unknown"
+            else if (result.changed)
+                "changed"
+            else
+                "unchanged",
+        );
+    }
+    try writer.writeAll(",\"summary\":");
     try writeString(writer, result.summary);
     if (result.items.len != 0) {
         try writer.writeAll(",\"items\":[");
@@ -1358,6 +1389,94 @@ test "apt_system_api.test.item-bearing results are owned and bind the canonical 
     try std.testing.expectError(
         error.UnexpectedItems,
         validateResult(confirmation),
+    );
+}
+
+test "apt_system_api.test.package grammar requires alphanumeric first byte across requests and items" {
+    const valid = [_][]const u8{
+        "a", "Z", "0", "a+", "a-", "a.", "a:", "a=",
+    };
+    const invalid = [_][]const u8{
+        "+a", "-a", ".a", ":a", "=a", "a_b", "a/b", "\xc3\xa9", "\x1f",
+    };
+    for (valid) |package| {
+        try validateRequest(.{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{package},
+        });
+        const result = try complete(.{
+            .operation = .list_installed,
+            .request_sha256 = @splat(0x11),
+            .profile = .{
+                .path = "/profile.json",
+                .sha256 = @splat(0x22),
+                .reference_evidence_sha256 = @splat(0x33),
+            },
+            .outcome = .success,
+            .exit_status = .success,
+            .summary = "installed",
+            .items = &.{.{ .package = package }},
+        });
+        const document = try result.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(document);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"mutation_status\":\"unchanged\"",
+        ) != null);
+    }
+    for (invalid) |package| {
+        try std.testing.expectError(error.InvalidPackage, validateRequest(.{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{package},
+        }));
+        try std.testing.expectError(error.InvalidItem, validateResult(.{
+            .operation = .list_installed,
+            .request_sha256 = @splat(0x11),
+            .profile = .{
+                .path = "/profile.json",
+                .sha256 = @splat(0x22),
+                .reference_evidence_sha256 = @splat(0x33),
+            },
+            .outcome = .success,
+            .exit_status = .success,
+            .summary = "installed",
+            .items = &.{.{ .package = package }},
+        }));
+    }
+    const too_long = "a" ** 256;
+    try std.testing.expectError(error.InvalidPackage, validateRequest(.{
+        .operation = .install,
+        .profile_path = "/profile.json",
+        .packages = &.{too_long},
+    }));
+}
+
+test "apt_system_api.test.unknown mutation status rejects all unverified evidence" {
+    const request: Request = .{
+        .operation = .install,
+        .profile_path = "/profile.json",
+        .packages = &.{"alpha"},
+    };
+    var unknown = try failure(
+        request,
+        .recovery,
+        .recovery_required,
+        "recovery",
+        "mutation status unknown",
+    );
+    unknown.mutation_status = .unknown;
+    _ = try complete(unknown);
+    unknown.profile = .{
+        .path = "/profile.json",
+        .sha256 = @splat(0x11),
+        .reference_evidence_sha256 = @splat(0x22),
+    };
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
     );
 }
 

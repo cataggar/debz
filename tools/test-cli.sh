@@ -76,7 +76,7 @@ debz = sys.argv[1]
 dangerous = "--credential=decisive-help-secret"
 result = subprocess.run(
     [debz, "apt", "update", "--help", dangerous]
-    + ["ignored"] * 260,
+    + list("ignored" for _ in range(8000)),
     stdin=subprocess.DEVNULL,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -85,6 +85,20 @@ result = subprocess.run(
 )
 assert result.returncode == 0, result
 assert b"debz apt update" in result.stdout
+assert dangerous.encode() not in result.stdout
+assert not result.stderr
+
+result = subprocess.run(
+    [debz, "recover", "--system-profile", "/profile.json", "--help", dangerous]
+    + list("ignored" for _ in range(8000)),
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=5,
+    check=False,
+)
+assert result.returncode == 0, result
+assert b"debz recover --system-profile PATH" in result.stdout
 assert dangerous.encode() not in result.stdout
 assert not result.stderr
 PY

@@ -23,6 +23,9 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         cls.v2 = json.loads(
             (ROOT / "schema/apt-system-result-v2.json").read_text()
         )
+        cls.request = json.loads(
+            (ROOT / "schema/apt-system-request-v1.json").read_text()
+        )
         v1_resource = Resource.from_contents(cls.v1)
         cls.registry = Registry().with_resources(
             [
@@ -37,6 +40,7 @@ class AptSystemResultSchemaTests(unittest.TestCase):
             cls.v2,
             registry=cls.registry,
         )
+        cls.request_validator = jsonschema.Draft202012Validator(cls.request)
 
     @staticmethod
     def confirmation() -> dict:
@@ -55,6 +59,7 @@ class AptSystemResultSchemaTests(unittest.TestCase):
             "outcome": "usage",
             "exit_status": 2,
             "changed": False,
+            "mutation_status": "unchanged",
             "summary": "confirmation required",
             "items": [
                 {
@@ -102,6 +107,61 @@ class AptSystemResultSchemaTests(unittest.TestCase):
                 "message": "extra diagnostic",
             }
         )
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(document)
+
+    def test_request_and_result_package_grammar_match_boundaries(self) -> None:
+        punctuation = "+-.:="
+        valid = ["a", "Z", "0"] + [f"a{value}" for value in punctuation]
+        invalid = list(punctuation) + ["é", "\x1f", "a/b", "a_"]
+        invalid.append("a" * 256)
+
+        for package in valid + invalid:
+            request = {
+                "schema": "https://debz.dev/schema/apt-system-request-v1",
+                "version": 1,
+                "api_version": 1,
+                "operation": "install",
+                "profile_path": "/profile.json",
+                "packages": [package],
+                "assume_yes": False,
+            }
+            result = self.confirmation()
+            result["items"][0]["package"] = package
+            request_valid = self.request_validator.is_valid(request)
+            result_valid = self.validator.is_valid(result)
+            self.assertEqual(request_valid, result_valid, package)
+            self.assertEqual(package in valid, request_valid, package)
+
+    def test_unknown_mutation_status_is_v2_without_fabricated_evidence(self) -> None:
+        document = self.confirmation()
+        document.pop("items")
+        document["mutation_status"] = "unknown"
+        document["profile"] = None
+        document["outcome"] = "recovery"
+        document["exit_status"] = 8
+        document["changed"] = False
+        document["summary"] = "mutation status unknown; recovery required"
+        document["evidence"] = {
+            "exact_lock": None,
+            "transaction_result": None,
+            "root_operation_completion": None,
+            "active_operation_state": None,
+        }
+        document["diagnostics"] = [
+            {
+                "id": "recovery_required",
+                "outcome": "recovery",
+                "phase": "recovery",
+                "message": "mutation status unknown; recovery required",
+            }
+        ]
+        self.validate(document)
+        document["profile"] = {
+            "path": "/profile.json",
+            "sha256": "22" * 32,
+            "reference_evidence_sha256": "33" * 32,
+        }
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(document)
 

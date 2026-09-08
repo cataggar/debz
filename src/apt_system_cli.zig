@@ -83,6 +83,86 @@ pub const ConfirmationDecision = enum {
     return_confirmation_required,
 };
 
+pub const AptHelpScanner = struct {
+    topic: HelpTopic = .apt,
+    command_seen: bool = false,
+    expect_profile_value: bool = false,
+    seen_profile: bool = false,
+    seen_json: bool = false,
+    prefix_valid: bool = true,
+
+    pub fn feed(self: *AptHelpScanner, argument: []const u8) ?HelpTopic {
+        if (self.command_seen) {
+            if (isHelpArgument(argument)) return self.topic;
+            return null;
+        }
+        if (!self.prefix_valid) return null;
+        if (self.expect_profile_value) {
+            self.expect_profile_value = false;
+            if (!validProfilePath(argument)) self.prefix_valid = false;
+            return null;
+        }
+        if (isHelpArgument(argument)) return .apt;
+        if (std.mem.eql(u8, argument, "--profile")) {
+            if (self.seen_profile) {
+                self.prefix_valid = false;
+                return null;
+            }
+            self.seen_profile = true;
+            self.expect_profile_value = true;
+            return null;
+        }
+        if (std.mem.eql(u8, argument, "--json")) {
+            if (self.seen_json) self.prefix_valid = false;
+            self.seen_json = true;
+            return null;
+        }
+        if (startsWithDash(argument)) {
+            self.prefix_valid = false;
+            return null;
+        }
+        self.topic = commandTopic(argument) orelse {
+            self.prefix_valid = false;
+            return null;
+        };
+        self.command_seen = true;
+        return null;
+    }
+};
+
+pub const RecoveryHelpScanner = struct {
+    expect_profile_value: bool = false,
+    seen_profile: bool = false,
+    seen_json: bool = false,
+    prefix_valid: bool = true,
+
+    pub fn feed(self: *RecoveryHelpScanner, argument: []const u8) bool {
+        if (!self.prefix_valid) return false;
+        if (self.expect_profile_value) {
+            self.expect_profile_value = false;
+            if (!validProfilePath(argument)) self.prefix_valid = false;
+            return false;
+        }
+        if (isHelpArgument(argument)) return true;
+        if (std.mem.eql(u8, argument, "--system-profile")) {
+            if (self.seen_profile) {
+                self.prefix_valid = false;
+                return false;
+            }
+            self.seen_profile = true;
+            self.expect_profile_value = true;
+            return false;
+        }
+        if (std.mem.eql(u8, argument, "--json")) {
+            if (self.seen_json) self.prefix_valid = false;
+            self.seen_json = true;
+            return false;
+        }
+        self.prefix_valid = false;
+        return false;
+    }
+};
+
 const apt_help =
     \\debz apt - deliberately limited apt-shaped system facade
     \\
@@ -193,8 +273,9 @@ pub fn helpText(topic: HelpTopic) []const u8 {
 }
 
 pub fn parseRecovery(arguments: []const []const u8) RecoveryParseResult {
+    var help_scanner: RecoveryHelpScanner = .{};
     for (arguments) |argument| {
-        if (isHelpArgument(argument)) return .help;
+        if (help_scanner.feed(argument)) return .help;
     }
     const failure_output = recognizedRecoveryOutput(arguments);
     if (arguments.len > maximum_arguments)
@@ -513,24 +594,9 @@ fn failureOutput(
 }
 
 fn detectHelp(arguments: []const []const u8) ?HelpTopic {
-    var topic: HelpTopic = .apt;
-    var command_seen = false;
-    var expect_profile_value = false;
+    var scanner: AptHelpScanner = .{};
     for (arguments) |argument| {
-        if (isHelpArgument(argument)) return topic;
-        if (command_seen) continue;
-        if (expect_profile_value) {
-            expect_profile_value = false;
-            continue;
-        }
-        if (std.mem.eql(u8, argument, "--profile")) {
-            expect_profile_value = true;
-            continue;
-        }
-        if (std.mem.eql(u8, argument, "--json")) continue;
-        if (startsWithDash(argument)) continue;
-        topic = commandTopic(argument) orelse return null;
-        command_seen = true;
+        if (scanner.feed(argument)) |topic| return topic;
     }
     return null;
 }
@@ -749,7 +815,12 @@ fn writeHumanResult(result: api.Result, writer: *std.Io.Writer) !void {
             @tagName(result.operation),
             @tagName(result.outcome),
             @intFromEnum(result.exit_status),
-            if (result.changed) "yes" else "no",
+            if (result.mutation_status != null)
+                "unknown (recovery required)"
+            else if (result.changed)
+                "yes"
+            else
+                "no",
         },
     );
     try writer.print("Plan/change details: {s}\n", .{result.summary});
@@ -998,9 +1069,6 @@ test "apt_system_cli.test.help wins for root and valid commands before parsing" 
         .{ .arguments = &.{}, .topic = .apt },
         .{ .arguments = &.{"--help"}, .topic = .apt },
         .{ .arguments = &.{ "-h", "--unknown" }, .topic = .apt },
-        .{ .arguments = &.{ "--unknown", "--help" }, .topic = .apt },
-        .{ .arguments = &.{ "--", "--help" }, .topic = .apt },
-        .{ .arguments = &.{ "--profile", "--help" }, .topic = .apt },
         .{ .arguments = &.{ "--profile", "/reviewed.json", "update", "--help" }, .topic = .update },
         .{ .arguments = &.{ "update", "--unknown", "--help" }, .topic = .update },
         .{ .arguments = &.{ "install", "curl", "--bad", "-h" }, .topic = .install },
@@ -1020,6 +1088,9 @@ test "apt_system_cli.test.help wins for root and valid commands before parsing" 
         &.{ "unknown-command", "--help" },
         .unknown_command,
     );
+    try expectFailure(&.{ "--unknown", "--help" }, .unknown_option);
+    try expectFailure(&.{ "--", "--help" }, .passthrough_not_supported);
+    try expectFailure(&.{ "--profile", "--help" }, .missing_command);
 }
 
 test "apt_system_cli.test.help returns before inaccessible trailing bytes" {
@@ -1441,13 +1512,19 @@ test "apt_system_cli.test.recovery grammar is strict pure and help decisive" {
         else => return error.UnexpectedParseResult,
     }
 
-    const help = parseRecovery(&.{
+    const malformed_help = parseRecovery(&.{
         "--system-profile",
         "/profile.json",
         "--unknown-secret",
         "--help",
     });
-    try std.testing.expect(help == .help);
+    try std.testing.expect(malformed_help == .failure);
+    try std.testing.expect(parseRecovery(&.{
+        "--system-profile",
+        "/profile.json",
+        "--help",
+        "--unknown-secret",
+    }) == .help);
 
     for ([_][]const []const u8{
         &.{},
@@ -1545,6 +1622,7 @@ test "apt_system_cli.test.decisive command help ignores unlimited dangerous suff
         else
             "ignored";
     }
+
     const oversized = try std.testing.allocator.alloc(
         u8,
         maximum_argument_bytes + 1,
@@ -1565,4 +1643,33 @@ test "apt_system_cli.test.decisive command help ignores unlimited dangerous suff
         ),
         else => return error.UnexpectedParseResult,
     }
+}
+
+test "apt_system_cli.test.streaming help scanners stop only on valid recognized prefixes" {
+    var apt: AptHelpScanner = .{};
+    try std.testing.expect(apt.feed("--json") == null);
+    try std.testing.expect(apt.feed("update") == null);
+    try std.testing.expectEqual(HelpTopic.update, apt.feed("--help").?);
+
+    var malformed_apt: AptHelpScanner = .{};
+    try std.testing.expect(malformed_apt.feed("--unknown") == null);
+    try std.testing.expect(malformed_apt.feed("--help") == null);
+
+    var unknown_command: AptHelpScanner = .{};
+    try std.testing.expect(unknown_command.feed("unknown") == null);
+    try std.testing.expect(unknown_command.feed("--help") == null);
+
+    var profile_value: AptHelpScanner = .{};
+    try std.testing.expect(profile_value.feed("--profile") == null);
+    try std.testing.expect(profile_value.feed("--help") == null);
+    try std.testing.expect(profile_value.feed("update") == null);
+
+    var recovery: RecoveryHelpScanner = .{};
+    try std.testing.expect(!recovery.feed("--system-profile"));
+    try std.testing.expect(!recovery.feed("/profile.json"));
+    try std.testing.expect(recovery.feed("--help"));
+
+    var malformed_recovery: RecoveryHelpScanner = .{};
+    try std.testing.expect(!malformed_recovery.feed("--unknown"));
+    try std.testing.expect(!malformed_recovery.feed("--help"));
 }

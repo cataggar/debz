@@ -420,18 +420,14 @@ fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpT
         return null;
     }
     if (std.mem.eql(u8, command, "recover")) {
-        var has_help = false;
-        var system_recovery = false;
+        var scanner: apt_cli.RecoveryHelpScanner = .{};
         while (args.next()) |argument| {
-            if (isHelpFlag(argument)) has_help = true;
-            if (std.mem.eql(u8, argument, "--system-profile"))
-                system_recovery = true;
+            if (scanner.feed(argument))
+                return if (scanner.seen_profile)
+                    .system_recovery
+                else
+                    .{ .operation = .recover };
         }
-        if (system_recovery) {
-            if (has_help) return .system_recovery;
-            return null;
-        }
-        if (has_help) return .{ .operation = .recover };
         return null;
     }
 
@@ -495,8 +491,15 @@ fn runAptSystem(
     stderr: *std.Io.Writer,
 ) !void {
     var arguments: std.ArrayList([]const u8) = .empty;
-    while (args.next()) |argument|
+    var help_scanner: apt_cli.AptHelpScanner = .{};
+    while (args.next()) |argument| {
+        if (help_scanner.feed(argument)) |topic| {
+            try stdout.writeAll(apt_cli.helpText(topic));
+            return;
+        }
         try arguments.append(init.arena.allocator(), argument);
+        if (arguments.items.len > apt_cli.maximum_arguments) break;
+    }
 
     const parsed = apt_cli.parse(arguments.items);
     switch (parsed) {
@@ -546,8 +549,15 @@ fn runAptSystemRecovery(
     stderr: *std.Io.Writer,
 ) !void {
     var arguments: std.ArrayList([]const u8) = .empty;
-    while (args.next()) |argument|
+    var help_scanner: apt_cli.RecoveryHelpScanner = .{};
+    while (args.next()) |argument| {
+        if (help_scanner.feed(argument)) {
+            try stdout.writeAll(apt_cli.helpText(.recovery));
+            return;
+        }
         try arguments.append(init.arena.allocator(), argument);
+        if (arguments.items.len > apt_cli.maximum_arguments) break;
+    }
 
     const parsed = switch (apt_cli.parseRecovery(arguments.items)) {
         .help => {
@@ -574,27 +584,14 @@ fn runAptSystemRecovery(
         undefined;
     composition.init(init.arena.allocator(), init.io, &backend);
     var terminal_context = ProductionTerminal{ .io = init.io };
-    const status = apt_command.runRecovery(
+    const status = try apt_command.runRecovery(
         init.arena.allocator(),
         parsed.profile_path,
         parsed.output,
         apt_command.Engine.production(composition.orchestrator()),
         terminal_context.interface(),
         .{ .stdout = stdout, .stderr = stderr },
-    ) catch {
-        if (parsed.output == .json) {
-            try stdout.writeAll(
-                "{\"schema\":\"io.github.cataggar.debz.apt-system-cli-diagnostic.v1\",\"version\":1,\"exit_status\":70,\"id\":\"internal_error\",\"topic\":\"recover\",\"message\":\"internal apt-system recovery failure\"}\n",
-            );
-        } else {
-            try stderr.writeAll(
-                "debz recover: internal apt-system recovery failure\n",
-            );
-        }
-        try stdout.flush();
-        try stderr.flush();
-        std.process.exit(@intFromEnum(debz.AptSystemExitStatus.internal));
-    };
+    );
     if (status != .success) {
         try stdout.flush();
         try stderr.flush();

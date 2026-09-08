@@ -15,7 +15,7 @@
     "exit_status",
     "changed",
     "summary",
-    "items",
+    "mutation_status",
     "evidence",
     "diagnostics",
     "digest_sha256"
@@ -43,6 +43,9 @@
     },
     "exit_status": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
     "changed": { "type": "boolean" },
+    "mutation_status": {
+      "enum": ["changed", "unchanged", "unknown"]
+    },
     "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "items": {
       "type": "array",
@@ -77,6 +80,30 @@
     { "$ref": "apt-system-result-v1.json#/allOf/9" },
     { "$ref": "apt-system-result-v1.json#/allOf/10" },
     {
+      "if": {
+        "properties": {
+          "mutation_status": { "const": "changed" }
+        },
+        "required": ["mutation_status"]
+      },
+      "then": {
+        "properties": { "changed": { "const": true } },
+        "required": ["items"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mutation_status": { "const": "unchanged" }
+        },
+        "required": ["mutation_status"]
+      },
+      "then": {
+        "properties": { "changed": { "const": false } },
+        "required": ["items"]
+      }
+    },
+    {
       "anyOf": [
         {
           "properties": {
@@ -100,6 +127,24 @@
               }
             }
           }
+        },
+        {
+          "properties": {
+            "mutation_status": { "const": "unknown" },
+            "changed": { "const": false },
+            "outcome": { "const": "recovery" },
+            "profile": { "type": "null" },
+            "evidence": {
+              "properties": {
+                "exact_lock": { "type": "null" },
+                "transaction_result": { "type": "null" },
+                "root_operation_completion": { "type": "null" },
+                "active_operation_state": { "type": "null" }
+              }
+            }
+          },
+          "required": ["mutation_status", "changed", "outcome"],
+          "not": { "required": ["items"] }
         }
       ]
     }
