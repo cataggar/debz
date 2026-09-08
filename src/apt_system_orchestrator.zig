@@ -5955,6 +5955,90 @@ fn testInitialState(
     });
 }
 
+fn reserveVerifyingTestState(
+    allocator: std.mem.Allocator,
+    store: StateStore,
+    state_path: []const u8,
+    paths: OperationPaths,
+    attempt_id: [32]u8,
+) !TestStatePair {
+    var initial = try testInitialState(allocator, attempt_id);
+    defer initial.deinit();
+    var profile_loaded = try nextState(allocator, initial.state, .{
+        .phase = .profile_loaded,
+        .updated_unix = 110,
+    });
+    defer profile_loaded.deinit();
+    var authenticated = try nextState(allocator, profile_loaded.state, .{
+        .phase = .authenticated,
+        .updated_unix = 120,
+    });
+    defer authenticated.deinit();
+    var downloaded = try nextState(allocator, authenticated.state, .{
+        .phase = .downloaded,
+        .exact_lock = .{
+            .path = paths.exact_lock,
+            .schema = exact_lock.schema_id,
+            .version = exact_lock.schema_version,
+            .digest_sha256 = @splat(0x51),
+        },
+        .updated_unix = 130,
+    });
+    defer downloaded.deinit();
+    var mutating = try nextState(allocator, downloaded.state, .{
+        .phase = .mutating,
+        .updated_unix = 140,
+    });
+    defer mutating.deinit();
+    var verifying = try nextState(allocator, mutating.state, .{
+        .phase = .verifying,
+        .transaction_result = .{
+            .path = paths.transaction_result,
+            .schema = transaction_provenance.schema_id,
+            .version = transaction_provenance.schema_version,
+            .digest_sha256 = @splat(0x52),
+        },
+        .updated_unix = 150,
+    });
+    errdefer verifying.deinit();
+    var final = try nextState(allocator, verifying.state, .{
+        .phase = .completed,
+        .outcome = .succeeded,
+        .root_operation_completion = .{
+            .document = .{
+                .path = paths.completion,
+                .schema = completion_schema_id,
+                .version = completion_schema_version,
+                .digest_sha256 = @splat(0x56),
+            },
+            .completed_attempt_id = attempt_id,
+        },
+        .updated_unix = 200,
+    });
+    errdefer final.deinit();
+    try store.reserveFn(
+        store.context,
+        allocator,
+        paths,
+        "{}",
+        initial.state,
+    );
+    inline for (.{
+        .{ initial.state, profile_loaded.state },
+        .{ profile_loaded.state, authenticated.state },
+        .{ authenticated.state, downloaded.state },
+        .{ downloaded.state, mutating.state },
+        .{ mutating.state, verifying.state },
+    }) |transition| try store.compareAndSetFn(
+        store.context,
+        allocator,
+        state_path,
+        operation_state.Expected.fromState(transition[0]),
+        transition[1],
+    );
+    return .{ .current = verifying, .final = final };
+}
+
 fn requirePrivilegedProductionTest() !void {
     if (builtin.os.tag == .linux and std.os.linux.geteuid() == 0) return;
     if (build_options.require_privileged_orchestration_tests)
@@ -5967,6 +6051,57 @@ fn privilegedCoverageUnavailable() anyerror {
         error.RequiredPrivilegedOrchestrationCoverageUnavailable
     else
         error.SkipZigTest;
+}
+
+test "apt_system_orchestrator.test.required_privileged.manifest covers every privileged test" {
+    const source = @embedFile("apt_system_orchestrator.zig");
+    const test_prefix = "\ntest \"";
+    const required_tag =
+        "apt_system_orchestrator.test.required_privileged.";
+    const privilege_call =
+        "requirePrivilegedProduction" ++ "Test();";
+    const unavailable_call =
+        "privilegedCoverage" ++ "Unavailable()";
+    var cursor: usize = 0;
+    var tagged_count: usize = 0;
+    var privilege_dependent_count: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, test_prefix)) |start| {
+        const body_start = start + test_prefix.len;
+        const name_end = std.mem.indexOfScalarPos(
+            u8,
+            source,
+            body_start,
+            '"',
+        ) orelse return error.InvalidTestManifest;
+        const next = std.mem.indexOfPos(
+            u8,
+            source,
+            name_end,
+            test_prefix,
+        ) orelse source.len;
+        const name = source[body_start..name_end];
+        const body = source[name_end..next];
+        const tagged = std.mem.startsWith(u8, name, required_tag);
+        if (tagged) tagged_count += 1;
+        if (std.mem.indexOf(
+            u8,
+            body,
+            privilege_call,
+        ) != null or std.mem.indexOf(
+            u8,
+            body,
+            unavailable_call,
+        ) != null) {
+            privilege_dependent_count += 1;
+            try std.testing.expect(tagged);
+        }
+        cursor = next;
+    }
+    try std.testing.expectEqual(@as(usize, 19), tagged_count);
+    try std.testing.expectEqual(
+        @as(usize, 15),
+        privilege_dependent_count,
+    );
 }
 
 test "apt_system_orchestrator.test.selector parsing preserves one batch" {
@@ -6004,7 +6139,7 @@ test "apt_system_orchestrator.test.operation paths are retained under one filesy
     );
 }
 
-test "apt_system_orchestrator.test.production options preserve host-root denial" {
+test "apt_system_orchestrator.test.required_privileged.production options preserve host-root denial" {
     const profile: ProfileView = .{
         .binding = .{
             .path = "/profile.json",
@@ -6067,7 +6202,7 @@ test "apt_system_orchestrator.test.active publication requires the complete dire
     try durability.permitActivePublication();
 }
 
-test "apt_system_orchestrator.test.operation directory parent is durable before active publication" {
+test "apt_system_orchestrator.test.required_privileged.durability operation directory parent is durable before active publication" {
     try requirePrivilegedProductionTest();
     {
         const root_path = try std.fmt.allocPrint(
@@ -6196,18 +6331,19 @@ test "apt_system_orchestrator.test.operation directory parent is durable before 
     }
 }
 
-test "apt_system_orchestrator.test.system finish reuses retained final after pre-CAS crash" {
-    var directory = std.testing.tmpDir(.{});
-    defer directory.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_length = try directory.dir.realPath(
-        std.testing.io,
-        &root_buffer,
+test "apt_system_orchestrator.test.required_privileged.durability system finish reuses retained final after pre-CAS crash" {
+    try requirePrivilegedProductionTest();
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-system-finish-reuse-{d}",
+        .{std.os.linux.getpid()},
     );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
     const state_path = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}/state",
-        .{root_buffer[0..root_length]},
+        .{root_path},
     );
     defer std.testing.allocator.free(state_path);
     const attempt_id: [32]u8 = @splat(0x41);
@@ -6217,12 +6353,6 @@ test "apt_system_orchestrator.test.system finish reuses retained final after pre
         attempt_id,
     );
     defer paths.deinit(std.testing.allocator);
-    var states = try testStatePair(
-        std.testing.allocator,
-        paths,
-        attempt_id,
-    );
-    defer states.deinit();
     var crash: TestFinishCrash = .{};
     var store: SystemStateStore = .{
         .allocator = std.testing.allocator,
@@ -6230,16 +6360,14 @@ test "apt_system_orchestrator.test.system finish reuses retained final after pre
         .finish_crash = crash.interface(),
     };
     const interface = store.interface();
-    interface.reserveFn(
-        interface.context,
+    var states = try reserveVerifyingTestState(
         std.testing.allocator,
+        interface,
+        state_path,
         paths,
-        "{}",
-        states.current.state,
-    ) catch |err| switch (err) {
-        error.NotRootOwned => return error.SkipZigTest,
-        else => return err,
-    };
+        attempt_id,
+    );
+    defer states.deinit();
     try std.testing.expectError(
         error.InjectedFinishCrash,
         interface.finishFn(
@@ -6267,24 +6395,13 @@ test "apt_system_orchestrator.test.system finish reuses retained final after pre
         active.state.digest_sha256,
     );
 
-    var regenerated = try nextState(
-        std.testing.allocator,
-        active.state,
-        .{
-            .phase = .completed,
-            .outcome = .succeeded,
-            .root_operation_completion = states.final.state.root_operation_completion,
-            .updated_unix = 999,
-        },
-    );
-    defer regenerated.deinit();
     store.finish_crash = null;
     try interface.finishFn(
         interface.context,
         std.testing.allocator,
         paths,
         operation_state.Expected.fromState(active.state),
-        regenerated.state,
+        states.final.state,
     );
     try std.testing.expect((try interface.readActive(
         std.testing.allocator,
@@ -6304,18 +6421,19 @@ test "apt_system_orchestrator.test.system finish reuses retained final after pre
     );
 }
 
-test "apt_system_orchestrator.test.system finish rejects foreign retained final" {
-    var directory = std.testing.tmpDir(.{});
-    defer directory.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_length = try directory.dir.realPath(
-        std.testing.io,
-        &root_buffer,
+test "apt_system_orchestrator.test.required_privileged.durability system finish rejects foreign retained final" {
+    try requirePrivilegedProductionTest();
+    const root_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/root/debz-system-finish-foreign-{d}",
+        .{std.os.linux.getpid()},
     );
+    defer std.testing.allocator.free(root_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root_path) catch {};
     const state_path = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}/state",
-        .{root_buffer[0..root_length]},
+        .{root_path},
     );
     defer std.testing.allocator.free(state_path);
     const attempt_id: [32]u8 = @splat(0x61);
@@ -6325,12 +6443,6 @@ test "apt_system_orchestrator.test.system finish rejects foreign retained final"
         attempt_id,
     );
     defer paths.deinit(std.testing.allocator);
-    var states = try testStatePair(
-        std.testing.allocator,
-        paths,
-        attempt_id,
-    );
-    defer states.deinit();
     var crash: TestFinishCrash = .{};
     var store: SystemStateStore = .{
         .allocator = std.testing.allocator,
@@ -6338,16 +6450,14 @@ test "apt_system_orchestrator.test.system finish rejects foreign retained final"
         .finish_crash = crash.interface(),
     };
     const interface = store.interface();
-    interface.reserveFn(
-        interface.context,
+    var states = try reserveVerifyingTestState(
         std.testing.allocator,
+        interface,
+        state_path,
         paths,
-        "{}",
-        states.current.state,
-    ) catch |err| switch (err) {
-        error.NotRootOwned => return error.SkipZigTest,
-        else => return err,
-    };
+        attempt_id,
+    );
+    defer states.deinit();
     try std.testing.expectError(
         error.InjectedFinishCrash,
         interface.finishFn(
@@ -6374,17 +6484,7 @@ test "apt_system_orchestrator.test.system finish rejects foreign retained final"
         std.testing.allocator,
     );
     defer std.testing.allocator.free(foreign_bytes);
-    const attempt_hex = std.fmt.bytesToHex(attempt_id, .lower);
-    const retained_relative = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "state/apt/operations/{s}/{s}",
-        .{ &attempt_hex, retained_state_name },
-    );
-    defer std.testing.allocator.free(retained_relative);
-    try directory.dir.writeFile(std.testing.io, .{
-        .sub_path = retained_relative,
-        .data = foreign_bytes,
-    });
+    try writeAbsoluteTestFile(paths.retained_state, foreign_bytes);
     store.finish_crash = null;
     try std.testing.expectError(
         error.PublicationConflict,
@@ -6407,7 +6507,7 @@ test "apt_system_orchestrator.test.system finish rejects foreign retained final"
     );
 }
 
-test "apt_system_orchestrator.test.production retained commit lock excludes evidence republish through active CAS" {
+test "apt_system_orchestrator.test.required_privileged.production retained commit lock excludes evidence republish through active CAS" {
     try requirePrivilegedProductionTest();
     try runRetainedCommitOverlapWatchdog(10_000);
 }
@@ -8741,7 +8841,7 @@ fn expectReady(outcome: PrepareOutcome) !Preparation {
     };
 }
 
-test "apt_system_orchestrator.test.preflight lock-acquisition death replays from durable outer state" {
+test "apt_system_orchestrator.test.required_privileged.recovery preflight lock-acquisition death replays from durable outer state" {
     try requirePrivilegedProductionTest();
     const root_path = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -8935,7 +9035,7 @@ test "apt_system_orchestrator.test.completed lower root requires recovery only w
     try std.testing.expectEqual(RootStatus.recovery_required, active.status);
 }
 
-test "apt_system_orchestrator.test.production private runner transfers canonical result through live-root namespace" {
+test "apt_system_orchestrator.test.required_privileged.production private runner transfers canonical result through live-root namespace" {
     try requirePrivilegedProductionTest();
     var original_mask: std.os.linux.sigset_t = undefined;
     try std.testing.expectEqual(
@@ -8991,7 +9091,7 @@ test "apt_system_orchestrator.test.production private runner transfers canonical
     );
 }
 
-test "apt_system_orchestrator.test.production private runner validates every workflow mode transport operation" {
+test "apt_system_orchestrator.test.required_privileged.production private runner validates every workflow mode transport operation" {
     try requirePrivilegedProductionTest();
     inline for (std.meta.tags(WorkflowMode)) |mode| {
         var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
@@ -9061,7 +9161,7 @@ test "apt_system_orchestrator.test.production private runner validates every wor
     try std.testing.expectEqual(RootStatus.completed, finalized.root_status);
 }
 
-test "apt_system_orchestrator.test.production private transport signal is supervised and releases live-root lock" {
+test "apt_system_orchestrator.test.required_privileged.production private transport signal is supervised and releases live-root lock" {
     try requirePrivilegedProductionTest();
     var preflight_runner: PrivateLiveRootRunner = .{
         .io = std.testing.io,
@@ -9244,7 +9344,7 @@ test "apt_system_orchestrator.test.private transport failures join helpers and r
     );
 }
 
-test "apt_system_orchestrator.test.production runner retains successful ownership through outer crash matrix" {
+test "apt_system_orchestrator.test.required_privileged.production runner retains successful ownership through outer crash matrix" {
     try requirePrivilegedProductionTest();
     const CrashCase = union(enum) {
         lower: production_backend.CompletionPoint,
@@ -9567,7 +9667,7 @@ test "apt_system_orchestrator.test.production runner retains successful ownershi
     }
 }
 
-test "apt_system_orchestrator.test.production restart resyncs visible final state before lower acknowledgment" {
+test "apt_system_orchestrator.test.required_privileged.production restart resyncs visible final state before lower acknowledgment" {
     try requirePrivilegedProductionTest();
     const Barrier = enum { active_state, retained_final };
     inline for (.{ false, true }) |recovering| {
@@ -9798,7 +9898,7 @@ test "apt_system_orchestrator.test.production restart resyncs visible final stat
     }
 }
 
-test "apt_system_orchestrator.test.production retained evidence corruption cannot acknowledge lower ownership" {
+test "apt_system_orchestrator.test.required_privileged.production retained evidence corruption cannot acknowledge lower ownership" {
     try requirePrivilegedProductionTest();
     const Fault = enum {
         missing_evidence,
@@ -10024,7 +10124,7 @@ test "apt_system_orchestrator.test.production retained evidence corruption canno
     }
 }
 
-test "apt_system_orchestrator.test.production clean reconciliation race never clears outer state after foreign reservation" {
+test "apt_system_orchestrator.test.required_privileged.production clean reconciliation race never clears outer state after foreign reservation" {
     try requirePrivilegedProductionTest();
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var fixture = ProductionRunnerFixture.init(
@@ -10212,7 +10312,7 @@ test "apt_system_orchestrator.test.production clean reconciliation race never cl
     );
 }
 
-test "apt_system_orchestrator.test.production missing marker never clears a retained lower record" {
+test "apt_system_orchestrator.test.required_privileged.production missing marker never clears a retained lower record" {
     try requirePrivilegedProductionTest();
     inline for (.{ false, true }) |recovering| {
         inline for (std.enums.values(MarkerLossRecordKind)) |record_kind| {
@@ -10400,7 +10500,7 @@ test "apt_system_orchestrator.test.production missing marker never clears a reta
     }
 }
 
-test "apt_system_orchestrator.test.production recovery commits unavailable provenance before acknowledgment" {
+test "apt_system_orchestrator.test.required_privileged.production recovery commits unavailable provenance before acknowledgment" {
     try requirePrivilegedProductionTest();
     inline for ([_]CompletionBoundary{
         .before_completion_published,
@@ -10599,7 +10699,7 @@ test "apt_system_orchestrator.test.production recovery commits unavailable prove
     }
 }
 
-test "apt_system_orchestrator.test.production runner retries every durable pre-mutation classification" {
+test "apt_system_orchestrator.test.required_privileged.production runner retries every durable pre-mutation classification" {
     try requirePrivilegedProductionTest();
     const RetryCase = enum {
         downloaded_unbound,
@@ -10892,7 +10992,7 @@ test "apt_system_orchestrator.test.lower root recovery blocks repository and pac
     }
 }
 
-test "apt_system_orchestrator.test.production composition instantiates the delivered engine" {
+test "apt_system_orchestrator.test.required_privileged.production composition instantiates the delivered engine" {
     var backend: production_backend.Backend = undefined;
     var composition: ProductionComposition = undefined;
     composition.init(
@@ -11368,7 +11468,7 @@ test "apt_system_orchestrator.test.completed lower record is discharged before o
     try std.testing.expectEqual(@as(usize, 2), harness.backend.plan_calls);
 }
 
-test "apt_system_orchestrator.test.production recovery bindings fail closed independently" {
+test "apt_system_orchestrator.test.required_privileged.production recovery bindings fail closed independently" {
     inline for (.{ "original", "discharge", "semantic", "attempt" }) |domain| {
         var harness = Harness.init(std.testing.allocator);
         defer harness.deinit();

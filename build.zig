@@ -365,7 +365,7 @@ pub fn build(b: *std.Build) void {
     const apt_system_orchestrator_tests = b.addTest(.{
         .root_module = apt_system_orchestrator_test_module,
         .filters = if (require_privileged_orchestration_tests)
-            &.{"apt_system_orchestrator.test.production"}
+            &.{"apt_system_orchestrator.test.required_privileged."}
         else
             &.{"apt_system_orchestrator.test."},
     });

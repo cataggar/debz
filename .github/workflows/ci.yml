@@ -585,7 +585,8 @@ jobs:
             ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache-orchestration-required" \
             ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache-orchestration-required" \
             "$(command -v zig)" build test-apt-system \
-              -Drequire-privileged-orchestration-tests=true
+              -Drequire-privileged-orchestration-tests=true \
+              --summary all
       - name: Normalize privileged orchestration diagnostics
         if: always()
         run: |
