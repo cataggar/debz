@@ -333,19 +333,22 @@ Ordinary non-orchestrated product success keeps its existing clear-on-success
 behavior. Orchestrated success instead transitions its binding to `released`,
 clears and fsyncs the root record, and returns the exact attempt, marker digest,
 and outer acknowledgment identity while retaining the marker. The outer engine
-verifies and durably retains transaction evidence, CAS-publishes that binding,
-then compare-and-clears only the matching released marker. A crash before
-outer retention therefore leaves the root protected and the transaction
-evidence available for exact-owner reconciliation; a crash after retention but
-before acknowledgment clears idempotently from the retained binding; a crash
-after acknowledgment completes from operation-local evidence without trusting
-a replaceable global result. A proven pre-mutation failure instead transitions
-to `abandoned`, clears and fsyncs the record, and deliberately retains that
-terminal exact-owner marker. On retry, the old marker remains continuously
-durable until it is atomically replaced by a fresh `bound` attempt; no crash
-prefix exposes an unowned clean root. Legacy record-only states retain their
-existing conservative recovery rules, and absence of both documents is the
-only fully clean state.
+verifies and durably retains transaction evidence and the exact canonical lower
+marker as operation-local `lower-acknowledgment-v1.json`. It then publishes the
+outer completion, publishes the immutable retained final state, and CASes the
+active state to that exact completed outcome before compare-and-clearing the
+matching released marker. The completed active owner remains discoverable
+until acknowledgment finishes. A crash before the outer commit therefore
+leaves the root protected; a crash after commit but before acknowledgment
+replays the retained token idempotently; a crash after acknowledgment only
+clears the already committed active owner and cannot regenerate or reinterpret
+the old success after a later root mutation. A proven pre-mutation failure
+instead transitions to `abandoned`, clears and fsyncs the record, and
+deliberately retains that terminal exact-owner marker. On retry, the old marker
+remains continuously durable until it is atomically replaced by a fresh
+`bound` attempt; no crash prefix exposes an unowned clean root. Legacy
+record-only states retain their existing conservative recovery rules, and
+absence of both documents is the only fully clean state.
 
 The same centralized owner-aware terminalization primitive is used by normal
 finish, error/deinit abandonment, explicit ownership finalization, and
@@ -363,11 +366,14 @@ After a real lower recovery, the engine strictly decodes and retains the
 operation-local `root-operation-completion-v1.json`, checks the observed lower
 attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
-binding before explicitly acknowledging the exact lower token and clearing its
-record and marker. A crash before outer retention therefore leaves the lower
-completed/published record available for retry; a crash after retention but
-before acknowledgment uses the retained binding and idempotently clears; a
-crash after acknowledgment uses only the retained operation-local evidence.
+binding together with the immutable final outcome before explicitly
+acknowledging the exact lower token and clearing its record and marker. The
+same operation-local lower acknowledgment document is used when detailed
+transaction provenance is honestly unavailable. A crash before outer commit
+therefore leaves the lower completed/published record available for retry; a
+crash after commit but before acknowledgment uses the retained binding and
+token and idempotently clears; a crash after acknowledgment performs no later
+success publication and only retires the committed active owner.
 The acknowledgment rereads the marker, record, and global completion under the
 root-operation lock and first durably transitions the exact marker to
 `acknowledged`. It then clears the matching record and marker. A crash between
