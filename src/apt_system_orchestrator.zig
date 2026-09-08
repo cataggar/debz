@@ -456,6 +456,29 @@ pub const PrivateLiveRootRunner = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
     ) !RootInspection {
+        var signal_guard = try live_root.blockWatchedSignals();
+        const inspection = inspectSignalsBlocked(
+            context,
+            allocator,
+            &signal_guard,
+        ) catch |err| {
+            signal_guard.restore() catch
+                return error.SignalSetupFailed;
+            return err;
+        };
+        signal_guard.restore() catch {
+            var owned = inspection;
+            owned.deinit();
+            return error.SignalSetupFailed;
+        };
+        return inspection;
+    }
+
+    fn inspectSignalsBlocked(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        signal_guard: *const live_root.SignalMaskGuard,
+    ) !RootInspection {
         const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
         const linux = std.os.linux;
@@ -494,11 +517,14 @@ pub const PrivateLiveRootRunner = struct {
             .runner = self,
             .output_fd = pipe[1],
         };
-        const result = try live_root.run(.{
-            .context = &child_context,
-            .child = inspectChild,
-            .termination_grace_ms = self.termination_grace_ms,
-        });
+        const result = try live_root.runSignalsBlocked(
+            .{
+                .context = &child_context,
+                .child = inspectChild,
+                .termination_grace_ms = self.termination_grace_ms,
+            },
+            signal_guard,
+        );
         _ = linux.close(pipe[1]);
         write_open = false;
         reader.join();
@@ -535,6 +561,30 @@ pub const PrivateLiveRootRunner = struct {
         self: *PrivateLiveRootRunner,
         allocator: std.mem.Allocator,
         invocation: Invocation,
+    ) !BackendResult {
+        var signal_guard = try live_root.blockWatchedSignals();
+        const result = self.invokeSignalsBlocked(
+            allocator,
+            invocation,
+            &signal_guard,
+        ) catch |err| {
+            signal_guard.restore() catch
+                return error.SignalSetupFailed;
+            return err;
+        };
+        signal_guard.restore() catch {
+            var owned = result;
+            owned.deinit();
+            return error.SignalSetupFailed;
+        };
+        return result;
+    }
+
+    fn invokeSignalsBlocked(
+        self: *PrivateLiveRootRunner,
+        allocator: std.mem.Allocator,
+        invocation: Invocation,
+        signal_guard: *const live_root.SignalMaskGuard,
     ) !BackendResult {
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
         const linux = std.os.linux;
@@ -576,11 +626,11 @@ pub const PrivateLiveRootRunner = struct {
             .invocation = invocation,
             .output_fd = pipe[1],
         };
-        const result = live_root.run(.{
+        const result = live_root.runSignalsBlocked(.{
             .context = &child_context,
             .child = transportChild,
             .termination_grace_ms = self.termination_grace_ms,
-        }) catch |err| {
+        }, signal_guard) catch |err| {
             _ = linux.close(pipe[1]);
             write_open = false;
             reader.join();
@@ -703,6 +753,31 @@ pub const PrivateLiveRootRunner = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
     ) !?root_operation_completion.OwnedDocument {
+        var signal_guard = try live_root.blockWatchedSignals();
+        const completion = readRecoveryCompletionSignalsBlocked(
+            context,
+            allocator,
+            &signal_guard,
+        ) catch |err| {
+            signal_guard.restore() catch
+                return error.SignalSetupFailed;
+            return err;
+        };
+        signal_guard.restore() catch {
+            if (completion) |owned| {
+                var value = owned;
+                value.deinit();
+            }
+            return error.SignalSetupFailed;
+        };
+        return completion;
+    }
+
+    fn readRecoveryCompletionSignalsBlocked(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        signal_guard: *const live_root.SignalMaskGuard,
+    ) !?root_operation_completion.OwnedDocument {
         const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
         const linux = std.os.linux;
@@ -741,11 +816,11 @@ pub const PrivateLiveRootRunner = struct {
             .runner = self,
             .output_fd = pipe[1],
         };
-        const result = live_root.run(.{
+        const result = live_root.runSignalsBlocked(.{
             .context = &child_context,
             .child = readRecoveryCompletionChild,
             .termination_grace_ms = self.termination_grace_ms,
-        }) catch |err| {
+        }, signal_guard) catch |err| {
             _ = linux.close(pipe[1]);
             write_open = false;
             reader.join();
@@ -1182,13 +1257,62 @@ pub const FinishCrash = struct {
     }
 };
 
+pub const DirectorySyncBoundary = enum {
+    ancestor_parent,
+    attempt_parent,
+    publication_directory,
+};
+
+pub const DirectorySync = struct {
+    context: *anyopaque,
+    syncFn: *const fn (
+        *anyopaque,
+        std.Io,
+        std.Io.Dir,
+        DirectorySyncBoundary,
+    ) anyerror!void,
+
+    pub fn sync(
+        self: DirectorySync,
+        io: std.Io,
+        dir: std.Io.Dir,
+        boundary: DirectorySyncBoundary,
+    ) !void {
+        try self.syncFn(self.context, io, dir, boundary);
+    }
+};
+
+const ReservationDurability = struct {
+    ancestor_parents: bool = false,
+    attempt_parent: bool = false,
+    request_document: bool = false,
+
+    fn permitActivePublication(self: ReservationDurability) !void {
+        if (!self.ancestor_parents or
+            !self.attempt_parent or
+            !self.request_document)
+            return error.OperationDirectoryNotDurable;
+    }
+};
+
 pub const SystemStateStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     wait_ms: u64 = 30_000,
     finish_crash: ?FinishCrash = null,
+    directory_sync: ?DirectorySync = null,
 
     const operation_lock_name = "operation.lock";
+
+    fn syncDirectoryAt(
+        self: *SystemStateStore,
+        dir: std.Io.Dir,
+        boundary: DirectorySyncBoundary,
+    ) !void {
+        if (self.directory_sync) |syncer|
+            return syncer.sync(self.io, dir, boundary);
+        return syncDirectory(self.io, dir);
+    }
 
     pub fn interface(self: *SystemStateStore) StateStore {
         return .{
@@ -1220,7 +1344,7 @@ pub const SystemStateStore = struct {
         );
         defer allocator.free(apt_path);
         var dir = openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             apt_path,
             false,
@@ -1257,16 +1381,18 @@ pub const SystemStateStore = struct {
         initial: operation_state.State,
     ) !void {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        var durability: ReservationDurability = .{};
         const parent_path = std.fs.path.dirname(paths.directory) orelse
             return error.InvalidPath;
         const leaf = std.fs.path.basename(paths.directory);
         var parent = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             parent_path,
             true,
         );
         defer parent.close(self.io);
+        durability.ancestor_parents = true;
         parent.createDir(
             self.io,
             leaf,
@@ -1275,9 +1401,14 @@ pub const SystemStateStore = struct {
             error.PathAlreadyExists => return error.StateAlreadyExists,
             else => return err,
         };
-        var operation_dir = try parent.openDir(self.io, leaf, .{
-            .follow_symlinks = false,
-        });
+        try self.syncDirectoryAt(parent, .attempt_parent);
+        durability.attempt_parent = true;
+        var operation_dir = try openSyncCapableDirectory(
+            self.io,
+            parent,
+            leaf,
+            true,
+        );
         defer operation_dir.close(self.io);
         try validateSecureDirectoryChain(
             self.io,
@@ -1291,11 +1422,12 @@ pub const SystemStateStore = struct {
             request_document_name,
             request_bytes,
         );
+        durability.request_document = true;
 
         const apt_path = std.fs.path.dirname(paths.active_state) orelse
             return error.InvalidPath;
         var apt_dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             apt_path,
             true,
@@ -1312,6 +1444,7 @@ pub const SystemStateStore = struct {
             operation_state.document_name,
             locks.interface(),
         );
+        try durability.permitActivePublication();
         try store.initialize(
             allocator,
             initial,
@@ -1335,7 +1468,7 @@ pub const SystemStateStore = struct {
         );
         defer allocator.free(apt_path);
         var apt_dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             apt_path,
             false,
@@ -1370,7 +1503,7 @@ pub const SystemStateStore = struct {
     ) !void {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
         var operation_dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             paths.directory,
             false,
@@ -1433,7 +1566,7 @@ pub const SystemStateStore = struct {
         const apt_path = std.fs.path.dirname(paths.active_state) orelse
             return error.InvalidPath;
         var apt_dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             apt_path,
             false,
@@ -1524,7 +1657,7 @@ pub const SystemStateStore = struct {
         if (!std.mem.eql(u8, &validated.digest_sha256, &digest))
             return error.DigestMismatch;
         var dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             paths.directory,
             false,
@@ -1565,7 +1698,7 @@ pub const SystemStateStore = struct {
             &digest,
         )) return error.DigestMismatch;
         var dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             paths.directory,
             false,
@@ -1630,7 +1763,7 @@ pub const SystemStateStore = struct {
     ) !api.CompletionBinding {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
         var dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             paths.directory,
             false,
@@ -1673,7 +1806,7 @@ pub const SystemStateStore = struct {
     ) !void {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
         var dir = try openSecureAbsoluteDirectory(
-            self.io,
+            self,
             allocator,
             paths.directory,
             false,
@@ -1742,7 +1875,7 @@ pub const SystemStateStore = struct {
         if (!lock.held(token)) return error.LockLost;
         try dir.rename(stage, dir, name, self.io);
         renamed = true;
-        try syncDirectory(self.io, dir);
+        try self.syncDirectoryAt(dir, .publication_directory);
     }
 };
 
@@ -2744,7 +2877,8 @@ pub const Engine = struct {
                 if (lower_inspection.record) |record|
                     record.record.state == .completed and
                         record.record.provenance == .published and
-                        record.record.outcome == .recovered
+                        (record.record.outcome == .succeeded or
+                            record.record.outcome == .recovered)
                 else
                     false;
             if (settled_lower_recovery)
@@ -4186,25 +4320,32 @@ fn readTrustedOperationFile(
 }
 
 fn openSecureAbsoluteDirectory(
-    io: std.Io,
+    store: *SystemStateStore,
     allocator: std.mem.Allocator,
     path: []const u8,
     create: bool,
 ) !std.Io.Dir {
+    const io = store.io;
     if (path.len < 2 or path[0] != '/' or path[path.len - 1] == '/')
         return error.InvalidPath;
-    var current = try std.Io.Dir.openDirAbsolute(io, "/", .{
-        .follow_symlinks = false,
-    });
+    var current = try openSyncCapableDirectory(
+        io,
+        .cwd(),
+        "/",
+        false,
+    );
     errdefer current.close(io);
     var components = std.mem.splitScalar(u8, path[1..], '/');
     while (components.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".") or
             std.mem.eql(u8, component, ".."))
             return error.InvalidPath;
-        const next = current.openDir(io, component, .{
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
+        const next = openSyncCapableDirectory(
+            io,
+            current,
+            component,
+            true,
+        ) catch |err| switch (err) {
             error.FileNotFound => create_block: {
                 if (!create) return err;
                 current.createDir(
@@ -4215,9 +4356,16 @@ fn openSecureAbsoluteDirectory(
                     error.PathAlreadyExists => {},
                     else => return create_err,
                 };
-                break :create_block try current.openDir(io, component, .{
-                    .follow_symlinks = false,
-                });
+                try store.syncDirectoryAt(
+                    current,
+                    .ancestor_parent,
+                );
+                break :create_block try openSyncCapableDirectory(
+                    io,
+                    current,
+                    component,
+                    true,
+                );
             },
             else => return err,
         };
@@ -4226,6 +4374,24 @@ fn openSecureAbsoluteDirectory(
     }
     try validateSecureDirectoryChain(io, allocator, path);
     return current;
+}
+
+fn openSyncCapableDirectory(
+    io: std.Io,
+    parent: std.Io.Dir,
+    path: []const u8,
+    resolve_beneath: bool,
+) !std.Io.Dir {
+    // Dir.openDir uses an O_PATH handle on Linux, which cannot be fsynced.
+    var file = try parent.openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = true,
+        .follow_symlinks = false,
+        .resolve_beneath = resolve_beneath,
+    });
+    errdefer file.close(io);
+    if ((try file.stat(io)).kind != .directory) return error.NotDir;
+    return .{ .handle = file.handle };
 }
 
 fn validateSecureDirectoryChain(
@@ -4307,6 +4473,29 @@ const TestStatePair = struct {
     }
 };
 
+const TestDirectorySync = struct {
+    events: [32]DirectorySyncBoundary = undefined,
+    count: usize = 0,
+    fail_on: ?DirectorySyncBoundary = null,
+
+    fn interface(self: *TestDirectorySync) DirectorySync {
+        return .{ .context = self, .syncFn = sync };
+    }
+
+    fn sync(
+        context: *anyopaque,
+        io: std.Io,
+        dir: std.Io.Dir,
+        boundary: DirectorySyncBoundary,
+    ) !void {
+        const self: *TestDirectorySync = @ptrCast(@alignCast(context));
+        self.events[self.count] = boundary;
+        self.count += 1;
+        if (self.fail_on == boundary) return error.InjectedDirectorySyncFailure;
+        try syncDirectory(io, dir);
+    }
+};
+
 fn testStatePair(
     allocator: std.mem.Allocator,
     paths: OperationPaths,
@@ -4358,6 +4547,27 @@ fn testStatePair(
         .updated_unix = 200,
     });
     return .{ .current = current, .final = final };
+}
+
+fn testInitialState(
+    allocator: std.mem.Allocator,
+    attempt_id: [32]u8,
+) !operation_state.OwnedState {
+    return operation_state.create(allocator, .{
+        .attempt_id = attempt_id,
+        .generation = 1,
+        .operation = .install,
+        .phase = .reserved,
+        .mutation_started = false,
+        .outcome = .pending,
+        .request_sha256 = @splat(0x53),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x54),
+            .reference_evidence_sha256 = @splat(0x55),
+        },
+        .updated_unix = 100,
+    });
 }
 
 test "apt_system_orchestrator.test.selector parsing preserves one batch" {
@@ -4436,6 +4646,156 @@ test "apt_system_orchestrator.test.system state store exposes durable operation 
     };
     const interface = store.interface();
     try std.testing.expect(interface.context == @as(*anyopaque, @ptrCast(&store)));
+}
+
+test "apt_system_orchestrator.test.active publication requires the complete directory durability sequence" {
+    var durability: ReservationDurability = .{};
+    try std.testing.expectError(
+        error.OperationDirectoryNotDurable,
+        durability.permitActivePublication(),
+    );
+    durability.ancestor_parents = true;
+    try std.testing.expectError(
+        error.OperationDirectoryNotDurable,
+        durability.permitActivePublication(),
+    );
+    durability.attempt_parent = true;
+    try std.testing.expectError(
+        error.OperationDirectoryNotDurable,
+        durability.permitActivePublication(),
+    );
+    durability.request_document = true;
+    try durability.permitActivePublication();
+}
+
+test "apt_system_orchestrator.test.operation directory parent is durable before active publication" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    {
+        const root_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "/root/debz-apt-system-durability-{d}-success",
+            .{std.os.linux.getpid()},
+        );
+        defer std.testing.allocator.free(root_path);
+        defer std.Io.Dir.cwd().deleteTree(
+            std.testing.io,
+            root_path,
+        ) catch {};
+        const state_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/state",
+            .{root_path},
+        );
+        defer std.testing.allocator.free(state_path);
+        const attempt_id: [32]u8 = @splat(0x31);
+        var paths = try pathsFor(
+            std.testing.allocator,
+            state_path,
+            attempt_id,
+        );
+        defer paths.deinit(std.testing.allocator);
+        var initial = try testInitialState(
+            std.testing.allocator,
+            attempt_id,
+        );
+        defer initial.deinit();
+        var syncs: TestDirectorySync = .{};
+        var store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .directory_sync = syncs.interface(),
+        };
+        const interface = store.interface();
+        try interface.reserveFn(
+            interface.context,
+            std.testing.allocator,
+            paths,
+            "{}",
+            initial.state,
+        );
+        const events = syncs.events[0..syncs.count];
+        const attempt_index = std.mem.indexOfScalar(
+            DirectorySyncBoundary,
+            events,
+            .attempt_parent,
+        ) orelse return error.MissingAttemptParentSync;
+        const publication_index = std.mem.indexOfScalar(
+            DirectorySyncBoundary,
+            events,
+            .publication_directory,
+        ) orelse return error.MissingPublicationSync;
+        try std.testing.expect(attempt_index < publication_index);
+        try std.testing.expect(std.mem.indexOfScalar(
+            DirectorySyncBoundary,
+            events[0..attempt_index],
+            .ancestor_parent,
+        ) != null);
+    }
+    {
+        const root_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "/root/debz-apt-system-durability-{d}-failure",
+            .{std.os.linux.getpid()},
+        );
+        defer std.testing.allocator.free(root_path);
+        defer std.Io.Dir.cwd().deleteTree(
+            std.testing.io,
+            root_path,
+        ) catch {};
+        const state_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/state",
+            .{root_path},
+        );
+        defer std.testing.allocator.free(state_path);
+        const attempt_id: [32]u8 = @splat(0x32);
+        var paths = try pathsFor(
+            std.testing.allocator,
+            state_path,
+            attempt_id,
+        );
+        defer paths.deinit(std.testing.allocator);
+        var initial = try testInitialState(
+            std.testing.allocator,
+            attempt_id,
+        );
+        defer initial.deinit();
+        var syncs: TestDirectorySync = .{
+            .fail_on = .attempt_parent,
+        };
+        var store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .directory_sync = syncs.interface(),
+        };
+        const interface = store.interface();
+        try std.testing.expectError(
+            error.InjectedDirectorySyncFailure,
+            interface.reserveFn(
+                interface.context,
+                std.testing.allocator,
+                paths,
+                "{}",
+                initial.state,
+            ),
+        );
+        var active = try interface.readActive(
+            std.testing.allocator,
+            state_path,
+        );
+        defer if (active) |*state| state.deinit();
+        try std.testing.expect(active == null);
+        try std.testing.expectError(
+            error.FileNotFound,
+            readTrustedOperationFile(
+                std.testing.io,
+                std.testing.allocator,
+                paths.request,
+                api.maximum_document_bytes,
+            ),
+        );
+    }
 }
 
 test "apt_system_orchestrator.test.system finish reuses retained final after pre-CAS crash" {
@@ -4901,6 +5261,87 @@ const FakeBackend = struct {
     }
 };
 
+const SignalTestBackend = struct {
+    ready_fd: ?i32 = null,
+
+    fn interface(self: *SignalTestBackend) Backend {
+        return .{
+            .context = self,
+            .routeFn = route,
+            .workflowFn = workflow,
+        };
+    }
+
+    fn route(
+        context: *anyopaque,
+        _: std.mem.Allocator,
+        _: product_api.Request,
+    ) !product_api.Result {
+        const self: *SignalTestBackend = @ptrCast(@alignCast(context));
+        if (self.ready_fd) |fd| {
+            var byte: [1]u8 = .{1};
+            if (std.os.linux.errno(std.os.linux.write(
+                fd,
+                &byte,
+                byte.len,
+            )) != .SUCCESS) return error.ReadySignalFailed;
+        }
+        waitForSignal();
+    }
+
+    fn workflow(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: WorkflowRequest,
+    ) !product_api.Result {
+        waitForSignal();
+    }
+
+    fn waitForSignal() noreturn {
+        while (true) {
+            var request: std.os.linux.timespec = .{
+                .sec = 1,
+                .nsec = 0,
+            };
+            var remaining: std.os.linux.timespec = undefined;
+            _ = std.os.linux.nanosleep(&request, &remaining);
+        }
+    }
+};
+
+fn reapSignalTestProcess(pid: i32) !u32 {
+    while (true) {
+        var status: u32 = 0;
+        const waited = std.os.linux.waitpid(pid, &status, 0);
+        switch (std.os.linux.errno(waited)) {
+            .SUCCESS => return status,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+}
+
+fn waitForSignalTestByte(fd: i32, timeout_ms: u64) !bool {
+    var elapsed: u64 = 0;
+    while (elapsed < timeout_ms) : (elapsed += 5) {
+        var byte: [1]u8 = undefined;
+        const result = std.os.linux.read(fd, &byte, byte.len);
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS => return result == 1,
+            .INTR => continue,
+            .AGAIN => {},
+            else => return error.ReadySignalFailed,
+        }
+        var delay: std.os.linux.timespec = .{
+            .sec = 0,
+            .nsec = 5_000_000,
+        };
+        var remaining: std.os.linux.timespec = undefined;
+        _ = std.os.linux.nanosleep(&delay, &remaining);
+    }
+    return false;
+}
+
 const FakeRunner = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
@@ -4921,6 +5362,7 @@ const FakeRunner = struct {
         original_request,
         discharge_request,
         attempt,
+        successful_outcome,
     };
 
     fn deinit(self: *FakeRunner) void {
@@ -5112,7 +5554,10 @@ fn fakeRecoveryCompletion(
         .phase = .provenance,
         .step = 4,
         .mutation_started = true,
-        .outcome = .recovered,
+        .outcome = if (mismatch == .successful_outcome)
+            .succeeded
+        else
+            .recovered,
         .provenance = .pending,
         .evidence = .{ .exact_lock = .{
             .schema = exact_lock.schema_id,
@@ -5648,6 +6093,15 @@ test "apt_system_orchestrator.test.completed lower root requires recovery only w
 test "apt_system_orchestrator.test.private runner transfers canonical result through live-root namespace" {
     if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
         return error.SkipZigTest;
+    var original_mask: std.os.linux.sigset_t = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.sigprocmask(
+            std.os.linux.SIG.SETMASK,
+            null,
+            &original_mask,
+        )),
+    );
     var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
     var backend: FakeBackend = .{};
     var result = runner.interface().route(
@@ -5680,6 +6134,17 @@ test "apt_system_orchestrator.test.private runner transfers canonical result thr
     defer inspection.deinit();
     try std.testing.expectEqual(RootStatus.clean, inspection.status);
     try std.testing.expect(inspection.attempt_id == null);
+    var restored_mask: std.os.linux.sigset_t = undefined;
+    _ = std.os.linux.sigprocmask(
+        std.os.linux.SIG.SETMASK,
+        null,
+        &restored_mask,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&original_mask),
+        std.mem.asBytes(&restored_mask),
+    );
 }
 
 test "apt_system_orchestrator.test.private runner validates every workflow mode transport operation" {
@@ -5715,8 +6180,195 @@ test "apt_system_orchestrator.test.private runner validates every workflow mode 
             workflowSurfaceOperation(.install, mode),
             result.result.operation,
         );
-        try std.testing.expectEqual(@as(usize, 1), backend.workflow_calls);
+        try std.testing.expectEqualStrings(
+            if (mode == .recover) "injected failure" else "ok",
+            result.result.summary,
+        );
     }
+}
+
+test "apt_system_orchestrator.test.private transport signal is supervised and releases live-root lock" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    var preflight_runner: PrivateLiveRootRunner = .{
+        .io = std.testing.io,
+        .termination_grace_ms = 50,
+    };
+    var preflight_backend: FakeBackend = .{};
+    var preflight = preflight_runner.interface().route(
+        std.testing.allocator,
+        preflight_backend.interface(),
+        .{
+            .operation = .list_installed,
+            .options = .{
+                .install_root = live_root.logical_root_path,
+                .cache_path = "/var/cache/apt",
+                .state_path = "/var/lib/apt",
+                .architecture = "amd64",
+            },
+        },
+    ) catch |err| switch (err) {
+        error.NotPrivileged,
+        error.NamespaceUnavailable,
+        error.UnsafeRuntimeDirectory,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    preflight.deinit();
+
+    var ready: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.pipe2(
+            &ready,
+            .{ .CLOEXEC = true, .NONBLOCK = true },
+        )),
+    );
+    defer {
+        _ = std.os.linux.close(ready[0]);
+        _ = std.os.linux.close(ready[1]);
+    }
+    const runner_pid = try live_root.testing.forkProcess();
+    if (runner_pid == 0) {
+        _ = std.os.linux.close(ready[0]);
+        var runner: PrivateLiveRootRunner = .{
+            .io = std.testing.io,
+            .termination_grace_ms = 50,
+        };
+        var backend: SignalTestBackend = .{ .ready_fd = ready[1] };
+        var result = runner.interface().route(
+            std.heap.page_allocator,
+            backend.interface(),
+            .{
+                .operation = .list_installed,
+                .options = .{
+                    .install_root = live_root.logical_root_path,
+                    .cache_path = "/var/cache/apt",
+                    .state_path = "/var/lib/apt",
+                    .architecture = "amd64",
+                },
+            },
+        ) catch |err| switch (err) {
+            error.LiveRootInterrupted => std.os.linux.exit_group(0),
+            else => std.os.linux.exit_group(121),
+        };
+        result.deinit();
+        std.os.linux.exit_group(122);
+    }
+    _ = std.os.linux.close(ready[1]);
+    ready[1] = -1;
+    var runner_live = true;
+    defer if (runner_live) {
+        _ = std.os.linux.kill(runner_pid, .KILL);
+        _ = reapSignalTestProcess(runner_pid) catch null;
+    };
+    try std.testing.expect(try waitForSignalTestByte(ready[0], 5_000));
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.kill(runner_pid, .TERM)),
+    );
+    const status = try reapSignalTestProcess(runner_pid);
+    runner_live = false;
+    try std.testing.expect(std.os.linux.W.IFEXITED(status));
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        std.os.linux.W.EXITSTATUS(status),
+    );
+
+    var final_backend: FakeBackend = .{};
+    var final_result = try preflight_runner.interface().route(
+        std.testing.allocator,
+        final_backend.interface(),
+        .{
+            .operation = .list_installed,
+            .options = .{
+                .install_root = live_root.logical_root_path,
+                .cache_path = "/var/cache/apt",
+                .state_path = "/var/lib/apt",
+                .architecture = "amd64",
+            },
+        },
+    );
+    defer final_result.deinit();
+    try std.testing.expectEqual(
+        product_api.ExitStatus.success,
+        final_result.result.exit_status,
+    );
+}
+
+test "apt_system_orchestrator.test.private transport failures join helpers and restore caller signal mask" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() == 0)
+        return error.SkipZigTest;
+    var original: std.os.linux.sigset_t = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.sigprocmask(
+            std.os.linux.SIG.SETMASK,
+            null,
+            &original,
+        )),
+    );
+    var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var backend: FakeBackend = .{};
+    try std.testing.expectError(
+        error.NotPrivileged,
+        runner.interface().route(
+            std.testing.allocator,
+            backend.interface(),
+            .{
+                .operation = .list_installed,
+                .options = .{
+                    .install_root = live_root.logical_root_path,
+                    .cache_path = "/var/cache/apt",
+                    .state_path = "/var/lib/apt",
+                    .architecture = "amd64",
+                },
+            },
+        ),
+    );
+    var after_route: std.os.linux.sigset_t = undefined;
+    _ = std.os.linux.sigprocmask(
+        std.os.linux.SIG.SETMASK,
+        null,
+        &after_route,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&original),
+        std.mem.asBytes(&after_route),
+    );
+    try std.testing.expectError(
+        error.NotPrivileged,
+        runner.interface().inspect(std.testing.allocator),
+    );
+    var after_inspect: std.os.linux.sigset_t = undefined;
+    _ = std.os.linux.sigprocmask(
+        std.os.linux.SIG.SETMASK,
+        null,
+        &after_inspect,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&original),
+        std.mem.asBytes(&after_inspect),
+    );
+    try std.testing.expectError(
+        error.NotPrivileged,
+        runner.interface().readRecoveryCompletion(
+            std.testing.allocator,
+        ),
+    );
+    var after_completion: std.os.linux.sigset_t = undefined;
+    _ = std.os.linux.sigprocmask(
+        std.os.linux.SIG.SETMASK,
+        null,
+        &after_completion,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&original),
+        std.mem.asBytes(&after_completion),
+    );
 }
 
 test "apt_system_orchestrator.test.backend failure text survives transport destruction" {
@@ -6338,6 +6990,13 @@ test "apt_system_orchestrator.test.production recovery bindings fail closed inde
 }
 
 test "apt_system_orchestrator.test.settled published recovery reconciles without lower workflow replay" {
+    inline for (.{ FakeRunner.RecoveryCompletionMismatch.none, .successful_outcome }) |fixture|
+        try expectSettledPublishedRecovery(fixture);
+}
+
+fn expectSettledPublishedRecovery(
+    fixture: FakeRunner.RecoveryCompletionMismatch,
+) !void {
     var harness = Harness.init(std.testing.allocator);
     defer harness.deinit();
     harness.rebind();
@@ -6385,7 +7044,7 @@ test "apt_system_orchestrator.test.settled published recovery reconciles without
     var completion = try fakeRecoveryCompletion(
         std.testing.allocator,
         workflow_request,
-        .none,
+        fixture,
     );
     defer completion.deinit();
     var pending_record = try root_operation.create(
@@ -6400,7 +7059,7 @@ test "apt_system_orchestrator.test.settled published recovery reconciles without
             .phase = .provenance,
             .step = 4,
             .mutation_started = true,
-            .outcome = .recovered,
+            .outcome = completion.document.outcome,
             .provenance = .pending,
             .evidence = .{ .exact_lock = .{
                 .schema = exact_lock.schema_id,
@@ -6418,7 +7077,7 @@ test "apt_system_orchestrator.test.settled published recovery reconciles without
     const provenance_sha256 = root_operation.provenanceDigest(
         pending_record.record,
         .{
-            .outcome = .recovered,
+            .outcome = completion.document.outcome,
             .document_sha256 = completion.document.digest_sha256,
             .journal_archived = false,
         },
@@ -6435,7 +7094,7 @@ test "apt_system_orchestrator.test.settled published recovery reconciles without
             .phase = .provenance,
             .step = 5,
             .mutation_started = true,
-            .outcome = .recovered,
+            .outcome = completion.document.outcome,
             .provenance = .published,
             .provenance_sha256 = provenance_sha256,
             .evidence = .{ .exact_lock = .{

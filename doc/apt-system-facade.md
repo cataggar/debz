@@ -247,10 +247,14 @@ prevents the later call; in particular, replacement after download produces
 zero execute calls.
 
 `PrivateLiveRootRunner` is the production composition's concrete runner. It
-invokes `live_root.run`, drains a bounded pipe concurrently, and accepts only a
-canonical product-result document whose operation matches the workflow
-surface: plan-only is `plan`, download-only is `download`, execute is the
-semantic package operation, and recovery is `recover`.
+blocks the live-root supervisor's watched signals before creating a transport
+reader, so every helper inherits the mask, then invokes the pre-blocked
+`live_root` entry point and restores the caller's original mask only after the
+reader and privileged process have terminated. It drains a bounded pipe
+concurrently and accepts only a canonical product-result document whose
+operation matches the workflow surface: plan-only is `plan`, download-only is
+`download`, execute is the semantic package operation, and recovery is
+`recover`.
 Termination, namespace setup, identity replacement, cleanup, transport, and
 lower-level root-operation status failures remain typed at the runner boundary.
 Owned results, including failure summaries and diagnostics, and list items are
@@ -262,8 +266,14 @@ The system state-store adapter creates and opens every directory component
 without following symbolic links. Request, retained state, exact lock,
 transaction result, and completion evidence stay on the profile state
 filesystem. Publication uses mode-restricted staged files, file sync,
-same-directory atomic rename, directory sync, and operation locks. Completed
-operation directories are retained as history while the active record is
+same-directory atomic rename, directory sync, and operation locks. Every newly
+created hierarchy component is made durable by syncing its containing parent
+through a normal sync-capable directory descriptor. In particular, the
+`operations` directory is synced immediately after creating an attempt
+directory, and request evidence is synced before active-state publication can
+begin. A sync error therefore leaves no active pointer to an operation
+directory that may disappear after power loss. Completed operation directories
+are retained as history while the active record is
 removed only after the final state is durable. A crash before removal therefore
 leaves a deterministic active or completed record rather than an ambiguous
 symlink or cross-filesystem pointer. If the retained final state was published
@@ -303,12 +313,14 @@ attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
 binding before any injectable outer post-backend boundary. If a process died
 after lower provenance publication but before returning, the still-present
-settled root record supplies the exact attempt and provenance digest used to
-validate the global completion once and retain the same operation-local
-binding; no lower workflow replay or recovery request is needed. Once the
-record is absent, reconciliation consumes only that operation-local path and
-digest. It never infers recovery from the outer phase or accepts a global
-completion that may belong to an older identical request. Without either
+settled root record supplies the exact attempt, outcome, and provenance digest
+used to validate the global completion once and retain the same operation-local
+binding. Both an originally recovered transaction and an originally successful
+transaction whose provenance discharge was interrupted are accepted without a
+lower workflow replay, recovery request, or fabricated transaction result.
+Once the record is absent, reconciliation consumes only that operation-local
+path and digest. It never infers recovery from the outer phase or accepts a
+global completion that may belong to an older identical request. Without either
 durable binding, clean reconciliation uses ordinary exact-lock-bound
 transaction evidence and does not claim that lower recovery occurred. The root
 record request digest is checked against the original execute-mode production

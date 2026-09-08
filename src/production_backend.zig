@@ -3629,6 +3629,7 @@ test "production recovery crash after provenance publication leaves a settled cl
     );
     defer record.deinit();
     try std.testing.expectEqual(root_operation.State.completed, record.record.state);
+    try std.testing.expectEqual(root_operation.Outcome.succeeded, record.record.outcome);
     try std.testing.expectEqual(
         root_operation.ProvenanceState.published,
         record.record.provenance,
