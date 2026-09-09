@@ -105,6 +105,12 @@ Preflight refuses, before anything can change:
 | `content_digest_mismatch` | content that does not hash to the digest the caller authorized |
 | `metadata_unsupported` | a mode change on a symbolic link, a mode outside `07777`, or an in-place ownership change on a non-directory carrying `security.capability` |
 
+One ordered hard-link replacement is not an ambiguous alias: after an earlier
+step has modeled replacing the exact declared source, a later hard-link target
+may still carry that source's old inode during preflight. The exemption is
+limited to that target/source pair. Independent replacements of two old
+hard-link names and aliased source lookups remain `path_alias`.
+
 ### Text the journal can carry
 
 The journal is a canonical JSON document, and a JSON string carries text, not
@@ -145,10 +151,14 @@ adapters do not widen this: a database plan path, a database directory, an
 archive path, an archive link literal, and an archive hard-link target are all
 lowered into ordinary intents and meet the same refusal.
 
-A directory's modification time is derived from its own entries, so a later
-step in the same plan would invalidate it as soon as it published a child. It
-is normalized to zero for directories and is neither published nor asserted,
-rather than being written and then quietly ignored.
+A directory's modification time is normally derived from its own entries, so
+ordinary directory steps normalize it to zero rather than asserting a value a
+later child publication immediately invalidates. A final `set_metadata` step
+may opt into a nonzero directory timestamp after every child step. Its
+precondition remains the normalized directory state; after the metadata
+boundary the exact timestamp is observed, journalled, and verified. Rollback
+continues to treat the intermediate parent-derived timestamp as normalized
+state, so this opt-in does not widen ordinary directory semantics.
 
 Cross-device targets are refused because publication and restoration are
 atomic renames between the workspace and the target directory, and a rename

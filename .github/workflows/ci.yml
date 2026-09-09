@@ -578,6 +578,10 @@ jobs:
           zig build -Doptimize=ReleaseSafe test
           zig build -Doptimize=ReleaseSafe fuzz
           zig build -Doptimize=ReleaseSafe run -- --help
+      - name: Compare native data-only materialization with dpkg
+        run: |
+          zig build test-native-materialization -j2 --summary all
+          zig build test-native-materialization -Doptimize=ReleaseSafe -j2 --summary all
       - name: Run required real apt facade acceptance
         run: |
           sudo env \

@@ -528,7 +528,8 @@ fn writesOwner(from: Metadata, to: Metadata) bool {
 }
 
 fn writesTimestamp(kind: Kind, from: Metadata, to: Metadata) bool {
-    return kind != .directory and from.modified_nanoseconds != to.modified_nanoseconds;
+    if (kind == .directory and to.modified_nanoseconds == 0) return false;
+    return from.modified_nanoseconds != to.modified_nanoseconds;
 }
 
 /// A bounded, deduplicated set of metadata combinations. One application
@@ -2079,7 +2080,16 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
     const model_index = try resolveModel(builder, path.text, &requires);
     try requireAncestors(builder, path, &requires);
 
-    try recordAlias(builder, model_index, path.text);
+    const allowed_produced_alias = switch (intent) {
+        .hard_link => |value| builder.index.get(value.source),
+        else => null,
+    };
+    try recordAlias(
+        builder,
+        model_index,
+        path.text,
+        allowed_produced_alias,
+    );
 
     const expected = builder.models.items[model_index].state;
     const step = try buildStep(builder, intent, path, expected, index, &requires);
@@ -2176,7 +2186,12 @@ fn requireAncestors(
 /// a wedged recovery afterwards. A state the plan itself produced is exact by
 /// construction, and a path registered again is the same entry, not an alias
 /// of it.
-fn recordAlias(builder: *Builder, model_index: u32, path: []const u8) BuildError!void {
+fn recordAlias(
+    builder: *Builder,
+    model_index: u32,
+    path: []const u8,
+    allowed_produced_alias: ?u32,
+) BuildError!void {
     const model = builder.models.items[model_index];
     if (model.produced) return;
     const state = switch (model.state) {
@@ -2189,6 +2204,14 @@ fn recordAlias(builder: *Builder, model_index: u32, path: []const u8) BuildError
     const found = try builder.aliases.getOrPut(builder.allocator, key);
     if (found.found_existing) {
         if (found.value_ptr.* == model_index) return;
+        // A hard-link target may still carry the source's old inode during
+        // preflight after an earlier step has already modeled replacing that
+        // exact source. No other produced alias is exempt: two independent
+        // replacements or an aliased source remain ambiguous.
+        if (allowed_produced_alias != null and
+            allowed_produced_alias.? == found.value_ptr.* and
+            builder.models.items[found.value_ptr.*].produced)
+            return;
         return builder.fail(.preflight, .path_alias, path);
     }
     found.value_ptr.* = model_index;
@@ -2497,9 +2520,7 @@ fn buildStep(
                     present.metadata.mode,
                 .uid = value.uid orelse present.metadata.uid,
                 .gid = value.gid orelse present.metadata.gid,
-                .modified_nanoseconds = if (present.kind == .directory)
-                    0
-                else if (value.modified_nanoseconds) |requested|
+                .modified_nanoseconds = if (value.modified_nanoseconds) |requested|
                     try validTimestamp(builder, requested, path.text)
                 else
                     present.metadata.modified_nanoseconds,
@@ -2615,7 +2636,7 @@ fn resolveSource(
 ) BuildError!Expectation {
     if (withinNamespace(path)) return builder.fail(.preflight, .path_collision, path);
     const model_index = try resolveModel(builder, path, requires);
-    try recordAlias(builder, model_index, path);
+    try recordAlias(builder, model_index, path, null);
     return builder.models.items[model_index].state;
 }
 
@@ -4204,7 +4225,19 @@ fn observeTarget(
             &observation.link_buffer,
         ) catch
             return engine.reject(.publication, .io_failed, step.index, .precondition_check),
-        .directory => state.metadata.modified_nanoseconds = 0,
+        .directory => {
+            const desired_timestamp = switch (step.desired) {
+                .present => |desired| desired.kind == .directory and
+                    desired.metadata.modified_nanoseconds != 0,
+                .absent => false,
+            };
+            const timestamp_applied = engine.progress.stage == .applying and
+                engine.progress.state(step.index).rank() >=
+                    StepState.metadata_applied.rank();
+            if (step.kind != .set_metadata or !desired_timestamp or
+                !timestamp_applied)
+                state.metadata.modified_nanoseconds = 0;
+        },
     }
     observation.device = value.device;
     observation.modeled = value.modeled;
@@ -5453,6 +5486,78 @@ test "root_mutation.test.applies creates, replacements, links, and removals" {
     try clear(&engine);
     try expectAbsent(root, journal_path);
     try expectAbsent(root, progress_path);
+}
+
+test "root_mutation.test.final directory timestamp follows child publication" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var plan = try planFor(&fixture, &.{
+        directoryIntent("usr"),
+        directoryIntent("usr/share"),
+        fileIntent("usr/share/file", "payload\n"),
+        .{ .metadata = .{
+            .path = "usr/share",
+            .modified_nanoseconds = 3_000_000_000,
+        } },
+    });
+    defer plan.deinit();
+    var engine = try prepare(
+        testing.allocator,
+        fixture.root(),
+        &fixture.attempt,
+        &plan,
+        .{},
+        .{},
+    );
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    try testing.expectEqual(
+        @as(i128, 3_000_000_000),
+        (try fixture.root().entry(
+            try root_fs.Path.init("usr/share"),
+        )).modified_nanoseconds,
+    );
+    try clear(&engine);
+}
+
+test "root_mutation.test.ordered hardlink group replacement is unambiguous" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/source", "old\n");
+    try root.createHardLink(
+        try root_fs.Path.init("usr/share/source"),
+        try root_fs.Path.init("usr/share/member"),
+    );
+    var plan = try planFor(&fixture, &.{
+        fileIntent("usr/share/source", "new\n"),
+        .{ .hard_link = .{
+            .path = "usr/share/member",
+            .source = "usr/share/source",
+        } },
+    });
+    defer plan.deinit();
+    var engine = try prepare(
+        testing.allocator,
+        root,
+        &fixture.attempt,
+        &plan,
+        .{},
+        .{},
+    );
+    defer engine.deinit();
+    try testing.expectEqual(
+        Outcome.applied,
+        (try apply(&engine, .fromPlan(&plan))).outcome,
+    );
+    try expectContent(root, "usr/share/source", "new\n");
+    const source = try root.entry(try root_fs.Path.init("usr/share/source"));
+    const member = try root.entry(try root_fs.Path.init("usr/share/member"));
+    try testing.expectEqual(source.inode, member.inode);
+    try clear(&engine);
 }
 
 /// Crash and error injection harness. Every fault names an exact durability
