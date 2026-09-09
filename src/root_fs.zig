@@ -244,12 +244,31 @@ pub const MetadataUpdate = struct {
     modified_nanoseconds: ?i128 = null,
 };
 
+pub const PublishPoint = enum {
+    before_stage_sync,
+    after_stage_sync,
+    before_rename,
+    after_rename,
+    before_directory_sync,
+    after_directory_sync,
+};
+
+pub const PublishObserver = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, PublishPoint) anyerror!void,
+
+    pub fn hit(self: PublishObserver, point: PublishPoint) !void {
+        try self.hitFn(self.context, point);
+    }
+};
+
 pub const PublishOptions = struct {
     permissions: File.Permissions = default_file_permissions,
     overwrite: OverwritePolicy = .replace,
     /// Fsyncs the staged contents and the destination directory so that a
     /// successful publication survives power loss.
     durable: bool = true,
+    observer: ?PublishObserver = null,
 };
 
 pub const default_file_permissions: File.Permissions =
@@ -305,9 +324,17 @@ pub const StagedFile = struct {
         if (!self.file_open) return error.StagedFileClosed;
         if (builtin.os.tag != .windows)
             try self.file.setPermissions(self.io, self.options.permissions);
-        if (self.options.durable) try self.file.sync(self.io);
+        if (self.options.durable) {
+            if (self.options.observer) |observer|
+                try observer.hit(.before_stage_sync);
+            try self.file.sync(self.io);
+            if (self.options.observer) |observer|
+                try observer.hit(.after_stage_sync);
+        }
         self.file.close(self.io);
         self.file_open = false;
+        if (self.options.observer) |observer|
+            try observer.hit(.before_rename);
         switch (self.options.overwrite) {
             .replace => try self.parent.dir.rename(
                 self.name(),
@@ -325,8 +352,16 @@ pub const StagedFile = struct {
                 else => return err,
             },
         }
+        if (self.options.observer) |observer|
+            try observer.hit(.after_rename);
         self.staged = false;
-        if (self.options.durable) try syncDir(self.io, self.parent.dir);
+        if (self.options.durable) {
+            if (self.options.observer) |observer|
+                try observer.hit(.before_directory_sync);
+            try syncDir(self.io, self.parent.dir);
+            if (self.options.observer) |observer|
+                try observer.hit(.after_directory_sync);
+        }
     }
 
     pub fn deinit(self: *StagedFile) void {

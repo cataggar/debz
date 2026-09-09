@@ -190,6 +190,7 @@ def audit_production_sources() -> None:
         for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
             if (
                 relative in (
+                    "src/apt_system_command.zig",
                     "src/apt_system_orchestrator.zig",
                     "src/production_backend.zig",
                 )

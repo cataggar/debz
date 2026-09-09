@@ -46,12 +46,23 @@ pub const WorkflowRecoveryAcknowledgment = struct {
 pub const WorkflowOwnershipAcknowledgment = struct {
     attempt_id: [32]u8,
     marker_sha256: [32]u8,
+    marker_exact_identity_sha256: [32]u8,
     acknowledgment_id: [32]u8,
+    marker: root_operation.DeferredAcknowledgment,
 };
 
-pub const WorkflowReconciliationClaim = struct {
-    exact_lock_sha256: [32]u8,
-    evidence_sha256: [32]u8,
+pub const WorkflowReconciliationClaim = union(enum) {
+    pre_mutation: struct {
+        outer_generation: u64,
+        outer_state_sha256: [32]u8,
+        profile_sha256: [32]u8,
+        profile_reference_sha256: [32]u8,
+        exact_lock_sha256: [32]u8,
+    },
+    post_mutation: struct {
+        exact_lock_sha256: [32]u8,
+        evidence_sha256: [32]u8,
+    },
 };
 
 pub const WorkflowRequest = struct {
@@ -65,6 +76,11 @@ pub const WorkflowRequest = struct {
     /// Internal outer-attempt identity, bound into the lower root record
     /// namespace before an orchestrated mutation can begin.
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
+    /// Exact lower owner authenticated by durable outer-operation evidence
+    /// for a restarted v2 workflow.
+    expected_ownership_marker: ?root_operation.DeferredAcknowledgment = null,
+    root_attempt_id: ?[32]u8 = null,
     reconciliation_claim: ?WorkflowReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?WorkflowOwnershipAcknowledgment = null,
@@ -76,6 +92,9 @@ const WorkflowDirective = struct {
     mode: WorkflowMode,
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
+    expected_ownership_marker: ?root_operation.DeferredAcknowledgment = null,
+    root_attempt_id: ?[32]u8 = null,
 };
 
 const TransactionSemanticOperation = enum {
@@ -290,6 +309,8 @@ pub const Backend = struct {
                 workflow.selectors,
                 workflow.orchestration_id.?,
                 claim,
+                workflow.recovery_review_claim,
+                workflow.expected_ownership_marker,
             );
         }
         if (workflow.recovery_acknowledgment) |acknowledgment| {
@@ -311,6 +332,7 @@ pub const Backend = struct {
                 request,
                 workflow.operation,
                 acknowledgment,
+                workflow.recovery_review_claim,
             ) catch |err| mapRuntimeError(operation, err);
         }
         if (workflow.finalize_ownership) {
@@ -333,7 +355,9 @@ pub const Backend = struct {
             return self.finalizeWorkflowOwnership(
                 allocator,
                 request,
+                workflow.operation,
                 workflow.ownership_acknowledgment.?,
+                workflow.recovery_review_claim,
             );
         }
         if (workflow.ownership_acknowledgment != null)
@@ -348,6 +372,9 @@ pub const Backend = struct {
             .mode = workflow.mode,
             .defer_recovery_clear = workflow.defer_recovery_clear,
             .orchestration_id = workflow.orchestration_id,
+            .recovery_review_claim = workflow.recovery_review_claim,
+            .expected_ownership_marker = workflow.expected_ownership_marker,
+            .root_attempt_id = workflow.root_attempt_id,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -720,6 +747,18 @@ pub const Backend = struct {
             false;
         guard.orchestration_id = if (workflow) |directive|
             directive.orchestration_id
+        else
+            null;
+        guard.recovery_review_claim = if (workflow) |directive|
+            directive.recovery_review_claim
+        else
+            null;
+        guard.expected_ownership_marker = if (workflow) |directive|
+            directive.expected_ownership_marker
+        else
+            null;
+        guard.root_attempt_id = if (workflow) |directive|
+            directive.root_attempt_id
         else
             null;
         if (guard.preserve_settled and
@@ -1371,11 +1410,16 @@ pub const Backend = struct {
             if (defer_clear)
                 root_operation.Store.init(
                     guard.owned_root.?.root,
-                ).readDeferredAcknowledgment(allocator) catch
-                    return blockedRecovery(
-                        request.operation,
-                        "lower orchestration binding is unreadable",
-                    )
+                ).readDeferredAcknowledgment(allocator) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.InvariantViolation => return error.InvariantViolation,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "lower orchestration binding is unreadable",
+                        ),
+                    }
             else
                 null;
         if (defer_clear and
@@ -1420,18 +1464,23 @@ pub const Backend = struct {
         defer statement.deinit();
 
         const store: root_operation_completion.Store = .init(guard.owned_root.?.root);
-        store.publish(allocator, statement.document) catch |err| return blockedRecovery(
-            request.operation,
-            try std.fmt.allocPrint(
-                allocator,
-                "root-operation completion provenance could not be published at {s}/{s}: {s}",
-                .{
-                    request.options.install_root,
-                    root_operation_completion.document_path,
-                    @errorName(err),
-                },
+        store.publish(allocator, statement.document) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
+                request.operation,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "root-operation completion provenance could not be published at {s}/{s}: {s}",
+                    .{
+                        request.options.install_root,
+                        root_operation_completion.document_path,
+                        @errorName(err),
+                    },
+                ),
             ),
-        );
+        };
         try guard.crash(.after_owed_provenance_document);
 
         // Provenance before clearing, exactly as an uninterrupted completion
@@ -1443,22 +1492,36 @@ pub const Backend = struct {
             .journal_archived = evidence.journal.status == .archived,
         });
         if (defer_clear) {
-            const marker = try root_operation.createDeferredAcknowledgment(.{
-                .state = .pending,
-                .attempt_id = record.attempt_id,
-                .completion_sha256 = statement.document.digest_sha256,
-                .provenance_sha256 = provenance_sha256,
-                .acknowledgment_id = orchestration_binding.?.acknowledgment_id,
-            });
+            const marker_base =
+                try root_operation.createDeferredAcknowledgment(.{
+                    .state = .pending,
+                    .attempt_id = record.attempt_id,
+                    .completion_sha256 = statement.document.digest_sha256,
+                    .provenance_sha256 = provenance_sha256,
+                    .acknowledgment_id = orchestration_binding.?.acknowledgment_id,
+                });
+            const marker = if (orchestration_binding.?
+                .recovery_review_claim_sha256 != null)
+                try root_operation.carryDeferredAcknowledgmentReviewOwner(
+                    marker_base,
+                    orchestration_binding.?,
+                )
+            else
+                marker_base;
             root_operation.Store.init(
                 guard.owned_root.?.root,
             ).publishDeferredAcknowledgment(
                 allocator,
                 marker,
-            ) catch return blockedRecovery(
-                request.operation,
-                "deferred lower recovery marker could not be published",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker could not be published",
+                ),
+            };
         }
         attempt.publishProvenance(
             allocator,
@@ -1517,6 +1580,7 @@ pub const Backend = struct {
         request: api.Request,
         semantic_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowRecoveryAcknowledgment,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1547,29 +1611,87 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        const marker = store.readDeferredAcknowledgment(allocator) catch
-            return blockedRecovery(
+        var marker = store.readDeferredAcknowledgment(allocator) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker is unreadable",
+                ),
+            };
+        var record = store.read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
                 request.operation,
-                "deferred lower recovery marker is unreadable",
-            );
-        var record = store.read(allocator) catch return blockedRecovery(
-            request.operation,
-            "deferred lower recovery record is unreadable",
-        );
+                "deferred lower recovery record is unreadable",
+            ),
+        };
         defer if (record) |*owned| owned.deinit();
         if (marker == null) {
             if (record != null) return blockedRecovery(
                 request.operation,
                 "deferred lower recovery marker is missing for an active record",
             );
-            return success(
+            if (recovery_review_claim) |claim| {
+                const review = store.readRecoveryReviewClaim(
+                    allocator,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "confirmed recovery review ownership is unreadable",
+                    ),
+                };
+                if (review != null) {
+                    const reconstructed =
+                        root_operation.createDeferredAcknowledgment(.{
+                            .state = .acknowledged,
+                            .attempt_id = acknowledgment.attempt_id,
+                            .completion_sha256 = acknowledgment.completion_sha256,
+                            .provenance_sha256 = acknowledgment.provenance_sha256,
+                            .acknowledgment_id = acknowledgment.acknowledgment_id,
+                        }) catch return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review cannot reconstruct exact lower ownership",
+                        );
+                    store.exchangeRecoveryReviewClaimForOwnership(
+                        allocator,
+                        .{
+                            .expected_claim = claim,
+                            .expected_marker = null,
+                            .expected_record_sha256 = null,
+                            .replacement_marker = reconstructed,
+                        },
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.InvariantViolation => return error.InvariantViolation,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review could not restore exact lower ownership",
+                        ),
+                    };
+                    marker =
+                        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+                            reconstructed,
+                            claim,
+                        );
+                }
+            }
+            if (marker == null) return success(
                 request.operation,
                 false,
                 "lower recovery acknowledgment was already finalized",
                 &.{},
             );
         }
-        const observed_marker = marker.?;
+        var observed_marker = marker.?;
         if (observed_marker.state == .bound or
             observed_marker.completion_sha256 == null or
             observed_marker.provenance_sha256 == null or
@@ -1602,10 +1724,15 @@ pub const Backend = struct {
 
         var completion = (root_operation_completion.Store.init(
             owned_root.root,
-        ).read(allocator) catch return blockedRecovery(
-            request.operation,
-            "deferred lower recovery completion evidence is unreadable",
-        )) orelse return blockedRecovery(
+        ).read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
+                request.operation,
+                "deferred lower recovery completion evidence is unreadable",
+            ),
+        }) orelse return blockedRecovery(
             request.operation,
             "deferred lower recovery completion evidence is missing",
         );
@@ -1624,7 +1751,6 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery acknowledgment token is stale or foreign",
             );
-        var acknowledged_marker = observed_marker;
         if (observed_marker.state == .pending) {
             const active = if (record) |owned|
                 owned.record
@@ -1641,30 +1767,71 @@ pub const Backend = struct {
                     request.operation,
                     "deferred lower recovery acknowledgment names a foreign operation",
                 );
+        }
+        if (recovery_review_claim) |expected_review| {
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .expected_claim = expected_review,
+                    .expected_marker = observed_marker,
+                    .expected_record_sha256 = if (record) |owned|
+                        owned.record.digest_sha256
+                    else
+                        null,
+                    .replacement_marker = observed_marker,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review could not be exchanged for the verified lower recovery owner",
+                ),
+            };
+            observed_marker =
+                try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+                    observed_marker,
+                    expected_review,
+                );
+        }
+        var acknowledged_marker = observed_marker;
+        if (observed_marker.state == .pending) {
             if (self.completion_crash) |crash|
                 try crash.hit(.before_deferred_acknowledged);
             acknowledged_marker =
                 store.acknowledgeDeferredAcknowledgment(
                     allocator,
-                    observed_marker.digest_sha256,
-                ) catch return blockedRecovery(
-                    request.operation,
-                    "deferred lower recovery acknowledgment could not be committed",
-                );
+                    observed_marker,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "deferred lower recovery acknowledgment could not be committed",
+                    ),
+                };
             if (self.completion_crash) |crash|
                 try crash.hit(.after_deferred_acknowledged);
         }
         store.cleanupOwned(allocator, .{
-            .attempt_id = acknowledged_marker.attempt_id,
-            .acknowledgment_id = acknowledged_marker.acknowledgment_id,
+            .authorization = root_operation.authorizationFromTrustedMarker(
+                acknowledged_marker,
+            ),
             .terminal_state = .acknowledged,
             .observer = self.deferredCleanupObserver(),
         }) catch |err| {
-            if (err == error.InjectedCompletionCrash) return err;
-            return blockedRecovery(
-                request.operation,
-                "deferred lower recovery ownership could not be cleared",
-            );
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ContractViolation => error.ContractViolation,
+                error.InvariantViolation => error.InvariantViolation,
+                error.InjectedCompletionCrash => error.InjectedCompletionCrash,
+                else => blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery ownership could not be cleared",
+                ),
+            };
         };
         if (record) |*owned| {
             owned.deinit();
@@ -1705,7 +1872,9 @@ pub const Backend = struct {
         self: *Backend,
         allocator: std.mem.Allocator,
         request: api.Request,
+        workflow_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowOwnershipAcknowledgment,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1736,7 +1905,7 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        const marker = store.readDeferredAcknowledgment(allocator) catch
+        var marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
                 "lower ownership marker is unreadable",
@@ -1751,22 +1920,226 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker is missing for an active record",
             );
-            return success(
+            if (recovery_review_claim) |claim| {
+                const review = store.readRecoveryReviewClaim(
+                    allocator,
+                ) catch return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review ownership is unreadable",
+                );
+                if (review != null) {
+                    const owner = acknowledgment.marker;
+                    if (!std.mem.eql(
+                        u8,
+                        &owner.digest_sha256,
+                        &acknowledgment.marker_sha256,
+                    ) or !std.mem.eql(
+                        u8,
+                        &root_operation.deferredAcknowledgmentExactIdentity(
+                            owner,
+                        ),
+                        &acknowledgment.marker_exact_identity_sha256,
+                    ) or !std.mem.eql(
+                        u8,
+                        &owner.attempt_id,
+                        &acknowledgment.attempt_id,
+                    ) or !std.mem.eql(
+                        u8,
+                        &owner.acknowledgment_id,
+                        &acknowledgment.acknowledgment_id,
+                    ))
+                        return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review cannot reconstruct exact lower ownership",
+                        );
+                    store.exchangeRecoveryReviewClaimForOwnership(
+                        allocator,
+                        .{
+                            .expected_claim = claim,
+                            .expected_marker = null,
+                            .expected_record_sha256 = null,
+                            .replacement_marker = owner,
+                        },
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review could not restore exact lower ownership",
+                        ),
+                    };
+                    marker = owner;
+                }
+            }
+            if (marker == null) return success(
                 request.operation,
                 false,
                 "lower orchestration ownership was already finalized",
                 &.{},
             );
         }
-        const observed = marker.?;
-        if ((observed.state != .bound and
-            observed.state != .released and
-            observed.state != .abandoned) or
+        var observed = marker.?;
+        if (!std.mem.eql(
+            u8,
+            &acknowledgment.marker.digest_sha256,
+            &acknowledgment.marker_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &root_operation.deferredAcknowledgmentExactIdentity(
+                acknowledgment.marker,
+            ),
+            &acknowledgment.marker_exact_identity_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &acknowledgment.marker.attempt_id,
+            &acknowledgment.attempt_id,
+        ) or !std.mem.eql(
+            u8,
+            &acknowledgment.marker.acknowledgment_id,
+            &acknowledgment.acknowledgment_id,
+        ))
+            return blockedRecovery(
+                request.operation,
+                "lower ownership acknowledgment is internally inconsistent",
+            );
+        const expected_observed = if (recovery_review_claim) |review|
+            if (observed.recovery_review_claim_sha256 != null)
+                root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+                    acknowledgment.marker,
+                    review,
+                ) catch return blockedRecovery(
+                    request.operation,
+                    "lower ownership acknowledgment cannot be bound to the confirmed recovery review",
+                )
+            else
+                acknowledgment.marker
+        else
+            acknowledgment.marker;
+        if (observed.state == .pre_mutation_reconciliation_claim) {
+            const claim = observed.pre_mutation_claim orelse
+                return blockedRecovery(
+                    request.operation,
+                    "lower reconciliation claim binding is absent",
+                );
+            const selectors = try allocator.alloc(
+                solver.PackageSelector,
+                request.packages.len,
+            );
+            defer allocator.free(selectors);
+            for (request.packages, 0..) |package, index|
+                selectors[index] = parseSelector(package);
+            const semantic_sha256 = try workflowSemanticRequestDigest(
+                allocator,
+                workflow_operation,
+                selectors,
+            );
+            if (record != null or
+                !std.mem.eql(
+                    u8,
+                    &claim.outer_attempt_id,
+                    &acknowledgment.acknowledgment_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &claim.semantic_request_sha256,
+                    &semantic_sha256,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.digest_sha256,
+                    &expected_observed.digest_sha256,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &root_operation.deferredAcknowledgmentExactIdentity(
+                        observed,
+                    ),
+                    &root_operation.deferredAcknowledgmentExactIdentity(
+                        expected_observed,
+                    ),
+                ) or
+                !root_operation.deferredAcknowledgmentExactEqual(
+                    observed,
+                    expected_observed,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.attempt_id,
+                    &acknowledgment.attempt_id,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &observed.acknowledgment_id,
+                    &acknowledgment.acknowledgment_id,
+                ))
+                return blockedRecovery(
+                    request.operation,
+                    "lower reconciliation claim belongs to another orchestrator",
+                );
+            if (recovery_review_claim) |expected_review| {
+                store.exchangeRecoveryReviewClaimForOwnership(
+                    allocator,
+                    .{
+                        .expected_claim = expected_review,
+                        .expected_marker = observed,
+                        .expected_record_sha256 = null,
+                        .replacement_marker = observed,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "confirmed recovery review could not be exchanged for the verified reconciliation owner",
+                    ),
+                };
+                observed =
+                    try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+                        observed,
+                        expected_review,
+                    );
+            }
+            if (self.completion_crash) |crash|
+                crash.hit(.before_ownership_marker_clear) catch
+                    return blockedRecovery(
+                        request.operation,
+                        "lower reconciliation claim acknowledgment was interrupted",
+                    );
+            store.clearDeferredAcknowledgment(
+                allocator,
+                observed,
+            ) catch return blockedRecovery(
+                request.operation,
+                "lower reconciliation claim could not be acknowledged",
+            );
+            if (self.completion_crash) |crash|
+                crash.hit(.after_ownership_marker_clear) catch
+                    return blockedRecovery(
+                        request.operation,
+                        "lower reconciliation claim acknowledgment was interrupted",
+                    );
+            return success(
+                request.operation,
+                false,
+                "lower reconciliation claim finalized",
+                &.{},
+            );
+        }
+        if (!std.mem.eql(
+            u8,
+            &observed.digest_sha256,
+            &expected_observed.digest_sha256,
+        ) or
             !std.mem.eql(
                 u8,
-                &observed.digest_sha256,
-                &acknowledgment.marker_sha256,
-            ) or
+                &root_operation.deferredAcknowledgmentExactIdentity(
+                    observed,
+                ),
+                &root_operation.deferredAcknowledgmentExactIdentity(
+                    expected_observed,
+                ),
+            ) or !root_operation.deferredAcknowledgmentExactEqual(
+            observed,
+            expected_observed,
+        ) or
             !std.mem.eql(
                 u8,
                 &observed.attempt_id,
@@ -1781,32 +2154,58 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker belongs to another orchestrator",
             );
-        if (record) |owned| {
-            if (!owned.record.clearable() or
-                (observed.state == .released and
-                    owned.record.outcome == .abandoned_before_mutation) or
-                (observed.state == .abandoned and
-                    owned.record.outcome != .abandoned_before_mutation) or
-                !std.mem.eql(
-                    u8,
-                    &owned.record.attempt_id,
-                    &observed.attempt_id,
-                ))
-                return blockedRecovery(
+        const compatibility = root_operation.deferredRecordCompatibility(
+            if (record) |owned| owned.record else null,
+            observed,
+            false,
+        );
+        const finalizable = switch (compatibility) {
+            .released_without_record,
+            .abandoned_without_record,
+            .released_completed,
+            .abandoned_pre_mutation,
+            .bound_completed_success,
+            .bound_completed_abandoned,
+            => true,
+            else => false,
+        };
+        if (!finalizable) return blockedRecovery(
+            request.operation,
+            "lower ownership record is unfinished, incompatible, or foreign",
+        );
+        if (recovery_review_claim) |expected_review| {
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .expected_claim = expected_review,
+                    .expected_marker = observed,
+                    .expected_record_sha256 = if (record) |owned|
+                        owned.record.digest_sha256
+                    else
+                        null,
+                    .replacement_marker = observed,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedRecovery(
                     request.operation,
-                    "lower ownership record is unfinished or foreign",
+                    "confirmed recovery review could not be exchanged for the verified lower owner",
+                ),
+            };
+            observed =
+                try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+                    observed,
+                    expected_review,
                 );
         }
         store.cleanupOwned(allocator, .{
-            .attempt_id = observed.attempt_id,
-            .acknowledgment_id = acknowledgment.acknowledgment_id,
-            .terminal_state = if (observed.state == .abandoned or
-                (record != null and
-                    record.?.record.outcome == .abandoned_before_mutation))
+            .authorization = root_operation.authorizationFromTrustedMarker(observed),
+            .terminal_state = if (compatibility == .abandoned_without_record or
+                compatibility == .abandoned_pre_mutation or
+                compatibility == .bound_completed_abandoned)
                 .abandoned
             else
                 .released,
-            .expected_marker_sha256 = acknowledgment.marker_sha256,
             .observer = self.ownershipCleanupObserver(),
         }) catch return blockedRecovery(
             request.operation,
@@ -1832,6 +2231,8 @@ pub const Backend = struct {
         selectors: []const solver.PackageSelector,
         orchestration_id: [32]u8,
         claim: WorkflowReconciliationClaim,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
+        expected_ownership_marker: ?root_operation.DeferredAcknowledgment,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1877,35 +2278,121 @@ pub const Backend = struct {
                 request.operation,
                 "lower root is not clean for reconciliation",
             );
-        const semantic_sha256 = try workflowProductRequestDigest(
+        const execute_request_sha256 = try workflowProductRequestDigest(
             allocator,
             semantic_operation,
             .execute,
             selectors,
             request.options,
         );
-        const attempt_id = reconciliationAttemptId(
-            orchestration_id,
-            semantic_sha256,
-            claim.exact_lock_sha256,
-            claim.evidence_sha256,
+        const semantic_request_sha256 = try workflowSemanticRequestDigest(
+            allocator,
+            semantic_operation,
+            selectors,
         );
+        const attempt_id = switch (claim) {
+            .pre_mutation => |binding| root_operation.preMutationReconciliationClaimId(.{
+                .outer_attempt_id = orchestration_id,
+                .outer_generation = binding.outer_generation,
+                .outer_state_sha256 = binding.outer_state_sha256,
+                .profile_sha256 = binding.profile_sha256,
+                .profile_reference_sha256 = binding.profile_reference_sha256,
+                .exact_lock_sha256 = binding.exact_lock_sha256,
+                .semantic_request_sha256 = semantic_request_sha256,
+            }),
+            .post_mutation => |binding| reconciliationAttemptId(
+                orchestration_id,
+                execute_request_sha256,
+                binding.exact_lock_sha256,
+                binding.evidence_sha256,
+            ),
+        };
         const reconciliation = try root_operation.createDeferredAcknowledgment(
             .{
-                .state = .released,
+                .state = switch (claim) {
+                    .pre_mutation => .pre_mutation_reconciliation_claim,
+                    .post_mutation => .released,
+                },
                 .attempt_id = attempt_id,
+                .pre_mutation_claim = switch (claim) {
+                    .pre_mutation => |binding| .{
+                        .outer_attempt_id = orchestration_id,
+                        .outer_generation = binding.outer_generation,
+                        .outer_state_sha256 = binding.outer_state_sha256,
+                        .profile_sha256 = binding.profile_sha256,
+                        .profile_reference_sha256 = binding.profile_reference_sha256,
+                        .exact_lock_sha256 = binding.exact_lock_sha256,
+                        .semantic_request_sha256 = semantic_request_sha256,
+                    },
+                    .post_mutation => null,
+                },
                 .acknowledgment_id = orchestration_id,
             },
         );
+        const expected_reconciliation =
+            if (recovery_review_claim) |review|
+                try root_operation
+                    .bindDeferredAcknowledgmentToRecoveryReview(
+                    reconciliation,
+                    review,
+                )
+            else
+                reconciliation;
+        if (recovery_review_claim != null and
+            expected_ownership_marker == null)
+            return blockedRecovery(
+                request.operation,
+                "authenticated exact reconciliation ownership is required",
+            );
+        if (expected_ownership_marker) |expected|
+            if (!root_operation.deferredAcknowledgmentExactEqual(
+                expected_reconciliation,
+                expected,
+            ))
+                return blockedRecovery(
+                    request.operation,
+                    "lower reconciliation owner does not match the authenticated exact token",
+                );
         if (self.completion_crash) |crash|
             try crash.hit(.before_reconciliation_marker_publish);
-        store.publishDeferredAcknowledgment(
-            allocator,
-            reconciliation,
-        ) catch return blockedRecovery(
-            request.operation,
-            "lower reconciliation ownership could not be published",
-        );
+        if (recovery_review_claim) |expected_review|
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .expected_claim = expected_review,
+                    .expected_marker = null,
+                    .expected_record_sha256 = null,
+                    .replacement_marker = reconciliation,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedRecovery(
+                    request.operation,
+                    "the confirmed recovery review could not be atomically exchanged for reconciliation ownership",
+                ),
+            }
+        else
+            store.publishDeferredAcknowledgment(
+                allocator,
+                reconciliation,
+            ) catch return blockedRecovery(
+                request.operation,
+                "lower reconciliation ownership could not be published",
+            );
+        const published = store.readDeferredAcknowledgment(allocator) catch
+            return blockedRecovery(
+                request.operation,
+                "lower reconciliation ownership could not be verified",
+            );
+        if (published == null or
+            !root_operation.deferredAcknowledgmentExactEqual(
+                expected_reconciliation,
+                published.?,
+            ))
+            return blockedRecovery(
+                request.operation,
+                "published lower reconciliation ownership differs from the authenticated exact token",
+            );
         if (self.completion_crash) |crash|
             try crash.hit(.after_reconciliation_marker_publish);
         return success(
@@ -1916,7 +2403,7 @@ pub const Backend = struct {
         );
     }
 
-    fn reconciliationAttemptId(
+    pub fn reconciliationAttemptId(
         orchestration_id: [32]u8,
         semantic_sha256: [32]u8,
         exact_lock_sha256: [32]u8,
@@ -1928,9 +2415,7 @@ pub const Backend = struct {
         hash.update(&semantic_sha256);
         hash.update(&exact_lock_sha256);
         hash.update(&evidence_sha256);
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        return digest;
+        return hash.finalResult();
     }
 
     fn ownershipCleanupObserver(
@@ -2431,6 +2916,10 @@ const RootOperationGuard = struct {
     /// pre-mutation binding for the subsequent execute call to adopt.
     preserve_pre_mutation: bool = false,
     orchestration_id: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
+    expected_ownership_marker: ?root_operation.DeferredAcknowledgment = null,
+    ownership_marker: ?root_operation.DeferredAcknowledgment = null,
+    root_attempt_id: ?[32]u8 = null,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -2529,6 +3018,9 @@ const RootOperationGuard = struct {
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
             .orchestration_id = self.orchestration_id,
+            .recovery_review_claim = self.recovery_review_claim,
+            .expected_deferred_acknowledgment = self.expected_ownership_marker,
+            .attempt_id = self.root_attempt_id,
             .acquisition_observer = self.acquisitionObserver(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         if (self.orchestration_id) |orchestration_id| {
@@ -2554,6 +3046,60 @@ const RootOperationGuard = struct {
                     request.operation,
                     "lower operation belongs to a different outer orchestrator attempt",
                 );
+                self.ownership_marker = if (binding.document_version ==
+                    root_operation.deferred_ack_v2_schema_version)
+                authenticated: {
+                    if (self.recovery_review_claim) |claim| {
+                        const expected = if (claim.prior_marker) |prior| expected: {
+                            const authenticated_prior =
+                                self.expected_ownership_marker orelse
+                                return blockedRecovery(
+                                    request.operation,
+                                    "authenticated prior v2 ownership is unavailable",
+                                );
+                            if (!root_operation.deferredAcknowledgmentExactEqual(
+                                authenticated_prior,
+                                prior,
+                            )) return blockedRecovery(
+                                request.operation,
+                                "reviewed prior owner differs from the authenticated exact token",
+                            );
+                            break :expected root_operation
+                                .bindDeferredAcknowledgmentToRecoveryReview(
+                                authenticated_prior,
+                                claim,
+                            ) catch return blockedRecovery(
+                                request.operation,
+                                "exact lower ownership evidence is invalid",
+                            );
+                        } else self.expected_ownership_marker orelse
+                            return blockedRecovery(
+                                request.operation,
+                                "authenticated replacement v2 ownership is unavailable",
+                            );
+                        if (!root_operation.deferredAcknowledgmentExactEqual(
+                            binding,
+                            expected,
+                        )) return blockedRecovery(
+                            request.operation,
+                            "lower operation does not match the authenticated exact ownership token",
+                        );
+                        break :authenticated expected;
+                    }
+                    const expected = self.expected_ownership_marker orelse
+                        return blockedRecovery(
+                            request.operation,
+                            "exact lower ownership evidence is unavailable",
+                        );
+                    if (!root_operation.deferredAcknowledgmentExactEqual(
+                        binding,
+                        expected,
+                    )) return blockedRecovery(
+                        request.operation,
+                        "lower operation does not match the reviewed exact ownership token",
+                    );
+                    break :authenticated expected;
+                } else binding;
             } else return blockedRecovery(
                 request.operation,
                 "lower operation has no originating outer orchestration binding",
@@ -2689,16 +3235,22 @@ const RootOperationGuard = struct {
             _ = self.coordinator.store().retainOwnedTerminal(
                 allocator,
                 .{
-                    .attempt_id = attempt.record().attempt_id,
-                    .acknowledgment_id = self.orchestration_id.?,
+                    .authorization = root_operation.authorizationFromTrustedMarker(
+                        self.ownership_marker orelse
+                            return blockedRecovery(
+                                operation,
+                                "exact lower ownership evidence is unavailable",
+                            ),
+                    ),
                     .terminal_state = .released,
                     .observer = self.cleanupObserver(),
                 },
-            ) catch
+            ) catch {
                 return blockedRecovery(
                     operation,
                     "completed lower operation ownership could not be retained",
                 );
+            };
             self.preserve_settled = true;
         }
         return null;
@@ -2708,11 +3260,13 @@ const RootOperationGuard = struct {
         self: *RootOperationGuard,
         terminal_state: root_operation.DeferredAcknowledgmentState,
     ) !void {
-        const orchestration_id = self.orchestration_id orelse return;
-        const attempt = self.active() orelse return;
+        _ = self.orchestration_id orelse return;
+        _ = self.active() orelse return;
         try self.coordinator.store().cleanupOwned(self.allocator, .{
-            .attempt_id = attempt.record().attempt_id,
-            .acknowledgment_id = orchestration_id,
+            .authorization = root_operation.authorizationFromTrustedMarker(
+                self.ownership_marker orelse
+                    return error.AuthorizationEvidenceMissing,
+            ),
             .terminal_state = terminal_state,
             .observer = self.cleanupObserver(),
         });
@@ -2764,8 +3318,10 @@ const RootOperationGuard = struct {
                             _ = self.coordinator.store().retainOwnedTerminal(
                                 self.allocator,
                                 .{
-                                    .attempt_id = value.record().attempt_id,
-                                    .acknowledgment_id = self.orchestration_id.?,
+                                    .authorization = root_operation.authorizationFromTrustedMarker(
+                                        self.ownership_marker orelse
+                                            return,
+                                    ),
                                     .terminal_state = .abandoned,
                                     .observer = self.cleanupObserver(),
                                 },
@@ -2869,6 +3425,14 @@ fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
             .recovery,
             .root_operation_recovery_required,
             "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.AuthorizationEvidenceMissing,
+        error.DeferredAcknowledgmentMismatch,
+        => api.failure(
+            operation,
+            .recovery,
+            .root_operation_recovery_required,
+            "the exact durable v2 root ownership token is unavailable or does not match",
         ),
         // The transaction itself finished; only the provenance it owes is
         // missing. Naming the command that discharges it keeps the root from
@@ -4425,14 +4989,33 @@ fn backendDeferredMarker(
     return try root_operation.decodeDeferredAcknowledgment(allocator, bytes);
 }
 
-test "production workflow clean reconciliation claim is durable exclusive and crash convergent" {
+test "production workflow reconciliation claims are distinct durable exclusive and crash convergent" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    inline for (.{
-        CompletionPoint.before_reconciliation_marker_publish,
-        CompletionPoint.after_reconciliation_marker_publish,
-    }) |point| {
+    const ClaimCase = struct {
+        point: CompletionPoint,
+        pre_mutation: bool,
+    };
+    inline for ([_]ClaimCase{
+        .{
+            .point = .before_reconciliation_marker_publish,
+            .pre_mutation = false,
+        },
+        .{
+            .point = .after_reconciliation_marker_publish,
+            .pre_mutation = false,
+        },
+        .{
+            .point = .before_reconciliation_marker_publish,
+            .pre_mutation = true,
+        },
+        .{
+            .point = .after_reconciliation_marker_publish,
+            .pre_mutation = true,
+        },
+    }) |claim_case| {
+        const point = claim_case.point;
         var directory = std.testing.tmpDir(.{});
         defer directory.cleanup();
         var fixture = try ProductionWorkflowFixture.init(
@@ -4461,16 +5044,38 @@ test "production workflow clean reconciliation claim is durable exclusive and cr
         claim_options.lock_input_path = fixture.lock_path;
         claim_options.assume_yes = true;
         claim_options.conffile = .keep_existing;
+        const pre_mutation_binding: root_operation.PreMutationReconciliationClaimBinding = .{
+            .outer_attempt_id = outer_id,
+            .outer_generation = 9,
+            .outer_state_sha256 = @splat(0xa2),
+            .profile_sha256 = @splat(0xa3),
+            .profile_reference_sha256 = @splat(0xa4),
+            .exact_lock_sha256 = @splat(0xb2),
+            .semantic_request_sha256 = try workflowSemanticRequestDigest(
+                allocator,
+                .remove,
+                &selectors,
+            ),
+        };
         const request: WorkflowRequest = .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
             .options = claim_options,
             .orchestration_id = outer_id,
-            .reconciliation_claim = .{
-                .exact_lock_sha256 = @splat(0xb2),
-                .evidence_sha256 = @splat(0xc3),
-            },
+            .reconciliation_claim = if (claim_case.pre_mutation)
+                .{ .pre_mutation = .{
+                    .outer_generation = pre_mutation_binding.outer_generation,
+                    .outer_state_sha256 = pre_mutation_binding.outer_state_sha256,
+                    .profile_sha256 = pre_mutation_binding.profile_sha256,
+                    .profile_reference_sha256 = pre_mutation_binding.profile_reference_sha256,
+                    .exact_lock_sha256 = pre_mutation_binding.exact_lock_sha256,
+                } }
+            else
+                .{ .post_mutation = .{
+                    .exact_lock_sha256 = @splat(0xb2),
+                    .evidence_sha256 = @splat(0xc3),
+                } },
         };
         try std.testing.expectError(
             error.InjectedCompletionCrash,
@@ -4496,9 +5101,20 @@ test "production workflow clean reconciliation claim is durable exclusive and cr
             const retained = marker orelse
                 return error.MissingDeferredAcknowledgment;
             try std.testing.expectEqual(
-                root_operation.DeferredAcknowledgmentState.released,
+                if (claim_case.pre_mutation)
+                    root_operation.DeferredAcknowledgmentState
+                        .pre_mutation_reconciliation_claim
+                else
+                    .released,
                 retained.state,
             );
+            if (claim_case.pre_mutation)
+                try std.testing.expect(
+                    root_operation.matchesPreMutationReconciliationClaim(
+                        retained,
+                        pre_mutation_binding,
+                    ),
+                );
             try std.testing.expectEqualSlices(
                 u8,
                 &outer_id,
@@ -4533,7 +5149,11 @@ test "production workflow clean reconciliation claim is durable exclusive and cr
                 .ownership_acknowledgment = .{
                     .attempt_id = retained.attempt_id,
                     .marker_sha256 = retained.digest_sha256,
+                    .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                        retained,
+                    ),
                     .acknowledgment_id = retained.acknowledgment_id,
+                    .marker = retained,
                 },
             },
         );
@@ -5761,7 +6381,11 @@ test "production workflow ownership cleanup converges across every durable bound
                 .ownership_acknowledgment = .{
                     .attempt_id = marker.attempt_id,
                     .marker_sha256 = marker.digest_sha256,
+                    .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                        marker,
+                    ),
                     .acknowledgment_id = @splat(0xe5),
+                    .marker = marker,
                 },
             });
             try std.testing.expectEqual(
@@ -5781,7 +6405,11 @@ test "production workflow ownership cleanup converges across every durable bound
                 .ownership_acknowledgment = .{
                     .attempt_id = marker.attempt_id,
                     .marker_sha256 = marker.digest_sha256,
+                    .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                        marker,
+                    ),
                     .acknowledgment_id = owner_id,
+                    .marker = marker,
                 },
             });
             try std.testing.expectEqual(api.ExitStatus.success, finalized.exit_status);
@@ -5968,7 +6596,11 @@ test "production workflow pre-mutation ownership abandon converges across every 
             .ownership_acknowledgment = .{
                 .attempt_id = released.attempt_id,
                 .marker_sha256 = released.digest_sha256,
+                .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                    released,
+                ),
                 .acknowledgment_id = owner_id,
+                .marker = released,
             },
         });
         try std.testing.expectEqual(api.ExitStatus.success, acknowledged.exit_status);
@@ -5977,6 +6609,310 @@ test "production workflow pre-mutation ownership abandon converges across every 
             &directory,
         )) == null);
     }
+}
+
+test "production workflow required_security.ownership finalization rejects a valid colliding v2 owner" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    const owner_id: [32]u8 = @splat(0x31);
+    const claim_a = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = owner_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(0x32),
+        .profile_sha256 = @splat(0x33),
+        .profile_reference_sha256 = @splat(0x34),
+        .exact_lock_sha256 = @splat(0x35),
+        .semantic_request_sha256 = @splat(0x36),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0x37),
+    });
+    const claim_b = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = claim_a.outer_attempt_id,
+        .outer_generation = claim_a.outer_generation,
+        .outer_state_sha256 = claim_a.outer_state_sha256,
+        .profile_sha256 = claim_a.profile_sha256,
+        .profile_reference_sha256 = claim_a.profile_reference_sha256,
+        .exact_lock_sha256 = claim_a.exact_lock_sha256,
+        .semantic_request_sha256 = claim_a.semantic_request_sha256,
+        .mutation_status = claim_a.mutation_status,
+        .nonce = @splat(0x38),
+    });
+    const base = try root_operation.createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0x39),
+        .acknowledgment_id = owner_id,
+    });
+    const marker_a =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            base,
+            claim_a,
+        );
+    const marker_b =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            base,
+            claim_b,
+        );
+    try std.testing.expectEqualSlices(
+        u8,
+        &marker_a.digest_sha256,
+        &marker_b.digest_sha256,
+    );
+    try std.testing.expect(!root_operation.deferredAcknowledgmentExactEqual(
+        marker_a,
+        marker_b,
+    ));
+
+    var owned_root = try root_fs.openAbsoluteRoot(
+        std.testing.io,
+        fixture.install_root,
+    );
+    defer owned_root.close();
+    const store = root_operation.Store.init(owned_root.root);
+    try store.ensureNamespace();
+    try store.publishDeferredAcknowledgment(allocator, marker_b);
+
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+    const foreign = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+        .orchestration_id = owner_id,
+        .finalize_ownership = true,
+        .ownership_acknowledgment = .{
+            .attempt_id = marker_a.attempt_id,
+            .marker_sha256 = marker_a.digest_sha256,
+            .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(marker_a),
+            .acknowledgment_id = owner_id,
+            .marker = marker_a,
+        },
+    });
+    try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        marker_b,
+        (try store.readDeferredAcknowledgment(allocator)).?,
+    ));
+
+    const exact = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .recover,
+        .selectors = &selectors,
+        .options = options,
+        .orchestration_id = owner_id,
+        .finalize_ownership = true,
+        .ownership_acknowledgment = .{
+            .attempt_id = marker_b.attempt_id,
+            .marker_sha256 = marker_b.digest_sha256,
+            .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(marker_b),
+            .acknowledgment_id = owner_id,
+            .marker = marker_b,
+        },
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, exact.exit_status);
+    try std.testing.expect(
+        (try store.readDeferredAcknowledgment(allocator)) == null,
+    );
+}
+
+test "production workflow required_security.restart requires the authenticated exact v2 owner" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory,
+        \\Package: removable
+        \\Status: install ok installed
+        \\Priority: optional
+        \\Architecture: amd64
+        \\Version: 1
+        \\
+    );
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    options.lock_output_path = null;
+    options.lock_input_path = fixture.lock_path;
+    options.assume_yes = true;
+    options.noninteractive = true;
+    options.conffile = .keep_existing;
+
+    const owner_id: [32]u8 = @splat(0x71);
+    const root_attempt_id: [32]u8 = @splat(0x70);
+    const claim_a = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = owner_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(0x72),
+        .profile_sha256 = @splat(0x73),
+        .profile_reference_sha256 = @splat(0x74),
+        .exact_lock_sha256 = @splat(0x75),
+        .semantic_request_sha256 = @splat(0x76),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0x77),
+    });
+    const owner_base = try root_operation.createDeferredAcknowledgment(.{
+        .state = .bound,
+        .attempt_id = root_attempt_id,
+        .acknowledgment_id = owner_id,
+    });
+    const marker_a =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            owner_base,
+            claim_a,
+        );
+    var owned_root = try root_fs.openAbsoluteRoot(
+        std.testing.io,
+        fixture.install_root,
+    );
+    defer owned_root.close();
+    const store = root_operation.Store.init(owned_root.root);
+    try store.ensureNamespace();
+    try store.publishRecoveryReviewClaim(allocator, claim_a);
+    const reserved = try backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .reserve,
+        .selectors = &selectors,
+        .options = options,
+        .orchestration_id = owner_id,
+        .recovery_review_claim = claim_a,
+        .expected_ownership_marker = marker_a,
+        .root_attempt_id = root_attempt_id,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, reserved.exit_status);
+    const observed_marker_a =
+        (try store.readDeferredAcknowledgment(allocator)).?;
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        marker_a,
+        observed_marker_a,
+    ));
+    try std.testing.expectEqual(
+        root_operation.DeferredAcknowledgmentState.bound,
+        marker_a.state,
+    );
+
+    const claim_b = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = claim_a.outer_attempt_id,
+        .outer_generation = claim_a.outer_generation,
+        .outer_state_sha256 = claim_a.outer_state_sha256,
+        .profile_sha256 = claim_a.profile_sha256,
+        .profile_reference_sha256 = claim_a.profile_reference_sha256,
+        .exact_lock_sha256 = claim_a.exact_lock_sha256,
+        .semantic_request_sha256 = claim_a.semantic_request_sha256,
+        .mutation_status = claim_a.mutation_status,
+        .nonce = @splat(0x78),
+    });
+    const marker_b =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            owner_base,
+            claim_b,
+        );
+    try std.testing.expectEqualSlices(
+        u8,
+        &marker_a.digest_sha256,
+        &marker_b.digest_sha256,
+    );
+    try std.testing.expect(!root_operation.deferredAcknowledgmentExactEqual(
+        marker_a,
+        marker_b,
+    ));
+    const marker_b_source = try marker_b.canonicalJson(allocator);
+    try owned_root.root.publishFile(
+        try root_fs.Path.init(root_operation.deferred_ack_path),
+        marker_b_source,
+        .{
+            .permissions = .fromMode(0o600),
+            .overwrite = .replace,
+            .durable = true,
+        },
+    );
+    var reopened_backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+
+    const foreign = try reopened_backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+        .orchestration_id = owner_id,
+        .expected_ownership_marker = marker_a,
+    });
+    try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        marker_b,
+        (try store.readDeferredAcknowledgment(allocator)).?,
+    ));
+    var retained_record = (try backendRootRecord(
+        allocator,
+        &directory,
+    )) orelse return error.MissingRootOperationRecord;
+    retained_record.deinit();
+
+    const exact = try reopened_backend.executeWorkflow(allocator, .{
+        .operation = .remove,
+        .mode = .execute,
+        .selectors = &selectors,
+        .options = options,
+        .orchestration_id = owner_id,
+        .expected_ownership_marker = marker_b,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, exact.exit_status);
+    try std.testing.expect(process.calls != 0);
+    try std.testing.expect((try backendRootRecord(
+        allocator,
+        &directory,
+    )) == null);
+    try std.testing.expectEqual(
+        root_operation.DeferredAcknowledgmentState.released,
+        (try store.readDeferredAcknowledgment(allocator)).?.state,
+    );
 }
 
 test "production workflow retry rotation preserves continuous owner proof across process death" {
@@ -6139,7 +7075,11 @@ test "production workflow retry rotation preserves continuous owner proof across
             .ownership_acknowledgment = .{
                 .attempt_id = released.attempt_id,
                 .marker_sha256 = released.digest_sha256,
+                .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                    released,
+                ),
                 .acknowledgment_id = owner_id,
+                .marker = released,
             },
         });
         try std.testing.expectEqual(api.ExitStatus.success, acknowledged.exit_status);

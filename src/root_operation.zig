@@ -58,8 +58,10 @@ pub const namespace_path = "var/lib/debz";
 pub const lock_name = "root-operation.lock";
 pub const record_name = "root-operation-v1.json";
 pub const deferred_ack_name = "root-operation-deferred-ack-v1.json";
+pub const recovery_review_name = deferred_ack_name;
 pub const record_path = namespace_path ++ "/" ++ record_name;
 pub const deferred_ack_path = namespace_path ++ "/" ++ deferred_ack_name;
+pub const recovery_review_path = deferred_ack_path;
 pub const lock_path = namespace_path ++ "/" ++ lock_name;
 
 /// Transaction backend the attempt is bound to. A record written for one
@@ -262,6 +264,133 @@ pub const OwnedRecord = struct {
 pub const deferred_ack_schema_id =
     "https://debz.dev/schema/root-operation-deferred-ack-v1";
 pub const deferred_ack_schema_version: u32 = 1;
+pub const deferred_ack_v2_schema_id =
+    "https://debz.dev/schema/root-operation-deferred-ack-v2";
+pub const deferred_ack_v2_schema_version: u32 = 2;
+pub const recovery_review_legacy_schema_id =
+    "https://debz.dev/schema/root-operation-recovery-review-v1";
+pub const recovery_review_legacy_schema_version: u32 = 1;
+pub const recovery_review_schema_id =
+    "https://debz.dev/schema/root-operation-recovery-review-v2";
+pub const recovery_review_schema_version: u32 = 2;
+
+pub const RecoveryReviewMutationStatus = enum {
+    unchanged,
+    changed,
+};
+
+pub const RecoveryReviewClaim = struct {
+    document_version: u32 = recovery_review_schema_version,
+    outer_attempt_id: [32]u8,
+    outer_generation: u64,
+    outer_state_sha256: [32]u8,
+    profile_sha256: [32]u8,
+    profile_reference_sha256: [32]u8,
+    exact_lock_sha256: [32]u8,
+    semantic_request_sha256: [32]u8,
+    outer_transaction_sha256: ?[32]u8 = null,
+    mutation_status: RecoveryReviewMutationStatus,
+    nonce: [32]u8,
+    marker_sha256: ?[32]u8 = null,
+    marker_exact_identity_sha256: ?[32]u8 = null,
+    prior_marker: ?DeferredAcknowledgment = null,
+    record_sha256: ?[32]u8 = null,
+    completion_sha256: ?[32]u8 = null,
+    digest_sha256: [32]u8 = @splat(0),
+    exact_identity_sha256: [32]u8 = @splat(0),
+
+    pub fn canonicalJson(
+        self: RecoveryReviewClaim,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (!validRecoveryReviewClaim(self)) return error.InvalidDocument;
+        if (!std.mem.eql(
+            u8,
+            &self.digest_sha256,
+            &recoveryReviewClaimDigest(self),
+        )) return error.DigestMismatch;
+        if (self.document_version == recovery_review_schema_version and
+            !std.mem.eql(
+                u8,
+                &self.exact_identity_sha256,
+                &recoveryReviewClaimExactIdentity(self),
+            )) return error.ExactIdentityMismatch;
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try writeRecoveryReviewClaim(self, &output.writer);
+        const bytes = try output.toOwnedSlice();
+        if (bytes.len > maximum_document_bytes) {
+            allocator.free(bytes);
+            return error.DocumentTooLarge;
+        }
+        return bytes;
+    }
+};
+
+pub fn createRecoveryReviewClaim(
+    input: RecoveryReviewClaim,
+) !RecoveryReviewClaim {
+    if (!validRecoveryReviewClaim(input)) return error.InvalidDocument;
+    var result = input;
+    result.digest_sha256 = recoveryReviewClaimDigest(result);
+    result.exact_identity_sha256 =
+        if (result.document_version == recovery_review_schema_version)
+            recoveryReviewClaimExactIdentity(result)
+        else
+            @splat(0);
+    return result;
+}
+
+fn validRecoveryReviewClaim(claim: RecoveryReviewClaim) bool {
+    if (claim.document_version != recovery_review_legacy_schema_version and
+        claim.document_version != recovery_review_schema_version)
+        return false;
+    if (claim.outer_generation == 0) return false;
+    if ((claim.prior_marker == null) != (claim.marker_sha256 == null))
+        return false;
+    if (claim.document_version == recovery_review_legacy_schema_version) {
+        if (claim.marker_exact_identity_sha256 != null or
+            !std.mem.eql(u8, &claim.exact_identity_sha256, &@as(
+                [32]u8,
+                @splat(0),
+            )))
+            return false;
+    } else if ((claim.prior_marker == null) !=
+        (claim.marker_exact_identity_sha256 == null))
+        return false;
+    if (claim.prior_marker) |marker|
+        if (!validDeferredAcknowledgment(marker) or !std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &claim.marker_sha256.?,
+        ) or (claim.document_version == recovery_review_schema_version and
+            !std.mem.eql(
+                u8,
+                &deferredAcknowledgmentExactIdentity(marker),
+                &claim.marker_exact_identity_sha256.?,
+            )) or (marker.document_version == deferred_ack_v2_schema_version and
+            claim.document_version == recovery_review_schema_version and
+            !std.mem.eql(
+                u8,
+                &marker.exact_identity_sha256.?,
+                &claim.marker_exact_identity_sha256.?,
+            )) or !std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &deferredAcknowledgmentDigest(marker),
+        )) return false;
+    return switch (claim.mutation_status) {
+        .unchanged => claim.outer_transaction_sha256 == null and
+            claim.completion_sha256 == null and
+            (claim.record_sha256 == null or claim.marker_sha256 != null),
+        .changed => claim.outer_transaction_sha256 != null or
+            (claim.marker_sha256 != null and
+                claim.record_sha256 != null) or
+            (claim.marker_sha256 == null and
+                claim.record_sha256 == null and
+                claim.completion_sha256 != null),
+    };
+}
 
 pub const DeferredAcknowledgmentState = enum {
     bound,
@@ -269,17 +398,34 @@ pub const DeferredAcknowledgmentState = enum {
     abandoned,
     pending,
     acknowledged,
+    pre_mutation_reconciliation_claim,
+};
+
+pub const PreMutationReconciliationClaimBinding = struct {
+    outer_attempt_id: [32]u8,
+    outer_generation: u64,
+    outer_state_sha256: [32]u8,
+    profile_sha256: [32]u8,
+    profile_reference_sha256: [32]u8,
+    exact_lock_sha256: [32]u8,
+    semantic_request_sha256: [32]u8,
 };
 
 /// Root-local ownership binding and non-reclaimable hand-off for an exact
 /// outer orchestrator attempt.
 pub const DeferredAcknowledgment = struct {
+    document_version: u32 = deferred_ack_schema_version,
     state: DeferredAcknowledgmentState = .bound,
     attempt_id: [32]u8,
     completion_sha256: ?[32]u8 = null,
     provenance_sha256: ?[32]u8 = null,
+    pre_mutation_claim: ?PreMutationReconciliationClaimBinding = null,
     acknowledgment_id: [32]u8,
+    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim_exact_identity_sha256: ?[32]u8 = null,
+    recovery_review_binding_sha256: ?[32]u8 = null,
     digest_sha256: [32]u8 = @splat(0),
+    exact_identity_sha256: ?[32]u8 = null,
 
     pub fn canonicalJson(
         self: DeferredAcknowledgment,
@@ -292,6 +438,13 @@ pub const DeferredAcknowledgment = struct {
             &self.digest_sha256,
             &deferredAcknowledgmentDigest(self),
         )) return error.DigestMismatch;
+        if (self.document_version == deferred_ack_v2_schema_version and
+            !std.mem.eql(
+                u8,
+                &self.exact_identity_sha256.?,
+                &deferredAcknowledgmentExactIdentity(self),
+            ))
+            return error.ExactIdentityMismatch;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         try writeDeferredAcknowledgment(self, &output.writer);
@@ -326,31 +479,513 @@ pub const OwnershipCleanupObserver = struct {
 };
 
 pub const OwnershipCleanup = struct {
-    attempt_id: [32]u8,
-    acknowledgment_id: [32]u8,
+    authorization: DeferredAcknowledgmentAuthorization,
     terminal_state: DeferredAcknowledgmentState,
-    expected_marker_sha256: ?[32]u8 = null,
     observer: ?OwnershipCleanupObserver = null,
 };
+
+pub const DeferredAcknowledgmentAuthorization = union(enum) {
+    exact_v2: DeferredAcknowledgment,
+    legacy_v1: struct {
+        attempt_id: [32]u8,
+        acknowledgment_id: [32]u8,
+    },
+};
+
+pub fn authorizationFromTrustedMarker(
+    marker: DeferredAcknowledgment,
+) DeferredAcknowledgmentAuthorization {
+    return if (marker.document_version == deferred_ack_v2_schema_version)
+        .{ .exact_v2 = marker }
+    else
+        .{ .legacy_v1 = .{
+            .attempt_id = marker.attempt_id,
+            .acknowledgment_id = marker.acknowledgment_id,
+        } };
+}
+
+fn authorizeDeferredAcknowledgment(
+    observed: DeferredAcknowledgment,
+    authorization: DeferredAcknowledgmentAuthorization,
+) !void {
+    switch (authorization) {
+        .exact_v2 => |expected| {
+            if (expected.document_version != deferred_ack_v2_schema_version or
+                observed.document_version != deferred_ack_v2_schema_version)
+                return error.DeferredAcknowledgmentMismatch;
+            if (!deferredAcknowledgmentExactEqual(observed, expected))
+                return error.DeferredAcknowledgmentMismatch;
+        },
+        .legacy_v1 => |legacy| {
+            if (observed.document_version != deferred_ack_schema_version)
+                return error.AuthorizationEvidenceMissing;
+            if (!std.mem.eql(
+                u8,
+                &observed.attempt_id,
+                &legacy.attempt_id,
+            ) or !std.mem.eql(
+                u8,
+                &observed.acknowledgment_id,
+                &legacy.acknowledgment_id,
+            )) return error.DeferredAcknowledgmentMismatch;
+        },
+    }
+}
 
 pub fn createDeferredAcknowledgment(
     input: DeferredAcknowledgment,
 ) !DeferredAcknowledgment {
-    if (!validDeferredAcknowledgment(input))
-        return error.InvalidDocument;
     var result = input;
+    if (result.state == .pre_mutation_reconciliation_claim or
+        result.recovery_review_claim_sha256 != null or
+        result.recovery_review_binding_sha256 != null)
+        result.document_version = deferred_ack_v2_schema_version;
     result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    if (result.document_version == deferred_ack_v2_schema_version)
+        result.exact_identity_sha256 =
+            deferredAcknowledgmentExactIdentity(result);
+    if (!validDeferredAcknowledgment(result))
+        return error.InvalidDocument;
     return result;
 }
 
 fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
+    switch (marker.document_version) {
+        deferred_ack_schema_version => {
+            if (marker.recovery_review_claim_sha256 != null or
+                marker.recovery_review_claim_exact_identity_sha256 != null or
+                marker.recovery_review_binding_sha256 != null or
+                marker.exact_identity_sha256 != null)
+                return false;
+        },
+        deferred_ack_v2_schema_version => {
+            if (marker.exact_identity_sha256 == null or
+                (marker.recovery_review_claim_sha256 == null) !=
+                    (marker.recovery_review_claim_exact_identity_sha256 == null) or
+                (marker.recovery_review_claim_sha256 == null) !=
+                    (marker.recovery_review_binding_sha256 == null))
+                return false;
+            if (marker.recovery_review_binding_sha256) |binding|
+                if (!std.mem.eql(
+                    u8,
+                    &binding,
+                    &(recoveryReviewBindingDigest(marker) orelse return false),
+                )) return false;
+        },
+        else => return false,
+    }
     return switch (marker.state) {
-        .bound, .released, .abandoned => marker.completion_sha256 == null and
-            marker.provenance_sha256 == null,
+        .bound,
+        .released,
+        .abandoned,
+        => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null and
+            marker.pre_mutation_claim == null,
+        .pre_mutation_reconciliation_claim => marker.completion_sha256 == null and
+            marker.provenance_sha256 == null and
+            marker.pre_mutation_claim != null and
+            std.mem.eql(
+                u8,
+                &marker.attempt_id,
+                &preMutationReconciliationClaimId(
+                    marker.pre_mutation_claim.?,
+                ),
+            ) and
+            std.mem.eql(
+                u8,
+                &marker.acknowledgment_id,
+                &marker.pre_mutation_claim.?.outer_attempt_id,
+            ),
         .pending, .acknowledged => marker.completion_sha256 != null and
-            marker.provenance_sha256 != null,
+            marker.provenance_sha256 != null and
+            marker.pre_mutation_claim == null,
     };
 }
+
+pub fn preMutationReconciliationClaimId(
+    binding: PreMutationReconciliationClaimBinding,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-root-pre-mutation-reconciliation-claim-v1\x00");
+    hash.update(&binding.outer_attempt_id);
+    var generation: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation, binding.outer_generation, .little);
+    hash.update(&generation);
+    hash.update(&binding.outer_state_sha256);
+    hash.update(&binding.profile_sha256);
+    hash.update(&binding.profile_reference_sha256);
+    hash.update(&binding.exact_lock_sha256);
+    hash.update(&binding.semantic_request_sha256);
+    return hash.finalResult();
+}
+
+pub fn matchesPreMutationReconciliationClaim(
+    marker: DeferredAcknowledgment,
+    binding: PreMutationReconciliationClaimBinding,
+) bool {
+    return marker.state == .pre_mutation_reconciliation_claim and
+        marker.pre_mutation_claim != null and
+        preMutationClaimBindingEqual(marker.pre_mutation_claim.?, binding) and
+        std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &binding.outer_attempt_id,
+        ) and
+        std.mem.eql(
+            u8,
+            &marker.attempt_id,
+            &preMutationReconciliationClaimId(binding),
+        );
+}
+
+pub fn deferredAcknowledgmentExactEqual(
+    left: DeferredAcknowledgment,
+    right: DeferredAcknowledgment,
+) bool {
+    return left.document_version == right.document_version and
+        left.state == right.state and
+        std.mem.eql(u8, &left.attempt_id, &right.attempt_id) and
+        exactOptionalDigestEqual(left.completion_sha256, right.completion_sha256) and
+        exactOptionalDigestEqual(left.provenance_sha256, right.provenance_sha256) and
+        optionalPreMutationClaimEqual(
+            left.pre_mutation_claim,
+            right.pre_mutation_claim,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.acknowledgment_id,
+            &right.acknowledgment_id,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_claim_sha256,
+            right.recovery_review_claim_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_claim_exact_identity_sha256,
+            right.recovery_review_claim_exact_identity_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_binding_sha256,
+            right.recovery_review_binding_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.digest_sha256,
+            &right.digest_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.exact_identity_sha256,
+            right.exact_identity_sha256,
+        );
+}
+
+pub fn recoveryReviewClaimExactEqual(
+    left: RecoveryReviewClaim,
+    right: RecoveryReviewClaim,
+) bool {
+    return left.document_version == right.document_version and
+        left.outer_generation == right.outer_generation and
+        std.mem.eql(u8, &left.outer_attempt_id, &right.outer_attempt_id) and
+        std.mem.eql(
+            u8,
+            &left.outer_state_sha256,
+            &right.outer_state_sha256,
+        ) and
+        std.mem.eql(u8, &left.profile_sha256, &right.profile_sha256) and
+        std.mem.eql(
+            u8,
+            &left.profile_reference_sha256,
+            &right.profile_reference_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.exact_lock_sha256,
+            &right.exact_lock_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.semantic_request_sha256,
+            &right.semantic_request_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.outer_transaction_sha256,
+            right.outer_transaction_sha256,
+        ) and
+        left.mutation_status == right.mutation_status and
+        std.mem.eql(u8, &left.nonce, &right.nonce) and
+        exactOptionalDigestEqual(left.marker_sha256, right.marker_sha256) and
+        exactOptionalDigestEqual(
+            left.marker_exact_identity_sha256,
+            right.marker_exact_identity_sha256,
+        ) and
+        optionalDeferredAcknowledgmentEqual(
+            left.prior_marker,
+            right.prior_marker,
+        ) and
+        exactOptionalDigestEqual(left.record_sha256, right.record_sha256) and
+        exactOptionalDigestEqual(
+            left.completion_sha256,
+            right.completion_sha256,
+        ) and
+        std.mem.eql(u8, &left.digest_sha256, &right.digest_sha256) and
+        std.mem.eql(
+            u8,
+            &left.exact_identity_sha256,
+            &right.exact_identity_sha256,
+        );
+}
+
+pub fn recoveryReviewTransferredOwnerIdentityMatches(
+    marker: DeferredAcknowledgment,
+    claim: RecoveryReviewClaim,
+) bool {
+    return validRecoveryReviewClaim(claim) and
+        std.mem.eql(
+            u8,
+            &claim.digest_sha256,
+            &recoveryReviewClaimDigest(claim),
+        ) and
+        (claim.document_version == recovery_review_legacy_schema_version or
+            std.mem.eql(
+                u8,
+                &claim.exact_identity_sha256,
+                &recoveryReviewClaimExactIdentity(claim),
+            )) and
+        validDeferredAcknowledgment(marker) and
+        std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &deferredAcknowledgmentDigest(marker),
+        ) and
+        marker.document_version == deferred_ack_v2_schema_version and
+        std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &claim.outer_attempt_id,
+        ) and marker.recovery_review_claim_sha256 != null and
+        std.mem.eql(
+            u8,
+            &marker.recovery_review_claim_sha256.?,
+            &claim.digest_sha256,
+        ) and marker.recovery_review_claim_exact_identity_sha256 != null and
+        std.mem.eql(
+            u8,
+            &marker.recovery_review_claim_exact_identity_sha256.?,
+            &recoveryReviewClaimExactIdentity(claim),
+        ) and marker.recovery_review_binding_sha256 != null and
+        std.mem.eql(
+            u8,
+            &marker.recovery_review_binding_sha256.?,
+            &(recoveryReviewBindingDigest(marker) orelse return false),
+        );
+}
+
+fn optionalPreMutationClaimEqual(
+    left: ?PreMutationReconciliationClaimBinding,
+    right: ?PreMutationReconciliationClaimBinding,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return preMutationClaimBindingEqual(left.?, right.?);
+}
+
+fn exactOptionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, &left.?, &right.?);
+}
+
+fn optionalDeferredAcknowledgmentEqual(
+    left: ?DeferredAcknowledgment,
+    right: ?DeferredAcknowledgment,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return deferredAcknowledgmentExactEqual(left.?, right.?);
+}
+
+fn sameDeferredAcknowledgmentOwner(
+    left: DeferredAcknowledgment,
+    right: DeferredAcknowledgment,
+) bool {
+    return left.document_version == right.document_version and
+        std.mem.eql(u8, &left.attempt_id, &right.attempt_id) and
+        std.mem.eql(
+            u8,
+            &left.acknowledgment_id,
+            &right.acknowledgment_id,
+        ) and
+        optionalPreMutationClaimEqual(
+            left.pre_mutation_claim,
+            right.pre_mutation_claim,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_claim_sha256,
+            right.recovery_review_claim_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_claim_exact_identity_sha256,
+            right.recovery_review_claim_exact_identity_sha256,
+        );
+}
+
+pub const DeferredRecordCompatibility = enum {
+    incompatible,
+    pre_mutation_reconciliation_claim,
+    bound_pre_mutation,
+    bound_ambiguous,
+    bound_mutating,
+    bound_completed_pending,
+    bound_completed_success,
+    bound_completed_abandoned,
+    released_without_record,
+    abandoned_without_record,
+    released_completed,
+    abandoned_pre_mutation,
+    pending_prepublication,
+    pending_published,
+    acknowledged_published,
+};
+
+pub fn deferredRecordCompatibility(
+    record: ?Record,
+    marker: DeferredAcknowledgment,
+    allow_pending_provenance: bool,
+) DeferredRecordCompatibility {
+    if (!validDeferredAcknowledgment(marker)) return .incompatible;
+    if (marker.state == .pre_mutation_reconciliation_claim)
+        return if (record == null)
+            .pre_mutation_reconciliation_claim
+        else
+            .incompatible;
+    const value = record orelse return switch (marker.state) {
+        .released => .released_without_record,
+        .abandoned => .abandoned_without_record,
+        else => .incompatible,
+    };
+    if (!std.mem.eql(u8, &value.attempt_id, &marker.attempt_id))
+        return .incompatible;
+    return switch (marker.state) {
+        .bound => if (value.state == .completed)
+            if (!value.mutation_started and
+                value.outcome == .abandoned_before_mutation and
+                value.provenance == .not_required and
+                value.provenance_sha256 == null)
+                .bound_completed_abandoned
+            else if (value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered) and
+                value.provenance == .published and
+                value.provenance_sha256 != null)
+                .bound_completed_success
+            else if (value.mutation_started and
+                (value.outcome == .succeeded or
+                    value.outcome == .recovered or
+                    value.outcome == .failed_after_mutation) and
+                value.provenance == .pending and
+                value.provenance_sha256 == null)
+                .bound_completed_pending
+            else
+                .incompatible
+        else if (value.state == .mutation_pending)
+            .bound_ambiguous
+        else if (value.mutation_started)
+            .bound_mutating
+        else if (value.state.provenPreMutation())
+            .bound_pre_mutation
+        else
+            .incompatible,
+        .released => if (value.state == .completed and
+            value.mutation_started and
+            (value.outcome == .succeeded or value.outcome == .recovered) and
+            value.provenance == .published and
+            value.provenance_sha256 != null)
+            .released_completed
+        else
+            .incompatible,
+        .abandoned => if (value.state == .completed and
+            !value.mutation_started and
+            value.outcome == .abandoned_before_mutation and
+            value.provenance == .not_required and
+            value.provenance_sha256 == null)
+            .abandoned_pre_mutation
+        else
+            .incompatible,
+        .pending => switch (value.provenance) {
+            .published => if (value.state == .completed and
+                value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered) and
+                value.provenance_sha256 != null and
+                marker.provenance_sha256 != null and
+                std.mem.eql(
+                    u8,
+                    &value.provenance_sha256.?,
+                    &marker.provenance_sha256.?,
+                ))
+                .pending_published
+            else
+                .incompatible,
+            .pending => if (allow_pending_provenance and
+                value.state == .completed and
+                value.mutation_started and
+                (value.outcome == .succeeded or value.outcome == .recovered))
+                .pending_prepublication
+            else
+                .incompatible,
+            .not_required => .incompatible,
+        },
+        .acknowledged => if (value.state == .completed and
+            value.mutation_started and
+            (value.outcome == .succeeded or value.outcome == .recovered) and
+            value.provenance == .published and
+            value.provenance_sha256 != null and
+            marker.provenance_sha256 != null and
+            std.mem.eql(
+                u8,
+                &value.provenance_sha256.?,
+                &marker.provenance_sha256.?,
+            ))
+            .acknowledged_published
+        else
+            .incompatible,
+        .pre_mutation_reconciliation_claim => unreachable,
+    };
+}
+
+fn preMutationClaimBindingEqual(
+    left: PreMutationReconciliationClaimBinding,
+    right: PreMutationReconciliationClaimBinding,
+) bool {
+    return left.outer_generation == right.outer_generation and
+        std.mem.eql(u8, &left.outer_attempt_id, &right.outer_attempt_id) and
+        std.mem.eql(
+            u8,
+            &left.outer_state_sha256,
+            &right.outer_state_sha256,
+        ) and
+        std.mem.eql(u8, &left.profile_sha256, &right.profile_sha256) and
+        std.mem.eql(
+            u8,
+            &left.profile_reference_sha256,
+            &right.profile_reference_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.exact_lock_sha256,
+            &right.exact_lock_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.semantic_request_sha256,
+            &right.semantic_request_sha256,
+        );
+}
+
+const WirePreMutationReconciliationClaim = struct {
+    outer_attempt_id: []const u8,
+    outer_generation: u64,
+    outer_state_sha256: []const u8,
+    profile_sha256: []const u8,
+    profile_reference_sha256: []const u8,
+    exact_lock_sha256: []const u8,
+    semantic_request_sha256: []const u8,
+};
 
 const WireDeferredAcknowledgment = struct {
     schema: []const u8,
@@ -359,8 +994,35 @@ const WireDeferredAcknowledgment = struct {
     attempt_id: []const u8,
     completion_sha256: ?[]const u8,
     provenance_sha256: ?[]const u8,
+    pre_mutation_claim: ?WirePreMutationReconciliationClaim = null,
     acknowledgment_id: []const u8,
+    recovery_review_claim_sha256: ?[]const u8 = null,
+    recovery_review_claim_exact_identity_sha256: ?[]const u8 = null,
+    recovery_review_binding_sha256: ?[]const u8 = null,
     digest_sha256: []const u8,
+    exact_identity_sha256: ?[]const u8 = null,
+};
+
+const WireRecoveryReviewClaim = struct {
+    schema: []const u8,
+    version: u32,
+    outer_attempt_id: []const u8,
+    outer_generation: u64,
+    outer_state_sha256: []const u8,
+    profile_sha256: []const u8,
+    profile_reference_sha256: []const u8,
+    exact_lock_sha256: []const u8,
+    semantic_request_sha256: []const u8,
+    outer_transaction_sha256: ?[]const u8,
+    mutation_status: RecoveryReviewMutationStatus,
+    nonce: []const u8,
+    marker_sha256: ?[]const u8,
+    marker_exact_identity_sha256: ?[]const u8 = null,
+    prior_marker: ?WireDeferredAcknowledgment = null,
+    record_sha256: ?[]const u8,
+    completion_sha256: ?[]const u8,
+    digest_sha256: []const u8,
+    exact_identity_sha256: ?[]const u8 = null,
 };
 
 pub fn decodeDeferredAcknowledgment(
@@ -376,16 +1038,44 @@ pub fn decodeDeferredAcknowledgment(
     ) catch return error.NonCanonicalDocument;
     defer parsed.deinit();
     const wire = parsed.value;
-    if (!std.mem.eql(u8, wire.schema, deferred_ack_schema_id) or
-        wire.version != deferred_ack_schema_version)
-        return error.UnsupportedSchema;
+    const document_version: u32 =
+        if (std.mem.eql(u8, wire.schema, deferred_ack_schema_id) and
+        wire.version == deferred_ack_schema_version)
+            deferred_ack_schema_version
+        else if (std.mem.eql(u8, wire.schema, deferred_ack_v2_schema_id) and
+        wire.version == deferred_ack_v2_schema_version)
+            deferred_ack_v2_schema_version
+        else
+            return error.UnsupportedSchema;
     const decoded: DeferredAcknowledgment = .{
+        .document_version = document_version,
         .state = wire.state,
         .attempt_id = try parseHex(32, wire.attempt_id),
         .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
         .provenance_sha256 = try parseOptionalHex(wire.provenance_sha256),
+        .pre_mutation_claim = if (wire.pre_mutation_claim) |claim| .{
+            .outer_attempt_id = try parseHex(32, claim.outer_attempt_id),
+            .outer_generation = claim.outer_generation,
+            .outer_state_sha256 = try parseHex(32, claim.outer_state_sha256),
+            .profile_sha256 = try parseHex(32, claim.profile_sha256),
+            .profile_reference_sha256 = try parseHex(32, claim.profile_reference_sha256),
+            .exact_lock_sha256 = try parseHex(32, claim.exact_lock_sha256),
+            .semantic_request_sha256 = try parseHex(32, claim.semantic_request_sha256),
+        } else null,
         .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
+        .recovery_review_claim_sha256 = try parseOptionalHex(
+            wire.recovery_review_claim_sha256,
+        ),
+        .recovery_review_claim_exact_identity_sha256 = try parseOptionalHex(
+            wire.recovery_review_claim_exact_identity_sha256,
+        ),
+        .recovery_review_binding_sha256 = try parseOptionalHex(
+            wire.recovery_review_binding_sha256,
+        ),
         .digest_sha256 = try parseHex(32, wire.digest_sha256),
+        .exact_identity_sha256 = try parseOptionalHex(
+            wire.exact_identity_sha256,
+        ),
     };
     if (!validDeferredAcknowledgment(decoded))
         return error.InvalidDocument;
@@ -394,6 +1084,144 @@ pub fn decodeDeferredAcknowledgment(
         &decoded.digest_sha256,
         &deferredAcknowledgmentDigest(decoded),
     )) return error.DigestMismatch;
+    if (decoded.document_version == deferred_ack_v2_schema_version and
+        !std.mem.eql(
+            u8,
+            &decoded.exact_identity_sha256.?,
+            &deferredAcknowledgmentExactIdentity(decoded),
+        ))
+        return error.ExactIdentityMismatch;
+    const canonical = try decoded.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return decoded;
+}
+
+pub fn decodeRecoveryReviewClaim(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !RecoveryReviewClaim {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
+    var parsed = std.json.parseFromSlice(
+        WireRecoveryReviewClaim,
+        allocator,
+        source,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+    ) catch return error.NonCanonicalDocument;
+    defer parsed.deinit();
+    const wire = parsed.value;
+    const document_version: u32 =
+        if (std.mem.eql(u8, wire.schema, recovery_review_legacy_schema_id) and
+        wire.version == recovery_review_legacy_schema_version)
+            recovery_review_legacy_schema_version
+        else if (std.mem.eql(u8, wire.schema, recovery_review_schema_id) and
+        wire.version == recovery_review_schema_version)
+            recovery_review_schema_version
+        else
+            return error.UnsupportedSchema;
+    const decoded: RecoveryReviewClaim = .{
+        .document_version = document_version,
+        .outer_attempt_id = try parseHex(32, wire.outer_attempt_id),
+        .outer_generation = wire.outer_generation,
+        .outer_state_sha256 = try parseHex(32, wire.outer_state_sha256),
+        .profile_sha256 = try parseHex(32, wire.profile_sha256),
+        .profile_reference_sha256 = try parseHex(
+            32,
+            wire.profile_reference_sha256,
+        ),
+        .exact_lock_sha256 = try parseHex(32, wire.exact_lock_sha256),
+        .semantic_request_sha256 = try parseHex(
+            32,
+            wire.semantic_request_sha256,
+        ),
+        .outer_transaction_sha256 = try parseOptionalHex(
+            wire.outer_transaction_sha256,
+        ),
+        .mutation_status = wire.mutation_status,
+        .nonce = try parseHex(32, wire.nonce),
+        .marker_sha256 = try parseOptionalHex(wire.marker_sha256),
+        .marker_exact_identity_sha256 = try parseOptionalHex(
+            wire.marker_exact_identity_sha256,
+        ),
+        .prior_marker = if (wire.prior_marker) |marker| .{
+            .document_version = if (std.mem.eql(
+                u8,
+                marker.schema,
+                deferred_ack_schema_id,
+            ) and marker.version == deferred_ack_schema_version)
+                deferred_ack_schema_version
+            else if (std.mem.eql(
+                u8,
+                marker.schema,
+                deferred_ack_v2_schema_id,
+            ) and marker.version == deferred_ack_v2_schema_version)
+                deferred_ack_v2_schema_version
+            else
+                return error.UnsupportedSchema,
+            .state = marker.state,
+            .attempt_id = try parseHex(32, marker.attempt_id),
+            .completion_sha256 = try parseOptionalHex(
+                marker.completion_sha256,
+            ),
+            .provenance_sha256 = try parseOptionalHex(
+                marker.provenance_sha256,
+            ),
+            .pre_mutation_claim = if (marker.pre_mutation_claim) |claim| .{
+                .outer_attempt_id = try parseHex(32, claim.outer_attempt_id),
+                .outer_generation = claim.outer_generation,
+                .outer_state_sha256 = try parseHex(
+                    32,
+                    claim.outer_state_sha256,
+                ),
+                .profile_sha256 = try parseHex(32, claim.profile_sha256),
+                .profile_reference_sha256 = try parseHex(
+                    32,
+                    claim.profile_reference_sha256,
+                ),
+                .exact_lock_sha256 = try parseHex(
+                    32,
+                    claim.exact_lock_sha256,
+                ),
+                .semantic_request_sha256 = try parseHex(
+                    32,
+                    claim.semantic_request_sha256,
+                ),
+            } else null,
+            .acknowledgment_id = try parseHex(32, marker.acknowledgment_id),
+            .recovery_review_claim_sha256 = try parseOptionalHex(
+                marker.recovery_review_claim_sha256,
+            ),
+            .recovery_review_claim_exact_identity_sha256 = try parseOptionalHex(
+                marker.recovery_review_claim_exact_identity_sha256,
+            ),
+            .recovery_review_binding_sha256 = try parseOptionalHex(
+                marker.recovery_review_binding_sha256,
+            ),
+            .digest_sha256 = try parseHex(32, marker.digest_sha256),
+            .exact_identity_sha256 = try parseOptionalHex(
+                marker.exact_identity_sha256,
+            ),
+        } else null,
+        .record_sha256 = try parseOptionalHex(wire.record_sha256),
+        .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
+        .digest_sha256 = try parseHex(32, wire.digest_sha256),
+        .exact_identity_sha256 = if (wire.exact_identity_sha256) |identity|
+            try parseHex(32, identity)
+        else
+            @splat(0),
+    };
+    if (!validRecoveryReviewClaim(decoded)) return error.InvalidDocument;
+    if (!std.mem.eql(
+        u8,
+        &decoded.digest_sha256,
+        &recoveryReviewClaimDigest(decoded),
+    )) return error.DigestMismatch;
+    if (decoded.document_version == recovery_review_schema_version and
+        !std.mem.eql(
+            u8,
+            &decoded.exact_identity_sha256,
+            &recoveryReviewClaimExactIdentity(decoded),
+        )) return error.ExactIdentityMismatch;
     const canonical = try decoded.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
@@ -665,8 +1493,310 @@ fn deferredAcknowledgmentDigest(
         hash.update(&digest)
     else
         hash.update("\x00");
+    if (marker.pre_mutation_claim) |claim| {
+        hash.update(&claim.outer_attempt_id);
+        var generation: [8]u8 = undefined;
+        std.mem.writeInt(u64, &generation, claim.outer_generation, .little);
+        hash.update(&generation);
+        hash.update(&claim.outer_state_sha256);
+        hash.update(&claim.profile_sha256);
+        hash.update(&claim.profile_reference_sha256);
+        hash.update(&claim.exact_lock_sha256);
+        hash.update(&claim.semantic_request_sha256);
+    }
     hash.update(&marker.acknowledgment_id);
     return hash.finalResult();
+}
+
+pub fn bindDeferredAcknowledgmentToRecoveryReview(
+    marker: DeferredAcknowledgment,
+    claim: RecoveryReviewClaim,
+) !DeferredAcknowledgment {
+    if (!validRecoveryReviewClaim(claim) or
+        (claim.document_version == recovery_review_schema_version and
+            !std.mem.eql(
+                u8,
+                &claim.exact_identity_sha256,
+                &recoveryReviewClaimExactIdentity(claim),
+            ))) return error.InvalidDocument;
+    var result = marker;
+    result.document_version = deferred_ack_v2_schema_version;
+    result.recovery_review_claim_sha256 = claim.digest_sha256;
+    result.recovery_review_claim_exact_identity_sha256 =
+        recoveryReviewClaimExactIdentity(claim);
+    result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    result.recovery_review_binding_sha256 =
+        recoveryReviewBindingDigest(result);
+    result.exact_identity_sha256 =
+        deferredAcknowledgmentExactIdentity(result);
+    if (!validDeferredAcknowledgment(result)) return error.InvalidDocument;
+    return result;
+}
+
+pub fn carryDeferredAcknowledgmentReviewOwner(
+    marker: DeferredAcknowledgment,
+    owner: DeferredAcknowledgment,
+) !DeferredAcknowledgment {
+    if (!validDeferredAcknowledgment(owner) or
+        owner.document_version != deferred_ack_v2_schema_version or
+        owner.recovery_review_claim_sha256 == null)
+        return error.InvalidDocument;
+    var result = marker;
+    result.document_version = deferred_ack_v2_schema_version;
+    result.recovery_review_claim_sha256 =
+        owner.recovery_review_claim_sha256;
+    result.recovery_review_claim_exact_identity_sha256 =
+        owner.recovery_review_claim_exact_identity_sha256;
+    result.recovery_review_binding_sha256 = null;
+    result.exact_identity_sha256 = null;
+    result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    result.recovery_review_binding_sha256 =
+        recoveryReviewBindingDigest(result);
+    result.exact_identity_sha256 =
+        deferredAcknowledgmentExactIdentity(result);
+    if (!validDeferredAcknowledgment(result)) return error.InvalidDocument;
+    return result;
+}
+
+fn deferredAcknowledgmentWithState(
+    marker: DeferredAcknowledgment,
+    state: DeferredAcknowledgmentState,
+) DeferredAcknowledgment {
+    var result = marker;
+    result.state = state;
+    result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    if (result.document_version == deferred_ack_v2_schema_version) {
+        result.recovery_review_binding_sha256 =
+            recoveryReviewBindingDigest(result);
+        result.exact_identity_sha256 =
+            deferredAcknowledgmentExactIdentity(result);
+    }
+
+    return result;
+}
+
+pub fn transitionDeferredAcknowledgment(
+    marker: DeferredAcknowledgment,
+    state: DeferredAcknowledgmentState,
+) !DeferredAcknowledgment {
+    const result = deferredAcknowledgmentWithState(marker, state);
+    if (!validDeferredAcknowledgment(result))
+        return error.InvalidDocument;
+    return result;
+}
+
+fn recoveryReviewBindingDigest(
+    marker: DeferredAcknowledgment,
+) ?[32]u8 {
+    const claim_exact_identity =
+        marker.recovery_review_claim_exact_identity_sha256 orelse return null;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-root-operation-recovery-review-binding-exact-v2\x00");
+    hash.update(&claim_exact_identity);
+    hash.update(&deferredAcknowledgmentOwnershipPayloadIdentity(marker));
+    return hash.finalResult();
+}
+
+fn recoveryReviewClaimDigest(claim: RecoveryReviewClaim) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(recovery_review_legacy_schema_id);
+    hash.update("\x001");
+    hash.update(&claim.outer_attempt_id);
+    var generation: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation, claim.outer_generation, .little);
+    hash.update(&generation);
+    hash.update(&claim.outer_state_sha256);
+    hash.update(&claim.profile_sha256);
+    hash.update(&claim.profile_reference_sha256);
+    hash.update(&claim.exact_lock_sha256);
+    hash.update(&claim.semantic_request_sha256);
+    if (claim.outer_transaction_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    hash.update(@tagName(claim.mutation_status));
+    hash.update("\x00");
+    hash.update(&claim.nonce);
+    if (claim.marker_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    if (claim.record_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    if (claim.completion_sha256) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+    return hash.finalResult();
+}
+
+fn recoveryReviewClaimExactIdentity(
+    claim: RecoveryReviewClaim,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(if (claim.document_version ==
+        recovery_review_legacy_schema_version)
+        "debz-root-operation-recovery-review-exact-v1\x00"
+    else
+        "debz-root-operation-recovery-review-exact-v2\x00");
+    hash.update(if (claim.document_version ==
+        recovery_review_legacy_schema_version)
+        recovery_review_legacy_schema_id
+    else
+        recovery_review_schema_id);
+    updateU64(&hash, claim.document_version);
+    hash.update(&claim.outer_attempt_id);
+    updateU64(&hash, claim.outer_generation);
+    hash.update(&claim.outer_state_sha256);
+    hash.update(&claim.profile_sha256);
+    hash.update(&claim.profile_reference_sha256);
+    hash.update(&claim.exact_lock_sha256);
+    hash.update(&claim.semantic_request_sha256);
+    updateOptionalDigest(&hash, claim.outer_transaction_sha256);
+    hash.update(@tagName(claim.mutation_status));
+    hash.update("\x00");
+    hash.update(&claim.nonce);
+    updateOptionalDigest(&hash, claim.marker_sha256);
+    updateOptionalDigest(&hash, claim.marker_exact_identity_sha256);
+    if (claim.prior_marker) |marker| {
+        hash.update("\x01");
+        hash.update(&deferredAcknowledgmentExactIdentity(marker));
+    } else hash.update("\x00");
+    updateOptionalDigest(&hash, claim.record_sha256);
+    updateOptionalDigest(&hash, claim.completion_sha256);
+    hash.update(&claim.digest_sha256);
+    return hash.finalResult();
+}
+
+pub fn deferredAcknowledgmentExactIdentity(
+    marker: DeferredAcknowledgment,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(if (marker.document_version == deferred_ack_schema_version)
+        "debz-root-operation-deferred-ack-exact-v1\x00"
+    else
+        "debz-root-operation-deferred-ack-exact-v2\x00");
+    updateDeferredAcknowledgmentExactPayload(&hash, marker, true);
+    return hash.finalResult();
+}
+
+fn deferredAcknowledgmentOwnershipPayloadIdentity(
+    marker: DeferredAcknowledgment,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-root-operation-deferred-ack-binding-payload-v2\x00");
+    updateDeferredAcknowledgmentExactPayload(&hash, marker, false);
+    return hash.finalResult();
+}
+
+fn updateDeferredAcknowledgmentExactPayload(
+    hash: *std.crypto.hash.sha2.Sha256,
+    marker: DeferredAcknowledgment,
+    include_binding: bool,
+) void {
+    updateU64(hash, marker.document_version);
+    hash.update(@tagName(marker.state));
+    hash.update("\x00");
+    hash.update(&marker.attempt_id);
+    updateOptionalDigest(hash, marker.completion_sha256);
+    updateOptionalDigest(hash, marker.provenance_sha256);
+    if (marker.pre_mutation_claim) |binding| {
+        hash.update("\x01");
+        hash.update(&binding.outer_attempt_id);
+        updateU64(hash, binding.outer_generation);
+        hash.update(&binding.outer_state_sha256);
+        hash.update(&binding.profile_sha256);
+        hash.update(&binding.profile_reference_sha256);
+        hash.update(&binding.exact_lock_sha256);
+        hash.update(&binding.semantic_request_sha256);
+    } else hash.update("\x00");
+    hash.update(&marker.acknowledgment_id);
+    updateOptionalDigest(hash, marker.recovery_review_claim_sha256);
+    updateOptionalDigest(
+        hash,
+        marker.recovery_review_claim_exact_identity_sha256,
+    );
+    if (include_binding)
+        updateOptionalDigest(hash, marker.recovery_review_binding_sha256);
+    hash.update(&marker.digest_sha256);
+}
+
+fn updateOptionalDigest(
+    hash: *std.crypto.hash.sha2.Sha256,
+    value: ?[32]u8,
+) void {
+    if (value) |digest| {
+        hash.update("\x01");
+        hash.update(&digest);
+    } else hash.update("\x00");
+}
+
+fn updateU64(
+    hash: *std.crypto.hash.sha2.Sha256,
+    value: anytype,
+) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(value), .little);
+    hash.update(&encoded);
+}
+
+fn writeRecoveryReviewClaim(
+    claim: RecoveryReviewClaim,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeAll("{\"schema\":");
+    try writeJsonString(
+        writer,
+        if (claim.document_version == recovery_review_legacy_schema_version)
+            recovery_review_legacy_schema_id
+        else
+            recovery_review_schema_id,
+    );
+    try writer.print(",\"version\":{},\"outer_attempt_id\":", .{
+        claim.document_version,
+    });
+    try writeHexString(writer, &claim.outer_attempt_id);
+    try writer.print(",\"outer_generation\":{}", .{claim.outer_generation});
+    try writer.writeAll(",\"outer_state_sha256\":");
+    try writeHexString(writer, &claim.outer_state_sha256);
+    try writer.writeAll(",\"profile_sha256\":");
+    try writeHexString(writer, &claim.profile_sha256);
+    try writer.writeAll(",\"profile_reference_sha256\":");
+    try writeHexString(writer, &claim.profile_reference_sha256);
+    try writer.writeAll(",\"exact_lock_sha256\":");
+    try writeHexString(writer, &claim.exact_lock_sha256);
+    try writer.writeAll(",\"semantic_request_sha256\":");
+    try writeHexString(writer, &claim.semantic_request_sha256);
+    try writer.writeAll(",\"outer_transaction_sha256\":");
+    try writeOptionalHex(writer, claim.outer_transaction_sha256);
+    try writer.writeAll(",\"mutation_status\":");
+    try writeJsonString(writer, @tagName(claim.mutation_status));
+    try writer.writeAll(",\"nonce\":");
+    try writeHexString(writer, &claim.nonce);
+    try writer.writeAll(",\"marker_sha256\":");
+    try writeOptionalHex(writer, claim.marker_sha256);
+    if (claim.document_version == recovery_review_schema_version) {
+        try writer.writeAll(",\"marker_exact_identity_sha256\":");
+        try writeOptionalHex(writer, claim.marker_exact_identity_sha256);
+    }
+    try writer.writeAll(",\"prior_marker\":");
+    if (claim.prior_marker) |marker|
+        try writeDeferredAcknowledgment(marker, writer)
+    else
+        try writer.writeAll("null");
+    try writer.writeAll(",\"record_sha256\":");
+    try writeOptionalHex(writer, claim.record_sha256);
+    try writer.writeAll(",\"completion_sha256\":");
+    try writeOptionalHex(writer, claim.completion_sha256);
+    try writer.writeAll(",\"digest_sha256\":");
+    try writeHexString(writer, &claim.digest_sha256);
+    if (claim.document_version == recovery_review_schema_version) {
+        try writer.writeAll(",\"exact_identity_sha256\":");
+        try writeHexString(writer, &claim.exact_identity_sha256);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeDeferredAcknowledgment(
@@ -674,9 +1804,15 @@ fn writeDeferredAcknowledgment(
     writer: *std.Io.Writer,
 ) !void {
     try writer.writeAll("{\"schema\":");
-    try writeJsonString(writer, deferred_ack_schema_id);
+    try writeJsonString(
+        writer,
+        if (marker.document_version == deferred_ack_schema_version)
+            deferred_ack_schema_id
+        else
+            deferred_ack_v2_schema_id,
+    );
     try writer.print(",\"version\":{},\"state\":", .{
-        deferred_ack_schema_version,
+        marker.document_version,
     });
     try writeJsonString(writer, @tagName(marker.state));
     try writer.writeAll(",\"attempt_id\":");
@@ -685,10 +1821,45 @@ fn writeDeferredAcknowledgment(
     try writeOptionalHex(writer, marker.completion_sha256);
     try writer.writeAll(",\"provenance_sha256\":");
     try writeOptionalHex(writer, marker.provenance_sha256);
+    if (marker.pre_mutation_claim) |claim| {
+        try writer.writeAll(",\"pre_mutation_claim\":{\"outer_attempt_id\":");
+        try writeHexString(writer, &claim.outer_attempt_id);
+        try writer.print(",\"outer_generation\":{}", .{
+            claim.outer_generation,
+        });
+        try writer.writeAll(",\"outer_state_sha256\":");
+        try writeHexString(writer, &claim.outer_state_sha256);
+        try writer.writeAll(",\"profile_sha256\":");
+        try writeHexString(writer, &claim.profile_sha256);
+        try writer.writeAll(",\"profile_reference_sha256\":");
+        try writeHexString(writer, &claim.profile_reference_sha256);
+        try writer.writeAll(",\"exact_lock_sha256\":");
+        try writeHexString(writer, &claim.exact_lock_sha256);
+        try writer.writeAll(",\"semantic_request_sha256\":");
+        try writeHexString(writer, &claim.semantic_request_sha256);
+        try writer.writeByte('}');
+    }
     try writer.writeAll(",\"acknowledgment_id\":");
     try writeHexString(writer, &marker.acknowledgment_id);
+    if (marker.document_version == deferred_ack_v2_schema_version) {
+        try writer.writeAll(",\"recovery_review_claim_sha256\":");
+        try writeOptionalHex(writer, marker.recovery_review_claim_sha256);
+        try writer.writeAll(
+            ",\"recovery_review_claim_exact_identity_sha256\":",
+        );
+        try writeOptionalHex(
+            writer,
+            marker.recovery_review_claim_exact_identity_sha256,
+        );
+        try writer.writeAll(",\"recovery_review_binding_sha256\":");
+        try writeOptionalHex(writer, marker.recovery_review_binding_sha256);
+    }
     try writer.writeAll(",\"digest_sha256\":");
     try writeHexString(writer, &marker.digest_sha256);
+    if (marker.document_version == deferred_ack_v2_schema_version) {
+        try writer.writeAll(",\"exact_identity_sha256\":");
+        try writeOptionalHex(writer, marker.exact_identity_sha256);
+    }
     try writer.writeByte('}');
 }
 
@@ -908,6 +2079,11 @@ fn parseOperation(surface: Surface, spelling: []const u8) ValidationError!Operat
     };
 }
 
+fn documentHasSchema(source: []const u8, comptime schema: []const u8) bool {
+    const prefix = "{\"schema\":\"" ++ schema ++ "\"";
+    return std.mem.startsWith(u8, source, prefix);
+}
+
 /// Root-anchored durable store. Reads never follow a symbolic link and never
 /// accept a directory or special file; writes publish atomically through a
 /// private staging entry and fsync the destination directory.
@@ -965,7 +2141,217 @@ pub const Store = struct {
             else => return err,
         };
         defer allocator.free(bytes);
+        if (documentHasSchema(bytes, recovery_review_schema_id) or
+            documentHasSchema(bytes, recovery_review_legacy_schema_id))
+        {
+            const claim = try decodeRecoveryReviewClaim(allocator, bytes);
+            return claim.prior_marker;
+        }
         return try decodeDeferredAcknowledgment(allocator, bytes);
+    }
+
+    pub fn readRecoveryReviewClaim(
+        self: Store,
+        allocator: std.mem.Allocator,
+    ) !?RecoveryReviewClaim {
+        const path = try root_fs.Path.init(recovery_review_path);
+        const bytes = self.root.readFileAlloc(
+            allocator,
+            path,
+            maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        if (documentHasSchema(bytes, deferred_ack_schema_id) or
+            documentHasSchema(bytes, deferred_ack_v2_schema_id))
+            return null;
+        return try decodeRecoveryReviewClaim(allocator, bytes);
+    }
+
+    pub fn publishRecoveryReviewClaim(
+        self: Store,
+        allocator: std.mem.Allocator,
+        claim: RecoveryReviewClaim,
+    ) !void {
+        if (try self.readRecoveryReviewClaim(allocator)) |existing| {
+            if (recoveryReviewClaimExactEqual(existing, claim)) return;
+            return error.RecoveryReviewClaimPresent;
+        }
+        const marker = try self.readDeferredAcknowledgment(allocator);
+        if (!optionalDeferredAcknowledgmentEqual(
+            claim.prior_marker,
+            marker,
+        )) return error.DeferredAcknowledgmentMismatch;
+        const bytes = try claim.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(recovery_review_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = if (marker == null)
+                    .fail_if_exists
+                else
+                    .replace,
+                .durable = true,
+            },
+        );
+    }
+
+    pub fn clearRecoveryReviewClaim(
+        self: Store,
+        allocator: std.mem.Allocator,
+        expected_claim: RecoveryReviewClaim,
+    ) !void {
+        const observed = try self.readRecoveryReviewClaim(allocator) orelse
+            return;
+        if (!recoveryReviewClaimExactEqual(
+            observed,
+            expected_claim,
+        )) return error.RecoveryReviewClaimMismatch;
+        if (observed.prior_marker) |marker| {
+            const bytes = try marker.canonicalJson(allocator);
+            defer allocator.free(bytes);
+            try self.root.publishFile(
+                try root_fs.Path.init(recovery_review_path),
+                bytes,
+                .{
+                    .permissions = record_permissions,
+                    .overwrite = .replace,
+                    .durable = true,
+                },
+            );
+        } else {
+            self.root.removeFile(
+                try root_fs.Path.init(recovery_review_path),
+            ) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            try self.root.syncDirectory(
+                try root_fs.Path.init(namespace_path),
+            );
+        }
+    }
+
+    pub const RecoveryReviewExchangePoint = enum {
+        before_owner_publish,
+        after_owner_publish,
+        before_claim_clear,
+        after_claim_clear,
+    };
+
+    pub const RecoveryReviewExchangeObserver = struct {
+        context: *anyopaque,
+        hitFn: *const fn (
+            *anyopaque,
+            RecoveryReviewExchangePoint,
+        ) anyerror!void,
+
+        pub fn hit(
+            self: RecoveryReviewExchangeObserver,
+            point: RecoveryReviewExchangePoint,
+        ) !void {
+            try self.hitFn(self.context, point);
+        }
+    };
+
+    pub const RecoveryReviewExchange = struct {
+        expected_claim: RecoveryReviewClaim,
+        expected_marker: ?DeferredAcknowledgment,
+        expected_record_sha256: ?[32]u8,
+        replacement_marker: ?DeferredAcknowledgment = null,
+        owner_publish_observer: ?root_fs.PublishObserver = null,
+        observer: ?RecoveryReviewExchangeObserver = null,
+    };
+
+    fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+        if (left == null or right == null)
+            return left == null and right == null;
+        return std.mem.eql(u8, &left.?, &right.?);
+    }
+
+    /// Exchanges a reviewed capability for an already-verified lower owner,
+    /// or durably publishes its replacement owner before removing the claim.
+    /// The caller must hold the root-operation lock.
+    pub fn exchangeRecoveryReviewClaimForOwnership(
+        self: Store,
+        allocator: std.mem.Allocator,
+        exchange: RecoveryReviewExchange,
+    ) !void {
+        const claim = try self.readRecoveryReviewClaim(allocator) orelse {
+            const transferred = try self.readDeferredAcknowledgment(
+                allocator,
+            ) orelse return error.RecoveryReviewClaimMissing;
+            var expected_transferred = exchange.replacement_marker orelse
+                exchange.expected_claim.prior_marker orelse
+                return error.RecoveryReviewClaimMissing;
+            if (!std.mem.eql(
+                u8,
+                &expected_transferred.acknowledgment_id,
+                &exchange.expected_claim.outer_attempt_id,
+            )) return error.RecoveryReviewClaimMissing;
+            expected_transferred =
+                bindDeferredAcknowledgmentToRecoveryReview(
+                    expected_transferred,
+                    exchange.expected_claim,
+                ) catch return error.RecoveryReviewClaimMissing;
+            if (!deferredAcknowledgmentExactEqual(
+                transferred,
+                expected_transferred,
+            )) return error.RecoveryReviewClaimMissing;
+            return;
+        };
+        if (!recoveryReviewClaimExactEqual(
+            claim,
+            exchange.expected_claim,
+        )) return error.RecoveryReviewClaimMismatch;
+
+        const marker = claim.prior_marker;
+        if (!optionalDeferredAcknowledgmentEqual(
+            exchange.expected_marker,
+            marker,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (!optionalDigestEqual(
+            exchange.expected_record_sha256,
+            if (record) |owned| owned.record.digest_sha256 else null,
+        )) return error.RecordMismatch;
+
+        var replacement = exchange.replacement_marker orelse
+            marker orelse return error.NoDeferredAcknowledgment;
+        if (!std.mem.eql(
+            u8,
+            &replacement.acknowledgment_id,
+            &claim.outer_attempt_id,
+        )) return error.InvalidDocument;
+        replacement = try bindDeferredAcknowledgmentToRecoveryReview(
+            replacement,
+            claim,
+        );
+        if (exchange.observer) |observer|
+            try observer.hit(.before_owner_publish);
+        const bytes = try replacement.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(recovery_review_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+                .observer = exchange.owner_publish_observer,
+            },
+        );
+        if (exchange.observer) |observer|
+            try observer.hit(.after_owner_publish);
+        if (exchange.observer) |observer|
+            try observer.hit(.before_claim_clear);
+        if (exchange.observer) |observer|
+            try observer.hit(.after_claim_clear);
     }
 
     pub fn publishDeferredAcknowledgment(
@@ -973,12 +2359,10 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         marker: DeferredAcknowledgment,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (try self.readDeferredAcknowledgment(allocator)) |existing| {
-            if (std.mem.eql(
-                u8,
-                &existing.digest_sha256,
-                &marker.digest_sha256,
-            )) return;
+            if (deferredAcknowledgmentExactEqual(existing, marker)) return;
             if (existing.state != .bound or marker.state != .pending or
                 !std.mem.eql(
                     u8,
@@ -989,7 +2373,7 @@ pub const Store = struct {
                     u8,
                     &existing.acknowledgment_id,
                     &marker.acknowledgment_id,
-                ))
+                ) or !sameDeferredAcknowledgmentOwner(existing, marker))
                 return error.DeferredAcknowledgmentPresent;
             const bytes = try marker.canonicalJson(allocator);
             defer allocator.free(bytes);
@@ -1023,12 +2407,16 @@ pub const Store = struct {
     pub fn rotateDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
+        expected: DeferredAcknowledgment,
         marker: DeferredAcknowledgment,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (marker.state != .bound) return error.InvalidDocument;
         const existing = try self.readDeferredAcknowledgment(allocator) orelse
             return error.NoDeferredAcknowledgment;
-        if ((existing.state != .bound and existing.state != .abandoned) or
+        if (!deferredAcknowledgmentExactEqual(existing, expected) or
+            (existing.state != .bound and existing.state != .abandoned) or
             !std.mem.eql(
                 u8,
                 &existing.acknowledgment_id,
@@ -1038,7 +2426,11 @@ pub const Store = struct {
         var record = try self.read(allocator);
         defer if (record) |*owned| owned.deinit();
         if (record != null) return error.DeferredAcknowledgmentMismatch;
-        const bytes = try marker.canonicalJson(allocator);
+        const replacement = if (existing.recovery_review_claim_sha256 != null)
+            try carryDeferredAcknowledgmentReviewOwner(marker, existing)
+        else
+            marker;
+        const bytes = try replacement.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
             try root_fs.Path.init(deferred_ack_path),
@@ -1054,18 +2446,19 @@ pub const Store = struct {
     pub fn acknowledgeDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
-        expected_digest: [32]u8,
+        expected: DeferredAcknowledgment,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
             return error.NoDeferredAcknowledgment;
-        if (observed.state != .pending or !std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &expected_digest,
-        )) return error.DeferredAcknowledgmentMismatch;
-        var next = observed;
-        next.state = .acknowledged;
-        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        if (observed.state != .pending or
+            !deferredAcknowledgmentExactEqual(observed, expected))
+            return error.DeferredAcknowledgmentMismatch;
+        const next = deferredAcknowledgmentWithState(
+            observed,
+            .acknowledged,
+        );
         const bytes = try next.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
@@ -1083,21 +2476,22 @@ pub const Store = struct {
     pub fn terminalizeDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
-        expected_digest: [32]u8,
+        expected: DeferredAcknowledgment,
         terminal_state: DeferredAcknowledgmentState,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (terminal_state != .released and terminal_state != .abandoned)
             return error.InvalidDocument;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
             return error.NoDeferredAcknowledgment;
-        if (observed.state != .bound or !std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &expected_digest,
-        )) return error.DeferredAcknowledgmentMismatch;
-        var next = observed;
-        next.state = terminal_state;
-        next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        if (observed.state != .bound or
+            !deferredAcknowledgmentExactEqual(observed, expected))
+            return error.DeferredAcknowledgmentMismatch;
+        const next = deferredAcknowledgmentWithState(
+            observed,
+            terminal_state,
+        );
         const bytes = try next.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
@@ -1117,6 +2511,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         cleanup: OwnershipCleanup,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (try self.readDeferredAcknowledgment(allocator) == null) {
             var record = try self.read(allocator);
             defer if (record) |*owned| owned.deinit();
@@ -1131,7 +2527,7 @@ pub const Store = struct {
             try observer.hit(.before_binding_clear);
         try self.clearDeferredAcknowledgment(
             allocator,
-            terminal.digest_sha256,
+            terminal,
         );
         if (cleanup.observer) |observer|
             try observer.hit(.after_binding_clear);
@@ -1145,36 +2541,31 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         cleanup: OwnershipCleanup,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const marker = try self.readDeferredAcknowledgment(allocator);
         var record = try self.read(allocator);
         defer if (record) |*owned| owned.deinit();
         if (marker == null) return error.NoDeferredAcknowledgment;
         const observed = marker.?;
-        if (cleanup.expected_marker_sha256) |expected|
-            if (!std.mem.eql(
-                u8,
-                &observed.digest_sha256,
-                &expected,
-            )) return error.DeferredAcknowledgmentMismatch;
-        if (!std.mem.eql(
-            u8,
-            &observed.attempt_id,
-            &cleanup.attempt_id,
-        ) or !std.mem.eql(
-            u8,
-            &observed.acknowledgment_id,
-            &cleanup.acknowledgment_id,
-        )) return error.DeferredAcknowledgmentMismatch;
+        try authorizeDeferredAcknowledgment(
+            observed,
+            cleanup.authorization,
+        );
         if (record) |owned| {
-            var expected_terminal = observed;
-            expected_terminal.state = cleanup.terminal_state;
+            const expected_terminal = deferredAcknowledgmentWithState(
+                observed,
+                cleanup.terminal_state,
+            );
             if (!owned.record.clearable() or
                 !recordMatchesDeferredAcknowledgment(
                     owned.record,
                     expected_terminal,
                     false,
                 ))
+            {
                 return error.DeferredAcknowledgmentMismatch;
+            }
         }
         var terminal = observed;
         if (observed.state == .bound) {
@@ -1182,7 +2573,7 @@ pub const Store = struct {
                 try observer.hit(.before_terminal_publish);
             terminal = try self.terminalizeDeferredAcknowledgment(
                 allocator,
-                observed.digest_sha256,
+                observed,
                 cleanup.terminal_state,
             );
             if (cleanup.observer) |observer|
@@ -1208,14 +2599,15 @@ pub const Store = struct {
     pub fn clearDeferredAcknowledgment(
         self: Store,
         allocator: std.mem.Allocator,
-        expected_digest: [32]u8,
+        expected: DeferredAcknowledgment,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
             return;
-        if (!std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &expected_digest,
+        if (!deferredAcknowledgmentExactEqual(
+            observed,
+            expected,
         )) return error.DeferredAcknowledgmentMismatch;
         self.root.removeFile(
             try root_fs.Path.init(deferred_ack_path),
@@ -1435,6 +2827,7 @@ pub const Error = LockError || ValidationError || error{
     NamespaceUnavailable,
     StoreFailed,
     AttemptMismatch,
+    AuthorizationEvidenceMissing,
 };
 
 /// What the caller intends to do with the root.
@@ -1527,6 +2920,12 @@ pub const Request = struct {
     /// Optional internal outer-attempt identity. Initial acquisition binds it
     /// durably before mutation and recovery must present the same identity.
     orchestration_id: ?[32]u8 = null,
+    /// Exact durable recovery review claim consumed under the root lock before
+    /// a confirmed recovery may adopt or create lower ownership.
+    recovery_review_claim: ?RecoveryReviewClaim = null,
+    /// Independently authenticated exact lower owner used when a restarted
+    /// workflow encounters a v2 deferred acknowledgment.
+    expected_deferred_acknowledgment: ?DeferredAcknowledgment = null,
     acquisition_observer: ?AcquisitionObserver = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
@@ -1707,6 +3106,29 @@ pub const Coordinator = struct {
             observer.hit(.after_lock_acquired) catch return error.StoreFailed;
 
         const store_handle = self.store();
+        var recovery_review = store_handle.readRecoveryReviewClaim(
+            allocator,
+        ) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.RecordCorrupt,
+            };
+        if (recovery_review) |review| {
+            const expected = request.recovery_review_claim orelse
+                return error.RecoveryRequired;
+            const orchestration_id = request.orchestration_id orelse
+                return error.RecoveryRequired;
+            if (!recoveryReviewClaimExactEqual(
+                review,
+                expected,
+            ) or !std.mem.eql(
+                u8,
+                &review.outer_attempt_id,
+                &orchestration_id,
+            )) return error.RecoveryRequired;
+        } else if (request.recovery_review_claim != null) {
+            return error.RecoveryRequired;
+        }
         var cleanup_forwarder: AcquisitionCleanupForwarder = undefined;
         const retry_cleanup_observer: ?OwnershipCleanupObserver =
             if (request.acquisition_observer) |observer| blk: {
@@ -1727,11 +3149,70 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
-        const deferred = store_handle.readDeferredAcknowledgment(
+        var deferred = store_handle.readDeferredAcknowledgment(
             allocator,
         ) catch return error.RecordCorrupt;
+        var review_exchanged = false;
+        if (recovery_review) |review| {
+            if (!Store.optionalDigestEqual(
+                review.marker_sha256,
+                if (deferred) |marker| marker.digest_sha256 else null,
+            ) or !Store.optionalDigestEqual(
+                review.record_sha256,
+                if (prior) |owned| owned.record.digest_sha256 else null,
+            )) return error.RecoveryRequired;
+            if (deferred != null) {
+                if (deferred.?.document_version ==
+                    deferred_ack_v2_schema_version)
+                {
+                    const expected =
+                        request.expected_deferred_acknowledgment orelse
+                        return error.AuthorizationEvidenceMissing;
+                    if (!deferredAcknowledgmentExactEqual(
+                        deferred.?,
+                        expected,
+                    )) return error.RecoveryRequired;
+                    if (review.prior_marker == null or
+                        !deferredAcknowledgmentExactEqual(
+                            expected,
+                            review.prior_marker.?,
+                        )) return error.RecoveryRequired;
+                }
+                store_handle.exchangeRecoveryReviewClaimForOwnership(
+                    allocator,
+                    .{
+                        .expected_claim = review,
+                        .expected_marker = review.prior_marker,
+                        .expected_record_sha256 = review.record_sha256,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.StoreFailed,
+                };
+                deferred = bindDeferredAcknowledgmentToRecoveryReview(
+                    deferred.?,
+                    review,
+                ) catch return error.RecordCorrupt;
+                recovery_review = null;
+                review_exchanged = true;
+            } else if (prior != null) {
+                return error.RecoveryRequired;
+            }
+        }
+        if (deferred) |marker| {
+            if (marker.document_version == deferred_ack_v2_schema_version and
+                !review_exchanged)
+            {
+                const expected =
+                    request.expected_deferred_acknowledgment orelse
+                    return error.AuthorizationEvidenceMissing;
+                if (!deferredAcknowledgmentExactEqual(marker, expected))
+                    return error.RecoveryRequired;
+            }
+        }
         if (deferred) |marker| switch (marker.state) {
             .acknowledged => return error.RecoveryRequired,
+            .pre_mutation_reconciliation_claim => return error.RecoveryRequired,
             .released => {
                 const orchestration_id =
                     request.orchestration_id orelse
@@ -1742,8 +3223,7 @@ pub const Coordinator = struct {
                     &marker.acknowledgment_id,
                 )) return error.RecoveryRequired;
                 store_handle.cleanupOwned(allocator, .{
-                    .attempt_id = marker.attempt_id,
-                    .acknowledgment_id = orchestration_id,
+                    .authorization = authorizationFromTrustedMarker(marker),
                     .terminal_state = marker.state,
                 }) catch return error.StoreFailed;
                 if (prior) |*value| {
@@ -1772,8 +3252,7 @@ pub const Coordinator = struct {
                                 .abandoned_before_mutation))
                         return error.RecoveryRequired;
                     _ = store_handle.retainOwnedTerminal(allocator, .{
-                        .attempt_id = marker.attempt_id,
-                        .acknowledgment_id = orchestration_id,
+                        .authorization = authorizationFromTrustedMarker(marker),
                         .terminal_state = .abandoned,
                         .observer = retry_cleanup_observer,
                     }) catch return error.StoreFailed;
@@ -1804,13 +3283,11 @@ pub const Coordinator = struct {
                         prior.?.record.outcome == .abandoned_before_mutation;
                     if (!abandoned) {
                         store_handle.cleanupOwned(allocator, .{
-                            .attempt_id = marker.attempt_id,
-                            .acknowledgment_id = orchestration_id,
+                            .authorization = authorizationFromTrustedMarker(marker),
                             .terminal_state = .released,
                         }) catch return error.StoreFailed;
                     } else _ = store_handle.retainOwnedTerminal(allocator, .{
-                        .attempt_id = marker.attempt_id,
-                        .acknowledgment_id = orchestration_id,
+                        .authorization = authorizationFromTrustedMarker(marker),
                         .terminal_state = .abandoned,
                         .observer = retry_cleanup_observer,
                     }) catch return error.StoreFailed;
@@ -1913,7 +3390,10 @@ pub const Coordinator = struct {
             // it starts pre-mutation. The executor bridge is published only
             // when control is actually handed over, so an early return on a
             // healthy root cannot strand it.
-            const created = try self.publishNew(allocator, request, reclaimed orelse 1, .{
+            var publish_request = request;
+            if (recovery_review == null)
+                publish_request.recovery_review_claim = null;
+            const created = try self.publishNew(allocator, publish_request, reclaimed orelse 1, .{
                 .state = .preflight,
                 .phase = .preflight,
             });
@@ -1977,7 +3457,10 @@ pub const Coordinator = struct {
             value.deinit();
             prior = null;
         }
-        const created = try self.publishNew(allocator, request, generation, .{
+        var publish_request = request;
+        if (recovery_review == null)
+            publish_request.recovery_review_claim = null;
+        const created = try self.publishNew(allocator, publish_request, generation, .{
             .state = .reserved,
             .phase = .reserved,
         });
@@ -2029,26 +3512,82 @@ pub const Coordinator = struct {
         });
         errdefer created.deinit();
         if (request.orchestration_id) |orchestration_id| {
-            const binding = createDeferredAcknowledgment(.{
-                .state = .bound,
-                .attempt_id = attempt_id,
-                .acknowledgment_id = orchestration_id,
-            }) catch return error.StoreFailed;
+            const expected_binding =
+                request.expected_deferred_acknowledgment;
+            if (expected_binding) |expected| {
+                if (expected.state != .bound or
+                    !std.mem.eql(
+                        u8,
+                        &expected.attempt_id,
+                        &attempt_id,
+                    ) or !std.mem.eql(
+                    u8,
+                    &expected.acknowledgment_id,
+                    &orchestration_id,
+                ))
+                    return error.RecoveryRequired;
+            }
+            const binding = if (request.recovery_review_claim != null)
+                createDeferredAcknowledgment(.{
+                    .document_version = if (expected_binding) |expected|
+                        expected.document_version
+                    else
+                        deferred_ack_schema_version,
+                    .state = .bound,
+                    .attempt_id = attempt_id,
+                    .acknowledgment_id = orchestration_id,
+                }) catch return error.StoreFailed
+            else
+                expected_binding orelse
+                    (createDeferredAcknowledgment(.{
+                        .state = .bound,
+                        .attempt_id = attempt_id,
+                        .acknowledgment_id = orchestration_id,
+                    }) catch return error.StoreFailed);
             const store_handle = self.store();
             if (request.acquisition_observer) |observer|
                 observer.hit(.before_binding_published) catch
                     return error.StoreFailed;
-            if (store_handle.readDeferredAcknowledgment(allocator) catch
-                return error.StoreFailed) |_|
-                store_handle.rotateDeferredAcknowledgment(
+            if (request.recovery_review_claim) |claim|
+                store_handle.exchangeRecoveryReviewClaimForOwnership(
                     allocator,
-                    binding,
-                ) catch return error.StoreFailed
-            else
-                store_handle.publishDeferredAcknowledgment(
-                    allocator,
-                    binding,
-                ) catch return error.StoreFailed;
+                    .{
+                        .expected_claim = claim,
+                        .expected_marker = null,
+                        .expected_record_sha256 = null,
+                        .replacement_marker = binding,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.StoreFailed,
+                };
+            if (request.recovery_review_claim != null and
+                expected_binding != null)
+            {
+                const observed =
+                    store_handle.readDeferredAcknowledgment(allocator) catch
+                        return error.StoreFailed;
+                if (observed == null or
+                    !deferredAcknowledgmentExactEqual(
+                        observed.?,
+                        expected_binding.?,
+                    ))
+                    return error.RecoveryRequired;
+            }
+            if (request.recovery_review_claim == null) {
+                if (store_handle.readDeferredAcknowledgment(allocator) catch
+                    return error.StoreFailed) |existing|
+                    store_handle.rotateDeferredAcknowledgment(
+                        allocator,
+                        existing,
+                        binding,
+                    ) catch return error.StoreFailed
+                else
+                    store_handle.publishDeferredAcknowledgment(
+                        allocator,
+                        binding,
+                    ) catch return error.StoreFailed;
+            }
             if (request.acquisition_observer) |observer|
                 observer.hit(.after_binding_published) catch
                     return error.StoreFailed;
@@ -2398,24 +3937,11 @@ fn recordMatchesDeferredAcknowledgment(
     marker: DeferredAcknowledgment,
     allow_pending_provenance: bool,
 ) bool {
-    if (!std.mem.eql(u8, &record.attempt_id, &marker.attempt_id) or
-        (marker.state != .bound and record.state != .completed))
-        return false;
-    return switch (marker.state) {
-        .bound => true,
-        .released => record.outcome != .abandoned_before_mutation,
-        .abandoned => record.outcome == .abandoned_before_mutation,
-        .pending, .acknowledged => switch (record.provenance) {
-            .published => record.provenance_sha256 != null and
-                marker.provenance_sha256 != null and std.mem.eql(
-                u8,
-                &record.provenance_sha256.?,
-                &marker.provenance_sha256.?,
-            ),
-            .pending => allow_pending_provenance,
-            .not_required => false,
-        },
-    };
+    return deferredRecordCompatibility(
+        record,
+        marker,
+        allow_pending_provenance,
+    ) != .incompatible;
 }
 
 fn adoptedBridge(state: State) BridgeOrigin {
@@ -2600,6 +4126,19 @@ const testing = std.testing;
 const test_root = "/target";
 const test_other_root = "/other";
 
+const FailingPublishObserver = struct {
+    fail_at: root_fs.PublishPoint,
+
+    fn interface(self: *FailingPublishObserver) root_fs.PublishObserver {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: root_fs.PublishPoint) !void {
+        const self: *FailingPublishObserver = @ptrCast(@alignCast(context));
+        if (point == self.fail_at) return error.InjectedCrash;
+    }
+};
+
 fn testRequest(operation: Operation) Request {
     return .{
         .backend = .legacy_dpkg,
@@ -2738,6 +4277,923 @@ test "root_operation.test.record round trips through its canonical encoding" {
         error.NonCanonicalDocument,
         decode(testing.allocator, bytes[0 .. bytes.len / 2], maximum_document_bytes),
     );
+}
+
+test "root_operation.test.deferred marker and record compatibility matrix is exhaustive" {
+    const Shape = enum {
+        absent,
+        reserved,
+        mutation_pending,
+        mutating,
+        completed_success_pending,
+        completed_success_published,
+        completed_recovered_published,
+        completed_abandoned,
+        foreign_completed_success,
+    };
+    const claim: PreMutationReconciliationClaimBinding = .{
+        .outer_attempt_id = @splat(0xa0),
+        .outer_generation = 7,
+        .outer_state_sha256 = @splat(0xa1),
+        .profile_sha256 = @splat(0xa2),
+        .profile_reference_sha256 = @splat(0xa3),
+        .exact_lock_sha256 = @splat(0xa4),
+        .semantic_request_sha256 = @splat(0xa5),
+    };
+    for (std.enums.values(DeferredAcknowledgmentState)) |marker_state| {
+        for (std.enums.values(Shape)) |shape| {
+            var input = testInput();
+            switch (shape) {
+                .absent => {},
+                .reserved => {},
+                .mutation_pending => {
+                    input.state = .mutation_pending;
+                    input.phase = .mutation;
+                },
+                .mutating => {
+                    input.state = .mutating;
+                    input.phase = .mutation;
+                    input.mutation_started = true;
+                },
+                .completed_success_pending => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .succeeded;
+                },
+                .completed_success_published,
+                .foreign_completed_success,
+                => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .succeeded;
+                    input.provenance = .published;
+                    input.provenance_sha256 = @splat(0x91);
+                    if (shape == .foreign_completed_success)
+                        input.attempt_id = @splat(0x45);
+                },
+                .completed_recovered_published => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.mutation_started = true;
+                    input.outcome = .recovered;
+                    input.provenance = .published;
+                    input.provenance_sha256 = @splat(0x91);
+                },
+                .completed_abandoned => {
+                    input.state = .completed;
+                    input.phase = .provenance;
+                    input.outcome = .abandoned_before_mutation;
+                    input.provenance = .not_required;
+                },
+            }
+            var owned: ?OwnedRecord = if (shape == .absent)
+                null
+            else
+                try create(testing.allocator, input);
+            defer if (owned) |*record| record.deinit();
+            const marker = try createDeferredAcknowledgment(.{
+                .state = marker_state,
+                .attempt_id = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    preMutationReconciliationClaimId(claim)
+                else
+                    @splat(0x44),
+                .completion_sha256 = if (marker_state == .pending or
+                    marker_state == .acknowledged)
+                    @splat(0x92)
+                else
+                    null,
+                .provenance_sha256 = if (marker_state == .pending or
+                    marker_state == .acknowledged)
+                    @splat(0x91)
+                else
+                    null,
+                .pre_mutation_claim = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    claim
+                else
+                    null,
+                .acknowledgment_id = if (marker_state ==
+                    .pre_mutation_reconciliation_claim)
+                    claim.outer_attempt_id
+                else
+                    @splat(0xb0),
+            });
+            const expected: DeferredRecordCompatibility =
+                if (shape == .foreign_completed_success)
+                    .incompatible
+                else switch (marker_state) {
+                    .pre_mutation_reconciliation_claim => if (shape == .absent)
+                        .pre_mutation_reconciliation_claim
+                    else
+                        .incompatible,
+                    .bound => switch (shape) {
+                        .reserved => .bound_pre_mutation,
+                        .mutation_pending => .bound_ambiguous,
+                        .mutating => .bound_mutating,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .bound_completed_success,
+                        .completed_success_pending => .bound_completed_pending,
+                        .completed_abandoned => .bound_completed_abandoned,
+                        else => .incompatible,
+                    },
+                    .released => switch (shape) {
+                        .absent => .released_without_record,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .released_completed,
+                        else => .incompatible,
+                    },
+                    .abandoned => if (shape == .absent)
+                        .abandoned_without_record
+                    else if (shape == .completed_abandoned)
+                        .abandoned_pre_mutation
+                    else
+                        .incompatible,
+                    .pending => switch (shape) {
+                        .completed_success_pending => .pending_prepublication,
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .pending_published,
+                        else => .incompatible,
+                    },
+                    .acknowledged => switch (shape) {
+                        .completed_success_published,
+                        .completed_recovered_published,
+                        => .acknowledged_published,
+                        else => .incompatible,
+                    },
+                };
+            try testing.expectEqual(
+                expected,
+                deferredRecordCompatibility(
+                    if (owned) |record| record.record else null,
+                    marker,
+                    true,
+                ),
+            );
+            if (marker_state == .pending and
+                shape == .completed_success_pending)
+                try testing.expectEqual(
+                    DeferredRecordCompatibility.incompatible,
+                    deferredRecordCompatibility(
+                        owned.?.record,
+                        marker,
+                        false,
+                    ),
+                );
+        }
+    }
+}
+
+test "root_operation.test.pre-mutation reconciliation claim round trips exact binding" {
+    const claim: PreMutationReconciliationClaimBinding = .{
+        .outer_attempt_id = @splat(0xc0),
+        .outer_generation = 42,
+        .outer_state_sha256 = @splat(0xc1),
+        .profile_sha256 = @splat(0xc2),
+        .profile_reference_sha256 = @splat(0xc3),
+        .exact_lock_sha256 = @splat(0xc4),
+        .semantic_request_sha256 = @splat(0xc5),
+    };
+    const marker = try createDeferredAcknowledgment(.{
+        .state = .pre_mutation_reconciliation_claim,
+        .attempt_id = preMutationReconciliationClaimId(claim),
+        .pre_mutation_claim = claim,
+        .acknowledgment_id = claim.outer_attempt_id,
+    });
+    const source = try marker.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    const decoded = try decodeDeferredAcknowledgment(
+        testing.allocator,
+        source,
+    );
+    try testing.expect(matchesPreMutationReconciliationClaim(
+        decoded,
+        claim,
+    ));
+}
+
+test "root_operation.test.recovery review claim canonicalizes exact clean and completion evidence" {
+    const cases = [_]RecoveryReviewClaim{
+        .{
+            .outer_attempt_id = @splat(0xd0),
+            .outer_generation = 7,
+            .outer_state_sha256 = @splat(0xd1),
+            .profile_sha256 = @splat(0xd2),
+            .profile_reference_sha256 = @splat(0xd3),
+            .exact_lock_sha256 = @splat(0xd4),
+            .semantic_request_sha256 = @splat(0xd5),
+            .mutation_status = .unchanged,
+            .nonce = @splat(0xd6),
+        },
+        .{
+            .outer_attempt_id = @splat(0xe0),
+            .outer_generation = 8,
+            .outer_state_sha256 = @splat(0xe1),
+            .profile_sha256 = @splat(0xe2),
+            .profile_reference_sha256 = @splat(0xe3),
+            .exact_lock_sha256 = @splat(0xe4),
+            .semantic_request_sha256 = @splat(0xe5),
+            .mutation_status = .changed,
+            .nonce = @splat(0xe6),
+            .completion_sha256 = @splat(0xe7),
+        },
+    };
+    for (cases) |input| {
+        const claim = try createRecoveryReviewClaim(input);
+        const source = try claim.canonicalJson(testing.allocator);
+        defer testing.allocator.free(source);
+        try testing.expect(source.len <= maximum_document_bytes);
+        try testing.expect(documentHasSchema(
+            source,
+            recovery_review_schema_id,
+        ));
+        const decoded = try decodeRecoveryReviewClaim(
+            testing.allocator,
+            source,
+        );
+        try testing.expectEqualDeep(claim, decoded);
+    }
+
+    const tamper_claim = try createRecoveryReviewClaim(cases[0]);
+    const tampered = try tamper_claim.canonicalJson(testing.allocator);
+    defer testing.allocator.free(tampered);
+    const exact_identity = std.mem.indexOf(
+        u8,
+        tampered,
+        "\"exact_identity_sha256\":\"",
+    ).? + "\"exact_identity_sha256\":\"".len;
+    tampered[exact_identity] = if (tampered[exact_identity] == '0')
+        '1'
+    else
+        '0';
+    try testing.expectError(
+        error.ExactIdentityMismatch,
+        decodeRecoveryReviewClaim(testing.allocator, tampered),
+    );
+
+    try testing.expectError(error.InvalidDocument, createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(0xf0),
+        .outer_generation = 9,
+        .outer_state_sha256 = @splat(0xf1),
+        .profile_sha256 = @splat(0xf2),
+        .profile_reference_sha256 = @splat(0xf3),
+        .exact_lock_sha256 = @splat(0xf4),
+        .semantic_request_sha256 = @splat(0xf5),
+        .mutation_status = .changed,
+        .nonce = @splat(0xf6),
+    }));
+}
+
+test "root_operation.test.frozen main deferred acknowledgment v1 fixtures remain byte exact" {
+    const fixtures = [_][]const u8{
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"bound\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"9ebc1e5a301ad8861e813b590c60e96e18728b38a32fb5e6e2a8cf5a80b64db7\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"released\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"0458d25d816074fc6148e0c14cb334e033df62d89f765c2b26aa719a45b1b6c5\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"abandoned\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"ef47268cb544cd653bf0694704424a291ae95db2b847ad6ceec60a1f727c34d6\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"pending\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"4aa48a83b79e06c2a850aa81c955e31588162fdb7fd0f7ab10e20eca70fe4992\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"acknowledged\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"57ccdec9d5fef63c77929b99157347caa15442a87fae1e823da73dfbdd343cb6\"}",
+    };
+    for (fixtures) |fixture| {
+        const decoded = try decodeDeferredAcknowledgment(
+            testing.allocator,
+            fixture,
+        );
+        try testing.expectEqual(
+            deferred_ack_schema_version,
+            decoded.document_version,
+        );
+        const encoded = try decoded.canonicalJson(testing.allocator);
+        defer testing.allocator.free(encoded);
+        try testing.expectEqualStrings(fixture, encoded);
+        try testing.expect(
+            std.mem.indexOf(u8, encoded, "recovery_review_") == null,
+        );
+    }
+}
+
+test "root_operation.test.frozen recovery review v1 upgrades through exact v2 ownership" {
+    const fixture =
+        "{\"schema\":\"https://debz.dev/schema/root-operation-recovery-review-v1\",\"version\":1,\"outer_attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"outer_generation\":7,\"outer_state_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"profile_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"profile_reference_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"exact_lock_sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"semantic_request_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"outer_transaction_sha256\":null,\"mutation_status\":\"unchanged\",\"nonce\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"marker_sha256\":null,\"prior_marker\":null,\"record_sha256\":null,\"completion_sha256\":null,\"digest_sha256\":\"a73f0c6ff882004999586e5858b4d9db052cfcfdd6999e4f1c2dfeb524615e83\"}";
+    const claim = try decodeRecoveryReviewClaim(testing.allocator, fixture);
+    try testing.expectEqual(
+        recovery_review_legacy_schema_version,
+        claim.document_version,
+    );
+    const encoded = try claim.canonicalJson(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings(fixture, encoded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: root_fs.Root = .init(testing.io, tmp.dir);
+    const store = Store.init(root);
+    try store.ensureNamespace();
+    try root.publishFile(
+        try root_fs.Path.init(recovery_review_path),
+        fixture,
+        .{},
+    );
+    const replacement = try createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0x88),
+        .acknowledgment_id = claim.outer_attempt_id,
+    });
+    try store.exchangeRecoveryReviewClaimForOwnership(
+        testing.allocator,
+        .{
+            .expected_claim = claim,
+            .expected_marker = null,
+            .expected_record_sha256 = null,
+            .replacement_marker = replacement,
+        },
+    );
+    const transferred = (try store.readDeferredAcknowledgment(
+        testing.allocator,
+    )).?;
+    try testing.expect(recoveryReviewTransferredOwnerIdentityMatches(
+        transferred,
+        claim,
+    ));
+}
+
+test "root_operation.test.upgrade finalizes frozen v1 ownership without rewriting it as v2" {
+    const pending_source =
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"pending\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"4aa48a83b79e06c2a850aa81c955e31588162fdb7fd0f7ab10e20eca70fe4992\"}";
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: root_fs.Root = .init(testing.io, tmp.dir);
+    const store = Store.init(root);
+    try store.ensureNamespace();
+    try root.publishFile(
+        try root_fs.Path.init(deferred_ack_path),
+        pending_source,
+        .{},
+    );
+    const pending = (try store.readDeferredAcknowledgment(
+        testing.allocator,
+    )).?;
+    const acknowledged = try store.acknowledgeDeferredAcknowledgment(
+        testing.allocator,
+        pending,
+    );
+    try testing.expectEqual(
+        deferred_ack_schema_version,
+        acknowledged.document_version,
+    );
+    const source = try acknowledged.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    try testing.expect(
+        std.mem.indexOf(u8, source, "recovery_review_") == null,
+    );
+    try store.cleanupOwned(testing.allocator, .{
+        .authorization = .{ .legacy_v1 = .{
+            .attempt_id = acknowledged.attempt_id,
+            .acknowledgment_id = acknowledged.acknowledgment_id,
+        } },
+        .terminal_state = .acknowledged,
+    });
+    try testing.expect(
+        (try store.readDeferredAcknowledgment(testing.allocator)) == null,
+    );
+}
+
+test "root_operation.test.recovery review exchange survives every durable publication boundary" {
+    inline for (std.enums.values(root_fs.PublishPoint)) |fail_at| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root: root_fs.Root = .init(testing.io, tmp.dir);
+        const store = Store.init(root);
+        try store.ensureNamespace();
+        const claim = try createRecoveryReviewClaim(.{
+            .outer_attempt_id = @splat(0xa1),
+            .outer_generation = 9,
+            .outer_state_sha256 = @splat(0xa2),
+            .profile_sha256 = @splat(0xa3),
+            .profile_reference_sha256 = @splat(0xa4),
+            .exact_lock_sha256 = @splat(0xa5),
+            .semantic_request_sha256 = @splat(0xa6),
+            .mutation_status = .unchanged,
+            .nonce = @splat(0xa7),
+        });
+        try store.publishRecoveryReviewClaim(testing.allocator, claim);
+        const replacement = try createDeferredAcknowledgment(.{
+            .attempt_id = @splat(0xb1),
+            .acknowledgment_id = claim.outer_attempt_id,
+        });
+        const transferred = try bindDeferredAcknowledgmentToRecoveryReview(
+            replacement,
+            claim,
+        );
+        var observer: FailingPublishObserver = .{ .fail_at = fail_at };
+        try testing.expectError(
+            error.InjectedCrash,
+            store.exchangeRecoveryReviewClaimForOwnership(
+                testing.allocator,
+                .{
+                    .expected_claim = claim,
+                    .expected_marker = null,
+                    .expected_record_sha256 = null,
+                    .replacement_marker = replacement,
+                    .owner_publish_observer = observer.interface(),
+                },
+            ),
+        );
+
+        const reopened = Store.init(.init(testing.io, tmp.dir));
+        const retained_claim =
+            try reopened.readRecoveryReviewClaim(testing.allocator);
+        const retained_owner =
+            try reopened.readDeferredAcknowledgment(testing.allocator);
+        switch (fail_at) {
+            .before_stage_sync,
+            .after_stage_sync,
+            .before_rename,
+            => {
+                try testing.expect(retained_claim != null);
+                try testing.expect(retained_owner == null);
+            },
+            .after_rename,
+            .before_directory_sync,
+            .after_directory_sync,
+            => {
+                try testing.expect(retained_claim == null);
+                try testing.expectEqualDeep(transferred, retained_owner.?);
+            },
+        }
+
+        try reopened.exchangeRecoveryReviewClaimForOwnership(
+            testing.allocator,
+            .{
+                .expected_claim = claim,
+                .expected_marker = null,
+                .expected_record_sha256 = null,
+                .replacement_marker = replacement,
+            },
+        );
+        try testing.expect(
+            (try reopened.readRecoveryReviewClaim(testing.allocator)) == null,
+        );
+        try testing.expectEqualDeep(
+            transferred,
+            (try reopened.readDeferredAcknowledgment(testing.allocator)).?,
+        );
+    }
+}
+
+test "root_operation.test.recovery review cancellation restores the exact prior owner" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const store = Store.init(.init(testing.io, tmp.dir));
+    try store.ensureNamespace();
+    const prior = try createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(0xc1),
+        .completion_sha256 = @splat(0xc2),
+        .provenance_sha256 = @splat(0xc3),
+        .acknowledgment_id = @splat(0xc4),
+    });
+    try store.publishDeferredAcknowledgment(testing.allocator, prior);
+    const claim = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior.acknowledgment_id,
+        .outer_generation = 10,
+        .outer_state_sha256 = @splat(0xc5),
+        .profile_sha256 = @splat(0xc6),
+        .profile_reference_sha256 = @splat(0xc7),
+        .exact_lock_sha256 = @splat(0xc8),
+        .semantic_request_sha256 = @splat(0xc9),
+        .mutation_status = .changed,
+        .nonce = @splat(0xca),
+        .marker_sha256 = prior.digest_sha256,
+        .marker_exact_identity_sha256 = deferredAcknowledgmentExactIdentity(prior),
+        .prior_marker = prior,
+        .record_sha256 = @splat(0xcb),
+    });
+    try store.publishRecoveryReviewClaim(testing.allocator, claim);
+    try testing.expectEqualDeep(
+        prior,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.acknowledgeDeferredAcknowledgment(
+            testing.allocator,
+            prior,
+        ),
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.clearDeferredAcknowledgment(
+            testing.allocator,
+            prior,
+        ),
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimMismatch,
+        store.clearRecoveryReviewClaim(
+            testing.allocator,
+            try createRecoveryReviewClaim(.{
+                .outer_attempt_id = claim.outer_attempt_id,
+                .outer_generation = claim.outer_generation,
+                .outer_state_sha256 = claim.outer_state_sha256,
+                .profile_sha256 = claim.profile_sha256,
+                .profile_reference_sha256 = claim.profile_reference_sha256,
+                .exact_lock_sha256 = claim.exact_lock_sha256,
+                .semantic_request_sha256 = claim.semantic_request_sha256,
+                .mutation_status = claim.mutation_status,
+                .nonce = @splat(0xff),
+                .marker_sha256 = claim.marker_sha256,
+                .marker_exact_identity_sha256 = claim.marker_exact_identity_sha256,
+                .prior_marker = claim.prior_marker,
+                .record_sha256 = claim.record_sha256,
+                .completion_sha256 = claim.completion_sha256,
+            }),
+        ),
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) != null,
+    );
+    try store.clearRecoveryReviewClaim(
+        testing.allocator,
+        claim,
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) == null,
+    );
+    try testing.expectEqualDeep(
+        prior,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    );
+}
+
+test "root_operation.test.deferred acknowledgment v2 is canonical bounded and tamper evident" {
+    const base = try createDeferredAcknowledgment(.{
+        .attempt_id = @splat(0xd1),
+        .acknowledgment_id = @splat(0xd2),
+    });
+    const claim = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = base.acknowledgment_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(0xd3),
+        .profile_sha256 = @splat(0xd4),
+        .profile_reference_sha256 = @splat(0xd5),
+        .exact_lock_sha256 = @splat(0xd6),
+        .semantic_request_sha256 = @splat(0xd7),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xd8),
+    });
+    const marker = try bindDeferredAcknowledgmentToRecoveryReview(base, claim);
+    try testing.expectEqual(
+        deferred_ack_v2_schema_version,
+        marker.document_version,
+    );
+    const source = try marker.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    try testing.expect(source.len <= maximum_document_bytes);
+    try testing.expect(
+        documentHasSchema(source, deferred_ack_v2_schema_id),
+    );
+    const decoded = try decodeDeferredAcknowledgment(
+        testing.allocator,
+        source,
+    );
+    try testing.expectEqualDeep(marker, decoded);
+
+    const tampered = try testing.allocator.dupe(u8, source);
+    defer testing.allocator.free(tampered);
+    const binding = std.mem.indexOf(
+        u8,
+        tampered,
+        "\"recovery_review_binding_sha256\":\"",
+    ).?;
+    tampered[binding + "\"recovery_review_binding_sha256\":\"".len] =
+        if (tampered[binding + "\"recovery_review_binding_sha256\":\"".len] == '0')
+            '1'
+        else
+            '0';
+    try testing.expectError(
+        error.InvalidDocument,
+        decodeDeferredAcknowledgment(testing.allocator, tampered),
+    );
+
+    const v1_with_v2_fields =
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"bound\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"recovery_review_claim_sha256\":null,\"recovery_review_binding_sha256\":null,\"digest_sha256\":\"9ebc1e5a301ad8861e813b590c60e96e18728b38a32fb5e6e2a8cf5a80b64db7\"}";
+    try testing.expectError(
+        error.NonCanonicalDocument,
+        decodeDeferredAcknowledgment(
+            testing.allocator,
+            v1_with_v2_fields,
+        ),
+    );
+}
+
+test "root_operation.test.valid v2 legacy digest collision cannot replace exact review identity" {
+    const prior_base = try createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0xe1),
+        .acknowledgment_id = @splat(0xe2),
+    });
+    const old_claim_a = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior_base.acknowledgment_id,
+        .outer_generation = 12,
+        .outer_state_sha256 = @splat(0xe3),
+        .profile_sha256 = @splat(0xe4),
+        .profile_reference_sha256 = @splat(0xe5),
+        .exact_lock_sha256 = @splat(0xe6),
+        .semantic_request_sha256 = @splat(0xe7),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xe8),
+    });
+    const old_claim_b = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = old_claim_a.outer_attempt_id,
+        .outer_generation = old_claim_a.outer_generation,
+        .outer_state_sha256 = old_claim_a.outer_state_sha256,
+        .profile_sha256 = old_claim_a.profile_sha256,
+        .profile_reference_sha256 = old_claim_a.profile_reference_sha256,
+        .exact_lock_sha256 = old_claim_a.exact_lock_sha256,
+        .semantic_request_sha256 = old_claim_a.semantic_request_sha256,
+        .mutation_status = old_claim_a.mutation_status,
+        .nonce = @splat(0xe9),
+    });
+    const prior_a = try bindDeferredAcknowledgmentToRecoveryReview(
+        prior_base,
+        old_claim_a,
+    );
+    const prior_b = try bindDeferredAcknowledgmentToRecoveryReview(
+        prior_base,
+        old_claim_b,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &prior_a.digest_sha256,
+        &prior_b.digest_sha256,
+    );
+    try testing.expect(!std.mem.eql(
+        u8,
+        &prior_a.recovery_review_binding_sha256.?,
+        &prior_b.recovery_review_binding_sha256.?,
+    ));
+    try testing.expect(!deferredAcknowledgmentExactEqual(prior_a, prior_b));
+    const claim_a = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(0xe5),
+        .outer_generation = 14,
+        .outer_state_sha256 = @splat(0xe6),
+        .profile_sha256 = @splat(0xe7),
+        .profile_reference_sha256 = @splat(0xe8),
+        .exact_lock_sha256 = @splat(0xe9),
+        .semantic_request_sha256 = @splat(0xea),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xeb),
+        .marker_sha256 = prior_a.digest_sha256,
+        .marker_exact_identity_sha256 = deferredAcknowledgmentExactIdentity(prior_a),
+        .prior_marker = prior_a,
+    });
+    const claim_b = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = claim_a.outer_attempt_id,
+        .outer_generation = claim_a.outer_generation,
+        .outer_state_sha256 = claim_a.outer_state_sha256,
+        .profile_sha256 = claim_a.profile_sha256,
+        .profile_reference_sha256 = claim_a.profile_reference_sha256,
+        .exact_lock_sha256 = claim_a.exact_lock_sha256,
+        .semantic_request_sha256 = claim_a.semantic_request_sha256,
+        .mutation_status = claim_a.mutation_status,
+        .nonce = claim_a.nonce,
+        .marker_sha256 = prior_b.digest_sha256,
+        .marker_exact_identity_sha256 = deferredAcknowledgmentExactIdentity(prior_b),
+        .prior_marker = prior_b,
+    });
+    try testing.expectEqualSlices(
+        u8,
+        &claim_a.digest_sha256,
+        &claim_b.digest_sha256,
+    );
+    try testing.expect(!recoveryReviewClaimExactEqual(claim_a, claim_b));
+    const prior_a_bytes = try prior_a.canonicalJson(testing.allocator);
+    defer testing.allocator.free(prior_a_bytes);
+    const prior_b_bytes = try prior_b.canonicalJson(testing.allocator);
+    defer testing.allocator.free(prior_b_bytes);
+    _ = try decodeDeferredAcknowledgment(testing.allocator, prior_a_bytes);
+    _ = try decodeDeferredAcknowledgment(testing.allocator, prior_b_bytes);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const store = Store.init(.init(testing.io, tmp.dir));
+    try store.ensureNamespace();
+    try store.publishDeferredAcknowledgment(testing.allocator, prior_a);
+    try store.publishRecoveryReviewClaim(testing.allocator, claim_a);
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.publishRecoveryReviewClaim(testing.allocator, claim_b),
+    );
+    const replacement = try createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0xec),
+        .acknowledgment_id = claim_a.outer_attempt_id,
+    });
+    try testing.expectError(
+        error.RecoveryReviewClaimMismatch,
+        store.exchangeRecoveryReviewClaimForOwnership(
+            testing.allocator,
+            .{
+                .expected_claim = claim_b,
+                .expected_marker = claim_b.prior_marker,
+                .expected_record_sha256 = null,
+                .replacement_marker = replacement,
+            },
+        ),
+    );
+    try testing.expect(recoveryReviewClaimExactEqual(
+        claim_a,
+        (try store.readRecoveryReviewClaim(testing.allocator)).?,
+    ));
+    try store.clearRecoveryReviewClaim(testing.allocator, claim_a);
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        prior_a,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
+    try store.clearDeferredAcknowledgment(
+        testing.allocator,
+        prior_a,
+    );
+    try store.publishDeferredAcknowledgment(testing.allocator, prior_b);
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.publishRecoveryReviewClaim(testing.allocator, claim_a),
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) == null,
+    );
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        prior_b,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
+
+    try store.clearDeferredAcknowledgment(testing.allocator, prior_b);
+    const bound_base = try createDeferredAcknowledgment(.{
+        .attempt_id = prior_base.attempt_id,
+        .acknowledgment_id = prior_base.acknowledgment_id,
+    });
+    const bound_a = try bindDeferredAcknowledgmentToRecoveryReview(
+        bound_base,
+        old_claim_a,
+    );
+    const bound_b = try bindDeferredAcknowledgmentToRecoveryReview(
+        bound_base,
+        old_claim_b,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &bound_a.digest_sha256,
+        &bound_b.digest_sha256,
+    );
+    try store.publishDeferredAcknowledgment(testing.allocator, bound_b);
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.terminalizeDeferredAcknowledgment(
+            testing.allocator,
+            bound_a,
+            .released,
+        ),
+    );
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.retainOwnedTerminal(testing.allocator, .{
+            .authorization = .{ .exact_v2 = bound_a },
+            .terminal_state = .released,
+        }),
+    );
+    try testing.expectError(
+        error.AuthorizationEvidenceMissing,
+        store.retainOwnedTerminal(testing.allocator, .{
+            .authorization = .{ .legacy_v1 = .{
+                .attempt_id = bound_b.attempt_id,
+                .acknowledgment_id = bound_b.acknowledgment_id,
+            } },
+            .terminal_state = .released,
+        }),
+    );
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        bound_b,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.clearDeferredAcknowledgment(testing.allocator, bound_a),
+    );
+    const rotated_base = try createDeferredAcknowledgment(.{
+        .attempt_id = @splat(0xed),
+        .acknowledgment_id = bound_b.acknowledgment_id,
+    });
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.rotateDeferredAcknowledgment(
+            testing.allocator,
+            bound_a,
+            rotated_base,
+        ),
+    );
+    const reopened = Store.init(.init(testing.io, tmp.dir));
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        bound_b,
+        (try reopened.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
+
+    const exact_terminal = try reopened.terminalizeDeferredAcknowledgment(
+        testing.allocator,
+        bound_b,
+        .released,
+    );
+    try reopened.clearDeferredAcknowledgment(
+        testing.allocator,
+        exact_terminal,
+    );
+
+    try reopened.publishDeferredAcknowledgment(testing.allocator, bound_b);
+    const pending_base = try createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = bound_base.attempt_id,
+        .completion_sha256 = @splat(0xee),
+        .provenance_sha256 = @splat(0xef),
+        .acknowledgment_id = bound_base.acknowledgment_id,
+    });
+    const pending_a = try carryDeferredAcknowledgmentReviewOwner(
+        pending_base,
+        bound_a,
+    );
+    const pending_b = try carryDeferredAcknowledgmentReviewOwner(
+        pending_base,
+        bound_b,
+    );
+    try testing.expectError(
+        error.DeferredAcknowledgmentPresent,
+        reopened.publishDeferredAcknowledgment(
+            testing.allocator,
+            pending_a,
+        ),
+    );
+    try reopened.publishDeferredAcknowledgment(
+        testing.allocator,
+        pending_b,
+    );
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        reopened.acknowledgeDeferredAcknowledgment(
+            testing.allocator,
+            pending_a,
+        ),
+    );
+    const acknowledged = try reopened.acknowledgeDeferredAcknowledgment(
+        testing.allocator,
+        pending_b,
+    );
+    var foreign_acknowledged = pending_a;
+    foreign_acknowledged.state = .acknowledged;
+    foreign_acknowledged.digest_sha256 =
+        deferredAcknowledgmentDigest(foreign_acknowledged);
+    foreign_acknowledged.recovery_review_binding_sha256 =
+        recoveryReviewBindingDigest(foreign_acknowledged);
+    foreign_acknowledged.exact_identity_sha256 =
+        deferredAcknowledgmentExactIdentity(foreign_acknowledged);
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        reopened.clearDeferredAcknowledgment(
+            testing.allocator,
+            foreign_acknowledged,
+        ),
+    );
+    try reopened.clearDeferredAcknowledgment(
+        testing.allocator,
+        acknowledged,
+    );
+
+    try reopened.publishDeferredAcknowledgment(testing.allocator, bound_b);
+    try reopened.rotateDeferredAcknowledgment(
+        testing.allocator,
+        bound_b,
+        rotated_base,
+    );
+    const rotated = (try reopened.readDeferredAcknowledgment(
+        testing.allocator,
+    )).?;
+    try testing.expectEqualSlices(
+        u8,
+        &old_claim_b.exact_identity_sha256,
+        &rotated.recovery_review_claim_exact_identity_sha256.?,
+    );
+    try reopened.clearDeferredAcknowledgment(testing.allocator, rotated);
+
+    try reopened.publishDeferredAcknowledgment(testing.allocator, bound_b);
+    const retained = try reopened.retainOwnedTerminal(
+        testing.allocator,
+        .{
+            .authorization = .{ .exact_v2 = bound_b },
+            .terminal_state = .released,
+        },
+    );
+    try reopened.clearDeferredAcknowledgment(testing.allocator, retained);
 }
 
 test "root_operation.test.records reject contradictory lifecycle combinations" {

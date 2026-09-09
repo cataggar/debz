@@ -10,11 +10,16 @@ const system_profile = @import("system_profile.zig");
 
 pub const api_version: u32 = 1;
 pub const request_schema_id = "https://debz.dev/schema/apt-system-request-v1";
+pub const recovery_request_schema_id =
+    "https://debz.dev/schema/apt-system-recovery-request-v1";
 pub const result_schema_id = "https://debz.dev/schema/apt-system-result-v1";
 pub const result_items_schema_id =
     "https://debz.dev/schema/apt-system-result-v2";
+pub const result_status_schema_id =
+    "https://debz.dev/schema/apt-system-result-v3";
 pub const schema_version: u32 = 1;
 pub const result_items_schema_version: u32 = 2;
+pub const result_status_schema_version: u32 = 3;
 pub const maximum_document_bytes: usize = 256 * 1024;
 pub const maximum_packages: usize = 256;
 pub const maximum_result_items: usize = 4096;
@@ -30,11 +35,12 @@ pub const Operation = enum {
     remove,
     upgrade,
     list_installed,
+    recover,
 
     pub fn mutatesRoot(self: Operation) bool {
         return switch (self) {
             .install, .remove, .upgrade => true,
-            .update, .list_installed => false,
+            .update, .list_installed, .recover => false,
         };
     }
 };
@@ -192,6 +198,10 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+pub const MutationStatus = enum {
+    unknown,
+};
+
 pub const ProfileBinding = struct {
     path: []const u8,
     sha256: [32]u8,
@@ -217,6 +227,12 @@ pub const Evidence = struct {
     active_operation_state: ?[]const u8 = null,
 };
 
+pub const RecoveryContext = struct {
+    profile_path: []const u8,
+    requested_operation: ?Operation = null,
+    action: ?[]const u8 = null,
+};
+
 pub const Item = struct {
     package: []const u8,
     version: ?[]const u8 = null,
@@ -232,6 +248,8 @@ pub const Result = struct {
     outcome: Outcome,
     exit_status: ExitStatus,
     changed: bool = false,
+    mutation_status: ?MutationStatus = null,
+    recovery_context: ?RecoveryContext = null,
     summary: []const u8,
     items: []const Item = &.{},
     evidence: Evidence = .{},
@@ -420,6 +438,11 @@ pub fn ownResult(
         };
     }
     result.items = items;
+    if (input.recovery_context) |context| result.recovery_context = .{
+        .profile_path = try owned.dupe(u8, context.profile_path),
+        .requested_operation = context.requested_operation,
+        .action = try dupeOptional(owned, context.action),
+    };
     if (input.profile) |profile| result.profile = .{
         .path = try owned.dupe(u8, profile.path),
         .sha256 = profile.sha256,
@@ -436,6 +459,7 @@ pub fn ownResult(
 
 pub fn validateRequest(request: Request) !void {
     if (request.api_version != api_version) return error.UnsupportedApiVersion;
+    if (request.operation == .recover) return error.InvalidOperation;
     if (!absolute_path.nonRootBounded(
         request.profile_path,
         maximum_path_bytes,
@@ -445,10 +469,11 @@ pub fn validateRequest(request: Request) !void {
         .install, .remove => request.packages.len != 0 and
             request.packages.len <= maximum_packages,
         .update, .upgrade, .list_installed => request.packages.len == 0,
+        .recover => false,
     };
     if (!count_valid) return error.InvalidPackageCount;
     for (request.packages, 0..) |package, index| {
-        if (!validPackage(package)) return error.InvalidPackage;
+        if (!validRequestPackage(package)) return error.InvalidPackage;
         for (request.packages[0..index]) |previous|
             if (std.mem.eql(u8, package, previous))
                 return error.DuplicatePackage;
@@ -460,10 +485,41 @@ pub fn validateResult(result: Result) !void {
     if (!validText(result.summary, maximum_summary_characters))
         return error.InvalidSummary;
     if (result.items.len > maximum_result_items) return error.TooManyItems;
-    if (result.operation != .list_installed and result.items.len != 0)
+    if (result.items.len != 0 and !resultAllowsItems(result))
         return error.UnexpectedItems;
+    if (result.recovery_context != null and result.mutation_status == null)
+        return error.InvalidRecoveryContext;
+    if (result.mutation_status) |status| switch (status) {
+        .unknown => {
+            if (result.operation != .recover or
+                result.items.len != 0 or
+                result.changed or result.outcome != .recovery or
+                result.profile != null or
+                result.evidence.exact_lock != null or
+                result.evidence.transaction_result != null or
+                result.evidence.root_operation_completion != null or
+                result.evidence.active_operation_state != null or
+                result.recovery_context == null or
+                result.recovery_context.?.action != null or
+                result.diagnostic_count != 1 or
+                result.diagnostics[0].id != .recovery_required or
+                result.diagnostics[0].phase == null or
+                !std.mem.eql(
+                    u8,
+                    result.diagnostics[0].phase.?,
+                    "recovery",
+                ))
+                return error.InvalidMutationStatus;
+            try validateRecoveryContext(result.recovery_context.?);
+            if (!std.mem.eql(
+                u8,
+                &result.request_sha256,
+                &(try recoveryRequestDigest(result.recovery_context.?)),
+            )) return error.InvalidRecoveryContext;
+        },
+    };
     for (result.items) |item| {
-        if (!validPackage(item.package)) return error.InvalidItem;
+        if (!validResultPackage(item.package)) return error.InvalidItem;
         if (item.version) |version|
             if (!validText(version, 1024)) return error.InvalidItem;
         if (item.architecture) |architecture|
@@ -472,6 +528,7 @@ pub fn validateResult(result: Result) !void {
             if (!validText(detail, maximum_summary_characters))
                 return error.InvalidItem;
     }
+
     if (result.diagnostic_count > maximum_diagnostics)
         return error.TooManyDiagnostics;
     if (result.exit_status != exitStatus(result.outcome))
@@ -511,6 +568,24 @@ pub fn validateResult(result: Result) !void {
         return error.DocumentTooLarge;
 }
 
+fn resultAllowsItems(result: Result) bool {
+    if (result.operation == .list_installed) return true;
+    if (!result.operation.mutatesRoot() or
+        result.outcome != .usage or
+        result.changed or
+        result.mutation_status != null or
+        result.recovery_context != null or
+        result.diagnostic_count != 1)
+        return false;
+    return result.diagnostics[0].id == .confirmation_required and
+        result.diagnostics[0].phase != null and
+        std.mem.eql(
+            u8,
+            result.diagnostics[0].phase.?,
+            "confirmation",
+        );
+}
+
 pub fn validateCompleteResult(result: Result) !void {
     try validateResult(result);
     if (!std.mem.eql(u8, &result.digest_sha256, &digestPayload(result)))
@@ -523,6 +598,22 @@ pub fn validateProfileBinding(profile: ProfileBinding) !void {
         maximum_path_bytes,
     ))
         return error.InvalidProfileBinding;
+}
+
+fn validateRecoveryContext(context: RecoveryContext) !void {
+    if (!absolute_path.nonRootBounded(
+        context.profile_path,
+        maximum_path_bytes,
+    )) return error.InvalidRecoveryContext;
+    if (context.requested_operation) |operation|
+        if (operation == .recover)
+            return error.InvalidRecoveryContext;
+    if (context.action) |action| {
+        const prefix = "debz recover --system-profile ";
+        if (!std.mem.startsWith(u8, action, prefix) or
+            !std.mem.eql(u8, action[prefix.len..], context.profile_path))
+            return error.InvalidRecoveryContext;
+    }
 }
 
 pub fn validateEvidence(evidence: Evidence) !void {
@@ -564,9 +655,20 @@ fn exitStatus(outcome: Outcome) ExitStatus {
     };
 }
 
-fn validPackage(package: []const u8) bool {
+fn validRequestPackage(package: []const u8) bool {
     if (package.len == 0 or package.len > 255 or package[0] == '-') return false;
     for (package) |byte|
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or
+            byte == '.' or byte == ':' or byte == '='))
+            return false;
+    return true;
+}
+
+fn validResultPackage(package: []const u8) bool {
+    if (package.len == 0 or package.len > 255 or
+        !std.ascii.isAlphanumeric(package[0]))
+        return false;
+    for (package[1..]) |byte|
         if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or
             byte == '.' or byte == ':' or byte == '='))
             return false;
@@ -617,6 +719,33 @@ fn requestDigestUnchecked(request: Request) [32]u8 {
     return sink.hasher.finalResult();
 }
 
+pub fn recoveryRequestDigest(context: RecoveryContext) ![32]u8 {
+    try validateRecoveryContext(context);
+    var buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(
+        &buffer,
+    );
+    writeRecoveryRequest(context, &sink.writer) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn writeRecoveryRequest(
+    context: RecoveryContext,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeAll("{\"schema\":");
+    try writeString(writer, recovery_request_schema_id);
+    try writer.writeAll(",\"version\":1,\"profile_path\":");
+    try writeString(writer, context.profile_path);
+    try writer.writeAll(",\"requested_operation\":");
+    if (context.requested_operation) |operation|
+        try writeString(writer, @tagName(operation))
+    else
+        try writer.writeAll("null");
+    try writer.writeByte('}');
+}
+
 fn writeRequest(request: Request, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
     try writeString(writer, request_schema_id);
@@ -655,19 +784,22 @@ fn writeResultPayload(result: Result, writer: *std.Io.Writer) !void {
 }
 
 fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
+    const wire_version = resultWireVersion(result);
     try writer.writeAll("{\"schema\":");
     try writeString(
         writer,
-        if (result.items.len == 0)
-            result_schema_id
-        else
-            result_items_schema_id,
+        switch (wire_version) {
+            .v1 => result_schema_id,
+            .v2 => result_items_schema_id,
+            .v3 => result_status_schema_id,
+        },
     );
     try writer.print(",\"version\":{},\"api_version\":{},\"operation\":", .{
-        if (result.items.len == 0)
-            schema_version
-        else
-            result_items_schema_version,
+        switch (wire_version) {
+            .v1 => schema_version,
+            .v2 => result_items_schema_version,
+            .v3 => result_status_schema_version,
+        },
         result.api_version,
     });
     try writeString(writer, @tagName(result.operation));
@@ -685,10 +817,34 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
     } else try writer.writeAll("null");
     try writer.writeAll(",\"outcome\":");
     try writeString(writer, @tagName(result.outcome));
-    try writer.print(",\"exit_status\":{},\"changed\":{},\"summary\":", .{
+    try writer.print(",\"exit_status\":{},\"changed\":{}", .{
         @intFromEnum(result.exit_status),
         result.changed,
     });
+    if (wire_version == .v3) {
+        try writer.writeAll(",\"mutation_status\":");
+        try writeString(
+            writer,
+            if (result.mutation_status != null)
+                "unknown"
+            else
+                "unchanged",
+        );
+        try writer.writeAll(",\"recovery_context\":");
+        if (result.recovery_context) |context| {
+            try writer.writeAll("{\"profile_path\":");
+            try writeString(writer, context.profile_path);
+            try writer.writeAll(",\"requested_operation\":");
+            if (context.requested_operation) |operation|
+                try writeString(writer, @tagName(operation))
+            else
+                try writer.writeAll("null");
+            try writer.writeAll(",\"action\":");
+            try writeOptionalString(writer, context.action);
+            try writer.writeByte('}');
+        } else try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"summary\":");
     try writeString(writer, result.summary);
     if (result.items.len != 0) {
         try writer.writeAll(",\"items\":[");
@@ -721,7 +877,23 @@ fn writeResultPayloadPrefix(result: Result, writer: *std.Io.Writer) !void {
         try writeString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
+
     try writer.writeByte(']');
+}
+
+const ResultWireVersion = enum {
+    v1,
+    v2,
+    v3,
+};
+
+fn resultWireVersion(result: Result) ResultWireVersion {
+    if (result.mutation_status != null or
+        result.recovery_context != null or
+        result.operation == .recover)
+        return .v3;
+    if (result.items.len == 0) return .v1;
+    return if (result.operation == .list_installed) .v2 else .v3;
 }
 
 fn writeEvidence(writer: *std.Io.Writer, evidence: Evidence) !void {
@@ -1269,7 +1441,7 @@ test "apt_system_api.test.text validation stops at bounded limits" {
     );
 }
 
-test "apt_system_api.test.list items are owned and bind the canonical digest" {
+test "apt_system_api.test.item-bearing results are owned and bind the canonical digest" {
     var package = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
     var version = [_]u8{ '1', '.', '2' };
     var architecture = [_]u8{ 'a', 'm', 'd', '6', '4' };
@@ -1322,6 +1494,304 @@ test "apt_system_api.test.list items are owned and bind the canonical digest" {
     var non_list = input;
     non_list.operation = .update;
     try std.testing.expectError(error.UnexpectedItems, validateResult(non_list));
+
+    var confirmation = try failure(
+        .{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{"alpha"},
+        },
+        .usage,
+        .confirmation_required,
+        "confirmation",
+        "confirmation required",
+    );
+    confirmation.profile = input.profile;
+    confirmation.items = &items;
+    confirmation.evidence.exact_lock = .{
+        .path = "/state/exact-lock.json",
+        .schema = "io.github.cataggar.debz.exact-closure-lock.v2",
+        .version = 2,
+        .digest_sha256 = @splat(0x44),
+    };
+    const completed_confirmation = try complete(confirmation);
+    const confirmation_document = try completed_confirmation.canonicalJson(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(confirmation_document);
+    const confirmation_fixture = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v3-confirmation.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(confirmation_fixture);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, confirmation_fixture, "\r\n"),
+        confirmation_document,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        confirmation_document,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\",\"version\":3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        confirmation_document,
+        "\"mutation_status\":\"unchanged\"",
+    ) != null);
+    confirmation.changed = true;
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(confirmation),
+    );
+    confirmation.changed = false;
+    confirmation.diagnostic_count = 2;
+    confirmation.diagnostics[1] = confirmation.diagnostics[0];
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(confirmation),
+    );
+}
+
+test "apt_system_api.test.result v2 canonical bytes and digest remain frozen" {
+    const result = try complete(.{
+        .operation = .list_installed,
+        .request_sha256 = @splat(0x11),
+        .profile = .{
+            .path = "/profile.json",
+            .sha256 = @splat(0x22),
+            .reference_evidence_sha256 = @splat(0x33),
+        },
+        .outcome = .success,
+        .exit_status = .success,
+        .summary = "installed packages",
+        .items = &.{.{
+            .package = "alpha",
+            .version = "1",
+            .architecture = "amd64",
+        }},
+    });
+    const canonical = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    const frozen = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v2-origin-main.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, frozen, "\r\n"),
+        canonical,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "\"mutation_status\"",
+    ) == null);
+}
+
+test "apt_system_api.test.request v1 canonical bytes and schema remain frozen" {
+    const request: Request = .{
+        .operation = .install,
+        .profile_path = "/profile.json",
+        .packages = &.{"+alpha"},
+    };
+    const canonical = try request.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    const frozen_document = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-request-v1-origin-main.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen_document);
+    try std.testing.expectEqualStrings(frozen_document, canonical);
+    var decoded = try decodeRequest(std.testing.allocator, frozen_document);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(
+        "+alpha",
+        decoded.request.packages[0],
+    );
+    const schema = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-request-v1.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(schema);
+    const frozen_schema = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-request-v1-origin-main.schema.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen_schema);
+    try std.testing.expectEqualStrings(frozen_schema, schema);
+}
+
+test "apt_system_api.test.request v1 and result item package grammars remain distinct" {
+    const result_valid = [_][]const u8{
+        "a", "Z", "0", "a+", "a-", "a.", "a:", "a=",
+    };
+    const result_invalid = [_][]const u8{
+        "+a", "-a", ".a", ":a", "=a", "a_b", "a/b", "\xc3\xa9", "\x1f",
+    };
+    const request_valid = [_][]const u8{
+        "a", "+a", ".a", ":a", "=a", "a+", "a-", "a.", "a:", "a=",
+    };
+    const request_invalid = [_][]const u8{
+        "-a", "a_b", "a/b", "\xc3\xa9", "\x1f",
+    };
+    for (request_valid) |package|
+        try validateRequest(.{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{package},
+        });
+    for (request_invalid) |package|
+        try std.testing.expectError(error.InvalidPackage, validateRequest(.{
+            .operation = .install,
+            .profile_path = "/profile.json",
+            .packages = &.{package},
+        }));
+    for (result_valid) |package| {
+        const result = try complete(.{
+            .operation = .list_installed,
+            .request_sha256 = @splat(0x11),
+            .profile = .{
+                .path = "/profile.json",
+                .sha256 = @splat(0x22),
+                .reference_evidence_sha256 = @splat(0x33),
+            },
+            .outcome = .success,
+            .exit_status = .success,
+            .summary = "installed",
+            .items = &.{.{ .package = package }},
+        });
+        const document = try result.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(document);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"schema\":\"https://debz.dev/schema/apt-system-result-v2\",\"version\":2",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"mutation_status\"",
+        ) == null);
+    }
+    for (result_invalid) |package|
+        try std.testing.expectError(error.InvalidItem, validateResult(.{
+            .operation = .list_installed,
+            .request_sha256 = @splat(0x11),
+            .profile = .{
+                .path = "/profile.json",
+                .sha256 = @splat(0x22),
+                .reference_evidence_sha256 = @splat(0x33),
+            },
+            .outcome = .success,
+            .exit_status = .success,
+            .summary = "installed",
+            .items = &.{.{ .package = package }},
+        }));
+    const too_long = "a" ** 256;
+    try std.testing.expectError(error.InvalidPackage, validateRequest(.{
+        .operation = .install,
+        .profile_path = "/profile.json",
+        .packages = &.{too_long},
+    }));
+}
+
+test "apt_system_api.test.unknown mutation status rejects all unverified evidence" {
+    const context: RecoveryContext = .{
+        .profile_path = "/profile.json",
+        .requested_operation = .install,
+    };
+    var unknown: Result = .{
+        .operation = .recover,
+        .request_sha256 = try recoveryRequestDigest(context),
+        .outcome = .recovery,
+        .exit_status = .recovery,
+        .summary = "mutation status unknown",
+        .mutation_status = .unknown,
+        .recovery_context = context,
+        .diagnostics = undefined,
+    };
+    unknown.diagnostics[0] = .{
+        .id = .recovery_required,
+        .outcome = .recovery,
+        .phase = "recovery",
+        .message = "mutation status unknown",
+    };
+    unknown.diagnostic_count = 1;
+    const completed = try complete(unknown);
+    const document = try completed.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(document);
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v3-unknown.document.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(fixture);
+    try std.testing.expectEqualStrings(
+        std.mem.trim(u8, fixture, "\r\n"),
+        document,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"schema\":\"https://debz.dev/schema/apt-system-result-v3\",\"version\":3",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"mutation_status\":\"unknown\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"operation\":\"recover\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "\"recovery_context\":{\"profile_path\":\"/profile.json\",\"requested_operation\":\"install\",\"action\":null}",
+    ) != null);
+    unknown.profile = .{
+        .path = "/profile.json",
+        .sha256 = @splat(0x11),
+        .reference_evidence_sha256 = @splat(0x22),
+    };
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
+    );
+    unknown.profile = null;
+    unknown.items = &.{.{ .package = "alpha" }};
+    try std.testing.expectError(
+        error.UnexpectedItems,
+        validateResult(unknown),
+    );
+    unknown.items = &.{};
+    unknown.diagnostics[0].id = .internal_error;
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
+    );
+    unknown.diagnostics[0].id = .recovery_required;
+    unknown.recovery_context = .{
+        .profile_path = "/profile.json",
+        .requested_operation = .install,
+        .action = "debz recover --system-profile /profile.json",
+    };
+    try std.testing.expectError(
+        error.InvalidMutationStatus,
+        validateResult(unknown),
+    );
 }
 
 test "apt_system_api.test.itemless results preserve exact v1 wire contract" {
@@ -1495,6 +1965,14 @@ test "apt_system_api.test.result v2 schema is an explicit bounded item extension
         .limited(maximum_document_bytes),
     );
     defer std.testing.allocator.free(source);
+    const frozen = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tools/fixtures/apt-system-result-v2-origin-main.schema.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(frozen);
+    try std.testing.expectEqualStrings(frozen, source);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -1519,4 +1997,34 @@ test "apt_system_api.test.result v2 schema is an explicit bounded item extension
         @as(i64, 1),
         properties.get("items").?.object.get("minItems").?.integer,
     );
+    try std.testing.expect(properties.get("mutation_status") == null);
+}
+
+test "apt_system_api.test.result v3 exclusively carries confirmation items or unknown status" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/apt-system-result-v3.json",
+        std.testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(source);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        source,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        result_status_schema_id,
+        parsed.value.object.get("$id").?.string,
+    );
+    const properties = parsed.value.object.get("properties").?.object;
+    try std.testing.expectEqual(
+        @as(i64, result_status_schema_version),
+        properties.get("version").?.object.get("const").?.integer,
+    );
+    const statuses = properties.get("mutation_status").?.object
+        .get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), statuses.len);
 }

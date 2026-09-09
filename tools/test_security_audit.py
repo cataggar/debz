@@ -136,6 +136,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
         self.assertEqual(
             [
+                "src/apt_system_command.zig",
                 "src/apt_system_orchestrator.zig",
                 "src/live_root.zig",
                 "src/maintainer_script.zig",
@@ -149,8 +150,14 @@ class SecurityAuditTests(unittest.TestCase):
             production_backend.index("linux.fork()"),
             production_backend.index('\ntest "'),
         )
+        apt_system_command = sources["src/apt_system_command.zig"]
+        self.assertEqual(apt_system_command.count("linux.fork()"), 1)
+        self.assertGreater(
+            apt_system_command.index("linux.fork()"),
+            apt_system_command.index('\ntest "'),
+        )
         apt_system_orchestrator = sources["src/apt_system_orchestrator.zig"]
-        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 2)
+        self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 1)
         first_test = apt_system_orchestrator.index('\ntest "')
         self.assertTrue(
             all(

@@ -127,6 +127,9 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "package-cache", "prepare" }, .usage = "debz package-cache prepare --lock-input PATH" },
         .{ .args = &.{"transaction-result"}, .usage = "debz transaction-result verify --state-path PATH" },
         .{ .args = &.{ "transaction-result", "verify" }, .usage = "debz transaction-result verify --state-path PATH" },
+        .{ .args = &.{"apt"}, .usage = "debz apt [--profile PATH] [--json] <command>" },
+        .{ .args = &.{ "apt", "install" }, .usage = "debz apt [--profile PATH] [--json] install [-y] PACKAGE..." },
+        .{ .args = &.{ "recover", "--system-profile", "/profile.json" }, .usage = "debz recover [--json] --system-profile PATH" },
         .{ .args = &.{"refresh"}, .usage = "debz refresh [options]" },
         .{ .args = &.{"install"}, .usage = "debz install [options] <package>" },
         .{ .args = &.{"remove"}, .usage = "debz remove [options] <package>" },
@@ -257,6 +260,11 @@ pub fn build(b: *std.Build) void {
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
     release_test_step.dependOn(&release_tests.step);
+    const apt_system_schema_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_apt_system_schema.py" },
+    );
+    release_test_step.dependOn(&apt_system_schema_tests.step);
+    test_step.dependOn(&apt_system_schema_tests.step);
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
@@ -288,11 +296,21 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"production workflow"},
     });
     const run_production_backend_tests = b.addRunArtifact(production_backend_tests);
+    const required_production_security_tests = b.addTest(.{
+        .root_module = production_backend_test_module,
+        .filters = &.{"production workflow required_security."},
+    });
+    const run_required_production_security_tests = b.addRunArtifact(
+        required_production_security_tests,
+    );
     const production_backend_test_step = b.step(
         "test-production-backend",
         "Run production backend workflow and exact-lock tests",
     );
     production_backend_test_step.dependOn(&run_production_backend_tests.step);
+    production_backend_test_step.dependOn(
+        &run_required_production_security_tests.step,
+    );
     test_step.dependOn(&run_production_backend_tests.step);
 
     const system_profile_test_module = b.createModule(.{
@@ -327,6 +345,40 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"apt_system_cli.test."},
     });
     const run_apt_system_cli_tests = b.addRunArtifact(apt_system_cli_tests);
+
+    const apt_system_command_test_module = b.createModule(.{
+        .root_source_file = b.path("src/apt_system_command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apt_system_command_test_module.addOptions(
+        "debz_build_options",
+        build_options,
+    );
+    apt_system_command_test_module.addIncludePath(
+        libsolv_dependency.path("src"),
+    );
+    apt_system_command_test_module.addIncludePath(
+        xz_dependency.path("src/liblzma/api"),
+    );
+    apt_system_command_test_module.addIncludePath(
+        zstd_dependency.path("lib"),
+    );
+    apt_system_command_test_module.addCMacro("LZMA_API_STATIC", "1");
+    apt_system_command_test_module.linkLibrary(libsolv);
+    apt_system_command_test_module.linkLibrary(liblzma);
+    apt_system_command_test_module.linkLibrary(zstd);
+    apt_system_command_test_module.link_libc = true;
+    const apt_system_command_tests = b.addTest(.{
+        .root_module = apt_system_command_test_module,
+        .filters = if (require_privileged_orchestration_tests)
+            &.{"apt_system_command.test.required_privileged."}
+        else
+            &.{"apt_system_command.test."},
+    });
+    const run_apt_system_command_tests = b.addRunArtifact(
+        apt_system_command_tests,
+    );
 
     const apt_system_state_test_module = b.createModule(.{
         .root_source_file = b.path("src/apt_system_state.zig"),
@@ -372,6 +424,13 @@ pub fn build(b: *std.Build) void {
     const run_apt_system_orchestrator_tests = b.addRunArtifact(
         apt_system_orchestrator_tests,
     );
+    const required_orchestrator_security_tests = b.addTest(.{
+        .root_module = apt_system_orchestrator_test_module,
+        .filters = &.{"apt_system_orchestrator.test.required_security."},
+    });
+    const run_required_orchestrator_security_tests = b.addRunArtifact(
+        required_orchestrator_security_tests,
+    );
 
     const apt_system_test_step = b.step(
         "test-apt-system",
@@ -380,13 +439,27 @@ pub fn build(b: *std.Build) void {
     apt_system_test_step.dependOn(&run_system_profile_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
+    apt_system_test_step.dependOn(&run_apt_system_command_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
     test_step.dependOn(&run_system_profile_tests.step);
     test_step.dependOn(&run_apt_system_api_tests.step);
     test_step.dependOn(&run_apt_system_cli_tests.step);
+    test_step.dependOn(&run_apt_system_command_tests.step);
     test_step.dependOn(&run_apt_system_state_tests.step);
     test_step.dependOn(&run_apt_system_orchestrator_tests.step);
+    const required_security_test_step = b.step(
+        "test-required-security",
+        "Run mandatory production ownership and restart security tests",
+    );
+    required_security_test_step.dependOn(
+        &run_required_production_security_tests.step,
+    );
+    required_security_test_step.dependOn(
+        &run_required_orchestrator_security_tests.step,
+    );
+    test_step.dependOn(&run_required_production_security_tests.step);
+    test_step.dependOn(&run_required_orchestrator_security_tests.step);
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,
@@ -665,11 +738,13 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-system-cli-diagnostic-v1.json",
         "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",
         "apt-system-request-v1.json",
         "apt-system-result-v1.json",
         "apt-system-result-v2.json",
+        "apt-system-result-v3.json",
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",

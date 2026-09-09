@@ -1,14 +1,13 @@
 # Apt-shaped system facade contracts
 
-`debz.apt_system_api` is a separate versioned orchestration contract for a
-future deliberately limited `debz apt` interface. `debz.apt_system_cli` now
+`debz.apt_system_api` is a separate versioned orchestration contract for the
+deliberately limited `debz apt` interface. `debz.apt_system_cli`
 defines its pure parsing, help, rendering, and confirmation-decision contract.
 `debz.apt_system_orchestrator` implements the reusable profile-bound engine
-behind that contract. Product API v1 and the existing root CLI remain
-unchanged. Neither module is wired into `main.zig`, so this document does not
-claim that the commands are currently exposed; the pure CLI module itself
-performs no dependency-solver, namespace, live-root, or production
-orchestration work.
+behind that contract, and `debz.apt_system_command` connects the strict parser
+to that engine. Product API v1 and its existing commands remain unchanged. The
+pure parser still performs no dependency-solver, namespace, live-root,
+terminal, or production orchestration work.
 
 The interface is **apt-shaped, not apt-compatible**. It promises no apt output,
 wording, exit-code convention, option aliases, configuration discovery, or
@@ -64,8 +63,158 @@ prompts.
 
 The exported confirmation seam deliberately performs no terminal calls.
 Non-`-y` mutation requests wait until a plan exists. A human request may then
-ask later integration for TTY confirmation; a JSON request instead requires a
-typed `confirmation_required` result and can never request a prompt.
+ask the executable integration for confirmation only when its input, plan
+output, and diagnostic streams are terminals. The complete atomic plan and
+exact-lock path are printed and flushed first. A negative answer, EOF, or
+non-TTY returns a typed
+`confirmation_required` result without executing. A JSON request instead
+returns one canonical result-v3 document containing the reviewed change items
+and can never prompt. Result-v2 remains reserved for `list_installed`; result-v3
+is used for mutating `confirmation_required` reviews. `-y` is solely the
+caller's confirmation signal; profile conffile policy is unchanged. Terminal
+confirmation reads one complete bounded line (64 content bytes maximum) and
+accepts only a trimmed whole-line `y` or `yes`. A yes-looking prefix, control
+bytes, or an overlong or incomplete line cannot authorize execution.
+
+System recovery has the separate strict spelling:
+
+```text
+debz recover [--json] --system-profile PATH
+```
+
+Human recovery prepares and renders the retained exact action before a
+recovery-specific TTY-only confirmation. The review carries verified
+tri-state mutation status derived from a generation-stable outer-state read
+and a root-locked compatible lower marker, record, and referenced completion;
+the outer `mutation_started` bit alone is not evidence. An exact bound prepared
+record with no lower mutation evidence may prove pre-mutation. Verified
+mutating, completed-success, released, pending-published, and
+acknowledged-published states prove mutation only with their exact compatible
+record and completion/provenance bindings. Missing, corrupt, swapped, foreign,
+or inconsistent evidence is UNKNOWN.
+
+A known-status review durably replaces the lower root-operation ownership
+marker with a `root-operation-recovery-review-v2` claim under the same lock and
+at the same marker path. The claim retains any prior marker verbatim and binds
+the outer attempt, generation and digest, trusted profile
+and reference, semantic request, exact lock, reviewed mutation status, nonce,
+the digest of any verified retained outer transaction, and exact lower
+evidence digests. It excludes a competing reservation while
+the prompt is open. Confirmed recovery must consume that exact claim under the
+same lower lock by atomically replacing it with an owner marker that retains
+the review-claim digest. Before rename the exact claim remains; after rename
+the exact replacement owner remains. Cancellation atomically restores the
+retained prior marker, or removes a clean-root claim durably. Changed evidence returns
+`confirmation_required` with phase `review_stale` and requires a fresh review.
+The original deferred-acknowledgment v1 wire format remains byte-for-byte
+canonical and readable for upgrades. Review-bound owners and new
+pre-mutation-reconciliation states use the versioned v2 marker schema; readers
+accept both versions but never reserialize a v1 document through the v2 layout.
+A prompt-time crash can adopt only the exact claim. Negative answers and EOF
+exact-release it without changing active operation state; JSON and UNKNOWN
+paths also release it and never strand prompt authorization.
+All cancellation paths use the same exact-capability disposition guard before
+invoking the release child. A confirmed release response disarms the guard;
+false, malformed, interrupted, or fatal responses trigger one OOM-independent
+lower-locked classification. A claim still present is exact-released, a release
+completed before response loss is accepted as clean, and a transferred owner
+is preserved and reported as recovery-required. Human review/output failures,
+negative or unavailable confirmation, JSON non-prompt cancellation, UNKNOWN
+cleanup, and stale-review rejection cannot call an unguarded release path.
+Settlement checks the complete retained prior-marker identity before examining
+review-binding fields. Version, state, attempts, acknowledgment identity,
+completion/provenance, pre-mutation binding, digest, and v2 review claim and
+binding fields must all match. An exact restored v1 or v2 prior owner is left
+intact and classified as a completed release; digest-only or field-mismatched
+documents remain foreign or unresolved.
+Review publication, validation, cancellation, atomic ownership exchange, and
+every destructive marker transition compare collision-resistant versioned
+identities. The legacy marker digest remains byte-compatible authority only
+for genuine v1 documents and is not unique v2 identity: two canonical v2
+owners may share it while carrying different review ownership. A v2 marker
+`exact_identity_sha256` hashes a domain tag, document version, and every
+security-relevant field except its own identity slot. A v2 review claim exact
+identity hashes every claim field plus the complete exact identity of its
+retained prior marker. Review-bound marker construction is ordered to avoid
+self-reference: compute the claim identity, hash the replacement marker
+ownership payload without binding/final-identity slots, compute the binding
+from those two identities, then compute the final marker identity including
+that binding. A transferred owner is recognized only with the reviewed outer
+acknowledgment identity, exact claim identity and binding, an allowed protocol
+state, and compatible record, completion, and provenance evidence. Publication,
+terminalization, acknowledgment, retention, rotation, restoration, and clear
+all reject a valid foreign v2 owner even when its legacy digest collides.
+Every destructive v2 store call requires an independently authenticated
+complete expected marker; attempt and acknowledgment IDs are accepted only
+for genuine v1 upgrade documents. Reading the current v2 marker is not
+authorization. A reservation therefore returns its complete exact owner token,
+which the outer operation carries into the subsequent execute invocation.
+Before any child can publish or exchange a v2 owner, the parent publishes
+`lower-ownership-token-v1.json` in the retained outer operation directory.
+This bounded canonical document binds the outer attempt, generation and state
+digest, request, trusted profile and reference, exact lock, semantic request,
+purpose, complete expected v2 marker bytes and exact identity, and any
+authenticated predecessor marker. Publication stages and fsyncs the file,
+renames it within the operation directory, and fsyncs that directory before
+the child runs. Token replacement accepts only an exact predecessor,
+collision-resistant review-owner continuation, or the operation-local exact
+workflow acknowledgment; a foreign marker with the same legacy digest cannot
+advance the token.
+When post-mutation outer evidence proves a clean lower root, recovery rotates
+the retained `recovery_review` token to a `clean_reconciliation` token with an
+operation-local compare-and-replace under the operation lock. The replacement
+binds the complete exact identity of the preparation token and the same outer
+attempt, request, profile, profile reference, exact lock, semantic request, and
+review owner. It is staged and file-synced before same-directory rename and
+operation-directory fsync. A crash before rename leaves the review token; a
+crash after rename leaves the reconciliation token. Restart accepts either
+exact state and never derives replacement authority from a missing, corrupt,
+or foreign token.
+Restart cleanup uses the retained operation-local acknowledgment or a fully
+reconstructed reviewed owner; if that evidence is absent, cleanup fails closed
+without changing the record or marker.
+Restart treats the observed lower marker only as evidence to compare. It loads
+the no-follow operation-local token first, verifies all outer/profile/request/
+lock bindings, and then requires the observed v2 identity to match the token,
+an exact state transition, or an exact retained workflow acknowledgment
+composed with the token's collision-resistant review identity. Missing,
+corrupt, stale, or foreign token evidence leaves the lower marker and record
+byte-for-byte unchanged.
+Frozen v1 review claims remain readable and byte-identical; an upgraded
+recovery derives their complete domain-separated identity from the exact
+canonical v1 document before transferring them into a v2 owner.
+After claim validation, every exit before atomic lower-protocol handoff
+exact-releases the claim. Restart cancellation requires either the original
+claim capability or a fully revalidated outer state, trusted profile, semantic
+request, exact lock, and matching claim owner; a path spelling or path digest
+alone is never cancellation authority. JSON cancellation is generated by the same
+production recovery preparation as human review, so its `changed` value and
+recovery action describe the exact reviewed mutation status rather than a
+generic install confirmation.
+
+Because child publication or atomic ownership transfer can precede the
+parent's transport response, the parent precomputes the exact claim capability
+and installs a disposition guard before invoking the child. Every failed
+handoff performs one lower-locked classification: it releases the exact claim,
+preserves an exact transferred owner, proves the claim already absent/restored,
+or reports cleanup-required evidence. Fatal allocation, contract, and
+invariant categories remain distinguishable from that durable disposition;
+transferred or foreign ownership is never silently cleared.
+
+A verified pre-mutation state may say that no package mutation occurred. A
+verified mutating or post-mutation state says that package mutation occurred or
+may be incomplete and that convergence may make further changes. UNKNOWN says
+that prior mutation status is unknown and fails closed without prompting or
+executing. Non-TTY input never invokes recovery. JSON recovery prepares but
+never prompts or mutates.
+Malformed recovery syntax is rejected before profile or operation-state I/O.
+Parse failures carry the output mode recognized from the valid canonical
+option prefix. Rejected command arguments, misplaced `--json`, and a
+`--json` token consumed as an invalid profile value cannot switch rendering.
+Decisive help for a recognized command returns before counting or inspecting
+the ignored suffix. The executable uses the same pure prefix scanner while
+collecting at most the parser limit plus one sentinel argument, so help does
+not require allocating or reading an unbounded suffix.
 
 ## Trusted system profile
 
@@ -153,9 +302,19 @@ machine interface. Itemless results retain the exact v1 wire format and digest.
 explicit additive result extension used when `list_installed` returns a
 non-empty bounded, owned `items` array preserving each package name and
 optional version, architecture, and detail. It keeps apt-system API version 1;
-no v1 document is emitted with a field that old v1 validators reject. Other
-operations cannot expose items, and v2 items participate in the canonical
-result digest. Runtime validation also measures the complete canonical
+its schema, required fields, canonical field order, bytes, and digest remain
+exactly compatible with the original result-v2 contract. No
+`mutation_status` field is added to v2.
+[`apt-system-result-v3.json`](../schema/apt-system-result-v3.json) is selected
+only for an item-bearing mutating `confirmation_required` review or an
+itemless fail-closed result with `mutation_status: "unknown"`. It cannot
+reinterpret a `list_installed` result. All item and status fields participate
+in the canonical result digest. An UNKNOWN result uses operation `recover`
+with a digest-bound recovery context containing only the requested profile
+path and, when known, the original requested operation. Its action is null:
+without verified active evidence it must give restoration/investigation
+guidance rather than loop by recommending the same recovery command. Runtime
+validation also measures the complete canonical
 encoding and rejects any result over the 256 KiB document ceiling, even when
 every individual item and the item count are otherwise valid.
 Production refresh repository-detail items are validated at the product
@@ -230,9 +389,9 @@ runner. Install, remove, and upgrade-all preparation instead:
 
 Preparation never executes a package transaction. The caller can render the
 review and either pass explicit confirmation to `execute` or return the
-versioned `confirmation_required` result. `-y` is therefore only a future
-caller's confirmation source; execution always takes conffile behavior from
-the loaded profile.
+versioned `confirmation_required` result. `-y` is therefore only a caller
+confirmation source; execution always takes conffile behavior from the loaded
+profile.
 
 Confirmed execution reloads and revalidates the profile, rereads the active
 state with locked compare-and-set, revalidates the full exact-lock binding
@@ -247,6 +406,42 @@ only install-root spelling supplied to a backend is
 `live_root.logical_root_path`; `/` remains denied by product API v1 and
 `live_root.host_root_allowed` remains false. Root, runtime, lock, or mountpoint
 replacement is surfaced as a typed conflict.
+
+If confirmed execution returns an unexpected transport, verification,
+publication, durability, CAS, or acknowledgment error, the CLI does not infer
+that mutation was absent. It asks the engine to inspect the exact active state
+while holding the state lock and emits an owned recovery result carrying the
+profile, exact lock, active-state path, and any retained transaction or
+completion evidence. `changed=true` requires either deeply verified completion
+evidence or a matching outer profile/lock together with an exact lower
+ownership marker and root-operation record that bind the same attempt,
+semantic workflow request, and observed mutation. A marker acknowledgment ID
+or outer `mutation_started` bit alone is never mutation proof. The exact
+`debz recover --system-profile PATH` action is emitted only with that verified
+actionable evidence. The same reconciliation applies to errors during
+confirmed recovery.
+
+If durable state inspection is unavailable, corrupt, absent, or foreign and
+no exact lower owner proves mutation, result v3 reports
+`mutation_status: "unknown"`, carries no unverified profile, lock, or active
+state evidence, and human output says `Changed: unknown (recovery required)`.
+A matching durable pre-mutation outer state plus a provably clean lower state
+is the only path that reports a clean internal failure. That proof publishes a
+root-locked exact-owner exclusion and then rechecks the identical outer
+generation and digest under its state lock before finalizing; a concurrent
+advance yields UNKNOWN. Recovery preparation
+uses the same fail-closed distinction instead of converting state I/O errors
+to a generic internal diagnostic.
+Production execution reconciles lock, state, transport, interruption, and
+durability failures at the engine boundary where durable context remains
+available. Allocation, invariant, and contract errors propagate to the
+internal-failure boundary and never fabricate recovery evidence.
+
+Request-v1 package selectors retain their frozen grammar: any nonempty
+sequence of ASCII alphanumeric bytes or `+ - . : =` is accepted except a
+leading `-`. Result-v2/v3 item names are deliberately stricter: the first byte
+must be ASCII alphanumeric, and remaining bytes may additionally be one of
+`+ - . : =`.
 
 The trusted profile-reference lease is revalidated immediately before every
 read-only route and every plan, download, execute, and recovery workflow call.
@@ -445,6 +640,16 @@ fabricate a transaction result. Crashes at every outer post-backend boundary
 converge through this reconciliation path exactly once, while canonical or
 binding mismatches remain recovery-required.
 
+Proving a failure happened before mutation uses a different internal marker:
+`pre_mutation_reconciliation_claim`. It binds the exact outer attempt, captured
+outer generation and state digest, trusted profile and reference digests,
+semantic request digest, and exact-lock digest. It is never interpreted as a
+released transaction or recovery completion. A restart can adopt only that
+exact claim, including after the retained failure or active-state CAS was
+published, finish the failed-before-mutation state, and exact-acknowledge the
+claim. Foreign attempts and inconsistent marker/record pairs retain all state
+and return UNKNOWN instead of clearing or entering transaction verification.
+
 Profile loading, live-root execution, workflow backend, state store,
 confirmation, result verifier, clock, and attempt-ID generation are explicit
 dependencies. Hermetic tests use injected fakes plus production-created
@@ -454,3 +659,16 @@ production adapters cover the strict profile loader, `ProductionWorkflow`,
 durable system store, and lock/provenance verifier. Only the capability-gated
 private-runner integration test enters the real namespace supervisor; it skips
 when the required Linux root namespace capabilities are unavailable.
+
+Trusted-profile revalidation and every private live-root invocation,
+inspection, completion read, and acknowledgment cross a finite typed boundary.
+The production child reports backend failures in a fixed-size versioned,
+allocation-free envelope. The parent validates its category and allowlisted
+code before mapping operational failures to reconciliation or propagating
+out-of-memory, contract, and invariant failures unchanged; malformed envelopes
+fail closed as transport contract failures.
+Operational trust replacement, I/O, lock, transport, signal, privilege, and
+root-replacement failures enter the durable failure/reconciliation policy.
+Allocation failures and invariant or contract violations propagate to the
+top-level internal-failure path without publishing a failed outcome, clearing
+active state, or fabricating recovery evidence.

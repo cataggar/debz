@@ -41,10 +41,12 @@ test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
 for schema in \
   apt-config-snapshot-v1.json \
+  apt-system-cli-diagnostic-v1.json \
   apt-system-operation-state-v1.json \
   apt-system-request-v1.json \
   apt-system-result-v1.json \
   apt-system-result-v2.json \
+  apt-system-result-v3.json \
   command-result-v1.json \
   exact-closure-lock-v1.json \
   exact-closure-lock-v2.json \
