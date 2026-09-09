@@ -761,6 +761,7 @@ fn installReleaseFiles(
         "integration-roots.md",
         "maintainer-script-runner.md",
         "multi-repository-policy.md",
+        "native-conffiles.md",
         "native-transaction-engine-v1.md",
         "native-transaction-program.md",
         "native-unpack.md",
