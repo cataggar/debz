@@ -1282,7 +1282,11 @@ pub const PrivateLiveRootRunner = struct {
                         ownership_acknowledgment = .{
                             .attempt_id = marker.attempt_id,
                             .marker_sha256 = marker.digest_sha256,
+                            .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                                marker,
+                            ),
                             .acknowledgment_id = marker.acknowledgment_id,
+                            .marker = marker,
                         };
                     }
                     if (workflow_invocation.request.reconciliation_claim !=
@@ -1715,6 +1719,10 @@ pub const PrivateLiveRootRunner = struct {
             .nonce = input.expected_claim.nonce,
             .marker_sha256 = if (marker) |value|
                 value.digest_sha256
+            else
+                null,
+            .marker_exact_identity_sha256 = if (marker) |value|
+                root_operation.deferredAcknowledgmentExactIdentity(value)
             else
                 null,
             .prior_marker = marker,
@@ -3206,10 +3214,9 @@ pub const SystemStateStore = struct {
                 allocator,
                 existing,
             );
-            if (!std.mem.eql(
-                u8,
-                &decoded.digest_sha256,
-                &acknowledgment.digest_sha256,
+            if (!root_operation.deferredAcknowledgmentExactEqual(
+                decoded,
+                acknowledgment,
             )) return error.PublicationConflict;
             return;
         }
@@ -4995,13 +5002,17 @@ pub const Engine = struct {
             if (review_claim_consumed) {
                 if (claim_transferred) |transferred| transferred.* = true;
             }
-            exclusion = .{
-                .state = .pre_mutation_reconciliation_claim,
-                .attempt_id = acknowledgment.attempt_id,
-                .pre_mutation_claim = claim_binding,
-                .acknowledgment_id = acknowledgment.acknowledgment_id,
-                .digest_sha256 = acknowledgment.marker_sha256,
-            };
+            exclusion = acknowledgment.marker;
+            if (!preMutationReconciliationClaimMatches(
+                exclusion,
+                prepared,
+                snapshot,
+                verified_lock,
+            )) return self.reconcileUnknownPreparedFailure(
+                allocator,
+                prepared,
+                "the lower clean-state exclusion claim returned foreign exact ownership",
+            );
             self.hitCompletionBoundary(
                 .after_pre_mutation_claim_published,
             ) catch return self.reconcileUnknownPreparedFailure(
@@ -5805,6 +5816,10 @@ pub const Engine = struct {
             .nonce = recoveryReviewNonce(preparation),
             .marker_sha256 = if (lower.deferred_acknowledgment) |marker|
                 marker.digest_sha256
+            else
+                null,
+            .marker_exact_identity_sha256 = if (lower.deferred_acknowledgment) |marker|
+                root_operation.deferredAcknowledgmentExactIdentity(marker)
             else
                 null,
             .prior_marker = lower.deferred_acknowledgment,
@@ -6961,6 +6976,18 @@ pub const Engine = struct {
         defer allocator.free(selectors);
         switch (acknowledgment.state) {
             .released, .abandoned, .pre_mutation_reconciliation_claim => {
+                const exact_acknowledgment = if (recovery_review_claim) |claim|
+                    if (claim.prior_marker) |prior| prior: {
+                        if (committed.outcome == .succeeded and
+                            !root_operation.deferredAcknowledgmentExactEqual(
+                                acknowledgment,
+                                prior,
+                            ))
+                            return error.InvalidEvidence;
+                        break :prior prior;
+                    } else acknowledgment
+                else
+                    acknowledgment;
                 try self.hitCompletionBoundary(.before_ownership_acknowledged);
                 var finalized = self.runner.workflow(
                     allocator,
@@ -6979,9 +7006,13 @@ pub const Engine = struct {
                         .recovery_review_claim = recovery_review_claim,
                         .finalize_ownership = true,
                         .ownership_acknowledgment = .{
-                            .attempt_id = acknowledgment.attempt_id,
-                            .marker_sha256 = acknowledgment.digest_sha256,
-                            .acknowledgment_id = acknowledgment.acknowledgment_id,
+                            .attempt_id = exact_acknowledgment.attempt_id,
+                            .marker_sha256 = exact_acknowledgment.digest_sha256,
+                            .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                                exact_acknowledgment,
+                            ),
+                            .acknowledgment_id = exact_acknowledgment.acknowledgment_id,
+                            .marker = exact_acknowledgment,
                         },
                     },
                 ) catch |err| switch (err) {
@@ -9307,7 +9338,9 @@ fn ownershipAcknowledgment(
     return .{
         .attempt_id = marker.attempt_id,
         .marker_sha256 = marker.digest_sha256,
+        .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(marker),
         .acknowledgment_id = acknowledgment_id,
+        .marker = marker,
     };
 }
 
@@ -9318,15 +9351,23 @@ fn durableLowerAcknowledgment(
     if (ownership != null and recovery != null)
         return error.AmbiguousLowerAcknowledgment;
     if (ownership) |acknowledgment| {
-        const marker = try root_operation.createDeferredAcknowledgment(.{
-            .state = .released,
-            .attempt_id = acknowledgment.attempt_id,
-            .acknowledgment_id = acknowledgment.acknowledgment_id,
-        });
+        const marker = acknowledgment.marker;
         if (!std.mem.eql(
             u8,
             &marker.digest_sha256,
             &acknowledgment.marker_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &root_operation.deferredAcknowledgmentExactIdentity(marker),
+            &acknowledgment.marker_exact_identity_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &marker.attempt_id,
+            &acknowledgment.attempt_id,
+        ) or !std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &acknowledgment.acknowledgment_id,
         )) return error.LowerAcknowledgmentMismatch;
         return marker;
     }
@@ -9353,11 +9394,11 @@ fn lowerAcknowledgmentMatches(
         ))
         return false;
     return switch (durable.state) {
-        .released => observed.state == .released and std.mem.eql(
-            u8,
-            &durable.digest_sha256,
-            &observed.digest_sha256,
-        ),
+        .released => observed.state == .released and
+            root_operation.deferredAcknowledgmentExactEqual(
+                durable,
+                observed,
+            ),
         .pending => (observed.state == .pending or
             observed.state == .acknowledged) and
             optionalDigestEqual(
@@ -11518,6 +11559,10 @@ const FakeRunner = struct {
                 marker.digest_sha256
             else
                 null,
+            .marker_exact_identity_sha256 = if (lower.deferred_acknowledgment) |marker|
+                root_operation.deferredAcknowledgmentExactIdentity(marker)
+            else
+                null,
             .prior_marker = lower.deferred_acknowledgment,
             .record_sha256 = if (lower.record) |owned|
                 owned.record.digest_sha256
@@ -12699,10 +12744,9 @@ const FakeStateStore = struct {
     ) !void {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
         if (self.lower_acknowledgment) |existing| {
-            if (!std.mem.eql(
-                u8,
-                &existing.digest_sha256,
-                &acknowledgment.digest_sha256,
+            if (!root_operation.deferredAcknowledgmentExactEqual(
+                existing,
+                acknowledgment,
             )) return error.PublicationConflict;
             return;
         }
@@ -15114,7 +15158,11 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
                     .ownership_acknowledgment = .{
                         .attempt_id = abandoned_marker.attempt_id,
                         .marker_sha256 = abandoned_marker.digest_sha256,
+                        .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                            abandoned_marker,
+                        ),
                         .acknowledgment_id = @splat(0xa7),
+                        .marker = abandoned_marker,
                     },
                 },
             );
@@ -15202,7 +15250,11 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
                         .ownership_acknowledgment = .{
                             .attempt_id = marker.attempt_id,
                             .marker_sha256 = marker.digest_sha256,
+                            .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(
+                                marker,
+                            ),
                             .acknowledgment_id = prepared.attempt_id,
+                            .marker = marker,
                         },
                     },
                 );
@@ -16780,7 +16832,7 @@ test "apt_system_orchestrator.test.required_privileged.production response loss 
         .{ .state = .released, .loss = .partial_response },
         .{ .state = .pending, .loss = .operational_after_clear },
     }) |case| {
-        const prior = try root_operation.createDeferredAcknowledgment(.{
+        const prior_base = try root_operation.createDeferredAcknowledgment(.{
             .state = case.state,
             .attempt_id = base.attempt_id,
             .completion_sha256 = if (case.state == .pending)
@@ -16792,14 +16844,18 @@ test "apt_system_orchestrator.test.required_privileged.production response loss 
             else
                 null,
             .acknowledgment_id = base.acknowledgment_id,
-            .recovery_review_claim_sha256 = base.recovery_review_claim_sha256,
         });
+        const prior =
+            try root_operation.carryDeferredAcknowledgmentReviewOwner(
+                prior_base,
+                base,
+            );
         if (try lower_store.readDeferredAcknowledgment(
             std.testing.allocator,
         )) |existing| {
             try lower_store.clearDeferredAcknowledgment(
                 std.testing.allocator,
-                existing.digest_sha256,
+                existing,
             );
         }
         try lower_store.publishDeferredAcknowledgment(
@@ -17852,24 +17908,44 @@ test "apt_system_orchestrator.test.valid v2 prior collision makes concurrent rev
 
     const base = harness.runner.inspect_deferred_acknowledgment orelse
         return error.MissingDeferredAcknowledgment;
-    const prior_a = try root_operation.createDeferredAcknowledgment(.{
+    const prior_base = try root_operation.createDeferredAcknowledgment(.{
         .state = base.state,
         .attempt_id = base.attempt_id,
         .completion_sha256 = base.completion_sha256,
         .provenance_sha256 = base.provenance_sha256,
         .pre_mutation_claim = base.pre_mutation_claim,
         .acknowledgment_id = base.acknowledgment_id,
-        .recovery_review_claim_sha256 = @splat(0x91),
     });
-    const prior_b = try root_operation.createDeferredAcknowledgment(.{
-        .state = base.state,
-        .attempt_id = base.attempt_id,
-        .completion_sha256 = base.completion_sha256,
-        .provenance_sha256 = base.provenance_sha256,
-        .pre_mutation_claim = base.pre_mutation_claim,
-        .acknowledgment_id = base.acknowledgment_id,
-        .recovery_review_claim_sha256 = @splat(0x92),
+    const owner_a = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior_base.acknowledgment_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(0x91),
+        .profile_sha256 = @splat(0x92),
+        .profile_reference_sha256 = @splat(0x93),
+        .exact_lock_sha256 = @splat(0x94),
+        .semantic_request_sha256 = @splat(0x95),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0x96),
     });
+    const owner_b = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = owner_a.outer_attempt_id,
+        .outer_generation = owner_a.outer_generation,
+        .outer_state_sha256 = owner_a.outer_state_sha256,
+        .profile_sha256 = owner_a.profile_sha256,
+        .profile_reference_sha256 = owner_a.profile_reference_sha256,
+        .exact_lock_sha256 = owner_a.exact_lock_sha256,
+        .semantic_request_sha256 = owner_a.semantic_request_sha256,
+        .mutation_status = owner_a.mutation_status,
+        .nonce = @splat(0x97),
+    });
+    const prior_a = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+        prior_base,
+        owner_a,
+    );
+    const prior_b = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+        prior_base,
+        owner_b,
+    );
     try std.testing.expectEqualSlices(
         u8,
         &prior_a.digest_sha256,
@@ -20951,18 +21027,42 @@ test "apt_system_orchestrator.test.cancellation guard classifies fatal stale and
 }
 
 test "apt_system_orchestrator.test.settlement prefers complete prior identity over review binding" {
-    const prior_v2 = try root_operation.createDeferredAcknowledgment(.{
+    const prior_base = try root_operation.createDeferredAcknowledgment(.{
         .state = .released,
         .attempt_id = @splat(0xa1),
         .acknowledgment_id = @splat(0xa4),
-        .recovery_review_claim_sha256 = @splat(0xa5),
     });
-    const collision_prior = try root_operation.createDeferredAcknowledgment(.{
-        .state = prior_v2.state,
-        .attempt_id = prior_v2.attempt_id,
-        .acknowledgment_id = prior_v2.acknowledgment_id,
-        .recovery_review_claim_sha256 = @splat(0xaf),
+    const prior_owner = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior_base.acknowledgment_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(0xa5),
+        .profile_sha256 = @splat(0xa6),
+        .profile_reference_sha256 = @splat(0xa7),
+        .exact_lock_sha256 = @splat(0xa8),
+        .semantic_request_sha256 = @splat(0xa9),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xaa),
     });
+    const collision_owner = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior_owner.outer_attempt_id,
+        .outer_generation = prior_owner.outer_generation,
+        .outer_state_sha256 = prior_owner.outer_state_sha256,
+        .profile_sha256 = prior_owner.profile_sha256,
+        .profile_reference_sha256 = prior_owner.profile_reference_sha256,
+        .exact_lock_sha256 = prior_owner.exact_lock_sha256,
+        .semantic_request_sha256 = prior_owner.semantic_request_sha256,
+        .mutation_status = prior_owner.mutation_status,
+        .nonce = @splat(0xaf),
+    });
+    const prior_v2 = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+        prior_base,
+        prior_owner,
+    );
+    const collision_prior =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            prior_base,
+            collision_owner,
+        );
     try std.testing.expectEqualSlices(
         u8,
         &prior_v2.digest_sha256,
@@ -20985,6 +21085,7 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         .mutation_status = .changed,
         .nonce = @splat(0xb7),
         .marker_sha256 = prior_v2.digest_sha256,
+        .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(prior_v2),
         .prior_marker = prior_v2,
         .record_sha256 = @splat(0xb8),
     });
@@ -21008,12 +21109,16 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         ),
     );
 
-    const transferred = try root_operation.createDeferredAcknowledgment(.{
+    const transferred_base = try root_operation.createDeferredAcknowledgment(.{
         .state = .released,
         .attempt_id = @splat(0xc1),
         .acknowledgment_id = claim.outer_attempt_id,
-        .recovery_review_claim_sha256 = claim.digest_sha256,
     });
+    const transferred =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            transferred_base,
+            claim,
+        );
     try std.testing.expectEqual(
         RecoveryReviewDisposition.transferred_owner,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
@@ -21024,12 +21129,16 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         ),
     );
 
-    const foreign_ack = try root_operation.createDeferredAcknowledgment(.{
+    const foreign_ack_base = try root_operation.createDeferredAcknowledgment(.{
         .state = .released,
         .attempt_id = transferred.attempt_id,
         .acknowledgment_id = @splat(0xc2),
-        .recovery_review_claim_sha256 = claim.digest_sha256,
     });
+    const foreign_ack =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            foreign_ack_base,
+            claim,
+        );
     try std.testing.expectEqual(
         RecoveryReviewDisposition.unresolved,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
@@ -21039,12 +21148,28 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
             null,
         ),
     );
-    const foreign_binding = try root_operation.createDeferredAcknowledgment(.{
-        .state = .released,
-        .attempt_id = transferred.attempt_id,
-        .acknowledgment_id = claim.outer_attempt_id,
-        .recovery_review_claim_sha256 = @splat(0xc3),
+    const foreign_binding_base =
+        try root_operation.createDeferredAcknowledgment(.{
+            .state = .released,
+            .attempt_id = transferred.attempt_id,
+            .acknowledgment_id = claim.outer_attempt_id,
+        });
+    const foreign_claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = claim.outer_attempt_id,
+        .outer_generation = claim.outer_generation,
+        .outer_state_sha256 = claim.outer_state_sha256,
+        .profile_sha256 = claim.profile_sha256,
+        .profile_reference_sha256 = claim.profile_reference_sha256,
+        .exact_lock_sha256 = claim.exact_lock_sha256,
+        .semantic_request_sha256 = claim.semantic_request_sha256,
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xc3),
     });
+    const foreign_binding =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            foreign_binding_base,
+            foreign_claim,
+        );
     try std.testing.expectEqual(
         RecoveryReviewDisposition.unresolved,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
@@ -21054,14 +21179,19 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
             null,
         ),
     );
-    const unsupported_state = try root_operation.createDeferredAcknowledgment(.{
-        .state = .pending,
-        .attempt_id = transferred.attempt_id,
-        .completion_sha256 = @splat(0xc4),
-        .provenance_sha256 = @splat(0xc5),
-        .acknowledgment_id = claim.outer_attempt_id,
-        .recovery_review_claim_sha256 = claim.digest_sha256,
-    });
+    const unsupported_state_base =
+        try root_operation.createDeferredAcknowledgment(.{
+            .state = .pending,
+            .attempt_id = transferred.attempt_id,
+            .completion_sha256 = @splat(0xc4),
+            .provenance_sha256 = @splat(0xc5),
+            .acknowledgment_id = claim.outer_attempt_id,
+        });
+    const unsupported_state =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            unsupported_state_base,
+            claim,
+        );
     try std.testing.expectEqual(
         RecoveryReviewDisposition.unresolved,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
@@ -21088,6 +21218,7 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         .mutation_status = .unchanged,
         .nonce = @splat(0xd9),
         .marker_sha256 = prior_v1.digest_sha256,
+        .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(prior_v1),
         .prior_marker = prior_v1,
     });
     try std.testing.expectEqual(

@@ -94,7 +94,7 @@ record and completion/provenance bindings. Missing, corrupt, swapped, foreign,
 or inconsistent evidence is UNKNOWN.
 
 A known-status review durably replaces the lower root-operation ownership
-marker with a `root-operation-recovery-review-v1` claim under the same lock and
+marker with a `root-operation-recovery-review-v2` claim under the same lock and
 at the same marker path. The claim retains any prior marker verbatim and binds
 the outer attempt, generation and digest, trusted profile
 and reference, semantic request, exact lock, reviewed mutation status, nonce,
@@ -127,14 +127,26 @@ completion/provenance, pre-mutation binding, digest, and v2 review claim and
 binding fields must all match. An exact restored v1 or v2 prior owner is left
 intact and classified as a completed release; digest-only or field-mismatched
 documents remain foreign or unresolved.
-Review publication, validation, cancellation, and atomic ownership exchange
-likewise compare the complete canonical claim, recursively including the exact
-prior marker. The legacy marker digest intentionally remains compatible with
-v1 and is not treated as unique v2 identity: two canonical v2 owners may share
-that digest while carrying different review bindings. A transferred owner is
-recognized only with the reviewed outer acknowledgment identity, exact claim
-and binding, an allowed protocol state, and compatible record,
-completion, and provenance evidence.
+Review publication, validation, cancellation, atomic ownership exchange, and
+every destructive marker transition compare collision-resistant versioned
+identities. The legacy marker digest remains byte-compatible authority only
+for genuine v1 documents and is not unique v2 identity: two canonical v2
+owners may share it while carrying different review ownership. A v2 marker
+`exact_identity_sha256` hashes a domain tag, document version, and every
+security-relevant field except its own identity slot. A v2 review claim exact
+identity hashes every claim field plus the complete exact identity of its
+retained prior marker. Review-bound marker construction is ordered to avoid
+self-reference: compute the claim identity, hash the replacement marker
+ownership payload without binding/final-identity slots, compute the binding
+from those two identities, then compute the final marker identity including
+that binding. A transferred owner is recognized only with the reviewed outer
+acknowledgment identity, exact claim identity and binding, an allowed protocol
+state, and compatible record, completion, and provenance evidence. Publication,
+terminalization, acknowledgment, retention, rotation, restoration, and clear
+all reject a valid foreign v2 owner even when its legacy digest collides.
+Frozen v1 review claims remain readable and byte-identical; an upgraded
+recovery derives their complete domain-separated identity from the exact
+canonical v1 document before transferring them into a v2 owner.
 After claim validation, every exit before atomic lower-protocol handoff
 exact-releases the claim. Restart cancellation requires either the original
 claim capability or a fully revalidated outer state, trusted profile, semantic
