@@ -58,10 +58,10 @@ pub const namespace_path = "var/lib/debz";
 pub const lock_name = "root-operation.lock";
 pub const record_name = "root-operation-v1.json";
 pub const deferred_ack_name = "root-operation-deferred-ack-v1.json";
-pub const recovery_review_name = "root-operation-recovery-review-v1.json";
+pub const recovery_review_name = deferred_ack_name;
 pub const record_path = namespace_path ++ "/" ++ record_name;
 pub const deferred_ack_path = namespace_path ++ "/" ++ deferred_ack_name;
-pub const recovery_review_path = namespace_path ++ "/" ++ recovery_review_name;
+pub const recovery_review_path = deferred_ack_path;
 pub const lock_path = namespace_path ++ "/" ++ lock_name;
 
 /// Transaction backend the attempt is bound to. A record written for one
@@ -277,7 +277,6 @@ pub const RecoveryReviewClaim = struct {
     outer_attempt_id: [32]u8,
     outer_generation: u64,
     outer_state_sha256: [32]u8,
-    profile_path_sha256: [32]u8,
     profile_sha256: [32]u8,
     profile_reference_sha256: [32]u8,
     exact_lock_sha256: [32]u8,
@@ -286,6 +285,7 @@ pub const RecoveryReviewClaim = struct {
     mutation_status: RecoveryReviewMutationStatus,
     nonce: [32]u8,
     marker_sha256: ?[32]u8 = null,
+    prior_marker: ?DeferredAcknowledgment = null,
     record_sha256: ?[32]u8 = null,
     completion_sha256: ?[32]u8 = null,
     digest_sha256: [32]u8 = @splat(0),
@@ -323,6 +323,18 @@ pub fn createRecoveryReviewClaim(
 
 fn validRecoveryReviewClaim(claim: RecoveryReviewClaim) bool {
     if (claim.outer_generation == 0) return false;
+    if ((claim.prior_marker == null) != (claim.marker_sha256 == null))
+        return false;
+    if (claim.prior_marker) |marker|
+        if (!validDeferredAcknowledgment(marker) or !std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &claim.marker_sha256.?,
+        ) or !std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &deferredAcknowledgmentDigest(marker),
+        )) return false;
     return switch (claim.mutation_status) {
         .unchanged => claim.outer_transaction_sha256 == null and
             claim.completion_sha256 == null and
@@ -364,6 +376,8 @@ pub const DeferredAcknowledgment = struct {
     provenance_sha256: ?[32]u8 = null,
     pre_mutation_claim: ?PreMutationReconciliationClaimBinding = null,
     acknowledgment_id: [32]u8,
+    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_binding_sha256: ?[32]u8 = null,
     digest_sha256: [32]u8 = @splat(0),
 
     pub fn canonicalJson(
@@ -421,14 +435,25 @@ pub const OwnershipCleanup = struct {
 pub fn createDeferredAcknowledgment(
     input: DeferredAcknowledgment,
 ) !DeferredAcknowledgment {
-    if (!validDeferredAcknowledgment(input))
-        return error.InvalidDocument;
     var result = input;
     result.digest_sha256 = deferredAcknowledgmentDigest(result);
+    result.recovery_review_binding_sha256 =
+        recoveryReviewBindingDigest(result);
+    if (!validDeferredAcknowledgment(result))
+        return error.InvalidDocument;
     return result;
 }
 
 fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
+    if ((marker.recovery_review_claim_sha256 == null) !=
+        (marker.recovery_review_binding_sha256 == null))
+        return false;
+    if (marker.recovery_review_binding_sha256) |binding|
+        if (!std.mem.eql(
+            u8,
+            &binding,
+            &(recoveryReviewBindingDigest(marker) orelse return false),
+        )) return false;
     return switch (marker.state) {
         .bound,
         .released,
@@ -663,6 +688,8 @@ const WireDeferredAcknowledgment = struct {
     provenance_sha256: ?[]const u8,
     pre_mutation_claim: ?WirePreMutationReconciliationClaim = null,
     acknowledgment_id: []const u8,
+    recovery_review_claim_sha256: ?[]const u8 = null,
+    recovery_review_binding_sha256: ?[]const u8 = null,
     digest_sha256: []const u8,
 };
 
@@ -672,7 +699,6 @@ const WireRecoveryReviewClaim = struct {
     outer_attempt_id: []const u8,
     outer_generation: u64,
     outer_state_sha256: []const u8,
-    profile_path_sha256: []const u8,
     profile_sha256: []const u8,
     profile_reference_sha256: []const u8,
     exact_lock_sha256: []const u8,
@@ -681,6 +707,7 @@ const WireRecoveryReviewClaim = struct {
     mutation_status: RecoveryReviewMutationStatus,
     nonce: []const u8,
     marker_sha256: ?[]const u8,
+    prior_marker: ?WireDeferredAcknowledgment = null,
     record_sha256: ?[]const u8,
     completion_sha256: ?[]const u8,
     digest_sha256: []const u8,
@@ -717,6 +744,12 @@ pub fn decodeDeferredAcknowledgment(
             .semantic_request_sha256 = try parseHex(32, claim.semantic_request_sha256),
         } else null,
         .acknowledgment_id = try parseHex(32, wire.acknowledgment_id),
+        .recovery_review_claim_sha256 = try parseOptionalHex(
+            wire.recovery_review_claim_sha256,
+        ),
+        .recovery_review_binding_sha256 = try parseOptionalHex(
+            wire.recovery_review_binding_sha256,
+        ),
         .digest_sha256 = try parseHex(32, wire.digest_sha256),
     };
     if (!validDeferredAcknowledgment(decoded))
@@ -752,7 +785,6 @@ pub fn decodeRecoveryReviewClaim(
         .outer_attempt_id = try parseHex(32, wire.outer_attempt_id),
         .outer_generation = wire.outer_generation,
         .outer_state_sha256 = try parseHex(32, wire.outer_state_sha256),
-        .profile_path_sha256 = try parseHex(32, wire.profile_path_sha256),
         .profile_sha256 = try parseHex(32, wire.profile_sha256),
         .profile_reference_sha256 = try parseHex(
             32,
@@ -769,6 +801,45 @@ pub fn decodeRecoveryReviewClaim(
         .mutation_status = wire.mutation_status,
         .nonce = try parseHex(32, wire.nonce),
         .marker_sha256 = try parseOptionalHex(wire.marker_sha256),
+        .prior_marker = if (wire.prior_marker) |marker| .{
+            .state = marker.state,
+            .attempt_id = try parseHex(32, marker.attempt_id),
+            .completion_sha256 = try parseOptionalHex(
+                marker.completion_sha256,
+            ),
+            .provenance_sha256 = try parseOptionalHex(
+                marker.provenance_sha256,
+            ),
+            .pre_mutation_claim = if (marker.pre_mutation_claim) |claim| .{
+                .outer_attempt_id = try parseHex(32, claim.outer_attempt_id),
+                .outer_generation = claim.outer_generation,
+                .outer_state_sha256 = try parseHex(
+                    32,
+                    claim.outer_state_sha256,
+                ),
+                .profile_sha256 = try parseHex(32, claim.profile_sha256),
+                .profile_reference_sha256 = try parseHex(
+                    32,
+                    claim.profile_reference_sha256,
+                ),
+                .exact_lock_sha256 = try parseHex(
+                    32,
+                    claim.exact_lock_sha256,
+                ),
+                .semantic_request_sha256 = try parseHex(
+                    32,
+                    claim.semantic_request_sha256,
+                ),
+            } else null,
+            .acknowledgment_id = try parseHex(32, marker.acknowledgment_id),
+            .recovery_review_claim_sha256 = try parseOptionalHex(
+                marker.recovery_review_claim_sha256,
+            ),
+            .recovery_review_binding_sha256 = try parseOptionalHex(
+                marker.recovery_review_binding_sha256,
+            ),
+            .digest_sha256 = try parseHex(32, marker.digest_sha256),
+        } else null,
         .record_sha256 = try parseOptionalHex(wire.record_sha256),
         .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
         .digest_sha256 = try parseHex(32, wire.digest_sha256),
@@ -1065,6 +1136,17 @@ fn deferredAcknowledgmentDigest(
     return hash.finalResult();
 }
 
+fn recoveryReviewBindingDigest(
+    marker: DeferredAcknowledgment,
+) ?[32]u8 {
+    const claim = marker.recovery_review_claim_sha256 orelse return null;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-root-operation-recovery-review-binding-v1\x00");
+    hash.update(&marker.digest_sha256);
+    hash.update(&claim);
+    return hash.finalResult();
+}
+
 fn recoveryReviewClaimDigest(claim: RecoveryReviewClaim) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(recovery_review_schema_id);
@@ -1074,7 +1156,6 @@ fn recoveryReviewClaimDigest(claim: RecoveryReviewClaim) [32]u8 {
     std.mem.writeInt(u64, &generation, claim.outer_generation, .little);
     hash.update(&generation);
     hash.update(&claim.outer_state_sha256);
-    hash.update(&claim.profile_path_sha256);
     hash.update(&claim.profile_sha256);
     hash.update(&claim.profile_reference_sha256);
     hash.update(&claim.exact_lock_sha256);
@@ -1114,8 +1195,6 @@ fn writeRecoveryReviewClaim(
     try writer.print(",\"outer_generation\":{}", .{claim.outer_generation});
     try writer.writeAll(",\"outer_state_sha256\":");
     try writeHexString(writer, &claim.outer_state_sha256);
-    try writer.writeAll(",\"profile_path_sha256\":");
-    try writeHexString(writer, &claim.profile_path_sha256);
     try writer.writeAll(",\"profile_sha256\":");
     try writeHexString(writer, &claim.profile_sha256);
     try writer.writeAll(",\"profile_reference_sha256\":");
@@ -1132,6 +1211,11 @@ fn writeRecoveryReviewClaim(
     try writeHexString(writer, &claim.nonce);
     try writer.writeAll(",\"marker_sha256\":");
     try writeOptionalHex(writer, claim.marker_sha256);
+    try writer.writeAll(",\"prior_marker\":");
+    if (claim.prior_marker) |marker|
+        try writeDeferredAcknowledgment(marker, writer)
+    else
+        try writer.writeAll("null");
     try writer.writeAll(",\"record_sha256\":");
     try writeOptionalHex(writer, claim.record_sha256);
     try writer.writeAll(",\"completion_sha256\":");
@@ -1177,6 +1261,10 @@ fn writeDeferredAcknowledgment(
     }
     try writer.writeAll(",\"acknowledgment_id\":");
     try writeHexString(writer, &marker.acknowledgment_id);
+    try writer.writeAll(",\"recovery_review_claim_sha256\":");
+    try writeOptionalHex(writer, marker.recovery_review_claim_sha256);
+    try writer.writeAll(",\"recovery_review_binding_sha256\":");
+    try writeOptionalHex(writer, marker.recovery_review_binding_sha256);
     try writer.writeAll(",\"digest_sha256\":");
     try writeHexString(writer, &marker.digest_sha256);
     try writer.writeByte('}');
@@ -1398,6 +1486,11 @@ fn parseOperation(surface: Surface, spelling: []const u8) ValidationError!Operat
     };
 }
 
+fn documentHasSchema(source: []const u8, comptime schema: []const u8) bool {
+    const prefix = "{\"schema\":\"" ++ schema ++ "\"";
+    return std.mem.startsWith(u8, source, prefix);
+}
+
 /// Root-anchored durable store. Reads never follow a symbolic link and never
 /// accept a directory or special file; writes publish atomically through a
 /// private staging entry and fsync the destination directory.
@@ -1455,6 +1548,10 @@ pub const Store = struct {
             else => return err,
         };
         defer allocator.free(bytes);
+        if (documentHasSchema(bytes, recovery_review_schema_id)) {
+            const claim = try decodeRecoveryReviewClaim(allocator, bytes);
+            return claim.prior_marker;
+        }
         return try decodeDeferredAcknowledgment(allocator, bytes);
     }
 
@@ -1472,6 +1569,7 @@ pub const Store = struct {
             else => return err,
         };
         defer allocator.free(bytes);
+        if (documentHasSchema(bytes, deferred_ack_schema_id)) return null;
         return try decodeRecoveryReviewClaim(allocator, bytes);
     }
 
@@ -1488,6 +1586,11 @@ pub const Store = struct {
             )) return;
             return error.RecoveryReviewClaimPresent;
         }
+        const marker = try self.readDeferredAcknowledgment(allocator);
+        if (!optionalDigestEqual(
+            claim.marker_sha256,
+            if (marker) |value| value.digest_sha256 else null,
+        )) return error.DeferredAcknowledgmentMismatch;
         const bytes = try claim.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
@@ -1495,7 +1598,10 @@ pub const Store = struct {
             bytes,
             .{
                 .permissions = record_permissions,
-                .overwrite = .fail_if_exists,
+                .overwrite = if (marker == null)
+                    .fail_if_exists
+                else
+                    .replace,
                 .durable = true,
             },
         );
@@ -1513,13 +1619,147 @@ pub const Store = struct {
             &observed.digest_sha256,
             &expected_digest,
         )) return error.RecoveryReviewClaimMismatch;
-        self.root.removeFile(
-            try root_fs.Path.init(recovery_review_path),
-        ) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
+        if (observed.prior_marker) |marker| {
+            const bytes = try marker.canonicalJson(allocator);
+            defer allocator.free(bytes);
+            try self.root.publishFile(
+                try root_fs.Path.init(recovery_review_path),
+                bytes,
+                .{
+                    .permissions = record_permissions,
+                    .overwrite = .replace,
+                    .durable = true,
+                },
+            );
+        } else {
+            self.root.removeFile(
+                try root_fs.Path.init(recovery_review_path),
+            ) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            try self.root.syncDirectory(
+                try root_fs.Path.init(namespace_path),
+            );
+        }
+    }
+
+    pub const RecoveryReviewExchangePoint = enum {
+        before_owner_publish,
+        after_owner_publish,
+        before_claim_clear,
+        after_claim_clear,
+    };
+
+    pub const RecoveryReviewExchangeObserver = struct {
+        context: *anyopaque,
+        hitFn: *const fn (
+            *anyopaque,
+            RecoveryReviewExchangePoint,
+        ) anyerror!void,
+
+        pub fn hit(
+            self: RecoveryReviewExchangeObserver,
+            point: RecoveryReviewExchangePoint,
+        ) !void {
+            try self.hitFn(self.context, point);
+        }
+    };
+
+    pub const RecoveryReviewExchange = struct {
+        claim_sha256: [32]u8,
+        outer_attempt_id: [32]u8,
+        expected_marker_sha256: ?[32]u8,
+        expected_record_sha256: ?[32]u8,
+        replacement_marker: ?DeferredAcknowledgment = null,
+        owner_publish_observer: ?root_fs.PublishObserver = null,
+        observer: ?RecoveryReviewExchangeObserver = null,
+    };
+
+    fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+        if (left == null or right == null)
+            return left == null and right == null;
+        return std.mem.eql(u8, &left.?, &right.?);
+    }
+
+    /// Exchanges a reviewed capability for an already-verified lower owner,
+    /// or durably publishes its replacement owner before removing the claim.
+    /// The caller must hold the root-operation lock.
+    pub fn exchangeRecoveryReviewClaimForOwnership(
+        self: Store,
+        allocator: std.mem.Allocator,
+        exchange: RecoveryReviewExchange,
+    ) !void {
+        const claim = try self.readRecoveryReviewClaim(allocator) orelse {
+            const transferred = try self.readDeferredAcknowledgment(
+                allocator,
+            ) orelse return error.RecoveryReviewClaimMissing;
+            if (!std.mem.eql(
+                u8,
+                &transferred.acknowledgment_id,
+                &exchange.outer_attempt_id,
+            ) or transferred.recovery_review_claim_sha256 == null or
+                !std.mem.eql(
+                    u8,
+                    &transferred.recovery_review_claim_sha256.?,
+                    &exchange.claim_sha256,
+                ))
+                return error.RecoveryReviewClaimMissing;
+            return;
         };
-        try self.root.syncDirectory(try root_fs.Path.init(namespace_path));
+        if (!std.mem.eql(
+            u8,
+            &claim.digest_sha256,
+            &exchange.claim_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &claim.outer_attempt_id,
+            &exchange.outer_attempt_id,
+        )) return error.RecoveryReviewClaimMismatch;
+
+        const marker = claim.prior_marker;
+        if (!optionalDigestEqual(
+            exchange.expected_marker_sha256,
+            if (marker) |value| value.digest_sha256 else null,
+        )) return error.DeferredAcknowledgmentMismatch;
+        var record = try self.read(allocator);
+        defer if (record) |*owned| owned.deinit();
+        if (!optionalDigestEqual(
+            exchange.expected_record_sha256,
+            if (record) |owned| owned.record.digest_sha256 else null,
+        )) return error.RecordMismatch;
+
+        var replacement = exchange.replacement_marker orelse
+            marker orelse return error.NoDeferredAcknowledgment;
+        if (!std.mem.eql(
+            u8,
+            &replacement.acknowledgment_id,
+            &exchange.outer_attempt_id,
+        )) return error.InvalidDocument;
+        replacement.recovery_review_claim_sha256 = claim.digest_sha256;
+        replacement.digest_sha256 = deferredAcknowledgmentDigest(replacement);
+        replacement.recovery_review_binding_sha256 =
+            recoveryReviewBindingDigest(replacement);
+        if (exchange.observer) |observer|
+            try observer.hit(.before_owner_publish);
+        const bytes = try replacement.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        try self.root.publishFile(
+            try root_fs.Path.init(recovery_review_path),
+            bytes,
+            .{
+                .permissions = record_permissions,
+                .overwrite = .replace,
+                .durable = true,
+                .observer = exchange.owner_publish_observer,
+            },
+        );
+        if (exchange.observer) |observer|
+            try observer.hit(.after_owner_publish);
+        if (exchange.observer) |observer|
+            try observer.hit(.before_claim_clear);
+        if (exchange.observer) |observer|
+            try observer.hit(.after_claim_clear);
     }
 
     pub fn publishDeferredAcknowledgment(
@@ -1527,6 +1767,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         marker: DeferredAcknowledgment,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (try self.readDeferredAcknowledgment(allocator)) |existing| {
             if (std.mem.eql(
                 u8,
@@ -1579,6 +1821,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         marker: DeferredAcknowledgment,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (marker.state != .bound) return error.InvalidDocument;
         const existing = try self.readDeferredAcknowledgment(allocator) orelse
             return error.NoDeferredAcknowledgment;
@@ -1610,6 +1854,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         expected_digest: [32]u8,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
             return error.NoDeferredAcknowledgment;
         if (observed.state != .pending or !std.mem.eql(
@@ -1620,6 +1866,8 @@ pub const Store = struct {
         var next = observed;
         next.state = .acknowledged;
         next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        next.recovery_review_binding_sha256 =
+            recoveryReviewBindingDigest(next);
         const bytes = try next.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
@@ -1640,6 +1888,8 @@ pub const Store = struct {
         expected_digest: [32]u8,
         terminal_state: DeferredAcknowledgmentState,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (terminal_state != .released and terminal_state != .abandoned)
             return error.InvalidDocument;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
@@ -1652,6 +1902,8 @@ pub const Store = struct {
         var next = observed;
         next.state = terminal_state;
         next.digest_sha256 = deferredAcknowledgmentDigest(next);
+        next.recovery_review_binding_sha256 =
+            recoveryReviewBindingDigest(next);
         const bytes = try next.canonicalJson(allocator);
         defer allocator.free(bytes);
         try self.root.publishFile(
@@ -1671,6 +1923,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         cleanup: OwnershipCleanup,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         if (try self.readDeferredAcknowledgment(allocator) == null) {
             var record = try self.read(allocator);
             defer if (record) |*owned| owned.deinit();
@@ -1699,6 +1953,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         cleanup: OwnershipCleanup,
     ) !DeferredAcknowledgment {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const marker = try self.readDeferredAcknowledgment(allocator);
         var record = try self.read(allocator);
         defer if (record) |*owned| owned.deinit();
@@ -1764,6 +2020,8 @@ pub const Store = struct {
         allocator: std.mem.Allocator,
         expected_digest: [32]u8,
     ) !void {
+        if (try self.readRecoveryReviewClaim(allocator) != null)
+            return error.RecoveryReviewClaimPresent;
         const observed = try self.readDeferredAcknowledgment(allocator) orelse
             return;
         if (!std.mem.eql(
@@ -2264,12 +2522,14 @@ pub const Coordinator = struct {
             observer.hit(.after_lock_acquired) catch return error.StoreFailed;
 
         const store_handle = self.store();
-        if (store_handle.readRecoveryReviewClaim(allocator) catch |err|
+        var recovery_review = store_handle.readRecoveryReviewClaim(
+            allocator,
+        ) catch |err|
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.RecordCorrupt,
-            }) |review|
-        {
+            };
+        if (recovery_review) |review| {
             const expected = request.recovery_review_claim_sha256 orelse
                 return error.RecoveryRequired;
             const orchestration_id = request.orchestration_id orelse
@@ -2283,13 +2543,6 @@ pub const Coordinator = struct {
                 &review.outer_attempt_id,
                 &orchestration_id,
             )) return error.RecoveryRequired;
-            store_handle.clearRecoveryReviewClaim(
-                allocator,
-                expected,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.StoreFailed,
-            };
         } else if (request.recovery_review_claim_sha256 != null) {
             return error.RecoveryRequired;
         }
@@ -2316,6 +2569,32 @@ pub const Coordinator = struct {
         const deferred = store_handle.readDeferredAcknowledgment(
             allocator,
         ) catch return error.RecordCorrupt;
+        if (recovery_review) |review| {
+            if (!Store.optionalDigestEqual(
+                review.marker_sha256,
+                if (deferred) |marker| marker.digest_sha256 else null,
+            ) or !Store.optionalDigestEqual(
+                review.record_sha256,
+                if (prior) |owned| owned.record.digest_sha256 else null,
+            )) return error.RecoveryRequired;
+            if (deferred != null) {
+                store_handle.exchangeRecoveryReviewClaimForOwnership(
+                    allocator,
+                    .{
+                        .claim_sha256 = review.digest_sha256,
+                        .outer_attempt_id = review.outer_attempt_id,
+                        .expected_marker_sha256 = review.marker_sha256,
+                        .expected_record_sha256 = review.record_sha256,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.StoreFailed,
+                };
+                recovery_review = null;
+            } else if (prior != null) {
+                return error.RecoveryRequired;
+            }
+        }
         if (deferred) |marker| switch (marker.state) {
             .acknowledged => return error.RecoveryRequired,
             .pre_mutation_reconciliation_claim => return error.RecoveryRequired,
@@ -2500,7 +2779,10 @@ pub const Coordinator = struct {
             // it starts pre-mutation. The executor bridge is published only
             // when control is actually handed over, so an early return on a
             // healthy root cannot strand it.
-            const created = try self.publishNew(allocator, request, reclaimed orelse 1, .{
+            var publish_request = request;
+            if (recovery_review == null)
+                publish_request.recovery_review_claim_sha256 = null;
+            const created = try self.publishNew(allocator, publish_request, reclaimed orelse 1, .{
                 .state = .preflight,
                 .phase = .preflight,
             });
@@ -2564,7 +2846,10 @@ pub const Coordinator = struct {
             value.deinit();
             prior = null;
         }
-        const created = try self.publishNew(allocator, request, generation, .{
+        var publish_request = request;
+        if (recovery_review == null)
+            publish_request.recovery_review_claim_sha256 = null;
+        const created = try self.publishNew(allocator, publish_request, generation, .{
             .state = .reserved,
             .phase = .reserved,
         });
@@ -2625,7 +2910,21 @@ pub const Coordinator = struct {
             if (request.acquisition_observer) |observer|
                 observer.hit(.before_binding_published) catch
                     return error.StoreFailed;
-            if (store_handle.readDeferredAcknowledgment(allocator) catch
+            if (request.recovery_review_claim_sha256) |claim_sha256|
+                store_handle.exchangeRecoveryReviewClaimForOwnership(
+                    allocator,
+                    .{
+                        .claim_sha256 = claim_sha256,
+                        .outer_attempt_id = orchestration_id,
+                        .expected_marker_sha256 = null,
+                        .expected_record_sha256 = null,
+                        .replacement_marker = binding,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.StoreFailed,
+                }
+            else if (store_handle.readDeferredAcknowledgment(allocator) catch
                 return error.StoreFailed) |_|
                 store_handle.rotateDeferredAcknowledgment(
                     allocator,
@@ -3174,6 +3473,19 @@ const testing = std.testing;
 const test_root = "/target";
 const test_other_root = "/other";
 
+const FailingPublishObserver = struct {
+    fail_at: root_fs.PublishPoint,
+
+    fn interface(self: *FailingPublishObserver) root_fs.PublishObserver {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, point: root_fs.PublishPoint) !void {
+        const self: *FailingPublishObserver = @ptrCast(@alignCast(context));
+        if (point == self.fail_at) return error.InjectedCrash;
+    }
+};
+
 fn testRequest(operation: Operation) Request {
     return .{
         .backend = .legacy_dpkg,
@@ -3518,7 +3830,6 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
             .outer_attempt_id = @splat(0xd0),
             .outer_generation = 7,
             .outer_state_sha256 = @splat(0xd1),
-            .profile_path_sha256 = @splat(0xd7),
             .profile_sha256 = @splat(0xd2),
             .profile_reference_sha256 = @splat(0xd3),
             .exact_lock_sha256 = @splat(0xd4),
@@ -3530,7 +3841,6 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
             .outer_attempt_id = @splat(0xe0),
             .outer_generation = 8,
             .outer_state_sha256 = @splat(0xe1),
-            .profile_path_sha256 = @splat(0xe8),
             .profile_sha256 = @splat(0xe2),
             .profile_reference_sha256 = @splat(0xe3),
             .exact_lock_sha256 = @splat(0xe4),
@@ -3555,7 +3865,6 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
         .outer_attempt_id = @splat(0xf0),
         .outer_generation = 9,
         .outer_state_sha256 = @splat(0xf1),
-        .profile_path_sha256 = @splat(0xf7),
         .profile_sha256 = @splat(0xf2),
         .profile_reference_sha256 = @splat(0xf3),
         .exact_lock_sha256 = @splat(0xf4),
@@ -3563,6 +3872,161 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
         .mutation_status = .changed,
         .nonce = @splat(0xf6),
     }));
+}
+
+test "root_operation.test.recovery review exchange survives every durable publication boundary" {
+    inline for (std.enums.values(root_fs.PublishPoint)) |fail_at| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root: root_fs.Root = .init(testing.io, tmp.dir);
+        const store = Store.init(root);
+        try store.ensureNamespace();
+        const claim = try createRecoveryReviewClaim(.{
+            .outer_attempt_id = @splat(0xa1),
+            .outer_generation = 9,
+            .outer_state_sha256 = @splat(0xa2),
+            .profile_sha256 = @splat(0xa3),
+            .profile_reference_sha256 = @splat(0xa4),
+            .exact_lock_sha256 = @splat(0xa5),
+            .semantic_request_sha256 = @splat(0xa6),
+            .mutation_status = .unchanged,
+            .nonce = @splat(0xa7),
+        });
+        try store.publishRecoveryReviewClaim(testing.allocator, claim);
+        const replacement = try createDeferredAcknowledgment(.{
+            .attempt_id = @splat(0xb1),
+            .acknowledgment_id = claim.outer_attempt_id,
+        });
+        const transferred = try createDeferredAcknowledgment(.{
+            .attempt_id = replacement.attempt_id,
+            .acknowledgment_id = replacement.acknowledgment_id,
+            .recovery_review_claim_sha256 = claim.digest_sha256,
+        });
+        var observer: FailingPublishObserver = .{ .fail_at = fail_at };
+        try testing.expectError(
+            error.InjectedCrash,
+            store.exchangeRecoveryReviewClaimForOwnership(
+                testing.allocator,
+                .{
+                    .claim_sha256 = claim.digest_sha256,
+                    .outer_attempt_id = claim.outer_attempt_id,
+                    .expected_marker_sha256 = null,
+                    .expected_record_sha256 = null,
+                    .replacement_marker = replacement,
+                    .owner_publish_observer = observer.interface(),
+                },
+            ),
+        );
+
+        const reopened = Store.init(.init(testing.io, tmp.dir));
+        const retained_claim =
+            try reopened.readRecoveryReviewClaim(testing.allocator);
+        const retained_owner =
+            try reopened.readDeferredAcknowledgment(testing.allocator);
+        switch (fail_at) {
+            .before_stage_sync,
+            .after_stage_sync,
+            .before_rename,
+            => {
+                try testing.expect(retained_claim != null);
+                try testing.expect(retained_owner == null);
+            },
+            .after_rename,
+            .before_directory_sync,
+            .after_directory_sync,
+            => {
+                try testing.expect(retained_claim == null);
+                try testing.expectEqualDeep(transferred, retained_owner.?);
+            },
+        }
+
+        try reopened.exchangeRecoveryReviewClaimForOwnership(
+            testing.allocator,
+            .{
+                .claim_sha256 = claim.digest_sha256,
+                .outer_attempt_id = claim.outer_attempt_id,
+                .expected_marker_sha256 = null,
+                .expected_record_sha256 = null,
+                .replacement_marker = replacement,
+            },
+        );
+        try testing.expect(
+            (try reopened.readRecoveryReviewClaim(testing.allocator)) == null,
+        );
+        try testing.expectEqualDeep(
+            transferred,
+            (try reopened.readDeferredAcknowledgment(testing.allocator)).?,
+        );
+    }
+}
+
+test "root_operation.test.recovery review cancellation restores the exact prior owner" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const store = Store.init(.init(testing.io, tmp.dir));
+    try store.ensureNamespace();
+    const prior = try createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(0xc1),
+        .completion_sha256 = @splat(0xc2),
+        .provenance_sha256 = @splat(0xc3),
+        .acknowledgment_id = @splat(0xc4),
+    });
+    try store.publishDeferredAcknowledgment(testing.allocator, prior);
+    const claim = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = prior.acknowledgment_id,
+        .outer_generation = 10,
+        .outer_state_sha256 = @splat(0xc5),
+        .profile_sha256 = @splat(0xc6),
+        .profile_reference_sha256 = @splat(0xc7),
+        .exact_lock_sha256 = @splat(0xc8),
+        .semantic_request_sha256 = @splat(0xc9),
+        .mutation_status = .changed,
+        .nonce = @splat(0xca),
+        .marker_sha256 = prior.digest_sha256,
+        .prior_marker = prior,
+        .record_sha256 = @splat(0xcb),
+    });
+    try store.publishRecoveryReviewClaim(testing.allocator, claim);
+    try testing.expectEqualDeep(
+        prior,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.acknowledgeDeferredAcknowledgment(
+            testing.allocator,
+            prior.digest_sha256,
+        ),
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.clearDeferredAcknowledgment(
+            testing.allocator,
+            prior.digest_sha256,
+        ),
+    );
+    try testing.expectError(
+        error.RecoveryReviewClaimMismatch,
+        store.clearRecoveryReviewClaim(
+            testing.allocator,
+            @splat(0xff),
+        ),
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) != null,
+    );
+    try store.clearRecoveryReviewClaim(
+        testing.allocator,
+        claim.digest_sha256,
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) == null,
+    );
+    try testing.expectEqualDeep(
+        prior,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    );
 }
 
 test "root_operation.test.records reject contradictory lifecycle combinations" {

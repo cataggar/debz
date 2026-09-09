@@ -345,8 +345,22 @@ pub fn runRecovery(
         .ready => |*recovery| {
             defer recovery.deinit();
             if (output == .human) {
-                try writeRecoveryReview(recovery.*, streams.stdout);
-                try streams.stdout.flush();
+                writeRecoveryReview(recovery.*, streams.stdout) catch |err| {
+                    cleanupRecoveryReview(
+                        allocator,
+                        engine,
+                        recovery.*,
+                    ) catch return error.RecoveryReviewCleanupFailed;
+                    return err;
+                };
+                streams.stdout.flush() catch |err| {
+                    cleanupRecoveryReview(
+                        allocator,
+                        engine,
+                        recovery.*,
+                    ) catch return error.RecoveryReviewCleanupFailed;
+                    return err;
+                };
             }
             if (recovery.mutation_status == .unknown) {
                 const cancellation = try engine.executeRecoveryFn(
@@ -374,6 +388,7 @@ pub fn runRecovery(
                     );
                     return cancellation_result.exit_status;
                 }
+
                 var result = try unknownRecoveryReviewResult(recovery.*);
                 defer result.deinit();
                 try cli.writeResult(
@@ -420,6 +435,26 @@ pub fn runRecovery(
             return result.exit_status;
         },
     }
+}
+
+fn cleanupRecoveryReview(
+    allocator: std.mem.Allocator,
+    engine: Engine,
+    recovery: orchestrator.RecoveryPreparation,
+) !void {
+    const invocation = try engine.executeRecoveryFn(
+        engine.context,
+        allocator,
+        recovery,
+        false,
+    );
+    var result = switch (invocation) {
+        .result => |value| value,
+        .operational_failure => return error.RecoveryReviewCleanupFailed,
+    };
+    defer result.deinit();
+    if (result.exit_status == .recovery)
+        return error.RecoveryReviewCleanupFailed;
 }
 
 fn writeReview(
@@ -922,6 +957,43 @@ extern fn grantpt(fd: c_int) c_int;
 extern fn unlockpt(fd: c_int) c_int;
 extern fn ptsname_r(fd: c_int, buffer: [*]u8, length: usize) c_int;
 
+const FailingWriter = struct {
+    writer: std.Io.Writer,
+    buffer: [4096]u8 = undefined,
+    fail_write: bool,
+
+    fn init(self: *FailingWriter, fail_write: bool) void {
+        self.fail_write = fail_write;
+        self.writer = .{
+            .vtable = &.{
+                .drain = drain,
+                .flush = flush,
+            },
+            .buffer = if (fail_write) &.{} else &self.buffer,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *FailingWriter = @fieldParentPtr("writer", writer);
+        if (self.fail_write) return error.WriteFailed;
+        writer.end = 0;
+        var consumed: usize = 0;
+        for (data, 0..) |slice, index|
+            consumed += slice.len * (if (index + 1 == data.len) splat else 1);
+        return consumed;
+    }
+
+    fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FailingWriter = @fieldParentPtr("writer", writer);
+        if (!self.fail_write) return error.WriteFailed;
+        return error.WriteFailed;
+    }
+};
+
 const TestPty = struct {
     master: std.Io.File,
     slave: std.Io.File,
@@ -1182,6 +1254,40 @@ test "apt_system_command.test.PTY confirmation parses the complete recovery answ
         try std.testing.expectEqual(api.ExitStatus.success, status);
         try std.testing.expectEqual(@as(usize, 1), context.recovery_execute_count);
         try std.testing.expectEqual(@as(usize, 0), context.recovery_cancel_count);
+    }
+}
+
+test "apt_system_command.test.recovery review output failures release the exact review" {
+    inline for (.{ true, false }) |fail_write| {
+        var context: TestContext = .{ .allocator = std.testing.allocator };
+        var terminal: TestTerminal = .{ .answer = .confirmed };
+        var stdout: FailingWriter = undefined;
+        stdout.init(fail_write);
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+        try std.testing.expectError(
+            error.WriteFailed,
+            runRecovery(
+                std.testing.allocator,
+                "/profile.json",
+                .human,
+                context.interface(),
+                terminal.interface(),
+                .{
+                    .stdout = &stdout.writer,
+                    .stderr = &stderr.writer,
+                },
+            ),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            context.recovery_cancel_count,
+        );
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            context.recovery_execute_count,
+        );
+        try std.testing.expectEqual(@as(usize, 0), terminal.call_count);
     }
 }
 

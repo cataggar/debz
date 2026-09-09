@@ -277,7 +277,7 @@ pub const RecoveryReviewInput = struct {
     profile: ProfileView,
     verified_lock: VerifiedLock,
     outer_transaction_sha256: ?[32]u8,
-    nonce: [32]u8,
+    expected_claim: root_operation.RecoveryReviewClaim,
 };
 
 pub const RecoveryReview = struct {
@@ -461,11 +461,6 @@ pub const LiveRootRunner = struct {
         std.mem.Allocator,
         root_operation.RecoveryReviewClaim,
     ) BoundaryError!bool,
-    cancelRecoveryReviewForProfileFn: ?*const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        [32]u8,
-    ) BoundaryError!bool = null,
 
     pub fn route(
         self: LiveRootRunner,
@@ -532,16 +527,6 @@ pub const LiveRootRunner = struct {
     ) BoundaryError!bool {
         return self.releaseRecoveryReviewFn(self.context, allocator, claim);
     }
-
-    pub fn cancelRecoveryReviewForProfile(
-        self: LiveRootRunner,
-        allocator: std.mem.Allocator,
-        profile_path: []const u8,
-    ) BoundaryError!bool {
-        const cancel = self.cancelRecoveryReviewForProfileFn orelse
-            return false;
-        return cancel(self.context, allocator, digestProfilePath(profile_path));
-    }
 };
 
 pub const TransportBoundary = enum { before_return };
@@ -593,7 +578,6 @@ pub const PrivateLiveRootRunner = struct {
         prepare: RecoveryReviewInput,
         validate: root_operation.RecoveryReviewClaim,
         release: root_operation.RecoveryReviewClaim,
-        cancel_profile: [32]u8,
     };
 
     const ReviewContext = struct {
@@ -638,7 +622,6 @@ pub const PrivateLiveRootRunner = struct {
             .prepareRecoveryReviewFn = prepareRecoveryReview,
             .validateRecoveryReviewFn = validateRecoveryReview,
             .releaseRecoveryReviewFn = releaseRecoveryReview,
-            .cancelRecoveryReviewForProfileFn = cancelRecoveryReviewForProfile,
         };
     }
 
@@ -736,22 +719,6 @@ pub const PrivateLiveRootRunner = struct {
             context,
             allocator,
             .{ .release = claim },
-        ) catch |err| return mapReviewBoundaryError(err)) {
-            .released => true,
-            .stale => false,
-            else => error.InvariantViolation,
-        };
-    }
-
-    fn cancelRecoveryReviewForProfile(
-        context: *anyopaque,
-        allocator: std.mem.Allocator,
-        profile_path_sha256: [32]u8,
-    ) BoundaryError!bool {
-        return switch (reviewOperation(
-            context,
-            allocator,
-            .{ .cancel_profile = profile_path_sha256 },
         ) catch |err| return mapReviewBoundaryError(err)) {
             .released => true,
             .stale => false,
@@ -1474,27 +1441,6 @@ pub const PrivateLiveRootRunner = struct {
                 };
                 break :release 24;
             },
-            .cancel_profile => |profile_path_sha256| cancel: {
-                const observed = store.readRecoveryReviewClaim(
-                    std.heap.page_allocator,
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => break :cancel 23,
-                };
-                if (observed == null or !std.mem.eql(
-                    u8,
-                    &observed.?.profile_path_sha256,
-                    &profile_path_sha256,
-                )) break :cancel 23;
-                store.clearRecoveryReviewClaim(
-                    std.heap.page_allocator,
-                    observed.?.digest_sha256,
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => break :cancel 23,
-                };
-                break :cancel 24;
-            },
         };
     }
 
@@ -1512,6 +1458,11 @@ pub const PrivateLiveRootRunner = struct {
             if (recoveryReviewBaseMatches(existing, input) and
                 (try recoveryReviewEvidenceMatches(store, existing)))
             {
+                if (!std.mem.eql(
+                    u8,
+                    &existing.digest_sha256,
+                    &input.expected_claim.digest_sha256,
+                )) return 20;
                 const bytes = try existing.canonicalJson(
                     std.heap.page_allocator,
                 );
@@ -1519,11 +1470,7 @@ pub const PrivateLiveRootRunner = struct {
                 try writeTransport(output_fd, bytes);
                 return 21;
             }
-            if (!std.mem.eql(
-                u8,
-                &existing.profile_path_sha256,
-                &digestProfilePath(input.prepared.request.profile_path),
-            )) return 20;
+            if (!recoveryReviewOwnerMatches(existing, input)) return 20;
             store.clearRecoveryReviewClaim(
                 std.heap.page_allocator,
                 existing.digest_sha256,
@@ -1569,9 +1516,6 @@ pub const PrivateLiveRootRunner = struct {
             .outer_attempt_id = input.prepared.attempt_id,
             .outer_generation = input.prepared.active_generation,
             .outer_state_sha256 = input.prepared.active_digest_sha256,
-            .profile_path_sha256 = digestProfilePath(
-                input.prepared.request.profile_path,
-            ),
             .profile_sha256 = input.prepared.profile.sha256,
             .profile_reference_sha256 = input.prepared.profile.reference_evidence_sha256,
             .exact_lock_sha256 = input.prepared.exact_lock.digest_sha256,
@@ -1585,11 +1529,12 @@ pub const PrivateLiveRootRunner = struct {
                 .changed => .changed,
                 .unknown => unreachable,
             },
-            .nonce = input.nonce,
+            .nonce = input.expected_claim.nonce,
             .marker_sha256 = if (marker) |value|
                 value.digest_sha256
             else
                 null,
+            .prior_marker = marker,
             .record_sha256 = if (record) |owned|
                 owned.record.digest_sha256
             else
@@ -1599,11 +1544,18 @@ pub const PrivateLiveRootRunner = struct {
             else
                 null,
         });
+        if (!std.mem.eql(
+            u8,
+            &claim.digest_sha256,
+            &input.expected_claim.digest_sha256,
+        )) return 20;
         try store.publishRecoveryReviewClaim(
             std.heap.page_allocator,
-            claim,
+            input.expected_claim,
         );
-        const bytes = try claim.canonicalJson(std.heap.page_allocator);
+        const bytes = try input.expected_claim.canonicalJson(
+            std.heap.page_allocator,
+        );
         defer std.heap.page_allocator.free(bytes);
         try writeTransport(output_fd, bytes);
         return 21;
@@ -1630,11 +1582,6 @@ pub const PrivateLiveRootRunner = struct {
             ) and
             std.mem.eql(
                 u8,
-                &claim.profile_path_sha256,
-                &digestProfilePath(input.prepared.request.profile_path),
-            ) and
-            std.mem.eql(
-                u8,
                 &claim.profile_sha256,
                 &input.prepared.profile.sha256,
             ) and
@@ -1655,6 +1602,37 @@ pub const PrivateLiveRootRunner = struct {
             ) and optionalDigestMatches(
             claim.outer_transaction_sha256,
             input.outer_transaction_sha256,
+        );
+    }
+
+    fn recoveryReviewOwnerMatches(
+        claim: root_operation.RecoveryReviewClaim,
+        input: RecoveryReviewInput,
+    ) bool {
+        const semantic_request_sha256 = semanticDigestForRequest(
+            std.heap.page_allocator,
+            input.prepared.request,
+        ) catch return false;
+        return std.mem.eql(
+            u8,
+            &claim.outer_attempt_id,
+            &input.prepared.attempt_id,
+        ) and std.mem.eql(
+            u8,
+            &claim.profile_sha256,
+            &input.prepared.profile.sha256,
+        ) and std.mem.eql(
+            u8,
+            &claim.profile_reference_sha256,
+            &input.prepared.profile.reference_evidence_sha256,
+        ) and std.mem.eql(
+            u8,
+            &claim.exact_lock_sha256,
+            &input.prepared.exact_lock.digest_sha256,
+        ) and std.mem.eql(
+            u8,
+            &claim.semantic_request_sha256,
+            &semantic_request_sha256,
         );
     }
 
@@ -3962,6 +3940,8 @@ pub const Engine = struct {
             .phase = .profile_loaded,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 request,
@@ -4037,6 +4017,8 @@ pub const Engine = struct {
             .phase = .authenticated,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 request,
@@ -4091,6 +4073,8 @@ pub const Engine = struct {
             .exact_lock = verified.binding,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 request,
@@ -4172,6 +4156,8 @@ pub const Engine = struct {
             loaded.view.state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         }) orelse return self.reconcilePreparedError(allocator, prepared);
         defer current.deinit();
@@ -4268,6 +4254,8 @@ pub const Engine = struct {
             .{ .phase = .downloaded },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.hitCompletionBoundary(.after_downloaded_state) catch
@@ -4375,6 +4363,8 @@ pub const Engine = struct {
             .{ .phase = .mutating },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedErrorWithPolicy(
                 allocator,
                 prepared,
@@ -4751,6 +4741,8 @@ pub const Engine = struct {
             prepared.profile_state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -4806,6 +4798,8 @@ pub const Engine = struct {
                 final.state,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
                 else => return self.reconcileUnknownPreparedFailure(
                     allocator,
                     prepared,
@@ -4817,6 +4811,8 @@ pub const Engine = struct {
                 prepared.profile_state_path,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
                 else => return self.reconcileUnknownPreparedFailure(
                     allocator,
                     prepared,
@@ -4865,6 +4861,8 @@ pub const Engine = struct {
             operation_state.Expected.fromState(committed.state),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcileUnknownPreparedFailure(
                 allocator,
                 prepared,
@@ -4893,6 +4891,8 @@ pub const Engine = struct {
             prepared.profile_state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => null,
         };
         defer if (active) |*owned| owned.deinit();
@@ -4937,6 +4937,8 @@ pub const Engine = struct {
             completion,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return result,
         };
         result.evidence.root_operation_completion = completion;
@@ -5143,6 +5145,8 @@ pub const Engine = struct {
                     binding,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
                     else => return recoveryDiagnostic(
                         allocator,
                         prepared.request,
@@ -5197,22 +5201,12 @@ pub const Engine = struct {
                 error.OperationalBoundaryFailure,
                 error.PrivilegeUnavailable,
                 error.RootReplacement,
-                => {
-                    const canceled =
-                        try self.cancelRecoveryReviewForProfileFailure(
-                            allocator,
-                            profile_path,
-                        );
-                    return .{ .result = try unknownMutationDiagnostic(
-                        allocator,
-                        null,
-                        profile_path,
-                        if (canceled)
-                            "the trusted profile could not be loaded for recovery; its exact profile-bound review claim was canceled"
-                        else
-                            "the trusted profile could not be loaded for recovery and review-claim cancellation could not be proven",
-                    ) };
-                },
+                => return .{ .result = try unknownMutationDiagnostic(
+                    allocator,
+                    null,
+                    profile_path,
+                    "the trusted profile could not be loaded for recovery",
+                ) },
             };
         defer loaded.deinit();
         loaded.revalidate(allocator) catch |err| switch (err) {
@@ -5222,37 +5216,11 @@ pub const Engine = struct {
             error.OperationalBoundaryFailure,
             error.PrivilegeUnavailable,
             error.RootReplacement,
-            => {
-                const canceled = try self.cancelRecoveryReviewForProfileFailure(
-                    allocator,
-                    profile_path,
-                );
-                return .{ .result = try unknownMutationDiagnostic(
-                    allocator,
-                    null,
-                    profile_path,
-                    if (canceled)
-                        "the trusted profile changed before recovery state could be verified; its exact profile-bound review claim was canceled"
-                    else
-                        "the trusted profile changed before recovery state could be verified and review-claim cancellation could not be proven",
-                ) };
-            },
-        };
-        _ = self.runner.cancelRecoveryReviewForProfile(
-            allocator,
-            profile_path,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ContractViolation => return error.ContractViolation,
-            error.InvariantViolation => return error.InvariantViolation,
-            error.OperationalBoundaryFailure,
-            error.PrivilegeUnavailable,
-            error.RootReplacement,
             => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
                 profile_path,
-                "an earlier exact recovery review claim could not be safely canceled before preparing a new review",
+                "the trusted profile changed before recovery state could be verified",
             ) },
         };
         var active = (self.store.inspectActiveLocked(
@@ -5260,6 +5228,8 @@ pub const Engine = struct {
             loaded.view.state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
@@ -5292,6 +5262,8 @@ pub const Engine = struct {
             paths,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
@@ -5429,11 +5401,94 @@ pub const Engine = struct {
         arena_transferred = true;
         var return_preparation = false;
         defer if (!return_preparation) preparation.deinit();
-        const nonce = self.ids.nextFn(self.ids.context) catch |err| switch (err) {
+        var lower = self.runner.inspect(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => {
+                return_preparation = true;
+                return .{ .ready = .{
+                    .prepared = preparation,
+                    .action = action,
+                    .mutation_status = .unknown,
+                } };
+            },
         };
-        const review: RecoveryReview = self.runner.prepareRecoveryReview(allocator, .{
+        defer lower.deinit();
+        var lower_completion = self.runner.readRecoveryCompletion(
+            allocator,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            error.OperationalBoundaryFailure,
+            error.PrivilegeUnavailable,
+            error.RootReplacement,
+            => {
+                return_preparation = true;
+                return .{ .ready = .{
+                    .prepared = preparation,
+                    .action = action,
+                    .mutation_status = .unknown,
+                } };
+            },
+        };
+        defer if (lower_completion) |*completion| completion.deinit();
+        const mutation_status = try classifyRecoveryMutationStatus(
+            allocator,
+            lower.deferred_acknowledgment,
+            if (lower.record) |record| record.record else null,
+            if (lower_completion) |completion| completion.document else null,
+            preparation,
+            active.state,
+            loaded.view,
+            verified,
+            verified_outer_transaction != null,
+        );
+        if (mutation_status == .unknown) {
+            return_preparation = true;
+            return .{ .ready = .{
+                .prepared = preparation,
+                .action = action,
+                .mutation_status = .unknown,
+            } };
+        }
+        const expected_claim = try root_operation.createRecoveryReviewClaim(.{
+            .outer_attempt_id = preparation.attempt_id,
+            .outer_generation = preparation.active_generation,
+            .outer_state_sha256 = preparation.active_digest_sha256,
+            .profile_sha256 = preparation.profile.sha256,
+            .profile_reference_sha256 = preparation.profile.reference_evidence_sha256,
+            .exact_lock_sha256 = preparation.exact_lock.digest_sha256,
+            .semantic_request_sha256 = verified.semantic_request_sha256,
+            .outer_transaction_sha256 = if (verified_outer_transaction) |transaction|
+                transaction.binding.digest_sha256
+            else
+                null,
+            .mutation_status = switch (mutation_status) {
+                .unchanged => .unchanged,
+                .changed => .changed,
+                .unknown => unreachable,
+            },
+            .nonce = recoveryReviewNonce(preparation),
+            .marker_sha256 = if (lower.deferred_acknowledgment) |marker|
+                marker.digest_sha256
+            else
+                null,
+            .prior_marker = lower.deferred_acknowledgment,
+            .record_sha256 = if (lower.record) |record|
+                record.record.digest_sha256
+            else
+                null,
+            .completion_sha256 = if (lower_completion) |completion|
+                completion.document.digest_sha256
+            else
+                null,
+        });
+        const review_input: RecoveryReviewInput = .{
             .prepared = &preparation,
             .outer_state = active.state,
             .profile = loaded.view,
@@ -5442,21 +5497,56 @@ pub const Engine = struct {
                 transaction.binding.digest_sha256
             else
                 null,
-            .nonce = nonce,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ContractViolation => return error.ContractViolation,
-            error.InvariantViolation => return error.InvariantViolation,
+            .expected_claim = expected_claim,
+        };
+        const review: RecoveryReview = self.runner.prepareRecoveryReview(
+            allocator,
+            review_input,
+        ) catch |err| switch (err) {
+            error.OutOfMemory,
+            error.ContractViolation,
+            error.InvariantViolation,
+            => {
+                _ = self.runner.releaseRecoveryReview(
+                    allocator,
+                    expected_claim,
+                ) catch {};
+                return err;
+            },
             error.OperationalBoundaryFailure,
             error.PrivilegeUnavailable,
             error.RootReplacement,
-            => .{ .mutation_status = .unknown },
+            => {
+                const released = self.runner.releaseRecoveryReview(
+                    allocator,
+                    expected_claim,
+                ) catch false;
+                if (!released) return .{ .result = try recoveryReviewCleanupFailure(
+                    allocator,
+                    .{
+                        .prepared = preparation,
+                        .action = action,
+                        .mutation_status = mutation_status,
+                        .review_claim = expected_claim,
+                    },
+                    expected_claim,
+                    "recovery review publication may have completed but its exact claim could not be released after transport failure",
+                ) };
+                return_preparation = true;
+                return .{ .ready = .{
+                    .prepared = preparation,
+                    .action = action,
+                    .mutation_status = .unknown,
+                } };
+            },
         };
         var stable = (self.store.inspectActiveLocked(
             allocator,
             preparation.profile_state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => null,
         });
         defer if (stable) |*owned_state| owned_state.deinit();
@@ -5469,18 +5559,41 @@ pub const Engine = struct {
             ) or
             !stateMatchesPreparation(stable.?.state, preparation))
         {
-            if (review.claim) |claim| _ = self.runner.releaseRecoveryReview(
-                allocator,
-                claim,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ContractViolation => return error.ContractViolation,
-                error.InvariantViolation => return error.InvariantViolation,
-                error.OperationalBoundaryFailure,
-                error.PrivilegeUnavailable,
-                error.RootReplacement,
-                => false,
-            };
+            if (review.claim) |claim| {
+                const released = self.runner.releaseRecoveryReview(
+                    allocator,
+                    claim,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.OperationalBoundaryFailure,
+                    error.PrivilegeUnavailable,
+                    error.RootReplacement,
+                    => return .{ .result = try recoveryReviewCleanupFailure(
+                        allocator,
+                        .{
+                            .prepared = preparation,
+                            .action = action,
+                            .mutation_status = review.mutation_status,
+                            .review_claim = claim,
+                        },
+                        claim,
+                        "active apt/system state changed and the exact recovery review claim could not be released",
+                    ) },
+                };
+                if (!released) return .{ .result = try recoveryReviewCleanupFailure(
+                    allocator,
+                    .{
+                        .prepared = preparation,
+                        .action = action,
+                        .mutation_status = review.mutation_status,
+                        .review_claim = claim,
+                    },
+                    claim,
+                    "active apt/system state changed and the exact recovery review claim is missing or foreign",
+                ) };
+            }
             return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
@@ -5495,25 +5608,6 @@ pub const Engine = struct {
             .mutation_status = review.mutation_status,
             .review_claim = review.claim,
         } };
-    }
-
-    fn cancelRecoveryReviewForProfileFailure(
-        self: *Engine,
-        allocator: std.mem.Allocator,
-        profile_path: []const u8,
-    ) InternalExecutionError!bool {
-        return self.runner.cancelRecoveryReviewForProfile(
-            allocator,
-            profile_path,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ContractViolation => return error.ContractViolation,
-            error.InvariantViolation => return error.InvariantViolation,
-            error.OperationalBoundaryFailure,
-            error.PrivilegeUnavailable,
-            error.RootReplacement,
-            => false,
-        };
     }
 
     pub fn cancelRecoveryReview(
@@ -5612,7 +5706,15 @@ pub const Engine = struct {
             recovery,
             review_claim,
             &claim_transferred,
-        ) catch |err| return err;
+        ) catch |err| {
+            if (!claim_transferred) {
+                _ = self.runner.releaseRecoveryReview(
+                    std.heap.page_allocator,
+                    review_claim,
+                ) catch {};
+            }
+            return err;
+        };
         if (!claim_transferred) {
             const released = self.runner.releaseRecoveryReview(
                 allocator,
@@ -5704,6 +5806,8 @@ pub const Engine = struct {
             loaded.view.state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 recovery.prepared,
@@ -5762,6 +5866,8 @@ pub const Engine = struct {
             recovery.prepared.paths,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 recovery.prepared,
@@ -6069,6 +6175,8 @@ pub const Engine = struct {
                         .{ .phase = .mutating },
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.InvariantViolation => return error.InvariantViolation,
                         else => return self.reconcilePreparedError(
                             allocator,
                             recovery.prepared,
@@ -6378,6 +6486,8 @@ pub const Engine = struct {
             .{ .phase = .recovering, .diagnostic = "recovery in progress" },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 recovery.prepared,
@@ -6696,12 +6806,17 @@ pub const Engine = struct {
                 prepared.paths,
                 source,
                 document.digest_sha256,
-            ) catch return self.markRecoveryRequired(
-                allocator,
-                prepared,
-                current,
-                "verified recovery completion evidence could not be retained",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "verified recovery completion evidence could not be retained",
+                ),
+            };
         } else {
             const existing_retained = if (current.state.transaction_result) |binding|
                 std.mem.eql(
@@ -6780,12 +6895,17 @@ pub const Engine = struct {
                     prepared.paths,
                     verified.bytes,
                     verified.binding.digest_sha256,
-                ) catch return self.markRecoveryRequired(
-                    allocator,
-                    prepared,
-                    current,
-                    "verified transaction result could not be retained",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    else => return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "verified transaction result could not be retained",
+                    ),
+                };
         }
         self.hitCompletionBoundary(.after_transaction_retained) catch
             return self.markRecoveryRequired(
@@ -6808,6 +6928,8 @@ pub const Engine = struct {
             },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 prepared,
@@ -6830,12 +6952,17 @@ pub const Engine = struct {
                 allocator,
                 prepared.paths,
                 acknowledgment,
-            ) catch return self.markRecoveryRequired(
-                allocator,
-                prepared,
-                current,
-                "lower acknowledgment token could not be retained",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "lower acknowledgment token could not be retained",
+                ),
+            };
         self.hitCompletionBoundary(.after_acknowledgment_retained) catch
             return self.reconcilePreparedError(allocator, prepared);
         self.hitCompletionBoundary(.before_completion_published) catch
@@ -6853,12 +6980,17 @@ pub const Engine = struct {
                 .recovered = recovered,
                 .completed_unix = self.clock.nowFn(self.clock.context),
             },
-        ) catch return self.markRecoveryRequired(
-            allocator,
-            prepared,
-            current,
-            "verified completion evidence could not be published",
-        );
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                current,
+                "verified completion evidence could not be published",
+            ),
+        };
         self.hitCompletionBoundary(.after_completion_published) catch
             return self.reconcilePreparedErrorWithCompletion(
                 allocator,
@@ -6883,6 +7015,8 @@ pub const Engine = struct {
             final.state,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedErrorWithCompletion(
                 allocator,
                 prepared,
@@ -6903,6 +7037,8 @@ pub const Engine = struct {
             prepared.paths,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedErrorWithCompletion(
                 allocator,
                 prepared,
@@ -7008,6 +7144,7 @@ pub const Engine = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.store.commitFn(
@@ -7018,6 +7155,8 @@ pub const Engine = struct {
             retained,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.acknowledgeCommittedLower(
@@ -7031,6 +7170,7 @@ pub const Engine = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
+            error.ContractViolation => return error.ContractViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         self.store.clearCommittedFn(
@@ -7040,6 +7180,8 @@ pub const Engine = struct {
             operation_state.Expected.fromState(retained),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(allocator, prepared),
         };
         return completedResult(
@@ -7169,6 +7311,8 @@ pub const Engine = struct {
             profile.state_path,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return try unknownMutationDiagnostic(
                 allocator,
                 request,
@@ -7204,6 +7348,8 @@ pub const Engine = struct {
                 paths,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
                 else => return try unknownMutationDiagnostic(
                     allocator,
                     request,
@@ -7321,6 +7467,8 @@ pub const Engine = struct {
             final.state,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return unknownMutationDiagnostic(
                 allocator,
                 request,
@@ -7370,6 +7518,8 @@ pub const Engine = struct {
             error.AttemptMismatch => return error.AttemptMismatch,
             error.MutationEvidenceRollback => return error.MutationEvidenceRollback,
             error.EvidenceRollback => return error.EvidenceRollback,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 prepared,
@@ -7403,6 +7553,8 @@ pub const Engine = struct {
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
                 else => return self.reconcilePreparedError(
                     allocator,
                     prepared,
@@ -7429,6 +7581,8 @@ pub const Engine = struct {
             },
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
             else => return self.reconcilePreparedError(
                 allocator,
                 prepared,
@@ -7838,10 +7992,18 @@ fn isRootIdentityError(err: anyerror) bool {
         err == error.ActiveHostMount;
 }
 
-fn digestProfilePath(path: []const u8) [32]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
-    return digest;
+fn recoveryReviewNonce(prepared: Preparation) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-recovery-review-capability-v1\x00");
+    hash.update(&prepared.attempt_id);
+    var generation: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation, prepared.active_generation, .little);
+    hash.update(&generation);
+    hash.update(&prepared.active_digest_sha256);
+    hash.update(&prepared.profile.sha256);
+    hash.update(&prepared.profile.reference_evidence_sha256);
+    hash.update(&prepared.exact_lock.digest_sha256);
+    return hash.finalResult();
 }
 
 fn staleRecoveryReviewResult(
@@ -10910,7 +11072,6 @@ const FakeRunner = struct {
             .prepareRecoveryReviewFn = prepareRecoveryReviewBoundary,
             .validateRecoveryReviewFn = validateRecoveryReviewBoundary,
             .releaseRecoveryReviewFn = releaseRecoveryReviewBoundary,
-            .cancelRecoveryReviewForProfileFn = cancelRecoveryReviewForProfileBoundary,
         };
     }
 
@@ -10982,7 +11143,11 @@ const FakeRunner = struct {
                     u8,
                     &claim.outer_state_sha256,
                     &input.prepared.active_digest_sha256,
-                ))
+                ) and std.mem.eql(
+                u8,
+                &claim.digest_sha256,
+                &input.expected_claim.digest_sha256,
+            ))
                 return .{
                     .mutation_status = switch (claim.mutation_status) {
                         .unchanged => .unchanged,
@@ -10992,8 +11157,24 @@ const FakeRunner = struct {
                 };
             if (!std.mem.eql(
                 u8,
-                &claim.profile_path_sha256,
-                &digestProfilePath(input.prepared.request.profile_path),
+                &claim.outer_attempt_id,
+                &input.prepared.attempt_id,
+            ) or !std.mem.eql(
+                u8,
+                &claim.profile_sha256,
+                &input.prepared.profile.sha256,
+            ) or !std.mem.eql(
+                u8,
+                &claim.profile_reference_sha256,
+                &input.prepared.profile.reference_evidence_sha256,
+            ) or !std.mem.eql(
+                u8,
+                &claim.exact_lock_sha256,
+                &input.prepared.exact_lock.digest_sha256,
+            ) or !std.mem.eql(
+                u8,
+                &claim.semantic_request_sha256,
+                &input.verified_lock.semantic_request_sha256,
             )) return .{ .mutation_status = .unknown };
             self.recovery_review_claim = null;
             self.recovery_review_releases += 1;
@@ -11025,9 +11206,6 @@ const FakeRunner = struct {
             .profile_sha256 = input.prepared.profile.sha256,
             .profile_reference_sha256 = input.prepared.profile.reference_evidence_sha256,
             .exact_lock_sha256 = input.prepared.exact_lock.digest_sha256,
-            .profile_path_sha256 = digestProfilePath(
-                input.prepared.request.profile_path,
-            ),
             .semantic_request_sha256 = input.verified_lock.semantic_request_sha256,
             .outer_transaction_sha256 = input.outer_transaction_sha256,
             .mutation_status = switch (status) {
@@ -11035,11 +11213,12 @@ const FakeRunner = struct {
                 .changed => .changed,
                 .unknown => unreachable,
             },
-            .nonce = input.nonce,
+            .nonce = input.expected_claim.nonce,
             .marker_sha256 = if (lower.deferred_acknowledgment) |marker|
                 marker.digest_sha256
             else
                 null,
+            .prior_marker = lower.deferred_acknowledgment,
             .record_sha256 = if (lower.record) |owned|
                 owned.record.digest_sha256
             else
@@ -11049,8 +11228,16 @@ const FakeRunner = struct {
             else
                 null,
         }) catch return error.InvariantViolation;
-        self.recovery_review_claim = claim;
-        return .{ .mutation_status = status, .claim = claim };
+        if (!std.mem.eql(
+            u8,
+            &claim.digest_sha256,
+            &input.expected_claim.digest_sha256,
+        )) return .{ .mutation_status = .unknown };
+        self.recovery_review_claim = input.expected_claim;
+        return .{
+            .mutation_status = status,
+            .claim = input.expected_claim,
+        };
     }
 
     fn validateRecoveryReviewBoundary(
@@ -11080,23 +11267,6 @@ const FakeRunner = struct {
             u8,
             &observed.digest_sha256,
             &claim.digest_sha256,
-        )) return false;
-        self.recovery_review_claim = null;
-        self.recovery_review_releases += 1;
-        return true;
-    }
-
-    fn cancelRecoveryReviewForProfileBoundary(
-        context: *anyopaque,
-        _: std.mem.Allocator,
-        profile_path_sha256: [32]u8,
-    ) BoundaryError!bool {
-        const self: *FakeRunner = @ptrCast(@alignCast(context));
-        const observed = self.recovery_review_claim orelse return false;
-        if (!std.mem.eql(
-            u8,
-            &observed.profile_path_sha256,
-            &profile_path_sha256,
         )) return false;
         self.recovery_review_claim = null;
         self.recovery_review_releases += 1;
@@ -16805,7 +16975,6 @@ test "apt_system_orchestrator.test.validated recovery fatal callbacks retain rev
                 .result => return error.ExpectedRecoveryPreparation,
             };
             defer recovery.deinit();
-            const claim_digest = recovery.review_claim.?.digest_sha256;
             if (std.mem.eql(u8, point, "load"))
                 harness.profile.load_boundary_error = failure
             else
@@ -16842,14 +17011,10 @@ test "apt_system_orchestrator.test.validated recovery fatal callbacks retain rev
                 harness.backend.recover_calls,
             );
             try std.testing.expectEqual(
-                @as(usize, 0),
+                @as(usize, 1),
                 harness.runner.recovery_review_releases,
             );
-            try std.testing.expect(std.mem.eql(
-                u8,
-                &claim_digest,
-                &harness.runner.recovery_review_claim.?.digest_sha256,
-            ));
+            try std.testing.expect(harness.runner.recovery_review_claim == null);
         }
     }
 }
@@ -16910,7 +17075,7 @@ test "apt_system_orchestrator.test.review cleanup failure retains exact retry ev
     try std.testing.expectEqual(@as(usize, 0), harness.backend.recover_calls);
 }
 
-test "apt_system_orchestrator.test.profile failure and restart base change cannot strand review claim" {
+test "apt_system_orchestrator.test.restart cancellation requires fully verified exact owner" {
     var harness = Harness.init(std.testing.allocator);
     defer harness.deinit();
     harness.rebind();
@@ -16952,9 +17117,9 @@ test "apt_system_orchestrator.test.profile failure and restart base change canno
         api.MutationStatus.unknown,
         unavailable.mutation_status.?,
     );
-    try std.testing.expect(harness.runner.recovery_review_claim == null);
+    try std.testing.expect(harness.runner.recovery_review_claim != null);
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         harness.runner.recovery_review_releases,
     );
 
@@ -16967,6 +17132,11 @@ test "apt_system_orchestrator.test.profile failure and restart base change canno
         .result => return error.ExpectedRecoveryPreparation,
     };
     defer restarted.deinit();
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &first.review_claim.?.digest_sha256,
+        &restarted.review_claim.?.digest_sha256,
+    ));
     harness.profile.revalidate_boundary_error =
         error.OperationalBoundaryFailure;
     var replaced = switch (try harness.engine.prepareRecovery(
@@ -16985,21 +17155,13 @@ test "apt_system_orchestrator.test.profile failure and restart base change canno
         api.MutationStatus.unknown,
         replaced.mutation_status.?,
     );
-    try std.testing.expect(harness.runner.recovery_review_claim == null);
+    try std.testing.expect(harness.runner.recovery_review_claim != null);
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 0),
         harness.runner.recovery_review_releases,
     );
 
     harness.profile.revalidate_boundary_error = null;
-    var final_review = switch (try harness.engine.prepareRecovery(
-        std.testing.allocator,
-        "/profile.json",
-    )) {
-        .ready => |value| value,
-        .result => return error.ExpectedRecoveryPreparation,
-    };
-    defer final_review.deinit();
     harness.store.foreign_inspected_active = true;
     var changed = switch (try harness.engine.prepareRecovery(
         std.testing.allocator,
@@ -17017,9 +17179,9 @@ test "apt_system_orchestrator.test.profile failure and restart base change canno
         api.MutationStatus.unknown,
         changed.mutation_status.?,
     );
-    try std.testing.expect(harness.runner.recovery_review_claim == null);
+    try std.testing.expect(harness.runner.recovery_review_claim != null);
     try std.testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 0),
         harness.runner.recovery_review_releases,
     );
 }
@@ -18809,7 +18971,7 @@ fn expectSettledPublishedRecovery(
         harness.backend.recovery_ack_calls,
     );
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 3),
         harness.runner.recovery_completion_reads,
     );
     try std.testing.expect(harness.store.active_bytes == null);
@@ -18956,7 +19118,7 @@ test "apt_system_orchestrator.test.profile replacement blocks recovery and recon
         try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
         try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
         try std.testing.expectEqual(
-            completion_reads_before_profile_replacement + 1,
+            completion_reads_before_profile_replacement + 2,
             harness.runner.recovery_completion_reads,
         );
     }

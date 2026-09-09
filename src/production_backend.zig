@@ -1568,22 +1568,7 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        if (recovery_review_claim_sha256) |digest|
-            consumeRecoveryReviewClaim(
-                allocator,
-                store,
-                acknowledgment.acknowledgment_id,
-                digest,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ContractViolation => return error.ContractViolation,
-                error.InvariantViolation => return error.InvariantViolation,
-                error.OperationalFailure => return blockedRecovery(
-                    request.operation,
-                    "the confirmed recovery review is stale or foreign",
-                ),
-            };
-        const marker = store.readDeferredAcknowledgment(allocator) catch
+        var marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
                 "deferred lower recovery marker is unreadable",
@@ -1598,7 +1583,45 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery marker is missing for an active record",
             );
-            return success(
+            if (recovery_review_claim_sha256) |digest| {
+                const review = store.readRecoveryReviewClaim(
+                    allocator,
+                ) catch return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review ownership is unreadable",
+                );
+                if (review != null) {
+                    const reconstructed =
+                        root_operation.createDeferredAcknowledgment(.{
+                            .state = .acknowledged,
+                            .attempt_id = acknowledgment.attempt_id,
+                            .completion_sha256 = acknowledgment.completion_sha256,
+                            .provenance_sha256 = acknowledgment.provenance_sha256,
+                            .acknowledgment_id = acknowledgment.acknowledgment_id,
+                        }) catch return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review cannot reconstruct exact lower ownership",
+                        );
+                    store.exchangeRecoveryReviewClaimForOwnership(
+                        allocator,
+                        .{
+                            .claim_sha256 = digest,
+                            .outer_attempt_id = acknowledgment.acknowledgment_id,
+                            .expected_marker_sha256 = null,
+                            .expected_record_sha256 = null,
+                            .replacement_marker = reconstructed,
+                        },
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review could not restore exact lower ownership",
+                        ),
+                    };
+                    marker = reconstructed;
+                }
+            }
+            if (marker == null) return success(
                 request.operation,
                 false,
                 "lower recovery acknowledgment was already finalized",
@@ -1660,7 +1683,6 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery acknowledgment token is stale or foreign",
             );
-        var acknowledged_marker = observed_marker;
         if (observed_marker.state == .pending) {
             const active = if (record) |owned|
                 owned.record
@@ -1677,6 +1699,28 @@ pub const Backend = struct {
                     request.operation,
                     "deferred lower recovery acknowledgment names a foreign operation",
                 );
+        }
+        if (recovery_review_claim_sha256) |digest|
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .claim_sha256 = digest,
+                    .outer_attempt_id = acknowledgment.acknowledgment_id,
+                    .expected_marker_sha256 = observed_marker.digest_sha256,
+                    .expected_record_sha256 = if (record) |owned|
+                        owned.record.digest_sha256
+                    else
+                        null,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review could not be exchanged for the verified lower recovery owner",
+                ),
+            };
+        var acknowledged_marker = observed_marker;
+        if (observed_marker.state == .pending) {
             if (self.completion_crash) |crash|
                 try crash.hit(.before_deferred_acknowledged);
             acknowledged_marker =
@@ -1774,22 +1818,7 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        if (recovery_review_claim_sha256) |digest|
-            consumeRecoveryReviewClaim(
-                allocator,
-                store,
-                acknowledgment.acknowledgment_id,
-                digest,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ContractViolation => return error.ContractViolation,
-                error.InvariantViolation => return error.InvariantViolation,
-                error.OperationalFailure => return blockedRecovery(
-                    request.operation,
-                    "the confirmed recovery review is stale or foreign",
-                ),
-            };
-        const marker = store.readDeferredAcknowledgment(allocator) catch
+        var marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
                 "lower ownership marker is unreadable",
@@ -1804,7 +1833,61 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker is missing for an active record",
             );
-            return success(
+            if (recovery_review_claim_sha256) |digest| {
+                const review = store.readRecoveryReviewClaim(
+                    allocator,
+                ) catch return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review ownership is unreadable",
+                );
+                if (review != null) {
+                    const states = [_]root_operation.DeferredAcknowledgmentState{
+                        .released,
+                        .abandoned,
+                        .bound,
+                    };
+                    var reconstructed: ?root_operation.DeferredAcknowledgment =
+                        null;
+                    for (states) |state| {
+                        const candidate =
+                            root_operation.createDeferredAcknowledgment(.{
+                                .state = state,
+                                .attempt_id = acknowledgment.attempt_id,
+                                .acknowledgment_id = acknowledgment.acknowledgment_id,
+                            }) catch continue;
+                        if (std.mem.eql(
+                            u8,
+                            &candidate.digest_sha256,
+                            &acknowledgment.marker_sha256,
+                        )) {
+                            reconstructed = candidate;
+                            break;
+                        }
+                    }
+                    const owner = reconstructed orelse return blockedRecovery(
+                        request.operation,
+                        "confirmed recovery review cannot reconstruct exact lower ownership",
+                    );
+                    store.exchangeRecoveryReviewClaimForOwnership(
+                        allocator,
+                        .{
+                            .claim_sha256 = digest,
+                            .outer_attempt_id = acknowledgment.acknowledgment_id,
+                            .expected_marker_sha256 = null,
+                            .expected_record_sha256 = null,
+                            .replacement_marker = owner,
+                        },
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "confirmed recovery review could not restore exact lower ownership",
+                        ),
+                    };
+                    marker = owner;
+                }
+            }
+            if (marker == null) return success(
                 request.operation,
                 false,
                 "lower orchestration ownership was already finalized",
@@ -1860,6 +1943,22 @@ pub const Backend = struct {
                     request.operation,
                     "lower reconciliation claim belongs to another orchestrator",
                 );
+            if (recovery_review_claim_sha256) |digest|
+                store.exchangeRecoveryReviewClaimForOwnership(
+                    allocator,
+                    .{
+                        .claim_sha256 = digest,
+                        .outer_attempt_id = acknowledgment.acknowledgment_id,
+                        .expected_marker_sha256 = observed.digest_sha256,
+                        .expected_record_sha256 = null,
+                    },
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "confirmed recovery review could not be exchanged for the verified reconciliation owner",
+                    ),
+                };
             if (self.completion_crash) |crash|
                 crash.hit(.before_ownership_marker_clear) catch
                     return blockedRecovery(
@@ -1924,6 +2023,25 @@ pub const Backend = struct {
             request.operation,
             "lower ownership record is unfinished, incompatible, or foreign",
         );
+        if (recovery_review_claim_sha256) |digest|
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .claim_sha256 = digest,
+                    .outer_attempt_id = acknowledgment.acknowledgment_id,
+                    .expected_marker_sha256 = observed.digest_sha256,
+                    .expected_record_sha256 = if (record) |owned|
+                        owned.record.digest_sha256
+                    else
+                        null,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedRecovery(
+                    request.operation,
+                    "confirmed recovery review could not be exchanged for the verified lower owner",
+                ),
+            };
         store.cleanupOwned(allocator, .{
             .attempt_id = observed.attempt_id,
             .acknowledgment_id = acknowledgment.acknowledgment_id,
@@ -1990,21 +2108,6 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        if (recovery_review_claim_sha256) |digest|
-            consumeRecoveryReviewClaim(
-                allocator,
-                store,
-                orchestration_id,
-                digest,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ContractViolation => return error.ContractViolation,
-                error.InvariantViolation => return error.InvariantViolation,
-                error.OperationalFailure => return blockedRecovery(
-                    request.operation,
-                    "the confirmed recovery review is stale or foreign",
-                ),
-            };
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
                 request.operation,
@@ -2073,13 +2176,31 @@ pub const Backend = struct {
         );
         if (self.completion_crash) |crash|
             try crash.hit(.before_reconciliation_marker_publish);
-        store.publishDeferredAcknowledgment(
-            allocator,
-            reconciliation,
-        ) catch return blockedRecovery(
-            request.operation,
-            "lower reconciliation ownership could not be published",
-        );
+        if (recovery_review_claim_sha256) |digest|
+            store.exchangeRecoveryReviewClaimForOwnership(
+                allocator,
+                .{
+                    .claim_sha256 = digest,
+                    .outer_attempt_id = orchestration_id,
+                    .expected_marker_sha256 = null,
+                    .expected_record_sha256 = null,
+                    .replacement_marker = reconciliation,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return blockedRecovery(
+                    request.operation,
+                    "the confirmed recovery review could not be atomically exchanged for reconciliation ownership",
+                ),
+            }
+        else
+            store.publishDeferredAcknowledgment(
+                allocator,
+                reconciliation,
+            ) catch return blockedRecovery(
+                request.operation,
+                "lower reconciliation ownership could not be published",
+            );
         if (self.completion_crash) |crash|
             try crash.hit(.after_reconciliation_marker_publish);
         return success(
@@ -2451,40 +2572,6 @@ fn workflowMode(operation: api.Operation, workflow: ?WorkflowDirective) Workflow
         .recover => .recover,
         else => .execute,
     };
-}
-
-const ConsumeRecoveryReviewClaimError = error{
-    OutOfMemory,
-    ContractViolation,
-    InvariantViolation,
-    OperationalFailure,
-};
-
-fn consumeRecoveryReviewClaim(
-    allocator: std.mem.Allocator,
-    store: root_operation.Store,
-    orchestration_id: [32]u8,
-    expected_digest: [32]u8,
-) ConsumeRecoveryReviewClaimError!void {
-    const review = store.readRecoveryReviewClaim(allocator) catch |err|
-        switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.OperationalFailure,
-        } orelse return error.OperationalFailure;
-    if (!std.mem.eql(
-        u8,
-        &review.outer_attempt_id,
-        &orchestration_id,
-    ) or !std.mem.eql(
-        u8,
-        &review.digest_sha256,
-        &expected_digest,
-    )) return error.OperationalFailure;
-    store.clearRecoveryReviewClaim(allocator, expected_digest) catch |err|
-        switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.OperationalFailure,
-        };
 }
 
 fn workflowRootOperation(
