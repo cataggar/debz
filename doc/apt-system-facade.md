@@ -113,6 +113,14 @@ accept both versions but never reserialize a v1 document through the v2 layout.
 A prompt-time crash can adopt only the exact claim. Negative answers and EOF
 exact-release it without changing active operation state; JSON and UNKNOWN
 paths also release it and never strand prompt authorization.
+All cancellation paths use the same exact-capability disposition guard before
+invoking the release child. A confirmed release response disarms the guard;
+false, malformed, interrupted, or fatal responses trigger one OOM-independent
+lower-locked classification. A claim still present is exact-released, a release
+completed before response loss is accepted as clean, and a transferred owner
+is preserved and reported as recovery-required. Human review/output failures,
+negative or unavailable confirmation, JSON non-prompt cancellation, UNKNOWN
+cleanup, and stale-review rejection cannot call an unguarded release path.
 After claim validation, every exit before atomic lower-protocol handoff
 exact-releases the claim. Restart cancellation requires either the original
 claim capability or a fully revalidated outer state, trusted profile, semantic
