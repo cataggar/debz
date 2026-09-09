@@ -15,6 +15,27 @@ dependency-resolution edge behavior. There is no `apt-get` alias and no
 passthrough to apt or dpkg. Unsupported syntax must become a typed usage
 outcome before repository, root, or package mutation.
 
+## Executable acceptance
+
+`zig build test-apt-system-acceptance` is a required Linux CI check on amd64
+and arm64, separate from the adapter and orchestration unit tests. Run it as
+root with Linux mount, PID, and network namespace support, Python 3 with
+`cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, GNU tar, shell,
+ldconfig, start-stop-daemon, rm, and diff available.
+CI invokes the same acceptance script with the preceding build's ReleaseSafe
+executable rather than compiling it again in a separate privileged cache.
+
+The check invokes the built `debz` executable and real dpkg in a disposable
+chroot under the repository's `.zig-cache`, using an authenticated fixture
+repository and an explicit system profile. It exercises update, multi-package
+confirmation and installation, retained exact-lock/transaction verification,
+installed listing, upgrade, batch removal, and all-or-nothing planning
+rejection. It also checks unsupported syntax before state creation, isolation
+from ambient APT configuration/proxies, unchanged host dpkg status, and mount
+cleanup. Missing privileges or fixture prerequisites fail rather than skip.
+The required privileged orchestration suite additionally covers interruption,
+recovery, ownership replacement, cache corruption, and durable publication.
+
 ## Strict CLI grammar
 
 The accepted grammar, and no other apt spelling, is:
