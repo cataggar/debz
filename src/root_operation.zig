@@ -1571,6 +1571,17 @@ fn deferredAcknowledgmentWithState(
         result.exact_identity_sha256 =
             deferredAcknowledgmentExactIdentity(result);
     }
+
+    return result;
+}
+
+pub fn transitionDeferredAcknowledgment(
+    marker: DeferredAcknowledgment,
+    state: DeferredAcknowledgmentState,
+) !DeferredAcknowledgment {
+    const result = deferredAcknowledgmentWithState(marker, state);
+    if (!validDeferredAcknowledgment(result))
+        return error.InvalidDocument;
     return result;
 }
 
@@ -3141,6 +3152,7 @@ pub const Coordinator = struct {
         var deferred = store_handle.readDeferredAcknowledgment(
             allocator,
         ) catch return error.RecordCorrupt;
+        var review_exchanged = false;
         if (recovery_review) |review| {
             if (!Store.optionalDigestEqual(
                 review.marker_sha256,
@@ -3150,6 +3162,22 @@ pub const Coordinator = struct {
                 if (prior) |owned| owned.record.digest_sha256 else null,
             )) return error.RecoveryRequired;
             if (deferred != null) {
+                if (deferred.?.document_version ==
+                    deferred_ack_v2_schema_version)
+                {
+                    const expected =
+                        request.expected_deferred_acknowledgment orelse
+                        return error.AuthorizationEvidenceMissing;
+                    if (!deferredAcknowledgmentExactEqual(
+                        deferred.?,
+                        expected,
+                    )) return error.RecoveryRequired;
+                    if (review.prior_marker == null or
+                        !deferredAcknowledgmentExactEqual(
+                            expected,
+                            review.prior_marker.?,
+                        )) return error.RecoveryRequired;
+                }
                 store_handle.exchangeRecoveryReviewClaimForOwnership(
                     allocator,
                     .{
@@ -3166,13 +3194,14 @@ pub const Coordinator = struct {
                     review,
                 ) catch return error.RecordCorrupt;
                 recovery_review = null;
+                review_exchanged = true;
             } else if (prior != null) {
                 return error.RecoveryRequired;
             }
         }
         if (deferred) |marker| {
             if (marker.document_version == deferred_ack_v2_schema_version and
-                request.recovery_review_claim == null)
+                !review_exchanged)
             {
                 const expected =
                     request.expected_deferred_acknowledgment orelse
@@ -3483,11 +3512,38 @@ pub const Coordinator = struct {
         });
         errdefer created.deinit();
         if (request.orchestration_id) |orchestration_id| {
-            const binding = createDeferredAcknowledgment(.{
-                .state = .bound,
-                .attempt_id = attempt_id,
-                .acknowledgment_id = orchestration_id,
-            }) catch return error.StoreFailed;
+            const expected_binding =
+                request.expected_deferred_acknowledgment;
+            if (expected_binding) |expected| {
+                if (expected.state != .bound or
+                    !std.mem.eql(
+                        u8,
+                        &expected.attempt_id,
+                        &attempt_id,
+                    ) or !std.mem.eql(
+                    u8,
+                    &expected.acknowledgment_id,
+                    &orchestration_id,
+                ))
+                    return error.RecoveryRequired;
+            }
+            const binding = if (request.recovery_review_claim != null)
+                createDeferredAcknowledgment(.{
+                    .document_version = if (expected_binding) |expected|
+                        expected.document_version
+                    else
+                        deferred_ack_schema_version,
+                    .state = .bound,
+                    .attempt_id = attempt_id,
+                    .acknowledgment_id = orchestration_id,
+                }) catch return error.StoreFailed
+            else
+                expected_binding orelse
+                    (createDeferredAcknowledgment(.{
+                        .state = .bound,
+                        .attempt_id = attempt_id,
+                        .acknowledgment_id = orchestration_id,
+                    }) catch return error.StoreFailed);
             const store_handle = self.store();
             if (request.acquisition_observer) |observer|
                 observer.hit(.before_binding_published) catch
@@ -3504,19 +3560,34 @@ pub const Coordinator = struct {
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.StoreFailed,
-                }
-            else if (store_handle.readDeferredAcknowledgment(allocator) catch
-                return error.StoreFailed) |existing|
-                store_handle.rotateDeferredAcknowledgment(
-                    allocator,
-                    existing,
-                    binding,
-                ) catch return error.StoreFailed
-            else
-                store_handle.publishDeferredAcknowledgment(
-                    allocator,
-                    binding,
-                ) catch return error.StoreFailed;
+                };
+            if (request.recovery_review_claim != null and
+                expected_binding != null)
+            {
+                const observed =
+                    store_handle.readDeferredAcknowledgment(allocator) catch
+                        return error.StoreFailed;
+                if (observed == null or
+                    !deferredAcknowledgmentExactEqual(
+                        observed.?,
+                        expected_binding.?,
+                    ))
+                    return error.RecoveryRequired;
+            }
+            if (request.recovery_review_claim == null) {
+                if (store_handle.readDeferredAcknowledgment(allocator) catch
+                    return error.StoreFailed) |existing|
+                    store_handle.rotateDeferredAcknowledgment(
+                        allocator,
+                        existing,
+                        binding,
+                    ) catch return error.StoreFailed
+                else
+                    store_handle.publishDeferredAcknowledgment(
+                        allocator,
+                        binding,
+                    ) catch return error.StoreFailed;
+            }
             if (request.acquisition_observer) |observer|
                 observer.hit(.after_binding_published) catch
                     return error.StoreFailed;

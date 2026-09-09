@@ -17,6 +17,43 @@ except ModuleNotFoundError:
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+REQUIRED_SECURITY_TESTS = {
+    "src/production_backend.zig": (
+        "production workflow required_security.ownership finalization rejects a valid colliding v2 owner",
+        "production workflow required_security.restart requires the authenticated exact v2 owner",
+    ),
+    "src/apt_system_orchestrator.zig": (
+        "apt_system_orchestrator.test.required_security.valid v2 prior collision makes concurrent review publication stale",
+        "apt_system_orchestrator.test.required_security.restart authenticates durable lower ownership token before review",
+        "apt_system_orchestrator.test.required_security.restart cancellation requires fully verified exact owner",
+        "apt_system_orchestrator.test.required_security.recovery transport failure preserves lower token for retry without second mutation",
+    ),
+}
+
+
+class RequiredSecurityTestManifestTests(unittest.TestCase):
+    def test_required_security_tests_are_selected_exactly_once(self) -> None:
+        build = (ROOT / "build.zig").read_text()
+        self.assertIn(
+            '.filters = &.{"production workflow required_security."}',
+            build,
+        )
+        self.assertIn(
+            '.filters = &.{"apt_system_orchestrator.test.required_security."}',
+            build,
+        )
+        selected = 0
+        for relative_path, names in REQUIRED_SECURITY_TESTS.items():
+            source = (ROOT / relative_path).read_text()
+            for name in names:
+                self.assertEqual(
+                    source.count(f'test "{name}"'),
+                    1,
+                    f"required security test missing or duplicated: {name}",
+                )
+                selected += 1
+        self.assertEqual(selected, 6)
+
 
 class AptSystemResultSchemaTests(unittest.TestCase):
     @classmethod

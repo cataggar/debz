@@ -296,11 +296,21 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"production workflow"},
     });
     const run_production_backend_tests = b.addRunArtifact(production_backend_tests);
+    const required_production_security_tests = b.addTest(.{
+        .root_module = production_backend_test_module,
+        .filters = &.{"production workflow required_security."},
+    });
+    const run_required_production_security_tests = b.addRunArtifact(
+        required_production_security_tests,
+    );
     const production_backend_test_step = b.step(
         "test-production-backend",
         "Run production backend workflow and exact-lock tests",
     );
     production_backend_test_step.dependOn(&run_production_backend_tests.step);
+    production_backend_test_step.dependOn(
+        &run_required_production_security_tests.step,
+    );
     test_step.dependOn(&run_production_backend_tests.step);
 
     const system_profile_test_module = b.createModule(.{
@@ -414,6 +424,13 @@ pub fn build(b: *std.Build) void {
     const run_apt_system_orchestrator_tests = b.addRunArtifact(
         apt_system_orchestrator_tests,
     );
+    const required_orchestrator_security_tests = b.addTest(.{
+        .root_module = apt_system_orchestrator_test_module,
+        .filters = &.{"apt_system_orchestrator.test.required_security."},
+    });
+    const run_required_orchestrator_security_tests = b.addRunArtifact(
+        required_orchestrator_security_tests,
+    );
 
     const apt_system_test_step = b.step(
         "test-apt-system",
@@ -431,6 +448,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_apt_system_command_tests.step);
     test_step.dependOn(&run_apt_system_state_tests.step);
     test_step.dependOn(&run_apt_system_orchestrator_tests.step);
+    const required_security_test_step = b.step(
+        "test-required-security",
+        "Run mandatory production ownership and restart security tests",
+    );
+    required_security_test_step.dependOn(
+        &run_required_production_security_tests.step,
+    );
+    required_security_test_step.dependOn(
+        &run_required_orchestrator_security_tests.step,
+    );
+    test_step.dependOn(&run_required_production_security_tests.step);
+    test_step.dependOn(&run_required_orchestrator_security_tests.step);
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,

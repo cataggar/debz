@@ -149,9 +149,27 @@ complete expected marker; attempt and acknowledgment IDs are accepted only
 for genuine v1 upgrade documents. Reading the current v2 marker is not
 authorization. A reservation therefore returns its complete exact owner token,
 which the outer operation carries into the subsequent execute invocation.
+Before any child can publish or exchange a v2 owner, the parent publishes
+`lower-ownership-token-v1.json` in the retained outer operation directory.
+This bounded canonical document binds the outer attempt, generation and state
+digest, request, trusted profile and reference, exact lock, semantic request,
+purpose, complete expected v2 marker bytes and exact identity, and any
+authenticated predecessor marker. Publication stages and fsyncs the file,
+renames it within the operation directory, and fsyncs that directory before
+the child runs. Token replacement accepts only an exact predecessor,
+collision-resistant review-owner continuation, or the operation-local exact
+workflow acknowledgment; a foreign marker with the same legacy digest cannot
+advance the token.
 Restart cleanup uses the retained operation-local acknowledgment or a fully
 reconstructed reviewed owner; if that evidence is absent, cleanup fails closed
 without changing the record or marker.
+Restart treats the observed lower marker only as evidence to compare. It loads
+the no-follow operation-local token first, verifies all outer/profile/request/
+lock bindings, and then requires the observed v2 identity to match the token,
+an exact state transition, or an exact retained workflow acknowledgment
+composed with the token's collision-resistant review identity. Missing,
+corrupt, stale, or foreign token evidence leaves the lower marker and record
+byte-for-byte unchanged.
 Frozen v1 review claims remain readable and byte-identical; an upgraded
 recovery derives their complete domain-separated identity from the exact
 canonical v1 document before transferring them into a v2 owner.
