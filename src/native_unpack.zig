@@ -37,6 +37,7 @@ const relation = @import("relation.zig");
 const root_fs = @import("root_fs.zig");
 const root_mutation = @import("root_mutation.zig");
 const root_operation = @import("root_operation.zig");
+const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const version_module = @import("debian_version.zig");
 
@@ -837,6 +838,16 @@ pub const CaseAlias = struct {
     second: []const u8,
 };
 
+pub const PlannedConffile = struct {
+    /// Canonical root-relative live path.
+    path: []const u8,
+    /// Physical package staging path used during unpack, when shipped.
+    staged_path: ?[]const u8 = null,
+    action: native_program.ConffileAction,
+    packaged_md5: ?[16]u8 = null,
+    recorded: ?package_database.ConffileEntry = null,
+};
+
 pub const PackagePlan = struct {
     identity: native_program.PackageIdentity,
     /// `name` or `name:architecture`, exactly as `info` spells it.
@@ -855,6 +866,7 @@ pub const PackagePlan = struct {
     /// Canonical `.list` content, sorted, with dpkg's `/.` root record.
     list_paths: []const []const u8,
     md5sums: []const package_database.Md5sumEntry,
+    conffiles: []const PlannedConffile = &.{},
     resolutions: []const Resolution,
     /// Status the transaction publishes. Item 10 leaves every package where
     /// `dpkg --unpack` leaves it.
@@ -977,7 +989,14 @@ const Request = struct {
     /// Paths whose filesystem metadata/features the descriptive snapshot
     /// cannot reproduce safely.
     unsupported_root_features: []const []const u8 = &.{},
+    conffiles: ConffileCapability = .handoff,
+    conffile_policy: transaction_executor.ConffilePolicy = .keep_existing,
     limits: Limits = .{},
+};
+
+const ConffileCapability = enum {
+    handoff,
+    unpack,
 };
 
 // ---------------------------------------------------------------------------
@@ -1027,6 +1046,9 @@ const PackageWork = struct {
     resolutions: std.ArrayList(Resolution) = .empty,
     list_paths: std.ArrayList([]const u8) = .empty,
     md5sums: std.ArrayList(package_database.Md5sumEntry) = .empty,
+    conffiles: std.ArrayList(PlannedConffile) = .empty,
+    conffile_records: std.ArrayList(package_database.ConffileEntry) = .empty,
+    declared_conffiles: std.ArrayList([]const u8) = .empty,
 };
 
 const ReplacementRule = struct {
@@ -1262,6 +1284,9 @@ const Builder = struct {
             item.resolutions.deinit(self.allocator);
             item.list_paths.deinit(self.allocator);
             item.md5sums.deinit(self.allocator);
+            item.conffiles.deinit(self.allocator);
+            item.conffile_records.deinit(self.allocator);
+            item.declared_conffiles.deinit(self.allocator);
         }
         self.work.deinit(self.allocator);
         for (self.models.items) |model| {
@@ -1618,7 +1643,8 @@ fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
     try indexFinalClaims(builder);
     try indexInstalledConffiles(builder);
     try indexCaseGraph(builder);
-    try inspectTouchedConffiles(builder);
+    if (builder.request.conffiles == .handoff)
+        try inspectTouchedConffiles(builder);
     try inspectDeferredState(builder);
     if (builder.deferred.items.len != 0) return error.Deferred;
     try proveCaseEvidence(builder);
@@ -2230,12 +2256,13 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
 
     for (builder.work.items) |item| {
         const archive = item.model;
-        for (archive.conffiles) |conffile| try builder.deferFeature(.{
-            .feature = .conffile,
-            .package = item.identity.name,
-            .architecture = item.identity.architecture,
-            .detail = conffile.path,
-        });
+        if (builder.request.conffiles == .handoff)
+            for (archive.conffiles) |conffile| try builder.deferFeature(.{
+                .feature = .conffile,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = conffile.path,
+            });
         for (archive.scripts) |script| try builder.deferFeature(.{
             .feature = .maintainer_script,
             .package = item.identity.name,
@@ -2255,12 +2282,13 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
             .detail = member.name,
         });
         const prior = item.prior orelse continue;
-        for (prior.conffiles) |conffile| try builder.deferFeature(.{
-            .feature = .conffile,
-            .package = prior.name,
-            .architecture = prior.architecture,
-            .detail = conffile.path,
-        });
+        if (builder.request.conffiles == .handoff)
+            for (prior.conffiles) |conffile| try builder.deferFeature(.{
+                .feature = .conffile,
+                .package = prior.name,
+                .architecture = prior.architecture,
+                .detail = conffile.path,
+            });
         for (prior.scripts) |script| try builder.deferFeature(.{
             .feature = .maintainer_script,
             .package = prior.name,
@@ -2486,6 +2514,296 @@ fn kindOf(kind: archive_application.FileKind) Kind {
     };
 }
 
+fn plannedConffile(
+    item: *const PackageWork,
+    path: []const u8,
+) ?PlannedConffile {
+    for (item.conffiles.items) |conffile| {
+        if (std.mem.eql(u8, conffile.path, path)) return conffile;
+    }
+    return null;
+}
+
+fn findRecordedConffile(
+    builder: *Builder,
+    record: *const package_database.PackageRecord,
+    canonical: []const u8,
+) ?package_database.ConffileEntry {
+    for (record.conffiles) |conffile| {
+        const relative = relativeListPath(conffile.path) orelse continue;
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const normalized = canonicalAliasPath(
+            builder.aliases,
+            relative,
+            &buffer,
+        ) orelse continue;
+        if (std.mem.eql(u8, normalized, canonical)) return conffile;
+    }
+    return null;
+}
+
+fn observeConffileMd5(
+    builder: *Builder,
+    path: []const u8,
+    item: *const PackageWork,
+) PlanError!?[16]u8 {
+    const resolved = root_fs.Path.init(path) catch
+        return builder.fail(.{
+            .surface = .transition,
+            .code = .invalid_path,
+            .path = path,
+            .package = item.identity.name,
+        });
+    const entry = builder.request.root.entryIfExists(resolved) catch
+        return builder.fail(.{
+            .surface = .transition,
+            .code = .root_unreadable,
+            .path = path,
+            .package = item.identity.name,
+        });
+    const found = entry orelse return null;
+    if (!found.isRegularFile() or !found.modeled or found.link_count != 1) {
+        try builder.deferFeature(.{
+            .feature = .unsupported_root_feature,
+            .package = item.identity.name,
+            .architecture = item.identity.architecture,
+            .detail = path,
+        });
+        return null;
+    }
+    try chargeComparedBytes(builder, found.size, .{
+        .surface = .transition,
+        .code = .path_limit,
+        .path = path,
+        .package = item.identity.name,
+    });
+    const bytes = builder.request.root.readFileAlloc(
+        builder.allocator,
+        resolved,
+        builder.limits.max_compare_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return builder.fail(.{
+            .surface = .transition,
+            .code = .root_unreadable,
+            .path = path,
+            .package = item.identity.name,
+        }),
+    };
+    defer builder.allocator.free(bytes);
+    return digestMd5(bytes);
+}
+
+fn validateGeneratedConffilePath(
+    builder: *Builder,
+    item: *const PackageWork,
+    path: []const u8,
+    allow_existing: bool,
+) PlanError!void {
+    if (builder.ownership.owned(path)) {
+        try builder.deferFeature(.{
+            .feature = .conffile,
+            .package = item.identity.name,
+            .architecture = item.identity.architecture,
+            .detail = path,
+        });
+        return;
+    }
+    const entry = builder.request.root.entryIfExists(
+        root_fs.Path.init(path) catch
+            return builder.fail(.{
+                .surface = .transition,
+                .code = .invalid_path,
+                .path = path,
+                .package = item.identity.name,
+            }),
+    ) catch return builder.fail(.{
+        .surface = .transition,
+        .code = .root_unreadable,
+        .path = path,
+        .package = item.identity.name,
+    });
+    if (entry) |found| {
+        if (!allow_existing or !found.isRegularFile() or
+            !found.modeled or found.link_count != 1)
+            try builder.deferFeature(.{
+                .feature = .conffile,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = path,
+            });
+    }
+}
+
+fn prepareUnpackConffiles(
+    builder: *Builder,
+    item: *PackageWork,
+) PlanError!void {
+    if (builder.request.conffiles != .unpack) return;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(builder.allocator);
+    for (item.model.conffiles) |conffile| {
+        const normalized = try normalizePath(builder, conffile.path);
+        const live = normalized.path;
+        const absolute = try absoluteSpelling(builder, live);
+        try seen.put(builder.allocator, live, {});
+        const recorded = if (item.prior) |prior|
+            findRecordedConffile(builder, prior, live)
+        else
+            null;
+        if (conffile.remove_on_upgrade) {
+            const declaration = try std.fmt.allocPrint(
+                builder.arena,
+                "remove-on-upgrade {s}",
+                .{absolute},
+            );
+            try item.declared_conffiles.append(
+                builder.allocator,
+                declaration,
+            );
+            var action: native_program.ConffileAction = .skip_not_shipped;
+            if (recorded) |old| {
+                var retained = old;
+                retained.obsolete = false;
+                retained.remove_on_upgrade = true;
+                try item.conffile_records.append(builder.allocator, retained);
+                action = switch (old.digest) {
+                    .new_conffile => .skip_not_shipped,
+                    .md5 => |digest| native_program.conffileDecision(
+                        builder.request.conffile_policy,
+                        .{
+                            .path = conffile.path,
+                            .md5 = null,
+                            .remove_on_upgrade = true,
+                        },
+                        .{
+                            .path = old.path,
+                            .recorded_md5 = digest,
+                            .on_disk_md5 = try observeConffileMd5(
+                                builder,
+                                live,
+                                item,
+                            ),
+                            .obsolete = old.obsolete,
+                        },
+                    ),
+                };
+                if (action == .remove_on_upgrade_stage_old) {
+                    const old_path = try std.fmt.allocPrint(
+                        builder.arena,
+                        "{s}.dpkg-old",
+                        .{live},
+                    );
+                    try validateGeneratedConffilePath(
+                        builder,
+                        item,
+                        old_path,
+                        false,
+                    );
+                }
+            } else {
+                try item.conffile_records.append(builder.allocator, .{
+                    .path = absolute,
+                    .digest = .new_conffile,
+                    .remove_on_upgrade = true,
+                });
+            }
+            try item.conffiles.append(builder.allocator, .{
+                .path = live,
+                .action = action,
+                .recorded = recorded,
+            });
+            continue;
+        }
+
+        const file_index = conffile.file_index orelse
+            return builder.fail(.{
+                .surface = .archive,
+                .code = .unsupported_entry,
+                .path = live,
+                .package = item.identity.name,
+            });
+        const file = item.model.files[file_index];
+        const packaged_md5 = file.md5 orelse digestMd5(
+            item.model.fileBytes(file) catch
+                return builder.fail(.{
+                    .surface = .archive,
+                    .code = .unsupported_entry,
+                    .path = live,
+                    .package = item.identity.name,
+                }),
+        );
+        if (recorded != null)
+            _ = try observeConffileMd5(builder, live, item);
+        if (recorded == null and
+            (builder.request.root.entryIfExists(
+                root_fs.Path.init(live) catch unreachable,
+            ) catch return builder.fail(.{
+                .surface = .transition,
+                .code = .root_unreadable,
+                .path = live,
+                .package = item.identity.name,
+            })) != null)
+            try builder.deferFeature(.{
+                .feature = .conffile,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = live,
+            });
+        const staged = try std.fmt.allocPrint(
+            builder.arena,
+            "{s}.dpkg-new",
+            .{live},
+        );
+        try validateGeneratedConffilePath(
+            builder,
+            item,
+            staged,
+            item.prior != null and item.prior.?.status.current == .unpacked,
+        );
+        try item.declared_conffiles.append(builder.allocator, absolute);
+        try item.conffile_records.append(builder.allocator, if (recorded) |old| .{
+            .path = old.path,
+            .digest = old.digest,
+            .obsolete = false,
+            .remove_on_upgrade = false,
+        } else .{
+            .path = absolute,
+            .digest = .new_conffile,
+        });
+        try item.conffiles.append(builder.allocator, .{
+            .path = live,
+            .staged_path = staged,
+            .action = .install_new,
+            .packaged_md5 = packaged_md5,
+            .recorded = recorded,
+        });
+    }
+    if (item.prior) |prior| {
+        for (prior.conffiles) |old| {
+            const relative = relativeListPath(old.path) orelse continue;
+            var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const live = canonicalAliasPath(
+                builder.aliases,
+                relative,
+                &buffer,
+            ) orelse continue;
+            if (seen.contains(live)) continue;
+            if (try observeConffileMd5(builder, live, item) == null)
+                continue;
+            const owned = try builder.arena.dupe(u8, live);
+            var obsolete = old;
+            obsolete.obsolete = true;
+            try item.conffile_records.append(builder.allocator, obsolete);
+            try item.conffiles.append(builder.allocator, .{
+                .path = owned,
+                .action = .mark_obsolete,
+                .recorded = old,
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-package planning
 // ---------------------------------------------------------------------------
@@ -2495,6 +2813,7 @@ fn preparePackageClaims(
     item: *PackageWork,
 ) PlanError!void {
     const model = item.model;
+    try prepareUnpackConffiles(builder, item);
     try indexReplaces(builder, item, model);
     if (model.files.len > builder.limits.max_paths_per_package)
         return builder.fail(.{
@@ -2516,6 +2835,22 @@ fn preparePackageClaims(
 
     for (model.files, 0..) |file, index| {
         var claim = try normalizePath(builder, file.path);
+        if (builder.request.conffiles == .unpack and file.conffile) {
+            const conffile = plannedConffile(item, claim.path) orelse
+                return builder.fail(.{
+                    .surface = .archive,
+                    .code = .program_incomplete,
+                    .path = claim.path,
+                    .package = item.identity.name,
+                });
+            claim.path = conffile.staged_path orelse
+                return builder.fail(.{
+                    .surface = .archive,
+                    .code = .program_incomplete,
+                    .path = claim.path,
+                    .package = item.identity.name,
+                });
+        }
         claim.kind = kindOf(file.kind);
         claim.file = index;
         _ = root_fs.Path.init(claim.path) catch return builder.fail(.{
@@ -3747,6 +4082,16 @@ fn pathOwnedOnlyByRetiringPackages(
     return true;
 }
 
+fn preservesConffilePath(item: *const PackageWork, path: []const u8) bool {
+    for (item.conffiles.items) |conffile| {
+        if (!std.mem.eql(u8, conffile.path, path)) continue;
+        return conffile.action != .remove_on_upgrade and
+            conffile.action != .remove_on_upgrade_stage_old and
+            conffile.action != .skip_not_shipped;
+    }
+    return false;
+}
+
 fn ownershipConflict(item: *const PackageWork, path: []const u8, holder: Owner) Diagnostic {
     return .{
         .surface = .ownership,
@@ -4729,7 +5074,9 @@ fn planFinalRemovals(builder: *Builder) PlanError!void {
         var survives = builder.transaction_claims.get(path) != null;
         for (builder.ownership.entries[index..last]) |owned| {
             if (builder.owner_work.get(owned.owner)) |work_index| {
-                if (transactionPackageClaims(builder, path, work_index)) {
+                if (transactionPackageClaims(builder, path, work_index) or
+                    preservesConffilePath(&builder.work.items[work_index], path))
+                {
                     survives = true;
                 } else if (retiring_package == null or
                     work_index < retiring_package.?)
@@ -5331,14 +5678,47 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
     try item.list_paths.append(builder.allocator, package_database.root_list_path);
     for (item.paths.items) |planned| {
         if (planned.synthesized) continue;
-        try item.list_paths.append(builder.allocator, planned.absolute);
+        const archive_file = if (planned.archive_entry) |index|
+            item.model.files[index]
+        else
+            null;
+        const conffile = if (archive_file) |file|
+            file.conffile and builder.request.conffiles == .unpack
+        else
+            false;
+        const logical_path = if (conffile)
+            (plannedConffile(item, (try normalizePath(
+                builder,
+                archive_file.?.path,
+            )).path) orelse return builder.fail(.{
+                .surface = .publication,
+                .code = .program_incomplete,
+                .path = planned.path,
+                .package = item.identity.name,
+            })).path
+        else
+            planned.path;
+        try item.list_paths.append(
+            builder.allocator,
+            if (conffile)
+                try absoluteSpelling(builder, logical_path)
+            else
+                planned.absolute,
+        );
         switch (planned.kind) {
             .regular, .hardlink => try item.md5sums.append(builder.allocator, .{
-                .path = planned.path,
+                .path = logical_path,
                 .digest = planned.md5.?,
             }),
             .directory, .symlink => {},
         }
+    }
+    for (item.conffiles.items) |conffile| {
+        if (conffile.action != .mark_obsolete) continue;
+        try item.list_paths.append(
+            builder.allocator,
+            try absoluteSpelling(builder, conffile.path),
+        );
     }
     std.mem.sort([]const u8, item.list_paths.items[1..], {}, lessPath);
     std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
@@ -5372,6 +5752,7 @@ const status_field_order = [_][]const u8{
     "Source",
     "Version",
     "Config-Version",
+    "Conffiles",
     "Replaces",
     "Provides",
     "Depends",
@@ -5430,12 +5811,13 @@ fn statusFields(
     });
     const control = paragraphs[0];
 
-    var field_count: usize = 1 + @as(usize, @intFromBool(
-        item.configured_version != null,
-    ));
+    var field_count: usize = 1 +
+        @as(usize, @intFromBool(item.configured_version != null)) +
+        @as(usize, @intFromBool(item.conffile_records.items.len != 0));
     for (status_field_order) |name| {
         if (std.ascii.eqlIgnoreCase(name, "Status") or
-            std.ascii.eqlIgnoreCase(name, "Config-Version")) continue;
+            std.ascii.eqlIgnoreCase(name, "Config-Version") or
+            std.ascii.eqlIgnoreCase(name, "Conffiles")) continue;
         const field = control.get(name) orelse continue;
         if (!excludedStatusField(field.name)) field_count += 1;
     }
@@ -5476,6 +5858,17 @@ fn statusFields(
                     .value_lines = lines,
                 });
             }
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "Conffiles")) {
+            if (item.conffile_records.items.len != 0)
+                try fields.append(
+                    builder.allocator,
+                    try package_database.conffilesField(
+                        builder.arena,
+                        item.conffile_records.items,
+                    ),
+                );
             continue;
         }
         const field = control.get(name) orelse continue;
@@ -5804,6 +6197,26 @@ fn lower(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
             md5sums[md5_index] = entry;
             md5sums[md5_index].path = try builder.arena.dupe(u8, entry.path);
         }
+        const conffiles = try builder.arena.alloc(
+            PlannedConffile,
+            item.conffiles.items.len,
+        );
+        for (item.conffiles.items, 0..) |conffile, conffile_index| {
+            conffiles[conffile_index] = conffile;
+            conffiles[conffile_index].path = try builder.arena.dupe(
+                u8,
+                conffile.path,
+            );
+            conffiles[conffile_index].staged_path = if (conffile.staged_path) |path|
+                try builder.arena.dupe(u8, path)
+            else
+                null;
+            if (conffile.recorded) |recorded| {
+                var copy = recorded;
+                copy.path = try builder.arena.dupe(u8, recorded.path);
+                conffiles[conffile_index].recorded = copy;
+            }
+        }
         const resolutions = try builder.arena.alloc(
             Resolution,
             item.resolutions.items.len,
@@ -5832,6 +6245,7 @@ fn lower(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
             .removals = item_removals,
             .list_paths = list_paths,
             .md5sums = md5sums,
+            .conffiles = conffiles,
             .resolutions = resolutions,
             .state = .unpacked,
         };
@@ -6005,7 +6419,10 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             .fields = try statusFields(builder, item, model, .unpacked),
             .paths = item.list_paths.items,
             .md5sums = item.md5sums.items,
-            .declared_conffiles = null,
+            .declared_conffiles = if (item.declared_conffiles.items.len == 0)
+                null
+            else
+                item.declared_conffiles.items,
             .trigger_declarations = null,
             .scripts = &.{},
         } });
@@ -6153,6 +6570,23 @@ pub fn planDigest(value: Plan) [32]u8 {
         for (item.md5sums) |entry| {
             hashText(&hash, entry.path);
             hashText(&hash, &entry.digest);
+        }
+        hashNumber(&hash, item.conffiles.len);
+        for (item.conffiles) |conffile| {
+            hashText(&hash, conffile.path);
+            hashOptionalText(&hash, conffile.staged_path);
+            hashText(&hash, @tagName(conffile.action));
+            hashOptionalDigest(16, &hash, conffile.packaged_md5);
+            if (conffile.recorded) |recorded| {
+                hashByte(&hash, 1);
+                hashText(&hash, recorded.path);
+                switch (recorded.digest) {
+                    .new_conffile => hashText(&hash, "newconffile"),
+                    .md5 => |digest| hashText(&hash, &digest),
+                }
+                hashBool(&hash, recorded.obsolete);
+                hashBool(&hash, recorded.remove_on_upgrade);
+            } else hashByte(&hash, 0);
         }
         hashNumber(&hash, item.resolutions.len);
         for (item.resolutions) |resolution| {
@@ -6717,14 +7151,34 @@ fn materializationOverwrite(
 const MaterializationIntents = struct {
     intents: std.ArrayList(root_mutation.Intent),
     database: root_mutation.DatabaseIntents,
+    arena: *std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *MaterializationIntents) void {
         self.intents.deinit(self.allocator);
         self.database.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self.arena);
         self.* = undefined;
     }
 };
+
+fn rootFileSha256(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    maximum_bytes: usize,
+) ![32]u8 {
+    const resolved = try root_fs.Path.init(path);
+    const entry = try root.entry(resolved);
+    if (!entry.isRegularFile() or !entry.modeled or entry.link_count != 1)
+        return error.UnsupportedConffile;
+    const bytes = try root.readFileAlloc(allocator, resolved, maximum_bytes);
+    defer allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
 
 fn lowerMaterializationIntents(
     allocator: std.mem.Allocator,
@@ -6732,12 +7186,19 @@ fn lowerMaterializationIntents(
     plan_value: Plan,
     bound: *const BoundArchives,
 ) !MaterializationIntents {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     errdefer intents.deinit(allocator);
     var directory_metadata: std.ArrayList(root_mutation.Intent) = .empty;
     defer directory_metadata.deinit(allocator);
     var publications: std.StringHashMapUnmanaged(PlannedPath) = .empty;
     defer publications.deinit(allocator);
+    var conffiles: std.StringHashMapUnmanaged(PlannedConffile) = .empty;
+    defer conffiles.deinit(allocator);
     for (plan_value.packages) |package| {
         for (package.paths) |planned| {
             if (!planned.publish) continue;
@@ -6746,19 +7207,54 @@ fn lowerMaterializationIntents(
                 return error.MaterializationPlanMismatch;
             found.value_ptr.* = planned;
         }
+        for (package.conffiles) |conffile| {
+            const found = try conffiles.getOrPut(allocator, conffile.path);
+            if (found.found_existing)
+                return error.MaterializationPlanMismatch;
+            found.value_ptr.* = conffile;
+        }
     }
 
     for (plan_value.filesystem) |change| switch (change) {
-        .remove => |removal| try intents.append(allocator, if (removal.directory)
-            .{ .remove_directory = .{
-                .path = removal.path,
-                .removal = .require_present,
-            } }
-        else
-            .{ .remove = .{
-                .path = removal.path,
-                .removal = .require_present,
-            } }),
+        .remove => |removal| {
+            if (conffiles.get(removal.path)) |conffile| switch (conffile.action) {
+                .remove_on_upgrade_stage_old => {
+                    const old_path = try std.fmt.allocPrint(
+                        owned,
+                        "{s}.dpkg-old",
+                        .{removal.path},
+                    );
+                    const source_sha256 = try rootFileSha256(
+                        allocator,
+                        root,
+                        removal.path,
+                        512 * 1024 * 1024,
+                    );
+                    try intents.append(allocator, .{ .copy = .{
+                        .path = old_path,
+                        .source = removal.path,
+                        .source_sha256 = source_sha256,
+                        .mode = removal.previous.mode,
+                        .uid = removal.previous.uid,
+                        .gid = removal.previous.gid,
+                        .modified_nanoseconds = removal.previous.modified_nanoseconds,
+                        .overwrite = .require_absent,
+                    } });
+                },
+                .skip_not_shipped, .mark_obsolete => continue,
+                else => {},
+            };
+            try intents.append(allocator, if (removal.directory)
+                .{ .remove_directory = .{
+                    .path = removal.path,
+                    .removal = .require_present,
+                } }
+            else
+                .{ .remove = .{
+                    .path = removal.path,
+                    .removal = .require_present,
+                } });
+        },
         .directory => |directory| {
             try intents.append(allocator, .{
                 .directory = .{
@@ -6859,6 +7355,7 @@ fn lowerMaterializationIntents(
     return .{
         .intents = intents,
         .database = database,
+        .arena = arena,
         .allocator = allocator,
     };
 }
@@ -6922,12 +7419,31 @@ fn verifyMaterializedFilesystem(
     };
 }
 
+const DatabasePhaseEvidence = struct {
+    base_generation: package_database.Generation,
+    base_status: package_database.StatusGeneration,
+    resulting_status: package_database.StatusGeneration,
+    digest: [32]u8,
+};
+
+fn databasePhaseEvidence(
+    plan_value: package_database_changes.Plan,
+) DatabasePhaseEvidence {
+    return .{
+        .base_generation = plan_value.base_generation,
+        .base_status = plan_value.base_status,
+        .resulting_status = plan_value.resulting_status,
+        .digest = plan_value.digest,
+    };
+}
+
 fn verifyMaterializedDatabase(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
     options: package_database.Options,
-    plan_value: Plan,
+    evidence: DatabasePhaseEvidence,
+    require_status_old: bool,
 ) !void {
     var captured = try captureDatabaseSnapshot(allocator, root, options);
     defer captured.deinit();
@@ -6948,20 +7464,22 @@ fn verifyMaterializedDatabase(
     var status_digest: [32]u8 = undefined;
     Sha256.hash(captured.snapshot.status.bytes, &status_digest, .{});
     if (captured.snapshot.status.bytes.len !=
-        plan_value.database.resulting_status.size or
+        evidence.resulting_status.size or
         !std.mem.eql(
             u8,
             &status_digest,
-            &plan_value.database.resulting_status.sha256,
+            &evidence.resulting_status.sha256,
         ))
         return error.MaterializationVerificationFailed;
-    const old = captured.snapshot.status_old orelse
-        return error.MaterializationVerificationFailed;
-    var old_digest: [32]u8 = undefined;
-    Sha256.hash(old.bytes, &old_digest, .{});
-    if (old.bytes.len != plan_value.database.base_status.size or
-        !std.mem.eql(u8, &old_digest, &plan_value.database.base_status.sha256))
-        return error.MaterializationVerificationFailed;
+    if (require_status_old) {
+        const old = captured.snapshot.status_old orelse
+            return error.MaterializationVerificationFailed;
+        var old_digest: [32]u8 = undefined;
+        Sha256.hash(old.bytes, &old_digest, .{});
+        if (old.bytes.len != evidence.base_status.size or
+            !std.mem.eql(u8, &old_digest, &evidence.base_status.sha256))
+            return error.MaterializationVerificationFailed;
+    }
 }
 
 fn materialize(
@@ -7193,7 +7711,8 @@ fn materialize(
             request.root,
             request.planning.program.target_architecture,
             request.planning.limits.database,
-            planned,
+            databasePhaseEvidence(planned.database),
+            true,
         ) catch |err| {
             try attempt.requireRecovery(allocator, .verification);
             return .{
@@ -7223,6 +7742,1150 @@ fn materialize(
         },
         .detail = @tagName(mutation_report.stage),
     };
+}
+
+fn materializationHashValue(domain: []const u8, value: anytype) [32]u8 {
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll(domain) catch unreachable;
+    std.json.Stringify.value(
+        value,
+        .{ .whitespace = .minified },
+        &sink.writer,
+    ) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn materializationProgramDigest(program: native_program.Program) [32]u8 {
+    var payload = program;
+    payload.digest_sha256 = @splat('0');
+    return materializationHashValue(
+        "debz-native-transaction-program-v1\x00",
+        payload,
+    );
+}
+
+fn phasePreflight(
+    request: MaterializationRequest,
+    database: package_database.Database,
+) ?MaterializationResult {
+    const program = request.planning.program;
+    if (request.planning.interoperability != .isolated_root)
+        return .{ .outcome = .handoff, .detail = "shared_root" };
+    if (!std.mem.eql(u8, program.schema, native_program.schema_id) or
+        program.version != native_program.schema_version or
+        program.backend != .native or
+        !std.mem.eql(u8, program.install_root, request.install_root))
+        return .{ .outcome = .refused, .detail = "program_mismatch" };
+    const root_identity = transaction_recovery.rootIdentity(
+        request.install_root,
+    );
+    if (!std.mem.eql(
+        u8,
+        &program.root_identity_sha256,
+        &hex(32, root_identity),
+    ) or
+        !std.mem.eql(
+            u8,
+            &program.digest_sha256,
+            &hex(32, materializationProgramDigest(program.*)),
+        ) or
+        !std.mem.eql(
+            u8,
+            &program.installed_database.generation_sha256,
+            &hex(32, database.generation.sha256),
+        ) or
+        program.installed_database.package_count != database.model.packages.len)
+        return .{ .outcome = .refused, .detail = "program_binding_mismatch" };
+    if (request.planning.root_identity_sha256) |expected| {
+        if (!std.mem.eql(u8, &expected, &root_identity))
+            return .{ .outcome = .refused, .detail = "root_identity_mismatch" };
+    }
+    if (program.policy.conffile != request.planning.conffile_policy)
+        return .{ .outcome = .refused, .detail = "conffile_policy_mismatch" };
+    if (database.model.pending_updates.len != 0)
+        return .{ .outcome = .refused, .detail = "updates_pending" };
+    if (database.model.triggers.interests.len != 0 or
+        database.model.triggers.pending.len != 0)
+        return .{ .outcome = .handoff, .detail = "trigger" };
+    if (database.model.diversions.len != 0)
+        return .{ .outcome = .handoff, .detail = "diversion" };
+    if (database.model.stat_overrides.len != 0)
+        return .{ .outcome = .handoff, .detail = "statoverride" };
+    if (database.model.opaque_info.len != 0)
+        return .{ .outcome = .handoff, .detail = "package_metadata" };
+    return null;
+}
+
+fn executePhaseMaterialization(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    intents: []const root_mutation.Intent,
+    database_evidence: DatabasePhaseEvidence,
+    phase_seed: [32]u8,
+    artifact_evidence: ?[32]u8,
+    require_status_old: bool,
+) !MaterializationResult {
+    const program_sha256 = parseHex(
+        32,
+        &request.planning.program.digest_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const authorization_sha256 = parseHex(
+        32,
+        &request.planning.program.authorization_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const request_sha256 = parseHex(
+        32,
+        &request.planning.program.request_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const policy_sha256 = parseHex(
+        32,
+        &request.planning.program.executor_policy_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const lock_digest = parseHex(
+        32,
+        &request.planning.program.exact_lock.digest_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const exact_lock: root_operation.LockBinding = .{
+        .version = request.planning.program.exact_lock.version,
+        .schema = request.planning.program.exact_lock.schema,
+        .digest_sha256 = lock_digest,
+    };
+    const operation_evidence: root_operation.Evidence = .{
+        .authorization_sha256 = authorization_sha256,
+        .program_sha256 = program_sha256,
+        .plan_sha256 = null,
+        .exact_lock = exact_lock,
+        .database_generation_sha256 = database_evidence.base_generation.sha256,
+        .artifact_evidence_sha256 = artifact_evidence,
+    };
+    var coordinator = try root_operation.Coordinator.open(
+        request.io,
+        request.root,
+        request.install_root,
+        request.locks,
+    );
+    var attempt = try coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = request.operation },
+        .request_sha256 = request_sha256,
+        .policy_sha256 = policy_sha256,
+        .evidence = operation_evidence,
+        .target_architecture = request.planning.program.target_architecture,
+        .foreign_architectures = request.planning.program.foreign_architectures,
+    });
+    var attempt_open = true;
+    defer if (attempt_open) attempt.release();
+    const preflight_result = root_mutation.preflight(
+        allocator,
+        request.root,
+        .{ .intents = intents, .limits = request.mutation_limits },
+    ) catch |err| {
+        try attempt.abandonIfPreMutation(allocator);
+        return err;
+    };
+    var mutation_plan = switch (preflight_result) {
+        .diagnostic => |diagnostic| {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = @tagName(diagnostic.code),
+            };
+        },
+        .plan => |value| value,
+    };
+    defer mutation_plan.deinit();
+    const phase_digest = boundConffilePhaseDigest(
+        phase_seed,
+        mutation_plan.steps_sha256,
+    );
+    const mutation_evidence: root_mutation.Evidence = .{
+        .authorization_sha256 = authorization_sha256,
+        .program_sha256 = program_sha256,
+        .plan_sha256 = phase_digest,
+        .exact_lock = exact_lock,
+        .database_generation_sha256 = database_evidence.base_generation.sha256,
+        .database_plan_sha256 = database_evidence.digest,
+        .artifact_evidence_sha256 = artifact_evidence,
+    };
+    var refusal: ?root_mutation.Diagnostic = null;
+    var engine = root_mutation.prepare(
+        allocator,
+        request.root,
+        &attempt,
+        &mutation_plan,
+        mutation_evidence,
+        .{
+            .hooks = request.hooks,
+            .limits = request.mutation_limits,
+            .refusal = &refusal,
+        },
+    ) catch |err| switch (err) {
+        error.Rejected => {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = if (refusal) |diagnostic|
+                    @tagName(diagnostic.code)
+                else
+                    "mutation_prepare_refused",
+            };
+        },
+        error.SimulatedCrash => return .{
+            .outcome = .recovery_required,
+            .detail = "simulated_crash",
+        },
+        else => return err,
+    };
+    var engine_open = true;
+    defer if (engine_open) engine.deinit();
+    const report = root_mutation.apply(
+        &engine,
+        .fromPlan(&mutation_plan),
+    ) catch |err| switch (err) {
+        error.SimulatedCrash => return .{
+            .outcome = .recovery_required,
+            .detail = "simulated_crash",
+        },
+        error.RecoveryRequired,
+        error.ExternalModification,
+        error.VerificationFailed,
+        => return .{
+            .outcome = .recovery_required,
+            .detail = @errorName(err),
+        },
+        else => return err,
+    };
+    if (report.outcome == .recovery_required)
+        return .{
+            .outcome = .recovery_required,
+            .detail = if (report.diagnostic) |diagnostic|
+                @tagName(diagnostic.code)
+            else
+                "recovery_required",
+        };
+    if (report.outcome == .applied) {
+        verifyMaterializedDatabase(
+            allocator,
+            request.root,
+            request.planning.program.target_architecture,
+            request.planning.limits.database,
+            database_evidence,
+            require_status_old,
+        ) catch {
+            try attempt.requireRecovery(allocator, .verification);
+            return .{
+                .outcome = .recovery_required,
+                .detail = "database_verification_failed",
+            };
+        };
+    }
+    try attempt.advance(allocator, .{
+        .state = .verifying,
+        .phase = .verification,
+    });
+    try attempt.complete(allocator, switch (report.outcome) {
+        .applied => .succeeded,
+        .rolled_back => .failed_after_mutation,
+        .recovery_required => unreachable,
+    });
+    try attempt.publishProvenance(allocator, phase_digest);
+    try root_mutation.clear(&engine);
+    try attempt.clear();
+    engine.deinit();
+    engine_open = false;
+    attempt.release();
+    attempt_open = false;
+    return .{
+        .outcome = if (report.outcome == .applied) .applied else .rolled_back,
+        .detail = @tagName(report.stage),
+    };
+}
+
+fn phaseStatusFields(
+    allocator: std.mem.Allocator,
+    record: package_database.PackageRecord,
+    want: package_database.Want,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+    conffiles: []const package_database.ConffileEntry,
+) ![]const package_database.StatusField {
+    var fields: std.ArrayList(package_database.StatusField) = .empty;
+    defer fields.deinit(allocator);
+    var status_seen = false;
+    var conffiles_written = false;
+    var config_written = false;
+    for (record.fields) |field| {
+        if (std.ascii.eqlIgnoreCase(field.name, "Status")) {
+            const lines = try allocator.alloc([]const u8, 1);
+            lines[0] = try std.fmt.allocPrint(
+                allocator,
+                "{s} ok {s}",
+                .{
+                    @tagName(want),
+                    package_database.currentStateSpelling(current),
+                },
+            );
+            try fields.append(allocator, .{
+                .name = "Status",
+                .value_lines = lines,
+            });
+            status_seen = true;
+        } else if (std.ascii.eqlIgnoreCase(field.name, "Config-Version")) {
+            if (!config_written) if (config_version) |version| {
+                const lines = try allocator.alloc([]const u8, 1);
+                lines[0] = version;
+                try fields.append(allocator, .{
+                    .name = "Config-Version",
+                    .value_lines = lines,
+                });
+                config_written = true;
+            };
+        } else if (std.ascii.eqlIgnoreCase(field.name, "Conffiles")) {
+            if (!conffiles_written and conffiles.len != 0) {
+                try fields.append(
+                    allocator,
+                    try package_database.conffilesField(allocator, conffiles),
+                );
+                conffiles_written = true;
+            }
+        } else {
+            try fields.append(allocator, field);
+        }
+        if (std.ascii.eqlIgnoreCase(field.name, "Version")) {
+            if (!config_written) if (config_version) |version| {
+                const lines = try allocator.alloc([]const u8, 1);
+                lines[0] = version;
+                try fields.append(allocator, .{
+                    .name = "Config-Version",
+                    .value_lines = lines,
+                });
+                config_written = true;
+            };
+            if (!conffiles_written and conffiles.len != 0) {
+                try fields.append(
+                    allocator,
+                    try package_database.conffilesField(allocator, conffiles),
+                );
+                conffiles_written = true;
+            }
+        }
+    }
+    if (!status_seen) return error.MaterializationDatabaseMismatch;
+    if (!conffiles_written and conffiles.len != 0)
+        try fields.append(
+            allocator,
+            try package_database.conffilesField(allocator, conffiles),
+        );
+    return allocator.dupe(package_database.StatusField, fields.items);
+}
+
+fn findDatabaseConffile(
+    record: package_database.PackageRecord,
+    path: []const u8,
+) ?package_database.ConffileEntry {
+    for (record.conffiles) |conffile| {
+        if (std.mem.eql(u8, conffile.path, path)) return conffile;
+    }
+    return null;
+}
+
+const RootConffileDigest = struct {
+    md5: [16]u8,
+    sha256: [32]u8,
+};
+
+fn rootMd5ForConffile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    maximum_bytes: usize,
+    compared_bytes: *u64,
+    maximum_total: u64,
+) !?RootConffileDigest {
+    const resolved = try root_fs.Path.init(path);
+    const observed = (try root.entryIfExists(resolved)) orelse return null;
+    if (!observed.isRegularFile() or !observed.modeled or
+        observed.link_count != 1)
+        return error.UnsupportedConffile;
+    if (observed.size > maximum_bytes)
+        return error.ConffileObservationLimit;
+    compared_bytes.* = std.math.add(
+        u64,
+        compared_bytes.*,
+        observed.size,
+    ) catch return error.ConffileObservationLimit;
+    if (compared_bytes.* > maximum_total)
+        return error.ConffileObservationLimit;
+    const maximum = std.math.cast(usize, observed.size) orelse
+        return error.UnsupportedConffile;
+    const bytes = try root.readFileAlloc(allocator, resolved, maximum);
+    defer allocator.free(bytes);
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return .{ .md5 = digestMd5(bytes), .sha256 = sha256 };
+}
+
+fn requireAbsentConffileArtifact(
+    root: root_fs.Root,
+    model: package_database.Model,
+    path: []const u8,
+) !void {
+    for (model.packages) |record| {
+        for (record.paths orelse &.{}) |listed| {
+            const relative = relativeListPath(listed) orelse continue;
+            if (std.mem.eql(u8, relative, path))
+                return error.ConffileArtifactCollision;
+        }
+    }
+    if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+        return error.ConffileArtifactCollision;
+}
+
+fn boundConffileFile(
+    archive: *const BoundArchive,
+    conffile: archive_application.Conffile,
+) !archive_application.File {
+    const index = conffile.file_index orelse return error.UnsupportedConffile;
+    if (index >= archive.model.files.len) return error.UnsupportedConffile;
+    const file = archive.model.files[index];
+    if (file.kind != .regular or !file.conffile)
+        return error.UnsupportedConffile;
+    return file;
+}
+
+fn appendArchiveConffileIntent(
+    intents: *std.ArrayList(root_mutation.Intent),
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    archive: *const BoundArchive,
+    file: archive_application.File,
+    overwrite: root_mutation.Overwrite,
+    metadata: ?root_fs.Entry,
+) !void {
+    var intent = try root_mutation.archiveFileIntent(
+        path,
+        &archive.model,
+        file,
+        archive.binding,
+    );
+    intent.file.overwrite = overwrite;
+    if (metadata) |entry| {
+        intent.file.mode = entry.mode;
+        intent.file.uid = entry.uid;
+        intent.file.gid = entry.gid;
+    }
+    try intents.append(allocator, intent);
+}
+
+fn conffilePhaseDigest(
+    operation: []const u8,
+    database_plan: package_database_changes.Plan,
+    artifact_evidence: ?[32]u8,
+) [32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update(digest_domain);
+    hashText(&hash, "conffile-phase");
+    hashText(&hash, operation);
+    hashText(&hash, &database_plan.digest);
+    hashOptionalDigest(32, &hash, artifact_evidence);
+    return hash.finalResult();
+}
+
+fn boundConffilePhaseDigest(
+    phase_seed: [32]u8,
+    steps_sha256: [32]u8,
+) [32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update(digest_domain);
+    hashText(&hash, "bound-conffile-phase");
+    hashText(&hash, &phase_seed);
+    hashText(&hash, &steps_sha256);
+    return hash.finalResult();
+}
+
+fn materializeConfigure(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{
+            .outcome = .refused,
+            .detail = "database_rejected",
+        },
+    };
+    defer database.deinit();
+    if (phasePreflight(request, database)) |result| return result;
+    var bound = (try bindMaterializationArchives(
+        allocator,
+        request.planning,
+    )) orelse return .{
+        .outcome = .refused,
+        .detail = "archive_binding_mismatch",
+    };
+    defer bound.deinit();
+    const artifact_evidence = artifactEvidenceDigest(&bound);
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    var changes: std.ArrayList(package_database_changes.Change) = .empty;
+    defer changes.deinit(allocator);
+    var compared_bytes: u64 = 0;
+
+    for (bound.items) |*archive| {
+        if (archive.model.scripts.len != 0 or
+            archive.model.triggers.len != 0 or
+            archive.model.metadata.len != 0)
+            return .{ .outcome = .handoff, .detail = "script_or_trigger" };
+        const record = database.model.find(
+            archive.model.facts.package,
+            archive.model.facts.architecture,
+        ) orelse return .{
+            .outcome = .refused,
+            .detail = "package_not_installed",
+        };
+        if (record.status.current != .unpacked or
+            !std.mem.eql(u8, record.version, archive.model.facts.version) or
+            record.status.error_state != .ok or
+            record.status.want == .hold or
+            record.scripts.len != 0 or
+            record.trigger_declarations != null or
+            record.triggers_pending.len != 0 or
+            record.triggers_awaited.len != 0)
+            return .{ .outcome = .refused, .detail = "package_not_unpacked" };
+        var resulting: std.ArrayList(package_database.ConffileEntry) = .empty;
+        defer resulting.deinit(allocator);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(allocator);
+
+        for (archive.model.conffiles) |conffile| {
+            const absolute = try std.fmt.allocPrint(
+                owned,
+                "/{s}",
+                .{conffile.path},
+            );
+            try seen.put(allocator, absolute, {});
+            const old = findDatabaseConffile(record.*, absolute);
+            if (conffile.remove_on_upgrade) {
+                if (old) |entry| try resulting.append(allocator, entry);
+                continue;
+            }
+            const file = try boundConffileFile(archive, conffile);
+            const packaged_md5 = file.md5 orelse digestMd5(
+                archive.model.fileBytes(file) catch
+                    return error.UnsupportedConffile,
+            );
+            const staged = try std.fmt.allocPrint(
+                owned,
+                "{s}.dpkg-new",
+                .{conffile.path},
+            );
+            const staged_md5 = try rootMd5ForConffile(
+                allocator,
+                request.root,
+                staged,
+                request.planning.limits.max_compare_bytes,
+                &compared_bytes,
+                request.planning.limits.max_compared_bytes,
+            );
+            const expected_sha256 = file.sha256 orelse
+                return error.UnsupportedConffile;
+            if (staged_md5 == null or
+                !std.mem.eql(u8, &staged_md5.?.md5, &packaged_md5) or
+                !std.mem.eql(u8, &staged_md5.?.sha256, &expected_sha256))
+                return .{
+                    .outcome = .refused,
+                    .detail = "staged_conffile_mismatch",
+                };
+            var live_digest: ?RootConffileDigest = null;
+            if (old) |entry| switch (entry.digest) {
+                .new_conffile => {},
+                .md5 => live_digest = try rootMd5ForConffile(
+                    allocator,
+                    request.root,
+                    conffile.path,
+                    request.planning.limits.max_compare_bytes,
+                    &compared_bytes,
+                    request.planning.limits.max_compared_bytes,
+                ),
+            };
+            const installed: ?native_program.InstalledConffile = if (old) |entry|
+                switch (entry.digest) {
+                    .new_conffile => null,
+                    .md5 => |digest| .{
+                        .path = entry.path,
+                        .recorded_md5 = digest,
+                        .on_disk_md5 = if (live_digest) |observed|
+                            observed.md5
+                        else
+                            null,
+                        .obsolete = entry.obsolete,
+                    },
+                }
+            else
+                null;
+            const action = native_program.conffileDecision(
+                request.planning.conffile_policy,
+                .{
+                    .path = conffile.path,
+                    .md5 = packaged_md5,
+                },
+                installed,
+            );
+            switch (action) {
+                .install_new, .restore_missing => try appendArchiveConffileIntent(
+                    &intents,
+                    allocator,
+                    conffile.path,
+                    archive,
+                    file,
+                    .require_absent,
+                    null,
+                ),
+                .replace_unmodified => try appendArchiveConffileIntent(
+                    &intents,
+                    allocator,
+                    conffile.path,
+                    archive,
+                    file,
+                    .replace,
+                    null,
+                ),
+                .keep_existing_stage_dist => {
+                    const dist = try std.fmt.allocPrint(
+                        owned,
+                        "{s}.dpkg-dist",
+                        .{conffile.path},
+                    );
+                    if (archive.model.findFile(dist) != null)
+                        return error.ConffileArtifactCollision;
+                    try requireAbsentConffileArtifact(
+                        request.root,
+                        database.model,
+                        dist,
+                    );
+                    const live_metadata = request.root.entryIfExists(
+                        try root_fs.Path.init(conffile.path),
+                    ) catch return error.UnsupportedConffile;
+                    try appendArchiveConffileIntent(
+                        &intents,
+                        allocator,
+                        dist,
+                        archive,
+                        file,
+                        .require_absent,
+                        live_metadata,
+                    );
+                },
+                .install_stage_old => {
+                    const old_path = try std.fmt.allocPrint(
+                        owned,
+                        "{s}.dpkg-old",
+                        .{conffile.path},
+                    );
+                    if (archive.model.findFile(old_path) != null)
+                        return error.ConffileArtifactCollision;
+                    try requireAbsentConffileArtifact(
+                        request.root,
+                        database.model,
+                        old_path,
+                    );
+                    const source_sha256 = (live_digest orelse
+                        return error.UnsupportedConffile).sha256;
+                    const current = try request.root.entry(
+                        try root_fs.Path.init(conffile.path),
+                    );
+                    try intents.append(allocator, .{ .copy = .{
+                        .path = old_path,
+                        .source = conffile.path,
+                        .source_sha256 = source_sha256,
+                        .mode = current.mode,
+                        .uid = current.uid,
+                        .gid = current.gid,
+                        .modified_nanoseconds = current.modified_nanoseconds,
+                        .overwrite = .require_absent,
+                    } });
+                    try appendArchiveConffileIntent(
+                        &intents,
+                        allocator,
+                        conffile.path,
+                        archive,
+                        file,
+                        .replace,
+                        current,
+                    );
+                },
+                .identical_no_op,
+                .keep_user_modified,
+                .keep_user_deleted,
+                => {},
+                .skip_not_shipped,
+                .remove_on_upgrade,
+                .remove_on_upgrade_stage_old,
+                .mark_obsolete,
+                .retain_on_remove,
+                .delete_on_purge,
+                => return error.UnsupportedConffile,
+            }
+            try intents.append(allocator, .{ .remove = .{
+                .path = staged,
+                .removal = .require_present,
+            } });
+            try resulting.append(allocator, .{
+                .path = absolute,
+                .digest = .{ .md5 = packaged_md5 },
+            });
+        }
+        for (record.conffiles) |old| {
+            if (!seen.contains(old.path))
+                try resulting.append(allocator, old);
+        }
+        const fields = try phaseStatusFields(
+            owned,
+            record.*,
+            .install,
+            .installed,
+            null,
+            resulting.items,
+        );
+        try changes.append(allocator, .{ .put_package = .{
+            .fields = fields,
+            .paths = record.paths,
+            .md5sums = record.md5sums,
+            .declared_conffiles = record.declared_conffiles,
+            .trigger_declarations = record.trigger_declarations,
+            .scripts = &.{},
+        } });
+    }
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        changes.items,
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| {
+            return .{
+                .outcome = .refused,
+                .detail = @tagName(diagnostic.code),
+            };
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    try intents.appendSlice(allocator, database_intents.intents);
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        intents.items,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest("configure", database_plan, artifact_evidence),
+        artifact_evidence,
+        true,
+    );
+}
+
+fn pathRetainedForConffiles(
+    relative: []const u8,
+    conffiles: []const package_database.ConffileEntry,
+) bool {
+    for (conffiles) |conffile| {
+        const live = relativeListPath(conffile.path) orelse continue;
+        if (std.mem.eql(u8, relative, live)) return true;
+        if (live.len > relative.len and live[relative.len] == '/' and
+            std.mem.eql(u8, live[0..relative.len], relative))
+            return true;
+    }
+    return false;
+}
+
+fn removableDirectory(
+    root: root_fs.Root,
+    path: []const u8,
+    removing: *const std.StringHashMapUnmanaged(void),
+) !bool {
+    var directory = try root.openDirectory(try root_fs.Path.init(path));
+    defer directory.close(root.io);
+    var iterator = directory.iterate();
+    while (try iterator.next(root.io)) |entry| {
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const child = try std.fmt.bufPrint(
+            &buffer,
+            "{s}/{s}",
+            .{ path, entry.name },
+        );
+        if (!removing.contains(child)) return false;
+    }
+    return true;
+}
+
+fn removalConfigVersion(
+    record: package_database.PackageRecord,
+) ?[]const u8 {
+    return switch (record.status.current) {
+        .installed, .triggers_awaited, .triggers_pending => record.version,
+        .unpacked, .config_files => switch (configVersionField(record)) {
+            .valid => |value| value,
+            .absent, .invalid => null,
+        },
+        else => null,
+    };
+}
+
+const RemovalCandidate = struct {
+    path: []const u8,
+    directory: bool,
+};
+
+fn materializeRemoval(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    selections: []const ExternalPackageSelection,
+    purge: bool,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{
+            .outcome = .refused,
+            .detail = "database_rejected",
+        },
+    };
+    defer database.deinit();
+    if (phasePreflight(request, database)) |result| return result;
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    var changes: std.ArrayList(package_database_changes.Change) = .empty;
+    defer changes.deinit(allocator);
+    var selected_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer selected_seen.deinit(allocator);
+    var selected_owners: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer selected_owners.deinit(allocator);
+    var selected_records: std.ArrayList(u32) = .empty;
+    defer selected_records.deinit(allocator);
+    for (selections) |selection| {
+        const selection_key = try std.fmt.allocPrint(
+            owned,
+            "{s}\x00{s}",
+            .{ selection.name, selection.architecture },
+        );
+        if ((try selected_seen.getOrPut(allocator, selection_key)).found_existing)
+            return .{ .outcome = .refused, .detail = "duplicate_package" };
+        var record_index: ?u32 = null;
+        for (database.model.packages, 0..) |record, index| {
+            if (std.mem.eql(u8, record.name, selection.name) and
+                std.mem.eql(u8, record.architecture, selection.architecture))
+                record_index = @intCast(index);
+        }
+        const index = record_index orelse continue;
+        try selected_owners.put(allocator, index, {});
+        try selected_records.append(allocator, index);
+    }
+    if (selected_records.items.len == 0) {
+        var hash = Sha256.init(.{});
+        hash.update(digest_domain);
+        hashText(&hash, "remove-already-absent");
+        hashText(&hash, &database.generation.sha256);
+        const no_op_evidence: DatabasePhaseEvidence = .{
+            .base_generation = database.generation,
+            .base_status = database.model.status,
+            .resulting_status = database.model.status,
+            .digest = hash.finalResult(),
+        };
+        const no_op_intents = [_]root_mutation.Intent{.{ .remove = .{
+            .path = package_database.database_directory ++ "/" ++
+                package_database.status_old_path,
+            .removal = .allow_absent,
+        } }};
+        return executePhaseMaterialization(
+            allocator,
+            request,
+            &no_op_intents,
+            no_op_evidence,
+            no_op_evidence.digest,
+            null,
+            false,
+        );
+    }
+
+    const aliases = detectAliases(allocator, request.root) catch
+        return .{ .outcome = .handoff, .detail = "root_alias" };
+    defer deinitAliasEvidence(allocator, aliases);
+    var ownership = indexOwnership(
+        allocator,
+        database.model,
+        aliases,
+    ) catch return .{
+        .outcome = .refused,
+        .detail = "ownership_index",
+    };
+    defer ownership.deinit();
+    var retained: std.StringHashMapUnmanaged(void) = .empty;
+    defer retained.deinit(allocator);
+    if (!purge) for (selected_records.items) |index| {
+        const record = database.model.packages[index];
+        for (record.conffiles) |conffile| {
+            const relative = relativeListPath(conffile.path) orelse continue;
+            var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const canonical = canonicalAliasPath(
+                aliases,
+                relative,
+                &buffer,
+            ) orelse return .{
+                .outcome = .refused,
+                .detail = "invalid_conffile",
+            };
+            const stored = try owned.dupe(u8, canonical);
+            try retained.put(allocator, stored, {});
+            var cursor = (root_fs.Path.init(stored) catch unreachable).parent();
+            while (cursor) |parent| : (cursor = parent.parent())
+                try retained.put(
+                    allocator,
+                    try owned.dupe(u8, parent.text),
+                    {},
+                );
+        }
+    };
+    var removing: std.StringHashMapUnmanaged(void) = .empty;
+    defer removing.deinit(allocator);
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(allocator);
+    var directories: std.ArrayList([]const u8) = .empty;
+    defer directories.deinit(allocator);
+
+    for (selected_records.items) |record_index| {
+        const record = &database.model.packages[record_index];
+        if (record.status.error_state != .ok or record.status.want == .hold)
+            return .{ .outcome = .refused, .detail = "package_state_unsupported" };
+        switch (record.status.current) {
+            .installed, .unpacked, .config_files => {},
+            else => return .{
+                .outcome = .refused,
+                .detail = "package_state_unsupported",
+            },
+        }
+        if (record.field("Config-Version") != null and
+            configVersionField(record.*) == .invalid)
+            return .{ .outcome = .refused, .detail = "config_version" };
+        if (record.scripts.len != 0 or record.trigger_declarations != null or
+            record.triggers_pending.len != 0 or record.triggers_awaited.len != 0)
+            return .{ .outcome = .handoff, .detail = "script_or_trigger" };
+
+        var retained_paths: std.ArrayList([]const u8) = .empty;
+        defer retained_paths.deinit(allocator);
+
+        for (record.paths orelse &.{}) |listed| {
+            const relative = relativeListPath(listed) orelse {
+                if (!purge and record.conffiles.len != 0)
+                    try retained_paths.append(allocator, listed);
+                continue;
+            };
+            var alias_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const canonical = canonicalAliasPath(
+                aliases,
+                relative,
+                &alias_buffer,
+            ) orelse return .{ .outcome = .refused, .detail = "invalid_path" };
+            if (!purge and retained.contains(canonical)) {
+                try retained_paths.append(allocator, listed);
+                continue;
+            }
+            var surviving_owner = false;
+            for (ownership.ownersOf(canonical)) |owned_path| {
+                if (!selected_owners.contains(owned_path.owner))
+                    surviving_owner = true;
+            }
+            if (surviving_owner or removing.contains(canonical)) continue;
+            const stored = try owned.dupe(u8, canonical);
+            const observed = (try request.root.entryIfExists(
+                try root_fs.Path.init(stored),
+            )) orelse continue;
+            switch (observed.kind) {
+                .directory => try directories.append(allocator, stored),
+                .file, .sym_link => {
+                    try files.append(allocator, stored);
+                    try removing.put(allocator, stored, {});
+                },
+                else => return .{
+                    .outcome = .handoff,
+                    .detail = "unsupported_root_feature",
+                },
+            }
+        }
+
+        if (purge) for (record.conffiles) |conffile| {
+            const relative = relativeListPath(conffile.path) orelse
+                return .{ .outcome = .refused, .detail = "invalid_conffile" };
+            for ([_][]const u8{ "", ".dpkg-old", ".dpkg-dist", ".dpkg-new" }) |suffix| {
+                // dpkg deliberately leaves the saved administrator version
+                // created by remove-on-upgrade outside package ownership.
+                if (conffile.remove_on_upgrade and
+                    std.mem.eql(u8, suffix, ".dpkg-old"))
+                    continue;
+                const path = try std.fmt.allocPrint(
+                    owned,
+                    "{s}{s}",
+                    .{ relative, suffix },
+                );
+                if (removing.contains(path)) continue;
+                for (ownership.ownersOf(path)) |owned_path| {
+                    if (!selected_owners.contains(owned_path.owner))
+                        return .{
+                            .outcome = .handoff,
+                            .detail = "foreign_owned_conffile",
+                        };
+                }
+                const observed = (try request.root.entryIfExists(
+                    try root_fs.Path.init(path),
+                )) orelse continue;
+                if (!observed.isRegularFile() or !observed.modeled or
+                    observed.link_count != 1)
+                    return .{
+                        .outcome = .handoff,
+                        .detail = "unsupported_conffile",
+                    };
+                try files.append(allocator, path);
+                try removing.put(allocator, path, {});
+            }
+        };
+
+        if (purge or record.conffiles.len == 0) {
+            try changes.append(allocator, .{
+                .remove_package = record.identity(),
+            });
+        } else {
+            const fields = try phaseStatusFields(
+                owned,
+                record.*,
+                .deinstall,
+                .config_files,
+                removalConfigVersion(record.*),
+                record.conffiles,
+            );
+            try changes.append(allocator, .{ .put_package = .{
+                .fields = fields,
+                .paths = try owned.dupe([]const u8, retained_paths.items),
+                .md5sums = null,
+                .declared_conffiles = null,
+                .trigger_declarations = null,
+                .scripts = &.{},
+            } });
+        }
+    }
+
+    std.mem.sort([]const u8, files.items, {}, lessPath);
+    for (files.items) |path| try intents.append(allocator, .{ .remove = .{
+        .path = path,
+        .removal = .allow_absent,
+    } });
+    std.mem.sort([]const u8, directories.items, {}, greaterPath);
+    for (directories.items) |path| {
+        if (removing.contains(path)) continue;
+        if (!try removableDirectory(request.root, path, &removing))
+            continue;
+        try removing.put(allocator, path, {});
+        try intents.append(allocator, .{ .remove_directory = .{
+            .path = path,
+            .removal = .allow_absent,
+        } });
+    }
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        changes.items,
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| return .{
+            .outcome = .refused,
+            .detail = @tagName(diagnostic.code),
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    try intents.appendSlice(allocator, database_intents.intents);
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        intents.items,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest(
+            if (purge) "purge" else "remove",
+            database_plan,
+            null,
+        ),
+        null,
+        false,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -7849,6 +9512,19 @@ const ExternalMaterializationOperation = enum {
     upgrade,
     downgrade,
     reinstall,
+    configure,
+    remove,
+    purge,
+};
+
+const ExternalConffilePolicy = enum {
+    keep_existing,
+    use_package_version,
+};
+
+const ExternalPackageSelection = struct {
+    name: []const u8,
+    architecture: []const u8,
 };
 
 const ExternalMaterializationRequest = struct {
@@ -7857,6 +9533,9 @@ const ExternalMaterializationRequest = struct {
     archives: []const []const u8,
     operation: ExternalMaterializationOperation,
     report: []const u8,
+    conffiles: bool = false,
+    policy: ExternalConffilePolicy = .keep_existing,
+    packages: []const ExternalPackageSelection = &.{},
 };
 
 fn readAbsoluteFile(
@@ -7903,6 +9582,8 @@ fn externalProductOperation(value: ExternalMaterializationOperation) product_api
         .install, .downgrade => .install,
         .upgrade => .upgrade,
         .reinstall => .reinstall,
+        .configure => .install,
+        .remove, .purge => .remove,
     };
 }
 
@@ -7927,9 +9608,15 @@ test "native_unpack.test.materialization external fixture" {
     );
     defer parsed.deinit();
     const external = parsed.value;
+    const archive_phase = switch (external.operation) {
+        .install, .upgrade, .downgrade, .reinstall, .configure => true,
+        .remove, .purge => false,
+    };
     if (!absolute_path.nonRoot(external.root) or
         !absolute_path.nonRoot(external.report) or
-        (external.archives.len == 0) or
+        (archive_phase != (external.archives.len != 0)) or
+        ((external.operation == .remove or external.operation == .purge) and
+            external.packages.len == 0) or
         (!std.mem.eql(u8, external.architecture, "amd64") and
             !std.mem.eql(u8, external.architecture, "arm64")))
         return error.InvalidExternalMaterializationRequest;
@@ -8063,6 +9750,13 @@ test "native_unpack.test.materialization external fixture" {
                 if (installed.parsed_version.order(incoming_version) != .eq)
                     return error.InvalidExternalOperation;
             },
+            .configure => {
+                const installed = prior orelse return error.InvalidExternalOperation;
+                if (installed.status.current != .unpacked or
+                    installed.parsed_version.order(incoming_version) != .eq)
+                    return error.InvalidExternalOperation;
+            },
+            .remove, .purge => unreachable,
         }
         steps[index] = unpackStep(
             artifact,
@@ -8084,12 +9778,16 @@ test "native_unpack.test.materialization external fixture" {
     program.root_identity_sha256 = hex(32, root_identity);
     program.target_architecture = external.architecture;
     program.foreign_architectures = database.model.foreign_architectures;
+    program.policy.conffile = switch (external.policy) {
+        .keep_existing => .keep_existing,
+        .use_package_version => .use_package_version,
+    };
     finalizeFixtureProgram(&program);
     var locks: root_operation.SystemLockBackend = .{
         .allocator = testing.allocator,
         .io = testing.io,
     };
-    const result = try materialize(testing.allocator, .{
+    const phase_request: MaterializationRequest = .{
         .io = testing.io,
         .root = root,
         .install_root = external.root,
@@ -8100,10 +9798,46 @@ test "native_unpack.test.materialization external fixture" {
             .root = root,
             .root_identity_sha256 = root_identity,
             .interoperability = .isolated_root,
+            .conffiles = if (external.conffiles) .unpack else .handoff,
+            .conffile_policy = switch (external.policy) {
+                .keep_existing => .keep_existing,
+                .use_package_version => .use_package_version,
+            },
         },
         .locks = locks.interface(),
         .operation = externalProductOperation(external.operation),
-    });
+    };
+    const result = switch (external.operation) {
+        .configure => materializeConfigure(
+            testing.allocator,
+            phase_request,
+        ) catch |err| switch (err) {
+            error.UnsupportedConffile,
+            error.ConffileArtifactCollision,
+            error.ConffileObservationLimit,
+            => MaterializationResult{
+                .outcome = .refused,
+                .detail = @errorName(err),
+            },
+            else => return err,
+        },
+        .remove, .purge => materializeRemoval(
+            testing.allocator,
+            phase_request,
+            external.packages,
+            external.operation == .purge,
+        ) catch |err| switch (err) {
+            error.UnsupportedConffile,
+            error.ConffileArtifactCollision,
+            error.ConffileObservationLimit,
+            => MaterializationResult{
+                .outcome = .refused,
+                .detail = @errorName(err),
+            },
+            else => return err,
+        },
+        else => try materialize(testing.allocator, phase_request),
+    };
     try writeMaterializationReport(
         testing.allocator,
         testing.io,
@@ -8335,6 +10069,158 @@ test "native_unpack.test.materialization handoff leaves payload untouched" {
     try testing.expect(try fixture.root().entryIfExists(
         try root_fs.Path.init(root_operation.namespace_path),
     ) == null);
+}
+
+test "native_unpack.test.conffile unpack stages package bytes and database state" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{.{
+        .path = "etc/demo.conf",
+        .content = "value\n",
+        .uid = currentUid(),
+        .gid = currentGid(),
+    }};
+    const bytes = try archive_application.test_fixtures.build(
+        testing.allocator,
+        .{
+            .package = "demo",
+            .version = "1",
+            .control = &.{
+                .{ .path = "conffiles", .content = "/etc/demo.conf\n" },
+            },
+            .data = &data,
+        },
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &steps,
+        &artifacts,
+    );
+    var planned = try expectPlan(try plan(testing.allocator, .{
+        .program = &program,
+        .snapshot = fixture.snapshot(),
+        .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+        .root = fixture.root(),
+        .interoperability = .isolated_root,
+        .conffiles = .unpack,
+    }));
+    defer planned.deinit();
+    try testing.expectEqual(@as(usize, 1), planned.packages[0].conffiles.len);
+    try testing.expectEqualStrings(
+        "etc/demo.conf.dpkg-new",
+        planned.packages[0].conffiles[0].staged_path.?,
+    );
+    var staged = false;
+    for (planned.filesystem) |change| switch (change) {
+        .file => |file| if (std.mem.eql(
+            u8,
+            file.path,
+            "etc/demo.conf.dpkg-new",
+        )) {
+            staged = true;
+        },
+        else => {},
+    };
+    try testing.expect(staged);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        planned.database.find("status").?.bytes,
+        "/etc/demo.conf newconffile",
+    ) != null);
+    try testing.expectEqualStrings(
+        "/etc/demo.conf\n",
+        planned.database.find("info/demo.conffiles").?.bytes,
+    );
+}
+
+test "native_unpack.test.conffile generated path rejects archive collision" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{
+        .{
+            .path = "etc/demo.conf",
+            .content = "value\n",
+            .uid = currentUid(),
+            .gid = currentGid(),
+        },
+        .{
+            .path = "etc/demo.conf.dpkg-new",
+            .content = "collision\n",
+            .uid = currentUid(),
+            .gid = currentGid(),
+        },
+    };
+    const bytes = try archive_application.test_fixtures.build(
+        testing.allocator,
+        .{
+            .package = "demo",
+            .version = "1",
+            .control = &.{
+                .{ .path = "conffiles", .content = "/etc/demo.conf\n" },
+            },
+            .data = &data,
+        },
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &steps,
+        &artifacts,
+    );
+    try expectRefusal(try plan(testing.allocator, .{
+        .program = &program,
+        .snapshot = fixture.snapshot(),
+        .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+        .root = fixture.root(),
+        .interoperability = .isolated_root,
+        .conffiles = .unpack,
+    }), .duplicate_archive_path);
+}
+
+test "native_unpack.test.conffile phase digest binds mutation steps" {
+    const seed: [32]u8 = @splat(0x11);
+    const first = boundConffilePhaseDigest(seed, @splat(0x22));
+    const second = boundConffilePhaseDigest(seed, @splat(0x23));
+    try testing.expect(!std.mem.eql(u8, &first, &second));
+}
+
+test "native_unpack.test.conffile observation rejects oversized root file" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "etc/demo.conf", "content\n");
+    var compared: u64 = 0;
+    try testing.expectError(
+        error.ConffileObservationLimit,
+        rootMd5ForConffile(
+            testing.allocator,
+            fixture.root(),
+            "etc/demo.conf",
+            "content\n".len - 1,
+            &compared,
+            1024,
+        ),
+    );
+    try testing.expectEqual(@as(u64, 0), compared);
 }
 
 const MaterializationFault = struct {
@@ -12475,6 +14361,12 @@ test "native_unpack.test.plan digest covers semantics and excludes telemetry" {
         .path = "usr/share/file",
         .digest = @splat(0x44),
     }};
+    var conffiles = [_]PlannedConffile{.{
+        .path = "etc/demo.conf",
+        .staged_path = "etc/demo.conf.dpkg-new",
+        .action = .install_new,
+        .packaged_md5 = @splat(0x45),
+    }};
     var paths = [_]PlannedPath{path};
     var removals = [_]Removal{removal};
     var resolutions = [_]Resolution{resolution};
@@ -12491,6 +14383,7 @@ test "native_unpack.test.plan digest covers semantics and excludes telemetry" {
         .removals = &removals,
         .list_paths = &list_paths,
         .md5sums = &md5sums,
+        .conffiles = &conffiles,
         .resolutions = &resolutions,
         .state = .unpacked,
     };
@@ -12636,6 +14529,9 @@ test "native_unpack.test.plan digest covers semantics and excludes telemetry" {
     md5sums[0].digest[0] ^= 1;
     try expectPlanDigestChanged(original, plan_value);
     md5sums[0].digest[0] ^= 1;
+    conffiles[0].action = .mark_obsolete;
+    try expectPlanDigestChanged(original, plan_value);
+    conffiles[0].action = .install_new;
 
     package.bootstrapped = false;
     packages[0] = package;

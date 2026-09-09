@@ -10,6 +10,11 @@ reference-`dpkg` comparison for install, upgrade, downgrade, and reinstall.
 The planner itself remains descriptive; actual execution and its bounded
 acceptance gate are described below.
 
+Item 11 adds an explicit opt-in conffile-unpack capability and private
+script-free configure/remove/purge adapters. The default item-10b path retains
+its existing conffile and removal handoffs. The phase contract and real-dpkg
+matrix are described in [Native conffile and removal acceptance](native-conffiles.md).
+
 The implementation is `src/native_unpack.zig`. Its exported surface is limited
 to immutable descriptive types and side-effect-free helpers:
 
@@ -285,7 +290,8 @@ refusals rather than generic unlink descriptions.
 
 ## Typed handoffs
 
-The planner returns one complete `Handoff` when the transaction needs work
+With the default item-10b capability, the planner returns one complete
+`Handoff` when the transaction needs work
 owned by later roadmap items. Handoff items are deduplicated and deterministically
 digested. Covered features include:
 
@@ -381,6 +387,11 @@ cutover, arbitrary maintainer-script safety, or an atomic snapshot in the
 presence of another privileged writer. Native backend selection remains
 unavailable. Later integration must supply the production authorization,
 isolation, recovery, and provenance contracts.
+
+The opt-in item-11 fixture contract and phase-by-phase conffile/remove/purge
+oracle are documented in [Native conffile and removal acceptance](native-conffiles.md).
+That path does not change the default item-10b conffile handoff or enable a
+production native executor.
 
 ## Validation
 

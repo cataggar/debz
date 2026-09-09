@@ -101,6 +101,11 @@ downgrade action with its prior installed version, the authenticated origin,
 digest, and size of every archive-producing action, and the exact intended
 final closure with its own digest.
 
+For removal, that closure may contain a residual `config-files` record or
+omit the package when no residual conffiles or `postrm` remain. The program
+compiler checks the authorized choice against installed evidence; authorizing
+absence does not permit it to discard conffiles that removal must retain.
+
 Authorization is native-only. Creating one for `legacy_dpkg` is rejected, and
 only exact-closure-lock v2 may be bound, so previously serialized v1 locks stay
 readable for the legacy backend and can never be silently reinterpreted as

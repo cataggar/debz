@@ -438,7 +438,9 @@ fn validateActionFinalState(
                 return error.ContradictoryFinalState;
         },
         .remove => {
-            const final = final_state[index orelse return error.MissingFinalPackage];
+            // Removal without residual conffiles or postrm drops the record.
+            // The compiler checks which result the installed evidence permits.
+            const final = final_state[index orelse return];
             if (final.state != .config_files or
                 !std.mem.eql(u8, final.version, action.version))
                 return error.ContradictoryFinalState;

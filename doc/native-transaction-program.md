@@ -74,15 +74,16 @@ No step contains a shell command, and no step is a free-form escape hatch.
 
 The compiler expands the authorized actions into dpkg-compatible transitions:
 
-- fresh install: `preinst install`, unpack, conffile decisions, `unpacked`,
-  configure barrier, `postinst configure`, `installed`;
+- fresh install: `preinst install`, unpack/stage conffiles, `unpacked`,
+  configure barrier, conffile decisions, `postinst configure`, `installed`;
 - install over `config-files`: the recorded version is replayed as the
   `install` and `configure` argument;
 - upgrade, downgrade, and reinstall: old `prerm upgrade <new>`, new `preinst
-  upgrade <old>`, unpack, old `postrm upgrade <new>`, conffile decisions, then
-  `postinst configure <old>`;
+  upgrade <old>`, unpack, old `postrm upgrade <new>`, `unpacked`, configure
+  barrier, conffile decisions, then `postinst configure <old>`;
 - remove: `prerm remove`, `half-installed`, owned-file removal retaining
-  conffiles, `postrm remove`, `config-files`;
+  conffiles, `postrm remove`, `config-files`; without residual conffiles or
+  `postrm`, remove drops the status record instead;
 - purge: the remove sequence when files are still installed, then `postrm
   purge`, conffile deletion, metadata removal, and removal of the status
   record;
@@ -92,6 +93,11 @@ The compiler expands the authorized actions into dpkg-compatible transitions:
 
 Maintainer scripts are emitted only when the corresponding evidence proves the
 script exists, so the program never plans a call to a script that is not there.
+Ordinary conffile decisions precede `postinst` and follow the configure barrier;
+`remove-on-upgrade` and obsolete marking remain unpack-phase decisions.
+Removal authorization binds either an absent final record or a residual
+`config-files` record; the compiler checks that choice against the installed
+conffile/script evidence rather than treating every removal as residual.
 
 ## Conffile decisions
 

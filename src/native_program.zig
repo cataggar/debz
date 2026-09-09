@@ -2368,13 +2368,18 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
                 .{ .state = .half_installed, .unwind = null, .recovery_required = true },
             );
         }
+        const residual_state: PackageState = if (!purge and
+            package.conffiles.len == 0 and installedScript(self, entry.*, .postrm) == null)
+            .not_installed
+        else
+            .config_files;
         last = try self.addStep(.remove, &.{last}, .{ .record_package_state = .{
             .package = package_identity,
-            .state = .config_files,
+            .state = residual_state,
             .hold = entry.hold,
-            .remove_entry = false,
+            .remove_entry = residual_state == .not_installed,
         } });
-        entry.state = .config_files;
+        entry.state = residual_state;
     }
     if (!purge) return;
     if (installedScript(self, entry.*, .postrm)) |digest| {
@@ -2567,7 +2572,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
         },
         else => {},
     }
-    last = try emitConffiles(self, entry_index, package_identity, last);
+    last = try emitConffiles(self, entry_index, package_identity, last, .unpack);
     if (prepared.triggers.len != 0) {
         last = try self.addStep(.unpack, &.{last}, .{ .record_trigger_interests = .{
             .package = package_identity,
@@ -2602,7 +2607,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
 /// never installs anything: it deletes an unmodified recorded file, preserves
 /// a modified one as `.dpkg-old`, and does nothing when nothing is recorded or
 /// nothing is present, including on a fresh install.
-fn conffileDecision(
+pub fn conffileDecision(
     policy: transaction_executor.ConffilePolicy,
     packaged: ArchiveConffile,
     recorded: ?InstalledConffile,
@@ -2638,7 +2643,8 @@ fn emitConffiles(
     self: *Compiler,
     entry_index: u32,
     package_identity: PackageIdentity,
-    unpack_step: u32,
+    previous: u32,
+    phase: Phase,
 ) CompileError!u32 {
     const entry = self.modeled[entry_index];
     const prepared = self.prepared[entry.archive.?];
@@ -2647,11 +2653,12 @@ fn emitConffiles(
     else
         &.{};
     const policy = self.input.authorization.policy.conffile;
-    var last = unpack_step;
+    var last = previous;
     for (prepared.conffiles) |conffile| {
         try self.charge(1);
+        if (conffile.remove_on_upgrade != (phase == .unpack)) continue;
         const recorded = findConffile(recorded_conffiles, conffile.path);
-        last = try self.addStep(.unpack, &.{last}, .{ .apply_conffile_decision = .{
+        last = try self.addStep(phase, &.{last}, .{ .apply_conffile_decision = .{
             .package = package_identity,
             .path = try self.arena.dupe(u8, conffile.path),
             .policy = policy,
@@ -2664,7 +2671,7 @@ fn emitConffiles(
                 null,
         } });
     }
-    for (recorded_conffiles) |conffile| {
+    if (phase == .unpack) for (recorded_conffiles) |conffile| {
         try self.charge(1);
         if (prepared.conffile(conffile.path) != null) continue;
         last = try self.addStep(.unpack, &.{last}, .{ .apply_conffile_decision = .{
@@ -2676,7 +2683,7 @@ fn emitConffiles(
             .recorded_md5 = hex(16, conffile.recorded_md5),
             .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
         } });
-    }
+    };
     return last;
 }
 
@@ -2708,7 +2715,13 @@ fn emitConfigure(
         const action = self.input.authorization.actions[entry.action.?];
         const prepared = self.prepared[entry.archive.?];
         const package_identity = self.artifacts.items[entry.artifact.?].package;
-        var last = barrier;
+        var last = try emitConffiles(
+            self,
+            entry_index,
+            package_identity,
+            barrier,
+            .configure,
+        );
         if (archiveScriptDigest(prepared, .postinst)) |digest| {
             const args: []const []const u8 = if (entry.installed_version) |version|
                 &.{ "configure", version }
@@ -2717,7 +2730,7 @@ fn emitConfigure(
             last = try emitScript(
                 self,
                 .configure,
-                &.{ barrier, entry.unpack_step.? },
+                &.{ last, entry.unpack_step.? },
                 package_identity,
                 .postinst,
                 .new_package,
@@ -3575,6 +3588,8 @@ test "native_program.test.fresh install compiles a complete deterministic progra
 
     var saw_preinst = false;
     var saw_postinst = false;
+    var saw_barrier = false;
+    var conffile_sequence: ?u32 = null;
     for (program.steps) |step| switch (step.operation) {
         .run_maintainer_script => |call| {
             switch (call.kind) {
@@ -3588,6 +3603,12 @@ test "native_program.test.fresh install compiles a complete deterministic progra
                 },
                 .postinst => {
                     saw_postinst = true;
+                    try testing.expect(conffile_sequence != null);
+                    try testing.expect(std.mem.indexOfScalar(
+                        u32,
+                        step.requires,
+                        conffile_sequence.?,
+                    ) != null);
                     try testing.expectEqualStrings("configure", call.arguments[0]);
                     try testing.expectEqual(PackageState.half_configured, call.failure.state);
                 },
@@ -3600,10 +3621,14 @@ test "native_program.test.fresh install compiles a complete deterministic progra
             );
         },
         .apply_conffile_decision => |decision| {
+            try testing.expect(saw_barrier);
+            try testing.expectEqual(Phase.configure, step.phase);
+            conffile_sequence = step.sequence;
             try testing.expectEqual(ConffileAction.install_new, decision.action);
             try testing.expectEqualStrings("/etc/app.conf", decision.path);
             try testing.expect(decision.recorded_md5 == null);
         },
+        .configure_barrier => saw_barrier = true,
         else => {},
     };
     try testing.expect(saw_preinst and saw_postinst);
@@ -4014,6 +4039,16 @@ test "native_program.test.compiled conffile steps carry the deciding digests" {
             }));
             defer owned.deinit();
             const decision = conffileDecisionFor(owned.program, "/etc/app.conf").?;
+            for (owned.program.steps) |step| switch (step.operation) {
+                .apply_conffile_decision => |value| {
+                    if (std.mem.eql(u8, value.path, "/etc/app.conf"))
+                        try testing.expectEqual(
+                            if (case.remove_on_upgrade) Phase.unpack else Phase.configure,
+                            step.phase,
+                        );
+                },
+                else => {},
+            };
             const expected = expectedConffileAction(case, policy);
             if (decision.action != expected) {
                 std.debug.print("compiled {s} ({s}): expected {s}, found {s}\n", .{
@@ -4196,6 +4231,51 @@ fn removalOrdered(kind: solver.OrderedActionKind) [1]solver.OrderedAction {
         .version = "2.0",
         .architecture = "amd64",
     }};
+}
+
+test "native_program.test.remove without residual metadata drops the record" {
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "legacy",
+        .version = "2.0",
+        .architecture = "amd64",
+        .prior_version = "2.0",
+        .artifact = null,
+    }};
+    var authorization = try testAuthorization(testing.allocator, &actions, &.{});
+    defer authorization.deinit();
+    const ordered = removalOrdered(.remove);
+    const installed = [_]InstalledPackage{.{
+        .name = "legacy",
+        .version = "2.0",
+        .architecture = "amd64",
+        .state = .installed,
+    }};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &ordered,
+        .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+    }));
+    defer owned.deinit();
+    var removed = false;
+    for (owned.program.steps) |step| switch (step.operation) {
+        .record_package_state => |state| if (state.state == .not_installed) {
+            try testing.expect(state.remove_entry);
+            removed = true;
+        },
+        else => {},
+    };
+    try testing.expect(removed);
+
+    try expectDiagnostic(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &ordered,
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = &removal_installed,
+        },
+    }), .missing_final_package);
 }
 
 test "native_program.test.remove retains conffiles and publishes the config-files state" {
