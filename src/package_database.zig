@@ -2459,6 +2459,8 @@ const Validator = struct {
             }
         }
 
+        var configured_versions: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer configured_versions.deinit(self.allocator);
         var total_paths: usize = 0;
         for (self.model.packages) |record| {
             if (try self.validateRecord(record)) |diagnostic| return diagnostic;
@@ -2478,11 +2480,17 @@ const Validator = struct {
             }
             const siblings = self.index.by_name.get(record.name).?;
             if (siblings.count != 1) {
-                const first = self.model.packages[siblings.index];
-                if (record.multi_arch != .same or first.multi_arch != .same or
-                    !std.mem.eql(u8, record.version, first.version))
-                {
+                if (record.multi_arch != .same)
                     return self.fail(.cross_file, .multiarch_conflict, record.name);
+                if (record.status.current != .unpacked) {
+                    const configured = try configured_versions.getOrPut(
+                        self.allocator,
+                        record.name,
+                    );
+                    if (configured.found_existing and
+                        !std.mem.eql(u8, record.version, configured.value_ptr.*))
+                        return self.fail(.cross_file, .multiarch_conflict, record.name);
+                    configured.value_ptr.* = record.version;
                 }
             }
         }
@@ -2638,10 +2646,9 @@ const Validator = struct {
                 if (!try self.keys.insert(entry.path)) {
                     return self.fail(.cross_file, .duplicate_checksum, record.name);
                 }
-                if (record.paths == null) continue;
-                if (!try self.paths.containsRelative(entry.path)) {
-                    return self.fail(.cross_file, .checksum_out_of_inventory, record.name);
-                }
+                // md5sums is the package's as-shipped manifest, not a second
+                // live ownership index. dpkg leaves a displaced path in this
+                // file when Replaces removes it from info/*.list.
             }
         }
 
@@ -3385,14 +3392,21 @@ test "package_database.test.package state and ownership must agree across files"
         .cross_file,
         .conffile_not_owned,
     );
-    try expectImportSurface(
-        minimalSnapshot(minimal_status, &.{
-            .{ .name = "solo.list", .bytes = minimal_list },
-            .{ .name = "solo.md5sums", .bytes = "5d41402abc4b2a76b9719d911017c592  usr/bin/other\n" },
-        }),
-        .cross_file,
-        .checksum_out_of_inventory,
-    );
+    var stale_checksums = switch (try importSnapshot(
+        testing.allocator,
+        .{
+            .native_architecture = "amd64",
+            .snapshot = minimalSnapshot(minimal_status, &.{
+                .{ .name = "solo.list", .bytes = minimal_list },
+                .{ .name = "solo.md5sums", .bytes = "5d41402abc4b2a76b9719d911017c592  usr/bin/other\n" },
+            }),
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    stale_checksums.deinit();
     try expectImportSurface(
         minimalSnapshot(minimal_status, &.{
             .{ .name = "solo.list", .bytes = minimal_list },
@@ -3530,6 +3544,61 @@ test "package_database.test.info directory entries must be safe qualified regula
     defer allocator.free(missing_list);
     snapshot.info = missing_list;
     try expectImportFailure(snapshot, .missing_file_list);
+}
+
+test "package_database.test.unpacked multiarch transition may precede siblings" {
+    const status = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        test_fixtures.status,
+        "Status: install ok installed\nArchitecture: i386\nMulti-Arch: same\nVersion: 1.2-3",
+        "Status: install ok unpacked\nArchitecture: i386\nMulti-Arch: same\nVersion: 1.2-4",
+    );
+    defer testing.allocator.free(status);
+    var snapshot = test_fixtures.snapshot();
+    snapshot.status = regularFile(status);
+    var database = switch (try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    database.deinit();
+}
+
+test "package_database.test.multiarch validation is independent of model record order" {
+    var database = switch (try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = test_fixtures.snapshot() },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    const packages = try testing.allocator.dupe(PackageRecord, database.model.packages);
+    defer testing.allocator.free(packages);
+    var sibling_index: ?usize = null;
+    var unrelated_index: ?usize = null;
+    for (packages, 0..) |record, index| {
+        if (std.mem.eql(u8, record.name, "libfoo")) {
+            if (std.mem.eql(u8, record.architecture, "i386"))
+                sibling_index = index;
+        } else {
+            unrelated_index = index;
+        }
+    }
+    std.mem.swap(PackageRecord, &packages[sibling_index.?], &packages[unrelated_index.?]);
+    var model = database.model;
+    model.packages = packages;
+    try testing.expectEqual(@as(?Diagnostic, null), try validateModel(testing.allocator, model, .{}));
+
+    packages[unrelated_index.?].version = "1.2-4";
+    packages[unrelated_index.?].parsed_version = try DebianVersion.parse("1.2-4");
+    const diagnostic = (try validateModel(testing.allocator, model, .{})).?;
+    try testing.expectEqual(Code.multiarch_conflict, diagnostic.code);
 }
 
 test "package_database.test.multiarch instances must be consistent" {
@@ -3857,17 +3926,24 @@ test "package_database.test.large generations import and validate without quadra
         .duplicate_checksum,
     );
 
-    var missing = try BulkFixture.init(testing.allocator, .{ .unowned_checksum = true });
-    defer missing.deinit();
-    const missing_entries = [_]InfoEntry{
-        .{ .name = "bulk.list", .bytes = missing.list },
-        .{ .name = "bulk.md5sums", .bytes = missing.md5sums },
+    var stale = try BulkFixture.init(testing.allocator, .{ .unowned_checksum = true });
+    defer stale.deinit();
+    const stale_entries = [_]InfoEntry{
+        .{ .name = "bulk.list", .bytes = stale.list },
+        .{ .name = "bulk.md5sums", .bytes = stale.md5sums },
     };
-    try expectImportSurface(
-        missing.snapshot(&missing_entries),
-        .cross_file,
-        .checksum_out_of_inventory,
-    );
+    var stale_database = switch (try importSnapshot(
+        testing.allocator,
+        .{
+            .native_architecture = "amd64",
+            .snapshot = stale.snapshot(&stale_entries),
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    stale_database.deinit();
 }
 
 test "package_database.test.model validation catches duplicates that no parser saw" {

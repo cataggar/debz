@@ -96,8 +96,9 @@ fn recoverLegacy(
     return transaction_executor.recover(allocator, request, dependencies);
 }
 
-/// Selection never falls back. A requested native backend must be present
-/// before callers perform acquisition, journal, database, or root mutation.
+/// Item 10 is planning-only. Native selection never accepts an injected
+/// command-shaped executor and remains unavailable before acquisition or
+/// mutation until a later integration supplies the real native capability.
 pub fn select(
     kind: Kind,
     legacy_dpkg: Executor,
@@ -105,7 +106,10 @@ pub fn select(
 ) SelectionError!Executor {
     return switch (kind) {
         .legacy_dpkg => legacy_dpkg,
-        .native => native orelse error.BackendUnavailable,
+        .native => {
+            _ = native;
+            return error.BackendUnavailable;
+        },
     };
 }
 
@@ -393,8 +397,8 @@ pub fn executeAuthorizedProgram(
     expected_program_sha256: ?[64]u8,
     dependencies: transaction_executor.Dependencies,
 ) !transaction_executor.Report {
-    const executor = try select(kind, legacy_dpkg, native);
     try authorizeProgram(kind, request, authorization, program, expected_program_sha256);
+    const executor = try select(kind, legacy_dpkg, native);
     return executor.execute(allocator, request, dependencies);
 }
 
@@ -409,8 +413,8 @@ pub fn executeAuthorized(
     authorization: ?*const native_authorization.Authorization,
     dependencies: transaction_executor.Dependencies,
 ) !transaction_executor.Report {
-    const executor = try select(kind, legacy_dpkg, native);
     try authorize(kind, request, authorization);
+    const executor = try select(kind, legacy_dpkg, native);
     return executor.execute(allocator, request, dependencies);
 }
 
@@ -456,12 +460,13 @@ test "transaction_engine.test.selection is explicit and never falls back" {
     const selected_legacy = try select(.legacy_dpkg, legacy.executor(), null);
     try std.testing.expectEqual(legacy.executor().context, selected_legacy.context);
 
-    const selected_native = try select(.native, legacy.executor(), native.executor());
-    try std.testing.expectEqual(native.executor().context, selected_native.context);
-
     try std.testing.expectError(
         error.BackendUnavailable,
         select(.native, legacy.executor(), null),
+    );
+    try std.testing.expectError(
+        error.BackendUnavailable,
+        select(.native, legacy.executor(), native.executor()),
     );
     try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
@@ -957,7 +962,7 @@ test "transaction_engine.test.unauthorized native execution never reaches the ex
     ));
     try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
 
-    try std.testing.expectError(error.TestOnly, executeAuthorized(
+    try std.testing.expectError(error.BackendUnavailable, executeAuthorized(
         std.testing.allocator,
         .native,
         legacy.executor(),
@@ -966,7 +971,7 @@ test "transaction_engine.test.unauthorized native execution never reaches the ex
         &fixture.authorization.authorization,
         dependencies,
     ));
-    try std.testing.expectEqual(@as(usize, 1), native.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
 }
 

@@ -149,13 +149,16 @@ class NativeDifferentialTests(unittest.TestCase):
                 root, native_differential.Limits(max_entries=2)
             )
 
-    def test_corpus_covers_required_v1_transitions(self) -> None:
+    def test_scenario_inventory_names_required_v1_cases(self) -> None:
         corpus = json.loads(
             (ROOT / "test/native-transaction/corpus-v1.json").read_text()
         )
         native_differential.validate_corpus(corpus)
         scenarios = {scenario["id"]: scenario for scenario in corpus["scenarios"]}
-        required = {
+        # This JSON is an inventory for external differential runners, not an
+        # executable parity assertion. Gate-critical item-10 behavior is
+        # exercised by native_unpack.test.* Zig fixtures.
+        inventory = {
             "fresh-install",
             "essential-bootstrap",
             "pre-depends-order",
@@ -188,8 +191,82 @@ class NativeDifferentialTests(unittest.TestCase):
             "filesystem-interruption",
             "database-interruption",
             "script-outcome-unknown",
+            "unpack-data-only",
+            "unpack-metadata-fidelity",
+            "unpack-file-deletion",
+            "unpack-directory-co-ownership",
+            "unpack-unowned-path",
+            "unpack-replaces-version-bound",
+            "unpack-conflict-refused",
+            "unpack-multi-arch-shared",
+            "unpack-multi-arch-divergent",
+            "unpack-merged-usr",
+            "unpack-merged-usr-foreign-link",
+            "unpack-directory-to-symlink",
+            "unpack-prefix-transition-refused",
+            "unpack-case-alias",
+            "unpack-conffile-handoff",
+            "unpack-script-handoff",
+            "unpack-trigger-handoff",
+            "unpack-diversion-handoff",
+            "unpack-archive-tamper",
+            "unpack-generation-drift",
+            "unpack-configure-barrier-handoff",
+            "unpack-displaced-ownership",
+            "unpack-existing-directory-metadata",
+            "unpack-installed-hardlink-group",
+            "unpack-removal-trigger-handoff",
+            "unpack-deferred-bound",
+            "unpack-hardlink-group-metadata",
+            "unpack-shared-directory-metadata",
+            "unpack-package-disappearance-handoff",
+            "unpack-control-metadata-handoff",
+            "unpack-hold-preserved",
+            "unpack-case-alias-refused",
+            "unpack-multi-package-trigger-handoff",
+            "unpack-synthesized-ancestor-metadata",
+            "unpack-disappearance-directory-only",
+            "unpack-dpkg-interoperability-handoff",
+            "unpack-database-surface-handoff",
+            "unpack-multi-arch-sibling-pair",
+            "unpack-shared-obsolete-removal",
+            "unpack-exclusive-name-saves-holder",
+            "unpack-replaces-directory-over-file",
+            "unpack-hardlink-metadata-order",
+            "unpack-canonical-database-publication",
+            "unpack-displaced-conffile-handoff",
+            "unpack-config-version-preserved",
+            "unpack-selection-normalized",
+            "unpack-queued-trigger-handoff",
+            "unpack-directory-over-symlink-refused",
+            "unpack-nondirectory-over-directory-refused",
+            "unpack-internal-database-import",
+            "unpack-config-files-conffile-handoff",
+            "unpack-installed-case-collision",
+            "unpack-multi-arch-interleaved",
+            "unpack-held-selection-handoff",
+            "unpack-folded-conffile-handoff",
+            "unpack-unmodeled-trigger-child",
+            "unpack-file-to-directory-children",
+            "unpack-unplanned-ancestor-refused",
+            "unpack-capture-budget",
+            "unpack-missing-owned-path-absent",
+            "unpack-removal-foreign-conffile",
+            "unpack-config-files-install",
+            "unpack-restricted-replaces",
+            "unpack-holder-keeps-own-file",
+            "unpack-co-owned-directory-drop",
+            "unpack-required-directory-kept",
+            "unpack-multi-arch-sibling-set",
+            "unpack-multi-arch-out-of-sync",
+            "unpack-planner-not-public",
+            "unpack-database-namespace-reserved",
+            "unpack-removal-handoff",
+            "unpack-purge-handoff",
+            "unpack-planned-link-chain",
+            "unpack-native-selection-unavailable",
         }
-        self.assertEqual(set(), required - scenarios.keys())
+        self.assertEqual(set(), inventory - scenarios.keys())
 
         invalid = json.loads(json.dumps(corpus))
         invalid["scenarios"][0]["typo"] = True

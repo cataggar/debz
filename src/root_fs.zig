@@ -230,6 +230,45 @@ pub const Entry = struct {
     }
 };
 
+/// Metadata and bytes read from one pinned regular-file descriptor.
+///
+/// `change_nanoseconds` is the inode status-change timestamp, not a durable
+/// inode generation or permission to cache across opens. Bytes are accepted
+/// only when the descriptor and its root-relative name still identify the
+/// same unchanged inode after the read.
+pub const RegularFileObservation = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+    /// Owned by the allocator passed to `PinnedRegularFile.observeAlloc`.
+    bytes: []u8,
+};
+
+/// Metadata and target read from one pinned symbolic-link descriptor.
+pub const SymbolicLinkObservation = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+    target: []const u8,
+};
+
+pub const DirectoryMember = struct {
+    name: []u8,
+    kind: File.Kind,
+};
+
+/// One bounded listing read through a pinned directory descriptor.
+pub const DirectoryObservation = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+    members: []DirectoryMember,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DirectoryObservation) void {
+        for (self.members) |member| self.allocator.free(member.name);
+        self.allocator.free(self.members);
+        self.* = undefined;
+    }
+};
+
 pub const CreateFileOptions = struct {
     permissions: File.Permissions = default_file_permissions,
     read: bool = false,
@@ -286,6 +325,287 @@ pub const Parent = struct {
     pub fn close(self: *Parent, io: Io) void {
         if (self.owned) self.dir.close(io);
         self.* = undefined;
+    }
+};
+
+const EntryIdentity = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+};
+
+/// A read-only regular-file descriptor pinned beneath a root.
+///
+/// The selected root, complete validated path, and parent descriptor are
+/// retained, so observations re-resolve the full no-follow chain and prove
+/// that the root-relative name still identifies this descriptor.
+/// The root descriptor and path bytes are borrowed and must outlive the pin.
+pub const PinnedRegularFile = struct {
+    root: Root,
+    path: Path,
+    io: Io,
+    parent: Parent,
+    leaf: []const u8,
+    file: File,
+    initial: EntryIdentity,
+
+    pub fn close(self: *PinnedRegularFile) void {
+        self.file.close(self.io);
+        self.parent.close(self.io);
+        self.* = undefined;
+    }
+
+    pub fn metadata(self: *const PinnedRegularFile) !struct {
+        entry: Entry,
+        change_nanoseconds: i128,
+    } {
+        const descriptor = try entryIdentityAt(
+            self.io,
+            .{ .handle = self.file.handle },
+            "",
+        );
+        const named = try entryIdentityAt(self.io, self.parent.dir, self.leaf);
+        const rooted = try rootedIdentity(self.root, self.path);
+        if (!sameEntryIdentity(self.initial, descriptor) or
+            !sameEntryIdentity(descriptor, named) or
+            !sameEntryIdentity(descriptor, rooted))
+            return error.PathChanged;
+        return .{
+            .entry = descriptor.entry,
+            .change_nanoseconds = descriptor.change_nanoseconds,
+        };
+    }
+
+    pub fn observeAlloc(
+        self: *const PinnedRegularFile,
+        allocator: std.mem.Allocator,
+        maximum_bytes: usize,
+    ) !RegularFileObservation {
+        _ = try self.metadata();
+        var reader = self.file.reader(self.io, &.{});
+        const bytes = reader.interface.allocRemaining(
+            allocator,
+            .limited(maximum_bytes +| 1),
+        ) catch |err| switch (err) {
+            error.StreamTooLong => return error.FileTooLarge,
+            error.ReadFailed => return reader.err.?,
+            else => |other| return other,
+        };
+        errdefer allocator.free(bytes);
+        const observed = try self.metadata();
+        if (bytes.len != observed.entry.size) return error.PathChanged;
+        return .{
+            .entry = observed.entry,
+            .change_nanoseconds = observed.change_nanoseconds,
+            .bytes = bytes,
+        };
+    }
+
+    /// Reads the pinned file twice from offset zero and accepts the bytes only
+    /// when both reads and all descriptor/name/full-root observations agree.
+    /// Read disagreement detects same-sized changes even with coarse change
+    /// times. Agreement is not an immutable snapshot of a concurrently writable
+    /// root; the caller must provide isolation for that stronger guarantee.
+    pub fn observeStableAlloc(
+        self: *const PinnedRegularFile,
+        allocator: std.mem.Allocator,
+        maximum_bytes: usize,
+    ) !RegularFileObservation {
+        return self.observeStableAllocWithHook(
+            allocator,
+            maximum_bytes,
+            null,
+        );
+    }
+
+    const ObservationHook = struct {
+        context: *anyopaque,
+        function: *const fn (*anyopaque) anyerror!void,
+    };
+
+    fn observeStableAllocWithHook(
+        self: *const PinnedRegularFile,
+        allocator: std.mem.Allocator,
+        maximum_bytes: usize,
+        hook: ?ObservationHook,
+    ) !RegularFileObservation {
+        const before = try self.metadata();
+        if (before.entry.size > maximum_bytes) return error.FileTooLarge;
+        const length: usize = @intCast(before.entry.size);
+        const first = try allocator.alloc(u8, length);
+        errdefer allocator.free(first);
+        if (try self.file.readPositionalAll(self.io, first, 0) != length)
+            return error.PathChanged;
+        _ = try self.metadata();
+        if (hook) |callback| try callback.function(callback.context);
+        const second = try allocator.alloc(u8, length);
+        defer allocator.free(second);
+        if (try self.file.readPositionalAll(self.io, second, 0) != length)
+            return error.PathChanged;
+        const after = try self.metadata();
+        if (!std.mem.eql(u8, first, second)) return error.PathChanged;
+        return .{
+            .entry = after.entry,
+            .change_nanoseconds = after.change_nanoseconds,
+            .bytes = first,
+        };
+    }
+};
+
+/// A read-only symbolic-link descriptor pinned beneath a root.
+///
+/// Linux permits `readlinkat(fd, "")` on an `O_PATH|O_NOFOLLOW` descriptor,
+/// which binds the target bytes and metadata to the same link inode. Other
+/// platforms fail closed rather than falling back to a name-only read.
+/// The root descriptor and path bytes are borrowed and must outlive the pin.
+pub const PinnedSymbolicLink = struct {
+    root: Root,
+    path: Path,
+    io: Io,
+    parent: Parent,
+    leaf: []const u8,
+    handle: std.posix.fd_t,
+    initial: EntryIdentity,
+
+    pub fn close(self: *PinnedSymbolicLink) void {
+        (File{
+            .handle = self.handle,
+            .flags = .{ .nonblocking = false },
+        }).close(self.io);
+        self.parent.close(self.io);
+        self.* = undefined;
+    }
+
+    pub fn observe(
+        self: *const PinnedSymbolicLink,
+        buffer: []u8,
+    ) !SymbolicLinkObservation {
+        if (builtin.os.tag != .linux) return error.OperationUnsupported;
+        const before = try entryIdentityAt(
+            self.io,
+            .{ .handle = self.handle },
+            "",
+        );
+        const named_before = try entryIdentityAt(
+            self.io,
+            self.parent.dir,
+            self.leaf,
+        );
+        const rooted_before = try rootedIdentity(self.root, self.path);
+        if (!sameEntryIdentity(self.initial, before) or
+            !sameEntryIdentity(before, named_before) or
+            !sameEntryIdentity(before, rooted_before))
+            return error.PathChanged;
+        const linux = std.os.linux;
+        const empty: [1:0]u8 = .{0};
+        const result = linux.readlinkat(
+            self.handle,
+            &empty,
+            buffer.ptr,
+            buffer.len,
+        );
+        const length = switch (linux.errno(result)) {
+            .SUCCESS => result,
+            .ACCES => return error.AccessDenied,
+            .INVAL => return error.NotSymbolicLink,
+            .NOENT => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        };
+        const after = try entryIdentityAt(
+            self.io,
+            .{ .handle = self.handle },
+            "",
+        );
+        const named = try entryIdentityAt(self.io, self.parent.dir, self.leaf);
+        const rooted = try rootedIdentity(self.root, self.path);
+        if (!sameEntryIdentity(before, after) or
+            !sameEntryIdentity(after, named) or
+            !sameEntryIdentity(after, rooted))
+            return error.PathChanged;
+        if (length != after.entry.size) return error.PathChanged;
+        return .{
+            .entry = after.entry,
+            .change_nanoseconds = after.change_nanoseconds,
+            .target = buffer[0..length],
+        };
+    }
+};
+
+/// A read-only directory pinned together with its selected root, complete
+/// validated path, and immediate parent descriptor.
+/// The root descriptor and path bytes are borrowed and must outlive the pin.
+pub const PinnedDirectory = struct {
+    root: Root,
+    path: Path,
+    io: Io,
+    parent: Parent,
+    leaf: []const u8,
+    dir: Dir,
+    initial: EntryIdentity,
+
+    pub fn close(self: *PinnedDirectory) void {
+        self.dir.close(self.io);
+        self.parent.close(self.io);
+        self.* = undefined;
+    }
+
+    pub fn metadata(self: *const PinnedDirectory) !struct {
+        entry: Entry,
+        change_nanoseconds: i128,
+    } {
+        const descriptor = try entryIdentityAt(self.io, self.dir, "");
+        const named = try entryIdentityAt(self.io, self.parent.dir, self.leaf);
+        const rooted = try rootedIdentity(self.root, self.path);
+        if (!sameEntryIdentity(self.initial, descriptor) or
+            !sameEntryIdentity(descriptor, named) or
+            !sameEntryIdentity(descriptor, rooted))
+            return error.PathChanged;
+        return .{
+            .entry = descriptor.entry,
+            .change_nanoseconds = descriptor.change_nanoseconds,
+        };
+    }
+
+    /// Lists at most `maximum_entries` whose names total at most
+    /// `maximum_name_bytes`. Metadata, contents, and the root-relative name
+    /// must still identify the unchanged pinned inode after iteration.
+    pub fn observeAlloc(
+        self: *const PinnedDirectory,
+        allocator: std.mem.Allocator,
+        maximum_entries: usize,
+        maximum_name_bytes: usize,
+    ) !DirectoryObservation {
+        _ = try self.metadata();
+        var members: std.ArrayList(DirectoryMember) = .empty;
+        errdefer {
+            for (members.items) |member| allocator.free(member.name);
+            members.deinit(allocator);
+        }
+        var name_bytes: usize = 0;
+        var iterator = self.dir.iterate();
+        while (try iterator.next(self.io)) |member| {
+            if (members.items.len >= maximum_entries)
+                return error.DirectoryTooLarge;
+            name_bytes = std.math.add(usize, name_bytes, member.name.len) catch
+                return error.DirectoryTooLarge;
+            if (name_bytes > maximum_name_bytes)
+                return error.DirectoryTooLarge;
+            const name = try allocator.dupe(u8, member.name);
+            members.append(allocator, .{
+                .name = name,
+                .kind = member.kind,
+            }) catch |err| {
+                allocator.free(name);
+                return err;
+            };
+        }
+        const observed = try self.metadata();
+        return .{
+            .entry = observed.entry,
+            .change_nanoseconds = observed.change_nanoseconds,
+            .members = try members.toOwnedSlice(allocator),
+            .allocator = allocator,
+        };
     }
 };
 
@@ -475,6 +795,116 @@ pub const Root = struct {
             self.io,
             parent.leaf,
         ) catch |err| return mapRegularFileError(err);
+    }
+
+    /// Pins a regular file and its parent for one coherent read-only
+    /// observation. Callers must release the returned handle with `close`.
+    pub fn pinRegularFile(self: Root, path: Path) !PinnedRegularFile {
+        var parent = try self.openParent(path);
+        errdefer parent.close(self.io);
+        const file = package_acquisition.openRegularFileNoFollow(
+            parent.dir,
+            self.io,
+            parent.leaf,
+        ) catch |err| return mapRegularFileError(err);
+        errdefer file.close(self.io);
+        const descriptor = try entryIdentityAt(
+            self.io,
+            .{ .handle = file.handle },
+            "",
+        );
+        const named = try entryIdentityAt(self.io, parent.dir, parent.leaf);
+        const rooted = try rootedIdentity(self, path);
+        if (!descriptor.entry.isRegularFile()) return error.NotRegularFile;
+        if (!sameEntryIdentity(descriptor, named) or
+            !sameEntryIdentity(descriptor, rooted))
+            return error.PathChanged;
+        return .{
+            .root = self,
+            .path = path,
+            .io = self.io,
+            .parent = parent,
+            .leaf = parent.leaf,
+            .file = file,
+            .initial = descriptor,
+        };
+    }
+
+    /// Pins a symbolic link itself, never its target. Linux is required
+    /// because portable APIs cannot bind `readlink` to an opened link inode.
+    pub fn pinSymbolicLink(self: Root, path: Path) !PinnedSymbolicLink {
+        if (builtin.os.tag != .linux) return error.OperationUnsupported;
+        var parent = try self.openParent(path);
+        errdefer parent.close(self.io);
+        const linux = std.os.linux;
+        var path_buffer: [maximum_component_bytes + 1]u8 = undefined;
+        if (parent.leaf.len > maximum_component_bytes) return error.PathTooLong;
+        @memcpy(path_buffer[0..parent.leaf.len], parent.leaf);
+        path_buffer[parent.leaf.len] = 0;
+        const name: [*:0]const u8 = @ptrCast(&path_buffer);
+        const raw = linux.openat(parent.dir.handle, name, .{
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+            .PATH = true,
+        }, 0);
+        const handle: std.posix.fd_t = switch (linux.errno(raw)) {
+            .SUCCESS => @intCast(raw),
+            .ACCES => return error.AccessDenied,
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDirectory,
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        };
+        errdefer (File{
+            .handle = handle,
+            .flags = .{ .nonblocking = false },
+        }).close(self.io);
+        const descriptor = try entryIdentityAt(
+            self.io,
+            .{ .handle = handle },
+            "",
+        );
+        const named = try entryIdentityAt(self.io, parent.dir, parent.leaf);
+        const rooted = try rootedIdentity(self, path);
+        if (!descriptor.entry.isSymbolicLink()) return error.NotSymbolicLink;
+        if (!sameEntryIdentity(descriptor, named) or
+            !sameEntryIdentity(descriptor, rooted))
+            return error.PathChanged;
+        return .{
+            .root = self,
+            .path = path,
+            .io = self.io,
+            .parent = parent,
+            .leaf = parent.leaf,
+            .handle = handle,
+            .initial = descriptor,
+        };
+    }
+
+    /// Pins a real directory and its parent for one coherent bounded
+    /// read-only observation. Callers must release it with `close`.
+    pub fn pinDirectory(self: Root, path: Path) !PinnedDirectory {
+        var parent = try self.openParent(path);
+        errdefer parent.close(self.io);
+        const dir = try openComponent(self.io, parent.dir, parent.leaf);
+        errdefer dir.close(self.io);
+        const descriptor = try entryIdentityAt(self.io, dir, "");
+        const named = try entryIdentityAt(self.io, parent.dir, parent.leaf);
+        const rooted = try rootedIdentity(self, path);
+        if (!descriptor.entry.isDirectory()) return error.NotDirectory;
+        if (!sameEntryIdentity(descriptor, named) or
+            !sameEntryIdentity(descriptor, rooted))
+            return error.PathChanged;
+        return .{
+            .root = self,
+            .path = path,
+            .io = self.io,
+            .parent = parent,
+            .leaf = parent.leaf,
+            .dir = dir,
+            .initial = descriptor,
+        };
     }
 
     /// Reads the whole file when it is at most `maximum_bytes` long and fails
@@ -1002,6 +1432,16 @@ fn syncDir(io: Io, dir: Dir) !void {
 /// `base` itself. On Linux a single `statx` reports ownership and the
 /// containing device, which `std.Io.File.Stat` does not carry.
 fn entryAt(io: Io, base: Dir, leaf: []const u8) !Entry {
+    return (try entryIdentityAt(io, base, leaf)).entry;
+}
+
+fn rootedIdentity(root: Root, path: Path) !EntryIdentity {
+    var parent = try root.openParent(path);
+    defer parent.close(root.io);
+    return entryIdentityAt(root.io, parent.dir, parent.leaf);
+}
+
+fn entryIdentityAt(io: Io, base: Dir, leaf: []const u8) !EntryIdentity {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var path_buffer: [maximum_path_bytes + 1]u8 = undefined;
@@ -1017,6 +1457,7 @@ fn entryAt(io: Io, base: Dir, leaf: []const u8) !Entry {
             .INO = true,
             .SIZE = true,
             .MTIME = true,
+            .CTIME = true,
         };
         const flags: u32 = linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW |
             @as(u32, if (leaf.len == 0) linux.AT.EMPTY_PATH else 0);
@@ -1035,16 +1476,20 @@ fn entryAt(io: Io, base: Dir, leaf: []const u8) !Entry {
         const wanted: u32 = @bitCast(request);
         if (filled & wanted != wanted) return error.Unexpected;
         return .{
-            .kind = statxKind(raw.mode),
-            .size = raw.size,
-            .mode = @as(u32, raw.mode) & 0o7777,
-            .uid = raw.uid,
-            .gid = raw.gid,
-            .device = (@as(u64, raw.dev_major) << 32) | raw.dev_minor,
-            .inode = raw.ino,
-            .link_count = raw.nlink,
-            .modified_nanoseconds = @as(i128, raw.mtime.sec) * std.time.ns_per_s + raw.mtime.nsec,
-            .modeled = true,
+            .entry = .{
+                .kind = statxKind(raw.mode),
+                .size = raw.size,
+                .mode = @as(u32, raw.mode) & 0o7777,
+                .uid = raw.uid,
+                .gid = raw.gid,
+                .device = (@as(u64, raw.dev_major) << 32) | raw.dev_minor,
+                .inode = raw.ino,
+                .link_count = raw.nlink,
+                .modified_nanoseconds = @as(i128, raw.mtime.sec) * std.time.ns_per_s + raw.mtime.nsec,
+                .modeled = true,
+            },
+            .change_nanoseconds = @as(i128, raw.ctime.sec) * std.time.ns_per_s +
+                raw.ctime.nsec,
         };
     }
     const stat = if (leaf.len == 0)
@@ -1052,17 +1497,34 @@ fn entryAt(io: Io, base: Dir, leaf: []const u8) !Entry {
     else
         try base.statFile(io, leaf, .{ .follow_symlinks = false });
     return .{
-        .kind = stat.kind,
-        .size = stat.size,
-        .mode = if (builtin.os.tag == .windows) 0 else @intCast(stat.permissions.toMode() & 0o7777),
-        .uid = 0,
-        .gid = 0,
-        .device = 0,
-        .inode = stat.inode,
-        .link_count = stat.nlink,
-        .modified_nanoseconds = stat.mtime.nanoseconds,
-        .modeled = false,
+        .entry = .{
+            .kind = stat.kind,
+            .size = stat.size,
+            .mode = if (builtin.os.tag == .windows) 0 else @intCast(stat.permissions.toMode() & 0o7777),
+            .uid = 0,
+            .gid = 0,
+            .device = 0,
+            .inode = stat.inode,
+            .link_count = stat.nlink,
+            .modified_nanoseconds = stat.mtime.nanoseconds,
+            .modeled = false,
+        },
+        .change_nanoseconds = stat.ctime.nanoseconds,
     };
+}
+
+fn sameEntryIdentity(left: EntryIdentity, right: EntryIdentity) bool {
+    return left.entry.kind == right.entry.kind and
+        left.entry.size == right.entry.size and
+        left.entry.mode == right.entry.mode and
+        left.entry.uid == right.entry.uid and
+        left.entry.gid == right.entry.gid and
+        left.entry.device == right.entry.device and
+        left.entry.inode == right.entry.inode and
+        left.entry.link_count == right.entry.link_count and
+        left.entry.modified_nanoseconds == right.entry.modified_nanoseconds and
+        left.entry.modeled == right.entry.modeled and
+        left.change_nanoseconds == right.change_nanoseconds;
 }
 
 fn statxKind(mode: u16) File.Kind {
@@ -1577,6 +2039,234 @@ test "root_fs.test.removal and rename operate on links, not their targets" {
     const bytes = try root.readFileAlloc(testing.allocator, try testPath("renamed"), 4096);
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings("other", bytes);
+}
+
+test "root_fs.test.pinned read observations reject substituted names" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+
+    const file_path = try testPath("observed");
+    try root.publishFile(file_path, "trusted\n", .{});
+    try root.publishFile(try testPath("replacement"), "foreign\n", .{});
+    var pinned_file = try root.pinRegularFile(file_path);
+    defer pinned_file.close();
+    try root.rename(file_path, try testPath("saved"), .fail_if_exists);
+    try root.rename(
+        try testPath("replacement"),
+        file_path,
+        .fail_if_exists,
+    );
+    try testing.expectError(
+        error.PathChanged,
+        pinned_file.observeAlloc(testing.allocator, 4096),
+    );
+
+    const link_path = try testPath("observed-link");
+    try root.createSymbolicLink(link_path, "trusted-target");
+    try root.createSymbolicLink(
+        try testPath("replacement-link"),
+        "foreign-target",
+    );
+    var pinned_link = try root.pinSymbolicLink(link_path);
+    defer pinned_link.close();
+    try root.rename(link_path, try testPath("saved-link"), .fail_if_exists);
+    try root.rename(
+        try testPath("replacement-link"),
+        link_path,
+        .fail_if_exists,
+    );
+    var target_buffer: [maximum_link_target_bytes]u8 = undefined;
+    try testing.expectError(
+        error.PathChanged,
+        pinned_link.observe(&target_buffer),
+    );
+
+    try root.createDirectory(
+        try testPath("observed-directory"),
+        default_directory_permissions,
+    );
+    try root.createDirectory(
+        try testPath("replacement-directory"),
+        default_directory_permissions,
+    );
+    var pinned_directory = try root.pinDirectory(
+        try testPath("observed-directory"),
+    );
+    defer pinned_directory.close();
+    try root.rename(
+        try testPath("observed-directory"),
+        try testPath("saved-directory"),
+        .fail_if_exists,
+    );
+    try root.rename(
+        try testPath("replacement-directory"),
+        try testPath("observed-directory"),
+        .fail_if_exists,
+    );
+    try testing.expectError(
+        error.PathChanged,
+        pinned_directory.observeAlloc(testing.allocator, 16, 4096),
+    );
+}
+
+test "root_fs.test.pinned observations bind metadata and content" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+
+    const file_path = try testPath("file");
+    try root.publishFile(file_path, "content\n", .{});
+    var pinned_file = try root.pinRegularFile(file_path);
+    defer pinned_file.close();
+    const file = try pinned_file.observeAlloc(testing.allocator, 4096);
+    defer testing.allocator.free(file.bytes);
+    try testing.expectEqualStrings("content\n", file.bytes);
+    try testing.expect(file.entry.isRegularFile());
+
+    const link_path = try testPath("link");
+    try root.createSymbolicLink(link_path, "target");
+    var pinned_link = try root.pinSymbolicLink(link_path);
+    defer pinned_link.close();
+    var target_buffer: [maximum_link_target_bytes]u8 = undefined;
+    const link = try pinned_link.observe(&target_buffer);
+    try testing.expectEqualStrings("target", link.target);
+    try testing.expect(link.entry.isSymbolicLink());
+
+    try root.createDirectory(
+        try testPath("directory"),
+        default_directory_permissions,
+    );
+    try root.publishFile(try testPath("directory/child"), "x", .{});
+    var pinned_directory = try root.pinDirectory(try testPath("directory"));
+    defer pinned_directory.close();
+    var directory = try pinned_directory.observeAlloc(
+        testing.allocator,
+        1,
+        5,
+    );
+    defer directory.deinit();
+    try testing.expectEqual(@as(usize, 1), directory.members.len);
+    try testing.expectEqualStrings("child", directory.members[0].name);
+}
+
+test "root_fs.test.pinned directory observation owns allocation failures" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+    const path = try testPath("directory");
+    try root.createDirectory(path, default_directory_permissions);
+    try root.publishFile(try testPath("directory/child"), "x", .{});
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        observeDirectoryUnderAllocationFailure,
+        .{ root, path },
+    );
+}
+
+fn observeDirectoryUnderAllocationFailure(
+    allocator: std.mem.Allocator,
+    root: Root,
+    path: Path,
+) !void {
+    var pinned = try root.pinDirectory(path);
+    defer pinned.close();
+    var observed = try pinned.observeAlloc(allocator, 16, 4096);
+    defer observed.deinit();
+    if (observed.members.len != 1) return error.TestUnexpectedResult;
+}
+
+test "root_fs.test.pinned observations remain attached to the selected root" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+    try root.createDirectoryPath(
+        try testPath("a/b/directory"),
+        default_directory_permissions,
+    );
+    try root.publishFile(try testPath("a/b/file"), "trusted\n", .{});
+    try root.createSymbolicLink(try testPath("a/b/link"), "trusted-target");
+
+    var file = try root.pinRegularFile(try testPath("a/b/file"));
+    defer file.close();
+    var link = try root.pinSymbolicLink(try testPath("a/b/link"));
+    defer link.close();
+    var directory = try root.pinDirectory(try testPath("a/b/directory"));
+    defer directory.close();
+
+    try root.rename(try testPath("a"), try testPath("detached"), .fail_if_exists);
+    try root.createDirectoryPath(
+        try testPath("a/b/directory"),
+        default_directory_permissions,
+    );
+    try root.publishFile(try testPath("a/b/file"), "foreign\n", .{});
+    try root.createSymbolicLink(try testPath("a/b/link"), "foreign-target");
+
+    try testing.expectError(
+        error.PathChanged,
+        file.observeAlloc(testing.allocator, 4096),
+    );
+    var target: [maximum_link_target_bytes]u8 = undefined;
+    try testing.expectError(error.PathChanged, link.observe(&target));
+    try testing.expectError(
+        error.PathChanged,
+        directory.observeAlloc(testing.allocator, 16, 4096),
+    );
+}
+
+const StableReadRace = struct {
+    root: Root,
+    path: Path,
+};
+
+fn changePinnedContent(context: *anyopaque) !void {
+    const race: *StableReadRace = @ptrCast(@alignCast(context));
+    try race.root.appendAt(race.path, 0, "foreign\n", true);
+}
+
+test "root_fs.test.stable pinned reads reject same-sized content races" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+    const path = try testPath("file");
+    try root.publishFile(path, "trusted\n", .{});
+    var pinned = try root.pinRegularFile(path);
+    defer pinned.close();
+    var race: StableReadRace = .{ .root = root, .path = path };
+    try testing.expectError(
+        error.PathChanged,
+        pinned.observeStableAllocWithHook(
+            testing.allocator,
+            4096,
+            .{ .context = &race, .function = changePinnedContent },
+        ),
+    );
+}
+
+test "root_fs.test.stable pinned reads own allocation failures" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+    const path = try testPath("file");
+    try root.publishFile(path, "content\n", .{});
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        stableReadUnderAllocationFailure,
+        .{ root, path },
+    );
+}
+
+fn stableReadUnderAllocationFailure(
+    allocator: std.mem.Allocator,
+    root: Root,
+    path: Path,
+) !void {
+    var pinned = try root.pinRegularFile(path);
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, 4096);
+    defer allocator.free(observed.bytes);
+    if (!std.mem.eql(u8, observed.bytes, "content\n"))
+        return error.TestUnexpectedResult;
 }
 
 test "root_fs.test.symbolic link publication is bounded and atomic" {

@@ -23,6 +23,14 @@ const archive_corpus = &.{
     @embedFile("corpus/archive/signed.deb"),
     @embedFile("corpus/archive/traversal.tar"),
 };
+/// `info/*.list` bytes drive the native ownership index: the canonical
+/// relative spelling, the sorted order, the exact-owner probe, and the
+/// bounded descendant scan all read them, and every one of them is reachable
+/// on a compromised root.
+const ownership_corpus = &.{
+    @embedFile("corpus/ownership/list"),
+    @embedFile("corpus/ownership/alias"),
+};
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
@@ -404,6 +412,19 @@ fn exerciseArchive(bytes: []const u8) !void {
     });
 }
 
+test "fuzz.native ownership index" {
+    try std.testing.fuzz({}, fuzzOwnership, .{ .corpus = ownership_corpus });
+}
+
+fn fuzzOwnership(_: void, smith: *std.testing.Smith) !void {
+    var storage: [max_input]u8 = undefined;
+    try exerciseOwnership(input(smith, &storage));
+}
+
+fn exerciseOwnership(bytes: []const u8) !void {
+    debz.native_unpack.fuzzOwnership(std.testing.allocator, bytes);
+}
+
 test "fuzz.lock provenance and transaction journals" {
     try std.testing.fuzz({}, fuzzState, .{ .corpus = state_corpus });
 }
@@ -547,6 +568,7 @@ test "fuzz.deterministic bounded mutation smoke" {
     try smokeCorpus(compression_corpus, exerciseCompression);
     try smokeCorpus(archive_corpus, exerciseArchive);
     try smokeCorpus(state_corpus, exerciseState);
+    try smokeCorpus(ownership_corpus, exerciseOwnership);
 }
 
 fn smokeCorpus(

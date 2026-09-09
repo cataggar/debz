@@ -336,6 +336,524 @@
       "operations": ["upgrade", "recover"],
       "features": ["crash-injection", "maintainer-script", "ambiguous-outcome"],
       "expected": "recovery-required"
+    },
+    {
+      "id": "unpack-data-only",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["regular-file", "directory", "symlink", "hardlink", "md5sums", "list"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-metadata-fidelity",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["mode", "ownership", "mtime", "setuid"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-file-deletion",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["obsolete-path", "removal", "list"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-directory-co-ownership",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["directory", "co-ownership", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-unowned-path",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "unowned", "overwrite"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-replaces-version-bound",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "replaces", "version-constraint"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-conflict-refused",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "conflict", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-multi-arch-shared",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["multi-arch", "ownership", "checksum"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-multi-arch-divergent",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["multi-arch", "ownership", "conflict"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-merged-usr",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["merged-usr", "alias", "symlink"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-merged-usr-foreign-link",
+      "initial": "corrupt",
+      "operations": ["install"],
+      "features": ["merged-usr", "alias", "escape"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-directory-to-symlink",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["directory", "symlink", "path-transition"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-prefix-transition-refused",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["directory", "path-transition", "conflict"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-case-alias",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["case-alias", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-conffile-handoff",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["conffile", "handoff", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-script-handoff",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["maintainer-script", "handoff", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-trigger-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["trigger", "handoff", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-diversion-handoff",
+      "initial": "corrupt",
+      "operations": ["install"],
+      "features": ["diversion", "statoverride", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-archive-tamper",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["archive", "binding", "tamper"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-generation-drift",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["database-generation", "evidence", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-configure-barrier-handoff",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["pre-depends", "handoff", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-displaced-ownership",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "replaces", "list"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-existing-directory-metadata",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["directory", "mode", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-installed-hardlink-group",
+      "initial": "healthy",
+      "operations": ["reinstall"],
+      "features": ["hardlink", "inode", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-removal-trigger-handoff",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["trigger", "removal", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-deferred-bound",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["conffile", "handoff", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-hardlink-group-metadata",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["hardlink", "inode", "metadata"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-shared-directory-metadata",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["directory", "ownership", "metadata"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-package-disappearance-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["replaces", "disappearance", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-control-metadata-handoff",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["metadata", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-hold-preserved",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["hold", "selection", "status"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-case-alias-refused",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["case-alias", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-multi-package-trigger-handoff",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["trigger", "handoff", "ownership"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-synthesized-ancestor-metadata",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["directory", "metadata", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-disappearance-directory-only",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["replaces", "disappearance", "directory"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-dpkg-interoperability-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["handoff", "recovery", "status"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-database-surface-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["handoff", "status", "metadata"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-multi-arch-sibling-pair",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["multi-arch", "ownership", "md5sums"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-shared-obsolete-removal",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["ownership", "removal", "directory"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-exclusive-name-saves-holder",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["replaces", "disappearance", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-replaces-directory-over-file",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["replaces", "directory", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-hardlink-metadata-order",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["hardlink", "metadata", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-canonical-database-publication",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["status", "metadata", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-displaced-conffile-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["conffile", "replaces", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-config-version-preserved",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["status", "selection", "metadata"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-selection-normalized",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["selection", "status"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-queued-trigger-handoff",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["trigger", "handoff", "recovery"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-directory-over-symlink-refused",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["directory", "refusal", "transition"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-nondirectory-over-directory-refused",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["directory", "refusal", "transition"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-internal-database-import",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["status", "integrity", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-config-files-conffile-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["conffile", "handoff", "status"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-installed-case-collision",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["case-alias", "ownership", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-multi-arch-interleaved",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["multi-arch", "ownership", "md5sums"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-held-selection-handoff",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["selection", "handoff", "status"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-folded-conffile-handoff",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["conffile", "case-alias", "handoff"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-unmodeled-trigger-child",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["trigger", "handoff", "status"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-file-to-directory-children",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["transition", "directory", "ownership"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-unplanned-ancestor-refused",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["transition", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-capture-budget",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["status", "refusal", "integrity"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-missing-owned-path-absent",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["ownership", "integrity", "status"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-removal-foreign-conffile",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["conffile", "ownership", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-config-files-install",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["conffile", "status", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-restricted-replaces",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-holder-keeps-own-file",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["ownership", "status", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-co-owned-directory-drop",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["ownership", "directory", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-required-directory-kept",
+      "initial": "healthy",
+      "operations": ["upgrade"],
+      "features": ["directory", "ownership", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-multi-arch-sibling-set",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-multi-arch-out-of-sync",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["ownership", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-planner-not-public",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["integrity", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-database-namespace-reserved",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["refusal", "integrity", "status"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-removal-handoff",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["status", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-purge-handoff",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["status", "refusal"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "unpack-planned-link-chain",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["hardlink", "integrity"],
+      "expected": "success"
+    },
+    {
+      "id": "unpack-native-selection-unavailable",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["integrity", "refusal"],
+      "expected": "failure-before-mutation"
     }
   ]
 }

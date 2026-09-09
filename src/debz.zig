@@ -249,6 +249,7 @@ pub const exact_lock = @import("exact_lock.zig");
 pub const exact_lock_v2 = @import("exact_lock_v2.zig");
 pub const native_authorization = @import("native_authorization.zig");
 pub const native_program = @import("native_program.zig");
+pub const native_unpack = @import("native_unpack.zig");
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
 pub const transaction_result_summary = @import("transaction_result_summary.zig");
@@ -427,6 +428,20 @@ pub const compileNativeTransactionProgram = native_program.compile;
 pub const decodeNativeTransactionProgram = native_program.decode;
 pub const validateNativeTransactionProgram = native_program.validateDocument;
 pub const NativeTransactionProgramStore = native_program.Store;
+pub const NativeUnpackPlan = native_unpack.Plan;
+pub const NativeUnpackResult = native_unpack.Result;
+pub const NativeUnpackPackagePlan = native_unpack.PackagePlan;
+pub const NativeUnpackFilesystemChange = native_unpack.FilesystemChange;
+pub const NativeUnpackOwnership = native_unpack.Ownership;
+pub const NativeUnpackOwnedEntry = native_unpack.OwnedEntry;
+pub const NativeUnpackHandoff = native_unpack.Handoff;
+pub const NativeUnpackDeferredFeature = native_unpack.DeferredFeature;
+pub const NativeUnpackDiagnostic = native_unpack.Diagnostic;
+pub const NativeUnpackDiagnosticCode = native_unpack.Code;
+pub const NativeUnpackInteroperability = native_unpack.Interoperability;
+pub const indexNativeUnpackOwnership = native_unpack.indexOwnership;
+pub const nativeUnpackRelativeListPath = native_unpack.relativeListPath;
+pub const digestNativeUnpackPlan = native_unpack.planDigest;
 pub const ExactClosureLock = exact_lock.Lock;
 pub const OwnedExactClosureLock = exact_lock.OwnedLock;
 pub const ExactClosureLockInput = exact_lock.Input;
@@ -548,6 +563,14 @@ test "empty solver context can be created and destroyed" {
     context.destroy();
 }
 
+test "native unpack exports no executable surface" {
+    try std.testing.expect(!@hasDecl(native_unpack, "plan"));
+    try std.testing.expect(!@hasDecl(native_unpack, "execute"));
+    try std.testing.expect(!@hasDecl(native_unpack, "recover"));
+    try std.testing.expect(!@hasDecl(native_unpack, "release"));
+    try std.testing.expect(!@hasDecl(native_unpack, "captureDatabase"));
+}
+
 test {
     _ = deb_payload;
     _ = archive_application;
@@ -581,6 +604,7 @@ test {
     _ = exact_lock_v2;
     _ = native_authorization;
     _ = native_program;
+    _ = native_unpack;
     _ = transaction_engine;
     _ = transaction_provenance;
     _ = transaction_provenance_v2;
