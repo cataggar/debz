@@ -10,6 +10,11 @@ pub const Purpose = enum {
     reservation,
     execution,
     recovery_review,
+    clean_reconciliation,
+};
+
+pub const Transition = enum {
+    recovery_review_to_clean_reconciliation,
 };
 
 pub const Input = struct {
@@ -22,6 +27,8 @@ pub const Input = struct {
     profile_reference_sha256: [32]u8,
     exact_lock_sha256: [32]u8,
     semantic_request_sha256: [32]u8,
+    transition: ?Transition = null,
+    prior_token_exact_identity_sha256: ?[32]u8 = null,
     prior_marker: ?root_operation.DeferredAcknowledgment = null,
     marker: root_operation.DeferredAcknowledgment,
 };
@@ -36,6 +43,8 @@ pub const Document = struct {
     profile_reference_sha256: [32]u8,
     exact_lock_sha256: [32]u8,
     semantic_request_sha256: [32]u8,
+    transition: ?Transition,
+    prior_token_exact_identity_sha256: ?[32]u8,
     prior_marker: ?root_operation.DeferredAcknowledgment,
     prior_marker_exact_identity_sha256: ?[32]u8,
     marker: root_operation.DeferredAcknowledgment,
@@ -93,6 +102,8 @@ pub fn create(
         .profile_reference_sha256 = input.profile_reference_sha256,
         .exact_lock_sha256 = input.exact_lock_sha256,
         .semantic_request_sha256 = input.semantic_request_sha256,
+        .transition = input.transition,
+        .prior_token_exact_identity_sha256 = input.prior_token_exact_identity_sha256,
         .prior_marker = input.prior_marker,
         .prior_marker_exact_identity_sha256 = if (input.prior_marker) |marker|
             root_operation.deferredAcknowledgmentExactIdentity(marker)
@@ -137,6 +148,8 @@ const Wire = struct {
     profile_reference_sha256: []const u8,
     exact_lock_sha256: []const u8,
     semantic_request_sha256: []const u8,
+    transition: ?Transition,
+    prior_token_exact_identity_sha256: ?[]const u8,
     prior_marker_exact_identity_sha256: ?[]const u8,
     prior_marker_canonical_hex: ?[]const u8,
     marker_exact_identity_sha256: []const u8,
@@ -202,6 +215,10 @@ pub fn decode(
         .profile_reference_sha256 = try parseHex(wire.profile_reference_sha256),
         .exact_lock_sha256 = try parseHex(wire.exact_lock_sha256),
         .semantic_request_sha256 = try parseHex(wire.semantic_request_sha256),
+        .transition = wire.transition,
+        .prior_token_exact_identity_sha256 = try parseOptionalHex(
+            wire.prior_token_exact_identity_sha256,
+        ),
         .prior_marker = prior_marker,
         .prior_marker_exact_identity_sha256 = try parseOptionalHex(
             wire.prior_marker_exact_identity_sha256,
@@ -249,6 +266,130 @@ pub fn matchesPriorMarker(
     );
 }
 
+pub fn exactIdentity(document: Document) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-apt-system-lower-ownership-token-exact-v1\x00");
+    hash.update(&document.digest_sha256);
+    return hash.finalResult();
+}
+
+pub fn exactEqual(left: Document, right: Document) bool {
+    return left.purpose == right.purpose and
+        std.mem.eql(u8, &left.outer_attempt_id, &right.outer_attempt_id) and
+        left.outer_generation == right.outer_generation and
+        std.mem.eql(
+            u8,
+            &left.outer_state_sha256,
+            &right.outer_state_sha256,
+        ) and
+        std.mem.eql(u8, &left.request_sha256, &right.request_sha256) and
+        std.mem.eql(u8, &left.profile_sha256, &right.profile_sha256) and
+        std.mem.eql(
+            u8,
+            &left.profile_reference_sha256,
+            &right.profile_reference_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.exact_lock_sha256,
+            &right.exact_lock_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.semantic_request_sha256,
+            &right.semantic_request_sha256,
+        ) and left.transition == right.transition and optionalDigestEqual(
+        left.prior_token_exact_identity_sha256,
+        right.prior_token_exact_identity_sha256,
+    ) and optionalMarkerEqual(left.prior_marker, right.prior_marker) and
+        optionalDigestEqual(
+            left.prior_marker_exact_identity_sha256,
+            right.prior_marker_exact_identity_sha256,
+        ) and root_operation.deferredAcknowledgmentExactEqual(
+        left.marker,
+        right.marker,
+    ) and std.mem.eql(
+        u8,
+        &left.marker_exact_identity_sha256,
+        &right.marker_exact_identity_sha256,
+    ) and std.mem.eql(
+        u8,
+        &left.digest_sha256,
+        &right.digest_sha256,
+    );
+}
+
+pub fn sameOperationBinding(left: Document, right: Document) bool {
+    return std.mem.eql(
+        u8,
+        &left.outer_attempt_id,
+        &right.outer_attempt_id,
+    ) and std.mem.eql(
+        u8,
+        &left.request_sha256,
+        &right.request_sha256,
+    ) and std.mem.eql(
+        u8,
+        &left.profile_sha256,
+        &right.profile_sha256,
+    ) and std.mem.eql(
+        u8,
+        &left.profile_reference_sha256,
+        &right.profile_reference_sha256,
+    ) and std.mem.eql(
+        u8,
+        &left.exact_lock_sha256,
+        &right.exact_lock_sha256,
+    ) and std.mem.eql(
+        u8,
+        &left.semantic_request_sha256,
+        &right.semantic_request_sha256,
+    );
+}
+
+pub fn legalPurposeTransition(from: Purpose, to: Purpose) bool {
+    return switch (from) {
+        .reservation => to == .reservation or
+            to == .execution or
+            to == .recovery_review,
+        .execution => to == .execution or to == .recovery_review,
+        .recovery_review => to == .execution or to == .recovery_review,
+        .clean_reconciliation => false,
+    };
+}
+
+pub fn legalAtomicTransition(
+    expected: Document,
+    replacement: Document,
+) bool {
+    return expected.purpose == .recovery_review and
+        replacement.purpose == .clean_reconciliation and
+        replacement.transition ==
+            .recovery_review_to_clean_reconciliation and
+        replacement.prior_marker == null and
+        replacement.prior_marker_exact_identity_sha256 == null and
+        optionalDigestEqual(
+            replacement.prior_token_exact_identity_sha256,
+            exactIdentity(expected),
+        ) and sameOperationBinding(expected, replacement) and
+        replacement.outer_generation >= expected.outer_generation and
+        replacement.marker.document_version ==
+            root_operation.deferred_ack_v2_schema_version and
+        replacement.marker.state == .released and
+        std.mem.eql(
+            u8,
+            &replacement.marker.acknowledgment_id,
+            &expected.outer_attempt_id,
+        ) and optionalDigestEqual(
+        replacement.marker.recovery_review_claim_sha256,
+        expected.marker.recovery_review_claim_sha256,
+    ) and optionalDigestEqual(
+        replacement.marker.recovery_review_claim_exact_identity_sha256,
+        expected.marker.recovery_review_claim_exact_identity_sha256,
+    ) and expected.marker.recovery_review_claim_sha256 != null and
+        expected.marker.recovery_review_claim_exact_identity_sha256 != null;
+}
+
 fn validate(
     document: Document,
     allocator: std.mem.Allocator,
@@ -256,6 +397,14 @@ fn validate(
     if (document.outer_generation == 0 or
         document.marker.document_version !=
             root_operation.deferred_ack_v2_schema_version or
+        ((document.purpose == .clean_reconciliation) !=
+            (document.transition ==
+                .recovery_review_to_clean_reconciliation)) or
+        ((document.purpose == .clean_reconciliation) !=
+            (document.prior_token_exact_identity_sha256 != null)) or
+        (document.purpose == .clean_reconciliation and
+            (document.prior_marker != null or
+                document.prior_marker_exact_identity_sha256 != null)) or
         (document.prior_marker == null) !=
             (document.prior_marker_exact_identity_sha256 == null) or
         !std.mem.eql(
@@ -327,6 +476,19 @@ fn writePayload(
     try writeHex(writer, &document.exact_lock_sha256);
     try writer.writeAll(",\"semantic_request_sha256\":");
     try writeHex(writer, &document.semantic_request_sha256);
+    try writer.writeAll(",\"transition\":");
+    if (document.transition) |transition| {
+        try writer.writeByte('"');
+        try writer.writeAll(@tagName(transition));
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"prior_token_exact_identity_sha256\":");
+    if (document.prior_token_exact_identity_sha256) |identity|
+        try writeHex(writer, &identity)
+    else
+        try writer.writeAll("null");
     try writer.writeAll(",\"prior_marker_exact_identity_sha256\":");
     if (document.prior_marker_exact_identity_sha256) |identity|
         try writeHex(writer, &identity)
@@ -373,6 +535,25 @@ fn parseOptionalHex(source: ?[]const u8) !?[32]u8 {
     return if (source) |value| try parseHex(value) else null;
 }
 
+fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+    if ((left == null) != (right == null)) return false;
+    return if (left) |value|
+        std.mem.eql(u8, &value, &right.?)
+    else
+        true;
+}
+
+fn optionalMarkerEqual(
+    left: ?root_operation.DeferredAcknowledgment,
+    right: ?root_operation.DeferredAcknowledgment,
+) bool {
+    if ((left == null) != (right == null)) return false;
+    return if (left) |marker|
+        root_operation.deferredAcknowledgmentExactEqual(marker, right.?)
+    else
+        true;
+}
+
 test "apt_system_lower_ownership_token.test.canonical exact marker token rejects tampering" {
     const marker = try root_operation.createDeferredAcknowledgment(.{
         .document_version = root_operation.deferred_ack_v2_schema_version,
@@ -405,4 +586,76 @@ test "apt_system_lower_ownership_token.test.canonical exact marker token rejects
         error.DigestMismatch,
         decode(std.testing.allocator, tampered),
     );
+}
+
+test "apt_system_lower_ownership_token.test.clean reconciliation transition binds exact prior token" {
+    const base = try root_operation.createDeferredAcknowledgment(.{
+        .document_version = root_operation.deferred_ack_v2_schema_version,
+        .state = .bound,
+        .attempt_id = @splat(0x21),
+        .acknowledgment_id = @splat(0x22),
+    });
+    const claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = base.acknowledgment_id,
+        .outer_generation = 4,
+        .outer_state_sha256 = @splat(0x23),
+        .profile_sha256 = @splat(0x25),
+        .profile_reference_sha256 = @splat(0x26),
+        .exact_lock_sha256 = @splat(0x27),
+        .semantic_request_sha256 = @splat(0x28),
+        .mutation_status = .changed,
+        .nonce = @splat(0x20),
+    });
+    const review_marker =
+        try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            base,
+            claim,
+        );
+    const review = try create(std.testing.allocator, .{
+        .purpose = .recovery_review,
+        .outer_attempt_id = review_marker.acknowledgment_id,
+        .outer_generation = 4,
+        .outer_state_sha256 = @splat(0x23),
+        .request_sha256 = @splat(0x24),
+        .profile_sha256 = @splat(0x25),
+        .profile_reference_sha256 = @splat(0x26),
+        .exact_lock_sha256 = @splat(0x27),
+        .semantic_request_sha256 = @splat(0x28),
+        .marker = review_marker,
+    });
+    const reconciliation_marker =
+        try root_operation.transitionDeferredAcknowledgment(
+            review_marker,
+            .released,
+        );
+    const replacement = try create(std.testing.allocator, .{
+        .purpose = .clean_reconciliation,
+        .outer_attempt_id = review.outer_attempt_id,
+        .outer_generation = 5,
+        .outer_state_sha256 = @splat(0x29),
+        .request_sha256 = review.request_sha256,
+        .profile_sha256 = review.profile_sha256,
+        .profile_reference_sha256 = review.profile_reference_sha256,
+        .exact_lock_sha256 = review.exact_lock_sha256,
+        .semantic_request_sha256 = review.semantic_request_sha256,
+        .transition = .recovery_review_to_clean_reconciliation,
+        .prior_token_exact_identity_sha256 = exactIdentity(review),
+        .marker = reconciliation_marker,
+    });
+    try std.testing.expect(legalAtomicTransition(review, replacement));
+    var foreign = review;
+    foreign.outer_state_sha256 = @splat(0x2a);
+    foreign = try create(std.testing.allocator, .{
+        .purpose = foreign.purpose,
+        .outer_attempt_id = foreign.outer_attempt_id,
+        .outer_generation = foreign.outer_generation,
+        .outer_state_sha256 = foreign.outer_state_sha256,
+        .request_sha256 = foreign.request_sha256,
+        .profile_sha256 = foreign.profile_sha256,
+        .profile_reference_sha256 = foreign.profile_reference_sha256,
+        .exact_lock_sha256 = foreign.exact_lock_sha256,
+        .semantic_request_sha256 = foreign.semantic_request_sha256,
+        .marker = foreign.marker,
+    });
+    try std.testing.expect(!legalAtomicTransition(foreign, replacement));
 }

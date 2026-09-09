@@ -160,6 +160,16 @@ the child runs. Token replacement accepts only an exact predecessor,
 collision-resistant review-owner continuation, or the operation-local exact
 workflow acknowledgment; a foreign marker with the same legacy digest cannot
 advance the token.
+When post-mutation outer evidence proves a clean lower root, recovery rotates
+the retained `recovery_review` token to a `clean_reconciliation` token with an
+operation-local compare-and-replace under the operation lock. The replacement
+binds the complete exact identity of the preparation token and the same outer
+attempt, request, profile, profile reference, exact lock, semantic request, and
+review owner. It is staged and file-synced before same-directory rename and
+operation-directory fsync. A crash before rename leaves the review token; a
+crash after rename leaves the reconciliation token. Restart accepts either
+exact state and never derives replacement authority from a missing, corrupt,
+or foreign token.
 Restart cleanup uses the retained operation-local acknowledgment or a fully
 reconstructed reviewed owner; if that evidence is absent, cleanup fails closed
 without changing the record or marker.
