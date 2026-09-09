@@ -22,6 +22,8 @@ and arm64, separate from the adapter and orchestration unit tests. Run it as
 root with Linux mount, PID, and network namespace support, Python 3 with
 `cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, GNU tar, shell,
 ldconfig, start-stop-daemon, rm, and diff available.
+CI invokes the same acceptance script with the preceding build's ReleaseSafe
+executable rather than compiling it again in a separate privileged cache.
 
 The check invokes the built `debz` executable and real dpkg in a disposable
 chroot under the repository's `.zig-cache`, using an authenticated fixture

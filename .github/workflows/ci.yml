@@ -577,17 +577,14 @@ jobs:
           zig build -Doptimize=ReleaseSafe
           zig build -Doptimize=ReleaseSafe test
           zig build -Doptimize=ReleaseSafe fuzz
-          zig build run -- --help
+          zig build -Doptimize=ReleaseSafe run -- --help
       - name: Run required real apt facade acceptance
         run: |
           sudo env \
             PATH="$PATH" \
             TMPDIR="$PWD/.zig-cache" \
             PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \
-            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache-apt-acceptance" \
-            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache-apt-acceptance" \
-            "$(command -v zig)" build test-apt-system-acceptance \
-              -Doptimize=ReleaseSafe --summary all
+            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz
       - name: Run required privileged orchestration crash suite
         run: |
           sudo rm -rf /run/debz
