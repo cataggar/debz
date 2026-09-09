@@ -615,6 +615,39 @@ pub fn recoveryReviewClaimExactEqual(
         std.mem.eql(u8, &left.digest_sha256, &right.digest_sha256);
 }
 
+pub fn recoveryReviewTransferredOwnerIdentityMatches(
+    marker: DeferredAcknowledgment,
+    claim: RecoveryReviewClaim,
+) bool {
+    return validRecoveryReviewClaim(claim) and
+        std.mem.eql(
+            u8,
+            &claim.digest_sha256,
+            &recoveryReviewClaimDigest(claim),
+        ) and
+        validDeferredAcknowledgment(marker) and
+        std.mem.eql(
+            u8,
+            &marker.digest_sha256,
+            &deferredAcknowledgmentDigest(marker),
+        ) and
+        marker.document_version == deferred_ack_v2_schema_version and
+        std.mem.eql(
+            u8,
+            &marker.acknowledgment_id,
+            &claim.outer_attempt_id,
+        ) and marker.recovery_review_claim_sha256 != null and
+        std.mem.eql(
+            u8,
+            &marker.recovery_review_claim_sha256.?,
+            &claim.digest_sha256,
+        ) and marker.recovery_review_binding_sha256 != null and
+        exactOptionalDigestEqual(
+            marker.recovery_review_binding_sha256,
+            recoveryReviewBindingDigest(marker),
+        );
+}
+
 fn optionalPreMutationClaimEqual(
     left: ?PreMutationReconciliationClaimBinding,
     right: ?PreMutationReconciliationClaimBinding,
@@ -1730,17 +1763,13 @@ pub const Store = struct {
         claim: RecoveryReviewClaim,
     ) !void {
         if (try self.readRecoveryReviewClaim(allocator)) |existing| {
-            if (std.mem.eql(
-                u8,
-                &existing.digest_sha256,
-                &claim.digest_sha256,
-            )) return;
+            if (recoveryReviewClaimExactEqual(existing, claim)) return;
             return error.RecoveryReviewClaimPresent;
         }
         const marker = try self.readDeferredAcknowledgment(allocator);
-        if (!optionalDigestEqual(
-            claim.marker_sha256,
-            if (marker) |value| value.digest_sha256 else null,
+        if (!optionalDeferredAcknowledgmentEqual(
+            claim.prior_marker,
+            marker,
         )) return error.DeferredAcknowledgmentMismatch;
         const bytes = try claim.canonicalJson(allocator);
         defer allocator.free(bytes);
@@ -1761,14 +1790,13 @@ pub const Store = struct {
     pub fn clearRecoveryReviewClaim(
         self: Store,
         allocator: std.mem.Allocator,
-        expected_digest: [32]u8,
+        expected_claim: RecoveryReviewClaim,
     ) !void {
         const observed = try self.readRecoveryReviewClaim(allocator) orelse
             return;
-        if (!std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &expected_digest,
+        if (!recoveryReviewClaimExactEqual(
+            observed,
+            expected_claim,
         )) return error.RecoveryReviewClaimMismatch;
         if (observed.prior_marker) |marker| {
             const bytes = try marker.canonicalJson(allocator);
@@ -1818,8 +1846,7 @@ pub const Store = struct {
     };
 
     pub const RecoveryReviewExchange = struct {
-        claim_sha256: [32]u8,
-        outer_attempt_id: [32]u8,
+        expected_claim: RecoveryReviewClaim,
         expected_marker_sha256: ?[32]u8,
         expected_record_sha256: ?[32]u8,
         replacement_marker: ?DeferredAcknowledgment = null,
@@ -1845,27 +1872,31 @@ pub const Store = struct {
             const transferred = try self.readDeferredAcknowledgment(
                 allocator,
             ) orelse return error.RecoveryReviewClaimMissing;
+            var expected_transferred = exchange.replacement_marker orelse
+                exchange.expected_claim.prior_marker orelse
+                return error.RecoveryReviewClaimMissing;
             if (!std.mem.eql(
                 u8,
-                &transferred.acknowledgment_id,
-                &exchange.outer_attempt_id,
-            ) or transferred.recovery_review_claim_sha256 == null or
-                !std.mem.eql(
-                    u8,
-                    &transferred.recovery_review_claim_sha256.?,
-                    &exchange.claim_sha256,
-                ))
-                return error.RecoveryReviewClaimMissing;
+                &expected_transferred.acknowledgment_id,
+                &exchange.expected_claim.outer_attempt_id,
+            )) return error.RecoveryReviewClaimMissing;
+            expected_transferred.document_version =
+                deferred_ack_v2_schema_version;
+            expected_transferred.recovery_review_claim_sha256 =
+                exchange.expected_claim.digest_sha256;
+            expected_transferred.digest_sha256 =
+                deferredAcknowledgmentDigest(expected_transferred);
+            expected_transferred.recovery_review_binding_sha256 =
+                recoveryReviewBindingDigest(expected_transferred);
+            if (!deferredAcknowledgmentExactEqual(
+                transferred,
+                expected_transferred,
+            )) return error.RecoveryReviewClaimMissing;
             return;
         };
-        if (!std.mem.eql(
-            u8,
-            &claim.digest_sha256,
-            &exchange.claim_sha256,
-        ) or !std.mem.eql(
-            u8,
-            &claim.outer_attempt_id,
-            &exchange.outer_attempt_id,
+        if (!recoveryReviewClaimExactEqual(
+            claim,
+            exchange.expected_claim,
         )) return error.RecoveryReviewClaimMismatch;
 
         const marker = claim.prior_marker;
@@ -1885,7 +1916,7 @@ pub const Store = struct {
         if (!std.mem.eql(
             u8,
             &replacement.acknowledgment_id,
-            &exchange.outer_attempt_id,
+            &claim.outer_attempt_id,
         )) return error.InvalidDocument;
         replacement.document_version = deferred_ack_v2_schema_version;
         replacement.recovery_review_claim_sha256 = claim.digest_sha256;
@@ -2493,7 +2524,7 @@ pub const Request = struct {
     orchestration_id: ?[32]u8 = null,
     /// Exact durable recovery review claim consumed under the root lock before
     /// a confirmed recovery may adopt or create lower ownership.
-    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim: ?RecoveryReviewClaim = null,
     acquisition_observer: ?AcquisitionObserver = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
@@ -2682,20 +2713,19 @@ pub const Coordinator = struct {
                 else => return error.RecordCorrupt,
             };
         if (recovery_review) |review| {
-            const expected = request.recovery_review_claim_sha256 orelse
+            const expected = request.recovery_review_claim orelse
                 return error.RecoveryRequired;
             const orchestration_id = request.orchestration_id orelse
                 return error.RecoveryRequired;
-            if (!std.mem.eql(
-                u8,
-                &review.digest_sha256,
-                &expected,
+            if (!recoveryReviewClaimExactEqual(
+                review,
+                expected,
             ) or !std.mem.eql(
                 u8,
                 &review.outer_attempt_id,
                 &orchestration_id,
             )) return error.RecoveryRequired;
-        } else if (request.recovery_review_claim_sha256 != null) {
+        } else if (request.recovery_review_claim != null) {
             return error.RecoveryRequired;
         }
         var cleanup_forwarder: AcquisitionCleanupForwarder = undefined;
@@ -2733,8 +2763,7 @@ pub const Coordinator = struct {
                 store_handle.exchangeRecoveryReviewClaimForOwnership(
                     allocator,
                     .{
-                        .claim_sha256 = review.digest_sha256,
-                        .outer_attempt_id = review.outer_attempt_id,
+                        .expected_claim = review,
                         .expected_marker_sha256 = review.marker_sha256,
                         .expected_record_sha256 = review.record_sha256,
                     },
@@ -2933,7 +2962,7 @@ pub const Coordinator = struct {
             // healthy root cannot strand it.
             var publish_request = request;
             if (recovery_review == null)
-                publish_request.recovery_review_claim_sha256 = null;
+                publish_request.recovery_review_claim = null;
             const created = try self.publishNew(allocator, publish_request, reclaimed orelse 1, .{
                 .state = .preflight,
                 .phase = .preflight,
@@ -3000,7 +3029,7 @@ pub const Coordinator = struct {
         }
         var publish_request = request;
         if (recovery_review == null)
-            publish_request.recovery_review_claim_sha256 = null;
+            publish_request.recovery_review_claim = null;
         const created = try self.publishNew(allocator, publish_request, generation, .{
             .state = .reserved,
             .phase = .reserved,
@@ -3062,12 +3091,11 @@ pub const Coordinator = struct {
             if (request.acquisition_observer) |observer|
                 observer.hit(.before_binding_published) catch
                     return error.StoreFailed;
-            if (request.recovery_review_claim_sha256) |claim_sha256|
+            if (request.recovery_review_claim) |claim|
                 store_handle.exchangeRecoveryReviewClaimForOwnership(
                     allocator,
                     .{
-                        .claim_sha256 = claim_sha256,
-                        .outer_attempt_id = orchestration_id,
+                        .expected_claim = claim,
                         .expected_marker_sha256 = null,
                         .expected_record_sha256 = null,
                         .replacement_marker = binding,
@@ -4125,8 +4153,7 @@ test "root_operation.test.recovery review exchange survives every durable public
             store.exchangeRecoveryReviewClaimForOwnership(
                 testing.allocator,
                 .{
-                    .claim_sha256 = claim.digest_sha256,
-                    .outer_attempt_id = claim.outer_attempt_id,
+                    .expected_claim = claim,
                     .expected_marker_sha256 = null,
                     .expected_record_sha256 = null,
                     .replacement_marker = replacement,
@@ -4160,8 +4187,7 @@ test "root_operation.test.recovery review exchange survives every durable public
         try reopened.exchangeRecoveryReviewClaimForOwnership(
             testing.allocator,
             .{
-                .claim_sha256 = claim.digest_sha256,
-                .outer_attempt_id = claim.outer_attempt_id,
+                .expected_claim = claim,
                 .expected_marker_sha256 = null,
                 .expected_record_sha256 = null,
                 .replacement_marker = replacement,
@@ -4227,7 +4253,21 @@ test "root_operation.test.recovery review cancellation restores the exact prior 
         error.RecoveryReviewClaimMismatch,
         store.clearRecoveryReviewClaim(
             testing.allocator,
-            @splat(0xff),
+            try createRecoveryReviewClaim(.{
+                .outer_attempt_id = claim.outer_attempt_id,
+                .outer_generation = claim.outer_generation,
+                .outer_state_sha256 = claim.outer_state_sha256,
+                .profile_sha256 = claim.profile_sha256,
+                .profile_reference_sha256 = claim.profile_reference_sha256,
+                .exact_lock_sha256 = claim.exact_lock_sha256,
+                .semantic_request_sha256 = claim.semantic_request_sha256,
+                .mutation_status = claim.mutation_status,
+                .nonce = @splat(0xff),
+                .marker_sha256 = claim.marker_sha256,
+                .prior_marker = claim.prior_marker,
+                .record_sha256 = claim.record_sha256,
+                .completion_sha256 = claim.completion_sha256,
+            }),
         ),
     );
     try testing.expect(
@@ -4235,7 +4275,7 @@ test "root_operation.test.recovery review cancellation restores the exact prior 
     );
     try store.clearRecoveryReviewClaim(
         testing.allocator,
-        claim.digest_sha256,
+        claim,
     );
     try testing.expect(
         (try store.readRecoveryReviewClaim(testing.allocator)) == null,
@@ -4296,50 +4336,120 @@ test "root_operation.test.deferred acknowledgment v2 is canonical bounded and ta
     );
 }
 
-test "root_operation.test.deferred acknowledgment exact identity rejects same-digest field mismatch" {
-    const v1 = try createDeferredAcknowledgment(.{
-        .state = .pending,
-        .attempt_id = @splat(0xe1),
-        .completion_sha256 = @splat(0xe2),
-        .provenance_sha256 = @splat(0xe3),
-        .acknowledgment_id = @splat(0xe4),
-    });
-    try testing.expect(deferredAcknowledgmentExactEqual(v1, v1));
-    var v1_mismatch = v1;
-    v1_mismatch.acknowledgment_id[0] ^= 0xff;
-    try testing.expectEqualSlices(
-        u8,
-        &v1.digest_sha256,
-        &v1_mismatch.digest_sha256,
-    );
-    try testing.expect(!deferredAcknowledgmentExactEqual(
-        v1,
-        v1_mismatch,
-    ));
-
-    const v2 = try createDeferredAcknowledgment(.{
+test "root_operation.test.valid v2 legacy digest collision cannot replace exact review identity" {
+    const prior_a = try createDeferredAcknowledgment(.{
         .state = .released,
-        .attempt_id = @splat(0xe5),
-        .acknowledgment_id = @splat(0xe6),
-        .recovery_review_claim_sha256 = @splat(0xe7),
+        .attempt_id = @splat(0xe1),
+        .acknowledgment_id = @splat(0xe2),
+        .recovery_review_claim_sha256 = @splat(0xe3),
     });
-    try testing.expect(deferredAcknowledgmentExactEqual(v2, v2));
-    var v2_claim_mismatch = v2;
-    v2_claim_mismatch.recovery_review_claim_sha256.?[0] ^= 0xff;
+    const prior_b = try createDeferredAcknowledgment(.{
+        .state = prior_a.state,
+        .attempt_id = prior_a.attempt_id,
+        .acknowledgment_id = prior_a.acknowledgment_id,
+        .recovery_review_claim_sha256 = @splat(0xe4),
+    });
     try testing.expectEqualSlices(
         u8,
-        &v2.digest_sha256,
-        &v2_claim_mismatch.digest_sha256,
+        &prior_a.digest_sha256,
+        &prior_b.digest_sha256,
     );
-    try testing.expect(!deferredAcknowledgmentExactEqual(
-        v2,
-        v2_claim_mismatch,
+    try testing.expect(!std.mem.eql(
+        u8,
+        &prior_a.recovery_review_binding_sha256.?,
+        &prior_b.recovery_review_binding_sha256.?,
     ));
-    var v2_binding_mismatch = v2;
-    v2_binding_mismatch.recovery_review_binding_sha256.?[0] ^= 0xff;
-    try testing.expect(!deferredAcknowledgmentExactEqual(
-        v2,
-        v2_binding_mismatch,
+    try testing.expect(!deferredAcknowledgmentExactEqual(prior_a, prior_b));
+    const claim_a = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(0xe5),
+        .outer_generation = 14,
+        .outer_state_sha256 = @splat(0xe6),
+        .profile_sha256 = @splat(0xe7),
+        .profile_reference_sha256 = @splat(0xe8),
+        .exact_lock_sha256 = @splat(0xe9),
+        .semantic_request_sha256 = @splat(0xea),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xeb),
+        .marker_sha256 = prior_a.digest_sha256,
+        .prior_marker = prior_a,
+    });
+    const claim_b = try createRecoveryReviewClaim(.{
+        .outer_attempt_id = claim_a.outer_attempt_id,
+        .outer_generation = claim_a.outer_generation,
+        .outer_state_sha256 = claim_a.outer_state_sha256,
+        .profile_sha256 = claim_a.profile_sha256,
+        .profile_reference_sha256 = claim_a.profile_reference_sha256,
+        .exact_lock_sha256 = claim_a.exact_lock_sha256,
+        .semantic_request_sha256 = claim_a.semantic_request_sha256,
+        .mutation_status = claim_a.mutation_status,
+        .nonce = claim_a.nonce,
+        .marker_sha256 = prior_b.digest_sha256,
+        .prior_marker = prior_b,
+    });
+    try testing.expectEqualSlices(
+        u8,
+        &claim_a.digest_sha256,
+        &claim_b.digest_sha256,
+    );
+    try testing.expect(!recoveryReviewClaimExactEqual(claim_a, claim_b));
+    const prior_a_bytes = try prior_a.canonicalJson(testing.allocator);
+    defer testing.allocator.free(prior_a_bytes);
+    const prior_b_bytes = try prior_b.canonicalJson(testing.allocator);
+    defer testing.allocator.free(prior_b_bytes);
+    _ = try decodeDeferredAcknowledgment(testing.allocator, prior_a_bytes);
+    _ = try decodeDeferredAcknowledgment(testing.allocator, prior_b_bytes);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const store = Store.init(.init(testing.io, tmp.dir));
+    try store.ensureNamespace();
+    try store.publishDeferredAcknowledgment(testing.allocator, prior_a);
+    try store.publishRecoveryReviewClaim(testing.allocator, claim_a);
+    try testing.expectError(
+        error.RecoveryReviewClaimPresent,
+        store.publishRecoveryReviewClaim(testing.allocator, claim_b),
+    );
+    const replacement = try createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0xec),
+        .acknowledgment_id = claim_a.outer_attempt_id,
+    });
+    try testing.expectError(
+        error.RecoveryReviewClaimMismatch,
+        store.exchangeRecoveryReviewClaimForOwnership(
+            testing.allocator,
+            .{
+                .expected_claim = claim_b,
+                .expected_marker_sha256 = claim_b.marker_sha256,
+                .expected_record_sha256 = null,
+                .replacement_marker = replacement,
+            },
+        ),
+    );
+    try testing.expect(recoveryReviewClaimExactEqual(
+        claim_a,
+        (try store.readRecoveryReviewClaim(testing.allocator)).?,
+    ));
+    try store.clearRecoveryReviewClaim(testing.allocator, claim_a);
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        prior_a,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
+    try store.clearDeferredAcknowledgment(
+        testing.allocator,
+        prior_a.digest_sha256,
+    );
+    try store.publishDeferredAcknowledgment(testing.allocator, prior_b);
+    try testing.expectError(
+        error.DeferredAcknowledgmentMismatch,
+        store.publishRecoveryReviewClaim(testing.allocator, claim_a),
+    );
+    try testing.expect(
+        (try store.readRecoveryReviewClaim(testing.allocator)) == null,
+    );
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        prior_b,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
     ));
 }
 

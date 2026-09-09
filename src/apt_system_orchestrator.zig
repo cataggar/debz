@@ -314,7 +314,7 @@ pub const WorkflowRequest = struct {
     options: product_api.CommonOptions,
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
-    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
     reconciliation_claim: ?ReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?OwnershipAcknowledgment = null,
@@ -402,7 +402,7 @@ pub const ProductionBackend = struct {
             .options = request.options,
             .defer_recovery_clear = request.defer_recovery_clear,
             .orchestration_id = request.orchestration_id,
-            .recovery_review_claim_sha256 = request.recovery_review_claim_sha256,
+            .recovery_review_claim = request.recovery_review_claim,
             .reconciliation_claim = request.reconciliation_claim,
             .finalize_ownership = request.finalize_ownership,
             .ownership_acknowledgment = request.ownership_acknowledgment,
@@ -1487,7 +1487,7 @@ pub const PrivateLiveRootRunner = struct {
                     )) break :release 23;
                 store.clearRecoveryReviewClaim(
                     std.heap.page_allocator,
-                    claim.digest_sha256,
+                    claim,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => break :release 23,
@@ -1509,16 +1509,26 @@ pub const PrivateLiveRootRunner = struct {
                     )) break :settle 26;
                     try store.clearRecoveryReviewClaim(
                         std.heap.page_allocator,
-                        claim.digest_sha256,
+                        claim,
                     );
                     break :settle 24;
                 }
                 const marker = try store.readDeferredAcknowledgment(
                     std.heap.page_allocator,
                 );
+                var record = try store.read(std.heap.page_allocator);
+                defer if (record) |*owned| owned.deinit();
+                const completion_store: root_operation_completion.Store =
+                    .init(store.root);
+                var completion = try completion_store.read(
+                    std.heap.page_allocator,
+                );
+                defer if (completion) |*owned| owned.deinit();
                 break :settle switch (classifySettledRecoveryReviewMarker(
                     claim,
                     marker,
+                    if (record) |owned| owned.record else null,
+                    if (completion) |owned| owned.document else null,
                 )) {
                     .released => 24,
                     .transferred_owner => 25,
@@ -1531,6 +1541,8 @@ pub const PrivateLiveRootRunner = struct {
     fn classifySettledRecoveryReviewMarker(
         claim: root_operation.RecoveryReviewClaim,
         marker: ?root_operation.DeferredAcknowledgment,
+        record: ?root_operation.Record,
+        completion: ?root_operation_completion.Document,
     ) RecoveryReviewDisposition {
         const value = marker orelse return if (claim.prior_marker == null)
             .released
@@ -1541,13 +1553,78 @@ pub const PrivateLiveRootRunner = struct {
                 value,
                 prior,
             )) return .released;
-        if (value.recovery_review_claim_sha256) |claim_sha256|
-            if (std.mem.eql(
-                u8,
-                &claim_sha256,
-                &claim.digest_sha256,
-            )) return .transferred_owner;
+        if (transferredRecoveryReviewOwnerMatches(
+            claim,
+            value,
+            record,
+            completion,
+        )) return .transferred_owner;
         return .unresolved;
+    }
+
+    fn transferredRecoveryReviewOwnerMatches(
+        claim: root_operation.RecoveryReviewClaim,
+        marker: root_operation.DeferredAcknowledgment,
+        record: ?root_operation.Record,
+        completion: ?root_operation_completion.Document,
+    ) bool {
+        if (!root_operation.recoveryReviewTransferredOwnerIdentityMatches(
+            marker,
+            claim,
+        )) return false;
+        const compatibility = root_operation.deferredRecordCompatibility(
+            record,
+            marker,
+            false,
+        );
+        return switch (compatibility) {
+            .pre_mutation_reconciliation_claim,
+            .bound_pre_mutation,
+            .bound_ambiguous,
+            .bound_mutating,
+            .bound_completed_pending,
+            .bound_completed_abandoned,
+            .abandoned_pre_mutation,
+            .released_without_record,
+            .abandoned_without_record,
+            => completion == null,
+            .bound_completed_success,
+            .released_completed,
+            => if (record) |active|
+                if (completion) |document|
+                    document.bindsRecord(active) and
+                        settledRecoveryProvenanceMatches(active, document)
+                else
+                    false
+            else
+                false,
+            .pending_published,
+            .acknowledged_published,
+            => if (record) |active|
+                if (completion) |document|
+                    marker.completion_sha256 != null and
+                        marker.provenance_sha256 != null and
+                        active.provenance_sha256 != null and
+                        std.mem.eql(
+                            u8,
+                            &marker.completion_sha256.?,
+                            &document.digest_sha256,
+                        ) and
+                        std.mem.eql(
+                            u8,
+                            &marker.provenance_sha256.?,
+                            &active.provenance_sha256.?,
+                        ) and
+                        document.bindsRecord(active) and
+                        settledRecoveryProvenanceMatches(active, document)
+                else
+                    false
+            else
+                false,
+            .pending_prepublication,
+            .incompatible,
+            => false,
+        };
     }
 
     fn prepareRecoveryReviewChild(
@@ -1565,10 +1642,9 @@ pub const PrivateLiveRootRunner = struct {
             if (recoveryReviewBaseMatches(existing, input) and
                 (try recoveryReviewEvidenceMatches(store, existing)))
             {
-                if (!std.mem.eql(
-                    u8,
-                    &existing.digest_sha256,
-                    &input.expected_claim.digest_sha256,
+                if (!root_operation.recoveryReviewClaimExactEqual(
+                    existing,
+                    input.expected_claim,
                 )) return 20;
                 const bytes = try existing.canonicalJson(
                     std.heap.page_allocator,
@@ -1580,7 +1656,7 @@ pub const PrivateLiveRootRunner = struct {
             if (!recoveryReviewOwnerMatches(existing, input)) return 20;
             store.clearRecoveryReviewClaim(
                 std.heap.page_allocator,
-                existing.digest_sha256,
+                existing,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return 20,
@@ -1651,10 +1727,9 @@ pub const PrivateLiveRootRunner = struct {
             else
                 null,
         });
-        if (!std.mem.eql(
-            u8,
-            &claim.digest_sha256,
-            &input.expected_claim.digest_sha256,
+        if (!root_operation.recoveryReviewClaimExactEqual(
+            claim,
+            input.expected_claim,
         )) return 20;
         try store.publishRecoveryReviewClaim(
             std.heap.page_allocator,
@@ -1755,11 +1830,11 @@ pub const PrivateLiveRootRunner = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return false,
         };
-        if (observed == null or !std.mem.eql(
-            u8,
-            &observed.?.digest_sha256,
-            &claim.digest_sha256,
-        )) return false;
+        if (observed == null or
+            !root_operation.recoveryReviewClaimExactEqual(
+                observed.?,
+                claim,
+            )) return false;
         const marker = store.readDeferredAcknowledgment(
             std.heap.page_allocator,
         ) catch |err| switch (err) {
@@ -1781,9 +1856,9 @@ pub const PrivateLiveRootRunner = struct {
             else => return false,
         };
         defer if (completion) |*owned| owned.deinit();
-        return optionalDigestMatches(
-            claim.marker_sha256,
-            if (marker) |value| value.digest_sha256 else null,
+        return optionalDeferredAcknowledgmentExactEqual(
+            claim.prior_marker,
+            marker,
         ) and optionalDigestMatches(
             claim.record_sha256,
             if (record) |owned| owned.record.digest_sha256 else null,
@@ -1800,6 +1875,18 @@ pub const PrivateLiveRootRunner = struct {
         if (expected == null or observed == null)
             return expected == null and observed == null;
         return std.mem.eql(u8, &expected.?, &observed.?);
+    }
+
+    fn optionalDeferredAcknowledgmentExactEqual(
+        expected: ?root_operation.DeferredAcknowledgment,
+        observed: ?root_operation.DeferredAcknowledgment,
+    ) bool {
+        if (expected == null or observed == null)
+            return expected == null and observed == null;
+        return root_operation.deferredAcknowledgmentExactEqual(
+            expected.?,
+            observed.?,
+        );
     }
 
     fn readRecoveryCompletion(
@@ -4765,7 +4852,7 @@ pub const Engine = struct {
         prepared: Preparation,
         snapshot: operation_state.State,
         clean_lower_policy: CleanLowerPolicy,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
         claim_transferred: ?*bool,
     ) InternalExecutionError!api.Result {
         var loaded = self.profiles.load(
@@ -4872,7 +4959,7 @@ pub const Engine = struct {
                         prepared.paths.exact_lock,
                     ),
                     .orchestration_id = prepared.attempt_id,
-                    .recovery_review_claim_sha256 = recovery_review_claim_sha256,
+                    .recovery_review_claim = recovery_review_claim,
                     .reconciliation_claim = .{ .pre_mutation = .{
                         .outer_generation = claim_binding.outer_generation,
                         .outer_state_sha256 = claim_binding.outer_state_sha256,
@@ -4904,7 +4991,7 @@ pub const Engine = struct {
                     "the lower clean-state exclusion claim was not durably acknowledged",
                 );
             const acknowledgment = claimed.ownership_acknowledgment.?;
-            review_claim_consumed = recovery_review_claim_sha256 != null;
+            review_claim_consumed = recovery_review_claim != null;
             if (review_claim_consumed) {
                 if (claim_transferred) |transferred| transferred.* = true;
             }
@@ -5063,7 +5150,7 @@ pub const Engine = struct {
             if (review_claim_consumed)
                 null
             else
-                recovery_review_claim_sha256,
+                recovery_review_claim,
             claim_transferred,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -5770,10 +5857,9 @@ pub const Engine = struct {
             }
         };
         if (review.claim == null or
-            !std.mem.eql(
-                u8,
-                &review.claim.?.digest_sha256,
-                &expected_claim.digest_sha256,
+            !root_operation.recoveryReviewClaimExactEqual(
+                review.claim.?,
+                expected_claim,
             ))
         {
             if (review_guard.settle(.operational_boundary_failure)) |cleanup|
@@ -6085,7 +6171,7 @@ pub const Engine = struct {
                     recovery.prepared,
                     current.state,
                     .clean_proves_pre_mutation,
-                    review_claim.digest_sha256,
+                    review_claim,
                     claim_transferred,
                 );
             return self.reconcileRetainedFinal(
@@ -6095,7 +6181,7 @@ pub const Engine = struct {
                 &current,
                 retained.state,
                 recovery_lock,
-                review_claim.digest_sha256,
+                review_claim,
                 claim_transferred,
             );
         }
@@ -6171,7 +6257,7 @@ pub const Engine = struct {
                     recovery.prepared,
                     current.state,
                     .clean_proves_pre_mutation,
-                    review_claim.digest_sha256,
+                    review_claim,
                     claim_transferred,
                 );
             }
@@ -6309,7 +6395,7 @@ pub const Engine = struct {
                                 recovery.prepared.paths.exact_lock,
                             ),
                             .orchestration_id = recovery.prepared.attempt_id,
-                            .recovery_review_claim_sha256 = review_claim.digest_sha256,
+                            .recovery_review_claim = review_claim,
                         },
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -6405,10 +6491,10 @@ pub const Engine = struct {
                             recovery.prepared.paths.exact_lock,
                         ),
                         .orchestration_id = recovery.prepared.attempt_id,
-                        .recovery_review_claim_sha256 = if (retry_unbound_preflight)
+                        .recovery_review_claim = if (retry_unbound_preflight)
                             null
                         else
-                            review_claim.digest_sha256,
+                            review_claim,
                     },
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -6514,7 +6600,7 @@ pub const Engine = struct {
                             recovery.prepared.paths.exact_lock,
                         ),
                         .orchestration_id = recovery.prepared.attempt_id,
-                        .recovery_review_claim_sha256 = review_claim.digest_sha256,
+                        .recovery_review_claim = review_claim,
                         .reconciliation_claim = .{ .post_mutation = .{
                             .exact_lock_sha256 = recovery_lock.binding.digest_sha256,
                             .evidence_sha256 = evidence_sha256,
@@ -6677,7 +6763,7 @@ pub const Engine = struct {
                 else
                     reconciliation_acknowledgment,
                 if (reconciliation_acknowledgment == null)
-                    review_claim.digest_sha256
+                    review_claim
                 else
                     null,
                 claim_transferred,
@@ -6754,7 +6840,7 @@ pub const Engine = struct {
             ),
             .defer_recovery_clear = true,
             .orchestration_id = recovery.prepared.attempt_id,
-            .recovery_review_claim_sha256 = review_claim.digest_sha256,
+            .recovery_review_claim = review_claim,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
@@ -6838,7 +6924,7 @@ pub const Engine = struct {
         loaded: *LoadedProfile,
         committed: operation_state.State,
         acknowledgment: root_operation.DeferredAcknowledgment,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
         claim_transferred: ?*bool,
     ) !void {
         if (!std.mem.eql(
@@ -6890,7 +6976,7 @@ pub const Engine = struct {
                             prepared.paths.exact_lock,
                         ),
                         .orchestration_id = prepared.attempt_id,
-                        .recovery_review_claim_sha256 = recovery_review_claim_sha256,
+                        .recovery_review_claim = recovery_review_claim,
                         .finalize_ownership = true,
                         .ownership_acknowledgment = .{
                             .attempt_id = acknowledgment.attempt_id,
@@ -6911,7 +6997,7 @@ pub const Engine = struct {
                 if (finalized.result.exit_status != .success or
                     finalized.root_status != .completed)
                     return error.LowerAcknowledgmentFailed;
-                if (recovery_review_claim_sha256 != null) {
+                if (recovery_review_claim != null) {
                     if (claim_transferred) |transferred| transferred.* = true;
                 }
                 try self.hitCompletionBoundary(.after_ownership_acknowledged);
@@ -6932,7 +7018,7 @@ pub const Engine = struct {
                         ),
                         .defer_recovery_clear = true,
                         .orchestration_id = prepared.attempt_id,
-                        .recovery_review_claim_sha256 = recovery_review_claim_sha256,
+                        .recovery_review_claim = recovery_review_claim,
                         .recovery_acknowledgment = .{
                             .attempt_id = acknowledgment.attempt_id,
                             .completion_sha256 = acknowledgment.completion_sha256.?,
@@ -6953,7 +7039,7 @@ pub const Engine = struct {
                 if (finalized.result.exit_status != .success or
                     finalized.root_status != .completed)
                     return error.LowerAcknowledgmentFailed;
-                if (recovery_review_claim_sha256 != null) {
+                if (recovery_review_claim != null) {
                     if (claim_transferred) |transferred| transferred.* = true;
                 }
                 try self.hitCompletionBoundary(.after_recovery_acknowledged);
@@ -6974,7 +7060,7 @@ pub const Engine = struct {
         expected_recovery_attempt: ?[32]u8,
         recovery_acknowledgment: ?RecoveryAcknowledgment,
         ownership_acknowledgment: ?OwnershipAcknowledgment,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
         claim_transferred: ?*bool,
     ) InternalExecutionError!api.Result {
         const profile = loaded.view;
@@ -7265,7 +7351,7 @@ pub const Engine = struct {
                 loaded,
                 durable_final.state,
                 acknowledgment,
-                recovery_review_claim_sha256,
+                recovery_review_claim,
                 claim_transferred,
             ) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -7299,7 +7385,7 @@ pub const Engine = struct {
         current: *operation_state.OwnedState,
         retained: operation_state.State,
         verified_lock: VerifiedLock,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
         claim_transferred: ?*bool,
     ) InternalExecutionError!api.Result {
         if (!retainedFinalMatchesActive(retained, current.state, prepared))
@@ -7369,7 +7455,7 @@ pub const Engine = struct {
             loaded,
             retained,
             acknowledgment,
-            recovery_review_claim_sha256,
+            recovery_review_claim,
             claim_transferred,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -11245,6 +11331,7 @@ const FakeRunner = struct {
     settle_review_failure: ?BoundaryError = null,
     force_release_review_stale: bool = false,
     review_failure_after_publish: ?BoundaryError = null,
+    review_snapshot_marker_override: ?root_operation.DeferredAcknowledgment = null,
 
     const RecoveryCompletionMismatch = enum {
         none,
@@ -11313,16 +11400,15 @@ const FakeRunner = struct {
         if (point != null and self.boundary_failure_point == point)
             return self.boundary_failure;
         if (self.recovery_review_claim) |claim| {
-            if (request.recovery_review_claim_sha256 == null or
-                !std.mem.eql(
-                    u8,
-                    &request.recovery_review_claim_sha256.?,
-                    &claim.digest_sha256,
+            if (request.recovery_review_claim == null or
+                !root_operation.recoveryReviewClaimExactEqual(
+                    request.recovery_review_claim.?,
+                    claim,
                 ))
                 return error.OperationalBoundaryFailure;
             self.recovery_review_claim = null;
             self.recovery_review_transferred = true;
-        } else if (request.recovery_review_claim_sha256 != null) {
+        } else if (request.recovery_review_claim != null) {
             return error.OperationalBoundaryFailure;
         }
         return workflow(context, allocator, backend, request) catch |err|
@@ -11353,10 +11439,9 @@ const FakeRunner = struct {
                     u8,
                     &claim.outer_state_sha256,
                     &input.prepared.active_digest_sha256,
-                ) and std.mem.eql(
-                u8,
-                &claim.digest_sha256,
-                &input.expected_claim.digest_sha256,
+                ) and root_operation.recoveryReviewClaimExactEqual(
+                claim,
+                input.expected_claim,
             ))
                 return .{
                     .mutation_status = switch (claim.mutation_status) {
@@ -11392,6 +11477,11 @@ const FakeRunner = struct {
         var lower = inspect(context, allocator) catch |err|
             return testBoundaryError(err);
         defer lower.deinit();
+        if (self.review_snapshot_marker_override) |marker| {
+            self.inspect_deferred_acknowledgment = marker;
+            lower.deferred_acknowledgment = marker;
+            self.review_snapshot_marker_override = null;
+        }
         var completion = readRecoveryCompletion(
             context,
             allocator,
@@ -11438,10 +11528,9 @@ const FakeRunner = struct {
             else
                 null,
         }) catch return error.InvariantViolation;
-        if (!std.mem.eql(
-            u8,
-            &claim.digest_sha256,
-            &input.expected_claim.digest_sha256,
+        if (!root_operation.recoveryReviewClaimExactEqual(
+            claim,
+            input.expected_claim,
         )) return .{ .mutation_status = .unknown };
         self.recovery_review_claim = input.expected_claim;
         if (self.review_failure_after_publish) |failure|
@@ -11460,10 +11549,9 @@ const FakeRunner = struct {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         if (self.force_review_stale) return false;
         const observed = self.recovery_review_claim orelse return false;
-        return std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &claim.digest_sha256,
+        return root_operation.recoveryReviewClaimExactEqual(
+            observed,
+            claim,
         );
     }
 
@@ -11476,10 +11564,9 @@ const FakeRunner = struct {
         if (self.release_review_failure) |failure| return failure;
         if (self.force_release_review_stale) return false;
         const observed = self.recovery_review_claim orelse return false;
-        if (!std.mem.eql(
-            u8,
-            &observed.digest_sha256,
-            &claim.digest_sha256,
+        if (!root_operation.recoveryReviewClaimExactEqual(
+            observed,
+            claim,
         )) return false;
         self.recovery_review_claim = null;
         self.recovery_review_releases += 1;
@@ -11493,10 +11580,9 @@ const FakeRunner = struct {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         if (self.settle_review_failure) |failure| return failure;
         if (self.recovery_review_claim) |observed| {
-            if (!std.mem.eql(
-                u8,
-                &observed.digest_sha256,
-                &claim.digest_sha256,
+            if (!root_operation.recoveryReviewClaimExactEqual(
+                observed,
+                claim,
             )) return .unresolved;
             self.recovery_review_claim = null;
             self.recovery_review_releases += 1;
@@ -17746,6 +17832,77 @@ test "apt_system_orchestrator.test.recovery review claim excludes foreign reserv
     try std.testing.expect(harness.runner.recovery_review_claim == null);
 }
 
+test "apt_system_orchestrator.test.valid v2 prior collision makes concurrent review publication stale" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+
+    const base = harness.runner.inspect_deferred_acknowledgment orelse
+        return error.MissingDeferredAcknowledgment;
+    const prior_a = try root_operation.createDeferredAcknowledgment(.{
+        .state = base.state,
+        .attempt_id = base.attempt_id,
+        .completion_sha256 = base.completion_sha256,
+        .provenance_sha256 = base.provenance_sha256,
+        .pre_mutation_claim = base.pre_mutation_claim,
+        .acknowledgment_id = base.acknowledgment_id,
+        .recovery_review_claim_sha256 = @splat(0x91),
+    });
+    const prior_b = try root_operation.createDeferredAcknowledgment(.{
+        .state = base.state,
+        .attempt_id = base.attempt_id,
+        .completion_sha256 = base.completion_sha256,
+        .provenance_sha256 = base.provenance_sha256,
+        .pre_mutation_claim = base.pre_mutation_claim,
+        .acknowledgment_id = base.acknowledgment_id,
+        .recovery_review_claim_sha256 = @splat(0x92),
+    });
+    try std.testing.expectEqualSlices(
+        u8,
+        &prior_a.digest_sha256,
+        &prior_b.digest_sha256,
+    );
+    try std.testing.expect(
+        !root_operation.deferredAcknowledgmentExactEqual(
+            prior_a,
+            prior_b,
+        ),
+    );
+    harness.runner.inspect_deferred_acknowledgment = prior_a;
+    harness.runner.review_snapshot_marker_override = prior_b;
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    try std.testing.expectEqual(
+        VerifiedMutationStatus.unknown,
+        recovery.mutation_status,
+    );
+    try std.testing.expect(recovery.review_claim == null);
+    try std.testing.expect(harness.runner.recovery_review_claim == null);
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        prior_b,
+        harness.runner.inspect_deferred_acknowledgment.?,
+    ));
+}
+
 test "apt_system_orchestrator.test.recovery cancellation uses exact reviewed production result" {
     var harness = Harness.init(std.testing.allocator);
     defer harness.deinit();
@@ -20795,13 +20952,28 @@ test "apt_system_orchestrator.test.cancellation guard classifies fatal stale and
 
 test "apt_system_orchestrator.test.settlement prefers complete prior identity over review binding" {
     const prior_v2 = try root_operation.createDeferredAcknowledgment(.{
-        .state = .pending,
+        .state = .released,
         .attempt_id = @splat(0xa1),
-        .completion_sha256 = @splat(0xa2),
-        .provenance_sha256 = @splat(0xa3),
         .acknowledgment_id = @splat(0xa4),
         .recovery_review_claim_sha256 = @splat(0xa5),
     });
+    const collision_prior = try root_operation.createDeferredAcknowledgment(.{
+        .state = prior_v2.state,
+        .attempt_id = prior_v2.attempt_id,
+        .acknowledgment_id = prior_v2.acknowledgment_id,
+        .recovery_review_claim_sha256 = @splat(0xaf),
+    });
+    try std.testing.expectEqualSlices(
+        u8,
+        &prior_v2.digest_sha256,
+        &collision_prior.digest_sha256,
+    );
+    try std.testing.expect(
+        !root_operation.deferredAcknowledgmentExactEqual(
+            prior_v2,
+            collision_prior,
+        ),
+    );
     const claim = try root_operation.createRecoveryReviewClaim(.{
         .outer_attempt_id = @splat(0xb1),
         .outer_generation = 7,
@@ -20815,33 +20987,29 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         .marker_sha256 = prior_v2.digest_sha256,
         .prior_marker = prior_v2,
         .record_sha256 = @splat(0xb8),
-        .completion_sha256 = @splat(0xb9),
     });
     try std.testing.expectEqual(
         RecoveryReviewDisposition.released,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
             claim,
             prior_v2,
+            null,
+            null,
         ),
     );
 
-    var same_digest_mismatch = prior_v2;
-    same_digest_mismatch.acknowledgment_id[0] ^= 0xff;
-    try std.testing.expectEqualSlices(
-        u8,
-        &prior_v2.digest_sha256,
-        &same_digest_mismatch.digest_sha256,
-    );
     try std.testing.expectEqual(
         RecoveryReviewDisposition.unresolved,
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
             claim,
-            same_digest_mismatch,
+            collision_prior,
+            null,
+            null,
         ),
     );
 
     const transferred = try root_operation.createDeferredAcknowledgment(.{
-        .state = .bound,
+        .state = .released,
         .attempt_id = @splat(0xc1),
         .acknowledgment_id = claim.outer_attempt_id,
         .recovery_review_claim_sha256 = claim.digest_sha256,
@@ -20851,6 +21019,56 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
             claim,
             transferred,
+            null,
+            null,
+        ),
+    );
+
+    const foreign_ack = try root_operation.createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = transferred.attempt_id,
+        .acknowledgment_id = @splat(0xc2),
+        .recovery_review_claim_sha256 = claim.digest_sha256,
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.unresolved,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            foreign_ack,
+            null,
+            null,
+        ),
+    );
+    const foreign_binding = try root_operation.createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = transferred.attempt_id,
+        .acknowledgment_id = claim.outer_attempt_id,
+        .recovery_review_claim_sha256 = @splat(0xc3),
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.unresolved,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            foreign_binding,
+            null,
+            null,
+        ),
+    );
+    const unsupported_state = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = transferred.attempt_id,
+        .completion_sha256 = @splat(0xc4),
+        .provenance_sha256 = @splat(0xc5),
+        .acknowledgment_id = claim.outer_attempt_id,
+        .recovery_review_claim_sha256 = claim.digest_sha256,
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.unresolved,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            unsupported_state,
+            null,
+            null,
         ),
     );
 
@@ -20877,6 +21095,8 @@ test "apt_system_orchestrator.test.settlement prefers complete prior identity ov
         PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
             v1_claim,
             prior_v1,
+            null,
+            null,
         ),
     );
 }

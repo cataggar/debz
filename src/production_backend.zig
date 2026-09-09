@@ -74,7 +74,7 @@ pub const WorkflowRequest = struct {
     /// Internal outer-attempt identity, bound into the lower root record
     /// namespace before an orchestrated mutation can begin.
     orchestration_id: ?[32]u8 = null,
-    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
     reconciliation_claim: ?WorkflowReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?WorkflowOwnershipAcknowledgment = null,
@@ -86,7 +86,7 @@ const WorkflowDirective = struct {
     mode: WorkflowMode,
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
-    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
 };
 
 const TransactionSemanticOperation = enum {
@@ -301,7 +301,7 @@ pub const Backend = struct {
                 workflow.selectors,
                 workflow.orchestration_id.?,
                 claim,
-                workflow.recovery_review_claim_sha256,
+                workflow.recovery_review_claim,
             );
         }
         if (workflow.recovery_acknowledgment) |acknowledgment| {
@@ -323,7 +323,7 @@ pub const Backend = struct {
                 request,
                 workflow.operation,
                 acknowledgment,
-                workflow.recovery_review_claim_sha256,
+                workflow.recovery_review_claim,
             ) catch |err| mapRuntimeError(operation, err);
         }
         if (workflow.finalize_ownership) {
@@ -348,7 +348,7 @@ pub const Backend = struct {
                 request,
                 workflow.operation,
                 workflow.ownership_acknowledgment.?,
-                workflow.recovery_review_claim_sha256,
+                workflow.recovery_review_claim,
             );
         }
         if (workflow.ownership_acknowledgment != null)
@@ -363,7 +363,7 @@ pub const Backend = struct {
             .mode = workflow.mode,
             .defer_recovery_clear = workflow.defer_recovery_clear,
             .orchestration_id = workflow.orchestration_id,
-            .recovery_review_claim_sha256 = workflow.recovery_review_claim_sha256,
+            .recovery_review_claim = workflow.recovery_review_claim,
         }) catch |err| mapRuntimeError(operation, err);
     }
 
@@ -738,8 +738,8 @@ pub const Backend = struct {
             directive.orchestration_id
         else
             null;
-        guard.recovery_review_claim_sha256 = if (workflow) |directive|
-            directive.recovery_review_claim_sha256
+        guard.recovery_review_claim = if (workflow) |directive|
+            directive.recovery_review_claim
         else
             null;
         if (guard.preserve_settled and
@@ -1553,7 +1553,7 @@ pub const Backend = struct {
         request: api.Request,
         semantic_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowRecoveryAcknowledgment,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1609,7 +1609,7 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery marker is missing for an active record",
             );
-            if (recovery_review_claim_sha256) |digest| {
+            if (recovery_review_claim) |claim| {
                 const review = store.readRecoveryReviewClaim(
                     allocator,
                 ) catch |err| switch (err) {
@@ -1636,8 +1636,7 @@ pub const Backend = struct {
                     store.exchangeRecoveryReviewClaimForOwnership(
                         allocator,
                         .{
-                            .claim_sha256 = digest,
-                            .outer_attempt_id = acknowledgment.acknowledgment_id,
+                            .expected_claim = claim,
                             .expected_marker_sha256 = null,
                             .expected_record_sha256 = null,
                             .replacement_marker = reconstructed,
@@ -1738,17 +1737,17 @@ pub const Backend = struct {
                     "deferred lower recovery acknowledgment names a foreign operation",
                 );
         }
-        if (recovery_review_claim_sha256) |digest|
+        if (recovery_review_claim) |expected_review|
             store.exchangeRecoveryReviewClaimForOwnership(
                 allocator,
                 .{
-                    .claim_sha256 = digest,
-                    .outer_attempt_id = acknowledgment.acknowledgment_id,
+                    .expected_claim = expected_review,
                     .expected_marker_sha256 = observed_marker.digest_sha256,
                     .expected_record_sha256 = if (record) |owned|
                         owned.record.digest_sha256
                     else
                         null,
+                    .replacement_marker = observed_marker,
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1837,7 +1836,7 @@ pub const Backend = struct {
         request: api.Request,
         workflow_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowOwnershipAcknowledgment,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1883,7 +1882,7 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker is missing for an active record",
             );
-            if (recovery_review_claim_sha256) |digest| {
+            if (recovery_review_claim) |claim| {
                 const review = store.readRecoveryReviewClaim(
                     allocator,
                 ) catch return blockedRecovery(
@@ -1921,8 +1920,7 @@ pub const Backend = struct {
                     store.exchangeRecoveryReviewClaimForOwnership(
                         allocator,
                         .{
-                            .claim_sha256 = digest,
-                            .outer_attempt_id = acknowledgment.acknowledgment_id,
+                            .expected_claim = claim,
                             .expected_marker_sha256 = null,
                             .expected_record_sha256 = null,
                             .replacement_marker = owner,
@@ -1993,14 +1991,14 @@ pub const Backend = struct {
                     request.operation,
                     "lower reconciliation claim belongs to another orchestrator",
                 );
-            if (recovery_review_claim_sha256) |digest|
+            if (recovery_review_claim) |expected_review|
                 store.exchangeRecoveryReviewClaimForOwnership(
                     allocator,
                     .{
-                        .claim_sha256 = digest,
-                        .outer_attempt_id = acknowledgment.acknowledgment_id,
+                        .expected_claim = expected_review,
                         .expected_marker_sha256 = observed.digest_sha256,
                         .expected_record_sha256 = null,
+                        .replacement_marker = observed,
                     },
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -2073,17 +2071,17 @@ pub const Backend = struct {
             request.operation,
             "lower ownership record is unfinished, incompatible, or foreign",
         );
-        if (recovery_review_claim_sha256) |digest|
+        if (recovery_review_claim) |expected_review|
             store.exchangeRecoveryReviewClaimForOwnership(
                 allocator,
                 .{
-                    .claim_sha256 = digest,
-                    .outer_attempt_id = acknowledgment.acknowledgment_id,
+                    .expected_claim = expected_review,
                     .expected_marker_sha256 = observed.digest_sha256,
                     .expected_record_sha256 = if (record) |owned|
                         owned.record.digest_sha256
                     else
                         null,
+                    .replacement_marker = observed,
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2127,7 +2125,7 @@ pub const Backend = struct {
         selectors: []const solver.PackageSelector,
         orchestration_id: [32]u8,
         claim: WorkflowReconciliationClaim,
-        recovery_review_claim_sha256: ?[32]u8,
+        recovery_review_claim: ?root_operation.RecoveryReviewClaim,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -2226,12 +2224,11 @@ pub const Backend = struct {
         );
         if (self.completion_crash) |crash|
             try crash.hit(.before_reconciliation_marker_publish);
-        if (recovery_review_claim_sha256) |digest|
+        if (recovery_review_claim) |expected_review|
             store.exchangeRecoveryReviewClaimForOwnership(
                 allocator,
                 .{
-                    .claim_sha256 = digest,
-                    .outer_attempt_id = orchestration_id,
+                    .expected_claim = expected_review,
                     .expected_marker_sha256 = null,
                     .expected_record_sha256 = null,
                     .replacement_marker = reconciliation,
@@ -2774,7 +2771,7 @@ const RootOperationGuard = struct {
     /// pre-mutation binding for the subsequent execute call to adopt.
     preserve_pre_mutation: bool = false,
     orchestration_id: ?[32]u8 = null,
-    recovery_review_claim_sha256: ?[32]u8 = null,
+    recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -2873,7 +2870,7 @@ const RootOperationGuard = struct {
             .wait_ms = request.options.lock_wait_ms,
             .adopt_settled_for_acknowledgment = self.preserve_settled,
             .orchestration_id = self.orchestration_id,
-            .recovery_review_claim_sha256 = self.recovery_review_claim_sha256,
+            .recovery_review_claim = self.recovery_review_claim,
             .acquisition_observer = self.acquisitionObserver(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         if (self.orchestration_id) |orchestration_id| {

@@ -127,6 +127,14 @@ completion/provenance, pre-mutation binding, digest, and v2 review claim and
 binding fields must all match. An exact restored v1 or v2 prior owner is left
 intact and classified as a completed release; digest-only or field-mismatched
 documents remain foreign or unresolved.
+Review publication, validation, cancellation, and atomic ownership exchange
+likewise compare the complete canonical claim, recursively including the exact
+prior marker. The legacy marker digest intentionally remains compatible with
+v1 and is not treated as unique v2 identity: two canonical v2 owners may share
+that digest while carrying different review bindings. A transferred owner is
+recognized only with the reviewed outer acknowledgment identity, exact claim
+and binding, an allowed protocol state, and compatible record,
+completion, and provenance evidence.
 After claim validation, every exit before atomic lower-protocol handoff
 exact-releases the claim. Restart cancellation requires either the original
 claim capability or a fully revalidated outer state, trusted profile, semantic
