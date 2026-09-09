@@ -162,6 +162,11 @@ completed outcome.
 
 ## Conffiles
 
+Ordinary conffiles are staged as `.dpkg-new` during unpack, with `newconffile`
+status evidence for a newly introduced path. Their live-file decisions belong
+to configure, before `postinst`; unpack must not apply them early.
+`remove-on-upgrade` and obsolete marking are unpack-phase work.
+
 Decisions follow dpkg's two-dimensional table over three digests: the digest
 the package ships, the digest the status database recorded for the installed
 version, and the digest observed in the root. The selected noninteractive
@@ -177,8 +182,10 @@ Every other case is decided by the digests alone. A file that already holds the
 packaged bytes is a no-op, an unmodified file is replaced without a conflict
 artifact, and a conffile the maintainer did not change keeps the local edit —
 or the local deletion — under either policy, with no conflict artifact. Remove
-retains conffiles and their status metadata; purge removes them and the package
-status record. V1 also covers newly introduced, renamed, removed, obsolete, and
+retains conffiles and their status metadata; without residual conffiles or a
+`postrm` script, removal drops the package record instead. Purge removes
+residual conffiles and the package status record. V1 also covers newly
+introduced, renamed, removed, obsolete, and
 missing conffiles, and `remove-on-upgrade`, which ships no file: it deletes an
 unmodified recorded file, preserves a modified one as `.dpkg-old`, and does
 nothing on a fresh install. Every decision and before/after digest is recorded.

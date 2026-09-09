@@ -119,6 +119,16 @@ pub fn optionalRegularFile(bytes: ?[]const u8) ?FileEntry {
     return .{ .bytes = bytes orelse return null };
 }
 
+pub fn declaredConffilePath(declaration: []const u8) ?[]const u8 {
+    const prefix = "remove-on-upgrade ";
+    const path = if (std.mem.startsWith(u8, declaration, prefix))
+        declaration[prefix.len..]
+    else
+        declaration;
+    if (!absolute_path.nonRoot(path)) return null;
+    return path;
+}
+
 pub const InfoEntry = struct {
     name: []const u8,
     bytes: []const u8 = &.{},
@@ -1493,13 +1503,13 @@ const Importer = struct {
             if (paths.items.len >= self.options.limits.max_conffiles_per_package) {
                 return self.fail(.info_conffiles, .conffile_limit, name, line.number);
             }
-            if (value.len > self.options.limits.max_path_bytes) {
+            const path = declaredConffilePath(value) orelse {
+                return self.fail(.info_conffiles, .invalid_path, name, line.number);
+            };
+            if (path.len > self.options.limits.max_path_bytes) {
                 return self.fail(.info_conffiles, .path_too_long, name, line.number);
             }
-            if (!absolute_path.nonRoot(value)) {
-                return self.fail(.info_conffiles, .invalid_path, name, line.number);
-            }
-            if (!try seen.insert(value)) {
+            if (!try seen.insert(path)) {
                 return self.fail(.info_conffiles, .duplicate_conffile, name, line.number);
             }
             try paths.append(self.scratch, value);
@@ -2657,7 +2667,9 @@ const Validator = struct {
                 return self.fail(.cross_file, .conffile_limit, record.name);
             }
             for (declared) |path| {
-                if (!self.names.contains(path)) {
+                const conffile = declaredConffilePath(path) orelse
+                    return self.fail(.cross_file, .invalid_path, record.name);
+                if (!self.names.contains(conffile)) {
                     return self.fail(.cross_file, .declared_conffile_mismatch, record.name);
                 }
             }
@@ -3049,6 +3061,27 @@ fn expectDiagnostic(result: Result, code: Code) !void {
             return error.TestUnexpectedResult;
         },
         .diagnostic => |diagnostic| try testing.expectEqual(code, diagnostic.code),
+    }
+}
+
+test "package_database.test.conffile declaration flags do not widen path limits" {
+    const status =
+        \\Package: demo
+        \\Status: deinstall ok config-files
+        \\Architecture: amd64
+        \\Version: 1
+        \\Conffiles:
+        \\ /x d41d8cd98f00b204e9800998ecf8427e
+        \\
+    ;
+    for ([_][]const u8{ "/123456789\n", "remove-on-upgrade /123456789\n" }) |declaration| {
+        try expectDiagnostic(try importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = .{
+                .status = regularFile(status),
+                .info = &.{.{ .name = "demo.conffiles", .bytes = declaration }},
+            },
+        }, .{ .limits = .{ .max_path_bytes = 8 } }), .path_too_long);
     }
 }
 

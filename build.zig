@@ -470,10 +470,14 @@ pub fn build(b: *std.Build) void {
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "native_program.test.", "transaction_engine.test." },
+        .filters = &.{
+            "native_authorization.test.",
+            "native_program.test.",
+            "transaction_engine.test.",
+        },
     });
     const run_native_program_tests = b.addRunArtifact(native_program_tests);
-    b.step("test-native-program", "Run native transaction program compiler tests")
+    b.step("test-native-program", "Run native authorization and program compiler tests")
         .dependOn(&run_native_program_tests.step);
 
     const root_operation_tests = b.addTest(.{
@@ -544,6 +548,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&native_materialization_oracle_tests.step);
     b.step("test-native-materialization", "Compare real native data-only unpack with dpkg")
         .dependOn(&native_materialization.step);
+
+    const native_conffiles = b.addSystemCommand(
+        &.{ "python3", "tools/test-native-conffiles.py" },
+    );
+    native_conffiles.addArtifactArg(native_materialization_tests);
+    const native_conffile_oracle_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_conffiles.py" },
+    );
+    native_conffiles.step.dependOn(&native_conffile_oracle_tests.step);
+    test_step.dependOn(&native_conffile_oracle_tests.step);
+    b.step("test-native-conffiles", "Compare native conffile and remove/purge phases with dpkg")
+        .dependOn(&native_conffiles.step);
 
     const package_database_tests = b.addTest(.{
         .root_module = debz,

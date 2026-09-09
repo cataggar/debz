@@ -107,9 +107,18 @@ Preflight refuses, before anything can change:
 
 One ordered hard-link replacement is not an ambiguous alias: after an earlier
 step has modeled replacing the exact declared source, a later hard-link target
-may still carry that source's old inode during preflight. The exemption is
-limited to that target/source pair. Independent replacements of two old
-hard-link names and aliased source lookups remain `path_alias`.
+may still carry that source's old inode during preflight. Sequential removals
+of every named member are likewise unambiguous after the first name is modeled
+absent. The exemptions are limited to those ordered operations. Independent
+replacements of two old hard-link names and aliased source lookups remain
+`path_alias`.
+An in-place metadata change does not retire or replace an inode and therefore
+does not qualify for either exemption.
+
+An ordered directory removal may name children that are still present during
+preflight when every immediate child already has an earlier intent whose
+modeled result is absence. An unmodeled child still produces
+`directory_not_empty`; the layer never infers recursive deletion.
 
 ### Text the journal can carry
 

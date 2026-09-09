@@ -60,18 +60,24 @@ immutable ordered filesystem description plus a
 `package_database_changes.Plan`. It models package identity by name and
 architecture, exact ownership and `Replaces`, `Multi-Arch: same`, hard links,
 merged-`/usr`, obsolete paths, and the reserved dpkg namespace. Conffiles,
-scripts, triggers, removal, purge, selection changes, package disappearance,
-shared roots, and unsupported filesystem/database features return typed
-handoffs. No apply, journal, recovery, or release entry point is exported.
+removal, and purge remain handoffs in the default item-10b path. Item 11 adds
+opt-in script-free conffile staging/configuration and removal/purge phases,
+including both policies, old/dist artifacts, obsolete/remove-on-upgrade state,
+and globally planned batch removal. Scripts, triggers, selection changes,
+package disappearance, shared roots, and unsupported filesystem/database
+features still hand off. No apply, journal, recovery, or release entry point is exported.
 Native backend selection remains `BackendUnavailable` before mutation. The
 private adapter composes the existing lock, journal, and mutation engine;
 `test-native-materialization` compares real install, upgrade, downgrade,
 reinstall, and repeated unpack results with dpkg on disposable roots. Native
-amd64/arm64 CI runs that gate in Debug and ReleaseSafe. Zero timestamps on
+amd64/arm64 CI runs that gate and `test-native-conffiles` in Debug and ReleaseSafe.
+The latter compares each unpack/configure/remove/purge phase against dpkg,
+including preservation of local and co-owned contents. Zero timestamps on
 newly materialized directories are explicitly refused, not approximated.
 Production execution, lifecycle, recovery, and provenance integration remain
 later roadmap work. See
-[Native unpack and file ownership](native-unpack.md).
+[Native unpack and file ownership](native-unpack.md) and
+[Native conffile and removal acceptance](native-conffiles.md).
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an

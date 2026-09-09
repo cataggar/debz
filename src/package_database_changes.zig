@@ -175,7 +175,12 @@ pub fn transitionAllowed(from: CurrentState, to: CurrentState) bool {
             else => false,
         },
         .unpacked => switch (to) {
-            .half_configured, .half_installed, .config_files, .not_installed => true,
+            .installed,
+            .half_configured,
+            .half_installed,
+            .config_files,
+            .not_installed,
+            => true,
             else => false,
         },
         .half_configured => switch (to) {
@@ -441,9 +446,10 @@ const Builder = struct {
         const limits = self.options.database.limits;
         if (paths.len > limits.max_conffiles_per_package) return self.fail(.conffile_limit, package);
         self.scratch_index.reset();
-        for (paths) |path| {
+        for (paths) |declaration| {
+            const path = database.declaredConffilePath(declaration) orelse
+                return self.fail(.invalid_path, package);
             if (path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
-            if (!database.validAbsolutePath(path)) return self.fail(.invalid_path, package);
             if (!try self.scratch_index.insert(path)) {
                 return self.fail(.duplicate_conffile, package);
             }

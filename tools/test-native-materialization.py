@@ -61,35 +61,49 @@ def make_package(
     architecture: str,
     version: str,
     feature: str = "data",
+    *,
+    package: str = PACKAGE,
+    conffile_content: bytes = b"package configuration\n",
+    extra_files: dict[str, bytes] | None = None,
 ) -> Path:
-    stem = f"{PACKAGE}_{version}_{feature}"
+    stem = f"{package}_{version}_{feature}"
     source = workspace / (stem + ".source")
+    payload = Path("usr/share") / package
     control = (
-        f"Package: {PACKAGE}\nVersion: {version}\nArchitecture: {architecture}\n"
+        f"Package: {package}\nVersion: {version}\nArchitecture: {architecture}\n"
         "Maintainer: debz fixture <fixture@example.invalid>\n"
         "Description: native data-only materialization fixture\n"
     )
     write(source / "DEBIAN/control", control.encode())
-    write(source / PAYLOAD / "data", f"data version {version}\n".encode())
-    os.link(source / PAYLOAD / "data", source / PAYLOAD / "data.link")
-    (source / PAYLOAD / "current").symlink_to("data")
+    write(source / payload / "data", f"data version {version}\n".encode())
+    os.link(source / payload / "data", source / payload / "data.link")
+    (source / payload / "current").symlink_to("data")
     write(
-        source / PAYLOAD / "mode",
+        source / payload / "mode",
         b"permission-sensitive payload\n",
         0o600 if version == "1" else 0o640,
     )
     write(
-        source / PAYLOAD / ("obsolete" if version == "1" else "introduced"),
+        source / payload / ("obsolete" if version == "1" else "introduced"),
         f"only in {version}\n".encode(),
     )
-    (source / PAYLOAD / "empty").mkdir(mode=0o750)
+    (source / payload / "empty").mkdir(mode=0o750)
     if feature == "conffile":
-        write(source / "etc/debz-native.conf", b"package configuration\n")
+        write(source / "etc/debz-native.conf", conffile_content)
         write(source / "DEBIAN/conffiles", b"/etc/debz-native.conf\n")
+    elif feature in ("obsolete-conffile", "remove-on-upgrade"):
+        (source / "etc").mkdir(mode=0o755)
+        if feature == "remove-on-upgrade":
+            write(
+                source / "DEBIAN/conffiles",
+                b"remove-on-upgrade /etc/debz-native.conf\n",
+            )
     elif feature == "script":
         write(source / "DEBIAN/preinst", b"#!/bin/sh\nexit 99\n", 0o755)
     elif feature not in ("data", "zero-time"):
         raise ValueError(f"unknown fixture feature: {feature}")
+    for path, content in (extra_files or {}).items():
+        write(source / path, content)
 
     checksums = []
     for path in sorted(source.rglob("*")):
@@ -100,10 +114,10 @@ def make_package(
     write(source / "DEBIAN/md5sums", "".join(checksums).encode())
     for path in [*source.rglob("*"), source]:
         if path.is_dir() and not path.is_symlink():
-            path.chmod(0o750 if path == source / PAYLOAD / "empty" else 0o755)
+            path.chmod(0o750 if path == source / payload / "empty" else 0o755)
         os.utime(path, (EPOCH, EPOCH), follow_symlinks=False)
     if feature == "zero-time":
-        os.utime(source / PAYLOAD / "empty", (0, 0))
+        os.utime(source / payload / "empty", (0, 0))
     destination = workspace / (stem + ".deb")
     run(
         ["dpkg-deb", "--build", "--uniform-compression", "-Zgzip", "-z1",
@@ -123,6 +137,21 @@ def make_root(path: Path, architecture: str) -> None:
     write(path / "var/lib/dpkg/arch", (architecture + "\n").encode())
 
 
+def reference_command(root: Path) -> list[str]:
+    if (
+        not root.is_absolute()
+        or root == Path("/")
+        or root.resolve(strict=True) != root
+        or (root / GUARD).is_symlink()
+        or (root / GUARD).read_text() != GUARD_CONTENT
+    ):
+        raise RuntimeError("reference execution requires a disposable fixture root")
+    return [
+        "dpkg", "--force-not-root", "--force-bad-path", "--no-triggers",
+        f"--root={root}",
+    ]
+
+
 def reference(
     root: Path,
     archive: Path,
@@ -131,11 +160,8 @@ def reference(
     *,
     configure: bool = False,
 ) -> None:
-    if root == Path("/") or (root / GUARD).read_text() != GUARD_CONTENT:
-        raise RuntimeError("reference execution requires a disposable fixture root")
     run(
-        ["dpkg", "--force-not-root", "--force-bad-path", "--no-triggers",
-         f"--root={root}", "--install" if configure else "--unpack", str(archive)],
+        [*reference_command(root), "--install" if configure else "--unpack", str(archive)],
         environment,
         log,
     )
@@ -145,7 +171,7 @@ def snapshot(root: Path) -> dict:
     return oracle.capture(root, excludes=(*oracle.DEFAULT_EXCLUDES, GUARD))
 
 
-def assert_parity(reference_root: Path, candidate: Path, destination: Path) -> None:
+def compare_roots(reference_root: Path, candidate: Path, destination: Path) -> None:
     expected = snapshot(reference_root)
     observed = snapshot(candidate)
     write(destination / "reference.snapshot.json", oracle.canonical_json(expected).encode())
@@ -153,6 +179,10 @@ def assert_parity(reference_root: Path, candidate: Path, destination: Path) -> N
     mismatches = oracle.differences(expected, observed, maximum=30)
     if mismatches:
         raise AssertionError("native/dpkg mismatch:\n" + "\n".join(mismatches))
+
+
+def assert_parity(reference_root: Path, candidate: Path, destination: Path) -> None:
+    compare_roots(reference_root, candidate, destination)
     expected_empty = (reference_root / PAYLOAD / "empty").stat()
     observed_empty = (candidate / PAYLOAD / "empty").stat()
     if expected_empty.st_mtime_ns != observed_empty.st_mtime_ns:
@@ -165,21 +195,30 @@ def assert_parity(reference_root: Path, candidate: Path, destination: Path) -> N
 def native(
     executable: Path,
     root: Path,
-    archive: Path,
+    archive: Path | None,
     architecture: str,
     operation: str,
     environment: dict[str, str],
     destination: Path,
+    *,
+    conffiles: bool = False,
+    policy: str = "keep_existing",
+    packages: list[dict[str, str]] | None = None,
 ) -> dict:
     report = destination / "native.report.json"
     request = destination / "native.request.json"
-    write(request, json.dumps({
+    document = {
         "root": str(root),
         "architecture": architecture,
-        "archives": [str(archive)],
+        "archives": [str(archive)] if archive else [],
         "operation": operation,
         "report": str(report),
-    }).encode())
+    }
+    if conffiles:
+        document.update(conffiles=True, policy=policy)
+    if packages is not None:
+        document["packages"] = packages
+    write(request, json.dumps(document).encode())
     run(
         [str(executable)],
         {**environment, "DEBZ_NATIVE_MATERIALIZATION_REQUEST": str(request)},
@@ -293,6 +332,19 @@ def exercise(
             print(f"{feature}: pre-mutation handoff passed")
 
 
+def fixture_environment(workspace: Path) -> dict[str, str]:
+    (workspace / "home").mkdir()
+    (workspace / "tmp").mkdir()
+    return {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "HOME": str(workspace / "home"),
+        "TMPDIR": str(workspace / "tmp"),
+        "SOURCE_DATE_EPOCH": str(EPOCH),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", nargs="?", type=Path)
@@ -320,16 +372,7 @@ def main() -> int:
         prefix="native-materialization-", dir=temporary_root,
     ) as temporary:
         workspace = Path(temporary)
-        (workspace / "home").mkdir()
-        (workspace / "tmp").mkdir()
-        environment = {
-            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-            "LANG": "C",
-            "LC_ALL": "C",
-            "HOME": str(workspace / "home"),
-            "TMPDIR": str(workspace / "tmp"),
-            "SOURCE_DATE_EPOCH": str(EPOCH),
-        }
+        environment = fixture_environment(workspace)
         exercise(executable, workspace, environment, architecture)
     if Path("/var/lib/dpkg/status").read_bytes() != host_status:
         raise AssertionError("host dpkg status changed during disposable-root acceptance")

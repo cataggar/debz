@@ -2084,11 +2084,16 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
         .hard_link => |value| builder.index.get(value.source),
         else => null,
     };
+    const allow_retired_alias = switch (intent) {
+        .remove => true,
+        else => false,
+    };
     try recordAlias(
         builder,
         model_index,
         path.text,
         allowed_produced_alias,
+        allow_retired_alias,
     );
 
     const expected = builder.models.items[model_index].state;
@@ -2191,6 +2196,7 @@ fn recordAlias(
     model_index: u32,
     path: []const u8,
     allowed_produced_alias: ?u32,
+    allow_retired_alias: bool,
 ) BuildError!void {
     const model = builder.models.items[model_index];
     if (model.produced) return;
@@ -2204,13 +2210,15 @@ fn recordAlias(
     const found = try builder.aliases.getOrPut(builder.allocator, key);
     if (found.found_existing) {
         if (found.value_ptr.* == model_index) return;
-        // A hard-link target may still carry the source's old inode during
-        // preflight after an earlier step has already modeled replacing that
-        // exact source. No other produced alias is exempt: two independent
-        // replacements or an aliased source remain ambiguous.
-        if (allowed_produced_alias != null and
-            allowed_produced_alias.? == found.value_ptr.* and
-            builder.models.items[found.value_ptr.*].produced)
+        // Only retirement or replacement separates the old aliases. An
+        // in-place metadata step still changes both names of the same inode.
+        const prior = builder.models.items[found.value_ptr.*];
+        const separated = switch (prior.state) {
+            .absent => allow_retired_alias,
+            .present => |present| allowed_produced_alias == found.value_ptr.* and
+                present.inode != state.inode,
+        };
+        if (prior.produced and separated)
             return;
         return builder.fail(.preflight, .path_alias, path);
     }
@@ -2636,7 +2644,7 @@ fn resolveSource(
 ) BuildError!Expectation {
     if (withinNamespace(path)) return builder.fail(.preflight, .path_collision, path);
     const model_index = try resolveModel(builder, path, requires);
-    try recordAlias(builder, model_index, path, null);
+    try recordAlias(builder, model_index, path, null, false);
     return builder.models.items[model_index].state;
 }
 
@@ -2652,9 +2660,21 @@ fn requireEmptyDirectory(builder: *Builder, path: root_fs.Path) BuildError!void 
     };
     defer dir.close(builder.root.io);
     var iterator = dir.iterate();
-    const first = iterator.next(builder.root.io) catch
-        return builder.fail(.preflight, .io_failed, path.text);
-    if (first != null) return builder.fail(.preflight, .directory_not_empty, path.text);
+    while (iterator.next(builder.root.io) catch
+        return builder.fail(.preflight, .io_failed, path.text)) |entry|
+    {
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const child = std.fmt.bufPrint(
+            &buffer,
+            "{s}/{s}",
+            .{ path.text, entry.name },
+        ) catch return builder.fail(.preflight, .directory_not_empty, path.text);
+        const model_index = builder.index.get(child) orelse
+            return builder.fail(.preflight, .directory_not_empty, path.text);
+        const model = builder.models.items[model_index];
+        if (!model.produced or model.state != .absent)
+            return builder.fail(.preflight, .directory_not_empty, path.text);
+    }
 }
 
 /// A hard link whose source is republished after the link is taken would name
@@ -5520,6 +5540,61 @@ test "root_mutation.test.final directory timestamp follows child publication" {
         )).modified_nanoseconds,
     );
     try clear(&engine);
+}
+
+test "root_mutation.test.ordered hardlink removal can empty its directory" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/group/source", "old\n");
+    try root.createHardLink(
+        try root_fs.Path.init("usr/share/group/source"),
+        try root_fs.Path.init("usr/share/group/member"),
+    );
+    var plan = try planFor(&fixture, &.{
+        .{ .remove = .{ .path = "usr/share/group/source" } },
+        .{ .remove = .{ .path = "usr/share/group/member" } },
+        .{ .remove_directory = .{ .path = "usr/share/group" } },
+    });
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&engine, .fromPlan(&plan))).outcome);
+    try expectAbsent(root, "usr/share/group");
+    try clear(&engine);
+}
+
+test "root_mutation.test.metadata changes do not retire a hardlink alias" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/source", "old\n");
+    try root.createHardLink(
+        try root_fs.Path.init("usr/share/source"),
+        try root_fs.Path.init("usr/share/member"),
+    );
+    try expectDiagnostic(&fixture, &.{
+        .{ .metadata = .{ .path = "usr/share/source", .mode = 0o600 } },
+        .{ .remove = .{ .path = "usr/share/member" } },
+    }, .path_alias);
+    try expectDiagnostic(&fixture, &.{
+        .{ .metadata = .{ .path = "usr/share/source", .mode = 0o600 } },
+        .{ .hard_link = .{ .path = "usr/share/member", .source = "usr/share/source" } },
+    }, .path_alias);
+}
+
+test "root_mutation.test.directory removal cannot infer unplanned child removal" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try writeExisting(fixture.root(), "usr/share/owned", "owned\n");
+    try writeExisting(fixture.root(), "usr/share/local", "local\n");
+    try expectDiagnostic(&fixture, &.{
+        .{ .remove = .{ .path = "usr/share/owned" } },
+        .{ .remove_directory = .{ .path = "usr/share" } },
+    }, .directory_not_empty);
 }
 
 test "root_mutation.test.ordered hardlink group replacement is unambiguous" {
