@@ -121,6 +121,12 @@ completed before response loss is accepted as clean, and a transferred owner
 is preserved and reported as recovery-required. Human review/output failures,
 negative or unavailable confirmation, JSON non-prompt cancellation, UNKNOWN
 cleanup, and stale-review rejection cannot call an unguarded release path.
+Settlement checks the complete retained prior-marker identity before examining
+review-binding fields. Version, state, attempts, acknowledgment identity,
+completion/provenance, pre-mutation binding, digest, and v2 review claim and
+binding fields must all match. An exact restored v1 or v2 prior owner is left
+intact and classified as a completed release; digest-only or field-mismatched
+documents remain foreign or unresolved.
 After claim validation, every exit before atomic lower-protocol handoff
 exact-releases the claim. Restart cancellation requires either the original
 claim capability or a fully revalidated outer state, trusted profile, semantic

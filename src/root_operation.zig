@@ -536,6 +536,106 @@ pub fn matchesPreMutationReconciliationClaim(
         );
 }
 
+pub fn deferredAcknowledgmentExactEqual(
+    left: DeferredAcknowledgment,
+    right: DeferredAcknowledgment,
+) bool {
+    return left.document_version == right.document_version and
+        left.state == right.state and
+        std.mem.eql(u8, &left.attempt_id, &right.attempt_id) and
+        exactOptionalDigestEqual(left.completion_sha256, right.completion_sha256) and
+        exactOptionalDigestEqual(left.provenance_sha256, right.provenance_sha256) and
+        optionalPreMutationClaimEqual(
+            left.pre_mutation_claim,
+            right.pre_mutation_claim,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.acknowledgment_id,
+            &right.acknowledgment_id,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_claim_sha256,
+            right.recovery_review_claim_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.recovery_review_binding_sha256,
+            right.recovery_review_binding_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.digest_sha256,
+            &right.digest_sha256,
+        );
+}
+
+pub fn recoveryReviewClaimExactEqual(
+    left: RecoveryReviewClaim,
+    right: RecoveryReviewClaim,
+) bool {
+    return left.outer_generation == right.outer_generation and
+        std.mem.eql(u8, &left.outer_attempt_id, &right.outer_attempt_id) and
+        std.mem.eql(
+            u8,
+            &left.outer_state_sha256,
+            &right.outer_state_sha256,
+        ) and
+        std.mem.eql(u8, &left.profile_sha256, &right.profile_sha256) and
+        std.mem.eql(
+            u8,
+            &left.profile_reference_sha256,
+            &right.profile_reference_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.exact_lock_sha256,
+            &right.exact_lock_sha256,
+        ) and
+        std.mem.eql(
+            u8,
+            &left.semantic_request_sha256,
+            &right.semantic_request_sha256,
+        ) and
+        exactOptionalDigestEqual(
+            left.outer_transaction_sha256,
+            right.outer_transaction_sha256,
+        ) and
+        left.mutation_status == right.mutation_status and
+        std.mem.eql(u8, &left.nonce, &right.nonce) and
+        exactOptionalDigestEqual(left.marker_sha256, right.marker_sha256) and
+        optionalDeferredAcknowledgmentEqual(
+            left.prior_marker,
+            right.prior_marker,
+        ) and
+        exactOptionalDigestEqual(left.record_sha256, right.record_sha256) and
+        exactOptionalDigestEqual(
+            left.completion_sha256,
+            right.completion_sha256,
+        ) and
+        std.mem.eql(u8, &left.digest_sha256, &right.digest_sha256);
+}
+
+fn optionalPreMutationClaimEqual(
+    left: ?PreMutationReconciliationClaimBinding,
+    right: ?PreMutationReconciliationClaimBinding,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return preMutationClaimBindingEqual(left.?, right.?);
+}
+
+fn exactOptionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, &left.?, &right.?);
+}
+
+fn optionalDeferredAcknowledgmentEqual(
+    left: ?DeferredAcknowledgment,
+    right: ?DeferredAcknowledgment,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return deferredAcknowledgmentExactEqual(left.?, right.?);
+}
+
 pub const DeferredRecordCompatibility = enum {
     incompatible,
     pre_mutation_reconciliation_claim,
@@ -4194,6 +4294,53 @@ test "root_operation.test.deferred acknowledgment v2 is canonical bounded and ta
             v1_with_v2_fields,
         ),
     );
+}
+
+test "root_operation.test.deferred acknowledgment exact identity rejects same-digest field mismatch" {
+    const v1 = try createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(0xe1),
+        .completion_sha256 = @splat(0xe2),
+        .provenance_sha256 = @splat(0xe3),
+        .acknowledgment_id = @splat(0xe4),
+    });
+    try testing.expect(deferredAcknowledgmentExactEqual(v1, v1));
+    var v1_mismatch = v1;
+    v1_mismatch.acknowledgment_id[0] ^= 0xff;
+    try testing.expectEqualSlices(
+        u8,
+        &v1.digest_sha256,
+        &v1_mismatch.digest_sha256,
+    );
+    try testing.expect(!deferredAcknowledgmentExactEqual(
+        v1,
+        v1_mismatch,
+    ));
+
+    const v2 = try createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(0xe5),
+        .acknowledgment_id = @splat(0xe6),
+        .recovery_review_claim_sha256 = @splat(0xe7),
+    });
+    try testing.expect(deferredAcknowledgmentExactEqual(v2, v2));
+    var v2_claim_mismatch = v2;
+    v2_claim_mismatch.recovery_review_claim_sha256.?[0] ^= 0xff;
+    try testing.expectEqualSlices(
+        u8,
+        &v2.digest_sha256,
+        &v2_claim_mismatch.digest_sha256,
+    );
+    try testing.expect(!deferredAcknowledgmentExactEqual(
+        v2,
+        v2_claim_mismatch,
+    ));
+    var v2_binding_mismatch = v2;
+    v2_binding_mismatch.recovery_review_binding_sha256.?[0] ^= 0xff;
+    try testing.expect(!deferredAcknowledgmentExactEqual(
+        v2,
+        v2_binding_mismatch,
+    ));
 }
 
 test "root_operation.test.records reject contradictory lifecycle combinations" {

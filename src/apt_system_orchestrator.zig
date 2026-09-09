@@ -1480,11 +1480,11 @@ pub const PrivateLiveRootRunner = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => break :release 23,
                 };
-                if (observed == null or !std.mem.eql(
-                    u8,
-                    &observed.?.digest_sha256,
-                    &claim.digest_sha256,
-                )) break :release 23;
+                if (observed == null or
+                    !root_operation.recoveryReviewClaimExactEqual(
+                        observed.?,
+                        claim,
+                    )) break :release 23;
                 store.clearRecoveryReviewClaim(
                     std.heap.page_allocator,
                     claim.digest_sha256,
@@ -1503,10 +1503,9 @@ pub const PrivateLiveRootRunner = struct {
                     std.heap.page_allocator,
                 );
                 if (observed) |value| {
-                    if (!std.mem.eql(
-                        u8,
-                        &value.digest_sha256,
-                        &claim.digest_sha256,
+                    if (!root_operation.recoveryReviewClaimExactEqual(
+                        value,
+                        claim,
                     )) break :settle 26;
                     try store.clearRecoveryReviewClaim(
                         std.heap.page_allocator,
@@ -1517,28 +1516,38 @@ pub const PrivateLiveRootRunner = struct {
                 const marker = try store.readDeferredAcknowledgment(
                     std.heap.page_allocator,
                 );
-                if (marker) |value| {
-                    if (value.recovery_review_claim_sha256) |claim_sha256| {
-                        if (std.mem.eql(
-                            u8,
-                            &claim_sha256,
-                            &claim.digest_sha256,
-                        )) break :settle 25;
-                        break :settle 26;
-                    }
-                    if (claim.prior_marker) |prior| {
-                        if (std.mem.eql(
-                            u8,
-                            &value.digest_sha256,
-                            &prior.digest_sha256,
-                        )) break :settle 24;
-                    }
-                    break :settle 26;
-                }
-                if (claim.prior_marker == null) break :settle 24;
-                break :settle 26;
+                break :settle switch (classifySettledRecoveryReviewMarker(
+                    claim,
+                    marker,
+                )) {
+                    .released => 24,
+                    .transferred_owner => 25,
+                    .unresolved => 26,
+                };
             },
         };
+    }
+
+    fn classifySettledRecoveryReviewMarker(
+        claim: root_operation.RecoveryReviewClaim,
+        marker: ?root_operation.DeferredAcknowledgment,
+    ) RecoveryReviewDisposition {
+        const value = marker orelse return if (claim.prior_marker == null)
+            .released
+        else
+            .unresolved;
+        if (claim.prior_marker) |prior|
+            if (root_operation.deferredAcknowledgmentExactEqual(
+                value,
+                prior,
+            )) return .released;
+        if (value.recovery_review_claim_sha256) |claim_sha256|
+            if (std.mem.eql(
+                u8,
+                &claim_sha256,
+                &claim.digest_sha256,
+            )) return .transferred_owner;
+        return .unresolved;
     }
 
     fn prepareRecoveryReviewChild(
@@ -9894,9 +9903,9 @@ test "apt_system_orchestrator.test.required_privileged.manifest covers every pri
         }
         cursor = next;
     }
-    try std.testing.expectEqual(@as(usize, 28), tagged_count);
+    try std.testing.expectEqual(@as(usize, 29), tagged_count);
     try std.testing.expectEqual(
-        @as(usize, 24),
+        @as(usize, 25),
         privilege_dependent_count,
     );
 }
@@ -16475,6 +16484,12 @@ test "apt_system_orchestrator.test.required_privileged.production cancellation g
         .result => return error.ExpectedRecoveryPreparation,
     };
     defer response_loss_recovery.deinit();
+    const v1_prior = response_loss_recovery.review_claim.?.prior_marker orelse
+        return error.MissingDeferredAcknowledgment;
+    try std.testing.expectEqual(
+        root_operation.deferred_ack_schema_version,
+        v1_prior.document_version,
+    );
     var response_loss: ProcessDeathTransportCrash = .{};
     runner.review_transport_crash = response_loss.interface();
     var response_loss_invocation = try engine.invokeExecuteRecovery(
@@ -16490,6 +16505,15 @@ test "apt_system_orchestrator.test.required_privileged.production cancellation g
         else => return error.ExpectedCancellationResult,
     }
     runner.review_transport_crash = null;
+    var restored_v1 = try runner.interface().inspect(
+        std.testing.allocator,
+    );
+    defer restored_v1.deinit();
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        v1_prior,
+        restored_v1.deferred_acknowledgment orelse
+            return error.MissingDeferredAcknowledgment,
+    ));
 
     var partial_recovery = switch (try engine.prepareRecovery(
         std.testing.allocator,
@@ -16556,6 +16580,228 @@ test "apt_system_orchestrator.test.required_privileged.production cancellation g
         std.testing.allocator,
         fixture.state_path,
     )) == null);
+}
+
+test "apt_system_orchestrator.test.required_privileged.production response loss restores every exact v2 prior owner" {
+    try requirePrivilegedProductionTest();
+    var fixture = ProductionRunnerFixture.init(
+        std.testing.allocator,
+    ) catch |err| switch (err) {
+        error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
+        else => return err,
+    };
+    defer fixture.deinit();
+    var process: ProductionRunnerProcess = .{
+        .io = std.testing.io,
+        .dpkg = fixture.dpkg,
+    };
+    var production: production_backend.Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    var backend: ProductionBackend = .{ .backend = &production };
+    var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var profile: FakeProfileLoader = .{
+        .state_path = fixture.state_path,
+        .cache_path = fixture.cache_path,
+        .source_paths = fixture.source_paths,
+        .keyring_paths = fixture.keyring_paths,
+    };
+    var state_store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+    var sources: FakeSources = .{};
+    var engine: Engine = .{
+        .profiles = profile.interface(),
+        .runner = runner.interface(),
+        .backend = backend.interface(),
+        .store = state_store.interface(),
+        .verifier = verifier.interface(),
+        .ids = sources.ids(),
+        .clock = sources.clock(),
+    };
+    var prepared = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.remove, &.{"removable"}),
+    ));
+    defer prepared.deinit();
+    const execute_child = try live_root.testing.forkProcess();
+    if (execute_child == 0) {
+        var crash: ProductionChildCrash = .{
+            .boundary = .after_completed_record,
+        };
+        production.completion_crash = crash.interface();
+        _ = engine.execute(
+            std.heap.page_allocator,
+            prepared,
+            true,
+        ) catch {};
+        std.os.linux.exit_group(106);
+    }
+    _ = try reapSignalTestProcess(execute_child);
+    var first_recovery = switch (try engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer first_recovery.deinit();
+    var transfer_loss: ErrorTransportCrash = .{
+        .failure = error.OperationalBoundaryFailure,
+    };
+    runner.transport_crash = transfer_loss.interface();
+    const transferred = try engine.invokeExecuteRecovery(
+        std.testing.allocator,
+        first_recovery,
+        true,
+    );
+    switch (transferred) {
+        .cleanup_required => |cleanup| try std.testing.expectEqual(
+            RecoveryCleanupDisposition.transferred_owner,
+            cleanup.disposition,
+        ),
+        else => return error.ExpectedCleanupRequired,
+    }
+    runner.transport_crash = null;
+    var lower = try runner.interface().inspect(std.testing.allocator);
+    defer lower.deinit();
+    const base = lower.deferred_acknowledgment orelse
+        return error.MissingDeferredAcknowledgment;
+    try std.testing.expectEqual(
+        root_operation.deferred_ack_v2_schema_version,
+        base.document_version,
+    );
+    try std.testing.expect(base.completion_sha256 != null);
+    try std.testing.expect(base.provenance_sha256 != null);
+
+    var host_root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer host_root.close();
+    const lower_store = root_operation.Store.init(host_root.root);
+    const ResponseLoss = enum {
+        child_death,
+        partial_response,
+        operational_after_clear,
+    };
+    inline for ([_]struct {
+        state: root_operation.DeferredAcknowledgmentState,
+        loss: ResponseLoss,
+    }{
+        .{ .state = .bound, .loss = .child_death },
+        .{ .state = .released, .loss = .partial_response },
+        .{ .state = .pending, .loss = .operational_after_clear },
+    }) |case| {
+        const prior = try root_operation.createDeferredAcknowledgment(.{
+            .state = case.state,
+            .attempt_id = base.attempt_id,
+            .completion_sha256 = if (case.state == .pending)
+                base.completion_sha256
+            else
+                null,
+            .provenance_sha256 = if (case.state == .pending)
+                base.provenance_sha256
+            else
+                null,
+            .acknowledgment_id = base.acknowledgment_id,
+            .recovery_review_claim_sha256 = base.recovery_review_claim_sha256,
+        });
+        if (try lower_store.readDeferredAcknowledgment(
+            std.testing.allocator,
+        )) |existing| {
+            try lower_store.clearDeferredAcknowledgment(
+                std.testing.allocator,
+                existing.digest_sha256,
+            );
+        }
+        try lower_store.publishDeferredAcknowledgment(
+            std.testing.allocator,
+            prior,
+        );
+        var recovery = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+            prior,
+            recovery.review_claim.?.prior_marker orelse
+                return error.MissingDeferredAcknowledgment,
+        ));
+        var process_loss: ProcessDeathTransportCrash = .{};
+        var operational_loss: ErrorTransportCrash = .{
+            .failure = error.OperationalBoundaryFailure,
+        };
+        switch (case.loss) {
+            .child_death => runner.review_transport_crash = process_loss.interface(),
+            .partial_response => runner.review_release_partial_response = true,
+            .operational_after_clear => runner.review_transport_crash = operational_loss.interface(),
+        }
+        var cancellation = try engine.invokeExecuteRecovery(
+            std.testing.allocator,
+            recovery,
+            false,
+        );
+        switch (cancellation) {
+            .result => |*result| {
+                defer result.deinit();
+                try std.testing.expectEqual(api.Outcome.usage, result.outcome);
+            },
+            else => return error.ExpectedCancellationResult,
+        }
+        runner.review_transport_crash = null;
+        runner.review_release_partial_response = false;
+        var restored = try runner.interface().inspect(
+            std.testing.allocator,
+        );
+        defer restored.deinit();
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+            prior,
+            restored.deferred_acknowledgment orelse
+                return error.MissingDeferredAcknowledgment,
+        ));
+
+        var adopted = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+            prior,
+            adopted.review_claim.?.prior_marker orelse
+                return error.MissingDeferredAcknowledgment,
+        ));
+        var adopted_cancel = try engine.executeRecovery(
+            std.testing.allocator,
+            adopted,
+            false,
+        );
+        adopted_cancel.deinit();
+        adopted.deinit();
+    }
+
+    var final_recovery = switch (try engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer final_recovery.deinit();
+    var completed = try engine.executeRecovery(
+        std.testing.allocator,
+        final_recovery,
+        true,
+    );
+    defer completed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, completed.outcome);
 }
 
 test "apt_system_orchestrator.test.required_privileged.production runner classifies every durable pre-mutation crash" {
@@ -20545,6 +20791,94 @@ test "apt_system_orchestrator.test.cancellation guard classifies fatal stale and
         },
         else => return error.ExpectedCleanupRequired,
     }
+}
+
+test "apt_system_orchestrator.test.settlement prefers complete prior identity over review binding" {
+    const prior_v2 = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(0xa1),
+        .completion_sha256 = @splat(0xa2),
+        .provenance_sha256 = @splat(0xa3),
+        .acknowledgment_id = @splat(0xa4),
+        .recovery_review_claim_sha256 = @splat(0xa5),
+    });
+    const claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(0xb1),
+        .outer_generation = 7,
+        .outer_state_sha256 = @splat(0xb2),
+        .profile_sha256 = @splat(0xb3),
+        .profile_reference_sha256 = @splat(0xb4),
+        .exact_lock_sha256 = @splat(0xb5),
+        .semantic_request_sha256 = @splat(0xb6),
+        .mutation_status = .changed,
+        .nonce = @splat(0xb7),
+        .marker_sha256 = prior_v2.digest_sha256,
+        .prior_marker = prior_v2,
+        .record_sha256 = @splat(0xb8),
+        .completion_sha256 = @splat(0xb9),
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.released,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            prior_v2,
+        ),
+    );
+
+    var same_digest_mismatch = prior_v2;
+    same_digest_mismatch.acknowledgment_id[0] ^= 0xff;
+    try std.testing.expectEqualSlices(
+        u8,
+        &prior_v2.digest_sha256,
+        &same_digest_mismatch.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.unresolved,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            same_digest_mismatch,
+        ),
+    );
+
+    const transferred = try root_operation.createDeferredAcknowledgment(.{
+        .state = .bound,
+        .attempt_id = @splat(0xc1),
+        .acknowledgment_id = claim.outer_attempt_id,
+        .recovery_review_claim_sha256 = claim.digest_sha256,
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.transferred_owner,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            claim,
+            transferred,
+        ),
+    );
+
+    const prior_v1 = try root_operation.createDeferredAcknowledgment(.{
+        .state = .bound,
+        .attempt_id = @splat(0xd1),
+        .acknowledgment_id = @splat(0xd2),
+    });
+    const v1_claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(0xd3),
+        .outer_generation = 8,
+        .outer_state_sha256 = @splat(0xd4),
+        .profile_sha256 = @splat(0xd5),
+        .profile_reference_sha256 = @splat(0xd6),
+        .exact_lock_sha256 = @splat(0xd7),
+        .semantic_request_sha256 = @splat(0xd8),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0xd9),
+        .marker_sha256 = prior_v1.digest_sha256,
+        .prior_marker = prior_v1,
+    });
+    try std.testing.expectEqual(
+        RecoveryReviewDisposition.released,
+        PrivateLiveRootRunner.classifySettledRecoveryReviewMarker(
+            v1_claim,
+            prior_v1,
+        ),
+    );
 }
 
 test "apt_system_orchestrator.test.recovery retention failure preserves lower token for retry without second mutation" {
