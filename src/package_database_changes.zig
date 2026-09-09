@@ -1535,12 +1535,17 @@ test "package_database_changes.test.unsafe or ambiguous change sets fail before 
         .invalid_path,
     );
 
-    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+    var stale_manifest = switch (try plan(testing.allocator, source, &.{
         .{ .put_md5sums = .{
             .identity = .{ .name = "toolz", .architecture = "amd64" },
             .entries = &.{.{ .path = "usr/bin/absent", .digest = @splat(0) }},
         } },
-    }, .{}), .checksum_out_of_inventory);
+    }, .{})) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer stale_manifest.deinit();
+    try testing.expect(stale_manifest.find("info/toolz.md5sums") != null);
 
     try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
         .{ .remove_info = .{

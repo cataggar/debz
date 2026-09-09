@@ -266,11 +266,16 @@ cutover.
 ## Incremental backend boundary
 
 `transaction_engine` owns explicit backend selection. `legacy_dpkg` remains
-the default while native work is incomplete. Library backends may inject a
-native executor for development, but selecting `native` without one returns a
-typed unavailable result before repository acquisition, journal access,
-database access, or root mutation. Selection never falls back to
-`legacy_dpkg`.
+the default while native work is incomplete. Roadmap item 10a adds only the
+descriptive unpack/ownership planner; it exports no apply or recovery
+capability. Selecting `native` therefore returns a typed unavailable result
+before repository acquisition, journal access, database access, or root
+mutation even if a command-shaped executor was injected. Selection never falls
+back to `legacy_dpkg`.
+
+Item 10b implements data-only materialization and must satisfy the original
+install/upgrade/downgrade/reinstall differential gate against dpkg. Publishing
+the planner does not complete item 10 or establish production parity.
 
 ## Native transaction authorization
 

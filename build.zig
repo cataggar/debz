@@ -514,6 +514,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-live-root-shared", "Run shared-propagation live-root isolation")
         .dependOn(&run_live_root_shared_tests.step);
 
+    const native_unpack_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test."},
+    });
+    const run_native_unpack_tests = b.addRunArtifact(native_unpack_tests);
+    b.step("test-native-unpack", "Run native unpack and file ownership tests")
+        .dependOn(&run_native_unpack_tests.step);
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -716,6 +724,7 @@ fn installReleaseFiles(
         "multi-repository-policy.md",
         "native-transaction-engine-v1.md",
         "native-transaction-program.md",
+        "native-unpack.md",
         "openpgp-verifier.md",
         "package-acquisition.md",
         "package-database.md",

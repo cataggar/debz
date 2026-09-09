@@ -38,7 +38,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `arch` | Unique validated foreign architectures. The native architecture comes from the authorized request and may not be listed. |
 | `info/format` | Must be format `1` when present. |
 | `info/*.list` | Bounded canonical absolute paths, including dpkg's `/.` root entry; duplicates rejected; ownership index published. |
-| `info/*.md5sums` | Lowercase MD5 plus canonical relative payload paths, each of which must be owned by the package. |
+| `info/*.md5sums` | Lowercase MD5 plus canonical relative as-shipped payload paths. Partial `Replaces` may leave entries that are no longer in the live `.list`, as dpkg does. |
 | `info/*.conffiles` | Declared conffiles, each of which must appear in the package's status `Conffiles`. |
 | `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |
@@ -47,6 +47,11 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `triggers/Unincorp` | Deferred activations and their awaiting packages. |
 | `diversions` | Complete three-line records typed; malformed records fail. |
 | `statoverride` | Bounded user, group, mode, and path records typed; malformed records fail. |
+
+Co-installed `Multi-Arch: same` instances normally require one version. A
+bounded unpack transaction may temporarily contain an `unpacked` incoming
+version beside an installed sibling's previous version; fully installed
+siblings with differing versions remain invalid.
 
 Info file names must be `package.suffix` or `package:architecture.suffix` and
 must resolve to exactly one status record. Unqualified names that match more
@@ -132,7 +137,8 @@ entry point. Every produced file is then checked
 against the importer's own bounds before a plan is returned. Planning fails
 closed on unknown packages, more than one change per subject, impossible state
 transitions, unsafe or non-executable scripts, invalid paths, checksums outside
-the inventory, bound violations, interrupted publication in `updates/`, and any
+the accepted checksum grammar, bound violations, interrupted publication in
+`updates/`, and any
 diversion or statoverride that covers a package or path being changed. Mutating
 diversions and statoverrides is not supported in v1.
 

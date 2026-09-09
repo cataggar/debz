@@ -1,0 +1,13 @@
+/.
+/usr
+/usr/bin
+/usr/bin/tool
+/usr/lib
+/usr/lib/x86_64-linux-gnu
+/usr/lib/x86_64-linux-gnu/libdemo.so.1
+/usr/share
+/usr/share/doc
+/usr/share/doc/demo
+/usr/share/doc/demo/copyright
+/etc
+/etc/demo.conf
