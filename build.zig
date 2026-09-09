@@ -194,6 +194,13 @@ pub fn build(b: *std.Build) void {
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
+    const apt_system_acceptance = b.addSystemCommand(
+        &.{ "python3", "tools/test-apt-system-acceptance.py" },
+    );
+    apt_system_acceptance.addArtifactArg(cli);
+    b.step("test-apt-system-acceptance", "Run real apt facade and dpkg in a disposable root (requires root)")
+        .dependOn(&apt_system_acceptance.step);
+
     const native_differential_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_differential.py" },
     );
