@@ -144,6 +144,14 @@ acknowledgment identity, exact claim identity and binding, an allowed protocol
 state, and compatible record, completion, and provenance evidence. Publication,
 terminalization, acknowledgment, retention, rotation, restoration, and clear
 all reject a valid foreign v2 owner even when its legacy digest collides.
+Every destructive v2 store call requires an independently authenticated
+complete expected marker; attempt and acknowledgment IDs are accepted only
+for genuine v1 upgrade documents. Reading the current v2 marker is not
+authorization. A reservation therefore returns its complete exact owner token,
+which the outer operation carries into the subsequent execute invocation.
+Restart cleanup uses the retained operation-local acknowledgment or a fully
+reconstructed reviewed owner; if that evidence is absent, cleanup fails closed
+without changing the record or marker.
 Frozen v1 review claims remain readable and byte-identical; an upgraded
 recovery derives their complete domain-separated identity from the exact
 canonical v1 document before transferring them into a v2 owner.

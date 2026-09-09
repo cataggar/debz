@@ -315,6 +315,7 @@ pub const WorkflowRequest = struct {
     defer_recovery_clear: bool = false,
     orchestration_id: ?[32]u8 = null,
     recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
+    expected_ownership_marker: ?root_operation.DeferredAcknowledgment = null,
     reconciliation_claim: ?ReconciliationClaim = null,
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?OwnershipAcknowledgment = null,
@@ -403,6 +404,7 @@ pub const ProductionBackend = struct {
             .defer_recovery_clear = request.defer_recovery_clear,
             .orchestration_id = request.orchestration_id,
             .recovery_review_claim = request.recovery_review_claim,
+            .expected_ownership_marker = request.expected_ownership_marker,
             .reconciliation_claim = request.reconciliation_claim,
             .finalize_ownership = request.finalize_ownership,
             .ownership_acknowledgment = request.ownership_acknowledgment,
@@ -1253,7 +1255,8 @@ pub const PrivateLiveRootRunner = struct {
                                 return error.MissingRecoveryAcknowledgment,
                         };
                     }
-                    if ((workflow_invocation.request.mode == .execute or
+                    if ((workflow_invocation.request.mode == .reserve or
+                        workflow_invocation.request.mode == .execute or
                         workflow_invocation.request.reconciliation_claim != null) and
                         workflow_invocation.request.orchestration_id != null and
                         decoded.result.exit_status == .success)
@@ -1264,7 +1267,9 @@ pub const PrivateLiveRootRunner = struct {
                             workflow_invocation.request.orchestration_id orelse
                             return error.MissingOwnershipAcknowledgment;
                         const expected_marker_state: root_operation.DeferredAcknowledgmentState =
-                            if (workflow_invocation.request.reconciliation_claim) |claim|
+                            if (workflow_invocation.request.mode == .reserve)
+                                .bound
+                            else if (workflow_invocation.request.reconciliation_claim) |claim|
                                 switch (claim) {
                                     .pre_mutation => .pre_mutation_reconciliation_claim,
                                     .post_mutation => .released,
@@ -1272,7 +1277,10 @@ pub const PrivateLiveRootRunner = struct {
                             else
                                 .released;
                         if (marker.state != expected_marker_state or
-                            inspection.record != null or
+                            (workflow_invocation.request.mode == .reserve and
+                                inspection.record == null) or
+                            (workflow_invocation.request.mode != .reserve and
+                                inspection.record != null) or
                             !std.mem.eql(
                                 u8,
                                 &marker.acknowledgment_id,
@@ -4638,7 +4646,8 @@ pub const Engine = struct {
         };
         defer reserved.deinit();
         if (reserved.result.exit_status != .success or
-            reserved.root_status != .recovery_required)
+            reserved.root_status != .recovery_required or
+            reserved.ownership_acknowledgment == null)
             return self.reconcilePreparedError(allocator, prepared);
         const after_reserve_lock = self.verifier.verifyLockFn(
             self.verifier.context,
@@ -4698,6 +4707,7 @@ pub const Engine = struct {
                 prepared.paths.exact_lock,
             ),
             .orchestration_id = prepared.attempt_id,
+            .expected_ownership_marker = reserved.ownership_acknowledgment.?.marker,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvariantViolation => return error.InvariantViolation,
@@ -6395,6 +6405,7 @@ pub const Engine = struct {
                     recovery.prepared.request,
                 );
                 defer allocator.free(selectors);
+                var retry_expected_marker: ?root_operation.DeferredAcknowledgment = null;
                 if (retry_unbound_preflight) {
                     var reserved = self.runner.workflow(
                         allocator,
@@ -6426,13 +6437,16 @@ pub const Engine = struct {
                     };
                     defer reserved.deinit();
                     if (reserved.result.exit_status != .success or
-                        reserved.root_status != .recovery_required)
+                        reserved.root_status != .recovery_required or
+                        reserved.ownership_acknowledgment == null)
                         return self.reconcilePreparedErrorWithPolicy(
                             allocator,
                             recovery.prepared,
                             .reservation_outcome_ambiguous,
                         );
                     claim_transferred.* = true;
+                    retry_expected_marker =
+                        reserved.ownership_acknowledgment.?.marker;
                     const after_reserve = self.verifier.verifyLockFn(
                         self.verifier.context,
                         allocator,
@@ -6510,6 +6524,10 @@ pub const Engine = struct {
                             null
                         else
                             review_claim,
+                        .expected_ownership_marker = if (retry_unbound_preflight)
+                            retry_expected_marker.?
+                        else
+                            null,
                     },
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -11728,6 +11746,10 @@ const FakeRunner = struct {
                         return error.MissingRecoveryAcknowledgment,
                 });
             self.inspect_status = .recovery_required;
+            result.ownership_acknowledgment = ownershipAcknowledgment(
+                self.inspect_deferred_acknowledgment.?,
+                request.orchestration_id.?,
+            );
         }
         if (request.reconciliation_claim != null and
             result.result.exit_status == .success)

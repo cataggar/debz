@@ -479,12 +479,58 @@ pub const OwnershipCleanupObserver = struct {
 };
 
 pub const OwnershipCleanup = struct {
-    attempt_id: [32]u8,
-    acknowledgment_id: [32]u8,
+    authorization: DeferredAcknowledgmentAuthorization,
     terminal_state: DeferredAcknowledgmentState,
-    expected_marker: ?DeferredAcknowledgment = null,
     observer: ?OwnershipCleanupObserver = null,
 };
+
+pub const DeferredAcknowledgmentAuthorization = union(enum) {
+    exact_v2: DeferredAcknowledgment,
+    legacy_v1: struct {
+        attempt_id: [32]u8,
+        acknowledgment_id: [32]u8,
+    },
+};
+
+pub fn authorizationFromTrustedMarker(
+    marker: DeferredAcknowledgment,
+) DeferredAcknowledgmentAuthorization {
+    return if (marker.document_version == deferred_ack_v2_schema_version)
+        .{ .exact_v2 = marker }
+    else
+        .{ .legacy_v1 = .{
+            .attempt_id = marker.attempt_id,
+            .acknowledgment_id = marker.acknowledgment_id,
+        } };
+}
+
+fn authorizeDeferredAcknowledgment(
+    observed: DeferredAcknowledgment,
+    authorization: DeferredAcknowledgmentAuthorization,
+) !void {
+    switch (authorization) {
+        .exact_v2 => |expected| {
+            if (expected.document_version != deferred_ack_v2_schema_version or
+                observed.document_version != deferred_ack_v2_schema_version)
+                return error.DeferredAcknowledgmentMismatch;
+            if (!deferredAcknowledgmentExactEqual(observed, expected))
+                return error.DeferredAcknowledgmentMismatch;
+        },
+        .legacy_v1 => |legacy| {
+            if (observed.document_version != deferred_ack_schema_version)
+                return error.AuthorizationEvidenceMissing;
+            if (!std.mem.eql(
+                u8,
+                &observed.attempt_id,
+                &legacy.attempt_id,
+            ) or !std.mem.eql(
+                u8,
+                &observed.acknowledgment_id,
+                &legacy.acknowledgment_id,
+            )) return error.DeferredAcknowledgmentMismatch;
+        },
+    }
+}
 
 pub fn createDeferredAcknowledgment(
     input: DeferredAcknowledgment,
@@ -2491,20 +2537,10 @@ pub const Store = struct {
         defer if (record) |*owned| owned.deinit();
         if (marker == null) return error.NoDeferredAcknowledgment;
         const observed = marker.?;
-        if (cleanup.expected_marker) |expected|
-            if (!deferredAcknowledgmentExactEqual(
-                observed,
-                expected,
-            )) return error.DeferredAcknowledgmentMismatch;
-        if (!std.mem.eql(
-            u8,
-            &observed.attempt_id,
-            &cleanup.attempt_id,
-        ) or !std.mem.eql(
-            u8,
-            &observed.acknowledgment_id,
-            &cleanup.acknowledgment_id,
-        )) return error.DeferredAcknowledgmentMismatch;
+        try authorizeDeferredAcknowledgment(
+            observed,
+            cleanup.authorization,
+        );
         if (record) |owned| {
             const expected_terminal = deferredAcknowledgmentWithState(
                 observed,
@@ -2780,6 +2816,7 @@ pub const Error = LockError || ValidationError || error{
     NamespaceUnavailable,
     StoreFailed,
     AttemptMismatch,
+    AuthorizationEvidenceMissing,
 };
 
 /// What the caller intends to do with the root.
@@ -2875,6 +2912,9 @@ pub const Request = struct {
     /// Exact durable recovery review claim consumed under the root lock before
     /// a confirmed recovery may adopt or create lower ownership.
     recovery_review_claim: ?RecoveryReviewClaim = null,
+    /// Independently authenticated exact lower owner used when a restarted
+    /// workflow encounters a v2 deferred acknowledgment.
+    expected_deferred_acknowledgment: ?DeferredAcknowledgment = null,
     acquisition_observer: ?AcquisitionObserver = null,
     /// Test seam. Production callers leave it null and receive a random
     /// identifier from the system CSPRNG.
@@ -3098,7 +3138,7 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
-        const deferred = store_handle.readDeferredAcknowledgment(
+        var deferred = store_handle.readDeferredAcknowledgment(
             allocator,
         ) catch return error.RecordCorrupt;
         if (recovery_review) |review| {
@@ -3121,9 +3161,24 @@ pub const Coordinator = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.StoreFailed,
                 };
+                deferred = bindDeferredAcknowledgmentToRecoveryReview(
+                    deferred.?,
+                    review,
+                ) catch return error.RecordCorrupt;
                 recovery_review = null;
             } else if (prior != null) {
                 return error.RecoveryRequired;
+            }
+        }
+        if (deferred) |marker| {
+            if (marker.document_version == deferred_ack_v2_schema_version and
+                request.recovery_review_claim == null)
+            {
+                const expected =
+                    request.expected_deferred_acknowledgment orelse
+                    return error.AuthorizationEvidenceMissing;
+                if (!deferredAcknowledgmentExactEqual(marker, expected))
+                    return error.RecoveryRequired;
             }
         }
         if (deferred) |marker| switch (marker.state) {
@@ -3139,8 +3194,7 @@ pub const Coordinator = struct {
                     &marker.acknowledgment_id,
                 )) return error.RecoveryRequired;
                 store_handle.cleanupOwned(allocator, .{
-                    .attempt_id = marker.attempt_id,
-                    .acknowledgment_id = orchestration_id,
+                    .authorization = authorizationFromTrustedMarker(marker),
                     .terminal_state = marker.state,
                 }) catch return error.StoreFailed;
                 if (prior) |*value| {
@@ -3169,8 +3223,7 @@ pub const Coordinator = struct {
                                 .abandoned_before_mutation))
                         return error.RecoveryRequired;
                     _ = store_handle.retainOwnedTerminal(allocator, .{
-                        .attempt_id = marker.attempt_id,
-                        .acknowledgment_id = orchestration_id,
+                        .authorization = authorizationFromTrustedMarker(marker),
                         .terminal_state = .abandoned,
                         .observer = retry_cleanup_observer,
                     }) catch return error.StoreFailed;
@@ -3201,13 +3254,11 @@ pub const Coordinator = struct {
                         prior.?.record.outcome == .abandoned_before_mutation;
                     if (!abandoned) {
                         store_handle.cleanupOwned(allocator, .{
-                            .attempt_id = marker.attempt_id,
-                            .acknowledgment_id = orchestration_id,
+                            .authorization = authorizationFromTrustedMarker(marker),
                             .terminal_state = .released,
                         }) catch return error.StoreFailed;
                     } else _ = store_handle.retainOwnedTerminal(allocator, .{
-                        .attempt_id = marker.attempt_id,
-                        .acknowledgment_id = orchestration_id,
+                        .authorization = authorizationFromTrustedMarker(marker),
                         .terminal_state = .abandoned,
                         .observer = retry_cleanup_observer,
                     }) catch return error.StoreFailed;
@@ -4528,8 +4579,10 @@ test "root_operation.test.upgrade finalizes frozen v1 ownership without rewritin
         std.mem.indexOf(u8, source, "recovery_review_") == null,
     );
     try store.cleanupOwned(testing.allocator, .{
-        .attempt_id = acknowledged.attempt_id,
-        .acknowledgment_id = acknowledged.acknowledgment_id,
+        .authorization = .{ .legacy_v1 = .{
+            .attempt_id = acknowledged.attempt_id,
+            .acknowledgment_id = acknowledged.acknowledgment_id,
+        } },
         .terminal_state = .acknowledged,
     });
     try testing.expect(
@@ -4937,12 +4990,24 @@ test "root_operation.test.valid v2 legacy digest collision cannot replace exact 
     try testing.expectError(
         error.DeferredAcknowledgmentMismatch,
         store.retainOwnedTerminal(testing.allocator, .{
-            .attempt_id = bound_a.attempt_id,
-            .acknowledgment_id = bound_a.acknowledgment_id,
+            .authorization = .{ .exact_v2 = bound_a },
             .terminal_state = .released,
-            .expected_marker = bound_a,
         }),
     );
+    try testing.expectError(
+        error.AuthorizationEvidenceMissing,
+        store.retainOwnedTerminal(testing.allocator, .{
+            .authorization = .{ .legacy_v1 = .{
+                .attempt_id = bound_b.attempt_id,
+                .acknowledgment_id = bound_b.acknowledgment_id,
+            } },
+            .terminal_state = .released,
+        }),
+    );
+    try testing.expect(deferredAcknowledgmentExactEqual(
+        bound_b,
+        (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    ));
     try testing.expectError(
         error.DeferredAcknowledgmentMismatch,
         store.clearDeferredAcknowledgment(testing.allocator, bound_a),
@@ -5053,10 +5118,8 @@ test "root_operation.test.valid v2 legacy digest collision cannot replace exact 
     const retained = try reopened.retainOwnedTerminal(
         testing.allocator,
         .{
-            .attempt_id = bound_b.attempt_id,
-            .acknowledgment_id = bound_b.acknowledgment_id,
+            .authorization = .{ .exact_v2 = bound_b },
             .terminal_state = .released,
-            .expected_marker = bound_b,
         },
     );
     try reopened.clearDeferredAcknowledgment(testing.allocator, retained);
