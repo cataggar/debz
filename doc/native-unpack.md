@@ -1,14 +1,14 @@
-# Native unpack and file ownership planning
+# Native unpack planning and data-only materialization
 
 Roadmap item 10a is a planning slice only. It does not execute an unpack, write a
 journal, mutate an install root, recover an interrupted operation, or release
 cleanup state. Production selection of the native backend remains unavailable
 before acquisition or mutation.
 
-Item 10b retains the original materialization and differential-parity gate:
-data-only install, upgrade, downgrade, and reinstall must match reference
-`dpkg` before item 10 is complete. This planner is neither an executable
-transaction nor proof that this parity gate has passed.
+Item 10b adds a private data-only materialization adapter and an executable
+reference-`dpkg` comparison for install, upgrade, downgrade, and reinstall.
+The planner itself remains descriptive; actual execution and its bounded
+acceptance gate are described below.
 
 The implementation is `src/native_unpack.zig`. Its exported surface is limited
 to immutable descriptive types and side-effect-free helpers:
@@ -37,9 +37,10 @@ a disposable or otherwise isolated root.
 The caller must keep that root stable for the planning pass. Pinned observations
 detect the changes described below, but do not provide an atomic whole-root
 snapshot or isolation from an equally privileged concurrent writer. A plan
-digest identifies descriptive evidence; it is not execution authority. Item
-10b and the later recovery/integration work must revalidate that evidence under
-the execution lock/isolation contract before mutation.
+digest identifies descriptive evidence; it is not execution authority. The
+10b adapter requires its fixture root to remain isolated from planning through
+publication. Later production integration must supply and enforce the
+execution lock/isolation contract before mutation.
 
 Archive callers provide bytes, not an application inventory. For every program
 artifact, the planner:
@@ -55,8 +56,8 @@ The package database is likewise supplied as snapshot bytes, not as a
 caller-built `package_database.Database`. The planner imports the snapshot
 itself, checks its generation and package count against the program, rejects
 pending update fragments, and builds ownership from the imported `info/*.list`
-records. The resulting `package_database_changes.Plan` is data only; item 10
-does not lower it into root-mutation execution.
+records. The resulting `package_database_changes.Plan` is data only; the private 10b
+adapter separately lowers it into root-mutation intents.
 
 All scans have explicit limits: distinct packages and artifacts, aggregate
 archive/model bytes, paths, filesystem changes, removals, work units, deferred
@@ -119,8 +120,9 @@ deferred-item field.
 
 An upgrade records the version most recently configured. A previously
 installed package contributes its installed version; an already-unpacked
-package must carry an explicit scalar `Config-Version`. The final unpacked
-status write preserves that value instead of dropping it.
+package preserves its explicit scalar `Config-Version`. An absent field means
+the package has never been configured, including repeated unconfigured unpack,
+and remains absent. A malformed field is handed off rather than fabricated.
 
 ## Package identity and ownership
 
@@ -294,7 +296,7 @@ digested. Covered features include:
 - package removal and purge;
 - package disappearance;
 - held-selection changes;
-- missing or malformed prior `Config-Version` evidence for an unpacked upgrade;
+- malformed prior `Config-Version` evidence for an unpacked upgrade;
 - diversions, stat overrides, alternatives, and unmodeled package metadata;
 - unmodeled `var/lib/dpkg` namespace entries;
 - shared-root interoperability; and
@@ -311,12 +313,74 @@ never claimed safe merely because the caller requested native execution.
 legacy backend remains the default and selection never falls back after native
 was requested.
 
-The public `debz` additions are descriptive native-unpack aliases only.
-`root_mutation`, `root_operation`, apt, product, repository, and completion
-APIs are unchanged by this slice. The root-filesystem additions are narrowly
-scoped read-only pinned observations; they do not enable native execution.
-Data-only materialization and parity are item 10b. Lifecycle, crash recovery,
-experimental integration, and production cutover remain items 11–16.
+The public `debz` additions are descriptive native-unpack aliases only. Apt,
+product, repository, completion, and root-operation APIs remain unchanged.
+The existing mutation engine additionally supports final nonzero directory
+timestamps and ordered hard-link group replacement. These changes do not
+enable a native production executor. Lifecycle, recovery/provenance
+integration, experimental integration, and production cutover remain items
+11–16.
+
+## Data-only materialization acceptance (item 10b)
+
+`zig build test-native-materialization` runs an internal native test driver
+against actual `.deb` bytes and compares the resulting disposable root with
+reference `dpkg --unpack`. The driver is not a production CLI/backend entry
+point. It composes the planner with the existing root-operation and
+root-mutation layer rather than interpreting plan fields in Python or copying
+the reference result.
+
+The private adapter reimports the root database, binds the archive bytes again,
+uses the actual system root-operation lock, and lowers payload and database
+changes into one existing mutation-engine plan. Database capture is no-follow
+and limited to 256 MiB of aggregate live allocation, in addition to per-file
+and entry-count limits. Archive models and database content remain owned
+through apply. Successful application verifies payload and database state
+before retiring the journal and active attempt; rolled-back operations retire
+only resolved evidence, and recovery-required results retain it. The shared
+lock inode and empty bookkeeping directories remain in place for subsequent
+operations. Unexpected preparation failures retain the active attempt rather
+than assuming every partial journal write was cleaned up.
+
+Explicit archive-directory timestamps are published after child operations.
+A newly materialized directory with timestamp zero is explicitly refused
+before mutation because the current mutation journal uses zero to mean an
+unasserted directory timestamp. The adapter does not silently substitute the
+current time. This limitation, conffiles, scripts, triggers, and the other
+typed handoffs remain outside its supported data-only subset.
+
+The independent runner, `tools/test-native-materialization.py`, builds ordinary
+packages with `dpkg-deb`. Their ownership matches the test user, so reference
+unpack can use `--force-not-root` without host privilege. Every candidate and
+reference root has an explicit disposable-root marker, its own dpkg database,
+and a bounded temporary workspace. Native execution never invokes dpkg; only
+the reference runner and initial healthy-root setup do so.
+
+The required cases are fresh install, upgrade, downgrade, and reinstall from
+real installed dpkg states, plus four consecutive native unpack operations on
+one root. The fixture includes changed and obsolete content, a hard-link
+group, a symbolic link, permission changes, and an empty archive directory.
+The existing semantic comparator checks path kinds, bytes, ownership, modes,
+file/link timestamps, hard-link groups, status and status-old, ownership
+lists, checksum manifests, architecture, and trigger state. It excludes debz's
+bookkeeping and ordinary directory timestamps, whose values depend on child
+publication; the runner additionally checks the empty archive directory's
+timestamp exactly. Conffile and maintainer-script cases must hand off without
+changing payload/database state or leaving active mutation evidence. The
+zero-directory-timestamp refusal is exercised the same way, and the repeated
+sequence must retain the same shared lock inode.
+
+Both native amd64 and arm64 CI jobs run this target in Debug and ReleaseSafe.
+`--oracle-only` validates fixture/reference consistency during development; it
+does not run native execution and cannot establish native parity. An absent or
+skipped native driver cannot pass acceptance without a structured outcome
+report and a matching resulting root.
+
+This is an isolated data-only integration boundary, not proof of production
+cutover, arbitrary maintainer-script safety, or an atomic snapshot in the
+presence of another privileged writer. Native backend selection remains
+unavailable. Later integration must supply the production authorization,
+isolation, recovery, and provenance contracts.
 
 ## Validation
 

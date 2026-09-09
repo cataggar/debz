@@ -529,6 +529,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-unpack", "Run native unpack and file ownership tests")
         .dependOn(&run_native_unpack_tests.step);
 
+    const native_materialization_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.materialization external fixture"},
+    });
+    const native_materialization = b.addSystemCommand(
+        &.{ "python3", "tools/test-native-materialization.py" },
+    );
+    native_materialization.addArtifactArg(native_materialization_tests);
+    const native_materialization_oracle_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_materialization.py" },
+    );
+    native_materialization.step.dependOn(&native_materialization_oracle_tests.step);
+    test_step.dependOn(&native_materialization_oracle_tests.step);
+    b.step("test-native-materialization", "Compare real native data-only unpack with dpkg")
+        .dependOn(&native_materialization.step);
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{

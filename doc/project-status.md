@@ -52,8 +52,9 @@ typed diagnostic, and `transaction_engine.authorizeProgram` requires a matching
 program before native execution. See
 [Native transaction program v1](native-transaction-program.md).
 
-`debz.native_unpack` is roadmap item 10a's planning-only unpack and ownership
-slice. Its private planner rebuilds bounded archive models from authenticated
+`debz.native_unpack` implements roadmap item 10's unpack and ownership work:
+10a's descriptive planner and 10b's private data-only materialization adapter.
+The planner rebuilds bounded archive models from authenticated
 bytes, imports the supplied package-database snapshot itself, and produces an
 immutable ordered filesystem description plus a
 `package_database_changes.Plan`. It models package identity by name and
@@ -62,10 +63,14 @@ merged-`/usr`, obsolete paths, and the reserved dpkg namespace. Conffiles,
 scripts, triggers, removal, purge, selection changes, package disappearance,
 shared roots, and unsupported filesystem/database features return typed
 handoffs. No apply, journal, recovery, or release entry point is exported.
-Native backend selection remains `BackendUnavailable` before mutation. Item
-10b still owns data-only materialization and real dpkg parity; item 10 is not
-complete until that gate passes. Execution and recovery integration must
-provide trusted authority and revalidate the planning evidence. See
+Native backend selection remains `BackendUnavailable` before mutation. The
+private adapter composes the existing lock, journal, and mutation engine;
+`test-native-materialization` compares real install, upgrade, downgrade,
+reinstall, and repeated unpack results with dpkg on disposable roots. Native
+amd64/arm64 CI runs that gate in Debug and ReleaseSafe. Zero timestamps on
+newly materialized directories are explicitly refused, not approximated.
+Production execution, lifecycle, recovery, and provenance integration remain
+later roadmap work. See
 [Native unpack and file ownership](native-unpack.md).
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native

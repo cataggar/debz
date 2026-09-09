@@ -1,6 +1,6 @@
 //! Native unpack and file ownership for data-only package transactions.
 //!
-//! This is roadmap item 10a of the native transaction engine. Its private
+//! This implements roadmap item 10 of the native transaction engine. Its private
 //! planner consumes a validated [`native_program.Program`], authenticated
 //! archive bytes, one package-database snapshot, and read-only root
 //! observations. It produces the exact immutable filesystem description and
@@ -14,8 +14,9 @@
 //! bootstrap materialization and normal unpack, merged-`/usr` normalization, file
 //! ownership and conflict resolution, `Replaces`, hard links, symbolic links,
 //! modes, ownership, modification times, directory transitions, the package
-//! `.list`, and `md5sums`. Actual materialization and differential parity are
-//! item 10b, not capabilities or guarantees of this module.
+//! `.list`, and `md5sums`. A private, isolated-root materialization adapter
+//! composes the existing mutation engine for item 10b's real-dpkg fixtures.
+//! Neither the planner nor adapter is a public native executor.
 //! Configuration, conffiles, scripts, triggers,
 //! removal, and purge belong to the following roadmap items. A package that
 //! needs one of them is refused with an explicit typed handoff before any
@@ -23,6 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const absolute_path = @import("absolute_path.zig");
 const archive_application = @import("archive_application.zig");
 const control_record = @import("control_record.zig");
 const dpkg_status = @import("dpkg_status.zig");
@@ -30,8 +32,12 @@ const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
 const package_database = @import("package_database.zig");
 const package_database_changes = @import("package_database_changes.zig");
+const product_api = @import("product_api.zig");
 const relation = @import("relation.zig");
 const root_fs = @import("root_fs.zig");
+const root_mutation = @import("root_mutation.zig");
+const root_operation = @import("root_operation.zig");
+const transaction_recovery = @import("transaction_recovery.zig");
 const version_module = @import("debian_version.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -348,6 +354,19 @@ fn detectAliases(
         .aliases = owned_aliases,
         .foreign = owned_foreign,
     };
+}
+
+fn normalizeCapturedNativeArchitecture(
+    snapshot: *package_database.Snapshot,
+    architecture: []const u8,
+) void {
+    const entry = snapshot.arch orelse return;
+    if (entry.kind != .regular or entry.bytes.len != architecture.len + 1)
+        return;
+    if (entry.bytes[entry.bytes.len - 1] != '\n' or
+        !std.mem.eql(u8, entry.bytes[0..architecture.len], architecture))
+        return;
+    snapshot.arch = null;
 }
 
 /// `usr/lib`, `/usr/lib`, and `./usr/lib` are the three spellings a Debian
@@ -1871,13 +1890,17 @@ fn openWork(
         }
         configured_version = switch (record.status.current) {
             .installed, .triggers_awaited, .triggers_pending => record.version,
-            .unpacked => scalarStatusField(record.*, "Config-Version") orelse blk: {
-                try builder.deferFeature(.{
-                    .feature = .config_version,
-                    .package = identity.name,
-                    .architecture = identity.architecture,
-                });
-                break :blk null;
+            .unpacked => switch (configVersionField(record.*)) {
+                .absent => null,
+                .valid => |value| value,
+                .invalid => blk: {
+                    try builder.deferFeature(.{
+                        .feature = .config_version,
+                        .package = identity.name,
+                        .architecture = identity.architecture,
+                    });
+                    break :blk null;
+                },
             },
             else => blk: {
                 try builder.deferFeature(.{
@@ -1928,17 +1951,22 @@ fn openWork(
     return builder.work.items.len - 1;
 }
 
-fn scalarStatusField(
+const ConfigVersionField = union(enum) {
+    absent,
+    valid: []const u8,
+    invalid,
+};
+
+fn configVersionField(
     record: package_database.PackageRecord,
-    name: []const u8,
-) ?[]const u8 {
-    const field = record.field(name) orelse return null;
-    if (field.value_lines.len != 1) return null;
+) ConfigVersionField {
+    const field = record.field("Config-Version") orelse return .absent;
+    if (field.value_lines.len != 1) return .invalid;
     const value = field.value_lines[0];
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0 or !std.mem.eql(u8, trimmed, value)) return null;
-    _ = version_module.DebianVersion.parse(value) catch return null;
-    return value;
+    if (trimmed.len == 0 or !std.mem.eql(u8, trimmed, value)) return .invalid;
+    _ = version_module.DebianVersion.parse(value) catch return .invalid;
+    return .{ .valid = value };
 }
 
 fn bindArtifact(
@@ -6337,6 +6365,867 @@ fn parseHex(comptime size: usize, value: []const u8) ?[size]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Internal data-only materialization adapter
+// ---------------------------------------------------------------------------
+
+const MaterializationOutcome = enum {
+    applied,
+    rolled_back,
+    recovery_required,
+    handoff,
+    refused,
+};
+
+const MaterializationResult = struct {
+    outcome: MaterializationOutcome,
+    detail: []const u8,
+};
+
+const MaterializationRequest = struct {
+    io: std.Io,
+    root: root_fs.Root,
+    install_root: []const u8,
+    planning: Request,
+    locks: root_operation.LockBackend,
+    operation: product_api.Operation,
+    hooks: root_mutation.Hooks = .{},
+    mutation_limits: root_mutation.Limits = .{},
+};
+
+const CapturedDatabase = struct {
+    snapshot: package_database.Snapshot,
+    arena: *std.heap.ArenaAllocator,
+    budget: *ModelAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    fn deinit(self: *CapturedDatabase) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.backing_allocator.destroy(self.budget);
+        self.* = undefined;
+    }
+};
+
+fn captureDatabaseFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    maximum_bytes: usize,
+) !?package_database.FileEntry {
+    const resolved = try root_fs.Path.init(path);
+    const observed = (try root.entryIfExists(resolved)) orelse return null;
+    const kind: package_database.EntryKind = switch (observed.kind) {
+        .file => .regular,
+        .directory => .directory,
+        .sym_link => .symlink,
+        else => .other,
+    };
+    const bytes = if (kind == .regular)
+        try root.readFileAlloc(allocator, resolved, maximum_bytes)
+    else
+        &.{};
+    return .{ .bytes = bytes, .kind = kind, .mode = observed.mode };
+}
+
+fn captureDatabaseSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    options: package_database.Options,
+) !CapturedDatabase {
+    return captureDatabaseSnapshotBounded(allocator, root, options, 256 * 1024 * 1024);
+}
+
+fn captureDatabaseSnapshotBounded(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    options: package_database.Options,
+    maximum_bytes: u64,
+) !CapturedDatabase {
+    const budget = try allocator.create(ModelAllocator);
+    errdefer allocator.destroy(budget);
+    budget.* = .init(allocator, maximum_bytes);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(budget.allocator());
+    errdefer arena.deinit();
+    const snapshot = captureDatabaseSnapshotInto(
+        arena.allocator(),
+        root,
+        options,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return if (budget.exhausted)
+            error.DatabaseCaptureLimit
+        else
+            error.OutOfMemory,
+        else => return err,
+    };
+    return .{
+        .snapshot = snapshot,
+        .arena = arena,
+        .budget = budget,
+        .backing_allocator = allocator,
+    };
+}
+
+fn captureDatabaseSnapshotInto(
+    owned: std.mem.Allocator,
+    root: root_fs.Root,
+    options: package_database.Options,
+) !package_database.Snapshot {
+    const limits = options.limits;
+
+    const status = (try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.status_path,
+        limits.max_status_bytes,
+    )) orelse return error.DatabaseStatusMissing;
+    var snapshot: package_database.Snapshot = .{ .status = status };
+    snapshot.status_old = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.status_old_path,
+        limits.max_status_bytes,
+    );
+    snapshot.arch = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.arch_path,
+        limits.max_database_file_bytes,
+    );
+    snapshot.diversions = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.diversions_path,
+        limits.max_database_file_bytes,
+    );
+    snapshot.statoverride = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.statoverride_path,
+        limits.max_database_file_bytes,
+    );
+    snapshot.triggers_file = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.triggers_file_path,
+        limits.max_database_file_bytes,
+    );
+    snapshot.triggers_unincorp = try captureDatabaseFile(
+        owned,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.triggers_unincorp_path,
+        limits.max_database_file_bytes,
+    );
+
+    var info: std.ArrayList(package_database.InfoEntry) = .empty;
+    defer info.deinit(owned);
+    var info_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.info_directory,
+    ));
+    defer info_dir.close(root.io);
+    var info_iterator = info_dir.iterate();
+    while (try info_iterator.next(root.io)) |entry| {
+        if (info.items.len >= limits.max_info_entries)
+            return error.DatabaseCaptureLimit;
+        const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                name,
+            },
+        );
+        const file = (try captureDatabaseFile(
+            owned,
+            root,
+            path,
+            limits.max_info_file_bytes,
+        )) orelse return error.DatabaseCaptureChanged;
+        try info.append(owned, .{
+            .name = name,
+            .bytes = file.bytes,
+            .kind = file.kind,
+            .mode = file.mode,
+        });
+    }
+    std.mem.sort(package_database.InfoEntry, info.items, {}, struct {
+        fn less(
+            _: void,
+            left: package_database.InfoEntry,
+            right: package_database.InfoEntry,
+        ) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.less);
+    snapshot.info = try owned.dupe(package_database.InfoEntry, info.items);
+
+    var updates: std.ArrayList(package_database.UpdateEntry) = .empty;
+    defer updates.deinit(owned);
+    var updates_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.updates_directory,
+    ));
+    defer updates_dir.close(root.io);
+    var updates_iterator = updates_dir.iterate();
+    while (try updates_iterator.next(root.io)) |entry| {
+        if (updates.items.len >= limits.max_update_fragments)
+            return error.DatabaseCaptureLimit;
+        const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.updates_directory,
+                name,
+            },
+        );
+        const file = (try captureDatabaseFile(
+            owned,
+            root,
+            path,
+            limits.max_database_file_bytes,
+        )) orelse return error.DatabaseCaptureChanged;
+        try updates.append(owned, .{
+            .name = name,
+            .bytes = file.bytes,
+            .kind = file.kind,
+            .mode = file.mode,
+        });
+    }
+    std.mem.sort(package_database.UpdateEntry, updates.items, {}, struct {
+        fn less(
+            _: void,
+            left: package_database.UpdateEntry,
+            right: package_database.UpdateEntry,
+        ) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.less);
+    snapshot.updates = try owned.dupe(package_database.UpdateEntry, updates.items);
+    return snapshot;
+}
+
+const BoundArchive = struct {
+    artifact: u32,
+    bytes: []const u8,
+    model: archive_application.Model,
+    binding: root_mutation.ArtifactBinding,
+};
+
+const BoundArchives = struct {
+    items: []BoundArchive,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *BoundArchives) void {
+        for (self.items) |*item| item.model.deinit();
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    fn find(self: *const BoundArchives, artifact: u32) ?*const BoundArchive {
+        for (self.items) |*item| {
+            if (item.artifact == artifact) return item;
+        }
+        return null;
+    }
+};
+
+fn bindMaterializationArchives(
+    allocator: std.mem.Allocator,
+    request: Request,
+) !?BoundArchives {
+    const items = try allocator.alloc(BoundArchive, request.program.artifacts.len);
+    var initialized: usize = 0;
+    var transferred = false;
+    defer if (!transferred) {
+        for (items[0..initialized]) |*item| item.model.deinit();
+        allocator.free(items);
+    };
+    for (request.program.artifacts, 0..) |artifact, index| {
+        const input = for (request.archives) |candidate| {
+            if (candidate.artifact == artifact.index) break candidate;
+        } else return null;
+        const archive_sha256 = parseHex(32, &artifact.sha256) orelse return null;
+        const application_sha256 = parseHex(
+            32,
+            &artifact.application_sha256,
+        ) orelse return null;
+        var model = switch (archive_application.revalidate(
+            allocator,
+            input.bytes,
+            .{ .local = .{
+                .size = artifact.size,
+                .sha256 = archive_sha256,
+                .identity = .{
+                    .package = artifact.package.name,
+                    .version = artifact.package.version,
+                    .architecture = artifact.package.architecture,
+                },
+            } },
+            request.limits.archive,
+            application_sha256,
+        )) {
+            .model => |value| value,
+            .diagnostic => return null,
+        };
+        var model_transferred = false;
+        defer if (!model_transferred) model.deinit();
+        const binding = root_mutation.bindArchive(
+            &model,
+            input.bytes,
+            artifact.index,
+            application_sha256,
+        ) catch return null;
+        items[index] = .{
+            .artifact = artifact.index,
+            .bytes = input.bytes,
+            .model = model,
+            .binding = binding,
+        };
+        initialized += 1;
+        model_transferred = true;
+    }
+    transferred = true;
+    return .{ .items = items, .allocator = allocator };
+}
+
+fn artifactEvidenceDigest(bound: *const BoundArchives) [32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update(digest_domain);
+    hashText(&hash, "materialization-artifacts");
+    hashNumber(&hash, bound.items.len);
+    for (bound.items) |item| {
+        hashNumber(&hash, item.artifact);
+        hashText(&hash, &item.model.provenance().sha256);
+        hashText(&hash, &item.model.digest);
+    }
+    return hash.finalResult();
+}
+
+fn materializationOverwrite(
+    publications: *const std.StringHashMapUnmanaged(PlannedPath),
+    path: []const u8,
+) !root_mutation.Overwrite {
+    const planned = publications.get(path) orelse
+        return error.MaterializationPlanMismatch;
+    return if (planned.previous == null) .require_absent else .replace;
+}
+
+const MaterializationIntents = struct {
+    intents: std.ArrayList(root_mutation.Intent),
+    database: root_mutation.DatabaseIntents,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *MaterializationIntents) void {
+        self.intents.deinit(self.allocator);
+        self.database.deinit();
+        self.* = undefined;
+    }
+};
+
+fn lowerMaterializationIntents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    plan_value: Plan,
+    bound: *const BoundArchives,
+) !MaterializationIntents {
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    errdefer intents.deinit(allocator);
+    var directory_metadata: std.ArrayList(root_mutation.Intent) = .empty;
+    defer directory_metadata.deinit(allocator);
+    var publications: std.StringHashMapUnmanaged(PlannedPath) = .empty;
+    defer publications.deinit(allocator);
+    for (plan_value.packages) |package| {
+        for (package.paths) |planned| {
+            if (!planned.publish) continue;
+            const found = try publications.getOrPut(allocator, planned.path);
+            if (found.found_existing)
+                return error.MaterializationPlanMismatch;
+            found.value_ptr.* = planned;
+        }
+    }
+
+    for (plan_value.filesystem) |change| switch (change) {
+        .remove => |removal| try intents.append(allocator, if (removal.directory)
+            .{ .remove_directory = .{
+                .path = removal.path,
+                .removal = .require_present,
+            } }
+        else
+            .{ .remove = .{
+                .path = removal.path,
+                .removal = .require_present,
+            } }),
+        .directory => |directory| {
+            try intents.append(allocator, .{
+                .directory = .{
+                    .path = directory.path,
+                    // Keep a fresh directory searchable until every child is
+                    // published; the exact archive mode and timestamp are one
+                    // final journalled metadata step below.
+                    .mode = directory.mode | 0o700,
+                    .uid = directory.uid,
+                    .gid = directory.gid,
+                    .overwrite = try materializationOverwrite(
+                        &publications,
+                        directory.path,
+                    ),
+                },
+            });
+            if (directory.modified_nanoseconds) |modified| {
+                if (modified == 0)
+                    return error.ZeroDirectoryTimestampUnsupported;
+                try directory_metadata.append(allocator, .{ .metadata = .{
+                    .path = directory.path,
+                    .mode = directory.mode,
+                    .uid = directory.uid,
+                    .gid = directory.gid,
+                    .modified_nanoseconds = modified,
+                } });
+            }
+        },
+        .file => |file| {
+            const archive = bound.find(file.artifact) orelse
+                return error.MaterializationArchiveMissing;
+            if (file.archive_entry >= archive.model.files.len)
+                return error.MaterializationPlanMismatch;
+            const modeled = archive.model.files[file.archive_entry];
+            if (modeled.kind != .regular)
+                return error.MaterializationPlanMismatch;
+            var intent = try root_mutation.archiveFileIntent(
+                file.path,
+                &archive.model,
+                modeled,
+                archive.binding,
+            );
+            intent.file.overwrite = try materializationOverwrite(
+                &publications,
+                file.path,
+            );
+            try intents.append(allocator, intent);
+        },
+        .symlink => |link| try intents.append(allocator, .{ .symlink = .{
+            .path = link.path,
+            .target = link.target,
+            .uid = link.uid,
+            .gid = link.gid,
+            .modified_nanoseconds = link.modified_nanoseconds,
+            .overwrite = try materializationOverwrite(&publications, link.path),
+        } }),
+        .hardlink => |link| try intents.append(allocator, .{ .hard_link = .{
+            .path = link.path,
+            .source = link.source,
+            .overwrite = try materializationOverwrite(&publications, link.path),
+        } }),
+    };
+    std.mem.reverse(root_mutation.Intent, directory_metadata.items);
+    try intents.appendSlice(allocator, directory_metadata.items);
+
+    const database_directory = try root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    const unincorp_path = package_database.database_directory ++ "/" ++
+        package_database.triggers_unincorp_path;
+    if (try root.entryIfExists(try root_fs.Path.init(unincorp_path)) == null) {
+        var empty_sha256: [32]u8 = undefined;
+        Sha256.hash("", &empty_sha256, .{});
+        try intents.append(allocator, .{ .file = .{
+            .path = unincorp_path,
+            .bytes = "",
+            .mode = 0o644,
+            .uid = database_directory.uid,
+            .gid = database_directory.gid,
+            .modified_nanoseconds = 0,
+            .overwrite = .require_absent,
+            .expected_sha256 = empty_sha256,
+        } });
+    }
+    var database = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        plan_value.database,
+        .{
+            .uid = database_directory.uid,
+            .gid = database_directory.gid,
+        },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    errdefer database.deinit();
+    try intents.appendSlice(allocator, database.intents);
+    return .{
+        .intents = intents,
+        .database = database,
+        .allocator = allocator,
+    };
+}
+
+fn verifyMaterializedFilesystem(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    plan_value: Plan,
+) !void {
+    for (plan_value.filesystem) |change| switch (change) {
+        .remove => |removal| if (try root.entryIfExists(
+            try root_fs.Path.init(removal.path),
+        ) != null) return error.MaterializationVerificationFailed,
+        .directory => |directory| {
+            const entry = try root.entry(try root_fs.Path.init(directory.path));
+            if (!entry.isDirectory() or entry.mode != directory.mode or
+                entry.uid != directory.uid or entry.gid != directory.gid)
+                return error.MaterializationVerificationFailed;
+            if (directory.modified_nanoseconds) |modified| {
+                if (entry.modified_nanoseconds != modified)
+                    return error.MaterializationVerificationFailed;
+            }
+        },
+        .file => |file| {
+            const path = try root_fs.Path.init(file.path);
+            const entry = try root.entry(path);
+            if (!entry.isRegularFile() or entry.mode != file.mode or
+                entry.uid != file.uid or entry.gid != file.gid or
+                entry.modified_nanoseconds != file.modified_nanoseconds)
+                return error.MaterializationVerificationFailed;
+            const maximum = std.math.cast(usize, entry.size) orelse
+                return error.MaterializationVerificationFailed;
+            const bytes = try root.readFileAlloc(allocator, path, maximum);
+            defer allocator.free(bytes);
+            var digest: [32]u8 = undefined;
+            Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &file.sha256))
+                return error.MaterializationVerificationFailed;
+        },
+        .symlink => |link| {
+            const path = try root_fs.Path.init(link.path);
+            const entry = try root.entry(path);
+            if (!entry.isSymbolicLink() or entry.uid != link.uid or
+                entry.gid != link.gid or
+                entry.modified_nanoseconds != link.modified_nanoseconds)
+                return error.MaterializationVerificationFailed;
+            var target: [root_fs.maximum_link_target_bytes]u8 = undefined;
+            if (!std.mem.eql(
+                u8,
+                try root.readSymbolicLink(path, &target),
+                link.target,
+            )) return error.MaterializationVerificationFailed;
+        },
+        .hardlink => |link| {
+            const target = try root.entry(try root_fs.Path.init(link.path));
+            const source = try root.entry(try root_fs.Path.init(link.source));
+            if (!target.isRegularFile() or !source.isRegularFile() or
+                target.device != source.device or target.inode != source.inode)
+                return error.MaterializationVerificationFailed;
+        },
+    };
+}
+
+fn verifyMaterializedDatabase(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    options: package_database.Options,
+    plan_value: Plan,
+) !void {
+    var captured = try captureDatabaseSnapshot(allocator, root, options);
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var imported = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        options,
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.MaterializationVerificationFailed,
+    };
+    defer imported.deinit();
+
+    var status_digest: [32]u8 = undefined;
+    Sha256.hash(captured.snapshot.status.bytes, &status_digest, .{});
+    if (captured.snapshot.status.bytes.len !=
+        plan_value.database.resulting_status.size or
+        !std.mem.eql(
+            u8,
+            &status_digest,
+            &plan_value.database.resulting_status.sha256,
+        ))
+        return error.MaterializationVerificationFailed;
+    const old = captured.snapshot.status_old orelse
+        return error.MaterializationVerificationFailed;
+    var old_digest: [32]u8 = undefined;
+    Sha256.hash(old.bytes, &old_digest, .{});
+    if (old.bytes.len != plan_value.database.base_status.size or
+        !std.mem.eql(u8, &old_digest, &plan_value.database.base_status.sha256))
+        return error.MaterializationVerificationFailed;
+}
+
+fn materialize(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+) !MaterializationResult {
+    var planned = switch (try plan(allocator, request.planning)) {
+        .handoff => |value| {
+            var handoff = value;
+            defer handoff.deinit();
+            return .{
+                .outcome = .handoff,
+                .detail = if (handoff.items.len == 0)
+                    "handoff"
+                else
+                    handoff.items[0].feature.spelling(),
+            };
+        },
+        .refusal => |value| {
+            var refusal = value;
+            defer refusal.deinit();
+            return .{
+                .outcome = .refused,
+                .detail = @tagName(refusal.diagnostic.code),
+            };
+        },
+        .plan => |value| value,
+    };
+    defer planned.deinit();
+
+    var fresh_database = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer fresh_database.deinit();
+    normalizeCapturedNativeArchitecture(
+        &fresh_database.snapshot,
+        request.planning.program.target_architecture,
+    );
+    const fresh_generation = try package_database.generation(
+        allocator,
+        fresh_database.snapshot,
+    );
+    if (!fresh_generation.eql(planned.database.base_generation))
+        return .{ .outcome = .refused, .detail = "database_generation_drift" };
+
+    var bound = (try bindMaterializationArchives(
+        allocator,
+        request.planning,
+    )) orelse return .{
+        .outcome = .refused,
+        .detail = "archive_binding_mismatch",
+    };
+    defer bound.deinit();
+    const artifact_evidence = artifactEvidenceDigest(&bound);
+
+    var lowered = lowerMaterializationIntents(
+        allocator,
+        request.root,
+        planned,
+        &bound,
+    ) catch |err| switch (err) {
+        error.ZeroDirectoryTimestampUnsupported => return .{
+            .outcome = .refused,
+            .detail = "zero_directory_timestamp_unsupported",
+        },
+        else => return err,
+    };
+    defer lowered.deinit();
+
+    const program_sha256 = parseHex(
+        32,
+        &request.planning.program.digest_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const authorization_sha256 = parseHex(
+        32,
+        &request.planning.program.authorization_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const request_sha256 = parseHex(
+        32,
+        &request.planning.program.request_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const policy_sha256 = parseHex(
+        32,
+        &request.planning.program.executor_policy_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const lock_digest = parseHex(
+        32,
+        &request.planning.program.exact_lock.digest_sha256,
+    ) orelse return error.MaterializationProgramDigest;
+    const exact_lock: root_operation.LockBinding = .{
+        .version = request.planning.program.exact_lock.version,
+        .schema = request.planning.program.exact_lock.schema,
+        .digest_sha256 = lock_digest,
+    };
+    const operation_evidence: root_operation.Evidence = .{
+        .authorization_sha256 = authorization_sha256,
+        .program_sha256 = program_sha256,
+        .plan_sha256 = planned.digest,
+        .exact_lock = exact_lock,
+        .database_generation_sha256 = planned.database.base_generation.sha256,
+        .artifact_evidence_sha256 = artifact_evidence,
+    };
+    const mutation_evidence: root_mutation.Evidence = .{
+        .authorization_sha256 = authorization_sha256,
+        .program_sha256 = program_sha256,
+        .plan_sha256 = planned.digest,
+        .exact_lock = exact_lock,
+        .database_generation_sha256 = planned.database.base_generation.sha256,
+        .database_plan_sha256 = planned.database.digest,
+        .artifact_evidence_sha256 = artifact_evidence,
+    };
+
+    var coordinator = try root_operation.Coordinator.open(
+        request.io,
+        request.root,
+        request.install_root,
+        request.locks,
+    );
+    var attempt = try coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = request.operation },
+        .request_sha256 = request_sha256,
+        .policy_sha256 = policy_sha256,
+        .evidence = operation_evidence,
+        .target_architecture = request.planning.program.target_architecture,
+        .foreign_architectures = request.planning.program.foreign_architectures,
+    });
+    defer attempt.release();
+
+    const preflight_result = root_mutation.preflight(
+        allocator,
+        request.root,
+        .{
+            .intents = lowered.intents.items,
+            .limits = request.mutation_limits,
+        },
+    ) catch |err| {
+        try attempt.abandonIfPreMutation(allocator);
+        return err;
+    };
+    var mutation_plan = switch (preflight_result) {
+        .diagnostic => |diagnostic| {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = @tagName(diagnostic.code),
+            };
+        },
+        .plan => |value| value,
+    };
+    defer mutation_plan.deinit();
+
+    var refusal: ?root_mutation.Diagnostic = null;
+    var engine = root_mutation.prepare(
+        allocator,
+        request.root,
+        &attempt,
+        &mutation_plan,
+        mutation_evidence,
+        .{
+            .hooks = request.hooks,
+            .limits = request.mutation_limits,
+            .refusal = &refusal,
+        },
+    ) catch |err| switch (err) {
+        error.Rejected => {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = if (refusal) |diagnostic|
+                    @tagName(diagnostic.code)
+                else
+                    "mutation_prepare_refused",
+            };
+        },
+        error.SimulatedCrash => return .{
+            .outcome = .recovery_required,
+            .detail = "simulated_crash",
+        },
+        else => return err,
+    };
+    defer engine.deinit();
+
+    const mutation_report = root_mutation.apply(
+        &engine,
+        .fromPlan(&mutation_plan),
+    ) catch |err| switch (err) {
+        error.SimulatedCrash => return .{
+            .outcome = .recovery_required,
+            .detail = "simulated_crash",
+        },
+        error.RecoveryRequired,
+        error.ExternalModification,
+        error.VerificationFailed,
+        => return .{
+            .outcome = .recovery_required,
+            .detail = @errorName(err),
+        },
+        else => return err,
+    };
+    if (mutation_report.outcome == .recovery_required) {
+        return .{
+            .outcome = .recovery_required,
+            .detail = if (mutation_report.diagnostic) |diagnostic|
+                @tagName(diagnostic.code)
+            else
+                "recovery_required",
+        };
+    }
+
+    if (mutation_report.outcome == .applied) {
+        verifyMaterializedFilesystem(
+            allocator,
+            request.root,
+            planned,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .verification);
+            return .{
+                .outcome = .recovery_required,
+                .detail = @errorName(err),
+            };
+        };
+        verifyMaterializedDatabase(
+            allocator,
+            request.root,
+            request.planning.program.target_architecture,
+            request.planning.limits.database,
+            planned,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .verification);
+            return .{
+                .outcome = .recovery_required,
+                .detail = @errorName(err),
+            };
+        };
+    }
+
+    try attempt.advance(allocator, .{
+        .state = .verifying,
+        .phase = .verification,
+    });
+    try attempt.complete(allocator, switch (mutation_report.outcome) {
+        .applied => .succeeded,
+        .rolled_back => .failed_after_mutation,
+        .recovery_required => unreachable,
+    });
+    try attempt.publishProvenance(allocator, planned.digest);
+    try root_mutation.clear(&engine);
+    try attempt.clear();
+    return .{
+        .outcome = switch (mutation_report.outcome) {
+            .applied => .applied,
+            .rolled_back => .rolled_back,
+            .recovery_required => unreachable,
+        },
+        .detail = @tagName(mutation_report.stage),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Fuzz boundary
 // ---------------------------------------------------------------------------
 
@@ -6877,6 +7766,820 @@ fn singleProgram(
     defer database.deinit();
     artifacts.* = .{testArtifact(0, model, bytes.len)};
     return testProgram(database.generation.sha256, database.model.packages.len, artifacts, steps);
+}
+
+fn fixtureInstallRoot(fixture: *Fixture, buffer: []u8) ![]const u8 {
+    const length = try fixture.tmp.dir.realPath(testing.io, buffer);
+    return buffer[0..length];
+}
+
+fn fixtureHashValue(domain: []const u8, value: anytype) [32]u8 {
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll(domain) catch unreachable;
+    std.json.Stringify.value(
+        value,
+        .{ .whitespace = .minified },
+        &sink.writer,
+    ) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn finalizeFixtureProgram(program: *native_program.Program) void {
+    program.artifacts_sha256 = hex(32, fixtureHashValue(
+        "debz-native-transaction-program-artifacts-v1\x00",
+        program.artifacts,
+    ));
+    program.steps_sha256 = hex(32, fixtureHashValue(
+        "debz-native-transaction-program-steps-v1\x00",
+        program.steps,
+    ));
+    var payload = program.*;
+    payload.digest_sha256 = @splat('0');
+    program.digest_sha256 = hex(32, fixtureHashValue(
+        "debz-native-transaction-program-v1\x00",
+        payload,
+    ));
+}
+
+fn bindFixtureProgramRoot(
+    program: *native_program.Program,
+    install_root: []const u8,
+) [32]u8 {
+    const identity = transaction_recovery.rootIdentity(install_root);
+    program.install_root = install_root;
+    program.root_identity_sha256 = hex(32, identity);
+    finalizeFixtureProgram(program);
+    return identity;
+}
+
+fn materializeFixture(
+    fixture: *Fixture,
+    program: *native_program.Program,
+    snapshot: package_database.Snapshot,
+    archives: []const ArchiveInput,
+    locks: root_operation.LockBackend,
+    operation: product_api.Operation,
+    hooks: root_mutation.Hooks,
+) !MaterializationResult {
+    var root_buffer: [4096]u8 = undefined;
+    const install_root = try fixtureInstallRoot(fixture, &root_buffer);
+    const root_identity = bindFixtureProgramRoot(program, install_root);
+    return materialize(testing.allocator, .{
+        .io = testing.io,
+        .root = fixture.root(),
+        .install_root = install_root,
+        .planning = .{
+            .program = program,
+            .snapshot = snapshot,
+            .archives = archives,
+            .root = fixture.root(),
+            .root_identity_sha256 = root_identity,
+            .interoperability = .isolated_root,
+        },
+        .locks = locks,
+        .operation = operation,
+        .hooks = hooks,
+    });
+}
+
+const ExternalMaterializationOperation = enum {
+    install,
+    upgrade,
+    downgrade,
+    reinstall,
+};
+
+const ExternalMaterializationRequest = struct {
+    root: []const u8,
+    architecture: []const u8,
+    archives: []const []const u8,
+    operation: ExternalMaterializationOperation,
+    report: []const u8,
+};
+
+fn readAbsoluteFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    maximum_bytes: usize,
+) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(
+        allocator,
+        .limited(maximum_bytes +| 1),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => error.FileTooLarge,
+        error.ReadFailed => reader.err.?,
+        else => |other| other,
+    };
+}
+
+fn writeMaterializationReport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    result: MaterializationResult,
+) !void {
+    const bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"outcome\":\"{s}\",\"detail\":\"{s}\"}}\n",
+        .{ @tagName(result.outcome), result.detail },
+    );
+    defer allocator.free(bytes);
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .truncate = true,
+    });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+}
+
+fn externalProductOperation(value: ExternalMaterializationOperation) product_api.Operation {
+    return switch (value) {
+        .install, .downgrade => .install,
+        .upgrade => .upgrade,
+        .reinstall => .reinstall,
+    };
+}
+
+test "native_unpack.test.materialization external fixture" {
+    const raw_request = std.c.getenv("DEBZ_NATIVE_MATERIALIZATION_REQUEST") orelse
+        return error.SkipZigTest;
+    const request_path = std.mem.span(raw_request);
+    if (!absolute_path.nonRoot(request_path))
+        return error.InvalidExternalMaterializationRequest;
+    const request_bytes = try readAbsoluteFile(
+        testing.allocator,
+        testing.io,
+        request_path,
+        1024 * 1024,
+    );
+    defer testing.allocator.free(request_bytes);
+    var parsed = try std.json.parseFromSlice(
+        ExternalMaterializationRequest,
+        testing.allocator,
+        request_bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    const external = parsed.value;
+    if (!absolute_path.nonRoot(external.root) or
+        !absolute_path.nonRoot(external.report) or
+        (external.archives.len == 0) or
+        (!std.mem.eql(u8, external.architecture, "amd64") and
+            !std.mem.eql(u8, external.architecture, "arm64")))
+        return error.InvalidExternalMaterializationRequest;
+    for (external.archives) |path| {
+        if (!absolute_path.nonRoot(path))
+            return error.InvalidExternalMaterializationRequest;
+    }
+
+    var root_dir = try std.Io.Dir.openDirAbsolute(testing.io, external.root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer root_dir.close(testing.io);
+    const root: root_fs.Root = .init(testing.io, root_dir);
+    const marker = try root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init(".debz-native-disposable"),
+        128,
+    );
+    defer testing.allocator.free(marker);
+    if (!std.mem.eql(
+        u8,
+        marker,
+        "debz native materialization fixture v1\n",
+    )) return error.InvalidExternalMaterializationRequest;
+
+    var captured = try captureDatabaseSnapshot(
+        testing.allocator,
+        root,
+        .{},
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        external.architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{
+            .native_architecture = external.architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+
+    const archive_bytes = try testing.allocator.alloc(
+        []u8,
+        external.archives.len,
+    );
+    defer testing.allocator.free(archive_bytes);
+    const models = try testing.allocator.alloc(
+        archive_application.Model,
+        external.archives.len,
+    );
+    defer testing.allocator.free(models);
+    var initialized: usize = 0;
+    defer {
+        for (models[0..initialized]) |*model| model.deinit();
+        for (archive_bytes[0..initialized]) |bytes|
+            testing.allocator.free(bytes);
+    }
+    var total_archive_bytes: u64 = 0;
+    for (external.archives, 0..) |path, index| {
+        const bytes = try readAbsoluteFile(
+            testing.allocator,
+            testing.io,
+            path,
+            1024 * 1024 * 1024,
+        );
+        errdefer testing.allocator.free(bytes);
+        archive_bytes[index] = bytes;
+        total_archive_bytes = try std.math.add(u64, total_archive_bytes, bytes.len);
+        if (total_archive_bytes > (Limits{}).max_archive_bytes)
+            return error.FileTooLarge;
+        var model = switch (archive_application.prepare(
+            testing.allocator,
+            bytes,
+            .{ .local = .{} },
+            .{},
+        )) {
+            .model => |value| value,
+            .diagnostic => return error.InvalidExternalArchive,
+        };
+        errdefer model.deinit();
+        models[index] = model;
+        initialized += 1;
+    }
+
+    const artifacts = try testing.allocator.alloc(
+        native_program.ProgramArtifact,
+        models.len,
+    );
+    defer testing.allocator.free(artifacts);
+    const steps = try testing.allocator.alloc(native_program.Step, models.len);
+    defer testing.allocator.free(steps);
+    const archives = try testing.allocator.alloc(ArchiveInput, models.len);
+    defer testing.allocator.free(archives);
+    for (models, 0..) |*model, index| {
+        const artifact: u32 = @intCast(index);
+        artifacts[index] = testArtifact(
+            artifact,
+            model,
+            archive_bytes[index].len,
+        );
+        const prior = database.model.find(
+            model.facts.package,
+            model.facts.architecture,
+        );
+        const incoming_version = try version_module.DebianVersion.parse(
+            model.facts.version,
+        );
+        switch (external.operation) {
+            .install => if (prior != null)
+                return error.InvalidExternalOperation,
+            .upgrade => {
+                const installed = prior orelse return error.InvalidExternalOperation;
+                if (installed.parsed_version.order(incoming_version) != .lt)
+                    return error.InvalidExternalOperation;
+            },
+            .downgrade => {
+                const installed = prior orelse return error.InvalidExternalOperation;
+                if (installed.parsed_version.order(incoming_version) != .gt)
+                    return error.InvalidExternalOperation;
+            },
+            .reinstall => {
+                const installed = prior orelse return error.InvalidExternalOperation;
+                if (installed.parsed_version.order(incoming_version) != .eq)
+                    return error.InvalidExternalOperation;
+            },
+        }
+        steps[index] = unpackStep(
+            artifact,
+            model,
+            artifact,
+            if (prior) |record| record.version else null,
+            false,
+        );
+        archives[index] = .{ .artifact = artifact, .bytes = archive_bytes[index] };
+    }
+    var program = testProgram(
+        database.generation.sha256,
+        database.model.packages.len,
+        artifacts,
+        steps,
+    );
+    const root_identity = transaction_recovery.rootIdentity(external.root);
+    program.install_root = external.root;
+    program.root_identity_sha256 = hex(32, root_identity);
+    program.target_architecture = external.architecture;
+    program.foreign_architectures = database.model.foreign_architectures;
+    finalizeFixtureProgram(&program);
+    var locks: root_operation.SystemLockBackend = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+    };
+    const result = try materialize(testing.allocator, .{
+        .io = testing.io,
+        .root = root,
+        .install_root = external.root,
+        .planning = .{
+            .program = &program,
+            .snapshot = captured.snapshot,
+            .archives = archives,
+            .root = root,
+            .root_identity_sha256 = root_identity,
+            .interoperability = .isolated_root,
+        },
+        .locks = locks.interface(),
+        .operation = externalProductOperation(external.operation),
+    });
+    try writeMaterializationReport(
+        testing.allocator,
+        testing.io,
+        external.report,
+        result,
+    );
+}
+
+test "native_unpack.test.materialization adapter applies data-only plan" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o750 },
+        .{ .path = "usr/share/demo/file", .content = "payload\n", .mode = 0o640 },
+        .{ .path = "usr/share/demo/link", .kind = '2', .link = "file" },
+        .{
+            .path = "usr/share/demo/hard",
+            .kind = '1',
+            .link = "./usr/share/demo/file",
+        },
+    };
+    const bytes = try buildOwnedArchive(
+        .{ .package = "demo", .version = "1" },
+        &data,
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &steps,
+        &artifacts,
+    );
+    var root_buffer: [4096]u8 = undefined;
+    const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    const root_identity = bindFixtureProgramRoot(&program, install_root);
+    var locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer locks.deinit();
+    const result = try materialize(testing.allocator, .{
+        .io = testing.io,
+        .root = fixture.root(),
+        .install_root = install_root,
+        .planning = .{
+            .program = &program,
+            .snapshot = fixture.snapshot(),
+            .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+            .root = fixture.root(),
+            .root_identity_sha256 = root_identity,
+            .interoperability = .isolated_root,
+        },
+        .locks = locks.interface(),
+        .operation = .install,
+    });
+    try testing.expectEqual(MaterializationOutcome.applied, result.outcome);
+    const published = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("usr/share/demo/file"),
+        4096,
+    );
+    defer testing.allocator.free(published);
+    try testing.expectEqualStrings("payload\n", published);
+    const file = try fixture.root().entry(try root_fs.Path.init("usr/share/demo/file"));
+    const hard = try fixture.root().entry(try root_fs.Path.init("usr/share/demo/hard"));
+    try testing.expectEqual(file.inode, hard.inode);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.record_path),
+    ) == null);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_mutation.journal_path),
+    ) == null);
+}
+
+test "native_unpack.test.materialization rejects stale inputs before mutation" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{.{
+        .path = "usr/share/demo/file",
+        .content = "payload\n",
+    }};
+    const bytes = try buildOwnedArchive(
+        .{ .package = "demo", .version = "1" },
+        &data,
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &steps,
+        &artifacts,
+    );
+    const tampered = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    var binding_program = program;
+    const binding_artifacts = [_]native_program.ProgramArtifact{
+        artifacts[0],
+        testArtifact(1, &model, bytes.len),
+    };
+    binding_program.artifacts = &binding_artifacts;
+    if (try bindMaterializationArchives(testing.allocator, .{
+        .program = &binding_program,
+        .snapshot = fixture.snapshot(),
+        .archives = &.{
+            .{ .artifact = 0, .bytes = bytes },
+            .{ .artifact = 1, .bytes = tampered },
+        },
+        .root = fixture.root(),
+        .root_identity_sha256 = @splat(0),
+        .interoperability = .isolated_root,
+    })) |value| {
+        var unexpected = value;
+        defer unexpected.deinit();
+        return error.TestUnexpectedResult;
+    }
+    var locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer locks.deinit();
+    const stale_archive = try materializeFixture(
+        &fixture,
+        &program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = tampered }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.refused, stale_archive.outcome);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init("usr/share/demo/file"),
+    ) == null);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    ) == null);
+
+    try fixture.root().publishFile(
+        try root_fs.Path.init("var/lib/dpkg/status"),
+        "\n",
+        .{},
+    );
+    const stale_database = try materializeFixture(
+        &fixture,
+        &program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.refused, stale_database.outcome);
+    try testing.expectEqualStrings(
+        "database_generation_drift",
+        stale_database.detail,
+    );
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    ) == null);
+}
+
+test "native_unpack.test.materialization handoff leaves payload untouched" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{.{
+        .path = "etc/demo.conf",
+        .content = "value\n",
+    }};
+    const bytes = try archive_application.test_fixtures.build(
+        testing.allocator,
+        .{
+            .package = "demo",
+            .version = "1",
+            .control = &.{
+                .{ .path = "conffiles", .content = "/etc/demo.conf\n" },
+            },
+            .data = &data,
+        },
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &steps,
+        &artifacts,
+    );
+    var locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer locks.deinit();
+    const result = try materializeFixture(
+        &fixture,
+        &program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.handoff, result.outcome);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init("etc/demo.conf"),
+    ) == null);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    ) == null);
+}
+
+const MaterializationFault = struct {
+    boundary: root_mutation.Boundary,
+    crash: bool,
+    fired: bool = false,
+
+    fn hooks(self: *MaterializationFault) root_mutation.Hooks {
+        return .{ .context = self, .beforeFn = before };
+    }
+
+    fn before(
+        context: ?*anyopaque,
+        boundary: root_mutation.Boundary,
+        _: u32,
+    ) root_mutation.HookError!void {
+        const self: *MaterializationFault = @ptrCast(@alignCast(context.?));
+        if (self.fired or boundary != self.boundary) return;
+        self.fired = true;
+        if (self.crash) return error.SimulatedCrash;
+        return error.RenameFailed;
+    }
+};
+
+test "native_unpack.test.materialization rollback and recovery retain truth" {
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+        .{
+            .path = "usr/share/demo/file",
+            .content = "payload\n",
+        },
+    };
+    const bytes = try buildOwnedArchive(
+        .{ .package = "demo", .version = "1" },
+        &data,
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+
+    var rollback_fixture: Fixture = undefined;
+    try rollback_fixture.init(empty_status, &.{});
+    defer rollback_fixture.deinit();
+    var rollback_artifacts: [1]native_program.ProgramArtifact = undefined;
+    var rollback_program = try singleProgram(
+        &rollback_fixture,
+        &model,
+        bytes,
+        &steps,
+        &rollback_artifacts,
+    );
+    var rollback_locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer rollback_locks.deinit();
+    var rollback_fault: MaterializationFault = .{
+        .boundary = .publish_rename,
+        .crash = false,
+    };
+    const rolled_back = try materializeFixture(
+        &rollback_fixture,
+        &rollback_program,
+        rollback_fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        rollback_locks.interface(),
+        .install,
+        rollback_fault.hooks(),
+    );
+    try testing.expectEqual(MaterializationOutcome.rolled_back, rolled_back.outcome);
+    try testing.expect(try rollback_fixture.root().entryIfExists(
+        try root_fs.Path.init("usr/share/demo/file"),
+    ) == null);
+    try testing.expect(try rollback_fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.record_path),
+    ) == null);
+    try testing.expect(try rollback_fixture.root().entryIfExists(
+        try root_fs.Path.init(root_mutation.journal_path),
+    ) == null);
+
+    var crash_fixture: Fixture = undefined;
+    try crash_fixture.init(empty_status, &.{});
+    defer crash_fixture.deinit();
+    var crash_artifacts: [1]native_program.ProgramArtifact = undefined;
+    var crash_program = try singleProgram(
+        &crash_fixture,
+        &model,
+        bytes,
+        &steps,
+        &crash_artifacts,
+    );
+    var crash_locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer crash_locks.deinit();
+    var crash_fault: MaterializationFault = .{
+        .boundary = .publish_rename,
+        .crash = true,
+    };
+    const recovery = try materializeFixture(
+        &crash_fixture,
+        &crash_program,
+        crash_fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        crash_locks.interface(),
+        .install,
+        crash_fault.hooks(),
+    );
+    try testing.expectEqual(
+        MaterializationOutcome.recovery_required,
+        recovery.outcome,
+    );
+    try testing.expect((try root_mutation.inspect(
+        testing.allocator,
+        crash_fixture.root(),
+        .{},
+    )) != null);
+    try testing.expect(try crash_fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.record_path),
+    ) != null);
+}
+
+test "native_unpack.test.materialization repeats without stale journal" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+        .{
+            .path = "usr/share/demo/file",
+            .content = "payload\n",
+        },
+    };
+    const bytes = try buildOwnedArchive(
+        .{ .package = "demo", .version = "1" },
+        &data,
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    var locks: root_operation.TestLockBackend = .{
+        .allocator = testing.allocator,
+    };
+    defer locks.deinit();
+
+    const install_steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, null, false),
+    };
+    var install_artifacts: [1]native_program.ProgramArtifact = undefined;
+    var install_program = try singleProgram(
+        &fixture,
+        &model,
+        bytes,
+        &install_steps,
+        &install_artifacts,
+    );
+    const first = try materializeFixture(
+        &fixture,
+        &install_program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, first.outcome);
+
+    var captured = try captureDatabaseSnapshot(
+        testing.allocator,
+        fixture.root(),
+        .{},
+    );
+    defer captured.deinit();
+    var database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{
+            .native_architecture = "amd64",
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    var other_data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/other", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/other/file", .content = "other\n" },
+    };
+    const other_bytes = try buildOwnedArchive(
+        .{ .package = "other", .version = "1" },
+        &other_data,
+    );
+    defer testing.allocator.free(other_bytes);
+    var other_model = try modelOf(other_bytes);
+    defer other_model.deinit();
+    const other_steps = [_]native_program.Step{
+        unpackStep(0, &other_model, 0, null, false),
+    };
+    var other_artifacts = [_]native_program.ProgramArtifact{
+        testArtifact(0, &other_model, other_bytes.len),
+    };
+    var other_program = testProgram(
+        database.generation.sha256,
+        database.model.packages.len,
+        &other_artifacts,
+        &other_steps,
+    );
+    const second = try materializeFixture(
+        &fixture,
+        &other_program,
+        captured.snapshot,
+        &.{.{ .artifact = 0, .bytes = other_bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, second.outcome);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_operation.record_path),
+    ) == null);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_mutation.journal_path),
+    ) == null);
+}
+
+test "native_unpack.test.materialization database capture has an aggregate bound" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    try testing.expectError(
+        error.DatabaseCaptureLimit,
+        captureDatabaseSnapshotBounded(testing.allocator, fixture.root(), .{}, 1),
+    );
+    var captured = try captureDatabaseSnapshot(testing.allocator, fixture.root(), .{});
+    defer captured.deinit();
+    try testing.expectEqualStrings(empty_status, captured.snapshot.status.bytes);
 }
 
 test "native_unpack.test.planning is deterministic and descriptive only" {
@@ -8212,7 +9915,7 @@ test "native_unpack.test.zero evidence limits refuse instead of truncating" {
     ), .case_alias_limit);
 }
 
-test "native_unpack.test.explicit Config-Version is retained and missing evidence hands off" {
+test "native_unpack.test.Config-Version distinguishes configured and never-configured unpack" {
     const with_config =
         \\Package: demo
         \\Status: install ok unpacked
@@ -8274,11 +9977,18 @@ test "native_unpack.test.explicit Config-Version is retained and missing evidenc
         &steps,
         &missing_artifacts,
     );
-    try expectHandoff(try planFor(
+    var never_configured = try expectPlan(try planFor(
         &missing,
         &missing_program,
         &.{.{ .artifact = 0, .bytes = bytes }},
-    ), .config_version);
+    ));
+    defer never_configured.deinit();
+    try testing.expect(never_configured.packages[0].configured_version == null);
+    const status_write = never_configured.database.find("status") orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(
+        std.mem.indexOf(u8, status_write.bytes, "Config-Version:") == null,
+    );
 }
 
 test "native_unpack.test.large ownership lowering is linearly budgeted" {
