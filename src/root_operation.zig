@@ -264,6 +264,9 @@ pub const OwnedRecord = struct {
 pub const deferred_ack_schema_id =
     "https://debz.dev/schema/root-operation-deferred-ack-v1";
 pub const deferred_ack_schema_version: u32 = 1;
+pub const deferred_ack_v2_schema_id =
+    "https://debz.dev/schema/root-operation-deferred-ack-v2";
+pub const deferred_ack_v2_schema_version: u32 = 2;
 pub const recovery_review_schema_id =
     "https://debz.dev/schema/root-operation-recovery-review-v1";
 pub const recovery_review_schema_version: u32 = 1;
@@ -370,6 +373,7 @@ pub const PreMutationReconciliationClaimBinding = struct {
 /// Root-local ownership binding and non-reclaimable hand-off for an exact
 /// outer orchestrator attempt.
 pub const DeferredAcknowledgment = struct {
+    document_version: u32 = deferred_ack_schema_version,
     state: DeferredAcknowledgmentState = .bound,
     attempt_id: [32]u8,
     completion_sha256: ?[32]u8 = null,
@@ -436,6 +440,10 @@ pub fn createDeferredAcknowledgment(
     input: DeferredAcknowledgment,
 ) !DeferredAcknowledgment {
     var result = input;
+    if (result.state == .pre_mutation_reconciliation_claim or
+        result.recovery_review_claim_sha256 != null or
+        result.recovery_review_binding_sha256 != null)
+        result.document_version = deferred_ack_v2_schema_version;
     result.digest_sha256 = deferredAcknowledgmentDigest(result);
     result.recovery_review_binding_sha256 =
         recoveryReviewBindingDigest(result);
@@ -445,15 +453,25 @@ pub fn createDeferredAcknowledgment(
 }
 
 fn validDeferredAcknowledgment(marker: DeferredAcknowledgment) bool {
-    if ((marker.recovery_review_claim_sha256 == null) !=
-        (marker.recovery_review_binding_sha256 == null))
-        return false;
-    if (marker.recovery_review_binding_sha256) |binding|
-        if (!std.mem.eql(
-            u8,
-            &binding,
-            &(recoveryReviewBindingDigest(marker) orelse return false),
-        )) return false;
+    switch (marker.document_version) {
+        deferred_ack_schema_version => {
+            if (marker.recovery_review_claim_sha256 != null or
+                marker.recovery_review_binding_sha256 != null)
+                return false;
+        },
+        deferred_ack_v2_schema_version => {
+            if ((marker.recovery_review_claim_sha256 == null) !=
+                (marker.recovery_review_binding_sha256 == null))
+                return false;
+            if (marker.recovery_review_binding_sha256) |binding|
+                if (!std.mem.eql(
+                    u8,
+                    &binding,
+                    &(recoveryReviewBindingDigest(marker) orelse return false),
+                )) return false;
+        },
+        else => return false,
+    }
     return switch (marker.state) {
         .bound,
         .released,
@@ -726,10 +744,17 @@ pub fn decodeDeferredAcknowledgment(
     ) catch return error.NonCanonicalDocument;
     defer parsed.deinit();
     const wire = parsed.value;
-    if (!std.mem.eql(u8, wire.schema, deferred_ack_schema_id) or
-        wire.version != deferred_ack_schema_version)
-        return error.UnsupportedSchema;
+    const document_version: u32 =
+        if (std.mem.eql(u8, wire.schema, deferred_ack_schema_id) and
+        wire.version == deferred_ack_schema_version)
+            deferred_ack_schema_version
+        else if (std.mem.eql(u8, wire.schema, deferred_ack_v2_schema_id) and
+        wire.version == deferred_ack_v2_schema_version)
+            deferred_ack_v2_schema_version
+        else
+            return error.UnsupportedSchema;
     const decoded: DeferredAcknowledgment = .{
+        .document_version = document_version,
         .state = wire.state,
         .attempt_id = try parseHex(32, wire.attempt_id),
         .completion_sha256 = try parseOptionalHex(wire.completion_sha256),
@@ -802,6 +827,20 @@ pub fn decodeRecoveryReviewClaim(
         .nonce = try parseHex(32, wire.nonce),
         .marker_sha256 = try parseOptionalHex(wire.marker_sha256),
         .prior_marker = if (wire.prior_marker) |marker| .{
+            .document_version = if (std.mem.eql(
+                u8,
+                marker.schema,
+                deferred_ack_schema_id,
+            ) and marker.version == deferred_ack_schema_version)
+                deferred_ack_schema_version
+            else if (std.mem.eql(
+                u8,
+                marker.schema,
+                deferred_ack_v2_schema_id,
+            ) and marker.version == deferred_ack_v2_schema_version)
+                deferred_ack_v2_schema_version
+            else
+                return error.UnsupportedSchema,
             .state = marker.state,
             .attempt_id = try parseHex(32, marker.attempt_id),
             .completion_sha256 = try parseOptionalHex(
@@ -1141,7 +1180,9 @@ fn recoveryReviewBindingDigest(
 ) ?[32]u8 {
     const claim = marker.recovery_review_claim_sha256 orelse return null;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-root-operation-recovery-review-binding-v1\x00");
+    hash.update("debz-root-operation-recovery-review-binding-v2\x00");
+    hash.update(deferred_ack_v2_schema_id);
+    hash.update("\x002");
     hash.update(&marker.digest_sha256);
     hash.update(&claim);
     return hash.finalResult();
@@ -1230,9 +1271,15 @@ fn writeDeferredAcknowledgment(
     writer: *std.Io.Writer,
 ) !void {
     try writer.writeAll("{\"schema\":");
-    try writeJsonString(writer, deferred_ack_schema_id);
+    try writeJsonString(
+        writer,
+        if (marker.document_version == deferred_ack_schema_version)
+            deferred_ack_schema_id
+        else
+            deferred_ack_v2_schema_id,
+    );
     try writer.print(",\"version\":{},\"state\":", .{
-        deferred_ack_schema_version,
+        marker.document_version,
     });
     try writeJsonString(writer, @tagName(marker.state));
     try writer.writeAll(",\"attempt_id\":");
@@ -1261,10 +1308,12 @@ fn writeDeferredAcknowledgment(
     }
     try writer.writeAll(",\"acknowledgment_id\":");
     try writeHexString(writer, &marker.acknowledgment_id);
-    try writer.writeAll(",\"recovery_review_claim_sha256\":");
-    try writeOptionalHex(writer, marker.recovery_review_claim_sha256);
-    try writer.writeAll(",\"recovery_review_binding_sha256\":");
-    try writeOptionalHex(writer, marker.recovery_review_binding_sha256);
+    if (marker.document_version == deferred_ack_v2_schema_version) {
+        try writer.writeAll(",\"recovery_review_claim_sha256\":");
+        try writeOptionalHex(writer, marker.recovery_review_claim_sha256);
+        try writer.writeAll(",\"recovery_review_binding_sha256\":");
+        try writeOptionalHex(writer, marker.recovery_review_binding_sha256);
+    }
     try writer.writeAll(",\"digest_sha256\":");
     try writeHexString(writer, &marker.digest_sha256);
     try writer.writeByte('}');
@@ -1569,7 +1618,9 @@ pub const Store = struct {
             else => return err,
         };
         defer allocator.free(bytes);
-        if (documentHasSchema(bytes, deferred_ack_schema_id)) return null;
+        if (documentHasSchema(bytes, deferred_ack_schema_id) or
+            documentHasSchema(bytes, deferred_ack_v2_schema_id))
+            return null;
         return try decodeRecoveryReviewClaim(allocator, bytes);
     }
 
@@ -1736,6 +1787,7 @@ pub const Store = struct {
             &replacement.acknowledgment_id,
             &exchange.outer_attempt_id,
         )) return error.InvalidDocument;
+        replacement.document_version = deferred_ack_v2_schema_version;
         replacement.recovery_review_claim_sha256 = claim.digest_sha256;
         replacement.digest_sha256 = deferredAcknowledgmentDigest(replacement);
         replacement.recovery_review_binding_sha256 =
@@ -3874,6 +3926,71 @@ test "root_operation.test.recovery review claim canonicalizes exact clean and co
     }));
 }
 
+test "root_operation.test.frozen main deferred acknowledgment v1 fixtures remain byte exact" {
+    const fixtures = [_][]const u8{
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"bound\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"9ebc1e5a301ad8861e813b590c60e96e18728b38a32fb5e6e2a8cf5a80b64db7\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"released\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"0458d25d816074fc6148e0c14cb334e033df62d89f765c2b26aa719a45b1b6c5\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"abandoned\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"ef47268cb544cd653bf0694704424a291ae95db2b847ad6ceec60a1f727c34d6\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"pending\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"4aa48a83b79e06c2a850aa81c955e31588162fdb7fd0f7ab10e20eca70fe4992\"}",
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"acknowledged\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"57ccdec9d5fef63c77929b99157347caa15442a87fae1e823da73dfbdd343cb6\"}",
+    };
+    for (fixtures) |fixture| {
+        const decoded = try decodeDeferredAcknowledgment(
+            testing.allocator,
+            fixture,
+        );
+        try testing.expectEqual(
+            deferred_ack_schema_version,
+            decoded.document_version,
+        );
+        const encoded = try decoded.canonicalJson(testing.allocator);
+        defer testing.allocator.free(encoded);
+        try testing.expectEqualStrings(fixture, encoded);
+        try testing.expect(
+            std.mem.indexOf(u8, encoded, "recovery_review_") == null,
+        );
+    }
+}
+
+test "root_operation.test.upgrade finalizes frozen v1 ownership without rewriting it as v2" {
+    const pending_source =
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"pending\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"provenance_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"digest_sha256\":\"4aa48a83b79e06c2a850aa81c955e31588162fdb7fd0f7ab10e20eca70fe4992\"}";
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: root_fs.Root = .init(testing.io, tmp.dir);
+    const store = Store.init(root);
+    try store.ensureNamespace();
+    try root.publishFile(
+        try root_fs.Path.init(deferred_ack_path),
+        pending_source,
+        .{},
+    );
+    const pending = (try store.readDeferredAcknowledgment(
+        testing.allocator,
+    )).?;
+    const acknowledged = try store.acknowledgeDeferredAcknowledgment(
+        testing.allocator,
+        pending.digest_sha256,
+    );
+    try testing.expectEqual(
+        deferred_ack_schema_version,
+        acknowledged.document_version,
+    );
+    const source = try acknowledged.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    try testing.expect(
+        std.mem.indexOf(u8, source, "recovery_review_") == null,
+    );
+    try store.cleanupOwned(testing.allocator, .{
+        .attempt_id = acknowledged.attempt_id,
+        .acknowledgment_id = acknowledged.acknowledgment_id,
+        .terminal_state = .acknowledged,
+    });
+    try testing.expect(
+        (try store.readDeferredAcknowledgment(testing.allocator)) == null,
+    );
+}
+
 test "root_operation.test.recovery review exchange survives every durable publication boundary" {
     inline for (std.enums.values(root_fs.PublishPoint)) |fail_at| {
         var tmp = testing.tmpDir(.{ .iterate = true });
@@ -4026,6 +4143,56 @@ test "root_operation.test.recovery review cancellation restores the exact prior 
     try testing.expectEqualDeep(
         prior,
         (try store.readDeferredAcknowledgment(testing.allocator)).?,
+    );
+}
+
+test "root_operation.test.deferred acknowledgment v2 is canonical bounded and tamper evident" {
+    const marker = try createDeferredAcknowledgment(.{
+        .attempt_id = @splat(0xd1),
+        .acknowledgment_id = @splat(0xd2),
+        .recovery_review_claim_sha256 = @splat(0xd3),
+    });
+    try testing.expectEqual(
+        deferred_ack_v2_schema_version,
+        marker.document_version,
+    );
+    const source = try marker.canonicalJson(testing.allocator);
+    defer testing.allocator.free(source);
+    try testing.expect(source.len <= maximum_document_bytes);
+    try testing.expect(
+        documentHasSchema(source, deferred_ack_v2_schema_id),
+    );
+    const decoded = try decodeDeferredAcknowledgment(
+        testing.allocator,
+        source,
+    );
+    try testing.expectEqualDeep(marker, decoded);
+
+    const tampered = try testing.allocator.dupe(u8, source);
+    defer testing.allocator.free(tampered);
+    const binding = std.mem.indexOf(
+        u8,
+        tampered,
+        "\"recovery_review_binding_sha256\":\"",
+    ).?;
+    tampered[binding + "\"recovery_review_binding_sha256\":\"".len] =
+        if (tampered[binding + "\"recovery_review_binding_sha256\":\"".len] == '0')
+            '1'
+        else
+            '0';
+    try testing.expectError(
+        error.InvalidDocument,
+        decodeDeferredAcknowledgment(testing.allocator, tampered),
+    );
+
+    const v1_with_v2_fields =
+        "{\"schema\":\"https://debz.dev/schema/root-operation-deferred-ack-v1\",\"version\":1,\"state\":\"bound\",\"attempt_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"completion_sha256\":null,\"provenance_sha256\":null,\"acknowledgment_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"recovery_review_claim_sha256\":null,\"recovery_review_binding_sha256\":null,\"digest_sha256\":\"9ebc1e5a301ad8861e813b590c60e96e18728b38a32fb5e6e2a8cf5a80b64db7\"}";
+    try testing.expectError(
+        error.NonCanonicalDocument,
+        decodeDeferredAcknowledgment(
+            testing.allocator,
+            v1_with_v2_fields,
+        ),
     );
 }
 

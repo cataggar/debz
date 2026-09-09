@@ -24,7 +24,7 @@ pub const Engine = struct {
         *anyopaque,
         std.mem.Allocator,
         []const u8,
-    ) EngineError!orchestrator.RecoveryPrepareOutcome,
+    ) EngineError!orchestrator.RecoveryPrepareInvocation,
     executeRecoveryFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -75,7 +75,7 @@ pub const Engine = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         profile_path: []const u8,
-    ) EngineError!orchestrator.RecoveryPrepareOutcome {
+    ) EngineError!orchestrator.RecoveryPrepareInvocation {
         const engine: *orchestrator.Engine = @ptrCast(@alignCast(context));
         return engine.invokePrepareRecovery(
             allocator,
@@ -302,6 +302,7 @@ pub fn runApt(
                         allocator,
                         prepared.*,
                     ),
+                    .cleanup_required => return error.InvariantViolation,
                 };
             };
             defer result.deinit();
@@ -342,6 +343,10 @@ pub fn runRecovery(
             );
             return result.exit_status;
         },
+        .cleanup_required => |cleanup| {
+            writeRecoveryCleanupRequired(cleanup, streams.stderr) catch {};
+            return recoveryCleanupError(cleanup.cause);
+        },
         .ready => |*recovery| {
             defer recovery.deinit();
             if (output == .human) {
@@ -376,6 +381,13 @@ pub fn runRecovery(
                         allocator,
                         recovery.prepared,
                     ),
+                    .cleanup_required => |cleanup| {
+                        writeRecoveryCleanupRequired(
+                            cleanup,
+                            streams.stderr,
+                        ) catch {};
+                        return recoveryCleanupError(cleanup.cause);
+                    },
                 };
                 defer cancellation_result.deinit();
                 if (cancellation_result.exit_status == .recovery) {
@@ -422,6 +434,13 @@ pub fn runRecovery(
                         allocator,
                         recovery.prepared,
                     ),
+                    .cleanup_required => |cleanup| {
+                        writeRecoveryCleanupRequired(
+                            cleanup,
+                            streams.stderr,
+                        ) catch {};
+                        return recoveryCleanupError(cleanup.cause);
+                    },
                 };
             };
             defer result.deinit();
@@ -451,10 +470,38 @@ fn cleanupRecoveryReview(
     var result = switch (invocation) {
         .result => |value| value,
         .operational_failure => return error.RecoveryReviewCleanupFailed,
+        .cleanup_required => return error.RecoveryReviewCleanupFailed,
     };
     defer result.deinit();
     if (result.exit_status == .recovery)
         return error.RecoveryReviewCleanupFailed;
+}
+
+fn writeRecoveryCleanupRequired(
+    cleanup: orchestrator.RecoveryCleanupRequired,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.print(
+        "debz apt: recovery ownership cleanup required; cause={s}; disposition={s}; claim_sha256=",
+        .{
+            @tagName(cleanup.cause),
+            @tagName(cleanup.disposition),
+        },
+    );
+    try writeHex(writer, &cleanup.claim.digest_sha256);
+    try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn recoveryCleanupError(
+    cause: orchestrator.RecoveryCleanupCause,
+) anyerror {
+    return switch (cause) {
+        .out_of_memory => error.OutOfMemoryRecoveryCleanupRequired,
+        .contract_violation => error.ContractViolationRecoveryCleanupRequired,
+        .invariant_violation => error.InvariantViolationRecoveryCleanupRequired,
+        .operational_boundary_failure => error.RecoveryReviewCleanupFailed,
+    };
 }
 
 fn writeReview(
@@ -746,7 +793,7 @@ const TestContext = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         profile_path: []const u8,
-    ) EngineError!orchestrator.RecoveryPrepareOutcome {
+    ) EngineError!orchestrator.RecoveryPrepareInvocation {
         const self: *TestContext = @ptrCast(@alignCast(context));
         self.recovery_prepare_count += 1;
         const request: api.Request = .{

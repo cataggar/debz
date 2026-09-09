@@ -1391,11 +1391,16 @@ pub const Backend = struct {
             if (defer_clear)
                 root_operation.Store.init(
                     guard.owned_root.?.root,
-                ).readDeferredAcknowledgment(allocator) catch
-                    return blockedRecovery(
-                        request.operation,
-                        "lower orchestration binding is unreadable",
-                    )
+                ).readDeferredAcknowledgment(allocator) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.InvariantViolation => return error.InvariantViolation,
+                        else => return blockedRecovery(
+                            request.operation,
+                            "lower orchestration binding is unreadable",
+                        ),
+                    }
             else
                 null;
         if (defer_clear and
@@ -1440,18 +1445,23 @@ pub const Backend = struct {
         defer statement.deinit();
 
         const store: root_operation_completion.Store = .init(guard.owned_root.?.root);
-        store.publish(allocator, statement.document) catch |err| return blockedRecovery(
-            request.operation,
-            try std.fmt.allocPrint(
-                allocator,
-                "root-operation completion provenance could not be published at {s}/{s}: {s}",
-                .{
-                    request.options.install_root,
-                    root_operation_completion.document_path,
-                    @errorName(err),
-                },
+        store.publish(allocator, statement.document) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
+                request.operation,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "root-operation completion provenance could not be published at {s}/{s}: {s}",
+                    .{
+                        request.options.install_root,
+                        root_operation_completion.document_path,
+                        @errorName(err),
+                    },
+                ),
             ),
-        );
+        };
         try guard.crash(.after_owed_provenance_document);
 
         // Provenance before clearing, exactly as an uninterrupted completion
@@ -1469,16 +1479,22 @@ pub const Backend = struct {
                 .completion_sha256 = statement.document.digest_sha256,
                 .provenance_sha256 = provenance_sha256,
                 .acknowledgment_id = orchestration_binding.?.acknowledgment_id,
+                .recovery_review_claim_sha256 = orchestration_binding.?.recovery_review_claim_sha256,
             });
             root_operation.Store.init(
                 guard.owned_root.?.root,
             ).publishDeferredAcknowledgment(
                 allocator,
                 marker,
-            ) catch return blockedRecovery(
-                request.operation,
-                "deferred lower recovery marker could not be published",
-            );
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker could not be published",
+                ),
+            };
         }
         attempt.publishProvenance(
             allocator,
@@ -1568,15 +1584,25 @@ pub const Backend = struct {
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
         const store = coordinator.store();
-        var marker = store.readDeferredAcknowledgment(allocator) catch
-            return blockedRecovery(
+        var marker = store.readDeferredAcknowledgment(allocator) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery marker is unreadable",
+                ),
+            };
+        var record = store.read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
                 request.operation,
-                "deferred lower recovery marker is unreadable",
-            );
-        var record = store.read(allocator) catch return blockedRecovery(
-            request.operation,
-            "deferred lower recovery record is unreadable",
-        );
+                "deferred lower recovery record is unreadable",
+            ),
+        };
         defer if (record) |*owned| owned.deinit();
         if (marker == null) {
             if (record != null) return blockedRecovery(
@@ -1586,10 +1612,15 @@ pub const Backend = struct {
             if (recovery_review_claim_sha256) |digest| {
                 const review = store.readRecoveryReviewClaim(
                     allocator,
-                ) catch return blockedRecovery(
-                    request.operation,
-                    "confirmed recovery review ownership is unreadable",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "confirmed recovery review ownership is unreadable",
+                    ),
+                };
                 if (review != null) {
                     const reconstructed =
                         root_operation.createDeferredAcknowledgment(.{
@@ -1613,6 +1644,8 @@ pub const Backend = struct {
                         },
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        error.ContractViolation => return error.ContractViolation,
+                        error.InvariantViolation => return error.InvariantViolation,
                         else => return blockedRecovery(
                             request.operation,
                             "confirmed recovery review could not restore exact lower ownership",
@@ -1661,10 +1694,15 @@ pub const Backend = struct {
 
         var completion = (root_operation_completion.Store.init(
             owned_root.root,
-        ).read(allocator) catch return blockedRecovery(
-            request.operation,
-            "deferred lower recovery completion evidence is unreadable",
-        )) orelse return blockedRecovery(
+        ).read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ContractViolation => return error.ContractViolation,
+            error.InvariantViolation => return error.InvariantViolation,
+            else => return blockedRecovery(
+                request.operation,
+                "deferred lower recovery completion evidence is unreadable",
+            ),
+        }) orelse return blockedRecovery(
             request.operation,
             "deferred lower recovery completion evidence is missing",
         );
@@ -1714,6 +1752,8 @@ pub const Backend = struct {
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
                 else => return blockedRecovery(
                     request.operation,
                     "confirmed recovery review could not be exchanged for the verified lower recovery owner",
@@ -1727,10 +1767,15 @@ pub const Backend = struct {
                 store.acknowledgeDeferredAcknowledgment(
                     allocator,
                     observed_marker.digest_sha256,
-                ) catch return blockedRecovery(
-                    request.operation,
-                    "deferred lower recovery acknowledgment could not be committed",
-                );
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ContractViolation => return error.ContractViolation,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    else => return blockedRecovery(
+                        request.operation,
+                        "deferred lower recovery acknowledgment could not be committed",
+                    ),
+                };
             if (self.completion_crash) |crash|
                 try crash.hit(.after_deferred_acknowledged);
         }
@@ -1740,11 +1785,16 @@ pub const Backend = struct {
             .terminal_state = .acknowledged,
             .observer = self.deferredCleanupObserver(),
         }) catch |err| {
-            if (err == error.InjectedCompletionCrash) return err;
-            return blockedRecovery(
-                request.operation,
-                "deferred lower recovery ownership could not be cleared",
-            );
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ContractViolation => error.ContractViolation,
+                error.InvariantViolation => error.InvariantViolation,
+                error.InjectedCompletionCrash => error.InjectedCompletionCrash,
+                else => blockedRecovery(
+                    request.operation,
+                    "deferred lower recovery ownership could not be cleared",
+                ),
+            };
         };
         if (record) |*owned| {
             owned.deinit();

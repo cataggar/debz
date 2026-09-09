@@ -285,6 +285,12 @@ pub const RecoveryReview = struct {
     claim: ?root_operation.RecoveryReviewClaim = null,
 };
 
+pub const RecoveryReviewDisposition = enum {
+    released,
+    transferred_owner,
+    unresolved,
+};
+
 pub const WorkflowOperation = enum { install, remove, upgrade_all };
 pub const WorkflowMode = enum {
     plan_only,
@@ -461,6 +467,10 @@ pub const LiveRootRunner = struct {
         std.mem.Allocator,
         root_operation.RecoveryReviewClaim,
     ) BoundaryError!bool,
+    settleRecoveryReviewFn: *const fn (
+        *anyopaque,
+        root_operation.RecoveryReviewClaim,
+    ) BoundaryError!RecoveryReviewDisposition,
 
     pub fn route(
         self: LiveRootRunner,
@@ -527,6 +537,13 @@ pub const LiveRootRunner = struct {
     ) BoundaryError!bool {
         return self.releaseRecoveryReviewFn(self.context, allocator, claim);
     }
+
+    pub fn settleRecoveryReview(
+        self: LiveRootRunner,
+        claim: root_operation.RecoveryReviewClaim,
+    ) BoundaryError!RecoveryReviewDisposition {
+        return self.settleRecoveryReviewFn(self.context, claim);
+    }
 };
 
 pub const TransportBoundary = enum { before_return };
@@ -544,6 +561,7 @@ pub const PrivateLiveRootRunner = struct {
     io: std.Io,
     termination_grace_ms: u64 = 1_000,
     transport_crash: ?TransportCrash = null,
+    review_transport_crash: ?TransportCrash = null,
 
     const Invocation = union(enum) {
         route: struct {
@@ -578,6 +596,7 @@ pub const PrivateLiveRootRunner = struct {
         prepare: RecoveryReviewInput,
         validate: root_operation.RecoveryReviewClaim,
         release: root_operation.RecoveryReviewClaim,
+        settle: root_operation.RecoveryReviewClaim,
     };
 
     const ReviewContext = struct {
@@ -622,6 +641,7 @@ pub const PrivateLiveRootRunner = struct {
             .prepareRecoveryReviewFn = prepareRecoveryReview,
             .validateRecoveryReviewFn = validateRecoveryReview,
             .releaseRecoveryReviewFn = releaseRecoveryReview,
+            .settleRecoveryReviewFn = settleRecoveryReview,
         };
     }
 
@@ -726,12 +746,30 @@ pub const PrivateLiveRootRunner = struct {
         };
     }
 
+    fn settleRecoveryReview(
+        context: *anyopaque,
+        claim: root_operation.RecoveryReviewClaim,
+    ) BoundaryError!RecoveryReviewDisposition {
+        return switch (reviewOperation(
+            context,
+            std.heap.page_allocator,
+            .{ .settle = claim },
+        ) catch |err| return mapReviewBoundaryError(err)) {
+            .released => .released,
+            .transferred_owner => .transferred_owner,
+            .unresolved => .unresolved,
+            else => error.InvariantViolation,
+        };
+    }
+
     const ReviewResult = union(enum) {
         unknown,
         claim: root_operation.RecoveryReviewClaim,
         valid,
         stale,
         released,
+        transferred_owner,
+        unresolved,
     };
 
     fn mapReviewBoundaryError(err: anyerror) BoundaryError {
@@ -817,11 +855,8 @@ pub const PrivateLiveRootRunner = struct {
             if (read_open) _ = linux.close(pipe[0]);
             if (write_open) _ = linux.close(pipe[1]);
         }
-        const buffer = try allocator.alloc(
-            u8,
-            root_operation.maximum_document_bytes,
-        );
-        defer allocator.free(buffer);
+        var fixed_buffer: [root_operation.maximum_document_bytes]u8 = undefined;
+        const buffer = fixed_buffer[0..];
         var reader_context: ReaderContext = .{
             .fd = pipe[0],
             .buffer = buffer,
@@ -882,6 +917,8 @@ pub const PrivateLiveRootRunner = struct {
             22 => .valid,
             23 => .stale,
             24 => .released,
+            25 => .transferred_owner,
+            26 => .unresolved,
             else => error.LiveRootChildFailed,
         };
     }
@@ -1010,6 +1047,7 @@ pub const PrivateLiveRootRunner = struct {
         return self.invokeInternal(allocator, invocation) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.ChildOutOfMemory => error.OutOfMemory,
+            error.ContractViolation,
             error.ChildContractViolation,
             error.MalformedFailureEnvelope,
             error.MalformedBackendResult,
@@ -1017,7 +1055,9 @@ pub const PrivateLiveRootRunner = struct {
             error.DocumentTooLarge,
             error.UnsafeInstallRoot,
             => error.ContractViolation,
-            error.ChildInvariantViolation => error.InvariantViolation,
+            error.InvariantViolation,
+            error.ChildInvariantViolation,
+            => error.InvariantViolation,
             error.NotPrivileged,
             error.NamespaceUnavailable,
             error.UnsafeRuntimeDirectory,
@@ -1412,6 +1452,7 @@ pub const PrivateLiveRootRunner = struct {
         const store = coordinator.store();
         return switch (context.operation) {
             .prepare => |input| prepareRecoveryReviewChild(
+                context.runner,
                 context.output_fd,
                 store,
                 input,
@@ -1441,10 +1482,51 @@ pub const PrivateLiveRootRunner = struct {
                 };
                 break :release 24;
             },
+            .settle => |claim| settle: {
+                const observed = try store.readRecoveryReviewClaim(
+                    std.heap.page_allocator,
+                );
+                if (observed) |value| {
+                    if (!std.mem.eql(
+                        u8,
+                        &value.digest_sha256,
+                        &claim.digest_sha256,
+                    )) break :settle 26;
+                    try store.clearRecoveryReviewClaim(
+                        std.heap.page_allocator,
+                        claim.digest_sha256,
+                    );
+                    break :settle 24;
+                }
+                const marker = try store.readDeferredAcknowledgment(
+                    std.heap.page_allocator,
+                );
+                if (marker) |value| {
+                    if (value.recovery_review_claim_sha256) |claim_sha256| {
+                        if (std.mem.eql(
+                            u8,
+                            &claim_sha256,
+                            &claim.digest_sha256,
+                        )) break :settle 25;
+                        break :settle 26;
+                    }
+                    if (claim.prior_marker) |prior| {
+                        if (std.mem.eql(
+                            u8,
+                            &value.digest_sha256,
+                            &prior.digest_sha256,
+                        )) break :settle 24;
+                    }
+                    break :settle 26;
+                }
+                if (claim.prior_marker == null) break :settle 24;
+                break :settle 26;
+            },
         };
     }
 
     fn prepareRecoveryReviewChild(
+        runner: *PrivateLiveRootRunner,
         output_fd: i32,
         store: root_operation.Store,
         input: RecoveryReviewInput,
@@ -1553,6 +1635,8 @@ pub const PrivateLiveRootRunner = struct {
             std.heap.page_allocator,
             input.expected_claim,
         );
+        if (runner.review_transport_crash) |crash|
+            try crash.hit(.before_return);
         const bytes = try input.expected_claim.canonicalJson(
             std.heap.page_allocator,
         );
@@ -3579,10 +3663,35 @@ pub const RecoveryPrepareOutcome = union(enum) {
     result: api.Result,
 };
 
+pub const RecoveryPrepareInvocation = union(enum) {
+    ready: RecoveryPreparation,
+    result: api.Result,
+    cleanup_required: RecoveryCleanupRequired,
+};
+
 pub const OperationalFailure = enum {
     interruption,
     state_io_or_durability,
     transport,
+};
+
+pub const RecoveryCleanupCause = enum {
+    out_of_memory,
+    contract_violation,
+    invariant_violation,
+    operational_boundary_failure,
+};
+
+pub const RecoveryCleanupDisposition = enum {
+    transferred_owner,
+    unresolved,
+    classification_failed,
+};
+
+pub const RecoveryCleanupRequired = struct {
+    cause: RecoveryCleanupCause,
+    disposition: RecoveryCleanupDisposition,
+    claim: root_operation.RecoveryReviewClaim,
 };
 
 pub const ExecutionError = error{
@@ -3648,6 +3757,7 @@ const InternalExecutionError = error{
 pub const ExecutionInvocation = union(enum) {
     result: api.Result,
     operational_failure: OperationalFailure,
+    cleanup_required: RecoveryCleanupRequired,
 };
 
 pub const CompletionBoundary = enum {
@@ -3682,6 +3792,59 @@ pub const CompletionCrash = struct {
         try self.hitFn(self.context, boundary);
     }
 };
+
+const RecoveryReviewGuard = struct {
+    runner: LiveRootRunner,
+    claim: root_operation.RecoveryReviewClaim,
+    armed: bool = true,
+
+    fn disarm(self: *RecoveryReviewGuard) void {
+        self.armed = false;
+    }
+
+    fn settle(
+        self: *RecoveryReviewGuard,
+        cause: RecoveryCleanupCause,
+    ) ?RecoveryCleanupRequired {
+        if (!self.armed) return null;
+        const disposition = self.runner.settleRecoveryReview(
+            self.claim,
+        ) catch |err| {
+            self.armed = false;
+            return .{
+                .cause = if (cause == .operational_boundary_failure)
+                    recoveryCleanupCause(err)
+                else
+                    cause,
+                .disposition = .classification_failed,
+                .claim = self.claim,
+            };
+        };
+        self.armed = false;
+        return switch (disposition) {
+            .released => null,
+            .transferred_owner => .{
+                .cause = cause,
+                .disposition = .transferred_owner,
+                .claim = self.claim,
+            },
+            .unresolved => .{
+                .cause = cause,
+                .disposition = .unresolved,
+                .claim = self.claim,
+            },
+        };
+    }
+};
+
+fn recoveryCleanupCause(err: anyerror) RecoveryCleanupCause {
+    return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.ContractViolation => .contract_violation,
+        error.InvariantViolation => .invariant_violation,
+        else => .operational_boundary_failure,
+    };
+}
 
 pub const Engine = struct {
     profiles: ProfileLoader,
@@ -3726,20 +3889,22 @@ pub const Engine = struct {
         recovery: RecoveryPreparation,
         confirmed: bool,
     ) ExecutionError!ExecutionInvocation {
-        const result = self.executeRecovery(
+        return self.executeRecoveryInvocation(
             allocator,
             recovery,
             confirmed,
         ) catch |err| return executionInvocationFailure(err);
-        return .{ .result = result };
     }
 
     pub fn invokePrepareRecovery(
         self: *Engine,
         allocator: std.mem.Allocator,
         profile_path: []const u8,
-    ) ExecutionError!RecoveryPrepareOutcome {
-        return self.prepareRecovery(allocator, profile_path) catch |err| switch (err) {
+    ) ExecutionError!RecoveryPrepareInvocation {
+        return self.prepareRecoveryInvocation(
+            allocator,
+            profile_path,
+        ) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.ContractViolation => error.ContractViolation,
             error.InvariantViolation => error.InvariantViolation,
@@ -5193,6 +5358,27 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         profile_path: []const u8,
     ) !RecoveryPrepareOutcome {
+        return switch (try self.prepareRecoveryInvocation(
+            allocator,
+            profile_path,
+        )) {
+            .ready => |ready| .{ .ready = ready },
+            .result => |result| .{ .result = result },
+            .cleanup_required => |cleanup| switch (cleanup.cause) {
+                .out_of_memory => error.OutOfMemory,
+                .contract_violation => error.ContractViolation,
+                .invariant_violation,
+                .operational_boundary_failure,
+                => error.InvariantViolation,
+            },
+        };
+    }
+
+    fn prepareRecoveryInvocation(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        profile_path: []const u8,
+    ) !RecoveryPrepareInvocation {
         var loaded = self.profiles.load(allocator, profile_path) catch |err|
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -5499,56 +5685,63 @@ pub const Engine = struct {
                 null,
             .expected_claim = expected_claim,
         };
+        var review_guard: RecoveryReviewGuard = .{
+            .runner = self.runner,
+            .claim = expected_claim,
+        };
+        defer std.debug.assert(!review_guard.armed);
         const review: RecoveryReview = self.runner.prepareRecoveryReview(
             allocator,
             review_input,
-        ) catch |err| switch (err) {
-            error.OutOfMemory,
-            error.ContractViolation,
-            error.InvariantViolation,
-            => {
-                _ = self.runner.releaseRecoveryReview(
-                    allocator,
-                    expected_claim,
-                ) catch {};
-                return err;
-            },
-            error.OperationalBoundaryFailure,
-            error.PrivilegeUnavailable,
-            error.RootReplacement,
-            => {
-                const released = self.runner.releaseRecoveryReview(
-                    allocator,
-                    expected_claim,
-                ) catch false;
-                if (!released) return .{ .result = try recoveryReviewCleanupFailure(
-                    allocator,
-                    .{
+        ) catch |err| {
+            if (review_guard.settle(recoveryCleanupCause(err))) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => {
+                    return_preparation = true;
+                    return .{ .ready = .{
                         .prepared = preparation,
                         .action = action,
-                        .mutation_status = mutation_status,
-                        .review_claim = expected_claim,
-                    },
-                    expected_claim,
-                    "recovery review publication may have completed but its exact claim could not be released after transport failure",
-                ) };
-                return_preparation = true;
-                return .{ .ready = .{
-                    .prepared = preparation,
-                    .action = action,
-                    .mutation_status = .unknown,
-                } };
-            },
+                        .mutation_status = .unknown,
+                    } };
+                },
+            }
         };
-        var stable = (self.store.inspectActiveLocked(
+        if (review.claim == null or
+            !std.mem.eql(
+                u8,
+                &review.claim.?.digest_sha256,
+                &expected_claim.digest_sha256,
+            ))
+        {
+            if (review_guard.settle(.operational_boundary_failure)) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            return_preparation = true;
+            return .{ .ready = .{
+                .prepared = preparation,
+                .action = action,
+                .mutation_status = .unknown,
+            } };
+        }
+        var stable = self.store.inspectActiveLocked(
             allocator,
             preparation.profile_state_path,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ContractViolation => return error.ContractViolation,
-            error.InvariantViolation => return error.InvariantViolation,
-            else => null,
-        });
+        ) catch |err| blk: {
+            if (review_guard.settle(recoveryCleanupCause(err))) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => break :blk null,
+            }
+        };
         defer if (stable) |*owned_state| owned_state.deinit();
         if (stable == null or
             stable.?.state.generation != preparation.active_generation or
@@ -5559,41 +5752,8 @@ pub const Engine = struct {
             ) or
             !stateMatchesPreparation(stable.?.state, preparation))
         {
-            if (review.claim) |claim| {
-                const released = self.runner.releaseRecoveryReview(
-                    allocator,
-                    claim,
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.ContractViolation => return error.ContractViolation,
-                    error.InvariantViolation => return error.InvariantViolation,
-                    error.OperationalBoundaryFailure,
-                    error.PrivilegeUnavailable,
-                    error.RootReplacement,
-                    => return .{ .result = try recoveryReviewCleanupFailure(
-                        allocator,
-                        .{
-                            .prepared = preparation,
-                            .action = action,
-                            .mutation_status = review.mutation_status,
-                            .review_claim = claim,
-                        },
-                        claim,
-                        "active apt/system state changed and the exact recovery review claim could not be released",
-                    ) },
-                };
-                if (!released) return .{ .result = try recoveryReviewCleanupFailure(
-                    allocator,
-                    .{
-                        .prepared = preparation,
-                        .action = action,
-                        .mutation_status = review.mutation_status,
-                        .review_claim = claim,
-                    },
-                    claim,
-                    "active apt/system state changed and the exact recovery review claim is missing or foreign",
-                ) };
-            }
+            if (review_guard.settle(.operational_boundary_failure)) |cleanup|
+                return .{ .cleanup_required = cleanup };
             return .{ .result = try unknownMutationDiagnostic(
                 allocator,
                 null,
@@ -5601,6 +5761,7 @@ pub const Engine = struct {
                 "active apt/system state changed while the recovery review was bound",
             ) };
         }
+        review_guard.disarm();
         return_preparation = true;
         return .{ .ready = .{
             .prepared = preparation,
@@ -5677,29 +5838,75 @@ pub const Engine = struct {
         recovery: RecoveryPreparation,
         confirmed: bool,
     ) InternalExecutionError!api.Result {
-        if (!confirmed) return self.cancelRecoveryReview(allocator, recovery);
+        return switch (try self.executeRecoveryInvocation(
+            allocator,
+            recovery,
+            confirmed,
+        )) {
+            .result => |result| result,
+            .operational_failure => error.InvariantViolation,
+            .cleanup_required => |cleanup| switch (cleanup.cause) {
+                .out_of_memory => error.OutOfMemory,
+                .contract_violation => error.ContractViolation,
+                .invariant_violation => error.InvariantViolation,
+                .operational_boundary_failure => recoveryReviewCleanupFailure(
+                    allocator,
+                    recovery,
+                    cleanup.claim,
+                    switch (cleanup.disposition) {
+                        .transferred_owner => "recovery ownership transferred before the parent accepted the child outcome; exact recovery is required",
+                        .unresolved => "recovery review ownership is unresolved and must be inspected using the exact claim",
+                        .classification_failed => "recovery review ownership could not be classified or released",
+                    },
+                ),
+            },
+        };
+    }
+
+    fn executeRecoveryInvocation(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        recovery: RecoveryPreparation,
+        confirmed: bool,
+    ) InternalExecutionError!ExecutionInvocation {
+        if (!confirmed) return .{ .result = try self.cancelRecoveryReview(
+            allocator,
+            recovery,
+        ) };
         const review_claim = recovery.review_claim orelse
-            return staleRecoveryReviewResult(recovery);
+            return .{ .result = try staleRecoveryReviewResult(recovery) };
         if (recovery.mutation_status == .unknown)
-            return staleRecoveryReviewResult(recovery);
+            return .{ .result = try staleRecoveryReviewResult(recovery) };
+        var review_guard: RecoveryReviewGuard = .{
+            .runner = self.runner,
+            .claim = review_claim,
+        };
+        defer std.debug.assert(!review_guard.armed);
         const review_valid = self.runner.validateRecoveryReview(
             allocator,
             review_claim,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ContractViolation => return error.ContractViolation,
-            error.InvariantViolation => return error.InvariantViolation,
-            error.OperationalBoundaryFailure,
-            error.PrivilegeUnavailable,
-            error.RootReplacement,
-            => return self.reconcilePreparedErrorWithPolicy(
-                allocator,
-                recovery.prepared,
-                .reservation_outcome_ambiguous,
-            ),
+        ) catch |err| {
+            if (review_guard.settle(recoveryCleanupCause(err))) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ContractViolation => return error.ContractViolation,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.OperationalBoundaryFailure,
+                error.PrivilegeUnavailable,
+                error.RootReplacement,
+                => return .{ .result = try self.reconcilePreparedErrorWithPolicy(
+                    allocator,
+                    recovery.prepared,
+                    .reservation_outcome_ambiguous,
+                ) },
+            }
         };
-        if (!review_valid)
-            return self.rejectStaleRecoveryReview(allocator, recovery);
+        if (!review_valid) {
+            if (review_guard.settle(.operational_boundary_failure)) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            return .{ .result = try staleRecoveryReviewResult(recovery) };
+        }
         var claim_transferred = false;
         var result = self.executeValidatedRecovery(
             allocator,
@@ -5707,55 +5914,19 @@ pub const Engine = struct {
             review_claim,
             &claim_transferred,
         ) catch |err| {
-            if (!claim_transferred) {
-                _ = self.runner.releaseRecoveryReview(
-                    std.heap.page_allocator,
-                    review_claim,
-                ) catch {};
-            }
-            return err;
+            if (review_guard.settle(recoveryCleanupCause(err))) |cleanup|
+                return .{ .cleanup_required = cleanup };
+            return executionInvocationFailure(err);
         };
-        if (!claim_transferred) {
-            const released = self.runner.releaseRecoveryReview(
-                allocator,
-                review_claim,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    result.deinit();
-                    return error.OutOfMemory;
-                },
-                error.ContractViolation => {
-                    result.deinit();
-                    return error.ContractViolation;
-                },
-                error.InvariantViolation => {
-                    result.deinit();
-                    return error.InvariantViolation;
-                },
-                error.OperationalBoundaryFailure,
-                error.PrivilegeUnavailable,
-                error.RootReplacement,
-                => {
-                    result.deinit();
-                    return recoveryReviewCleanupFailure(
-                        allocator,
-                        recovery,
-                        review_claim,
-                        "the validated recovery review claim could not be released",
-                    );
-                },
-            };
-            if (!released) {
+        if (claim_transferred) {
+            review_guard.disarm();
+        } else {
+            if (review_guard.settle(.operational_boundary_failure)) |cleanup| {
                 result.deinit();
-                return recoveryReviewCleanupFailure(
-                    allocator,
-                    recovery,
-                    review_claim,
-                    "the validated recovery review claim is missing or foreign",
-                );
+                return .{ .cleanup_required = cleanup };
             }
         }
-        return result;
+        return .{ .result = result };
     }
 
     fn executeValidatedRecovery(
@@ -9699,9 +9870,9 @@ test "apt_system_orchestrator.test.required_privileged.manifest covers every pri
         }
         cursor = next;
     }
-    try std.testing.expectEqual(@as(usize, 25), tagged_count);
+    try std.testing.expectEqual(@as(usize, 27), tagged_count);
     try std.testing.expectEqual(
-        @as(usize, 21),
+        @as(usize, 23),
         privilege_dependent_count,
     );
 }
@@ -11035,8 +11206,10 @@ const FakeRunner = struct {
     recovery_review_claim: ?root_operation.RecoveryReviewClaim = null,
     recovery_review_prepares: usize = 0,
     recovery_review_releases: usize = 0,
+    recovery_review_transferred: bool = false,
     force_review_stale: bool = false,
     release_review_failure: ?BoundaryError = null,
+    review_failure_after_publish: ?BoundaryError = null,
 
     const RecoveryCompletionMismatch = enum {
         none,
@@ -11072,6 +11245,7 @@ const FakeRunner = struct {
             .prepareRecoveryReviewFn = prepareRecoveryReviewBoundary,
             .validateRecoveryReviewFn = validateRecoveryReviewBoundary,
             .releaseRecoveryReviewFn = releaseRecoveryReviewBoundary,
+            .settleRecoveryReviewFn = settleRecoveryReviewBoundary,
         };
     }
 
@@ -11112,6 +11286,7 @@ const FakeRunner = struct {
                 ))
                 return error.OperationalBoundaryFailure;
             self.recovery_review_claim = null;
+            self.recovery_review_transferred = true;
         } else if (request.recovery_review_claim_sha256 != null) {
             return error.OperationalBoundaryFailure;
         }
@@ -11234,6 +11409,8 @@ const FakeRunner = struct {
             &input.expected_claim.digest_sha256,
         )) return .{ .mutation_status = .unknown };
         self.recovery_review_claim = input.expected_claim;
+        if (self.review_failure_after_publish) |failure|
+            return failure;
         return .{
             .mutation_status = status,
             .claim = input.expected_claim,
@@ -11271,6 +11448,26 @@ const FakeRunner = struct {
         self.recovery_review_claim = null;
         self.recovery_review_releases += 1;
         return true;
+    }
+
+    fn settleRecoveryReviewBoundary(
+        context: *anyopaque,
+        claim: root_operation.RecoveryReviewClaim,
+    ) BoundaryError!RecoveryReviewDisposition {
+        const self: *FakeRunner = @ptrCast(@alignCast(context));
+        if (self.release_review_failure) |failure| return failure;
+        if (self.recovery_review_claim) |observed| {
+            if (!std.mem.eql(
+                u8,
+                &observed.digest_sha256,
+                &claim.digest_sha256,
+            )) return .unresolved;
+            self.recovery_review_claim = null;
+            self.recovery_review_releases += 1;
+            return .released;
+        }
+        if (self.recovery_review_transferred) return .transferred_owner;
+        return .released;
     }
 
     fn readRecoveryCompletionBoundary(
@@ -11936,6 +12133,7 @@ const OuterGenerationRaceRunner = struct {
             .prepareRecoveryReviewFn = prepareRecoveryReviewBoundary,
             .validateRecoveryReviewFn = validateRecoveryReviewBoundary,
             .releaseRecoveryReviewFn = releaseRecoveryReviewBoundary,
+            .settleRecoveryReviewFn = settleRecoveryReviewBoundary,
         };
     }
 
@@ -12035,6 +12233,14 @@ const OuterGenerationRaceRunner = struct {
             allocator,
             claim,
         );
+    }
+
+    fn settleRecoveryReviewBoundary(
+        context: *anyopaque,
+        claim: root_operation.RecoveryReviewClaim,
+    ) BoundaryError!RecoveryReviewDisposition {
+        const self: *OuterGenerationRaceRunner = @ptrCast(@alignCast(context));
+        return FakeRunner.settleRecoveryReviewBoundary(self.inner, claim);
     }
 
     fn route(
@@ -13401,6 +13607,19 @@ const ProcessDeathTransportCrash = struct {
     }
 };
 
+const ErrorTransportCrash = struct {
+    failure: anyerror,
+
+    fn interface(self: *ErrorTransportCrash) TransportCrash {
+        return .{ .context = self, .hitFn = hit };
+    }
+
+    fn hit(context: *anyopaque, _: TransportBoundary) !void {
+        const self: *ErrorTransportCrash = @ptrCast(@alignCast(context));
+        return self.failure;
+    }
+};
+
 const AbandonAfterReservationTransport = struct {
     io: std.Io,
     disrupted_path: []const u8,
@@ -13889,6 +14108,7 @@ test "apt_system_orchestrator.test.execution state errors reconcile at durable b
         var result = switch (invocation) {
             .result => |value| value,
             .operational_failure => return error.Unexpected,
+            .cleanup_required => return error.Unexpected,
         };
         defer result.deinit();
         try std.testing.expectEqual(api.Outcome.configuration, result.outcome);
@@ -15875,6 +16095,249 @@ test "apt_system_orchestrator.test.required_privileged.production recovery commi
         try std.testing.expectEqual(RootStatus.clean, clean.status);
         try std.testing.expect(clean.deferred_acknowledgment == null);
     }
+}
+
+test "apt_system_orchestrator.test.required_privileged.production post-transfer fatals preserve exact owner disposition" {
+    try requirePrivilegedProductionTest();
+    inline for ([_]anyerror{
+        error.OutOfMemory,
+        error.ContractViolation,
+        error.InvariantViolation,
+    }) |fatal| {
+        var fixture = ProductionRunnerFixture.init(
+            std.testing.allocator,
+        ) catch |err| switch (err) {
+            error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
+            else => return err,
+        };
+        defer fixture.deinit();
+        var process: ProductionRunnerProcess = .{
+            .io = std.testing.io,
+            .dpkg = fixture.dpkg,
+        };
+        var production: production_backend.Backend = .{
+            .io = std.testing.io,
+            .now_unix = @import("fixtures/openpgp.zig").created + 30,
+            .process_runner = process.interface(),
+        };
+        var backend: ProductionBackend = .{ .backend = &production };
+        var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+        var profile: FakeProfileLoader = .{
+            .state_path = fixture.state_path,
+            .cache_path = fixture.cache_path,
+            .source_paths = fixture.source_paths,
+            .keyring_paths = fixture.keyring_paths,
+        };
+        var store: SystemStateStore = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+        };
+        var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+        var sources: FakeSources = .{};
+        var engine: Engine = .{
+            .profiles = profile.interface(),
+            .runner = runner.interface(),
+            .backend = backend.interface(),
+            .store = store.interface(),
+            .verifier = verifier.interface(),
+            .ids = sources.ids(),
+            .clock = sources.clock(),
+        };
+        var prepared = try expectReady(try engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.remove, &.{"removable"}),
+        ));
+        defer prepared.deinit();
+        const execute_child = try live_root.testing.forkProcess();
+        if (execute_child == 0) {
+            var crash: ProductionChildCrash = .{
+                .boundary = .after_completed_record,
+            };
+            production.completion_crash = crash.interface();
+            _ = engine.execute(
+                std.heap.page_allocator,
+                prepared,
+                true,
+            ) catch {};
+            std.os.linux.exit_group(103);
+        }
+        _ = try reapSignalTestProcess(execute_child);
+        var recovery = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer recovery.deinit();
+        const claim_digest = recovery.review_claim.?.digest_sha256;
+        var transport_failure: ErrorTransportCrash = .{ .failure = fatal };
+        runner.transport_crash = transport_failure.interface();
+        const invocation = try engine.invokeExecuteRecovery(
+            std.testing.allocator,
+            recovery,
+            true,
+        );
+        switch (invocation) {
+            .cleanup_required => |cleanup| {
+                try std.testing.expectEqual(
+                    switch (fatal) {
+                        error.OutOfMemory => RecoveryCleanupCause.out_of_memory,
+                        error.ContractViolation => RecoveryCleanupCause.contract_violation,
+                        error.InvariantViolation => RecoveryCleanupCause.invariant_violation,
+                        else => unreachable,
+                    },
+                    cleanup.cause,
+                );
+                try std.testing.expectEqual(
+                    RecoveryCleanupDisposition.transferred_owner,
+                    cleanup.disposition,
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    &claim_digest,
+                    &cleanup.claim.digest_sha256,
+                );
+            },
+            else => return error.ExpectedCleanupRequired,
+        }
+        runner.transport_crash = null;
+        var inspection = try runner.interface().inspect(
+            std.testing.allocator,
+        );
+        defer inspection.deinit();
+        const marker = inspection.deferred_acknowledgment orelse
+            return error.MissingRecoveryAcknowledgment;
+        try std.testing.expectEqualSlices(
+            u8,
+            &claim_digest,
+            &marker.recovery_review_claim_sha256.?,
+        );
+        var retry = switch (try engine.prepareRecovery(
+            std.testing.allocator,
+            "/profile.json",
+        )) {
+            .ready => |value| value,
+            .result => return error.ExpectedRecoveryPreparation,
+        };
+        defer retry.deinit();
+        var completed = try engine.executeRecovery(
+            std.testing.allocator,
+            retry,
+            true,
+        );
+        defer completed.deinit();
+        try std.testing.expectEqual(api.Outcome.success, completed.outcome);
+    }
+}
+
+test "apt_system_orchestrator.test.required_privileged.production lost review response releases precomputed claim" {
+    try requirePrivilegedProductionTest();
+    var fixture = ProductionRunnerFixture.init(
+        std.testing.allocator,
+    ) catch |err| switch (err) {
+        error.NamespaceUnavailable => return privilegedCoverageUnavailable(),
+        else => return err,
+    };
+    defer fixture.deinit();
+    var process: ProductionRunnerProcess = .{
+        .io = std.testing.io,
+        .dpkg = fixture.dpkg,
+    };
+    var production: production_backend.Backend = .{
+        .io = std.testing.io,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    var backend: ProductionBackend = .{ .backend = &production };
+    var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var profile: FakeProfileLoader = .{
+        .state_path = fixture.state_path,
+        .cache_path = fixture.cache_path,
+        .source_paths = fixture.source_paths,
+        .keyring_paths = fixture.keyring_paths,
+    };
+    var store: SystemStateStore = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    var verifier: SystemResultVerifier = .{ .io = std.testing.io };
+    var sources: FakeSources = .{};
+    var engine: Engine = .{
+        .profiles = profile.interface(),
+        .runner = runner.interface(),
+        .backend = backend.interface(),
+        .store = store.interface(),
+        .verifier = verifier.interface(),
+        .ids = sources.ids(),
+        .clock = sources.clock(),
+    };
+    var prepared = try expectReady(try engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.remove, &.{"removable"}),
+    ));
+    defer prepared.deinit();
+    const execute_child = try live_root.testing.forkProcess();
+    if (execute_child == 0) {
+        var crash: ProductionChildCrash = .{
+            .boundary = .after_completed_record,
+        };
+        production.completion_crash = crash.interface();
+        _ = engine.execute(
+            std.heap.page_allocator,
+            prepared,
+            true,
+        ) catch {};
+        std.os.linux.exit_group(104);
+    }
+    _ = try reapSignalTestProcess(execute_child);
+    var response_loss: ProcessDeathTransportCrash = .{};
+    runner.review_transport_crash = response_loss.interface();
+    var failed_review = try engine.invokePrepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    );
+    switch (failed_review) {
+        .ready => |*ready| {
+            defer ready.deinit();
+            try std.testing.expectEqual(
+                VerifiedMutationStatus.unknown,
+                ready.mutation_status,
+            );
+            try std.testing.expect(ready.review_claim == null);
+        },
+        .result => |*result| {
+            defer result.deinit();
+            return error.ExpectedUnknownRecoveryPreparation;
+        },
+        .cleanup_required => return error.UnexpectedCleanupRequired,
+    }
+    runner.review_transport_crash = null;
+    var retry = switch (try engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer retry.deinit();
+    try std.testing.expect(retry.review_claim != null);
+    var cancelled = try engine.executeRecovery(
+        std.testing.allocator,
+        retry,
+        false,
+    );
+    defer cancelled.deinit();
+    try std.testing.expectEqual(api.Outcome.usage, cancelled.outcome);
+    var clean_retry = switch (try engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer clean_retry.deinit();
+    try std.testing.expect(clean_retry.review_claim != null);
 }
 
 test "apt_system_orchestrator.test.required_privileged.production runner classifies every durable pre-mutation crash" {
@@ -19578,6 +20041,146 @@ test "apt_system_orchestrator.test.recovery transport failure preserves lower to
     try std.testing.expectEqual(@as(usize, 1), harness.backend.recovery_ack_calls);
     try std.testing.expectEqual(@as(usize, 1), harness.runner.recovery_ack_calls);
     try std.testing.expect(harness.store.active_bytes == null);
+}
+
+test "apt_system_orchestrator.test.post-transfer transport failure returns exact durable cleanup disposition" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+    var recovery = switch (try harness.engine.prepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    )) {
+        .ready => |value| value,
+        .result => return error.ExpectedRecoveryPreparation,
+    };
+    defer recovery.deinit();
+    const claim_digest = recovery.review_claim.?.digest_sha256;
+    harness.runner.fail_after_recovery_transport = true;
+    const invocation = try harness.engine.invokeExecuteRecovery(
+        std.testing.allocator,
+        recovery,
+        true,
+    );
+    switch (invocation) {
+        .cleanup_required => |cleanup| {
+            try std.testing.expectEqual(
+                RecoveryCleanupCause.operational_boundary_failure,
+                cleanup.cause,
+            );
+            try std.testing.expectEqual(
+                RecoveryCleanupDisposition.transferred_owner,
+                cleanup.disposition,
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                &claim_digest,
+                &cleanup.claim.digest_sha256,
+            );
+        },
+        else => return error.ExpectedCleanupRequired,
+    }
+    try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
+    try std.testing.expect(harness.runner.recovery_review_transferred);
+}
+
+test "apt_system_orchestrator.test.post-publication fatal releases claim or returns cleanup evidence" {
+    for ([_]BoundaryError{
+        error.OutOfMemory,
+        error.ContractViolation,
+        error.InvariantViolation,
+    }) |fatal| {
+        var harness = Harness.init(std.testing.allocator);
+        defer harness.deinit();
+        harness.rebind();
+        var prepared = try expectReady(try harness.engine.prepare(
+            std.testing.allocator,
+            mutationRequest(.install, &.{"alpha"}),
+        ));
+        defer prepared.deinit();
+        harness.runner.fail_mode = .execute;
+        var interrupted = try harness.engine.execute(
+            std.testing.allocator,
+            prepared,
+            true,
+        );
+        defer interrupted.deinit();
+        harness.runner.fail_mode = null;
+        harness.runner.review_failure_after_publish = fatal;
+        try std.testing.expectError(
+            fatal,
+            harness.engine.invokePrepareRecovery(
+                std.testing.allocator,
+                "/profile.json",
+            ),
+        );
+        try std.testing.expect(harness.runner.recovery_review_claim == null);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            harness.runner.recovery_review_releases,
+        );
+    }
+
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    ));
+    defer prepared.deinit();
+    harness.runner.fail_mode = .execute;
+    var interrupted = try harness.engine.execute(
+        std.testing.allocator,
+        prepared,
+        true,
+    );
+    defer interrupted.deinit();
+    harness.runner.fail_mode = null;
+    harness.runner.review_failure_after_publish = error.OutOfMemory;
+    harness.runner.release_review_failure = error.OperationalBoundaryFailure;
+    var outcome = try harness.engine.invokePrepareRecovery(
+        std.testing.allocator,
+        "/profile.json",
+    );
+    switch (outcome) {
+        .cleanup_required => |cleanup| {
+            try std.testing.expectEqual(
+                RecoveryCleanupCause.out_of_memory,
+                cleanup.cause,
+            );
+            try std.testing.expectEqual(
+                RecoveryCleanupDisposition.classification_failed,
+                cleanup.disposition,
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                &harness.runner.recovery_review_claim.?.digest_sha256,
+                &cleanup.claim.digest_sha256,
+            );
+        },
+        .ready => |*ready| {
+            ready.deinit();
+            return error.ExpectedCleanupRequired;
+        },
+        .result => |*result| {
+            result.deinit();
+            return error.ExpectedCleanupRequired;
+        },
+    }
 }
 
 test "apt_system_orchestrator.test.recovery retention failure preserves lower token for retry without second mutation" {
