@@ -477,8 +477,17 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_native_program_tests = b.addRunArtifact(native_program_tests);
-    b.step("test-native-program", "Run native authorization and program compiler tests")
-        .dependOn(&run_native_program_tests.step);
+    const native_program_corpus_tests = b.addTest(.{
+        .root_module = fuzz_tests.root_module,
+        .filters = &.{"fuzz.corpus native transaction program seeds stay canonical"},
+    });
+    const run_native_program_corpus_tests = b.addRunArtifact(native_program_corpus_tests);
+    const native_program_step = b.step(
+        "test-native-program",
+        "Run native authorization, program compiler, and canonical corpus tests",
+    );
+    native_program_step.dependOn(&run_native_program_tests.step);
+    native_program_step.dependOn(&run_native_program_corpus_tests.step);
 
     const root_operation_tests = b.addTest(.{
         .root_module = debz,
