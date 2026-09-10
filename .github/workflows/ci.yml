@@ -582,6 +582,10 @@ jobs:
         run: |
           zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -j2 --summary all
           zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize=ReleaseSafe -j2 --summary all
+      - name: Exercise native process crashes, recovery, and provenance
+        run: |
+          zig build test-native-recovery -j2 --summary all
+          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all
       - name: Run required real apt facade acceptance
         run: |
           sudo env \

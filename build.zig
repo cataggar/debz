@@ -631,6 +631,30 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-triggers", "Compare native trigger activation and processing with dpkg")
         .dependOn(&native_triggers.step);
 
+    const native_recovery_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{ "native_recovery.test.", "native_provenance.test." },
+    });
+    const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
+    b.step("test-native-recovery-unit", "Run native execution journal and provenance tests")
+        .dependOn(&run_native_recovery_tests.step);
+    test_step.dependOn(&run_native_recovery_tests.step);
+    const native_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/test-native-recovery.py",
+    });
+    native_recovery.addArtifactArg(native_lifecycle_tests);
+    native_recovery.addArg("--native-helper");
+    native_recovery.addArtifactArg(native_trigger_helper);
+    const native_recovery_oracle_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
+    );
+    native_recovery.step.dependOn(&native_recovery_oracle_tests.step);
+    native_recovery.step.dependOn(&run_native_recovery_tests.step);
+    test_step.dependOn(&native_recovery_oracle_tests.step);
+    b.step("test-native-recovery", "Compare real native crash recovery with dpkg and bound provenance")
+        .dependOn(&native_recovery.step);
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -833,6 +857,7 @@ fn installReleaseFiles(
         "multi-repository-policy.md",
         "native-conffiles.md",
         "native-lifecycle.md",
+        "native-recovery.md",
         "native-transaction-engine-v1.md",
         "native-transaction-program.md",
         "native-triggers.md",
@@ -869,8 +894,14 @@ fn installReleaseFiles(
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
+        "native-execution-intent-v1.json",
+        "native-execution-progress-v1.json",
+        "native-managed-state-v1.json",
+        "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",
         "native-transaction-program-v1.json",
+        "native-transaction-provenance-v1.json",
+        "native-trigger-events-v1.json",
         "package-cache-error-v1.json",
         "package-cache-fingerprint-v1.json",
         "package-cache-result-v1.json",

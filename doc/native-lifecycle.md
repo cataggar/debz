@@ -3,9 +3,10 @@
 The item-12 lifecycle acceptance boundary composes the native program compiler,
 data/conffile materialization, package database, root-operation coordinator, and
 audited maintainer-script runner. It is private: production native selection
-remains unavailable and the legacy backend remains the default. Trigger
-execution, full interrupted-script recovery orchestration, and production
-integration are separate milestones.
+remains unavailable and the legacy backend remains the default.
+[Trigger execution](native-triggers.md) and
+[durable native recovery](native-recovery.md) extend this private boundary.
+Production integration remains a separate milestone.
 
 ## Execution contract
 

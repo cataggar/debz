@@ -33,7 +33,10 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
+const native_provenance = @import("native_provenance.zig");
+const native_recovery = @import("native_recovery.zig");
 const native_trigger = @import("native_trigger.zig");
+const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
 const package_database_changes = @import("package_database_changes.zig");
 const product_api = @import("product_api.zig");
@@ -47,6 +50,105 @@ const transaction_recovery = @import("transaction_recovery.zig");
 const version_module = @import("debian_version.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+threadlocal var active_native_recovery: ?*native_recovery.Runtime = null;
+threadlocal var active_native_action: ?native_recovery.Action = null;
+threadlocal var active_native_program_step: u32 = 0;
+threadlocal var active_native_phase_ordinal: u16 = 0;
+threadlocal var active_native_script_ordinal: u32 = 0;
+threadlocal var active_native_phase_steps: ?[]const root_mutation.Step = null;
+
+fn nativeAction(
+    kind: native_recovery.ActionKind,
+    program_step: u32,
+    substep: u16,
+    ordinal: u32,
+) native_recovery.Action {
+    return .{
+        .kind = kind,
+        .program_step = program_step,
+        .substep = substep,
+        .ordinal = ordinal,
+    };
+}
+
+fn recoveredActionApplied() !bool {
+    const runtime = active_native_recovery orelse return false;
+    const action = active_native_action orelse return false;
+    const record = try runtime.latest(action) orelse return false;
+    return record.stage == .completed and
+        (record.result == .applied or record.result == .succeeded or
+            record.result == .recovered);
+}
+
+fn beginNativePhase(kind: native_recovery.ActionKind) ?native_recovery.Action {
+    if (active_native_recovery == null) return null;
+    const action = nativeAction(
+        kind,
+        active_native_program_step,
+        active_native_phase_ordinal,
+        0,
+    );
+    active_native_phase_ordinal +%= 1;
+    active_native_action = action;
+    return action;
+}
+
+fn beginNativeProgramStep(
+    step: native_program.Step,
+) native_program.Operation {
+    active_native_program_step = step.sequence;
+    active_native_phase_ordinal = 0;
+    active_native_script_ordinal = 0;
+    return step.operation;
+}
+
+fn checkpointManagedPaths(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    action: native_recovery.Action,
+    steps: []const root_mutation.Step,
+    transient: bool,
+) !native_recovery.Digest {
+    const paths = try allocator.alloc([]const u8, steps.len);
+    defer allocator.free(paths);
+    for (steps, 0..) |step, index| paths[index] = step.path;
+    return native_recovery.updateManagedState(
+        allocator,
+        runtime.root,
+        runtime.intent_sha256,
+        action,
+        paths,
+        transient,
+    );
+}
+
+const CombinedMutationHooks = struct {
+    original: root_mutation.Hooks,
+    runtime: ?*native_recovery.Runtime,
+    action: ?native_recovery.Action,
+
+    fn before(
+        context: ?*anyopaque,
+        boundary: root_mutation.Boundary,
+        index: u32,
+    ) root_mutation.HookError!void {
+        const self: *CombinedMutationHooks = @ptrCast(@alignCast(context.?));
+        if (self.original.beforeFn) |call|
+            try call(self.original.context, boundary, index);
+        const runtime = self.runtime orelse return;
+        const action = self.action orelse return;
+        const selected = runtime.crash.selected orelse return;
+        const matches = switch (selected) {
+            .during_filesystem_publication => action.kind == .filesystem,
+            .during_database_publication => action.kind == .database,
+            else => false,
+        };
+        if (matches and
+            (boundary == .publish_rename or boundary == .publish_create))
+            std.process.exit(native_recovery.crash_exit_code);
+    }
+};
 
 pub const model_version: u32 = 1;
 
@@ -7638,6 +7740,12 @@ fn materialize(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
 ) !MaterializationResult {
+    const previous_action = active_native_action;
+    _ = beginNativePhase(.filesystem);
+    defer active_native_action = previous_action;
+    if (try recoveredActionApplied())
+        return .{ .outcome = .applied, .detail = "recovered_phase" };
+
     var planned = switch (try plan(allocator, request.planning)) {
         .handoff => |value| {
             var handoff = value;
@@ -7813,6 +7921,15 @@ fn materialize(
         else
             @intCast(mutation_plan.steps.len - 1);
 
+    if (active_native_recovery) |runtime| {
+        if (active_native_action) |action|
+            try runtime.append(action, .prepared, .none, null);
+    }
+    var combined_hooks: CombinedMutationHooks = .{
+        .original = request.hooks,
+        .runtime = active_native_recovery,
+        .action = active_native_action,
+    };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
@@ -7821,7 +7938,11 @@ fn materialize(
         &mutation_plan,
         mutation_evidence,
         .{
-            .hooks = request.hooks,
+            .hooks = .{
+                .context = &combined_hooks,
+                .beforeFn = CombinedMutationHooks.before,
+            },
+            .allow_recovery_continuation = active_native_recovery != null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -7844,22 +7965,27 @@ fn materialize(
     };
     defer engine.deinit();
 
-    const mutation_report = root_mutation.apply(
-        &engine,
-        .fromPlan(&mutation_plan),
-    ) catch |err| switch (err) {
-        error.SimulatedCrash => return .{
-            .outcome = .recovery_required,
-            .detail = "simulated_crash",
-        },
-        error.RecoveryRequired,
-        error.ExternalModification,
-        error.VerificationFailed,
-        => return .{
-            .outcome = .recovery_required,
-            .detail = @errorName(err),
-        },
-        else => return err,
+    const mutation_report = block: {
+        const previous_steps = active_native_phase_steps;
+        active_native_phase_steps = mutation_plan.steps;
+        defer active_native_phase_steps = previous_steps;
+        break :block root_mutation.apply(
+            &engine,
+            .fromPlan(&mutation_plan),
+        ) catch |err| switch (err) {
+            error.SimulatedCrash => return .{
+                .outcome = .recovery_required,
+                .detail = "simulated_crash",
+            },
+            error.RecoveryRequired,
+            error.ExternalModification,
+            error.VerificationFailed,
+            => return .{
+                .outcome = .recovery_required,
+                .detail = @errorName(err),
+            },
+            else => return err,
+        };
     };
     if (mutation_report.outcome == .recovery_required) {
         return .{
@@ -7897,6 +8023,47 @@ fn materialize(
                 .detail = @errorName(err),
             };
         };
+    }
+
+    if (active_native_recovery) |runtime| {
+        if (active_native_action) |action| {
+            const checkpoint_sha256 = switch (mutation_report.outcome) {
+                .applied => try checkpointManagedPaths(
+                    allocator,
+                    runtime,
+                    action,
+                    mutation_plan.steps,
+                    false,
+                ),
+                .rolled_back => block: {
+                    try native_recovery.discardTransientManagedState(
+                        allocator,
+                        request.root,
+                        runtime.intent_sha256,
+                    );
+                    try native_recovery.validateStableManagedState(
+                        allocator,
+                        request.root,
+                        runtime.intent_sha256,
+                    );
+                    break :block native_recovery.hexDigest(
+                        mutation_plan.steps_sha256,
+                    );
+                },
+                .recovery_required => unreachable,
+            };
+            try runtime.append(
+                action,
+                .completed,
+                switch (mutation_report.outcome) {
+                    .applied => .applied,
+                    .rolled_back => .rolled_back,
+                    .recovery_required => unreachable,
+                },
+                checkpoint_sha256,
+            );
+            runtime.recovered_phase_count += @intFromBool(runtime.recovering);
+        }
     }
 
     if (!owns_attempt) {
@@ -8017,6 +8184,12 @@ fn executePhaseMaterialization(
     artifact_evidence: ?[32]u8,
     require_status_old: bool,
 ) !MaterializationResult {
+    const previous_action = active_native_action;
+    _ = beginNativePhase(.database);
+    defer active_native_action = previous_action;
+    if (try recoveredActionApplied())
+        return .{ .outcome = .applied, .detail = "recovered_phase" };
+
     const program_sha256 = parseHex(
         32,
         &request.planning.program.digest_sha256,
@@ -8120,6 +8293,15 @@ fn executePhaseMaterialization(
         else
             artifact_evidence,
     };
+    if (active_native_recovery) |runtime| {
+        if (active_native_action) |action|
+            try runtime.append(action, .prepared, .none, null);
+    }
+    var combined_hooks: CombinedMutationHooks = .{
+        .original = request.hooks,
+        .runtime = active_native_recovery,
+        .action = active_native_action,
+    };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
@@ -8128,7 +8310,11 @@ fn executePhaseMaterialization(
         &mutation_plan,
         mutation_evidence,
         .{
-            .hooks = request.hooks,
+            .hooks = .{
+                .context = &combined_hooks,
+                .beforeFn = CombinedMutationHooks.before,
+            },
+            .allow_recovery_continuation = active_native_recovery != null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -8151,22 +8337,27 @@ fn executePhaseMaterialization(
     };
     var engine_open = true;
     defer if (engine_open) engine.deinit();
-    const report = root_mutation.apply(
-        &engine,
-        .fromPlan(&mutation_plan),
-    ) catch |err| switch (err) {
-        error.SimulatedCrash => return .{
-            .outcome = .recovery_required,
-            .detail = "simulated_crash",
-        },
-        error.RecoveryRequired,
-        error.ExternalModification,
-        error.VerificationFailed,
-        => return .{
-            .outcome = .recovery_required,
-            .detail = @errorName(err),
-        },
-        else => return err,
+    const report = block: {
+        const previous_steps = active_native_phase_steps;
+        active_native_phase_steps = mutation_plan.steps;
+        defer active_native_phase_steps = previous_steps;
+        break :block root_mutation.apply(
+            &engine,
+            .fromPlan(&mutation_plan),
+        ) catch |err| switch (err) {
+            error.SimulatedCrash => return .{
+                .outcome = .recovery_required,
+                .detail = "simulated_crash",
+            },
+            error.RecoveryRequired,
+            error.ExternalModification,
+            error.VerificationFailed,
+            => return .{
+                .outcome = .recovery_required,
+                .detail = @errorName(err),
+            },
+            else => return err,
+        };
     };
     if (report.outcome == .recovery_required)
         return .{
@@ -8224,6 +8415,44 @@ fn executePhaseMaterialization(
                 .outcome = .recovery_required,
                 .detail = "database_verification_failed",
             };
+        }
+    }
+    if (active_native_recovery) |runtime| {
+        if (active_native_action) |action| {
+            const checkpoint_sha256 = switch (report.outcome) {
+                .applied => try checkpointManagedPaths(
+                    allocator,
+                    runtime,
+                    action,
+                    mutation_plan.steps,
+                    false,
+                ),
+                .rolled_back => block: {
+                    try native_recovery.discardTransientManagedState(
+                        allocator,
+                        request.root,
+                        runtime.intent_sha256,
+                    );
+                    try native_recovery.validateStableManagedState(
+                        allocator,
+                        request.root,
+                        runtime.intent_sha256,
+                    );
+                    break :block native_recovery.hexDigest(phase_digest);
+                },
+                .recovery_required => unreachable,
+            };
+            try runtime.append(
+                action,
+                .completed,
+                switch (report.outcome) {
+                    .applied => .applied,
+                    .rolled_back => .rolled_back,
+                    .recovery_required => unreachable,
+                },
+                checkpoint_sha256,
+            );
+            runtime.recovered_phase_count += @intFromBool(runtime.recovering);
         }
     }
     if (!owns_attempt) {
@@ -10651,6 +10880,7 @@ const ExternalMaterializationOperation = enum {
     remove,
     purge,
     process_triggers,
+    recover,
 };
 
 const ExternalConffilePolicy = enum {
@@ -10694,6 +10924,8 @@ const ExternalLifecycleRequest = struct {
     fault: ?[]const u8 = null,
     triggers: bool = false,
     defer_triggers: bool = false,
+    recovery: bool = false,
+    crash_at: ?native_recovery.CrashPoint = null,
 };
 
 const LifecycleOutcome = enum {
@@ -10709,6 +10941,8 @@ const LifecycleResult = struct {
     outcome: LifecycleOutcome,
     detail: []const u8,
     program_sha256: ?[64]u8 = null,
+    attempt_id: ?[64]u8 = null,
+    provenance_path: ?[]const u8 = null,
 };
 
 const CompiledLifecycle = struct {
@@ -11117,6 +11351,7 @@ fn lifecycleActionKind(
         .remove => .remove,
         .purge => .purge,
         .process_triggers => .reinstall,
+        .recover => unreachable,
     };
 }
 
@@ -11222,6 +11457,30 @@ fn appendRuntimeTriggerEvent(
             });
     }
     if (listeners.items.len == 0) return;
+    for (events.items) |event| {
+        if (event.origin != origin or
+            !std.mem.eql(u8, event.source.name, source.name) or
+            !std.mem.eql(u8, event.source.architecture, source.architecture) or
+            !std.mem.eql(u8, event.trigger, trigger) or
+            event.activation_awaits != activation_awaits or
+            event.listeners.len != listeners.items.len)
+            continue;
+        var equal = true;
+        for (event.listeners, listeners.items) |left, right| {
+            if (!std.mem.eql(u8, left.trigger, right.trigger) or
+                !std.mem.eql(u8, left.package.name, right.package.name) or
+                !std.mem.eql(
+                    u8,
+                    left.package.architecture,
+                    right.package.architecture,
+                ) or left.await_mode != right.await_mode)
+            {
+                equal = false;
+                break;
+            }
+        }
+        if (equal) return;
+    }
     try events.append(allocator, .{
         .origin = origin,
         .source = .{
@@ -11235,6 +11494,97 @@ fn appendRuntimeTriggerEvent(
             listeners.items,
         ),
     });
+}
+
+fn persistRuntimeTriggerEvents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    events: []const RuntimeTriggerEvent,
+) !void {
+    const runtime = active_native_recovery orelse return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const persisted = try owned.alloc(
+        native_recovery.TriggerEvent,
+        events.len,
+    );
+    for (events, 0..) |event, event_index| {
+        const listeners = try owned.alloc(
+            native_recovery.TriggerListener,
+            event.listeners.len,
+        );
+        for (event.listeners, 0..) |listener, listener_index|
+            listeners[listener_index] = .{
+                .trigger = listener.trigger,
+                .package = listener.package.name,
+                .architecture = listener.package.architecture,
+                .await_mode = switch (listener.await_mode) {
+                    .awaited => .awaited,
+                    .noawait => .noawait,
+                },
+            };
+        persisted[event_index] = .{
+            .origin = switch (event.origin) {
+                .automatic => .automatic,
+                .dynamic => .dynamic,
+            },
+            .source_package = event.source.name,
+            .source_architecture = event.source.architecture,
+            .trigger = event.trigger,
+            .activation_awaits = event.activation_awaits,
+            .listeners = listeners,
+        };
+    }
+    try native_recovery.publishTriggerEvents(
+        owned,
+        root,
+        runtime.intent_sha256,
+        persisted,
+    );
+}
+
+fn restoreRuntimeTriggerEvents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+) !void {
+    if (active_native_recovery == null) return;
+    var persisted = try native_recovery.readTriggerEvents(allocator, root);
+    defer persisted.deinit();
+    for (persisted.document.events) |event| {
+        const listeners = try allocator.alloc(
+            package_database.TriggerInterest,
+            event.listeners.len,
+        );
+        for (event.listeners, 0..) |listener, index| listeners[index] = .{
+            .trigger = try allocator.dupe(u8, listener.trigger),
+            .package = .{
+                .name = try allocator.dupe(u8, listener.package),
+                .architecture = try allocator.dupe(u8, listener.architecture),
+            },
+            .await_mode = switch (listener.await_mode) {
+                .awaited => .awaited,
+                .noawait => .noawait,
+            },
+        };
+        try events.append(allocator, .{
+            .origin = switch (event.origin) {
+                .automatic => .automatic,
+                .dynamic => .dynamic,
+            },
+            .source = .{
+                .name = try allocator.dupe(u8, event.source_package),
+                .architecture = try allocator.dupe(
+                    u8,
+                    event.source_architecture,
+                ),
+            },
+            .trigger = try allocator.dupe(u8, event.trigger),
+            .activation_awaits = event.activation_awaits,
+            .listeners = listeners,
+        });
+    }
 }
 
 fn collectArchiveTriggerEvents(
@@ -11784,6 +12134,7 @@ fn compileLifecycleProgram(
             .architecture = action.architecture,
         }),
         .process_triggers => {},
+        .recover => unreachable,
     }
     const final_state = try lifecycleFinalState(
         owned,
@@ -12587,6 +12938,39 @@ fn lifecyclePublishDerivedFinalState(
     );
 }
 
+fn latestAuthenticatedTriggerCaller(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !?package_database.Identity {
+    if (active_native_recovery == null) return null;
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    var index = progress.document.records.len;
+    while (index != 0) {
+        index -= 1;
+        const record = progress.document.records[index];
+        if (record.stage != .outcome or
+            (record.action.kind != .script and
+                record.action.kind != .compensation and
+                record.action.kind != .trigger))
+            continue;
+        var outcome = (try native_recovery.readScriptOutcome(
+            allocator,
+            root,
+            record.action,
+        )) orelse continue;
+        defer outcome.deinit();
+        return .{
+            .name = try allocator.dupe(u8, outcome.outcome.package),
+            .architecture = try allocator.dupe(
+                u8,
+                outcome.outcome.architecture,
+            ),
+        };
+    }
+    return null;
+}
+
 fn lifecycleIncorporateTriggerQueue(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -12666,6 +13050,10 @@ fn lifecycleIncorporateTriggerQueue(
     }
     if (activation_log) |log| {
         const destination = activation_allocator orelse return error.InvalidLifecycleProgram;
+        const noawait_source = try latestAuthenticatedTriggerCaller(
+            destination,
+            root,
+        );
         for (database.model.triggers.pending) |pending| {
             const initial = for (initial_pending) |candidate| {
                 if (std.mem.eql(u8, candidate.trigger, pending.trigger))
@@ -12701,7 +13089,8 @@ fn lifecycleIncorporateTriggerQueue(
                 try appendRuntimeTriggerEvent(
                     destination,
                     log,
-                    .{ .name = "", .architecture = "" },
+                    noawait_source orelse
+                        .{ .name = "", .architecture = "" },
                     pending.trigger,
                     false,
                     database.model.triggers.interests,
@@ -12709,6 +13098,12 @@ fn lifecycleIncorporateTriggerQueue(
                 );
         }
     }
+    if (activation_log) |log|
+        try persistRuntimeTriggerEvents(
+            activation_allocator orelse return error.InvalidLifecycleProgram,
+            root,
+            log.items,
+        );
     if (apply_events)
         return lifecycleApplyTriggerEvents(
             allocator,
@@ -12895,9 +13290,95 @@ fn lifecycleCompleteTriggerHandler(
     );
 }
 
+fn recoveredTriggerOrdinal(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+    arguments: []const []const u8,
+) !u32 {
+    if (active_native_recovery == null) return active_native_script_ordinal;
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    var next: u32 = 0;
+    for (progress.document.records) |record| {
+        if (record.action.kind != .trigger or
+            record.action.program_step != sequence or
+            record.stage != .outcome)
+            continue;
+        next = @max(next, record.action.ordinal +| 1);
+        var outcome = (try native_recovery.readScriptOutcome(
+            allocator,
+            root,
+            record.action,
+        )) orelse return error.InvalidScriptOutcome;
+        defer outcome.deinit();
+        if (std.mem.eql(u8, outcome.outcome.package, package.name) and
+            std.mem.eql(u8, outcome.outcome.architecture, package.architecture) and
+            textListEqual(outcome.outcome.arguments, arguments))
+            return record.action.ordinal;
+    }
+    return next;
+}
+
+fn restoreTriggerCycleSignatures(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    sequence: u32,
+    produced: *std.AutoHashMapUnmanaged([32]u8, void),
+) !void {
+    if (active_native_recovery == null) return;
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    for (progress.document.records) |record| {
+        if (record.action.kind != .trigger or
+            record.action.program_step != sequence or
+            record.action.substep != std.math.maxInt(u16) or
+            record.stage != .activation)
+            continue;
+        const digest = native_recovery.parseDigest(
+            record.evidence_sha256 orelse return error.InvalidRecoveryProgress,
+        ) orelse return error.InvalidRecoveryProgress;
+        try produced.put(allocator, digest, {});
+    }
+}
+
+fn persistTriggerCycleSignature(
+    runtime: *native_recovery.Runtime,
+    sequence: u32,
+    ordinal: u32,
+    signature: [32]u8,
+) !void {
+    const action = nativeAction(
+        .trigger,
+        sequence,
+        std.math.maxInt(u16),
+        ordinal,
+    );
+    if (try runtime.latest(action)) |record| {
+        const evidence = record.evidence_sha256 orelse
+            return error.InvalidRecoveryProgress;
+        if (record.stage != .activation or
+            !std.mem.eql(
+                u8,
+                &evidence,
+                &native_recovery.hexDigest(signature),
+            ))
+            return error.InvalidRecoveryProgress;
+        return;
+    }
+    try runtime.append(
+        action,
+        .activation,
+        .succeeded,
+        native_recovery.hexDigest(signature),
+    );
+}
+
 fn lifecycleProcessTriggers(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
+    activation_log: *std.ArrayList(RuntimeTriggerEvent),
     root: root_fs.Root,
     install_root: []const u8,
     program: *const native_program.Program,
@@ -12919,14 +13400,20 @@ fn lifecycleProcessTriggers(
         attempt,
         operation,
         policy,
-        null,
-        null,
+        scratch,
+        activation_log,
         true,
         &.{},
     );
     if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
     var produced: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer produced.deinit(allocator);
+    try restoreTriggerCycleSignatures(
+        allocator,
+        root,
+        sequence,
+        &produced,
+    );
     var used_fault = false;
     var invocation_count: u32 = 0;
     const maximum_invocations = program.trigger_authority.?.maximum_invocations;
@@ -12946,6 +13433,26 @@ fn lifecycleProcessTriggers(
             return .{ .outcome = .refused, .detail = "trigger_handler_unbound" };
         const joined = try std.mem.join(scratch, " ", handler.triggers);
         const arguments = [_][]const u8{ "triggered", joined };
+        if (active_native_recovery != null) {
+            active_native_script_ordinal = try recoveredTriggerOrdinal(
+                allocator,
+                root,
+                sequence,
+                handler.package,
+                &arguments,
+            );
+            if (active_native_script_ordinal >= maximum_invocations)
+                return .{
+                    .outcome = .trigger_failed,
+                    .detail = "trigger_invocation_limit",
+                    .program_sha256 = program.digest_sha256,
+                };
+            invocation_count = @max(
+                invocation_count,
+                active_native_script_ordinal + 1,
+            );
+        }
+        const handler_ordinal = active_native_script_ordinal;
         const outcome = try runLifecycleScript(
             allocator,
             root,
@@ -12973,6 +13480,7 @@ fn lifecycleProcessTriggers(
                 .program_sha256 = program.digest_sha256,
             },
             .exited => |value| value,
+            .not_started => 255,
         };
         if (code != 0) {
             const failed = try lifecycleCompleteTriggerHandler(
@@ -13019,8 +13527,8 @@ fn lifecycleProcessTriggers(
             attempt,
             operation,
             policy,
-            null,
-            null,
+            scratch,
+            activation_log,
             true,
             &.{},
         );
@@ -13064,6 +13572,13 @@ fn lifecycleProcessTriggers(
             };
         }
         try produced.put(allocator, next.state_sha256, {});
+        if (active_native_recovery) |runtime|
+            try persistTriggerCycleSignature(
+                runtime,
+                sequence,
+                handler_ordinal,
+                next.state_sha256,
+            );
     }
     return .{
         .outcome = .applied,
@@ -13193,7 +13708,7 @@ fn publishTriggerAuthority(
     errdefer allocator.free(bytes);
     if (bytes.len > native_trigger.maximum_document_bytes)
         return error.TriggerAuthorityTooLarge;
-    try root.publishFile(
+    root.publishFile(
         try root_fs.Path.init(native_trigger.authority_path),
         bytes,
         .{
@@ -13204,7 +13719,19 @@ fn publishTriggerAuthority(
             .overwrite = .fail_if_exists,
             .durable = true,
         },
-    );
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const observed = try root.readFileAlloc(
+                allocator,
+                try root_fs.Path.init(native_trigger.authority_path),
+                native_trigger.maximum_document_bytes,
+            );
+            defer allocator.free(observed);
+            if (!std.mem.eql(u8, observed, bytes))
+                return error.TriggerAuthorityChanged;
+        },
+        else => return err,
+    };
     return bytes;
 }
 
@@ -13275,6 +13802,9 @@ fn stageLifecycleScripts(
     if (directory) |entry| {
         if (entry.kind != .directory)
             return .{ .outcome = .refused, .detail = "tmp_ci_not_directory" };
+        if (active_native_recovery) |runtime|
+            staging.directory_created =
+                !runtime.staging_directory_initially_present;
     } else {
         try intents.append(allocator, .{ .directory = .{
             .path = lifecycle_tmp_ci,
@@ -13296,8 +13826,20 @@ fn stageLifecycleScripts(
                 "{s}/{s}.{s}",
                 .{ lifecycle_tmp_ci, package.name, @tagName(kind) },
             );
-            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
-                return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null) {
+                if (active_native_recovery == null)
+                    return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+                const staged_sha = rootFileSha256(
+                    allocator,
+                    root,
+                    path,
+                    64 * 1024 * 1024,
+                ) catch return .{ .outcome = .refused, .detail = "tmp_ci_changed" };
+                if (!std.mem.eql(u8, &staged_sha, &script.sha256))
+                    return .{ .outcome = .refused, .detail = "tmp_ci_changed" };
+                try staging.paths.append(allocator, path);
+                continue;
+            }
             try intents.append(allocator, .{ .file = .{
                 .path = path,
                 .bytes = model.scriptBytes(script),
@@ -13344,8 +13886,20 @@ fn stageLifecycleScripts(
                 "{s}/{s}:{s}.{s}",
                 .{ lifecycle_tmp_ci, package.name, package.architecture, @tagName(kind) },
             );
-            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
-                return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null) {
+                if (active_native_recovery == null)
+                    return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+                const staged_sha = rootFileSha256(
+                    allocator,
+                    root,
+                    path,
+                    64 * 1024 * 1024,
+                ) catch return .{ .outcome = .refused, .detail = "tmp_ci_changed" };
+                if (!std.mem.eql(u8, &staged_sha, &script.sha256))
+                    return .{ .outcome = .refused, .detail = "tmp_ci_changed" };
+                try staging.paths.append(allocator, path);
+                continue;
+            }
             try intents.append(allocator, .{ .copy = .{
                 .path = path,
                 .source = source,
@@ -13570,8 +14124,446 @@ fn clearLifecycleScriptRecord(
 
 const LifecycleScriptOutcome = union(enum) {
     exited: u8,
+    not_started,
     recovery_required,
 };
+
+fn textListEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b|
+        if (!std.mem.eql(u8, a, b)) return false;
+    return true;
+}
+
+fn nativeScriptOutcomeMatches(
+    outcome: native_recovery.ScriptOutcome,
+    runtime: native_recovery.Runtime,
+    action: native_recovery.Action,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: [32]u8,
+    arguments: []const []const u8,
+) bool {
+    const expected_script = native_recovery.hexDigest(script_sha256);
+    return std.mem.eql(u8, &outcome.intent_sha256, &runtime.intent_sha256) and
+        std.meta.eql(outcome.action, action) and
+        std.mem.eql(u8, outcome.package, package.name) and
+        std.mem.eql(u8, outcome.package_version, package.version) and
+        std.mem.eql(u8, outcome.architecture, package.architecture) and
+        outcome.kind == kind and
+        std.mem.eql(u8, outcome.source, @tagName(source)) and
+        std.mem.eql(u8, &outcome.script_sha256, &expected_script) and
+        textListEqual(outcome.arguments, arguments);
+}
+
+fn nativeScriptDisposition(
+    outcome: native_recovery.ScriptOutcome,
+) LifecycleScriptOutcome {
+    return switch (outcome.disposition) {
+        .exited => .{ .exited = outcome.exit_code orelse 255 },
+        .setup_failed, .rejected => if (!outcome.spawned)
+            .not_started
+        else
+            .recovery_required,
+        .signaled,
+        .timed_out,
+        .cancelled,
+        .output_limit_exceeded,
+        => .recovery_required,
+    };
+}
+
+fn hexBytesAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    const output = try allocator.alloc(u8, try std.math.mul(
+        usize,
+        bytes.len,
+        2,
+    ));
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, index| {
+        output[index * 2] = alphabet[byte >> 4];
+        output[index * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return output;
+}
+
+fn persistNativeScriptOutcome(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    action: native_recovery.Action,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: [32]u8,
+    arguments: []const []const u8,
+    report: maintainer_script.Report,
+) !native_recovery.ScriptOutcome {
+    const environment = try allocator.alloc(
+        native_recovery.EnvironmentEntry,
+        report.environment.len,
+    );
+    defer allocator.free(environment);
+    const stdout_hex = try hexBytesAlloc(allocator, report.stdout);
+    defer allocator.free(stdout_hex);
+    const stderr_hex = try hexBytesAlloc(allocator, report.stderr);
+    defer allocator.free(stderr_hex);
+    const combined_hex = try hexBytesAlloc(allocator, report.combined);
+    defer allocator.free(combined_hex);
+    for (report.environment, 0..) |entry, index| environment[index] = .{
+        .key = entry.key,
+        .value = entry.value,
+    };
+    var disposition: native_recovery.ScriptDisposition = undefined;
+    var exit_code: ?u8 = null;
+    var signal: ?u32 = null;
+    var setup_stage: ?maintainer_script.SetupStage = null;
+    var setup_errno: ?u32 = null;
+    var rejection_reason: ?maintainer_script.RejectionReason = null;
+    switch (report.outcome) {
+        .exited => |value| {
+            disposition = .exited;
+            exit_code = value;
+        },
+        .signaled => |value| {
+            disposition = .signaled;
+            signal = value;
+        },
+        .timed_out => disposition = .timed_out,
+        .cancelled => disposition = .cancelled,
+        .setup_failed => |failure| {
+            disposition = .setup_failed;
+            setup_stage = failure.stage;
+            setup_errno = failure.errno;
+        },
+        .output_limit_exceeded => disposition = .output_limit_exceeded,
+        .rejected => |reason| {
+            disposition = .rejected;
+            rejection_reason = reason;
+        },
+    }
+    var outcome: native_recovery.ScriptOutcome = .{
+        .intent_sha256 = runtime.intent_sha256,
+        .action = action,
+        .package = package.name,
+        .package_version = package.version,
+        .architecture = package.architecture,
+        .kind = kind,
+        .source = @tagName(source),
+        .script_sha256 = native_recovery.hexDigest(script_sha256),
+        .arguments = arguments,
+        .environment = environment,
+        .disposition = disposition,
+        .exit_code = exit_code,
+        .signal = signal,
+        .setup_stage = setup_stage,
+        .setup_errno = setup_errno,
+        .rejection_reason = rejection_reason,
+        .spawned = report.outcome.spawned(),
+        .invocation_sha256 = native_recovery.hexDigest(
+            report.evidence.invocation_sha256,
+        ),
+        .stdout_sha256 = native_recovery.hexDigest(
+            report.evidence.stdout_sha256,
+        ),
+        .stderr_sha256 = native_recovery.hexDigest(
+            report.evidence.stderr_sha256,
+        ),
+        .combined_sha256 = native_recovery.hexDigest(
+            report.evidence.combined_sha256,
+        ),
+        .stdout_hex = stdout_hex,
+        .stderr_hex = stderr_hex,
+        .combined_hex = combined_hex,
+        .output_bytes = report.output_bytes,
+        .output_limit = report.output_limit,
+        .terminated_process_group = report.terminated_process_group,
+        .escalated_to_kill = report.escalated_to_kill,
+        .issued_descendant_sweep = report.issued_descendant_sweep,
+        .digest_sha256 = @splat('0'),
+    };
+    native_recovery.sealScriptOutcome(&outcome);
+    try native_recovery.publishScriptOutcome(allocator, runtime.root, outcome);
+    return outcome;
+}
+
+fn retainNativeEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    intent: native_recovery.Intent,
+    progress: native_recovery.ProgressDocument,
+    managed: native_recovery.ManagedStateDocument,
+    trigger_events: native_recovery.TriggerEventsDocument,
+) !native_provenance.RetainedEvidence {
+    var source_arena = std.heap.ArenaAllocator.init(allocator);
+    defer source_arena.deinit();
+    const scratch = source_arena.allocator();
+    var sources: std.ArrayList(native_provenance.EvidenceSource) = .empty;
+    defer sources.deinit(scratch);
+    const record = attempt.record();
+    try sources.append(scratch, .{
+        .kind = .authorization,
+        .source_path = root_operation.namespace_path ++ "/" ++
+            native_recovery.authorization_name,
+        .receipt_name = "authorization.json",
+        .document_sha256 = native_recovery.hexDigest(
+            record.authorization_sha256 orelse
+                return error.InvalidRecoveryIntent,
+        ),
+    });
+    try sources.append(scratch, .{
+        .kind = .program,
+        .source_path = root_operation.namespace_path ++ "/" ++
+            native_recovery.program_name,
+        .receipt_name = "program.json",
+        .document_sha256 = native_recovery.hexDigest(
+            record.program_sha256 orelse return error.InvalidRecoveryIntent,
+        ),
+    });
+    try sources.append(scratch, .{
+        .kind = .intent,
+        .source_path = native_recovery.intent_path,
+        .receipt_name = "intent.json",
+        .document_sha256 = intent.digest_sha256,
+    });
+    try sources.append(scratch, .{
+        .kind = .progress,
+        .source_path = native_recovery.progress_path,
+        .receipt_name = "progress.json",
+        .document_sha256 = progress.digest_sha256,
+    });
+    try sources.append(scratch, .{
+        .kind = .managed_state,
+        .source_path = native_recovery.managed_state_path,
+        .receipt_name = "managed-state.json",
+        .document_sha256 = managed.digest_sha256,
+    });
+    try sources.append(scratch, .{
+        .kind = .trigger_events,
+        .source_path = native_recovery.trigger_events_path,
+        .receipt_name = "trigger-events.json",
+        .document_sha256 = trigger_events.digest_sha256,
+    });
+    try sources.append(scratch, .{
+        .kind = .active_script,
+        .source_path = lifecycle_script_record_path,
+        .receipt_name = "active-script.json",
+        .required = false,
+    });
+    try sources.append(scratch, .{
+        .kind = .root_mutation_journal,
+        .source_path = root_mutation.journal_path,
+        .receipt_name = "root-mutation-journal.json",
+        .required = false,
+    });
+    try sources.append(scratch, .{
+        .kind = .root_mutation_progress,
+        .source_path = root_mutation.progress_path,
+        .receipt_name = "root-mutation-progress.log",
+        .required = false,
+    });
+    for (progress.records) |entry| {
+        if (entry.action.kind != .script and
+            entry.action.kind != .compensation and
+            entry.action.kind != .trigger)
+            continue;
+        var already_added = false;
+        for (sources.items) |source| {
+            if (source.action) |action| {
+                if (std.meta.eql(action, entry.action)) {
+                    already_added = true;
+                    break;
+                }
+            }
+        }
+        if (already_added) continue;
+        var path_buffer: [128]u8 = undefined;
+        const source_path = try native_recovery.scriptOutcomePath(
+            entry.action,
+            &path_buffer,
+        );
+        var outcome = (try native_recovery.readScriptOutcome(
+            scratch,
+            root,
+            entry.action,
+        )) orelse continue;
+        defer outcome.deinit();
+        if (!std.mem.eql(
+            u8,
+            &outcome.outcome.intent_sha256,
+            &intent.digest_sha256,
+        )) return error.InvalidScriptOutcome;
+        const receipt_name = try std.fmt.allocPrint(
+            scratch,
+            "scripts/{s}-{}-{}-{}.json",
+            .{
+                @tagName(entry.action.kind),
+                entry.action.program_step,
+                entry.action.substep,
+                entry.action.ordinal,
+            },
+        );
+        try sources.append(scratch, .{
+            .kind = .script_outcome,
+            .source_path = try scratch.dupe(u8, source_path),
+            .receipt_name = receipt_name,
+            .document_sha256 = outcome.outcome.digest_sha256,
+            .action = entry.action,
+        });
+    }
+    return native_provenance.retainEvidence(
+        allocator,
+        root,
+        intent.attempt_id,
+        sources.items,
+    );
+}
+
+fn nativeFinalClosureDigest(
+    snapshot: package_database.Snapshot,
+) [32]u8 {
+    const Closure = struct {
+        status: package_database.FileEntry,
+        arch: ?package_database.FileEntry,
+        triggers_file: ?package_database.FileEntry,
+        triggers_unincorp: ?package_database.FileEntry,
+        triggers_named: []const package_database.NamedTriggerEntry,
+    };
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll("debz-native-package-database-closure-v1\x00") catch
+        unreachable;
+    std.json.Stringify.value(
+        Closure{
+            .status = snapshot.status,
+            .arch = snapshot.arch,
+            .triggers_file = snapshot.triggers_file,
+            .triggers_unincorp = snapshot.triggers_unincorp,
+            .triggers_named = snapshot.triggers_named,
+        },
+        .{ .whitespace = .minified },
+        &sink.writer,
+    ) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return sink.hasher.finalResult();
+}
+
+fn publishNativeRecoveryRequiredProvenance(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    program_sha256: [32]u8,
+    detail: []const u8,
+) !void {
+    const runtime = active_native_recovery orelse return;
+    var intent = try native_recovery.readIntent(allocator, root);
+    defer intent.deinit();
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        intent.intent.architecture,
+    );
+    const final_generation = try package_database.generation(
+        allocator,
+        captured.snapshot,
+    );
+    var script_hash = Sha256.init(.{});
+    script_hash.update("debz-native-script-outcomes-v1\x00");
+    var recovered_phases: u64 = 0;
+    for (progress.document.records) |entry| {
+        if ((entry.action.kind == .script or entry.action.kind == .trigger or
+            entry.action.kind == .compensation) and
+            entry.stage == .outcome)
+        {
+            script_hash.update(&entry.digest_sha256);
+            if (entry.evidence_sha256) |digest| script_hash.update(&digest);
+        }
+        if (entry.result == .recovered) recovered_phases += 1;
+    }
+    var trigger_events = try native_recovery.readTriggerEvents(
+        allocator,
+        root,
+    );
+    defer trigger_events.deinit();
+    if (!std.mem.eql(
+        u8,
+        &trigger_events.document.intent_sha256,
+        &runtime.intent_sha256,
+    )) return error.InvalidTriggerEvents;
+    var managed = try native_recovery.readManagedState(allocator, root);
+    defer managed.deinit();
+    if (!std.mem.eql(
+        u8,
+        &managed.document.intent_sha256,
+        &runtime.intent_sha256,
+    )) return error.InvalidManagedState;
+    var retained = try retainNativeEvidence(
+        allocator,
+        root,
+        attempt,
+        intent.intent,
+        progress.document,
+        managed.document,
+        trigger_events.document,
+    );
+    defer retained.deinit();
+    const record = attempt.record();
+    var provenance: native_provenance.Document = .{
+        .attempt_id = native_provenance.hexDigest(record.attempt_id),
+        .install_root = record.install_root,
+        .root_identity_sha256 = native_provenance.hexDigest(
+            record.root_identity_sha256,
+        ),
+        .root_inode = (try root.metadataOfRoot()).inode,
+        .operation = record.operation,
+        .request_sha256 = native_provenance.hexDigest(record.request_sha256),
+        .policy_sha256 = native_provenance.hexDigest(record.policy_sha256),
+        .authorization_sha256 = native_provenance.hexDigest(
+            record.authorization_sha256 orelse
+                return error.InvalidRecoveryIntent,
+        ),
+        .program_sha256 = native_provenance.hexDigest(program_sha256),
+        .exact_lock_sha256 = if (record.exact_lock) |lock|
+            native_provenance.hexDigest(lock.digest_sha256)
+        else
+            return error.InvalidRecoveryIntent,
+        .artifact_evidence_sha256 = native_provenance.hexDigest(
+            record.artifact_evidence_sha256 orelse
+                return error.InvalidRecoveryIntent,
+        ),
+        .initial_database_generation_sha256 = intent.intent.database_generation_sha256,
+        .execution_intent_sha256 = runtime.intent_sha256,
+        .progress_head_sha256 = progress.document.head_sha256,
+        .progress_record_count = progress.document.records.len,
+        .script_outcomes_sha256 = native_provenance.hexDigest(
+            script_hash.finalResult(),
+        ),
+        .trigger_evidence_sha256 = trigger_events.document.digest_sha256,
+        .final_database_generation_sha256 = native_provenance.hexDigest(
+            final_generation.sha256,
+        ),
+        .final_state_sha256 = native_provenance.hexDigest(
+            nativeFinalClosureDigest(captured.snapshot),
+        ),
+        .recovered_phase_count = recovered_phases,
+        .evidence_root = retained.root_path,
+        .evidence_files = retained.files,
+        .evidence_files_sha256 = retained.digest_sha256,
+        .final_state_kind = .package_database_closure_v1,
+        .outcome = .recovery_required,
+        .detail = detail,
+        .digest_sha256 = @splat('0'),
+    };
+    native_provenance.seal(&provenance);
+    try native_provenance.publish(allocator, root, provenance);
+}
 
 fn lifecycleScriptOwner(
     authorization: native_authorization.Authorization,
@@ -13610,6 +14602,16 @@ fn runLifecycleScript(
 ) !LifecycleScriptOutcome {
     const package = bound_owner orelse
         try lifecycleScriptOwner(authorization.*, target, source);
+    const recovery_action = nativeAction(
+        if (bound_owner != null) .trigger else .script,
+        sequence,
+        @intCast(@intFromEnum(kind)),
+        active_native_script_ordinal,
+    );
+    active_native_script_ordinal +%= 1;
+    const previous_action = active_native_action;
+    active_native_action = recovery_action;
+    defer active_native_action = previous_action;
     const path = try lifecycleScriptPath(
         allocator,
         root,
@@ -13625,6 +14627,190 @@ fn runLifecycleScript(
     if (!std.mem.eql(u8, &expected, &observed))
         return error.InstalledScriptMismatch;
 
+    if (active_native_recovery) |runtime| {
+        if (try native_recovery.readScriptOutcome(
+            allocator,
+            root,
+            recovery_action,
+        )) |owned_value| {
+            var owned = owned_value;
+            defer owned.deinit();
+            if (!nativeScriptOutcomeMatches(
+                owned.outcome,
+                runtime.*,
+                recovery_action,
+                package,
+                kind,
+                source,
+                expected,
+                arguments,
+            )) return error.InvalidScriptOutcome;
+            const latest_record = try runtime.latest(recovery_action) orelse
+                return error.InvalidRecoveryProgress;
+            const managed_checkpoint_sha256 =
+                try native_recovery.managedCheckpointDigestForAction(
+                    allocator,
+                    root,
+                    runtime.intent_sha256,
+                    recovery_action,
+                );
+            if (latest_record.stage != .completed and
+                managed_checkpoint_sha256 == null)
+            {
+                try attempt.requireRecovery(allocator, .script);
+                try publishNativeRecoveryRequiredProvenance(
+                    allocator,
+                    root,
+                    attempt,
+                    parseHex(32, &program.digest_sha256) orelse
+                        return error.InvalidLifecycleProgram,
+                    "managed_state_unresolved",
+                );
+                return .recovery_required;
+            }
+            {
+                const record = latest_record;
+                if (record.stage == .in_flight) {
+                    try runtime.append(
+                        recovery_action,
+                        .outcome,
+                        switch (owned.outcome.disposition) {
+                            .exited => .exited,
+                            else => if (!owned.outcome.spawned)
+                                .not_started
+                            else
+                                .recovery_required,
+                        },
+                        owned.outcome.digest_sha256,
+                    );
+                    try runtime.append(
+                        recovery_action,
+                        .completed,
+                        switch (owned.outcome.disposition) {
+                            .exited => if (owned.outcome.exit_code == 0)
+                                .succeeded
+                            else
+                                .failed,
+                            else => if (!owned.outcome.spawned)
+                                .not_started
+                            else
+                                .recovery_required,
+                        },
+                        managed_checkpoint_sha256 orelse
+                            return error.InvalidManagedState,
+                    );
+                } else if (record.stage == .outcome) {
+                    try runtime.append(
+                        recovery_action,
+                        .completed,
+                        switch (owned.outcome.disposition) {
+                            .exited => if (owned.outcome.exit_code == 0)
+                                .succeeded
+                            else
+                                .failed,
+                            else => if (!owned.outcome.spawned)
+                                .not_started
+                            else
+                                .recovery_required,
+                        },
+                        managed_checkpoint_sha256 orelse
+                            return error.InvalidManagedState,
+                    );
+                } else if (record.stage != .completed) {
+                    return error.InvalidRecoveryProgress;
+                }
+            }
+            const active_path = try root_fs.Path.init(
+                lifecycle_script_record_path,
+            );
+            if (try root.entryIfExists(active_path) != null) {
+                const expected_active = try lifecycleScriptRecordBytes(
+                    allocator,
+                    program.*,
+                    sequence,
+                    package,
+                    kind,
+                    source,
+                    script_sha256,
+                    arguments,
+                    "in_flight",
+                    null,
+                );
+                defer allocator.free(expected_active);
+                const observed_active = try root.readFileAlloc(
+                    allocator,
+                    active_path,
+                    64 * 1024,
+                );
+                defer allocator.free(observed_active);
+                if (std.mem.eql(u8, observed_active, expected_active)) {
+                    const disposition = nativeScriptDisposition(owned.outcome);
+                    const terminal_record = switch (disposition) {
+                        .exited => |code| try lifecycleScriptRecordBytes(
+                            allocator,
+                            program.*,
+                            sequence,
+                            package,
+                            kind,
+                            source,
+                            script_sha256,
+                            arguments,
+                            "exited",
+                            code,
+                        ),
+                        .not_started => try lifecycleScriptRecordBytes(
+                            allocator,
+                            program.*,
+                            sequence,
+                            package,
+                            kind,
+                            source,
+                            script_sha256,
+                            arguments,
+                            "not_started",
+                            null,
+                        ),
+                        .recovery_required => {
+                            try attempt.requireRecovery(allocator, .script);
+                            return .recovery_required;
+                        },
+                    };
+                    defer allocator.free(terminal_record);
+                    try publishLifecycleScriptRecord(
+                        root,
+                        terminal_record,
+                        .replace,
+                    );
+                    try clearLifecycleScriptRecord(
+                        allocator,
+                        root,
+                        terminal_record,
+                    );
+                }
+            }
+            return nativeScriptDisposition(owned.outcome);
+        }
+        if (try runtime.latest(recovery_action)) |record| {
+            if (record.stage == .in_flight or record.stage == .outcome or
+                record.stage == .completed)
+            {
+                try attempt.requireRecovery(allocator, .script);
+                try publishNativeRecoveryRequiredProvenance(
+                    allocator,
+                    root,
+                    attempt,
+                    parseHex(32, &program.digest_sha256) orelse
+                        return error.InvalidLifecycleProgram,
+                    "script_outcome_unknown",
+                );
+                return .recovery_required;
+            }
+        } else {
+            try runtime.append(recovery_action, .prepared, .none, null);
+            runtime.crash.hit(.after_script_prepared);
+        }
+    }
+
     const in_flight = try lifecycleScriptRecordBytes(
         allocator,
         program.*,
@@ -13638,6 +14824,8 @@ fn runLifecycleScript(
         null,
     );
     defer allocator.free(in_flight);
+    if (active_native_recovery) |runtime|
+        try runtime.append(recovery_action, .in_flight, .none, null);
     publishLifecycleScriptRecord(
         root,
         in_flight,
@@ -13647,7 +14835,10 @@ fn runLifecycleScript(
         return .recovery_required;
     };
     try attempt.advance(allocator, .{
-        .state = .mutating,
+        .state = if (attempt.record().state == .recovering)
+            .recovering
+        else
+            .mutating,
         .phase = .script,
     });
 
@@ -13667,13 +14858,63 @@ fn runLifecycleScript(
     }, .{ .launcher = launcher.interface() });
     defer report.deinit();
 
+    if (active_native_recovery) |runtime| {
+        runtime.crash.hit(.after_script_return_before_outcome);
+        if (kind == .postrm and source == .installed_package)
+            runtime.crash.hit(.after_upgrade_postrm_return_before_outcome);
+    }
+
     if (inject_unknown) {
         try attempt.requireRecovery(allocator, .script);
         return .recovery_required;
     }
+    var native_outcome: ?native_recovery.ScriptOutcome = null;
+    var managed_checkpoint_sha256: ?native_recovery.Digest = null;
+    if (active_native_recovery) |runtime| {
+        native_outcome = try persistNativeScriptOutcome(
+            allocator,
+            runtime,
+            recovery_action,
+            package,
+            kind,
+            source,
+            expected,
+            arguments,
+            report,
+        );
+        managed_checkpoint_sha256 = try checkpointManagedPaths(
+            allocator,
+            runtime,
+            recovery_action,
+            active_native_phase_steps orelse &.{},
+            active_native_phase_steps != null,
+        );
+        try runtime.append(
+            recovery_action,
+            .outcome,
+            switch (report.outcome) {
+                .exited => .exited,
+                else => if (report.outcome.spawned())
+                    .recovery_required
+                else
+                    .not_started,
+            },
+            native_outcome.?.digest_sha256,
+        );
+        runtime.crash.hit(.after_script_outcome);
+        switch (report.outcome) {
+            .exited => |code| if (code != 0)
+                runtime.crash.hit(.after_failure_outcome),
+            else => runtime.crash.hit(.after_failure_outcome),
+        }
+        if (recovery_action.kind == .trigger)
+            runtime.crash.hit(.after_trigger_outcome);
+    }
     const code = switch (report.outcome) {
         .exited => |value| value,
-        else => {
+        else => if (!report.outcome.spawned())
+            255
+        else {
             try attempt.requireRecovery(allocator, .script);
             return .recovery_required;
         },
@@ -13700,7 +14941,10 @@ fn runLifecycleScript(
         return .recovery_required;
     };
     try attempt.advance(allocator, .{
-        .state = .mutating,
+        .state = if (attempt.record().state == .recovering)
+            .recovering
+        else
+            .mutating,
         .phase = .script,
     });
     clearLifecycleScriptRecord(
@@ -13711,6 +14955,15 @@ fn runLifecycleScript(
         try attempt.requireRecovery(allocator, .script);
         return .recovery_required;
     };
+    if (active_native_recovery) |runtime|
+        try runtime.append(
+            recovery_action,
+            .completed,
+            if (code == 0) .succeeded else .failed,
+            managed_checkpoint_sha256 orelse
+                if (native_outcome) |value| value.digest_sha256 else null,
+        );
+    if (!report.outcome.spawned()) return .not_started;
     return .{ .exited = code };
 }
 
@@ -13752,6 +15005,7 @@ const PostUnpackHook = struct {
     script: PostUnpackScript,
     inject_unknown: bool = false,
     fired: bool = false,
+    unknown_outcome: bool = false,
     rollback_required: bool = false,
     failed_compensation: ?u32 = null,
 };
@@ -13787,7 +15041,11 @@ fn postUnpackHook(
     };
     const code = switch (primary) {
         .exited => |value| value,
-        .recovery_required => return error.SimulatedCrash,
+        .not_started => 255,
+        .recovery_required => {
+            context.unknown_outcome = true;
+            return error.SimulatedCrash;
+        },
     };
     if (code == 0) return;
     if (context.script.call.failure.unwind) |unwind| {
@@ -13813,7 +15071,11 @@ fn postUnpackHook(
         };
         const unwind_code = switch (unwind_outcome) {
             .exited => |value| value,
-            .recovery_required => return error.SimulatedCrash,
+            .not_started => 255,
+            .recovery_required => {
+                context.unknown_outcome = true;
+                return error.SimulatedCrash;
+            },
         };
         if (unwind_code == 0 and
             context.script.call.failure.resume_after_unwind)
@@ -13849,7 +15111,11 @@ fn postUnpackHook(
         };
         const compensation_code = switch (outcome) {
             .exited => |value| value,
-            .recovery_required => return error.SimulatedCrash,
+            .not_started => 255,
+            .recovery_required => {
+                context.unknown_outcome = true;
+                return error.SimulatedCrash;
+            },
         };
         if (compensation_code != 0) {
             context.failed_compensation = @intCast(compensation_index);
@@ -13918,20 +15184,256 @@ fn restoreLifecycleStatusOld(
 
 fn finishLifecycleAttempt(
     allocator: std.mem.Allocator,
+    root: root_fs.Root,
     attempt: *root_operation.Attempt,
     program_sha256: [32]u8,
     succeeded: bool,
 ) !void {
-    try attempt.advance(allocator, .{
-        .state = .verifying,
-        .phase = .verification,
-    });
-    try attempt.complete(
-        allocator,
-        if (succeeded) .succeeded else .failed_after_mutation,
+    const runtime = active_native_recovery orelse {
+        try attempt.advance(allocator, .{
+            .state = .verifying,
+            .phase = .verification,
+        });
+        try attempt.complete(
+            allocator,
+            if (succeeded) .succeeded else .failed_after_mutation,
+        );
+        try attempt.publishProvenance(allocator, program_sha256);
+        try attempt.clear();
+        return;
+    };
+    const terminal_action = nativeAction(
+        .provenance,
+        std.math.maxInt(u32),
+        0,
+        0,
     );
-    try attempt.publishProvenance(allocator, program_sha256);
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    var terminal_result: native_recovery.Result = if (succeeded)
+        if (runtime.recovering) .recovered else .succeeded
+    else
+        .failed;
+    if (native_recovery.latest(progress.document, terminal_action)) |record| {
+        if (record.stage != .terminal) return error.InvalidRecoveryProgress;
+        terminal_result = record.result;
+    } else {
+        progress.deinit();
+        try runtime.append(
+            terminal_action,
+            .terminal,
+            terminal_result,
+            null,
+        );
+        progress = try native_recovery.readProgress(allocator, root);
+    }
+
+    var record = attempt.record();
+    if (record.state != .completed) {
+        if (record.state != .recovering) try attempt.advance(allocator, .{
+            .state = .verifying,
+            .phase = .verification,
+        });
+        try attempt.complete(allocator, switch (terminal_result) {
+            .succeeded => .succeeded,
+            .recovered => .recovered,
+            .failed => .failed_after_mutation,
+            else => return error.InvalidRecoveryProgress,
+        });
+        record = attempt.record();
+    }
+
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        record.target_architecture,
+    );
+    const final_generation = try package_database.generation(
+        allocator,
+        captured.snapshot,
+    );
+
+    var script_hash = Sha256.init(.{});
+    script_hash.update("debz-native-script-outcomes-v1\x00");
+    var recovered_phases: u64 = 0;
+    for (progress.document.records) |entry| {
+        if ((entry.action.kind == .script or entry.action.kind == .trigger or
+            entry.action.kind == .compensation) and
+            entry.stage == .outcome)
+        {
+            script_hash.update(&entry.digest_sha256);
+            if (entry.evidence_sha256) |digest| script_hash.update(&digest);
+        }
+        if (entry.result == .recovered) recovered_phases += 1;
+    }
+    const script_outcomes_sha256 = script_hash.finalResult();
+    var trigger_events = try native_recovery.readTriggerEvents(
+        allocator,
+        root,
+    );
+    defer trigger_events.deinit();
+    if (!std.mem.eql(
+        u8,
+        &trigger_events.document.intent_sha256,
+        &runtime.intent_sha256,
+    )) return error.InvalidTriggerEvents;
+    var owned_intent = try native_recovery.readIntent(allocator, root);
+    defer owned_intent.deinit();
+    if (!std.mem.eql(
+        u8,
+        &owned_intent.intent.digest_sha256,
+        &runtime.intent_sha256,
+    )) return error.InvalidRecoveryIntent;
+    var managed = try native_recovery.readManagedState(allocator, root);
+    defer managed.deinit();
+    if (!std.mem.eql(
+        u8,
+        &managed.document.intent_sha256,
+        &runtime.intent_sha256,
+    ) or managed.document.transient != null)
+        return error.InvalidManagedState;
+    var retained = try retainNativeEvidence(
+        allocator,
+        root,
+        attempt,
+        owned_intent.intent,
+        progress.document,
+        managed.document,
+        trigger_events.document,
+    );
+    defer retained.deinit();
+    var provenance: native_provenance.Document = .{
+        .attempt_id = native_provenance.hexDigest(record.attempt_id),
+        .install_root = record.install_root,
+        .root_identity_sha256 = native_provenance.hexDigest(
+            record.root_identity_sha256,
+        ),
+        .root_inode = (try root.metadataOfRoot()).inode,
+        .operation = record.operation,
+        .request_sha256 = native_provenance.hexDigest(record.request_sha256),
+        .policy_sha256 = native_provenance.hexDigest(record.policy_sha256),
+        .authorization_sha256 = native_provenance.hexDigest(
+            record.authorization_sha256 orelse
+                return error.InvalidRecoveryIntent,
+        ),
+        .program_sha256 = native_provenance.hexDigest(program_sha256),
+        .exact_lock_sha256 = if (record.exact_lock) |lock|
+            native_provenance.hexDigest(lock.digest_sha256)
+        else
+            return error.InvalidRecoveryIntent,
+        .artifact_evidence_sha256 = native_provenance.hexDigest(
+            record.artifact_evidence_sha256 orelse
+                return error.InvalidRecoveryIntent,
+        ),
+        .initial_database_generation_sha256 = owned_intent.intent.database_generation_sha256,
+        .execution_intent_sha256 = runtime.intent_sha256,
+        .progress_head_sha256 = progress.document.head_sha256,
+        .progress_record_count = progress.document.records.len,
+        .script_outcomes_sha256 = native_provenance.hexDigest(
+            script_outcomes_sha256,
+        ),
+        .trigger_evidence_sha256 = trigger_events.document.digest_sha256,
+        .final_database_generation_sha256 = native_provenance.hexDigest(
+            final_generation.sha256,
+        ),
+        .final_state_sha256 = native_provenance.hexDigest(
+            nativeFinalClosureDigest(captured.snapshot),
+        ),
+        .recovered_phase_count = recovered_phases,
+        .evidence_root = retained.root_path,
+        .evidence_files = retained.files,
+        .evidence_files_sha256 = retained.digest_sha256,
+        .final_state_kind = .package_database_closure_v1,
+        .outcome = switch (terminal_result) {
+            .succeeded => .succeeded,
+            .recovered => .succeeded,
+            .failed => .failed,
+            else => return error.InvalidRecoveryProgress,
+        },
+        .detail = switch (terminal_result) {
+            .succeeded => "completed",
+            .recovered => "recovered",
+            .failed => "failed",
+            else => unreachable,
+        },
+        .digest_sha256 = @splat('0'),
+    };
+    native_provenance.seal(&provenance);
+    const provenance_preexisting = if (try native_provenance.read(
+        allocator,
+        root,
+    )) |owned_value| block: {
+        var owned = owned_value;
+        defer owned.deinit();
+        break :block std.mem.eql(
+            u8,
+            &owned.document.attempt_id,
+            &provenance.attempt_id,
+        );
+    } else false;
+    try native_provenance.publish(allocator, root, provenance);
+
+    var statement = try root_operation_completion.create(allocator, .{
+        .record = record,
+        .transaction_provenance = .{
+            .status = if (runtime.recovering and !provenance_preexisting)
+                .recovered
+            else
+                .already_present,
+            .schema = native_provenance.schema_id,
+            .document_sha256 = parseHex(
+                32,
+                &provenance.digest_sha256,
+            ) orelse return error.InvalidRecoveryProvenance,
+            .detail = "native transaction provenance",
+        },
+        .journal = .{
+            .status = .absent,
+            .detail = "native phase journals cleared after durable completion",
+        },
+        .discharge = .{
+            .surface = .package_transaction,
+            .operation = switch (record.operation) {
+                .package_transaction => |value| @tagName(value),
+                .repository_bootstrap => return error.InvalidRecoveryIntent,
+            },
+            .request_sha256 = record.request_sha256,
+        },
+    });
+    defer statement.deinit();
+    const completion_store: root_operation_completion.Store = .init(root);
+    try completion_store.publish(allocator, statement.document);
+    if (record.provenance == .pending) {
+        try attempt.publishProvenance(
+            allocator,
+            root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .document_sha256 = statement.document.digest_sha256,
+                .journal_archived = false,
+            }),
+        );
+    }
+    runtime.crash.hit(.after_provenance);
     try attempt.clear();
+    runtime.crash.hit(.after_active_clear);
+    for (progress.document.records) |entry| {
+        if (entry.action.kind != .script and
+            entry.action.kind != .compensation and
+            entry.action.kind != .trigger)
+            continue;
+        var path_buffer: [128]u8 = undefined;
+        const path = try native_recovery.scriptOutcomePath(
+            entry.action,
+            &path_buffer,
+        );
+        root.removeFile(try root_fs.Path.init(path)) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    try native_recovery.cleanup(allocator, root, owned_intent.intent);
+    return;
 }
 
 fn lifecycleOperationWant(
@@ -14036,6 +15538,1498 @@ fn verifyLifecycleFinalClosure(
     return lifecycleFinalClosureMatches(expected_state, database);
 }
 
+fn recoveryBlobEntryKind(
+    value: package_database.EntryKind,
+) native_recovery.EntryKind {
+    return switch (value) {
+        .regular => .regular,
+        .directory => .directory,
+        .symlink => .symlink,
+        .other => .other,
+    };
+}
+
+fn appendRecoveryBlob(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    blobs: *std.ArrayList(native_recovery.Blob),
+    kind: native_recovery.BlobKind,
+    key: []const u8,
+    logical_path: []const u8,
+    bytes: []const u8,
+    entry_kind: native_recovery.EntryKind,
+    mode: u32,
+) !void {
+    const index = blobs.items.len;
+    const path = switch (kind) {
+        .request => try std.fmt.allocPrint(
+            allocator,
+            "{s}/native-lifecycle.json",
+            .{native_recovery.request_directory},
+        ),
+        .artifact => try std.fmt.allocPrint(
+            allocator,
+            "{s}/{d:0>5}.deb",
+            .{ native_recovery.artifact_directory, index },
+        ),
+        .database => try std.fmt.allocPrint(
+            allocator,
+            "{s}/{d:0>5}.blob",
+            .{ native_recovery.database_directory, index },
+        ),
+        .installed_script => try std.fmt.allocPrint(
+            allocator,
+            "{s}/{d:0>5}.script",
+            .{ native_recovery.scripts_directory, index },
+        ),
+    };
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    const blob: native_recovery.Blob = .{
+        .kind = kind,
+        .key = try allocator.dupe(u8, key),
+        .logical_path = try allocator.dupe(u8, logical_path),
+        .storage_path = path,
+        .sha256 = native_recovery.hexDigest(sha256),
+        .size = bytes.len,
+        .entry_kind = entry_kind,
+        .mode = mode,
+    };
+    try native_recovery.publishBlob(allocator, root, path, bytes, sha256);
+    try blobs.append(allocator, blob);
+}
+
+fn infoBlobKind(name: []const u8) native_recovery.BlobKind {
+    inline for (.{ ".preinst", ".postinst", ".prerm", ".postrm" }) |suffix|
+        if (std.mem.endsWith(u8, name, suffix)) return .installed_script;
+    return .database;
+}
+
+fn prepareNativeRecovery(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    compiled: *const CompiledLifecycle,
+    raw_request: []const u8,
+    archive_bytes: []const []u8,
+    initial_snapshot: package_database.Snapshot,
+    attempt: *root_operation.Attempt,
+) !native_recovery.Runtime {
+    for ([_][]const u8{
+        native_recovery.workspace_directory,
+        native_recovery.artifact_directory,
+        native_recovery.database_directory,
+        native_recovery.scripts_directory,
+        native_recovery.request_directory,
+    }) |path| try root.createDirectoryPath(
+        try root_fs.Path.init(path),
+        if (builtin.os.tag == .windows)
+            .default_file
+        else
+            .fromMode(0o700),
+    );
+    var namespace = try root.openDirectory(
+        try root_fs.Path.init(root_operation.namespace_path),
+    );
+    defer namespace.close(root.io);
+    var authorization_store = try native_authorization.Store.init(
+        root.io,
+        namespace,
+        native_recovery.authorization_name,
+    );
+    try authorization_store.writeAtomic(
+        allocator,
+        compiled.authorization.authorization,
+    );
+    var program_store = try native_program.Store.init(
+        root.io,
+        namespace,
+        native_recovery.program_name,
+    );
+    try program_store.writeAtomic(
+        allocator,
+        compiled.program.program,
+    );
+
+    const expected_request_sha256 = parseHex(
+        32,
+        &compiled.program.program.request_sha256,
+    ) orelse return error.InvalidLifecycleProgram;
+    var observed_request_sha256: [32]u8 = undefined;
+    Sha256.hash(raw_request, &observed_request_sha256, .{});
+    if (!std.mem.eql(
+        u8,
+        &expected_request_sha256,
+        &observed_request_sha256,
+    )) return error.InvalidLifecycleProgram;
+    var blobs: std.ArrayList(native_recovery.Blob) = .empty;
+    try appendRecoveryBlob(
+        allocator,
+        root,
+        &blobs,
+        .request,
+        "request",
+        "request/native-lifecycle.json",
+        raw_request,
+        .regular,
+        0o600,
+    );
+    for (archive_bytes, 0..) |bytes, index| {
+        const key = try std.fmt.allocPrint(allocator, "artifact:{d}", .{index});
+        const logical = try std.fmt.allocPrint(allocator, "artifacts/{d}.deb", .{index});
+        try appendRecoveryBlob(
+            allocator,
+            root,
+            &blobs,
+            .artifact,
+            key,
+            logical,
+            bytes,
+            .regular,
+            0o600,
+        );
+    }
+    try appendRecoveryBlob(
+        allocator,
+        root,
+        &blobs,
+        .database,
+        "status",
+        package_database.database_directory ++ "/" ++ package_database.status_path,
+        initial_snapshot.status.bytes,
+        recoveryBlobEntryKind(initial_snapshot.status.kind),
+        initial_snapshot.status.mode,
+    );
+    const optional_files = .{
+        .{ "status-old", package_database.status_old_path, initial_snapshot.status_old },
+        .{ "arch", package_database.arch_path, initial_snapshot.arch },
+        .{ "diversions", package_database.diversions_path, initial_snapshot.diversions },
+        .{ "statoverride", package_database.statoverride_path, initial_snapshot.statoverride },
+        .{ "triggers-file", package_database.triggers_file_path, initial_snapshot.triggers_file },
+        .{ "triggers-unincorp", package_database.triggers_unincorp_path, initial_snapshot.triggers_unincorp },
+    };
+    inline for (optional_files) |entry| if (entry[2]) |file| {
+        const logical = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ package_database.database_directory, entry[1] },
+        );
+        try appendRecoveryBlob(
+            allocator,
+            root,
+            &blobs,
+            .database,
+            entry[0],
+            logical,
+            file.bytes,
+            recoveryBlobEntryKind(file.kind),
+            file.mode,
+        );
+    };
+    for (initial_snapshot.info) |entry| {
+        const logical = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                entry.name,
+            },
+        );
+        const key = try std.fmt.allocPrint(allocator, "info:{s}", .{entry.name});
+        try appendRecoveryBlob(
+            allocator,
+            root,
+            &blobs,
+            infoBlobKind(entry.name),
+            key,
+            logical,
+            entry.bytes,
+            recoveryBlobEntryKind(entry.kind),
+            entry.mode,
+        );
+    }
+    for (initial_snapshot.updates) |entry| {
+        const logical = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.updates_directory,
+                entry.name,
+            },
+        );
+        const key = try std.fmt.allocPrint(allocator, "update:{s}", .{entry.name});
+        try appendRecoveryBlob(
+            allocator,
+            root,
+            &blobs,
+            .database,
+            key,
+            logical,
+            entry.bytes,
+            recoveryBlobEntryKind(entry.kind),
+            entry.mode,
+        );
+    }
+    for (initial_snapshot.triggers_named) |entry| {
+        const logical = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.triggers_directory,
+                entry.name,
+            },
+        );
+        const key = try std.fmt.allocPrint(allocator, "trigger:{s}", .{entry.name});
+        try appendRecoveryBlob(
+            allocator,
+            root,
+            &blobs,
+            .database,
+            key,
+            logical,
+            entry.bytes,
+            recoveryBlobEntryKind(entry.kind),
+            entry.mode,
+        );
+    }
+
+    const program = compiled.program.program;
+    const authorization = compiled.authorization.authorization;
+    const request_sha256 = parseHex(32, &program.request_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const policy_sha256 = parseHex(32, &program.executor_policy_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const lock_sha256 = parseHex(32, &program.exact_lock.digest_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const artifact_sha256 = parseHex(32, &program.artifacts_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const database_sha256 = parseHex(
+        32,
+        &program.installed_database.generation_sha256,
+    ) orelse return error.InvalidLifecycleProgram;
+    const trigger_sha256 = parseHex(
+        32,
+        &program.installed_database.trigger_state_sha256,
+    ) orelse return error.InvalidLifecycleProgram;
+    var packages: std.ArrayList(native_recovery.PackageSelection) = .empty;
+    for (external.packages) |selection| try packages.append(allocator, .{
+        .name = selection.name,
+        .architecture = selection.architecture,
+    });
+    var ordered: std.ArrayList(native_recovery.OrderedAction) = .empty;
+    if (external.ordered_actions) |actions| for (actions) |action|
+        try ordered.append(allocator, .{
+            .sequence = action.sequence,
+            .kind = @tagName(action.kind),
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        });
+    const staging_directory_initially_present =
+        try root.entryIfExists(try root_fs.Path.init(lifecycle_tmp_ci)) != null;
+    const root_metadata = try root.metadataOfRoot();
+    var intent: native_recovery.Intent = .{
+        .attempt_id = native_recovery.hexDigest(attempt.attemptId()),
+        .install_root = external.root,
+        .root_identity_sha256 = native_recovery.hexDigest(
+            transaction_recovery.rootIdentity(external.root),
+        ),
+        .root_inode = root_metadata.inode,
+        .operation = switch (external.operation) {
+            .install => .install,
+            .upgrade => .upgrade,
+            .downgrade => .downgrade,
+            .reinstall => .reinstall,
+            .configure => .configure,
+            .remove => .remove,
+            .purge => .purge,
+            .process_triggers => .process_triggers,
+            .recover => unreachable,
+        },
+        .architecture = external.architecture,
+        .policy = switch (external.policy) {
+            .keep_existing => .keep_existing,
+            .use_package_version => .use_package_version,
+        },
+        .triggers = external.triggers,
+        .defer_triggers = external.defer_triggers,
+        .staging_directory_initially_present = staging_directory_initially_present,
+        .request_sha256 = native_recovery.hexDigest(request_sha256),
+        .policy_sha256 = native_recovery.hexDigest(policy_sha256),
+        .authorization_sha256 = native_recovery.hexDigest(
+            authorization.digest_sha256,
+        ),
+        .program_sha256 = program.digest_sha256,
+        .exact_lock_sha256 = native_recovery.hexDigest(lock_sha256),
+        .artifact_evidence_sha256 = native_recovery.hexDigest(artifact_sha256),
+        .database_generation_sha256 = native_recovery.hexDigest(database_sha256),
+        .initial_trigger_state_sha256 = native_recovery.hexDigest(trigger_sha256),
+        .packages = packages.items,
+        .ordered_actions = ordered.items,
+        .authorization_path = native_recovery.authorization_name,
+        .program_path = native_recovery.program_name,
+        .blobs = blobs.items,
+        .digest_sha256 = @splat('0'),
+    };
+    native_recovery.sealIntent(&intent);
+    try native_recovery.publishIntent(allocator, root, intent);
+    try native_recovery.initializeProgress(
+        allocator,
+        root,
+        intent.digest_sha256,
+    );
+    try native_recovery.initializeTriggerEvents(
+        allocator,
+        root,
+        intent.digest_sha256,
+    );
+    try native_recovery.initializeManagedState(
+        allocator,
+        root,
+        intent.digest_sha256,
+    );
+    return .{
+        .allocator = allocator,
+        .root = root,
+        .intent_sha256 = intent.digest_sha256,
+        .crash = .{ .selected = external.crash_at },
+        .staging_directory_initially_present = staging_directory_initially_present,
+    };
+}
+
+fn pendingNativeMutationAction(
+    progress: native_recovery.ProgressDocument,
+) ?native_recovery.Action {
+    var index = progress.records.len;
+    while (index != 0) {
+        index -= 1;
+        const record = progress.records[index];
+        if (record.action.kind != .filesystem and
+            record.action.kind != .database)
+            continue;
+        const newest = native_recovery.latest(
+            progress,
+            record.action,
+        ) orelse continue;
+        if (newest.sequence != record.sequence or
+            newest.stage == .completed)
+            continue;
+        return record.action;
+    }
+    return null;
+}
+
+const ActiveScriptRecovery = enum {
+    none,
+    known_outcome,
+    outcome_unknown,
+};
+
+fn activeScriptInvocationMatches(
+    authorization: native_authorization.Authorization,
+    active: native_trigger.ActiveScript,
+    target: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) !bool {
+    const owner = try lifecycleScriptOwner(authorization, target, source);
+    const expected_sha256 = parseHex(32, &script_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    return std.mem.eql(u8, active.package, owner.name) and
+        std.mem.eql(u8, active.version, owner.version) and
+        std.mem.eql(u8, active.architecture, owner.architecture) and
+        active.kind == kind and
+        std.mem.eql(u8, @tagName(active.source), @tagName(source)) and
+        std.mem.eql(u8, &active.script_sha256, &expected_sha256) and
+        textListEqual(active.arguments, arguments);
+}
+
+fn activeScriptAuthorized(
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    active: native_trigger.ActiveScript,
+    action: native_recovery.Action,
+) !bool {
+    const program_sha256 = parseHex(32, &program.digest_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    if (!std.mem.eql(
+        u8,
+        &active.program_sha256,
+        &program_sha256,
+    ) or active.step != action.program_step)
+        return false;
+    if (action.kind == .trigger) {
+        const authority = program.trigger_authority orelse return false;
+        if (active.kind != .postinst or active.arguments.len != 2 or
+            !std.mem.eql(u8, active.arguments[0], "triggered"))
+            return false;
+        const handler = for (authority.handlers) |candidate| {
+            if (std.mem.eql(u8, candidate.package.name, active.package) and
+                std.mem.eql(u8, candidate.package.version, active.version) and
+                std.mem.eql(
+                    u8,
+                    candidate.package.architecture,
+                    active.architecture,
+                ))
+                break candidate;
+        } else return false;
+        if (!std.mem.eql(
+            u8,
+            @tagName(handler.source),
+            @tagName(active.source),
+        )) return false;
+        const expected_sha256 = parseHex(
+            32,
+            &handler.postinst_sha256,
+        ) orelse return error.InvalidLifecycleProgram;
+        if (!std.mem.eql(
+            u8,
+            &expected_sha256,
+            &active.script_sha256,
+        )) return false;
+        var triggers = std.mem.splitScalar(u8, active.arguments[1], ' ');
+        var count: usize = 0;
+        while (triggers.next()) |trigger| {
+            if (trigger.len == 0) return false;
+            var allowed = false;
+            for (authority.allowed_triggers) |candidate| {
+                if (std.mem.eql(u8, candidate, trigger)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) return false;
+            count += 1;
+        }
+        return count != 0;
+    }
+    const step = program.step(active.step) orelse return false;
+    const call = switch (step.operation) {
+        .run_maintainer_script => |value| value,
+        else => return false,
+    };
+    if (try activeScriptInvocationMatches(
+        authorization,
+        active,
+        call.package,
+        call.kind,
+        call.source,
+        call.script_sha256,
+        call.arguments,
+    )) return true;
+    if (call.failure.unwind) |unwind| {
+        if (try activeScriptInvocationMatches(
+            authorization,
+            active,
+            call.package,
+            unwind.kind,
+            unwind.source,
+            unwind.script_sha256,
+            unwind.arguments,
+        )) return true;
+    }
+    for (call.failure.compensations) |compensation| {
+        if (try activeScriptInvocationMatches(
+            authorization,
+            active,
+            call.package,
+            compensation.kind,
+            compensation.source,
+            compensation.script_sha256,
+            compensation.arguments,
+        )) return true;
+    }
+    return false;
+}
+
+fn classifyActiveScriptBeforeMutationRecovery(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    runtime: native_recovery.Runtime,
+) !ActiveScriptRecovery {
+    const record_path = try root_fs.Path.init(lifecycle_script_record_path);
+    if (try root.entryIfExists(record_path) == null) return .none;
+    const bytes = try root.readFileAlloc(
+        allocator,
+        record_path,
+        native_trigger.maximum_document_bytes,
+    );
+    defer allocator.free(bytes);
+    var active = try native_trigger.decodeActiveScript(allocator, bytes);
+    defer active.deinit();
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    if (!std.mem.eql(
+        u8,
+        &progress.document.intent_sha256,
+        &runtime.intent_sha256,
+    )) return error.InvalidRecoveryProgress;
+    var selected: ?native_recovery.Record = null;
+    var index = progress.document.records.len;
+    while (index != 0) {
+        index -= 1;
+        const record = progress.document.records[index];
+        if (record.action.program_step != active.script.step or
+            (record.action.kind != .script and
+                record.action.kind != .compensation and
+                record.action.kind != .trigger))
+            continue;
+        const newest = native_recovery.latest(
+            progress.document,
+            record.action,
+        ) orelse continue;
+        if (newest.sequence != record.sequence) continue;
+        selected = record;
+        break;
+    }
+    const record = selected orelse return error.InvalidScriptOutcome;
+    if (!try activeScriptAuthorized(
+        program,
+        authorization,
+        active.script,
+        record.action,
+    )) return error.InvalidScriptOutcome;
+    if (try native_recovery.readScriptOutcome(
+        allocator,
+        root,
+        record.action,
+    )) |owned_value| {
+        var outcome = owned_value;
+        defer outcome.deinit();
+        const source: native_program.ScriptSource = switch (active.script.source) {
+            .installed_package => .installed_package,
+            .new_package => .new_package,
+        };
+        if (!nativeScriptOutcomeMatches(
+            outcome.outcome,
+            runtime,
+            record.action,
+            .{
+                .name = active.script.package,
+                .version = active.script.version,
+                .architecture = active.script.architecture,
+            },
+            active.script.kind,
+            source,
+            active.script.script_sha256,
+            active.script.arguments,
+        )) return error.InvalidScriptOutcome;
+        return .known_outcome;
+    }
+    if (record.stage != .in_flight) return error.InvalidScriptOutcome;
+    return .outcome_unknown;
+}
+
+fn recoverNativeRootMutation(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    runtime: *native_recovery.Runtime,
+) !bool {
+    var opened = try root_mutation.open(
+        allocator,
+        root,
+        attempt,
+        .{},
+    ) orelse {
+        try native_recovery.validateStableManagedState(
+            allocator,
+            root,
+            runtime.intent_sha256,
+        );
+        return true;
+    };
+    defer opened.deinit();
+    if (try native_recovery.managedStateHasTransient(
+        allocator,
+        root,
+        runtime.intent_sha256,
+    )) {
+        const stage = try root_mutation.inspect(
+            allocator,
+            root,
+            .{},
+        ) orelse return error.InvalidManagedState;
+        if (stage.direction() != .finish_new)
+            return error.ManagedStateChanged;
+    }
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    const action = pendingNativeMutationAction(progress.document) orelse {
+        try attempt.requireRecovery(allocator, .mutation);
+        return false;
+    };
+    const report = try root_mutation.recover(&opened);
+    switch (report.outcome) {
+        .applied => {
+            const checkpoint_sha256 = try checkpointManagedPaths(
+                allocator,
+                runtime,
+                action,
+                opened.journal().steps,
+                false,
+            );
+            try runtime.append(
+                action,
+                .completed,
+                .recovered,
+                checkpoint_sha256,
+            );
+            runtime.recovered_phase_count += 1;
+            try root_mutation.clear(&opened);
+            return true;
+        },
+        .rolled_back => {
+            try native_recovery.discardTransientManagedState(
+                allocator,
+                root,
+                runtime.intent_sha256,
+            );
+            try native_recovery.validateStableManagedState(
+                allocator,
+                root,
+                runtime.intent_sha256,
+            );
+            try runtime.append(action, .completed, .rolled_back, null);
+            try root_mutation.clear(&opened);
+            return true;
+        },
+        .recovery_required => {
+            try attempt.requireRecovery(allocator, .mutation);
+            return false;
+        },
+    }
+}
+
+const RecoveredLifecycleInputs = struct {
+    snapshot: package_database.Snapshot,
+    archive_bytes: []const []u8,
+    models: []archive_application.Model,
+};
+
+fn recoveredDatabaseEntryKind(
+    value: native_recovery.EntryKind,
+) package_database.EntryKind {
+    return switch (value) {
+        .regular => .regular,
+        .directory => .directory,
+        .symlink => .symlink,
+        .other => .other,
+    };
+}
+
+fn recoveredFileEntry(
+    blob: native_recovery.Blob,
+    bytes: []const u8,
+) package_database.FileEntry {
+    return .{
+        .bytes = bytes,
+        .kind = recoveredDatabaseEntryKind(blob.entry_kind),
+        .mode = blob.mode,
+    };
+}
+
+fn artifactBlobIndex(key: []const u8) !usize {
+    const prefix = "artifact:";
+    if (!std.mem.startsWith(u8, key, prefix))
+        return error.RecoveryRequestBindingMismatch;
+    return std.fmt.parseUnsigned(usize, key[prefix.len..], 10) catch
+        error.InvalidRecoveryIntent;
+}
+
+fn loadRecoveredLifecycleInputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent: native_recovery.Intent,
+    program: native_program.Program,
+) !RecoveredLifecycleInputs {
+    const artifacts = try allocator.alloc(?[]u8, program.artifacts.len);
+    @memset(artifacts, null);
+    var info: std.ArrayList(package_database.InfoEntry) = .empty;
+    var updates: std.ArrayList(package_database.UpdateEntry) = .empty;
+    var named: std.ArrayList(package_database.NamedTriggerEntry) = .empty;
+    var snapshot: package_database.Snapshot = undefined;
+    var status_seen = false;
+    snapshot.status_old = null;
+    snapshot.arch = null;
+    snapshot.diversions = null;
+    snapshot.statoverride = null;
+    snapshot.triggers_file = null;
+    snapshot.triggers_unincorp = null;
+    for (intent.blobs) |blob| {
+        const bytes = try native_recovery.verifyBlob(allocator, root, blob);
+        switch (blob.kind) {
+            .request => {},
+            .artifact => {
+                const index = try artifactBlobIndex(blob.key);
+                if (index >= artifacts.len or artifacts[index] != null)
+                    return error.RecoveryRequestBindingMismatch;
+                artifacts[index] = bytes;
+            },
+            .installed_script, .database => {
+                if (std.mem.eql(u8, blob.key, "status")) {
+                    if (status_seen) return error.InvalidRecoveryIntent;
+                    snapshot.status = recoveredFileEntry(blob, bytes);
+                    status_seen = true;
+                } else if (std.mem.eql(u8, blob.key, "status-old")) {
+                    snapshot.status_old = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "arch")) {
+                    snapshot.arch = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "diversions")) {
+                    snapshot.diversions = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "statoverride")) {
+                    snapshot.statoverride = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "triggers-file")) {
+                    snapshot.triggers_file = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "triggers-unincorp")) {
+                    snapshot.triggers_unincorp = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.startsWith(u8, blob.key, "info:")) {
+                    try info.append(allocator, .{
+                        .name = blob.key["info:".len..],
+                        .bytes = bytes,
+                        .kind = recoveredDatabaseEntryKind(blob.entry_kind),
+                        .mode = blob.mode,
+                    });
+                } else if (std.mem.startsWith(u8, blob.key, "update:")) {
+                    try updates.append(allocator, .{
+                        .name = blob.key["update:".len..],
+                        .bytes = bytes,
+                        .kind = recoveredDatabaseEntryKind(blob.entry_kind),
+                        .mode = blob.mode,
+                    });
+                } else if (std.mem.startsWith(u8, blob.key, "trigger:")) {
+                    try named.append(allocator, .{
+                        .name = blob.key["trigger:".len..],
+                        .bytes = bytes,
+                        .kind = recoveredDatabaseEntryKind(blob.entry_kind),
+                        .mode = blob.mode,
+                    });
+                } else return error.InvalidRecoveryIntent;
+            },
+        }
+    }
+    if (!status_seen) return error.InvalidRecoveryIntent;
+    snapshot.info = try allocator.dupe(package_database.InfoEntry, info.items);
+    snapshot.updates = try allocator.dupe(package_database.UpdateEntry, updates.items);
+    snapshot.triggers_named = try allocator.dupe(
+        package_database.NamedTriggerEntry,
+        named.items,
+    );
+
+    const archive_bytes = try allocator.alloc([]u8, artifacts.len);
+    const models = try allocator.alloc(archive_application.Model, artifacts.len);
+    for (artifacts, 0..) |maybe_bytes, index| {
+        const bytes = maybe_bytes orelse return error.InvalidRecoveryIntent;
+        archive_bytes[index] = bytes;
+        models[index] = switch (archive_application.prepare(
+            allocator,
+            bytes,
+            .{ .local = .{} },
+            .{},
+        )) {
+            .model => |value| value,
+            .diagnostic => return error.InvalidExternalArchive,
+        };
+        if (models[index].metadata.len != 0 or
+            models[index].script(.config) != null)
+            return error.InvalidExternalArchive;
+    }
+    return .{
+        .snapshot = snapshot,
+        .archive_bytes = archive_bytes,
+        .models = models,
+    };
+}
+
+fn recoveryExternalRequest(
+    allocator: std.mem.Allocator,
+    request: ExternalLifecycleRequest,
+    intent: native_recovery.Intent,
+) !ExternalLifecycleRequest {
+    const packages = try allocator.alloc(
+        ExternalPackageSelection,
+        intent.packages.len,
+    );
+    for (intent.packages, 0..) |package, index| packages[index] = .{
+        .name = package.name,
+        .architecture = package.architecture,
+    };
+    const ordered = try allocator.alloc(
+        ExternalLifecycleAction,
+        intent.ordered_actions.len,
+    );
+    for (intent.ordered_actions, 0..) |action, index| ordered[index] = .{
+        .sequence = action.sequence,
+        .kind = std.meta.stringToEnum(
+            solver.OrderedActionKind,
+            action.kind,
+        ) orelse return error.InvalidRecoveryIntent,
+        .package = action.package,
+        .version = action.version,
+        .architecture = action.architecture,
+    };
+    return .{
+        .root = intent.install_root,
+        .architecture = intent.architecture,
+        .archives = &.{},
+        .operation = switch (intent.operation) {
+            .install => .install,
+            .upgrade => .upgrade,
+            .downgrade => .downgrade,
+            .reinstall => .reinstall,
+            .configure => .configure,
+            .remove => .remove,
+            .purge => .purge,
+            .process_triggers => .process_triggers,
+        },
+        .report = request.report,
+        .policy = switch (intent.policy) {
+            .keep_existing => .keep_existing,
+            .use_package_version => .use_package_version,
+        },
+        .packages = packages,
+        .ordered_actions = if (ordered.len == 0) null else ordered,
+        .triggers = intent.triggers,
+        .defer_triggers = intent.defer_triggers,
+        .recovery = true,
+        .crash_at = request.crash_at,
+    };
+}
+
+fn validatePersistedLifecycleRequest(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent: native_recovery.Intent,
+) !void {
+    var request_blob: ?native_recovery.Blob = null;
+    var artifact_count: usize = 0;
+    for (intent.blobs) |blob| switch (blob.kind) {
+        .request => {
+            if (request_blob != null or
+                !std.mem.eql(u8, blob.key, "request"))
+                return error.InvalidRecoveryIntent;
+            request_blob = blob;
+        },
+        .artifact => artifact_count += 1,
+        .installed_script, .database => {},
+    };
+    const blob = request_blob orelse return error.InvalidRecoveryIntent;
+    if (!std.mem.eql(u8, &blob.sha256, &intent.request_sha256))
+        return error.InvalidRecoveryIntent;
+    const bytes = try native_recovery.verifyBlob(allocator, root, blob);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(
+        ExternalLifecycleRequest,
+        allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const request = parsed.value;
+    const expected_policy: ExternalConffilePolicy = switch (intent.policy) {
+        .keep_existing => .keep_existing,
+        .use_package_version => .use_package_version,
+    };
+    const operation_matches = switch (intent.operation) {
+        .install => request.operation == .install,
+        .upgrade => request.operation == .upgrade,
+        .downgrade => request.operation == .downgrade,
+        .reinstall => request.operation == .reinstall,
+        .configure => request.operation == .configure,
+        .remove => request.operation == .remove,
+        .purge => request.operation == .purge,
+        .process_triggers => request.operation == .process_triggers,
+    };
+    if (!operation_matches or
+        !std.mem.eql(u8, request.root, intent.install_root) or
+        !std.mem.eql(u8, request.architecture, intent.architecture) or
+        request.archives.len != artifact_count or
+        request.policy != expected_policy or
+        request.triggers != intent.triggers or
+        request.defer_triggers != intent.defer_triggers or
+        !request.recovery or request.packages.len != intent.packages.len)
+        return error.RecoveryRequestBindingMismatch;
+    for (request.packages, intent.packages) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or
+            !std.mem.eql(u8, left.architecture, right.architecture))
+            return error.RecoveryRequestBindingMismatch;
+    }
+    const ordered = request.ordered_actions orelse &.{};
+    if (ordered.len != intent.ordered_actions.len)
+        return error.RecoveryRequestBindingMismatch;
+    for (ordered, intent.ordered_actions) |left, right| {
+        if (left.sequence != right.sequence or
+            !std.mem.eql(u8, @tagName(left.kind), right.kind) or
+            !std.mem.eql(u8, left.package, right.package) or
+            !std.mem.eql(u8, left.version, right.version) or
+            !std.mem.eql(u8, left.architecture, right.architecture))
+            return error.RecoveryRequestBindingMismatch;
+    }
+}
+
+fn rootOperationEvidenceFromRecord(
+    record: root_operation.Record,
+) root_operation.Evidence {
+    return .{
+        .authorization_sha256 = record.authorization_sha256,
+        .program_sha256 = record.program_sha256,
+        .plan_sha256 = record.plan_sha256,
+        .exact_lock = record.exact_lock,
+        .database_generation_sha256 = record.database_generation_sha256,
+        .artifact_evidence_sha256 = record.artifact_evidence_sha256,
+    };
+}
+
+fn orphanNativeEvidenceDetail(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !?[]const u8 {
+    const script_path = try root_fs.Path.init(lifecycle_script_record_path);
+    if (try root.entryIfExists(script_path) != null) {
+        const bytes = try root.readFileAlloc(
+            allocator,
+            script_path,
+            native_trigger.maximum_document_bytes,
+        );
+        defer allocator.free(bytes);
+        var active = native_trigger.decodeActiveScript(
+            allocator,
+            bytes,
+        ) catch return "script_evidence_invalid";
+        defer active.deinit();
+        return "script_outcome_unknown";
+    }
+    if (try root.entryIfExists(
+        try root_fs.Path.init(root_mutation.journal_path),
+    ) != null or try root.entryIfExists(
+        try root_fs.Path.init(root_mutation.progress_path),
+    ) != null) return "mutation_evidence_unresolved";
+    if (try root.entryIfExists(
+        try root_fs.Path.init(native_trigger.authority_path),
+    ) != null) return "trigger_evidence_unresolved";
+
+    var namespace = root.pinDirectory(
+        try root_fs.Path.init(root_operation.namespace_path),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer namespace.close();
+    var observed = try namespace.observeAlloc(
+        allocator,
+        native_recovery.maximum_records,
+        64 * 1024 * 1024,
+    );
+    defer observed.deinit();
+    for (observed.members) |member| {
+        const name = member.name;
+        if (std.mem.eql(u8, name, "native-recovery-v1") or
+            std.mem.eql(u8, name, native_recovery.authorization_name) or
+            std.mem.eql(u8, name, native_recovery.program_name) or
+            std.mem.eql(u8, name, "native-execution-progress-v1.log") or
+            std.mem.eql(u8, name, "native-managed-state-v1.json") or
+            std.mem.eql(u8, name, "native-trigger-events-v1.json") or
+            std.mem.startsWith(
+                u8,
+                name,
+                native_recovery.script_outcome_prefix,
+            ) or std.mem.startsWith(u8, name, ".debz-native-"))
+            return "native_recovery_evidence_unresolved";
+    }
+    return null;
+}
+
+fn recoverWithoutNativeIntent(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    request: ExternalLifecycleRequest,
+    locks: root_operation.LockBackend,
+) !LifecycleResult {
+    if (try native_provenance.read(allocator, root)) |prior_value| {
+        var prior = prior_value;
+        defer prior.deinit();
+        if (!std.mem.eql(
+            u8,
+            prior.document.install_root,
+            request.root,
+        ) or (try root.metadataOfRoot()).inode != prior.document.root_inode)
+            return error.RecoveryRootIdentityMismatch;
+    }
+    var coordinator = try root_operation.Coordinator.open(
+        root.io,
+        root,
+        request.root,
+        locks,
+    );
+    if (try coordinator.inspect(allocator)) |owned_value| {
+        var observed = owned_value;
+        defer observed.deinit();
+        const record = observed.record;
+        var attempt = try coordinator.acquire(allocator, .{
+            .intent = .recovery,
+            .existing = .fail,
+            .backend = record.backend,
+            .operation = record.operation,
+            .request_sha256 = record.request_sha256,
+            .policy_sha256 = record.policy_sha256,
+            .evidence = rootOperationEvidenceFromRecord(record),
+            .target_architecture = record.target_architecture,
+            .foreign_architectures = record.foreign_architectures,
+            .adopt_settled_for_acknowledgment = true,
+        });
+        defer attempt.release();
+        if (!std.mem.eql(
+            u8,
+            &attempt.attemptId(),
+            &record.attempt_id,
+        )) return error.ActiveAttemptChanged;
+        const script_path = try root_fs.Path.init(lifecycle_script_record_path);
+        if (try root.entryIfExists(script_path) != null) {
+            const bytes = try root.readFileAlloc(
+                allocator,
+                script_path,
+                native_trigger.maximum_document_bytes,
+            );
+            defer allocator.free(bytes);
+            var active = native_trigger.decodeActiveScript(
+                allocator,
+                bytes,
+            ) catch return .{
+                .outcome = .recovery_required,
+                .detail = "script_evidence_invalid",
+            };
+            defer active.deinit();
+            if (record.program_sha256) |program_sha256| {
+                if (!std.mem.eql(
+                    u8,
+                    &active.script.program_sha256,
+                    &program_sha256,
+                )) return .{
+                    .outcome = .recovery_required,
+                    .detail = "script_evidence_invalid",
+                };
+            }
+            return .{
+                .outcome = .recovery_required,
+                .detail = "script_outcome_unknown",
+            };
+        }
+        return .{
+            .outcome = .recovery_required,
+            .detail = if (try root.entryIfExists(
+                try root_fs.Path.init(root_mutation.journal_path),
+            ) != null)
+                "mutation_evidence_unresolved"
+            else
+                "active_attempt_untracked",
+        };
+    }
+
+    var provenance = try native_provenance.read(allocator, root) orelse
+        return error.RecoveryEvidenceMissing;
+    defer provenance.deinit();
+    const completion_store: root_operation_completion.Store = .init(root);
+    var completion = try completion_store.read(allocator) orelse
+        return error.RecoveryEvidenceMissing;
+    defer completion.deinit();
+
+    var lock_attempt = try coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .existing = .fail,
+        .backend = completion.document.backend,
+        .operation = completion.document.operation,
+        .request_sha256 = completion.document.request_sha256,
+        .policy_sha256 = completion.document.policy_sha256,
+        .evidence = .{
+            .authorization_sha256 = completion.document.authorization_sha256,
+            .program_sha256 = completion.document.program_sha256,
+            .plan_sha256 = completion.document.plan_sha256,
+            .exact_lock = completion.document.exact_lock,
+            .database_generation_sha256 = completion.document.database_generation_sha256,
+            .artifact_evidence_sha256 = completion.document.artifact_evidence_sha256,
+        },
+        .target_architecture = completion.document.target_architecture,
+        .foreign_architectures = completion.document.foreign_architectures,
+    });
+    var temporary_attempt_active = true;
+    defer if (temporary_attempt_active) {
+        lock_attempt.abandonIfPreMutation(allocator) catch |err| {
+            std.log.err("native recovery could not abandon temporary attempt: {s}", .{@errorName(err)});
+        };
+        lock_attempt.release();
+    };
+
+    if (try orphanNativeEvidenceDetail(allocator, root)) |detail| {
+        try lock_attempt.abandonIfPreMutation(allocator);
+        lock_attempt.release();
+        temporary_attempt_active = false;
+        return .{
+            .outcome = .recovery_required,
+            .detail = detail,
+        };
+    }
+
+    var locked_provenance = try native_provenance.read(
+        allocator,
+        root,
+    ) orelse return error.RecoveryEvidenceMissing;
+    defer locked_provenance.deinit();
+    var locked_completion = try completion_store.read(allocator) orelse
+        return error.RecoveryEvidenceMissing;
+    defer locked_completion.deinit();
+    if (!std.mem.eql(
+        u8,
+        &locked_provenance.document.digest_sha256,
+        &provenance.document.digest_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &locked_completion.document.digest_sha256,
+        &completion.document.digest_sha256,
+    )) return error.ActiveAttemptChanged;
+    try native_provenance.verifyEvidence(
+        allocator,
+        root,
+        locked_provenance.document,
+    );
+    if (!std.mem.eql(
+        u8,
+        locked_provenance.document.install_root,
+        request.root,
+    ) or (try root.metadataOfRoot()).inode !=
+        locked_provenance.document.root_inode)
+        return error.InvalidRecoveryProvenance;
+    const provenance_attempt = native_recovery.parseDigest(
+        locked_provenance.document.attempt_id,
+    ) orelse return error.InvalidRecoveryProvenance;
+    const provenance_digest = parseHex(
+        32,
+        &locked_provenance.document.digest_sha256,
+    ) orelse return error.InvalidRecoveryProvenance;
+    if (!std.mem.eql(
+        u8,
+        &locked_completion.document.attempt_id,
+        &provenance_attempt,
+    ) or locked_completion.document.transaction_provenance.document_sha256 == null or
+        !std.mem.eql(
+            u8,
+            &locked_completion.document.transaction_provenance.document_sha256.?,
+            &provenance_digest,
+        ))
+        return error.InvalidRecoveryProvenance;
+
+    try lock_attempt.abandonIfPreMutation(allocator);
+    lock_attempt.release();
+    temporary_attempt_active = false;
+    return .{
+        .outcome = switch (locked_provenance.document.outcome) {
+            .succeeded => .applied,
+            .failed => .script_failed,
+            .recovery_required => .recovery_required,
+        },
+        .detail = "already_completed",
+        .program_sha256 = locked_provenance.document.program_sha256,
+        .attempt_id = locked_provenance.document.attempt_id,
+        .provenance_path = native_provenance.document_path,
+    };
+}
+
+fn recoverLifecycleProgram(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    request: ExternalLifecycleRequest,
+    locks: root_operation.LockBackend,
+) !LifecycleResult {
+    var intent = native_recovery.readIntent(allocator, root) catch |err| switch (err) {
+        error.FileNotFound => return recoverWithoutNativeIntent(
+            allocator,
+            root,
+            request,
+            locks,
+        ),
+        else => return err,
+    };
+    defer intent.deinit();
+    if ((try root.metadataOfRoot()).inode != intent.intent.root_inode)
+        return error.RecoveryRootIdentityMismatch;
+    if (!std.mem.eql(u8, intent.intent.install_root, request.root) or
+        !std.mem.eql(u8, intent.intent.architecture, request.architecture) or
+        !std.mem.eql(
+            u8,
+            intent.intent.authorization_path,
+            native_recovery.authorization_name,
+        ) or
+        !std.mem.eql(
+            u8,
+            intent.intent.program_path,
+            native_recovery.program_name,
+        ))
+        return error.InvalidRecoveryIntent;
+    var namespace = try root.openDirectory(
+        try root_fs.Path.init(root_operation.namespace_path),
+    );
+    defer namespace.close(root.io);
+    const authorization_store = try native_authorization.Store.init(
+        root.io,
+        namespace,
+        native_recovery.authorization_name,
+    );
+    const program_store = try native_program.Store.init(
+        root.io,
+        namespace,
+        native_recovery.program_name,
+    );
+    var compiled: CompiledLifecycle = .{
+        .authorization = try authorization_store.read(
+            allocator,
+            native_recovery.maximum_intent_bytes,
+        ),
+        .program = try program_store.read(
+            allocator,
+            native_recovery.maximum_intent_bytes,
+        ),
+    };
+    defer compiled.deinit();
+    if (!std.mem.eql(
+        u8,
+        &compiled.program.program.digest_sha256,
+        &intent.intent.program_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &native_recovery.hexDigest(
+            compiled.authorization.authorization.digest_sha256,
+        ),
+        &intent.intent.authorization_sha256,
+    ) or !compiled.program.program.matchesAuthorization(
+        compiled.authorization.authorization,
+    )) return error.RecoveryProgramBindingMismatch;
+    const persisted_program = compiled.program.program;
+    if (!std.mem.eql(
+        u8,
+        &persisted_program.request_sha256,
+        &intent.intent.request_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &persisted_program.executor_policy_sha256,
+        &intent.intent.policy_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &persisted_program.exact_lock.digest_sha256,
+        &intent.intent.exact_lock_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &persisted_program.artifacts_sha256,
+        &intent.intent.artifact_evidence_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &persisted_program.installed_database.generation_sha256,
+        &intent.intent.database_generation_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &persisted_program.installed_database.trigger_state_sha256,
+        &intent.intent.initial_trigger_state_sha256,
+    ) or !std.mem.eql(
+        u8,
+        persisted_program.install_root,
+        intent.intent.install_root,
+    ) or !std.mem.eql(
+        u8,
+        persisted_program.target_architecture,
+        intent.intent.architecture,
+    )) return error.RecoveryProgramBindingMismatch;
+    try validatePersistedLifecycleRequest(allocator, root, intent.intent);
+    var cleanup_coordinator = try root_operation.Coordinator.open(
+        root.io,
+        root,
+        request.root,
+        locks,
+    );
+    const active_record = try cleanup_coordinator.inspect(allocator);
+    if (active_record == null) {
+        var progress = try native_recovery.readProgress(allocator, root);
+        defer progress.deinit();
+        const terminal = native_recovery.latest(
+            progress.document,
+            nativeAction(.provenance, std.math.maxInt(u32), 0, 0),
+        ) orelse return error.RecoveryEvidenceMissing;
+        if (terminal.stage != .terminal)
+            return error.InvalidRecoveryProgress;
+        var provenance = try native_provenance.read(allocator, root) orelse
+            return error.RecoveryEvidenceMissing;
+        defer provenance.deinit();
+        try native_provenance.verifyEvidence(
+            allocator,
+            root,
+            provenance.document,
+        );
+        const completion_store: root_operation_completion.Store = .init(root);
+        var completion = try completion_store.read(allocator) orelse
+            return error.RecoveryEvidenceMissing;
+        defer completion.deinit();
+        const original_attempt = native_recovery.parseDigest(
+            intent.intent.attempt_id,
+        ) orelse return error.InvalidRecoveryIntent;
+        const provenance_digest = parseHex(
+            32,
+            &provenance.document.digest_sha256,
+        ) orelse return error.InvalidRecoveryProvenance;
+        if (!std.mem.eql(
+            u8,
+            &provenance.document.attempt_id,
+            &intent.intent.attempt_id,
+        ) or !std.mem.eql(
+            u8,
+            &provenance.document.program_sha256,
+            &intent.intent.program_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &completion.document.attempt_id,
+            &original_attempt,
+        ) or completion.document.transaction_provenance.document_sha256 == null or
+            !std.mem.eql(
+                u8,
+                &completion.document.transaction_provenance.document_sha256.?,
+                &provenance_digest,
+            )) return error.InvalidRecoveryProvenance;
+        const program = compiled.program.program;
+        var cleanup_attempt = try cleanup_coordinator.acquire(allocator, .{
+            .intent = .mutation,
+            .existing = .fail,
+            .backend = .native,
+            .operation = .{
+                .package_transaction = externalProductOperation(
+                    switch (intent.intent.operation) {
+                        .install => .install,
+                        .upgrade => .upgrade,
+                        .downgrade => .downgrade,
+                        .reinstall => .reinstall,
+                        .configure => .configure,
+                        .remove => .remove,
+                        .purge => .purge,
+                        .process_triggers => .process_triggers,
+                    },
+                ),
+            },
+            .request_sha256 = native_recovery.parseDigest(
+                intent.intent.request_sha256,
+            ) orelse return error.InvalidRecoveryIntent,
+            .policy_sha256 = native_recovery.parseDigest(
+                intent.intent.policy_sha256,
+            ) orelse return error.InvalidRecoveryIntent,
+            .evidence = .{
+                .authorization_sha256 = native_recovery.parseDigest(
+                    intent.intent.authorization_sha256,
+                ),
+                .program_sha256 = native_recovery.parseDigest(
+                    intent.intent.program_sha256,
+                ),
+                .plan_sha256 = native_recovery.parseDigest(
+                    intent.intent.program_sha256,
+                ),
+                .exact_lock = .{
+                    .schema = program.exact_lock.schema,
+                    .version = program.exact_lock.version,
+                    .digest_sha256 = native_recovery.parseDigest(
+                        intent.intent.exact_lock_sha256,
+                    ) orelse return error.InvalidRecoveryIntent,
+                },
+                .database_generation_sha256 = native_recovery.parseDigest(
+                    intent.intent.database_generation_sha256,
+                ),
+                .artifact_evidence_sha256 = native_recovery.parseDigest(
+                    intent.intent.artifact_evidence_sha256,
+                ),
+            },
+            .target_architecture = program.target_architecture,
+            .foreign_architectures = program.foreign_architectures,
+        });
+        defer cleanup_attempt.release();
+        for (progress.document.records) |entry| {
+            if (entry.action.kind != .script and
+                entry.action.kind != .compensation and
+                entry.action.kind != .trigger)
+                continue;
+            var path_buffer: [128]u8 = undefined;
+            const path = try native_recovery.scriptOutcomePath(
+                entry.action,
+                &path_buffer,
+            );
+            root.removeFile(try root_fs.Path.init(path)) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+        try native_recovery.cleanup(allocator, root, intent.intent);
+        try cleanup_attempt.abandonIfPreMutation(allocator);
+        return .{
+            .outcome = switch (provenance.document.outcome) {
+                .succeeded => .applied,
+                .failed => .script_failed,
+                .recovery_required => .recovery_required,
+            },
+            .detail = "cleanup_completed",
+            .program_sha256 = provenance.document.program_sha256,
+            .attempt_id = native_recovery.hexDigest(original_attempt),
+            .provenance_path = native_provenance.document_path,
+        };
+    } else {
+        var owned_active = active_record.?;
+        owned_active.deinit();
+    }
+    var recovery_arena = std.heap.ArenaAllocator.init(allocator);
+    defer recovery_arena.deinit();
+    const owned = recovery_arena.allocator();
+    const inputs = try loadRecoveredLifecycleInputs(
+        owned,
+        root,
+        intent.intent,
+        compiled.program.program,
+    );
+    var initial_database = switch (try package_database.importSnapshot(
+        owned,
+        .{
+            .native_architecture = intent.intent.architecture,
+            .snapshot = inputs.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer initial_database.deinit();
+    if (!std.mem.eql(
+        u8,
+        &native_recovery.hexDigest(initial_database.generation.sha256),
+        &intent.intent.database_generation_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &native_recovery.hexDigest(
+            native_trigger.stateDigest(initial_database.model),
+        ),
+        &intent.intent.initial_trigger_state_sha256,
+    )) return error.RecoveryDatabaseBindingMismatch;
+    const external = try recoveryExternalRequest(owned, request, intent.intent);
+    return executeLifecycleProgram(
+        owned,
+        root,
+        external,
+        &compiled,
+        inputs.models,
+        inputs.archive_bytes,
+        inputs.snapshot,
+        initial_database.model,
+        locks,
+        intent.intent,
+        null,
+    );
+}
+
 fn executeLifecycleProgram(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -14046,6 +17040,8 @@ fn executeLifecycleProgram(
     initial_snapshot: package_database.Snapshot,
     initial_model: package_database.Model,
     locks: root_operation.LockBackend,
+    recovery_intent: ?native_recovery.Intent,
+    raw_request: ?[]const u8,
 ) !LifecycleResult {
     const program = &compiled.program.program;
     const authorization = &compiled.authorization.authorization;
@@ -14075,7 +17071,7 @@ fn executeLifecycleProgram(
         locks,
     );
     var attempt = coordinator.acquire(allocator, .{
-        .intent = .mutation,
+        .intent = if (recovery_intent != null) .recovery else .mutation,
         .existing = .reclaim_resolved,
         .backend = .native,
         .operation = .{ .package_transaction = operation },
@@ -14095,6 +17091,7 @@ fn executeLifecycleProgram(
         },
         .target_architecture = program.target_architecture,
         .foreign_architectures = program.foreign_architectures,
+        .adopt_settled_for_acknowledgment = recovery_intent != null,
     }) catch |err| switch (err) {
         error.RecoveryRequired,
         error.OperationInProgress,
@@ -14108,6 +17105,21 @@ fn executeLifecycleProgram(
     };
     var attempt_active = true;
     defer if (attempt_active) attempt.release();
+    if (recovery_intent) |intent| {
+        if (!std.mem.eql(
+            u8,
+            &intent.attempt_id,
+            &native_recovery.hexDigest(attempt.attemptId()),
+        )) {
+            attempt.release();
+            attempt_active = false;
+            return .{
+                .outcome = .refused,
+                .detail = "attempt_binding_mismatch",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    }
 
     var locked_capture = captureDatabaseSnapshot(allocator, root, .{}) catch |err| {
         try attempt.abandonIfPreMutation(allocator);
@@ -14137,7 +17149,7 @@ fn executeLifecycleProgram(
         },
     };
     defer locked_database.deinit();
-    if (!lifecycleDatabaseMatchesProgram(
+    if (recovery_intent == null and !lifecycleDatabaseMatchesProgram(
         program.*,
         locked_database.generation,
         locked_database.model.packages.len,
@@ -14151,7 +17163,7 @@ fn executeLifecycleProgram(
             .program_sha256 = program.digest_sha256,
         };
     }
-    try attempt.advance(allocator, .{
+    if (recovery_intent == null) try attempt.advance(allocator, .{
         .state = .preflight,
         .phase = .preflight,
     });
@@ -14161,6 +17173,139 @@ fn executeLifecycleProgram(
     scratch_arena.* = .init(allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
+    var recovery_runtime: native_recovery.Runtime = undefined;
+    defer {
+        active_native_recovery = null;
+        active_native_action = null;
+    }
+    if (recovery_intent) |intent| {
+        recovery_runtime = .{
+            .allocator = scratch,
+            .root = root,
+            .intent_sha256 = intent.digest_sha256,
+            .crash = .{ .selected = external.crash_at },
+            .recovering = true,
+            .staging_directory_initially_present = intent.staging_directory_initially_present,
+        };
+        active_native_recovery = &recovery_runtime;
+        const script_recovery = classifyActiveScriptBeforeMutationRecovery(
+            allocator,
+            root,
+            program.*,
+            authorization.*,
+            recovery_runtime,
+        ) catch {
+            try attempt.requireRecovery(allocator, .script);
+            try publishNativeRecoveryRequiredProvenance(
+                allocator,
+                root,
+                &attempt,
+                program_sha256,
+                "script_evidence_invalid",
+            );
+            return .{
+                .outcome = .recovery_required,
+                .detail = "script_evidence_invalid",
+                .program_sha256 = program.digest_sha256,
+            };
+        };
+        if (script_recovery == .outcome_unknown) {
+            try attempt.requireRecovery(allocator, .script);
+            try publishNativeRecoveryRequiredProvenance(
+                allocator,
+                root,
+                &attempt,
+                program_sha256,
+                "script_outcome_unknown",
+            );
+            return .{
+                .outcome = .recovery_required,
+                .detail = "script_outcome_unknown",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+        const mutation_recovered = recoverNativeRootMutation(
+            allocator,
+            root,
+            &attempt,
+            &recovery_runtime,
+        ) catch |err| switch (err) {
+            error.ManagedStateChanged,
+            error.InvalidManagedState,
+            error.UnmodeledManagedState,
+            error.ManagedStateLimit,
+            => block: {
+                try attempt.requireRecovery(allocator, .verification);
+                break :block false;
+            },
+            else => return err,
+        };
+        if (!mutation_recovered) {
+            const detail = if (attempt.record().phase == .verification)
+                "managed_state_changed"
+            else
+                "mutation_evidence_unresolved";
+            try publishNativeRecoveryRequiredProvenance(
+                allocator,
+                root,
+                &attempt,
+                program_sha256,
+                detail,
+            );
+            return .{
+                .outcome = .recovery_required,
+                .detail = detail,
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    } else if (external.recovery) {
+        recovery_runtime = try prepareNativeRecovery(
+            scratch,
+            root,
+            external,
+            compiled,
+            raw_request orelse return error.InvalidLifecycleProgram,
+            archive_bytes,
+            initial_snapshot,
+            &attempt,
+        );
+        active_native_recovery = &recovery_runtime;
+        recovery_runtime.crash.hit(.after_execution_intent);
+    }
+    if (recovery_intent != null) {
+        var terminal_progress = try native_recovery.readProgress(
+            allocator,
+            root,
+        );
+        defer terminal_progress.deinit();
+        const terminal = native_recovery.latest(
+            terminal_progress.document,
+            nativeAction(.provenance, std.math.maxInt(u32), 0, 0),
+        );
+        if (terminal) |record| {
+            if (record.stage != .terminal)
+                return error.InvalidRecoveryProgress;
+            const terminal_succeeded = record.result == .succeeded or
+                record.result == .recovered;
+            try finishLifecycleAttempt(
+                allocator,
+                root,
+                &attempt,
+                program_sha256,
+                terminal_succeeded,
+            );
+            attempt.release();
+            attempt_active = false;
+            return .{
+                .outcome = if (terminal_succeeded) .applied else .script_failed,
+                .detail = if (terminal_succeeded)
+                    "recovered"
+                else
+                    "recovered_failure",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    }
     const trigger_authority_bytes = try publishTriggerAuthority(
         allocator,
         root,
@@ -14176,14 +17321,18 @@ fn executeLifecycleProgram(
     defer consumed_scripts.deinit(allocator);
     var trigger_events: std.ArrayList(RuntimeTriggerEvent) = .empty;
     defer trigger_events.deinit(scratch);
+    try restoreRuntimeTriggerEvents(scratch, root, &trigger_events);
     var fault_used = false;
     var crossed_configure_barrier = false;
     var status_old_baseline = try scratch.dupe(
         u8,
-        locked_capture.snapshot.status.bytes,
+        if (recovery_intent != null)
+            initial_snapshot.status.bytes
+        else
+            locked_capture.snapshot.status.bytes,
     );
 
-    for (program.steps) |step| switch (step.operation) {
+    for (program.steps) |step| switch (beginNativeProgramStep(step)) {
         .assert_authorization,
         .assert_root_state,
         .assert_database_generation,
@@ -14269,6 +17418,11 @@ fn executeLifecycleProgram(
                 if (post_unpack != null) &hook_context.target_step else null,
             );
             if (post_unpack != null) {
+                if (hook_context.unknown_outcome) return .{
+                    .outcome = .recovery_required,
+                    .detail = "script_outcome_unknown",
+                    .program_sha256 = program.digest_sha256,
+                };
                 if (hook_context.fired)
                     try consumed_scripts.put(
                         allocator,
@@ -14321,6 +17475,12 @@ fn executeLifecycleProgram(
                                         );
                                         break :rollback_compensations;
                                     }
+                                },
+                                .not_started => {
+                                    failed_compensation = @intCast(
+                                        compensation_index,
+                                    );
+                                    break :rollback_compensations;
                                 },
                                 .recovery_required => return .{
                                     .outcome = .recovery_required,
@@ -14405,6 +17565,7 @@ fn executeLifecycleProgram(
                     );
                     try finishLifecycleAttempt(
                         allocator,
+                        root,
                         &attempt,
                         program_sha256,
                         false,
@@ -14456,6 +17617,11 @@ fn executeLifecycleProgram(
                     program.target_architecture,
                     &models[model_index],
                     &trigger_events,
+                );
+                try persistRuntimeTriggerEvents(
+                    scratch,
+                    root,
+                    trigger_events.items,
                 );
             }
         },
@@ -14547,6 +17713,12 @@ fn executeLifecycleProgram(
                     intent.package.ref(),
                     intent.owned_paths_sha256,
                     &trigger_events,
+                );
+            if (program.trigger_authority != null)
+                try persistRuntimeTriggerEvents(
+                    scratch,
+                    root,
+                    trigger_events.items,
                 );
             const result = try lifecycleRemovePackage(
                 allocator,
@@ -14657,6 +17829,7 @@ fn executeLifecycleProgram(
                     .program_sha256 = program.digest_sha256,
                 },
                 .exited => |value| value,
+                .not_started => 255,
             };
             if (code == 0) continue;
 
@@ -14685,6 +17858,7 @@ fn executeLifecycleProgram(
                         .program_sha256 = program.digest_sha256,
                     },
                     .exited => |value| value == 0,
+                    .not_started => false,
                 };
             }
 
@@ -14726,6 +17900,10 @@ fn executeLifecycleProgram(
                 );
                 switch (compensation_outcome) {
                     .exited => |compensation_code| if (compensation_code != 0) {
+                        failed_compensation = compensation;
+                        break :compensations;
+                    },
+                    .not_started => {
                         failed_compensation = compensation;
                         break :compensations;
                     },
@@ -14939,7 +18117,13 @@ fn executeLifecycleProgram(
                 root,
                 trigger_authority_bytes,
             );
-            try finishLifecycleAttempt(allocator, &attempt, program_sha256, false);
+            try finishLifecycleAttempt(
+                allocator,
+                root,
+                &attempt,
+                program_sha256,
+                false,
+            );
             attempt.release();
             attempt_active = false;
             return .{
@@ -15017,6 +18201,7 @@ fn executeLifecycleProgram(
             const trigger_result = try lifecycleProcessTriggers(
                 allocator,
                 scratch,
+                &trigger_events,
                 root,
                 external.root,
                 program,
@@ -15071,6 +18256,7 @@ fn executeLifecycleProgram(
                     );
                     try finishLifecycleAttempt(
                         allocator,
+                        root,
                         &attempt,
                         program_sha256,
                         false,
@@ -15156,7 +18342,13 @@ fn executeLifecycleProgram(
         root,
         trigger_authority_bytes,
     );
-    try finishLifecycleAttempt(allocator, &attempt, program_sha256, true);
+    try finishLifecycleAttempt(
+        allocator,
+        root,
+        &attempt,
+        program_sha256,
+        true,
+    );
     attempt.release();
     attempt_active = false;
     return .{
@@ -15216,9 +18408,32 @@ fn writeLifecycleReport(
         detail: []const u8,
         program_sha256: ?[]const u8,
     };
+    const ProvenanceWire = struct {
+        outcome: []const u8,
+        detail: []const u8,
+        program_sha256: []const u8,
+        attempt_id: []const u8,
+        provenance_path: []const u8,
+    };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.json.Stringify.value(
+    if (result.provenance_path) |provenance_path| {
+        const program_sha256 = result.program_sha256 orelse
+            return error.InvalidRecoveryProvenance;
+        const attempt_id = result.attempt_id orelse
+            return error.InvalidRecoveryProvenance;
+        try std.json.Stringify.value(
+            ProvenanceWire{
+                .outcome = @tagName(result.outcome),
+                .detail = result.detail,
+                .program_sha256 = &program_sha256,
+                .attempt_id = &attempt_id,
+                .provenance_path = provenance_path,
+            },
+            .{ .whitespace = .minified },
+            &output.writer,
+        );
+    } else try std.json.Stringify.value(
         Wire{
             .outcome = @tagName(result.outcome),
             .detail = result.detail,
@@ -15234,6 +18449,32 @@ fn writeLifecycleReport(
     try file.sync(io);
 }
 
+fn attachLifecycleProvenance(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    result: *LifecycleResult,
+) !void {
+    var owned = try native_provenance.read(allocator, root) orelse return;
+    defer owned.deinit();
+    const operation_store: root_operation.Store = .init(root);
+    if (try operation_store.read(allocator)) |active_value| {
+        var active = active_value;
+        defer active.deinit();
+        const provenance_attempt = native_recovery.parseDigest(
+            owned.document.attempt_id,
+        ) orelse return error.InvalidRecoveryProvenance;
+        if (!std.mem.eql(
+            u8,
+            &provenance_attempt,
+            &active.record.attempt_id,
+        )) return;
+    }
+    result.attempt_id = owned.document.attempt_id;
+    result.provenance_path = native_provenance.document_path;
+    if (result.program_sha256 == null)
+        result.program_sha256 = owned.document.program_sha256;
+}
+
 fn externalProductOperation(value: ExternalMaterializationOperation) product_api.Operation {
     return switch (value) {
         .install, .downgrade => .install,
@@ -15241,7 +18482,13 @@ fn externalProductOperation(value: ExternalMaterializationOperation) product_api
         .reinstall => .reinstall,
         .configure, .process_triggers => .install,
         .remove, .purge => .remove,
+        .recover => unreachable,
     };
+}
+
+test "native_recovery.test.native_provenance.test.contract coverage" {
+    try native_recovery.testContracts();
+    try native_provenance.testContract();
 }
 
 test "native_unpack.test.materialization external fixture" {
@@ -15267,14 +18514,14 @@ test "native_unpack.test.materialization external fixture" {
     const external = parsed.value;
     const archive_phase = switch (external.operation) {
         .install, .upgrade, .downgrade, .reinstall, .configure => true,
-        .remove, .purge, .process_triggers => false,
+        .remove, .purge, .process_triggers, .recover => false,
     };
     if (!absolute_path.nonRoot(external.root) or
         !absolute_path.nonRoot(external.report) or
         (archive_phase != (external.archives.len != 0)) or
         ((external.operation == .remove or external.operation == .purge) and
             external.packages.len == 0) or
-        external.operation == .process_triggers or
+        (external.operation == .process_triggers or external.operation == .recover) or
         (!std.mem.eql(u8, external.architecture, "amd64") and
             !std.mem.eql(u8, external.architecture, "arm64")))
         return error.InvalidExternalMaterializationRequest;
@@ -15414,7 +18661,7 @@ test "native_unpack.test.materialization external fixture" {
                     installed.parsed_version.order(incoming_version) != .eq)
                     return error.InvalidExternalOperation;
             },
-            .remove, .purge, .process_triggers => unreachable,
+            .remove, .purge, .process_triggers, .recover => unreachable,
         }
         steps[index] = unpackStep(
             artifact,
@@ -15980,7 +19227,7 @@ test "native_unpack.test.lifecycle external fixture" {
     const external = parsed.value;
     const archive_phase = switch (external.operation) {
         .install, .upgrade, .downgrade, .reinstall, .configure => true,
-        .remove, .purge, .process_triggers => false,
+        .remove, .purge, .process_triggers, .recover => false,
     };
     if (!absolute_path.nonRoot(external.root) or
         !absolute_path.nonRoot(external.report) or
@@ -16027,6 +19274,46 @@ test "native_unpack.test.lifecycle external fixture" {
         marker,
         "debz native materialization fixture v1\n",
     )) return error.InvalidExternalLifecycleRequest;
+    if (external.operation == .recover) {
+        if (external.archives.len != 0 or external.packages.len != 0 or
+            external.ordered_actions != null or external.fault != null)
+            return error.InvalidExternalLifecycleRequest;
+        var recovery_locks: root_operation.SystemLockBackend = .{
+            .allocator = testing.allocator,
+            .io = testing.io,
+        };
+        var result = recoverLifecycleProgram(
+            testing.allocator,
+            root,
+            external,
+            recovery_locks.interface(),
+        ) catch |err| LifecycleResult{
+            .outcome = .recovery_required,
+            .detail = @errorName(err),
+        };
+        try attachLifecycleProvenance(testing.allocator, root, &result);
+        try writeLifecycleReport(
+            testing.allocator,
+            testing.io,
+            external.report,
+            result,
+        );
+        return;
+    }
+    if (try root.entryIfExists(
+        try root_fs.Path.init(native_recovery.intent_path),
+    ) != null) {
+        try writeLifecycleReport(
+            testing.allocator,
+            testing.io,
+            external.report,
+            .{
+                .outcome = .recovery_required,
+                .detail = "native_recovery_evidence_active",
+            },
+        );
+        return;
+    }
     var inspection_locks: root_operation.SystemLockBackend = .{
         .allocator = testing.allocator,
         .io = testing.io,
@@ -16220,7 +19507,7 @@ test "native_unpack.test.lifecycle external fixture" {
         .allocator = testing.allocator,
         .io = testing.io,
     };
-    const result = executeLifecycleProgram(
+    var result = executeLifecycleProgram(
         testing.allocator,
         root,
         external,
@@ -16230,11 +19517,14 @@ test "native_unpack.test.lifecycle external fixture" {
         captured.snapshot,
         database.model,
         locks.interface(),
+        null,
+        request_bytes,
     ) catch |err| LifecycleResult{
         .outcome = .recovery_required,
         .detail = @errorName(err),
         .program_sha256 = compiled.program.program.digest_sha256,
     };
+    try attachLifecycleProvenance(testing.allocator, root, &result);
     try writeLifecycleReport(
         testing.allocator,
         testing.io,

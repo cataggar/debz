@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-progress-v1",
+  "title": "debz native execution progress v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "intent_sha256",
+    "records",
+    "head_sha256",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-execution-progress-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "records": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": {
+        "$ref": "#/$defs/record"
+      }
+    },
+    "head_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "program_step",
+        "substep",
+        "ordinal"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "filesystem",
+            "database",
+            "script",
+            "compensation",
+            "trigger",
+            "verification",
+            "provenance",
+            "cleanup"
+          ]
+        },
+        "program_step": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "substep": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "action",
+        "stage",
+        "result",
+        "previous_sha256",
+        "digest_sha256"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "stage": {
+          "enum": [
+            "prepared",
+            "in_flight",
+            "outcome",
+            "completed",
+            "activation",
+            "terminal"
+          ]
+        },
+        "result": {
+          "enum": [
+            "none",
+            "applied",
+            "rolled_back",
+            "exited",
+            "not_started",
+            "failed",
+            "succeeded",
+            "recovered",
+            "recovery_required"
+          ]
+        },
+        "evidence_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previous_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "digest_sha256": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    }
+  }
+}
