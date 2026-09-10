@@ -36,10 +36,14 @@ non-absolute or non-canonical root, host root without explicit policy, a script
 path that is absolute, non-canonical, or contains `..`, a script that lives
 outside the allowed script directories (`var/lib/dpkg/info` and
 `var/lib/dpkg/tmp.ci` by default), a script file name that does not match the
-requested kind, an invalid package, version or architecture, an empty,
+requested kind, an invalid package, version or architecture, an invalid empty,
 non-printable, oversized, or option-shaped argument, too many arguments, an
 invalid or duplicated variable, and an invalid timeout, output limit, or script
 directory.
+
+The only accepted empty argument is the second argument of `postinst
+configure ""`, which represents a package that has never been successfully
+configured. It is preserved in argv and the invocation evidence, not omitted.
 
 ## Execution policy
 

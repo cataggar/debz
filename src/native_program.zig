@@ -59,6 +59,7 @@ pub const maximum_ownership_conflicts: usize = 100_000;
 pub const maximum_compile_work: usize = 16_000_000;
 pub const maximum_step_dependencies: usize = 8;
 pub const maximum_script_arguments: usize = 8;
+pub const maximum_script_compensations: usize = 8;
 pub const maximum_argument_bytes: usize = 512;
 pub const maximum_identity_bytes: usize = 256;
 pub const maximum_path_bytes: usize = 4096;
@@ -158,6 +159,12 @@ pub const ScriptFailure = struct {
     /// Package state the database must record if the call fails.
     state: PackageState,
     unwind: ?Unwind,
+    /// A successful primary unwind may let dpkg continue the transaction.
+    resume_after_unwind: bool = false,
+    /// Exact additional calls for a terminal known failure.
+    compensations: []const Unwind = &.{},
+    /// Roll back the data mutation after this many compensation calls.
+    rollback_after_compensations: ?u32 = null,
     /// A failure that cannot be compensated automatically and must publish a
     /// durable recovery requirement.
     recovery_required: bool,
@@ -617,6 +624,9 @@ pub const InstalledPackage = struct {
     version: []const u8,
     architecture: []const u8,
     state: PackageState,
+    /// Last successfully configured version. This is `Config-Version` for an
+    /// unpacked package and normally equals `version` for a configured one.
+    configured_version: ?[]const u8 = null,
     hold: bool = false,
     essential: bool = false,
     /// Digest of the published owned-path set for this package.
@@ -1131,6 +1141,15 @@ fn updateByte(hasher: *Sha256, value: u8) void {
     hasher.update(&[_]u8{value});
 }
 
+fn updateOptionalString(hasher: *Sha256, value: ?[]const u8) void {
+    if (value) |text| {
+        updateByte(hasher, 1);
+        updateString(hasher, text);
+    } else {
+        updateByte(hasher, 0);
+    }
+}
+
 fn scriptsDigest(scripts: []const InstalledScript) [32]u8 {
     var hasher = Sha256.init(.{});
     hasher.update("debz-native-transaction-program-scripts-v1\x00");
@@ -1186,6 +1205,7 @@ fn installedEvidenceDigest(packages: []const InstalledPackage) [32]u8 {
         updateString(&hasher, package.version);
         updateString(&hasher, package.architecture);
         updateByte(&hasher, @intFromEnum(package.state));
+        updateOptionalString(&hasher, package.configured_version);
         updateByte(&hasher, @intFromBool(package.hold));
         updateByte(&hasher, @intFromBool(package.essential));
         hasher.update(&package.owned_paths_sha256);
@@ -1303,6 +1323,14 @@ fn buildInstalled(self: *Compiler) CompileError!void {
             });
         if (!validVersion(package.version))
             return self.reject(.{ .code = .invalid_version, .package = package.name });
+        if (package.configured_version) |version| {
+            if (!validVersion(version))
+                return self.reject(.{
+                    .code = .invalid_version,
+                    .detail = "configured version",
+                    .package = package.name,
+                });
+        }
         packages[index] = package;
         packages[index].scripts = try prepareScripts(self, package);
         packages[index].conffiles = try prepareInstalledConffiles(self, package);
@@ -1764,6 +1792,15 @@ fn validateActionEvidence(
                 });
             switch (state) {
                 .installed, .triggers_awaited, .triggers_pending => {},
+                .unpacked => {},
+                .half_configured => if (action.kind != .reinstall or
+                    !std.mem.eql(u8, action.version, entry.installed_version.?))
+                    return self.reject(.{
+                        .code = .installed_state_contradiction,
+                        .detail = "unhealthy installed state",
+                        .package = action.package,
+                        .architecture = action.architecture,
+                    }),
                 else => return self.reject(.{
                     .code = .installed_state_contradiction,
                     .detail = "unhealthy installed state",
@@ -1794,12 +1831,7 @@ fn validateActionEvidence(
                 });
             switch (state) {
                 .installed, .triggers_awaited, .triggers_pending => {},
-                .config_files => if (action.kind == .remove) return self.reject(.{
-                    .code = .installed_state_contradiction,
-                    .detail = "remove of config-files package",
-                    .package = action.package,
-                    .architecture = action.architecture,
-                }),
+                .config_files => {},
                 else => return self.reject(.{
                     .code = .installed_state_contradiction,
                     .detail = "unhealthy installed state",
@@ -1932,13 +1964,19 @@ fn validateOrdering(self: *Compiler) CompileError!void {
             },
             .configure_pending => {
                 counts.lifecycle = true;
-                if (pending.items.len == 0)
-                    return self.reject(.{
-                        .code = .ordering_mismatch,
-                        .detail = "configure barrier without pending unpack",
-                        .package = entry.package,
-                        .sequence = index,
-                    });
+                if (pending.items.len == 0) {
+                    const modeled = self.modeled[self.modeled_index.get(key).?];
+                    if (action.kind != .reinstall or
+                        (modeled.state != .unpacked and
+                            modeled.state != .half_configured))
+                        return self.reject(.{
+                            .code = .ordering_mismatch,
+                            .detail = "configure barrier without pending unpack",
+                            .package = entry.package,
+                            .sequence = index,
+                        });
+                    try pending.append(self.arena, action_index);
+                }
                 for (pending.items) |pending_index| configured[pending_index] = true;
                 pending.clearRetainingCapacity();
                 self.final_barrier = index;
@@ -1957,7 +1995,7 @@ fn validateOrdering(self: *Compiler) CompileError!void {
                     .package = action.package,
                     .architecture = action.architecture,
                 });
-        } else if (!unpacked[index]) {
+        } else if (!unpacked[index] and !configured[index]) {
             return self.reject(.{
                 .code = .missing_ordered_action,
                 .detail = "unpack",
@@ -2179,6 +2217,16 @@ fn installedScript(
     return null;
 }
 
+fn configuredVersion(self: *Compiler, entry: Modeled) ?[]const u8 {
+    const index = entry.installed orelse return null;
+    const package = self.installed[index];
+    if (package.configured_version) |version| return version;
+    return switch (package.state) {
+        .installed, .triggers_awaited, .triggers_pending, .config_files => package.version,
+        else => null,
+    };
+}
+
 fn findConffile(
     conffiles: []const InstalledConffile,
     path: []const u8,
@@ -2210,6 +2258,28 @@ fn makeUnwind(
         .script_sha256 = hex(32, found),
         .arguments = try self.arguments(args),
     };
+}
+
+fn compactUnwinds(
+    self: *Compiler,
+    candidates: []const ?Unwind,
+) CompileError![]const Unwind {
+    if (candidates.len > maximum_script_compensations)
+        return self.reject(.{
+            .code = .invalid_script_metadata,
+            .detail = "compensation count",
+        });
+    var result: std.ArrayList(Unwind) = .empty;
+    for (candidates) |candidate| {
+        if (candidate) |value| try result.append(self.arena, value);
+    }
+    const owned = try result.toOwnedSlice(self.arena);
+    if (owned.len > maximum_script_compensations)
+        return self.reject(.{
+            .code = .invalid_script_metadata,
+            .detail = "compensation count",
+        });
+    return owned;
 }
 
 fn emitScript(
@@ -2252,6 +2322,11 @@ fn emitLifecycle(self: *Compiler) CompileError!void {
                 try pending.append(self.arena, entry_index);
             },
             .configure_pending => {
+                if (pending.items.len == 0)
+                    try pending.append(self.arena, modeledIndexOf(
+                        self,
+                        self.input.authorization.actions[action_index],
+                    ));
                 const reason: BarrierReason =
                     if (self.final_barrier.? == index) .final else .pre_depends;
                 try emitConfigure(self, pending.items, reason);
@@ -2472,7 +2547,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
         },
         .upgrade, .downgrade, .reinstall => {
             const prior = action.prior_version.?;
-            if (installedScript(self, entry.*, .prerm)) |digest| {
+            if (entry.state != .unpacked) if (installedScript(self, entry.*, .prerm)) |digest| {
                 last = try emitScript(
                     self,
                     .unpack,
@@ -2489,12 +2564,22 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
                             archiveScriptDigest(prepared, .prerm),
                             .prerm,
                             .new_package,
-                            &.{ "failed-upgrade", prior },
+                            &.{ "failed-upgrade", prior, action.version },
                         ),
+                        .resume_after_unwind = archiveScriptDigest(prepared, .prerm) != null,
+                        .compensations = try compactUnwinds(self, &.{
+                            try makeUnwind(
+                                self,
+                                installedScript(self, entry.*, .postinst),
+                                .postinst,
+                                .installed_package,
+                                &.{ "abort-upgrade", action.version },
+                            ),
+                        }),
                         .recovery_required = false,
                     },
                 );
-            }
+            };
             if (archiveScriptDigest(prepared, .preinst)) |digest| {
                 last = try emitScript(
                     self,
@@ -2504,7 +2589,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
                     .preinst,
                     .new_package,
                     digest,
-                    &.{ "upgrade", prior },
+                    &.{ "upgrade", prior, action.version },
                     .{
                         .state = .half_installed,
                         .unwind = try makeUnwind(
@@ -2512,8 +2597,17 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
                             archiveScriptDigest(prepared, .postrm),
                             .postrm,
                             .new_package,
-                            &.{ "abort-upgrade", prior },
+                            &.{ "abort-upgrade", prior, action.version },
                         ),
+                        .compensations = try compactUnwinds(self, &.{
+                            try makeUnwind(
+                                self,
+                                installedScript(self, entry.*, .postinst),
+                                .postinst,
+                                .installed_package,
+                                &.{ "abort-upgrade", action.version },
+                            ),
+                        }),
                         .recovery_required = false,
                     },
                 );
@@ -2563,8 +2657,44 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
                             archiveScriptDigest(prepared, .postrm),
                             .postrm,
                             .new_package,
-                            &.{ "failed-upgrade", action.prior_version.? },
+                            &.{
+                                "failed-upgrade",
+                                action.prior_version.?,
+                                action.version,
+                            },
                         ),
+                        .resume_after_unwind = archiveScriptDigest(prepared, .postrm) != null,
+                        .compensations = try compactUnwinds(self, &.{
+                            try makeUnwind(
+                                self,
+                                installedScript(self, entry.*, .preinst),
+                                .preinst,
+                                .installed_package,
+                                &.{ "abort-upgrade", action.version },
+                            ),
+                            try makeUnwind(
+                                self,
+                                archiveScriptDigest(prepared, .postrm),
+                                .postrm,
+                                .new_package,
+                                &.{
+                                    "abort-upgrade",
+                                    action.prior_version.?,
+                                    action.version,
+                                },
+                            ),
+                            try makeUnwind(
+                                self,
+                                installedScript(self, entry.*, .postinst),
+                                .postinst,
+                                .installed_package,
+                                &.{ "abort-upgrade", action.version },
+                            ),
+                        }),
+                        .rollback_after_compensations = if (installedScript(self, entry.*, .preinst) != null)
+                            1
+                        else
+                            0,
                         .recovery_required = true,
                     },
                 );
@@ -2723,14 +2853,14 @@ fn emitConfigure(
             .configure,
         );
         if (archiveScriptDigest(prepared, .postinst)) |digest| {
-            const args: []const []const u8 = if (entry.installed_version) |version|
+            const args: []const []const u8 = if (configuredVersion(self, entry.*)) |version|
                 &.{ "configure", version }
             else
-                &.{"configure"};
+                &.{ "configure", "" };
             last = try emitScript(
                 self,
                 .configure,
-                &.{ last, entry.unpack_step.? },
+                &.{ last, entry.unpack_step orelse entry.assert_step },
                 package_identity,
                 .postinst,
                 .new_package,
@@ -3219,6 +3349,17 @@ fn validateModel(comptime T: type, value: T) bool {
     }
 }
 
+fn validScriptArguments(arguments: []const []const u8) bool {
+    if (arguments.len > maximum_script_arguments) return false;
+    for (arguments) |argument| {
+        if (argument.len > maximum_argument_bytes) return false;
+        for (argument) |byte| {
+            if (byte <= 0x1f or byte == 0x7f) return false;
+        }
+    }
+    return true;
+}
+
 /// Revalidates a decoded document exactly as strictly as compilation validated
 /// the program it published.
 pub fn validateDocument(program: Program) DecodeError!void {
@@ -3274,14 +3415,24 @@ pub fn validateDocument(program: Program) DecodeError!void {
             .unpack_package => |intent| if (intent.artifact >= program.artifacts.len)
                 return error.InvalidProgram,
             .run_maintainer_script => |call| {
-                if (call.arguments.len > maximum_script_arguments) return error.InvalidProgram;
-                for (call.arguments) |argument| {
-                    if (argument.len > maximum_argument_bytes) return error.InvalidProgram;
-                }
+                if (!validScriptArguments(call.arguments)) return error.InvalidProgram;
                 if (call.failure.unwind) |unwind| {
-                    if (unwind.arguments.len > maximum_script_arguments)
+                    if (!validScriptArguments(unwind.arguments))
                         return error.InvalidProgram;
                 }
+                if (call.failure.compensations.len > maximum_script_compensations)
+                    return error.InvalidProgram;
+                for (call.failure.compensations) |compensation| {
+                    if (!validScriptArguments(compensation.arguments))
+                        return error.InvalidProgram;
+                }
+                if (call.failure.rollback_after_compensations) |count| {
+                    if (count > call.failure.compensations.len)
+                        return error.InvalidProgram;
+                }
+                if (call.failure.resume_after_unwind and
+                    call.failure.unwind == null)
+                    return error.InvalidProgram;
             },
             .apply_conffile_decision => |decision| if (decision.path.len > maximum_path_bytes or
                 !absolute_path.nonRoot(decision.path)) return error.InvalidPath,
@@ -3609,7 +3760,9 @@ test "native_program.test.fresh install compiles a complete deterministic progra
                         step.requires,
                         conffile_sequence.?,
                     ) != null);
+                    try testing.expectEqual(@as(usize, 2), call.arguments.len);
                     try testing.expectEqualStrings("configure", call.arguments[0]);
+                    try testing.expectEqualStrings("", call.arguments[1]);
                     try testing.expectEqual(PackageState.half_configured, call.failure.state);
                 },
                 else => return error.TestUnexpectedResult,
@@ -3790,18 +3943,36 @@ test "native_program.test.upgrade orders old and new scripts with exact unwind c
     try testing.expectEqual(ScriptSource.new_package, old_prerm.failure.unwind.?.source);
     try testing.expectEqualStrings("failed-upgrade", old_prerm.failure.unwind.?.arguments[0]);
     try testing.expectEqualStrings("1.0", old_prerm.failure.unwind.?.arguments[1]);
+    try testing.expectEqualStrings("1.2", old_prerm.failure.unwind.?.arguments[2]);
+    try testing.expect(old_prerm.failure.resume_after_unwind);
+    try testing.expectEqual(@as(usize, 1), old_prerm.failure.compensations.len);
+    try testing.expectEqual(
+        maintainer_script.Kind.postinst,
+        old_prerm.failure.compensations[0].kind,
+    );
 
     const new_preinst = scriptCallAt(program, 1).?;
     try testing.expectEqual(maintainer_script.Kind.preinst, new_preinst.kind);
     try testing.expectEqual(ScriptSource.new_package, new_preinst.source);
     try testing.expectEqualStrings("upgrade", new_preinst.arguments[0]);
     try testing.expectEqualStrings("1.0", new_preinst.arguments[1]);
+    try testing.expectEqualStrings("1.2", new_preinst.arguments[2]);
     try testing.expectEqualStrings("abort-upgrade", new_preinst.failure.unwind.?.arguments[0]);
+    try testing.expectEqualStrings("1.0", new_preinst.failure.unwind.?.arguments[1]);
+    try testing.expectEqualStrings("1.2", new_preinst.failure.unwind.?.arguments[2]);
+    try testing.expectEqual(@as(usize, 1), new_preinst.failure.compensations.len);
 
     const old_postrm = scriptCallAt(program, 2).?;
     try testing.expectEqual(maintainer_script.Kind.postrm, old_postrm.kind);
     try testing.expectEqual(ScriptSource.installed_package, old_postrm.source);
     try testing.expectEqualStrings("upgrade", old_postrm.arguments[0]);
+    try testing.expectEqualStrings(
+        "1.2",
+        old_postrm.failure.unwind.?.arguments[2],
+    );
+    try testing.expect(old_postrm.failure.resume_after_unwind);
+    try testing.expectEqual(@as(?u32, 0), old_postrm.failure.rollback_after_compensations);
+    try testing.expectEqual(@as(usize, 2), old_postrm.failure.compensations.len);
     try testing.expect(old_postrm.failure.recovery_required);
 
     const new_postinst = scriptCallAt(program, 3).?;
@@ -3834,6 +4005,143 @@ test "native_program.test.upgrade orders old and new scripts with exact unwind c
         else => {},
     };
     try testing.expect(unpack_seen);
+}
+
+test "native_program.test.configure uses recorded configured version" {
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &upgrade_actions,
+        &upgrade_final,
+    );
+    defer authorization.deinit();
+    var installed = [_]InstalledPackage{upgradeInstalled()[0]};
+    installed[0].configured_version = "0.8";
+    const archives = [_]Archive{upgradeArchive()};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = &installed,
+        },
+        .archives = &archives,
+    }));
+    defer owned.deinit();
+
+    const postinst = scriptCallAt(owned.program, 3).?;
+    try testing.expectEqualStrings("configure", postinst.arguments[0]);
+    try testing.expectEqualStrings("0.8", postinst.arguments[1]);
+}
+
+test "native_program.test.half-configured package compiles configure-only retry" {
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .reinstall,
+        .package = "app",
+        .version = "1.0",
+        .architecture = "amd64",
+        .prior_version = "1.0",
+        .artifact = testArtifact(0x31, 100),
+    }};
+    const final_state = [_]native_authorization.FinalPackage{.{
+        .name = "app",
+        .version = "1.0",
+        .architecture = "amd64",
+        .state = .installed,
+        .dpkg_selection_hold = false,
+    }};
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &actions,
+        &final_state,
+    );
+    defer authorization.deinit();
+    var installed = [_]InstalledPackage{upgradeInstalled()[0]};
+    installed[0].state = .half_configured;
+    installed[0].configured_version = "0.8";
+    var archive = upgradeArchive();
+    archive.version = "1.0";
+    const archives = [_]Archive{archive};
+    const ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .configure_pending,
+        .package = "app",
+        .version = "1.0",
+        .architecture = "amd64",
+    }};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &ordered,
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = &installed,
+        },
+        .archives = &archives,
+    }));
+    defer owned.deinit();
+
+    try testing.expectEqual(@as(usize, 0), owned.program.countSteps(.unpack_package));
+    const postinst = scriptCallAt(owned.program, 0).?;
+    try testing.expectEqual(maintainer_script.Kind.postinst, postinst.kind);
+    try testing.expectEqualStrings("0.8", postinst.arguments[1]);
+}
+
+test "native_program.test.compensation vectors are strictly bounded and validated" {
+    var authorization = try testAuthorization(
+        testing.allocator,
+        &upgrade_actions,
+        &upgrade_final,
+    );
+    defer authorization.deinit();
+    const archives = [_]Archive{upgradeArchive()};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = upgradeInstalled(),
+        },
+        .archives = &archives,
+    }));
+    defer owned.deinit();
+    const steps = try testing.allocator.dupe(Step, owned.program.steps);
+    defer testing.allocator.free(steps);
+    var program = owned.program;
+    program.steps = steps;
+    const script_index = for (steps, 0..) |step, index| switch (step.operation) {
+        .run_maintainer_script => |call| {
+            if (call.failure.compensations.len != 0) break index;
+        },
+        else => {},
+    } else return error.TestUnexpectedResult;
+    const original = steps[script_index].operation.run_maintainer_script;
+
+    var too_many: [maximum_script_compensations + 1]Unwind = undefined;
+    for (&too_many) |*slot| slot.* = original.failure.compensations[0];
+    var call = original;
+    call.failure.compensations = &too_many;
+    steps[script_index].operation = .{ .run_maintainer_script = call };
+    try testing.expectError(error.InvalidProgram, validateDocument(program));
+
+    call = original;
+    var invalid_digest = [_]Unwind{original.failure.compensations[0]};
+    invalid_digest[0].script_sha256[0] = 'z';
+    call.failure.compensations = &invalid_digest;
+    steps[script_index].operation = .{ .run_maintainer_script = call };
+    try testing.expectError(error.InvalidDigest, validateDocument(program));
+
+    call = original;
+    var invalid_argument = [_]Unwind{original.failure.compensations[0]};
+    invalid_argument[0].arguments = &.{"bad\nargument"};
+    call.failure.compensations = &invalid_argument;
+    steps[script_index].operation = .{ .run_maintainer_script = call };
+    try testing.expectError(error.InvalidProgram, validateDocument(program));
+
+    call = original;
+    call.failure.rollback_after_compensations =
+        @intCast(call.failure.compensations.len + 1);
+    steps[script_index].operation = .{ .run_maintainer_script = call };
+    try testing.expectError(error.InvalidProgram, validateDocument(program));
 }
 
 /// Every conffile decision the compiler can reach, keyed by the three digests

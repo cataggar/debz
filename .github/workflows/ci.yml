@@ -578,10 +578,10 @@ jobs:
           zig build -Doptimize=ReleaseSafe test
           zig build -Doptimize=ReleaseSafe fuzz
           zig build -Doptimize=ReleaseSafe run -- --help
-      - name: Compare native materialization and conffile phases with dpkg
+      - name: Compare native materialization, conffiles, and lifecycle with dpkg
         run: |
-          zig build test-native-materialization test-native-conffiles -j2 --summary all
-          zig build test-native-materialization test-native-conffiles -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-materialization test-native-conffiles test-native-lifecycle -j2 --summary all
+          zig build test-native-materialization test-native-conffiles test-native-lifecycle -Doptimize=ReleaseSafe -j2 --summary all
       - name: Run required real apt facade acceptance
         run: |
           sudo env \

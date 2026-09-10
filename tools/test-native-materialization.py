@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import hashlib
 import importlib.util
 import json
@@ -65,7 +66,13 @@ def make_package(
     package: str = PACKAGE,
     conffile_content: bytes = b"package configuration\n",
     extra_files: dict[str, bytes] | None = None,
+    scripts: dict[str, bytes] | None = None,
+    control_fields: dict[str, str] | None = None,
+    prepare_payload: Callable[[Path], None] | None = None,
+    compression: str = "gzip",
 ) -> Path:
+    if compression not in ("gzip", "none"):
+        raise ValueError(f"unsupported fixture compression: {compression}")
     stem = f"{package}_{version}_{feature}"
     source = workspace / (stem + ".source")
     payload = Path("usr/share") / package
@@ -74,6 +81,8 @@ def make_package(
         "Maintainer: debz fixture <fixture@example.invalid>\n"
         "Description: native data-only materialization fixture\n"
     )
+    for name, value in (control_fields or {}).items():
+        control += f"{name}: {value}\n"
     write(source / "DEBIAN/control", control.encode())
     write(source / payload / "data", f"data version {version}\n".encode())
     os.link(source / payload / "data", source / payload / "data.link")
@@ -104,6 +113,12 @@ def make_package(
         raise ValueError(f"unknown fixture feature: {feature}")
     for path, content in (extra_files or {}).items():
         write(source / path, content)
+    for name, content in (scripts or {}).items():
+        if name not in ("preinst", "postinst", "prerm", "postrm"):
+            raise ValueError(f"unsupported maintainer-script fixture: {name}")
+        write(source / "DEBIAN" / name, content, 0o755)
+    if prepare_payload is not None:
+        prepare_payload(source)
 
     checksums = []
     for path in sorted(source.rglob("*")):
@@ -120,8 +135,8 @@ def make_package(
         os.utime(source / payload / "empty", (0, 0))
     destination = workspace / (stem + ".deb")
     run(
-        ["dpkg-deb", "--build", "--uniform-compression", "-Zgzip", "-z1",
-         str(source), str(destination)],
+        ["dpkg-deb", "--build", "--uniform-compression", f"-Z{compression}",
+         *(["-z1"] if compression == "gzip" else []), str(source), str(destination)],
         environment,
         workspace / (stem + ".build.log"),
     )

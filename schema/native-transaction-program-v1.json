@@ -448,6 +448,9 @@
       "required": [
         "state",
         "unwind",
+        "resume_after_unwind",
+        "compensations",
+        "rollback_after_compensations",
         "recovery_required"
       ],
       "properties": {
@@ -470,6 +473,28 @@
             },
             {
               "$ref": "#/$defs/unwind"
+            }
+          ]
+        },
+        "resume_after_unwind": {
+          "type": "boolean"
+        },
+        "compensations": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/unwind"
+          }
+        },
+        "rollback_after_compensations": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8
             }
           ]
         },
