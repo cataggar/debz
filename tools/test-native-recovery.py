@@ -252,16 +252,20 @@ def assert_progress(proof: dict, progress: dict, scripts: list[dict]) -> None:
         raise AssertionError("completed provenance has no terminal progress")
 
 
-def assert_script_output(script: dict) -> None:
+def assert_output_streams(script: dict) -> None:
     output = {}
     for stream in ("stdout", "stderr", "combined"):
         output[stream] = bytes.fromhex(script[f"{stream}_hex"])
         if hashlib.sha256(output[stream]).hexdigest() != script[f"{stream}_sha256"]:
             raise AssertionError("retained script output digest mismatch")
-    if len(output["combined"]) != len(output["stdout"]) + len(output["stderr"]):
-        raise AssertionError("retained script output is incomplete")
-    if script["output_bytes"] != len(output["combined"]) or script["output_bytes"] > script["output_limit"]:
+    if output["combined"] and (output["stdout"] or output["stderr"]):
+        raise AssertionError("retained script output mixes capture modes")
+    if script["output_bytes"] != sum(map(len, output.values())) or script["output_bytes"] > script["output_limit"]:
         raise AssertionError("retained script output accounting differs")
+
+
+def assert_script_output(script: dict) -> None:
+    assert_output_streams(script)
     environment = {entry["key"]: entry["value"] for entry in script["environment"]}
     if len(environment) != len(script["environment"]) or list(environment) != sorted(environment):
         raise AssertionError("retained script environment is not canonical")

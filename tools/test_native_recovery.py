@@ -284,6 +284,21 @@ class RecoveryOracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "arguments or identity"):
             acceptance.assert_script_trace(self.root, proof, [script])
 
+    def test_retained_output_supports_separate_and_combined_capture(self) -> None:
+        for output in (
+            {"stdout": b"out", "stderr": b"err", "combined": b""},
+            {"stdout": b"", "stderr": b"", "combined": b"outerr"},
+        ):
+            with self.subTest(output=output):
+                script = {"output_bytes": 6, "output_limit": 100}
+                for stream, raw in output.items():
+                    script[f"{stream}_hex"] = raw.hex()
+                    script[f"{stream}_sha256"] = acceptance.hashlib.sha256(raw).hexdigest()
+                acceptance.assert_output_streams(script)
+                script["output_bytes"] = 0
+                with self.assertRaisesRegex(AssertionError, "output accounting"):
+                    acceptance.assert_output_streams(script)
+
 
 if __name__ == "__main__":
     unittest.main()

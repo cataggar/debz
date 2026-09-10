@@ -764,6 +764,13 @@ pub fn build(b: *std.Build) void {
     const run_maintainer_script_tests = b.addRunArtifact(maintainer_script_tests);
     b.step("test-maintainer-script", "Run audited maintainer-script runner tests")
         .dependOn(&run_maintainer_script_tests.step);
+    const native_helper_namespace_tests = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env", "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    native_helper_namespace_tests.addArtifactArg(maintainer_script_tests);
+    b.step("test-native-helper-namespace", "Require private helper mounts without changing package-owned files")
+        .dependOn(&native_helper_namespace_tests.step);
 
     const archive_application_tests = b.addTest(.{
         .root_module = debz,

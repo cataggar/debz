@@ -15,6 +15,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
+const root_fs = @import("root_fs.zig");
+const live_root = @import("live_root.zig");
 
 pub const Kind = enum {
     preinst,
@@ -111,6 +113,76 @@ pub const EnvironmentEntry = struct {
     value: []const u8,
 };
 
+pub const HelperEvidence = struct {
+    source_path: []const u8,
+    target_path: []const u8,
+    sha256: [32]u8,
+};
+
+/// One verified helper and existing target, pinned for a single invocation.
+/// The caller keeps the root and this binding alive until execution returns.
+pub const HelperMount = struct {
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    evidence: HelperEvidence,
+    source: root_fs.PinnedRegularFile,
+    target: root_fs.PinnedRegularFile,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        source_path: []const u8,
+        target_path: []const u8,
+        expected_sha256: [32]u8,
+    ) !HelperMount {
+        var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root_length = try root.dir.realPath(root.io, &root_buffer);
+        const root_path = try allocator.dupe(u8, root_buffer[0..root_length]);
+        errdefer allocator.free(root_path);
+        const source_name = try allocator.dupe(u8, source_path);
+        errdefer allocator.free(source_name);
+        const target_name = try allocator.dupe(u8, target_path);
+        errdefer allocator.free(target_name);
+        var source = try root.pinRegularFile(try root_fs.Path.init(source_name));
+        errdefer source.close();
+        var target = try root.pinRegularFile(try root_fs.Path.init(target_name));
+        errdefer target.close();
+        var result: HelperMount = .{
+            .allocator = allocator,
+            .root_path = root_path,
+            .evidence = .{
+                .source_path = source_name,
+                .target_path = target_name,
+                .sha256 = expected_sha256,
+            },
+            .source = source,
+            .target = target,
+        };
+        try result.verify(allocator);
+        return result;
+    }
+
+    pub fn verify(self: *const HelperMount, allocator: std.mem.Allocator) !void {
+        const observed = try self.source.observeAlloc(allocator, 32 * 1024 * 1024);
+        defer allocator.free(observed.bytes);
+        if (observed.entry.mode & 0o111 == 0) return error.HelperNotExecutable;
+        var sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(observed.bytes, &sha256, .{});
+        if (!std.mem.eql(u8, &sha256, &self.evidence.sha256))
+            return error.HelperDigestMismatch;
+        _ = try self.target.metadata();
+    }
+
+    pub fn deinit(self: *HelperMount) void {
+        self.source.close();
+        self.target.close();
+        self.allocator.free(self.root_path);
+        self.allocator.free(self.evidence.source_path);
+        self.allocator.free(self.evidence.target_path);
+        self.* = undefined;
+    }
+};
+
 pub const Request = struct {
     /// Absolute canonical path of the selected root.
     root: []const u8,
@@ -119,6 +191,7 @@ pub const Request = struct {
     arguments: []const []const u8 = &.{},
     variables: []const Variable = &.{},
     policy: Policy = .{},
+    helper_mount: ?*const HelperMount = null,
 };
 
 pub const Isolation = enum {
@@ -156,7 +229,7 @@ pub const SetupStage = enum {
     session,
     /// Child stdin/stdout/stderr installation failed.
     standard_streams,
-    /// chroot-equivalent root entry failed.
+    /// Root entry or private helper namespace setup failed.
     root_isolation,
     working_directory,
     /// `execve` of the script failed.
@@ -256,6 +329,7 @@ pub const Invocation = struct {
     descendants: DescendantPolicy,
     limits: Limits,
     cancellation: Cancellation,
+    helper_mount: ?*const HelperMount = null,
 };
 
 pub const Execution = struct {
@@ -334,6 +408,7 @@ pub const Report = struct {
     /// descendant policy. It never claims that descendants existed.
     issued_descendant_sweep: bool,
     evidence: Evidence,
+    helper: ?HelperEvidence = null,
 
     pub fn succeeded(self: Report) bool {
         return switch (self.outcome) {
@@ -374,6 +449,11 @@ pub fn run(
     const argv = try buildArgv(arena, program, owned.arguments);
     const environment = try buildEnvironment(arena, owned);
     const evidence_base = digests(owned, isolation, argv, environment);
+    const helper: ?HelperEvidence = if (owned.helper_mount) |mount| .{
+        .source_path = try arena.dupe(u8, mount.evidence.source_path),
+        .target_path = try arena.dupe(u8, mount.evidence.target_path),
+        .sha256 = mount.evidence.sha256,
+    } else null;
 
     if (validate(owned)) |reason| {
         return .{
@@ -397,6 +477,7 @@ pub fn run(
             .escalated_to_kill = false,
             .issued_descendant_sweep = false,
             .evidence = evidenceWithOutput(evidence_base, "", "", ""),
+            .helper = helper,
         };
     }
 
@@ -410,6 +491,7 @@ pub fn run(
         .descendants = owned.policy.descendants,
         .limits = owned.policy.limits,
         .cancellation = dependencies.cancellation,
+        .helper_mount = owned.helper_mount,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => Execution{ .outcome = .{ .setup_failed = .{ .stage = .launcher } } },
@@ -446,6 +528,7 @@ pub fn run(
             captured_stderr,
             captured_combined,
         ),
+        .helper = helper,
     };
 }
 
@@ -453,6 +536,10 @@ pub fn run(
 pub fn validate(request: Request) ?RejectionReason {
     const policy = request.policy;
     if (!absolute_path.root(request.root)) return .invalid_root;
+    if (request.helper_mount) |mount| {
+        if (!std.mem.eql(u8, request.root, mount.root_path))
+            return .invalid_root;
+    }
     if (std.mem.eql(u8, request.root, "/") and !policy.allow_host_root) return .host_root_denied;
 
     if (policy.limits.timeout_ms == 0) return .invalid_timeout;
@@ -543,6 +630,7 @@ fn cloneRequest(arena: std.mem.Allocator, request: Request) !Request {
         .arguments = arguments,
         .variables = variables,
         .policy = request.policy,
+        .helper_mount = request.helper_mount,
     };
 }
 
@@ -609,6 +697,12 @@ fn digests(
     hash.update(&argv_sha256);
     hash.update(&environment_sha256);
     hash.update(&policy_sha256);
+    if (request.helper_mount) |mount| {
+        hash.update("debz-maintainer-script-helper-mount-v1\x00");
+        hashString(&hash, mount.evidence.source_path);
+        hashString(&hash, mount.evidence.target_path);
+        hash.update(&mount.evidence.sha256);
+    }
     return .{
         .script_sha256 = request.identity.script_sha256,
         .argv_sha256 = argv_sha256,
@@ -750,6 +844,27 @@ pub const SystemLauncher = struct {
     ) anyerror!Execution {
         return launch(allocator, invocation);
     }
+
+    /// Exercises the complete helper/root setup without entering a script.
+    /// Native callers require an exited-zero result before package mutation.
+    pub fn probeHelper(
+        allocator: std.mem.Allocator,
+        mount: *const HelperMount,
+        cancellation: Cancellation,
+    ) !Execution {
+        return launchConfigured(allocator, .{
+            .root = mount.root_path,
+            .isolation = if (std.mem.eql(u8, mount.root_path, "/")) .host_root else .chroot,
+            .program = "/",
+            .argv = &.{"/"},
+            .environment = &.{},
+            .capture = .separate,
+            .descendants = .terminate,
+            .limits = .{ .timeout_ms = 5_000 },
+            .cancellation = cancellation,
+            .helper_mount = mount,
+        }, true);
+    }
 };
 
 const linux = std.os.linux;
@@ -757,10 +872,30 @@ const linux = std.os.linux;
 const child_status_bytes = 5;
 
 fn launch(allocator: std.mem.Allocator, invocation: Invocation) !Execution {
+    return launchConfigured(allocator, invocation, false);
+}
+
+fn launchConfigured(
+    allocator: std.mem.Allocator,
+    invocation: Invocation,
+    setup_only: bool,
+) !Execution {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
     var strings: Strings = try .init(allocator, invocation);
     defer strings.deinit(allocator);
+    var helper: HelperDescriptors = .{};
+    defer helper.close();
+    if (invocation.helper_mount) |mount| {
+        if (!std.mem.eql(u8, invocation.root, mount.root_path))
+            return error.InvalidHelperRoot;
+        try mount.verify(allocator);
+        const prepared = helper.prepare(mount);
+        if (prepared != .SUCCESS)
+            return setupFailure(.launcher, @intFromEnum(prepared));
+        _ = try mount.source.metadata();
+        _ = try mount.target.metadata();
+    }
 
     var output_pipe: [2]i32 = .{ -1, -1 };
     var error_pipe: [2]i32 = .{ -1, -1 };
@@ -804,6 +939,10 @@ fn launch(allocator: std.mem.Allocator, invocation: Invocation) !Execution {
         .error_read = if (separate) error_pipe[0] else output_pipe[0],
         .status_write = status_pipe[1],
         .status_read = status_pipe[0],
+        .helper = if (invocation.helper_mount != null) helper else null,
+        .helper_source = strings.helper_source,
+        .helper_target = strings.helper_target,
+        .setup_only = setup_only,
     };
 
     const forked = linux.fork();
@@ -840,12 +979,24 @@ const Strings = struct {
     envp: [:null]?[*:0]const u8,
     argv_storage: [][:0]u8,
     envp_storage: [][:0]u8,
+    helper_source: ?[:0]u8,
+    helper_target: ?[:0]u8,
 
     fn init(allocator: std.mem.Allocator, invocation: Invocation) !Strings {
         const root = try allocator.dupeZ(u8, invocation.root);
         errdefer allocator.free(root);
         const program = try allocator.dupeZ(u8, invocation.program);
         errdefer allocator.free(program);
+        const helper_source = if (invocation.helper_mount) |mount|
+            try allocator.dupeZ(u8, mount.evidence.source_path)
+        else
+            null;
+        errdefer if (helper_source) |path| allocator.free(path);
+        const helper_target = if (invocation.helper_mount) |mount|
+            try allocator.dupeZ(u8, mount.evidence.target_path)
+        else
+            null;
+        errdefer if (helper_target) |path| allocator.free(path);
 
         const argv_storage = try allocator.alloc([:0]u8, invocation.argv.len);
         errdefer allocator.free(argv_storage);
@@ -884,6 +1035,8 @@ const Strings = struct {
             .envp = envp,
             .argv_storage = argv_storage,
             .envp_storage = envp_storage,
+            .helper_source = helper_source,
+            .helper_target = helper_target,
         };
     }
 
@@ -896,7 +1049,48 @@ const Strings = struct {
         allocator.free(self.envp);
         allocator.free(self.program);
         allocator.free(self.root);
+        if (self.helper_source) |path| allocator.free(path);
+        if (self.helper_target) |path| allocator.free(path);
         self.* = undefined;
+    }
+};
+
+const HelperDescriptors = struct {
+    root: i32 = -1,
+    source: i32 = -1,
+    target: i32 = -1,
+    root_stat: linux.Statx = undefined,
+    source_stat: linux.Statx = undefined,
+    target_stat: linux.Statx = undefined,
+
+    fn prepare(self: *HelperDescriptors, mount: *const HelperMount) linux.E {
+        const originals = [_]i32{
+            mount.source.root.dir.handle,
+            mount.source.file.handle,
+            mount.target.file.handle,
+        };
+        const copies = [_]*i32{ &self.root, &self.source, &self.target };
+        const metadata = [_]*linux.Statx{ &self.root_stat, &self.source_stat, &self.target_stat };
+        for (originals, copies, metadata) |original, copy, captured| {
+            while (true) {
+                const rc = linux.fcntl(original, linux.F.DUPFD_CLOEXEC, 3);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => copy.* = @intCast(rc),
+                    .INTR => continue,
+                    else => |err| return err,
+                }
+                break;
+            }
+            const observed = helperStat(copy.*, captured);
+            if (observed != .SUCCESS) return observed;
+        }
+        return .SUCCESS;
+    }
+
+    fn close(self: *HelperDescriptors) void {
+        closeFd(&self.root);
+        closeFd(&self.source);
+        closeFd(&self.target);
     }
 };
 
@@ -913,6 +1107,10 @@ const ChildDescriptor = struct {
     error_read: i32,
     status_write: i32,
     status_read: i32,
+    helper: ?HelperDescriptors = null,
+    helper_source: ?[:0]const u8 = null,
+    helper_target: ?[:0]const u8 = null,
+    setup_only: bool = false,
 };
 
 /// Child half of the fork. Only async-signal-safe raw syscalls run here; no
@@ -968,11 +1166,21 @@ fn childMain(child: ChildDescriptor) noreturn {
         _ = linux.sigaction(signal, &action, null);
     }
 
+    var helper_root: i32 = -1;
+    if (child.helper != null) {
+        const exposed = exposeHelper(child);
+        if (exposed.err != .SUCCESS)
+            childFail(streams.status, .root_isolation, exposed.err);
+        helper_root = exposed.root;
+    }
     switch (child.isolation) {
         .chroot => {
             // chdir first so the chroot target and the post-chroot working
             // directory cannot be raced through the inherited cwd.
-            const entered = linux.errno(linux.chdir(child.root.ptr));
+            const entered = linux.errno(if (helper_root >= 0)
+                linux.fchdir(helper_root)
+            else
+                linux.chdir(child.root.ptr));
             if (entered != .SUCCESS) childFail(streams.status, .working_directory, entered);
             const isolated = linux.errno(linux.chroot("."));
             if (isolated != .SUCCESS) childFail(streams.status, .root_isolation, isolated);
@@ -981,9 +1189,124 @@ fn childMain(child: ChildDescriptor) noreturn {
     }
     const working = linux.errno(linux.chdir("/"));
     if (working != .SUCCESS) childFail(streams.status, .working_directory, working);
+    if (helper_root >= 0) _ = linux.close(helper_root);
+    if (child.setup_only) linux.exit(0);
 
     const executed = linux.errno(linux.execve(child.program.ptr, child.argv, child.envp));
     childFail(streams.status, .execute, executed);
+}
+
+const HelperExposure = struct { root: i32 = -1, err: linux.E = .SUCCESS };
+const MountOpenHow = extern struct { flags: u64, mode: u64 = 0, resolve: u64 };
+
+fn helperStat(fd: i32, metadata: *linux.Statx) linux.E {
+    const result = linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .BASIC_STATS, metadata));
+    if (result != .SUCCESS) return result;
+    const required: linux.STATX = .{
+        .TYPE = true,
+        .MODE = true,
+        .NLINK = true,
+        .UID = true,
+        .GID = true,
+        .MTIME = true,
+        .CTIME = true,
+        .INO = true,
+        .SIZE = true,
+    };
+    const bits: u32 = @bitCast(required);
+    if (@as(u32, @bitCast(metadata.mask)) & bits != bits) return .OPNOTSUPP;
+    return .SUCCESS;
+}
+
+fn reopenMountPath(
+    dirfd: i32,
+    path: [*:0]const u8,
+    expected: linux.Statx,
+    directory: bool,
+) HelperExposure {
+    const flags: linux.O = .{ .PATH = true, .CLOEXEC = true, .DIRECTORY = directory };
+    const how: MountOpenHow = .{
+        .flags = @as(u32, @bitCast(flags)),
+        // No magic links or symlinks; relative paths must remain below root.
+        .resolve = 0x02 | 0x04 | @as(u64, if (directory) 0 else 0x08),
+    };
+    const opened = linux.syscall4(
+        .openat2,
+        @bitCast(@as(isize, dirfd)),
+        @intFromPtr(path),
+        @intFromPtr(&how),
+        @sizeOf(MountOpenHow),
+    );
+    const opened_error = linux.errno(opened);
+    if (opened_error != .SUCCESS) return .{ .err = opened_error };
+    const fd: i32 = @intCast(opened);
+    var observed: linux.Statx = undefined;
+    const metadata_error = helperStat(fd, &observed);
+    if (metadata_error != .SUCCESS) {
+        _ = linux.close(fd);
+        return .{ .err = metadata_error };
+    }
+    if (observed.dev_major != expected.dev_major or observed.dev_minor != expected.dev_minor or
+        observed.ino != expected.ino or observed.mode != expected.mode or
+        observed.uid != expected.uid or observed.gid != expected.gid or (!directory and
+        (observed.size != expected.size or
+            observed.nlink != expected.nlink or
+            observed.mtime.sec != expected.mtime.sec or observed.mtime.nsec != expected.mtime.nsec or
+            observed.ctime.sec != expected.ctime.sec or observed.ctime.nsec != expected.ctime.nsec)))
+    {
+        _ = linux.close(fd);
+        return .{ .err = .STALE };
+    }
+    return .{ .root = fd };
+}
+
+fn exposeHelper(child: ChildDescriptor) HelperExposure {
+    const helper = child.helper.?;
+    const unshared = linux.errno(linux.unshare(linux.CLONE.NEWNS));
+    if (unshared != .SUCCESS) return .{ .err = unshared };
+    const isolated = linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
+    if (isolated != .SUCCESS) return .{ .err = isolated };
+
+    // FDs opened before unshare still refer to the old mount tree. Reopen in
+    // the private tree without following links, then match the pinned inodes.
+    const root = reopenMountPath(linux.AT.FDCWD, child.root, helper.root_stat, true);
+    if (root.err != .SUCCESS) return root;
+    var retain_root = false;
+    defer if (!retain_root) {
+        _ = linux.close(root.root);
+    };
+    const source = reopenMountPath(root.root, child.helper_source.?, helper.source_stat, false);
+    if (source.err != .SUCCESS) return source;
+    defer _ = linux.close(source.root);
+    const target = reopenMountPath(root.root, child.helper_target.?, helper.target_stat, false);
+    if (target.err != .SUCCESS) return target;
+    defer _ = linux.close(target.root);
+
+    const opened = live_root.cloneMountDescriptor(source.root, false);
+    const opened_error = linux.errno(opened);
+    if (opened_error != .SUCCESS) return .{ .err = opened_error };
+    const tree: i32 = @intCast(opened);
+    defer _ = linux.close(tree);
+    // Read-only, nosuid and nodev, but executable even if staging is noexec.
+    const attributes: live_root.MountAttribute = .{
+        .attr_set = 1 | 2 | 4,
+        .attr_clear = 8,
+        .propagation = 0,
+    };
+    const protected = linux.errno(live_root.setMountAttributes(tree, false, &attributes));
+    if (protected != .SUCCESS) return .{ .err = protected };
+    const moved = linux.errno(linux.move_mount(tree, "", target.root, "", .{
+        .F_SYMLINKS = false,
+        .F_AUTOMOUNTS = false,
+        .F_EMPTY_PATH = true,
+        .T_SYMLINKS = false,
+        .T_AUTOMOUNTS = false,
+        .T_EMPTY_PATH = true,
+        .SET_GROUP = false,
+    }));
+    if (moved != .SUCCESS) return .{ .err = moved };
+    retain_root = true;
+    return root;
 }
 
 const ChildStreams = struct {
@@ -2510,4 +2833,150 @@ test "maintainer_script.test.system launcher enters the alternate root before ex
     defer host_report.deinit();
     try testing.expectEqual(Isolation.host_root, host_report.isolation);
     try testing.expectEqual(@as(u8, 0), host_report.outcome.exited);
+}
+
+test "maintainer_script.test.helper binding rejects changed source and target" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try writeExecutableScript(&directory, "source", "native-helper");
+    try writeExecutableScript(&directory, "target", "original-helper");
+    const root = root_fs.Root.init(testing.io, directory.dir);
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("native-helper", &sha256, .{});
+    try testing.expectError(
+        error.HelperDigestMismatch,
+        HelperMount.init(testing.allocator, root, "source", "target", @splat(0)),
+    );
+    var mount = try HelperMount.init(testing.allocator, root, "source", "target", sha256);
+    defer mount.deinit();
+    try mount.verify(testing.allocator);
+    try writeExecutableScript(&directory, "target", "externally-changed-target");
+    try testing.expectError(error.PathChanged, mount.verify(testing.allocator));
+}
+
+test "maintainer_script.test.helper identity is bound without changing the environment" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try writeExecutableScript(&directory, "source", "native-helper");
+    try writeExecutableScript(&directory, "target", "original-helper");
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("native-helper", &sha256, .{});
+    var mount = try HelperMount.init(
+        testing.allocator,
+        root_fs.Root.init(testing.io, directory.dir),
+        "source",
+        "target",
+        sha256,
+    );
+    defer mount.deinit();
+    var recorder: RecordingLauncher = .{};
+    var request = testRequest();
+    request.root = mount.root_path;
+    var original = try run(testing.allocator, request, .{ .launcher = recorder.interface() });
+    defer original.deinit();
+    request.helper_mount = &mount;
+    var bound = try run(testing.allocator, request, .{ .launcher = recorder.interface() });
+    defer bound.deinit();
+    try testing.expect(!std.mem.eql(u8, &original.evidence.invocation_sha256, &bound.evidence.invocation_sha256));
+    try testing.expectEqualSlices(u8, &original.evidence.environment_sha256, &bound.evidence.environment_sha256);
+    try testing.expectEqualStrings("source", bound.helper.?.source_path);
+    try testing.expectEqualSlices(u8, &sha256, &bound.helper.?.sha256);
+    request.root = "/different-root";
+    try testing.expectEqual(RejectionReason.invalid_root, validate(request).?);
+}
+
+test "maintainer_script.test.private helper namespace preserves target bytes" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    const native_body = "#!/bin/sh\nprintf 'native-helper\\n'\n";
+    const original_body = "#!/bin/sh\nprintf 'original-helper\\n'\n";
+    try writeExecutableScript(&directory, "helper", native_body);
+    try writeExecutableScript(&directory, "bin/dpkg-trigger", original_body);
+    const source = try absoluteTempPath(testing.allocator, &directory, "helper");
+    defer testing.allocator.free(source);
+    const target = try absoluteTempPath(testing.allocator, &directory, "bin/dpkg-trigger");
+    defer testing.allocator.free(target);
+    var host = try root_fs.openAbsoluteRoot(testing.io, "/");
+    defer host.close();
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(native_body, &sha256, .{});
+    var mount = try HelperMount.init(testing.allocator, host.root, source[1..], target[1..], sha256);
+    defer mount.deinit();
+    var probe = try SystemLauncher.probeHelper(testing.allocator, &mount, Cancellation.never());
+    defer probe.deinit(testing.allocator);
+    switch (probe.outcome) {
+        .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+        .setup_failed => |failure| {
+            try testing.expectEqual(SetupStage.root_isolation, failure.stage);
+            try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
+            if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+                return error.NativeHelperNamespaceRequired;
+            try mount.verify(testing.allocator);
+            return;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\"$2" || exit 81
+        \\PATH="${2%/*}:$PATH"
+        \\export PATH
+        \\dpkg-trigger || exit 82
+        \\if (printf 'changed\n' > "$2") 2>/dev/null; then exit 83; fi
+        \\
+    );
+    defer script.deinit(testing.allocator);
+    var request = script.request(&.{ "configure", target });
+    request.helper_mount = &mount;
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    try testing.expect(report.succeeded());
+    try testing.expectEqualStrings("native-helper\nnative-helper\n", report.stdout);
+    try mount.verify(testing.allocator);
+    const actual = try mount.target.observeAlloc(testing.allocator, 1024);
+    defer testing.allocator.free(actual.bytes);
+    try testing.expectEqualStrings(original_body, actual.bytes);
+}
+
+test "maintainer_script.test.helper namespace retains alternate-root isolation" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    const helper_body = "#!/bin/sh\nexit 0\n";
+    try writeExecutableScript(&directory, "var/lib/debz/helper", helper_body);
+    try writeExecutableScript(&directory, "usr/bin/dpkg-trigger", "original");
+    try writeExecutableScript(&directory, "var/lib/dpkg/info/demo.postinst", helper_body);
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(helper_body, &sha256, .{});
+    var mount = try HelperMount.init(
+        testing.allocator,
+        root_fs.Root.init(testing.io, directory.dir),
+        "var/lib/debz/helper",
+        "usr/bin/dpkg-trigger",
+        sha256,
+    );
+    defer mount.deinit();
+    var request = testRequest();
+    request.root = mount.root_path;
+    request.helper_mount = &mount;
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    switch (report.outcome) {
+        .setup_failed => |failure| switch (failure.stage) {
+            .root_isolation => {
+                try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
+                if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+                    return error.NativeHelperNamespaceRequired;
+            },
+            .execute => try testing.expectEqual(@intFromEnum(linux.E.NOENT), failure.errno),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try mount.verify(testing.allocator);
 }

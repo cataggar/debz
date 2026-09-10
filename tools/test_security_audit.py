@@ -201,7 +201,11 @@ class SecurityAuditTests(unittest.TestCase):
                 text,
             )
         )
-        self.assertEqual(["src/live_root.zig"], namespace_owners)
+        self.assertEqual(["src/live_root.zig", "src/maintainer_script.zig"], namespace_owners)
+        self.assertIn("linux.unshare(linux.CLONE.NEWNS)", runner)
+        self.assertIn("live_root.cloneMountDescriptor(", runner)
+        self.assertIn("live_root.setMountAttributes(", runner)
+        self.assertIn("linux.move_mount(", runner)
 
     def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
         self.assertEqual(
