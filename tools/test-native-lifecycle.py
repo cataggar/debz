@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -81,6 +82,26 @@ fi
 exit 0
 """.encode()
     return result
+
+
+def rewrite_database_field(script: bytes, package: str, before: str, after: str) -> bytes:
+    return script.removesuffix(b"exit 0\n") + f"""
+status=''
+selected=no
+while IFS= read -r line; do
+    case "$line" in
+        {shlex.quote("Package: " + package)}) selected=yes ;;
+        'Package: '*) selected=no ;;
+    esac
+    if [ "$selected" = yes ] && [ "$line" = {shlex.quote(before)} ]; then
+        line={shlex.quote(after)}
+    fi
+    status="$status$line
+"
+done < /var/lib/dpkg/status
+printf '%s' "$status" > /var/lib/dpkg/status
+exit 0
+""".encode()
 
 
 def reference_phase(
@@ -588,24 +609,8 @@ def exercise(
             package=unrelated,
         )
         changed_database_scripts = scripts(m.PACKAGE, "1")
-        changed_database_scripts["postinst"] = (
-            changed_database_scripts["postinst"].removesuffix(b"exit 0\n") + f"""
-status=''
-selected=no
-while IFS= read -r line; do
-    case "$line" in
-        'Package: {unrelated}') selected=yes ;;
-        'Package: '*) selected=no ;;
-    esac
-    if [ "$selected" = yes ] && [ "$line" = 'Version: 1' ]; then
-        line='Version: 9'
-    fi
-    status="$status$line
-"
-done < /var/lib/dpkg/status
-printf '%s' "$status" > /var/lib/dpkg/status
-exit 0
-""".encode()
+        changed_database_scripts["postinst"] = rewrite_database_field(
+            changed_database_scripts["postinst"], unrelated, "Version: 1", "Version: 9",
         )
         changed_database_archive = m.make_package(
             workspace / "packages/changed-database", environment, architecture, "1",

@@ -178,6 +178,23 @@ class NativeDifferentialTests(unittest.TestCase):
             "trigger-await",
             "trigger-noawait",
             "trigger-failure",
+            "trigger-interest-half-configured",
+            "trigger-interest-pending-recorded",
+            "trigger-interest-pending-without-authority",
+            "trigger-cycle-no-progress",
+            "trigger-deferred-await-matrix",
+            "trigger-default-await-aliases",
+            "trigger-existing-unincorporated-queue",
+            "trigger-named-file-order",
+            "trigger-file-lifecycle",
+            "trigger-new-handler-batch-order",
+            "trigger-script-activation-coalesces",
+            "trigger-script-activation-deferred",
+            "trigger-postrm-activation",
+            "trigger-dynamic-chain",
+            "trigger-script-outcome-unknown",
+            "trigger-malformed-unincorporated-queue",
+            "trigger-deferred-unrelated-selection-change",
             "archive-application-model",
             "archive-checksum-verification",
             "archive-unsupported-feature",
@@ -267,6 +284,18 @@ class NativeDifferentialTests(unittest.TestCase):
             "unpack-native-selection-unavailable",
         }
         self.assertEqual(set(), inventory - scenarios.keys())
+        self.assertEqual("failure", scenarios["trigger-failure"]["expected"])
+        self.assertEqual(
+            "recovery-required", scenarios["trigger-script-outcome-unknown"]["expected"],
+        )
+        self.assertEqual("success", scenarios["trigger-interest-pending-recorded"]["expected"])
+        self.assertEqual(
+            ["process_triggers"], scenarios["trigger-interest-pending-recorded"]["operations"],
+        )
+        self.assertEqual(
+            "failure-before-mutation",
+            scenarios["trigger-interest-pending-without-authority"]["expected"],
+        )
 
         invalid = json.loads(json.dumps(corpus))
         invalid["scenarios"][0]["typo"] = True

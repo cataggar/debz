@@ -19,6 +19,7 @@
     "exact_lock",
     "policy",
     "actions",
+    "trigger_authority",
     "final_state",
     "final_state_sha256",
     "digest_sha256"
@@ -43,8 +44,13 @@
     "policy": { "$ref": "#/$defs/policy" },
     "actions": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/action" }
+    },
+    "trigger_authority": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/triggerAuthority" }
+      ]
     },
     "final_state": {
       "type": "array",
@@ -157,16 +163,121 @@
         }
       }
     },
+    "triggerHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "source", "postinst_sha256", "declarations_sha256"],
+      "properties": {
+        "package": { "$ref": "#/$defs/identity" },
+        "source": { "enum": ["installed_package", "new_package"] },
+        "postinst_sha256": { "$ref": "#/$defs/sha256" },
+        "declarations_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "triggerCaller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "source", "kind", "script_sha256"],
+      "properties": {
+        "package": { "$ref": "#/$defs/identity" },
+        "source": { "enum": ["installed_package", "new_package"] },
+        "kind": { "enum": ["preinst", "postinst", "prerm", "postrm"] },
+        "script_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "triggerAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "defer_triggers",
+        "initial_state_sha256",
+        "handlers",
+        "callers",
+        "allowed_triggers",
+        "maximum_invocations",
+        "final_mode",
+        "base_final_state_sha256",
+        "maximum_activations"
+      ],
+      "properties": {
+        "mode": { "enum": ["transaction", "process_pending"] },
+        "defer_triggers": { "type": "boolean" },
+        "initial_state_sha256": { "$ref": "#/$defs/sha256" },
+        "handlers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/triggerHandler" }
+        },
+        "callers": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/triggerCaller" }
+        },
+        "allowed_triggers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "maximum_invocations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "final_mode": {
+          "enum": ["exact", "derive_from_activations"]
+        },
+        "base_final_state_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        },
+        "maximum_activations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        }
+      }
+    },
     "finalPackage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "architecture", "state", "dpkg_selection_hold"],
+      "required": [
+        "name",
+        "version",
+        "architecture",
+        "state",
+        "dpkg_selection_hold",
+        "triggers_pending",
+        "triggers_awaited"
+      ],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "version": { "type": "string", "minLength": 1 },
         "architecture": { "type": "string", "minLength": 1 },
-        "state": { "enum": ["installed", "config_files"] },
-        "dpkg_selection_hold": { "type": "boolean" }
+        "state": {
+          "enum": [
+            "installed",
+            "config_files",
+            "triggers_pending",
+            "triggers_awaited"
+          ]
+        },
+        "dpkg_selection_hold": { "type": "boolean" },
+        "triggers_pending": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "triggers_awaited": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "type": "string", "minLength": 1 }
+        }
       }
     }
   }

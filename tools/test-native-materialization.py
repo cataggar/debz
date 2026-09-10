@@ -70,6 +70,7 @@ def make_package(
     control_fields: dict[str, str] | None = None,
     prepare_payload: Callable[[Path], None] | None = None,
     compression: str = "gzip",
+    triggers: bytes | None = None,
 ) -> Path:
     if compression not in ("gzip", "none"):
         raise ValueError(f"unsupported fixture compression: {compression}")
@@ -117,6 +118,8 @@ def make_package(
         if name not in ("preinst", "postinst", "prerm", "postrm"):
             raise ValueError(f"unsupported maintainer-script fixture: {name}")
         write(source / "DEBIAN" / name, content, 0o755)
+    if triggers is not None:
+        write(source / "DEBIAN/triggers", triggers)
     if prepare_payload is not None:
         prepare_payload(source)
 

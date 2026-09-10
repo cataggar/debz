@@ -893,12 +893,74 @@ const Builder = struct {
             const interests = try database.writeTriggerInterests(self.arena, self.triggers.interests);
             var interests_digest: [32]u8 = undefined;
             Sha256.hash(interests, &interests_digest, .{});
+            var has_file_interest = false;
+            for (self.triggers.interests) |interest| {
+                if (interest.trigger.len != 0 and interest.trigger[0] == '/')
+                    has_file_interest = true;
+            }
             try ordered.append(self.scratch, .{
                 .path = database.triggers_file_path,
-                .kind = .replace,
+                .kind = if (has_file_interest) .replace else .remove,
                 .bytes = interests,
                 .sha256 = interests_digest,
             });
+            var old_named: std.ArrayList([]const u8) = .empty;
+            defer old_named.deinit(self.scratch);
+            var new_named: std.ArrayList([]const u8) = .empty;
+            defer new_named.deinit(self.scratch);
+            for (self.base.triggers.interests) |interest| {
+                if (interest.trigger.len != 0 and interest.trigger[0] != '/')
+                    try old_named.append(self.scratch, interest.trigger);
+            }
+            for (self.triggers.interests) |interest| {
+                if (interest.trigger.len != 0 and interest.trigger[0] != '/')
+                    try new_named.append(self.scratch, interest.trigger);
+            }
+            std.mem.sort([]const u8, old_named.items, {}, lessText);
+            std.mem.sort([]const u8, new_named.items, {}, lessText);
+            var previous: ?[]const u8 = null;
+            for (old_named.items) |name| {
+                if (previous) |value| {
+                    if (std.mem.eql(u8, value, name)) continue;
+                }
+                previous = name;
+                var retained = false;
+                for (new_named.items) |candidate| {
+                    if (std.mem.eql(u8, candidate, name)) retained = true;
+                }
+                if (!retained) try ordered.append(self.scratch, .{
+                    .path = try std.fmt.allocPrint(
+                        self.arena,
+                        "{s}/{s}",
+                        .{ database.triggers_directory, name },
+                    ),
+                    .kind = .remove,
+                });
+            }
+            previous = null;
+            for (new_named.items) |name| {
+                if (previous) |value| {
+                    if (std.mem.eql(u8, value, name)) continue;
+                }
+                previous = name;
+                const bytes = try database.writeNamedTriggerInterests(
+                    self.arena,
+                    name,
+                    self.triggers.interests,
+                );
+                var digest: [32]u8 = undefined;
+                Sha256.hash(bytes, &digest, .{});
+                try ordered.append(self.scratch, .{
+                    .path = try std.fmt.allocPrint(
+                        self.arena,
+                        "{s}/{s}",
+                        .{ database.triggers_directory, name },
+                    ),
+                    .kind = .replace,
+                    .bytes = bytes,
+                    .sha256 = digest,
+                });
+            }
             const pending = try database.writePendingTriggers(self.arena, self.triggers.pending);
             var pending_digest: [32]u8 = undefined;
             Sha256.hash(pending, &pending_digest, .{});
@@ -987,6 +1049,10 @@ fn isScriptPath(path: []const u8) bool {
 
 fn lessWrite(_: void, left: PlannedWrite, right: PlannedWrite) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
+}
+
+fn lessText(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
 }
 
 fn planDigest(base: database.Generation, writes: []const PlannedWrite) [32]u8 {
@@ -1130,6 +1196,7 @@ const SimulatedRoot = struct {
     triggers_unincorp: ?[]const u8 = null,
     status_target: ?[]const u8 = null,
     info: std.ArrayList(database.InfoEntry) = .empty,
+    triggers_named: std.ArrayList(database.NamedTriggerEntry) = .empty,
 
     fn init(allocator: std.mem.Allocator, source: database.Snapshot) !SimulatedRoot {
         var root: SimulatedRoot = .{
@@ -1141,6 +1208,10 @@ const SimulatedRoot = struct {
             .triggers_unincorp = if (source.triggers_unincorp) |entry| entry.bytes else null,
         };
         try root.info.appendSlice(root.arena.allocator(), source.info);
+        try root.triggers_named.appendSlice(
+            root.arena.allocator(),
+            source.triggers_named,
+        );
         return root;
     }
 
@@ -1151,6 +1222,13 @@ const SimulatedRoot = struct {
 
     fn find(self: *SimulatedRoot, name: []const u8) ?usize {
         for (self.info.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.name, name)) return index;
+        }
+        return null;
+    }
+
+    fn findNamedTrigger(self: *SimulatedRoot, name: []const u8) ?usize {
+        for (self.triggers_named.items, 0..) |entry, index| {
             if (std.mem.eql(u8, entry.name, name)) return index;
         }
         return null;
@@ -1188,6 +1266,37 @@ const SimulatedRoot = struct {
                 self.status_old = try allocator.dupe(u8, self.status);
                 continue;
             }
+            if (std.mem.startsWith(
+                u8,
+                write.path,
+                database.triggers_directory ++ "/",
+            ) and
+                !std.mem.eql(u8, write.path, database.triggers_file_path) and
+                !std.mem.eql(u8, write.path, database.triggers_unincorp_path))
+            {
+                const name = write.path[database.triggers_directory.len + 1 ..];
+                const existing = self.findNamedTrigger(name);
+                switch (write.kind) {
+                    .remove => {
+                        if (existing) |index| _ =
+                            self.triggers_named.orderedRemove(index);
+                    },
+                    .replace => {
+                        const entry: database.NamedTriggerEntry = .{
+                            .name = try allocator.dupe(u8, name),
+                            .bytes = try allocator.dupe(u8, write.bytes),
+                            .mode = write.mode,
+                        };
+                        if (existing) |index| {
+                            self.triggers_named.items[index] = entry;
+                        } else {
+                            try self.triggers_named.append(allocator, entry);
+                        }
+                    },
+                    .copy => return error.TestUnexpectedResult,
+                }
+                continue;
+            }
             const target: *?[]const u8 = if (std.mem.eql(u8, write.path, database.arch_path))
                 &self.arch
             else if (std.mem.eql(u8, write.path, database.triggers_file_path))
@@ -1211,6 +1320,7 @@ const SimulatedRoot = struct {
             .arch = database.optionalRegularFile(self.arch),
             .triggers_file = database.optionalRegularFile(self.triggers_file),
             .triggers_unincorp = database.optionalRegularFile(self.triggers_unincorp),
+            .triggers_named = self.triggers_named.items,
             .info = self.info.items,
         };
     }
@@ -1810,7 +1920,7 @@ test "package_database_changes.test.staged trigger state cannot publish an unimp
 
     const repeated_packages = [_]database.PendingPackage{
         .{ .package = toolz, .await_mode = .awaited },
-        .{ .package = toolz, .await_mode = .noawait },
+        .{ .package = toolz, .await_mode = .awaited },
     };
     const repeated_package_pending = [_]database.PendingTrigger{
         .{ .trigger = "/usr/share/toolz", .packages = &repeated_packages },

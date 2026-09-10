@@ -14,7 +14,7 @@ The layer does two things and nothing else:
 
 Neither module opens, reads, or writes a file. Callers supply a captured
 `Snapshot` in which every consumed file - `status`, `status-old`, `arch`,
-`diversions`, `statoverride`, both trigger files, every `info` entry, and every
+`diversions`, `statoverride`, shared and named trigger files, every `info` entry, and every
 `updates` fragment - carries the bytes plus the entry kind and mode the reader
 observed. The returned `Plan` is a complete list of file intents that owns its
 own bytes, so a caller mutating or freeing its buffers afterwards cannot change
@@ -43,8 +43,9 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |
 | `info/*` (other) | Retained as opaque evidence (owner, mode, size, SHA-256). Names must still be package qualified. |
-| `triggers/File` | File-trigger interests, including dpkg's `/`-prefixed noawait spelling. |
-| `triggers/Unincorp` | Deferred activations and their awaiting packages. |
+| `triggers/File` | File-trigger interests with `package` or `package/noawait` listeners. |
+| `triggers/<name>` | Named interests with the same listener grammar; each bounded regular file contributes generation evidence. |
+| `triggers/Unincorp` | Deferred activations with ordered awaiting-package tokens and explicit `-` no-await markers. |
 | `diversions` | Complete three-line records typed; malformed records fail. |
 | `statoverride` | Bounded user, group, mode, and path records typed; malformed records fail. |
 
@@ -56,6 +57,12 @@ siblings with differing versions remain invalid.
 Info file names must be `package.suffix` or `package:architecture.suffix` and
 must resolve to exactly one status record. Unqualified names that match more
 than one instance are ambiguous and rejected rather than guessed.
+
+The shared `triggers/Lock` is synchronization infrastructure, not a named
+interest file or consumed database generation. `File` and `Unincorp` retain
+their dedicated formats. Other trigger-directory entries must satisfy the
+named-interest path, grammar, kind, mode, and size bounds; they are not silently
+ignored.
 
 ## Validation
 
@@ -81,7 +88,7 @@ Import rejects, before any change can be planned:
   records that still own one;
 - `triggers-awaited` or `triggers-pending` states without the matching status
   field, and trigger fields that contradict the state;
-- file-trigger interests that the owning package does not declare, trigger
+- file or named interests that the owning package does not declare, trigger
   records naming unknown packages, and malformed trigger grammar;
 - database entries that are not regular files, setuid, setgid, or
   world-writable modes, and non-executable maintainer scripts, for top-level
@@ -126,8 +133,9 @@ database change between preflight and mutation.
 - `put_file_list`, `put_md5sums`, `put_trigger_declarations`, and `remove_info`
   edit a single info surface.
 - `remove_package` purges the record and every info file the package owns.
-- `set_trigger_state` and `set_foreign_architectures` republish the shared
-  trigger and architecture surfaces.
+- `set_trigger_state` republishes the shared and named trigger surfaces,
+  including explicit removals of obsolete named files.
+- `set_foreign_architectures` republishes the architecture surface.
 
 The resulting model is validated with exactly the same rules import uses, so a
 plan can never publish a database that would fail to import. Trigger state,
@@ -158,8 +166,8 @@ status that imports - including fields far longer than one database line - can
 always be republished.
 
 Write order is deterministic: `status-old` is copied from the current `status`
-first, then info files sorted by path, then `arch`, `triggers/File`,
-`triggers/Unincorp`, and finally `status`, which publishes the new generation
+first, then info files sorted by path, then `arch` and the shared/named trigger
+surfaces, and finally `status`, which publishes the new generation
 last. Each intent carries its exact bytes, SHA-256, and mode; `copy` intents
 carry the expected source digest instead of bytes. The plan digest binds the
 base generation and every ordered intent, and `base_status` plus
@@ -167,8 +175,7 @@ base generation and every ordered intent, and `base_status` plus
 
 ## Deferred integration
 
-The following are intentionally not implemented here and are tracked by later
-roadmap items:
+The following are deliberately outside this pure database model:
 
 - capturing a `Snapshot` through root-anchored, no-follow descriptors, and
   applying a `Plan` durably with staging, fsync, and atomic rename;

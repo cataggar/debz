@@ -147,17 +147,39 @@ longer ships is marked obsolete rather than removed.
 
 ## Trigger processing
 
-Deferred trigger work is the only place a package outside the authorized
-actions receives a maintainer-script call and a state record, so it fails
-closed. A trigger-interested package is driven through `triggers-pending`,
-`postinst triggered`, and back to `installed` only when it is completely
-installed. `half-installed`, `half-configured`, `unpacked`, `config-files`, and
-absent packages are rejected instead of promoted, and so are packages the
-database recorded as `triggers-pending` or `triggers-awaited`, whose earlier
-trigger work v1 evidence does not enumerate and this program could not
-preserve. The one accepted awaited state is the one the compiler creates
-itself, for a package that activated an awaited trigger while it was
-configured and whose return to `installed` the same program records.
+Trigger work can invoke a package outside the archive/removal actions, so
+item 13 adds explicit `TriggerAuthority` rather than inventing an action for
+an unchanged handler. Authority binds handler package/version/architecture,
+script source and postinst digest, declaration evidence, permitted dynamic
+callers and trigger names, initial registry/queue evidence, and work limits.
+Trigger-only processing has no archive action.
+
+`final_mode` either binds an `exact` final state or explicitly authorizes
+`derive_from_activations` for deferred completion. Derived mode binds the base
+final-state digest and activation limit, then computes exact ordered pending
+names and awaited edges from bound initial work and validated activation
+events. It neither predicts opaque script output from script text nor copies
+observed final status into the expected result. Package closure and unrelated
+state remain constrained, and immediate processing keeps exact semantics.
+
+Explicit trigger authority can consume existing pending/awaited work from its
+bound database generation. Without that authority, the earlier compiler path
+still refuses pre-existing pending/awaited state rather than discard it.
+Unhealthy, unpacked, residual, and absent packages are not silently promoted
+to installed trigger handlers.
+
+Both activation and listener await modes contribute to waiting edges.
+Repeated activations coalesce while preserving processing order. The exact
+`postinst triggered` call contains one space-separated name argument; its
+activation order differs from the reversed `Triggers-Pending` status
+serialization. File-trigger events are bound to archive application or
+installed ownership evidence, not unrestricted runtime path discovery.
+
+The private interpreter consumes this authority under the lifecycle's single
+outer lock and durable invocation protocol. Known trigger failures,
+no-progress cycles, and unknown invocation outcomes are distinct. Production
+native selection remains unavailable; see
+[Native trigger execution](native-triggers.md).
 
 ## Validation
 

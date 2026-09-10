@@ -203,8 +203,8 @@
       "id": "trigger-failure",
       "initial": "healthy",
       "operations": ["install"],
-      "features": ["triggered-postinst", "failure-state", "recovery"],
-      "expected": "recovery-required"
+      "features": ["triggered-postinst", "failure-state", "known-exit", "awaited-release"],
+      "expected": "failure"
     },
     {
       "id": "trigger-interest-half-configured",
@@ -215,9 +215,16 @@
     },
     {
       "id": "trigger-interest-pending-recorded",
-      "initial": "corrupt",
+      "initial": "imported",
+      "operations": ["process_triggers"],
+      "features": ["trigger", "triggers-pending", "triggers-awaited", "compiled-authority"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-interest-pending-without-authority",
+      "initial": "imported",
       "operations": ["install"],
-      "features": ["trigger", "triggers-pending", "fail-closed"],
+      "features": ["trigger", "triggers-pending", "missing-trigger-authority", "fail-closed"],
       "expected": "failure-before-mutation"
     },
     {
@@ -226,6 +233,97 @@
       "operations": ["install"],
       "features": ["trigger-cycle", "no-progress"],
       "expected": "failure"
+    },
+    {
+      "id": "trigger-deferred-await-matrix",
+      "initial": "healthy",
+      "operations": ["install", "process_triggers"],
+      "features": ["interest-await", "interest-noawait", "activate-await", "activate-noawait", "defer-triggers"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-default-await-aliases",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["interest", "activate", "default-await"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-existing-unincorporated-queue",
+      "initial": "imported",
+      "operations": ["process_triggers"],
+      "features": ["unincorp", "awaiting-package", "noawait-marker", "no-archive-action"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-named-file-order",
+      "initial": "healthy",
+      "operations": ["install", "process_triggers"],
+      "features": ["named-trigger", "file-trigger", "activation-order", "pending-status-order", "exact-script-argv"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-file-lifecycle",
+      "initial": "healthy",
+      "operations": ["install", "upgrade", "remove", "purge"],
+      "features": ["file-trigger", "archive-paths", "installed-ownership", "handler-purge"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-new-handler-batch-order",
+      "initial": "fresh",
+      "operations": ["install"],
+      "features": ["new-handler", "archive-order", "script-identity"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-script-activation-coalesces",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["native-helper", "dynamic-activation", "duplicate-coalescing"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-script-activation-deferred",
+      "initial": "healthy",
+      "operations": ["install", "process_triggers"],
+      "features": ["native-helper", "dynamic-activation", "duplicate-coalescing", "defer-triggers"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-postrm-activation",
+      "initial": "healthy",
+      "operations": ["remove"],
+      "features": ["native-helper", "postrm", "dynamic-activation", "installed-script-identity"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-dynamic-chain",
+      "initial": "healthy",
+      "operations": ["install"],
+      "features": ["native-helper", "dynamic-activation", "handler-chain"],
+      "expected": "success"
+    },
+    {
+      "id": "trigger-script-outcome-unknown",
+      "initial": "healthy",
+      "operations": ["install", "process_triggers", "purge"],
+      "features": ["triggered-postinst", "unknown-outcome", "durable-script-record", "helper-authority", "reentry-blocked"],
+      "expected": "recovery-required"
+    },
+    {
+      "id": "trigger-malformed-unincorporated-queue",
+      "initial": "corrupt",
+      "operations": ["process_triggers"],
+      "features": ["unincorp", "malformed-queue", "preflight", "fail-closed"],
+      "expected": "failure-before-mutation"
+    },
+    {
+      "id": "trigger-deferred-unrelated-selection-change",
+      "initial": "healthy",
+      "operations": ["install", "process_triggers"],
+      "features": ["defer-triggers", "unexpected-database-change", "selection-binding", "reentry-blocked"],
+      "expected": "recovery-required"
     },
     {
       "id": "healthy-root-import",

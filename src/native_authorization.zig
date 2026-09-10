@@ -13,6 +13,7 @@ const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
 const debian_version = @import("debian_version.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const maintainer_script = @import("maintainer_script.zig");
 const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
 const transaction_engine = @import("transaction_engine.zig");
@@ -28,6 +29,12 @@ pub const maximum_foreign_architectures: usize = 256;
 pub const maximum_identity_bytes: usize = 256;
 pub const maximum_root_bytes: usize = 4096;
 pub const maximum_validation_items: usize = 400_000;
+pub const maximum_trigger_handlers: usize = 4096;
+pub const maximum_trigger_callers: usize = 4096;
+pub const maximum_authorized_triggers: usize = 4096;
+pub const maximum_trigger_edges: usize = 4096;
+pub const maximum_trigger_invocations: u32 = 4096;
+pub const maximum_trigger_activations: u32 = 4096;
 
 /// The authorization is bound to one backend. Only the native engine consumes
 /// it; legacy documents can never be reinterpreted as native authorization.
@@ -72,9 +79,49 @@ pub const Action = struct {
     artifact: ?Artifact,
 };
 
+pub const TriggerScriptSource = enum { installed_package, new_package };
+pub const TriggerMode = enum { transaction, process_pending };
+pub const TriggerFinalMode = enum { exact, derive_from_activations };
+
+pub const TriggerHandler = struct {
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    source: TriggerScriptSource,
+    postinst_sha256: [32]u8,
+    declarations_sha256: [32]u8,
+};
+
+pub const TriggerCaller = struct {
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    source: TriggerScriptSource,
+    kind: maintainer_script.Kind,
+    script_sha256: [32]u8,
+};
+
+pub const TriggerAuthority = struct {
+    mode: TriggerMode,
+    defer_triggers: bool,
+    initial_state_sha256: [32]u8,
+    handlers: []const TriggerHandler,
+    callers: []const TriggerCaller,
+    allowed_triggers: []const []const u8,
+    maximum_invocations: u32,
+    final_mode: TriggerFinalMode = .exact,
+    base_final_state_sha256: ?[32]u8 = null,
+    maximum_activations: u32 = 0,
+};
+
 /// Exact package state required after the transaction completes. Packages that
 /// must not remain in the database are absent from the final closure.
-pub const FinalState = enum { installed, config_files };
+pub const FinalState = enum {
+    installed,
+    config_files,
+    triggers_pending,
+    triggers_awaited,
+};
 
 pub const FinalPackage = struct {
     name: []const u8,
@@ -82,6 +129,8 @@ pub const FinalPackage = struct {
     architecture: []const u8,
     state: FinalState,
     dpkg_selection_hold: bool,
+    triggers_pending: []const []const u8 = &.{},
+    triggers_awaited: []const []const u8 = &.{},
 };
 
 pub const Input = struct {
@@ -97,6 +146,7 @@ pub const Input = struct {
     policy: PolicyBinding,
     actions: []const Action,
     final_state: []const FinalPackage,
+    trigger_authority: ?TriggerAuthority = null,
 };
 
 pub const Authorization = struct {
@@ -113,6 +163,7 @@ pub const Authorization = struct {
     policy: PolicyBinding,
     actions: []const Action,
     final_state: []const FinalPackage,
+    trigger_authority: ?TriggerAuthority,
     final_state_sha256: [32]u8,
     digest_sha256: [32]u8,
 
@@ -203,6 +254,11 @@ pub const ValidationError = error{
     FinalStateDigestMismatch,
     DocumentTooLarge,
     InvalidDigest,
+    InvalidTriggerAuthority,
+    TooManyTriggerHandlers,
+    TooManyTriggerCallers,
+    TooManyAuthorizedTriggers,
+    TooManyTriggerEdges,
 };
 
 pub fn create(
@@ -218,16 +274,59 @@ pub fn create(
         return error.UnsupportedLockVersion;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     if (!validIdentity(input.target_architecture)) return error.InvalidIdentity;
-    if (input.actions.len == 0) return error.EmptyProgram;
+    if (input.actions.len == 0 and
+        (input.trigger_authority == null or
+            input.trigger_authority.?.mode != .process_pending))
+        return error.EmptyProgram;
+    if (input.trigger_authority) |trigger| {
+        if ((trigger.mode == .process_pending) != (input.actions.len == 0) or
+            trigger.maximum_invocations == 0 or
+            trigger.maximum_invocations > maximum_trigger_invocations)
+            return error.InvalidTriggerAuthority;
+        switch (trigger.final_mode) {
+            .exact => if (trigger.defer_triggers or
+                trigger.base_final_state_sha256 != null or
+                trigger.maximum_activations != 0)
+                return error.InvalidTriggerAuthority,
+            .derive_from_activations => {
+                const base_digest = digestFinalState(input.final_state);
+                if (!trigger.defer_triggers or
+                    trigger.mode != .transaction or
+                    trigger.base_final_state_sha256 == null or
+                    trigger.maximum_activations == 0 or
+                    trigger.maximum_activations > maximum_trigger_activations or
+                    !std.mem.eql(
+                        u8,
+                        &trigger.base_final_state_sha256.?,
+                        &base_digest,
+                    ))
+                    return error.InvalidTriggerAuthority;
+            },
+        }
+        if (trigger.handlers.len > maximum_trigger_handlers)
+            return error.TooManyTriggerHandlers;
+        if (trigger.callers.len > maximum_trigger_callers)
+            return error.TooManyTriggerCallers;
+        if (trigger.allowed_triggers.len > maximum_authorized_triggers)
+            return error.TooManyAuthorizedTriggers;
+    }
     if (input.actions.len > maximum_actions) return error.TooManyActions;
     if (input.final_state.len > maximum_final_packages) return error.TooManyFinalPackages;
     if (input.foreign_architectures.len > maximum_foreign_architectures)
         return error.TooManyArchitectures;
-    const validation_items = std.math.add(
+    var validation_items = std.math.add(
         usize,
         input.actions.len,
         input.final_state.len,
     ) catch return error.ValidationWorkLimitExceeded;
+    if (input.trigger_authority) |trigger| {
+        validation_items = std.math.add(
+            usize,
+            validation_items,
+            trigger.handlers.len + trigger.callers.len +
+                trigger.allowed_triggers.len,
+        ) catch return error.ValidationWorkLimitExceeded;
+    }
     if (validation_items > maximum_validation_items)
         return error.ValidationWorkLimitExceeded;
     if (input.install_root.len > maximum_root_bytes) return error.RootTooLong;
@@ -270,12 +369,37 @@ pub fn create(
         if (!validIdentity(package.name) or !validIdentity(package.architecture))
             return error.InvalidIdentity;
         try validateVersion(package.version);
+        if (package.triggers_pending.len > maximum_trigger_edges or
+            package.triggers_awaited.len > maximum_trigger_edges)
+            return error.TooManyTriggerEdges;
+        switch (package.state) {
+            .triggers_pending => if (package.triggers_pending.len == 0 or
+                package.triggers_awaited.len != 0)
+                return error.ContradictoryFinalState,
+            .triggers_awaited => if (package.triggers_awaited.len == 0)
+                return error.ContradictoryFinalState,
+            .installed, .config_files => if (package.triggers_pending.len != 0 or
+                package.triggers_awaited.len != 0)
+                return error.ContradictoryFinalState,
+        }
+        const pending = try owned.alloc([]const u8, package.triggers_pending.len);
+        for (package.triggers_pending, 0..) |edge, edge_index| {
+            if (!validTriggerToken(edge)) return error.InvalidTriggerAuthority;
+            pending[edge_index] = try owned.dupe(u8, edge);
+        }
+        const awaited = try owned.alloc([]const u8, package.triggers_awaited.len);
+        for (package.triggers_awaited, 0..) |edge, edge_index| {
+            if (!validTriggerToken(edge)) return error.InvalidTriggerAuthority;
+            awaited[edge_index] = try owned.dupe(u8, edge);
+        }
         final_state[index] = .{
             .name = try owned.dupe(u8, package.name),
             .version = try owned.dupe(u8, package.version),
             .architecture = try owned.dupe(u8, package.architecture),
             .state = package.state,
             .dpkg_selection_hold = package.dpkg_selection_hold,
+            .triggers_pending = pending,
+            .triggers_awaited = awaited,
         };
     }
     std.mem.sort(FinalPackage, final_state, {}, lessFinalPackage);
@@ -349,6 +473,99 @@ pub fn create(
         try validateActionFinalState(action, final_state);
     }
 
+    var trigger_authority: ?TriggerAuthority = null;
+    if (input.trigger_authority) |trigger| {
+        if (trigger.handlers.len == 0 or trigger.allowed_triggers.len == 0)
+            return error.InvalidTriggerAuthority;
+        const handlers = try owned.alloc(TriggerHandler, trigger.handlers.len);
+        for (trigger.handlers, 0..) |handler, index| {
+            if (!validIdentity(handler.package) or
+                !validIdentity(handler.architecture))
+                return error.InvalidIdentity;
+            try validateVersion(handler.version);
+            if (!architectureAllowed(
+                target_architecture,
+                foreign_architectures,
+                handler.architecture,
+            )) return error.ArchitectureNotSelected;
+            handlers[index] = .{
+                .package = try owned.dupe(u8, handler.package),
+                .version = try owned.dupe(u8, handler.version),
+                .architecture = try owned.dupe(u8, handler.architecture),
+                .source = handler.source,
+                .postinst_sha256 = handler.postinst_sha256,
+                .declarations_sha256 = handler.declarations_sha256,
+            };
+        }
+        std.mem.sort(TriggerHandler, handlers, {}, lessTriggerHandler);
+        if (handlers.len > 1)
+            for (handlers[1..], 1..) |handler, index| {
+                const previous = handlers[index - 1];
+                if (sameIdentity(
+                    previous.package,
+                    previous.architecture,
+                    handler.package,
+                    handler.architecture,
+                )) return error.InvalidTriggerAuthority;
+            };
+        const callers = try owned.alloc(TriggerCaller, trigger.callers.len);
+        for (trigger.callers, 0..) |caller, index| {
+            if (!validIdentity(caller.package) or
+                !validIdentity(caller.architecture))
+                return error.InvalidIdentity;
+            try validateVersion(caller.version);
+            if (!architectureAllowed(
+                target_architecture,
+                foreign_architectures,
+                caller.architecture,
+            )) return error.ArchitectureNotSelected;
+            callers[index] = .{
+                .package = try owned.dupe(u8, caller.package),
+                .version = try owned.dupe(u8, caller.version),
+                .architecture = try owned.dupe(u8, caller.architecture),
+                .source = caller.source,
+                .kind = caller.kind,
+                .script_sha256 = caller.script_sha256,
+            };
+        }
+        std.mem.sort(TriggerCaller, callers, {}, lessTriggerCaller);
+        if (callers.len > 1)
+            for (callers[1..], 1..) |caller, index| {
+                const previous = callers[index - 1];
+                if (sameIdentity(
+                    previous.package,
+                    previous.architecture,
+                    caller.package,
+                    caller.architecture,
+                ) and previous.kind == caller.kind and
+                    previous.source == caller.source)
+                    return error.InvalidTriggerAuthority;
+            };
+        const allowed = try owned.alloc([]const u8, trigger.allowed_triggers.len);
+        for (trigger.allowed_triggers, 0..) |name, index| {
+            if (!validTriggerToken(name)) return error.InvalidTriggerAuthority;
+            allowed[index] = try owned.dupe(u8, name);
+        }
+        std.mem.sort([]const u8, allowed, {}, lessString);
+        if (allowed.len > 1)
+            for (allowed[1..], 1..) |name, index| {
+                if (std.mem.eql(u8, allowed[index - 1], name))
+                    return error.InvalidTriggerAuthority;
+            };
+        trigger_authority = .{
+            .mode = trigger.mode,
+            .defer_triggers = trigger.defer_triggers,
+            .initial_state_sha256 = trigger.initial_state_sha256,
+            .handlers = handlers,
+            .callers = callers,
+            .allowed_triggers = allowed,
+            .maximum_invocations = trigger.maximum_invocations,
+            .final_mode = trigger.final_mode,
+            .base_final_state_sha256 = trigger.base_final_state_sha256,
+            .maximum_activations = trigger.maximum_activations,
+        };
+    }
+
     var authorization: Authorization = .{
         .backend = input.backend,
         .target_architecture = target_architecture,
@@ -371,6 +588,7 @@ pub fn create(
         },
         .actions = actions,
         .final_state = final_state,
+        .trigger_authority = trigger_authority,
         .final_state_sha256 = undefined,
         .digest_sha256 = undefined,
     };
@@ -433,7 +651,9 @@ fn validateActionFinalState(
     switch (action.kind) {
         .install, .upgrade, .downgrade, .reinstall => {
             const final = final_state[index orelse return error.MissingFinalPackage];
-            if (final.state != .installed or
+            if ((final.state != .installed and
+                final.state != .triggers_pending and
+                final.state != .triggers_awaited) or
                 !std.mem.eql(u8, final.version, action.version))
                 return error.ContradictoryFinalState;
         },
@@ -498,6 +718,35 @@ const WireFinalPackage = struct {
     architecture: []const u8,
     state: FinalState,
     dpkg_selection_hold: bool,
+    triggers_pending: []const []const u8 = &.{},
+    triggers_awaited: []const []const u8 = &.{},
+};
+
+const WireTriggerHandler = struct {
+    package: WireIdentity,
+    source: TriggerScriptSource,
+    postinst_sha256: []const u8,
+    declarations_sha256: []const u8,
+};
+
+const WireTriggerCaller = struct {
+    package: WireIdentity,
+    source: TriggerScriptSource,
+    kind: maintainer_script.Kind,
+    script_sha256: []const u8,
+};
+
+const WireTriggerAuthority = struct {
+    mode: TriggerMode,
+    defer_triggers: bool,
+    initial_state_sha256: []const u8,
+    handlers: []const WireTriggerHandler,
+    callers: []const WireTriggerCaller,
+    allowed_triggers: []const []const u8,
+    maximum_invocations: u32,
+    final_mode: TriggerFinalMode = .exact,
+    base_final_state_sha256: ?[]const u8 = null,
+    maximum_activations: u32 = 0,
 };
 
 const WireLockBinding = struct {
@@ -528,6 +777,7 @@ const WireAuthorization = struct {
     policy: WirePolicy,
     actions: []const WireAction,
     final_state: []const WireFinalPackage,
+    trigger_authority: ?WireTriggerAuthority = null,
     final_state_sha256: []const u8,
     digest_sha256: []const u8,
 };
@@ -552,6 +802,14 @@ pub fn decode(
         return error.TooManyFinalPackages;
     if (parsed.value.foreign_architectures.len > maximum_foreign_architectures)
         return error.TooManyArchitectures;
+    if (parsed.value.trigger_authority) |trigger| {
+        if (trigger.handlers.len > maximum_trigger_handlers)
+            return error.TooManyTriggerHandlers;
+        if (trigger.callers.len > maximum_trigger_callers)
+            return error.TooManyTriggerCallers;
+        if (trigger.allowed_triggers.len > maximum_authorized_triggers)
+            return error.TooManyAuthorizedTriggers;
+    }
 
     const actions = try allocator.alloc(Action, parsed.value.actions.len);
     defer allocator.free(actions);
@@ -580,6 +838,53 @@ pub fn decode(
             .architecture = package.architecture,
             .state = package.state,
             .dpkg_selection_hold = package.dpkg_selection_hold,
+            .triggers_pending = package.triggers_pending,
+            .triggers_awaited = package.triggers_awaited,
+        };
+    }
+
+    var trigger_authority: ?TriggerAuthority = null;
+    var trigger_handlers: []TriggerHandler = &.{};
+    defer if (trigger_handlers.len != 0) allocator.free(trigger_handlers);
+    var trigger_callers: []TriggerCaller = &.{};
+    defer if (trigger_callers.len != 0) allocator.free(trigger_callers);
+    if (parsed.value.trigger_authority) |trigger| {
+        trigger_handlers = try allocator.alloc(TriggerHandler, trigger.handlers.len);
+        for (trigger.handlers, 0..) |handler, index| {
+            trigger_handlers[index] = .{
+                .package = handler.package.name,
+                .version = handler.package.version,
+                .architecture = handler.package.architecture,
+                .source = handler.source,
+                .postinst_sha256 = try parseHex(32, handler.postinst_sha256),
+                .declarations_sha256 = try parseHex(32, handler.declarations_sha256),
+            };
+        }
+        trigger_callers = try allocator.alloc(TriggerCaller, trigger.callers.len);
+        for (trigger.callers, 0..) |caller, index| {
+            trigger_callers[index] = .{
+                .package = caller.package.name,
+                .version = caller.package.version,
+                .architecture = caller.package.architecture,
+                .source = caller.source,
+                .kind = caller.kind,
+                .script_sha256 = try parseHex(32, caller.script_sha256),
+            };
+        }
+        trigger_authority = .{
+            .mode = trigger.mode,
+            .defer_triggers = trigger.defer_triggers,
+            .initial_state_sha256 = try parseHex(32, trigger.initial_state_sha256),
+            .handlers = trigger_handlers,
+            .callers = trigger_callers,
+            .allowed_triggers = trigger.allowed_triggers,
+            .maximum_invocations = trigger.maximum_invocations,
+            .final_mode = trigger.final_mode,
+            .base_final_state_sha256 = if (trigger.base_final_state_sha256) |value|
+                try parseHex(32, value)
+            else
+                null,
+            .maximum_activations = trigger.maximum_activations,
         };
     }
 
@@ -604,6 +909,7 @@ pub fn decode(
         },
         .actions = actions,
         .final_state = final_state,
+        .trigger_authority = trigger_authority,
     });
     errdefer result.deinit();
     const root_identity = try parseHex(32, parsed.value.root_identity_sha256);
@@ -760,6 +1066,10 @@ fn digestFinalState(final_state: []const FinalPackage) [32]u8 {
     return sink.hasher.finalResult();
 }
 
+pub fn finalStateDigest(final_state: []const FinalPackage) [32]u8 {
+    return digestFinalState(final_state);
+}
+
 fn writeDocument(authorization: Authorization, writer: *std.Io.Writer) !void {
     try writePayload(authorization, writer);
     writer.undo(1);
@@ -831,7 +1141,72 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
         } else try writer.writeAll("null");
         try writer.writeByte('}');
     }
-    try writer.writeAll("],\"final_state\":");
+    try writer.writeAll("],\"trigger_authority\":");
+    if (authorization.trigger_authority) |trigger| {
+        try writer.writeAll("{\"mode\":");
+        try writeJsonString(writer, @tagName(trigger.mode));
+        try writer.print(",\"defer_triggers\":{},\"initial_state_sha256\":", .{
+            trigger.defer_triggers,
+        });
+        try writeHexString(writer, &trigger.initial_state_sha256);
+        try writer.writeAll(",\"handlers\":[");
+        for (trigger.handlers, 0..) |handler, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"package\":");
+            try writeIdentity(
+                writer,
+                handler.package,
+                handler.version,
+                handler.architecture,
+            );
+            try writer.writeAll(",\"source\":");
+            try writeJsonString(writer, @tagName(handler.source));
+            try writer.writeAll(",\"postinst_sha256\":");
+            try writeHexString(writer, &handler.postinst_sha256);
+            try writer.writeAll(",\"declarations_sha256\":");
+            try writeHexString(writer, &handler.declarations_sha256);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"callers\":[");
+        for (trigger.callers, 0..) |caller, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"package\":");
+            try writeIdentity(
+                writer,
+                caller.package,
+                caller.version,
+                caller.architecture,
+            );
+            try writer.writeAll(",\"source\":");
+            try writeJsonString(writer, @tagName(caller.source));
+            try writer.writeAll(",\"kind\":");
+            try writeJsonString(writer, @tagName(caller.kind));
+            try writer.writeAll(",\"script_sha256\":");
+            try writeHexString(writer, &caller.script_sha256);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"allowed_triggers\":[");
+        for (trigger.allowed_triggers, 0..) |name, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writeJsonString(writer, name);
+        }
+        try writer.print("],\"maximum_invocations\":{},\"final_mode\":", .{
+            trigger.maximum_invocations,
+        });
+        try writeJsonString(writer, @tagName(trigger.final_mode));
+        try writer.writeAll(",\"base_final_state_sha256\":");
+        if (trigger.base_final_state_sha256) |digest|
+            try writeHexString(writer, &digest)
+        else
+            try writer.writeAll("null");
+        try writer.print(
+            ",\"maximum_activations\":{}}}",
+            .{trigger.maximum_activations},
+        );
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"final_state\":");
     try writeFinalState(authorization.final_state, writer);
     try writer.writeAll(",\"final_state_sha256\":");
     try writeHexString(writer, &authorization.final_state_sha256);
@@ -850,10 +1225,19 @@ fn writeFinalState(final_state: []const FinalPackage, writer: *std.Io.Writer) !v
         try writeJsonString(writer, package.architecture);
         try writer.writeAll(",\"state\":");
         try writeJsonString(writer, @tagName(package.state));
-        try writer.print(
-            ",\"dpkg_selection_hold\":{}}}",
-            .{package.dpkg_selection_hold},
-        );
+        try writer.print(",\"dpkg_selection_hold\":{},\"triggers_pending\":[", .{
+            package.dpkg_selection_hold,
+        });
+        for (package.triggers_pending, 0..) |edge, edge_index| {
+            if (edge_index != 0) try writer.writeByte(',');
+            try writeJsonString(writer, edge);
+        }
+        try writer.writeAll("],\"triggers_awaited\":[");
+        for (package.triggers_awaited, 0..) |edge, edge_index| {
+            if (edge_index != 0) try writer.writeByte(',');
+            try writeJsonString(writer, edge);
+        }
+        try writer.writeAll("]}");
     }
     try writer.writeByte(']');
 }
@@ -1000,6 +1384,48 @@ fn sameIdentity(
 ) bool {
     return std.mem.eql(u8, left_name, right_name) and
         std.mem.eql(u8, left_architecture, right_architecture);
+}
+
+fn architectureAllowed(
+    target: []const u8,
+    foreign: []const []const u8,
+    architecture: []const u8,
+) bool {
+    if (std.mem.eql(u8, architecture, target) or
+        std.mem.eql(u8, architecture, "all"))
+        return true;
+    for (foreign) |candidate| {
+        if (std.mem.eql(u8, architecture, candidate)) return true;
+    }
+    return false;
+}
+
+fn validTriggerToken(value: []const u8) bool {
+    if (value.len == 0 or value.len > 4096) return false;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte >= 0x7f) return false;
+    }
+    return if (value[0] == '/')
+        absolute_path.nonRoot(value)
+    else
+        std.mem.indexOfScalar(u8, value, '/') == null;
+}
+
+fn lessTriggerHandler(_: void, left: TriggerHandler, right: TriggerHandler) bool {
+    const name = std.mem.order(u8, left.package, right.package);
+    if (name != .eq) return name == .lt;
+    return std.mem.order(u8, left.architecture, right.architecture) == .lt;
+}
+
+fn lessTriggerCaller(_: void, left: TriggerCaller, right: TriggerCaller) bool {
+    const name = std.mem.order(u8, left.package, right.package);
+    if (name != .eq) return name == .lt;
+    const architecture = std.mem.order(u8, left.architecture, right.architecture);
+    if (architecture != .eq) return architecture == .lt;
+    const kind = @intFromEnum(left.kind);
+    const other_kind = @intFromEnum(right.kind);
+    if (kind != other_kind) return kind < other_kind;
+    return @intFromEnum(left.source) < @intFromEnum(right.source);
 }
 
 fn lessAction(_: void, left: Action, right: Action) bool {
@@ -1328,6 +1754,109 @@ test "native_authorization.test.canonical document binds program artifacts and f
             decode(std.testing.allocator, tampered, maximum_document_bytes),
         );
     }
+}
+
+test "native_authorization.test.trigger-only authority needs no synthetic action" {
+    const handlers = [_]TriggerHandler{.{
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .postinst_sha256 = @splat(0x31),
+        .declarations_sha256 = @splat(0x32),
+    }};
+    const callers = [_]TriggerCaller{.{
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .kind = .postinst,
+        .script_sha256 = @splat(0x31),
+    }};
+    const final_state = [_]FinalPackage{.{
+        .name = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .state = .installed,
+        .dpkg_selection_hold = false,
+    }};
+    var input = testInput();
+    input.actions = &.{};
+    input.final_state = &final_state;
+    input.trigger_authority = .{
+        .mode = .process_pending,
+        .defer_triggers = false,
+        .initial_state_sha256 = @splat(0x33),
+        .handlers = &handlers,
+        .callers = &callers,
+        .allowed_triggers = &.{"debz-trigger"},
+        .maximum_invocations = 8,
+    };
+    var owned = try create(std.testing.allocator, input);
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.authorization.actions.len);
+    try std.testing.expectEqual(
+        TriggerMode.process_pending,
+        owned.authorization.trigger_authority.?.mode,
+    );
+    const document = try owned.authorization.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(document);
+    var decoded = try decode(
+        std.testing.allocator,
+        document,
+        maximum_document_bytes,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        decoded.authorization.trigger_authority.?.handlers.len,
+    );
+}
+
+test "native_authorization.test.derived trigger final mode binds base and bounds" {
+    const handlers = [_]TriggerHandler{.{
+        .package = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .source = .new_package,
+        .postinst_sha256 = @splat(0x41),
+        .declarations_sha256 = @splat(0x42),
+    }};
+    var input = testInput();
+    const base_digest = finalStateDigest(input.final_state);
+    input.trigger_authority = .{
+        .mode = .transaction,
+        .defer_triggers = true,
+        .initial_state_sha256 = @splat(0x43),
+        .handlers = &handlers,
+        .callers = &.{},
+        .allowed_triggers = &.{"debz-trigger"},
+        .maximum_invocations = 8,
+        .final_mode = .derive_from_activations,
+        .base_final_state_sha256 = base_digest,
+        .maximum_activations = 8,
+    };
+    var valid = try create(std.testing.allocator, input);
+    valid.deinit();
+
+    input.trigger_authority.?.base_final_state_sha256.?[0] ^= 1;
+    try std.testing.expectError(
+        error.InvalidTriggerAuthority,
+        create(std.testing.allocator, input),
+    );
+    input.trigger_authority.?.base_final_state_sha256 = base_digest;
+    input.trigger_authority.?.maximum_activations =
+        maximum_trigger_activations + 1;
+    try std.testing.expectError(
+        error.InvalidTriggerAuthority,
+        create(std.testing.allocator, input),
+    );
+    input.trigger_authority.?.maximum_activations = 8;
+    input.trigger_authority.?.final_mode = .exact;
+    try std.testing.expectError(
+        error.InvalidTriggerAuthority,
+        create(std.testing.allocator, input),
+    );
 }
 
 test "native_authorization.test.rejects contradictory duplicate and unauthorized programs" {
