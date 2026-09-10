@@ -18,9 +18,10 @@
 //! composes the existing mutation engine for real-dpkg data, conffile, removal,
 //! and lifecycle fixtures. The lifecycle interpreter consumes a compiled
 //! native program, runs validated scripts in an isolated root, and retains
-//! durable evidence for ambiguous outcomes. Neither adapter is a public native
-//! executor; triggers and other unsupported features still hand off before
-//! mutation.
+//! durable evidence for ambiguous outcomes. Its private trigger extension
+//! models named/file interests, deferred queues, dynamic helper activation,
+//! failures, and bounded cycle detection. None of these adapters is a public
+//! native executor; other unsupported features still hand off before mutation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,6 +33,7 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
+const native_trigger = @import("native_trigger.zig");
 const package_database = @import("package_database.zig");
 const package_database_changes = @import("package_database_changes.zig");
 const product_api = @import("product_api.zig");
@@ -997,6 +999,7 @@ const Request = struct {
     /// Private lifecycle execution may interpret one compiled data step at a
     /// time while retaining the complete parent program as authority.
     lifecycle_execution: bool = false,
+    trigger_execution: bool = false,
     lifecycle_sequences: []const u32 = &.{},
     limits: Limits = .{},
 };
@@ -1822,18 +1825,21 @@ fn collectSteps(builder: *Builder) PlanError!void {
                     .architecture = decision.package.architecture,
                     .detail = decision.path,
                 }),
-            .record_trigger_interests => |record| try builder.deferFeature(.{
-                .feature = .trigger,
-                .package = record.package.name,
-                .architecture = record.package.architecture,
-            }),
-            .activate_trigger => |activation| try builder.deferFeature(.{
-                .feature = .trigger,
-                .package = activation.source.name,
-                .architecture = activation.source.architecture,
-                .detail = activation.trigger,
-            }),
-            .process_deferred_triggers => try builder.deferFeature(.{ .feature = .trigger }),
+            .record_trigger_interests => |record| if (!builder.request.trigger_execution)
+                try builder.deferFeature(.{
+                    .feature = .trigger,
+                    .package = record.package.name,
+                    .architecture = record.package.architecture,
+                }),
+            .activate_trigger => |activation| if (!builder.request.trigger_execution)
+                try builder.deferFeature(.{
+                    .feature = .trigger,
+                    .package = activation.source.name,
+                    .architecture = activation.source.architecture,
+                    .detail = activation.trigger,
+                }),
+            .process_deferred_triggers => if (!builder.request.trigger_execution)
+                try builder.deferFeature(.{ .feature = .trigger }),
             .assert_path_ownership => |assertion| if (assertion.resolution == .forced_overwrite)
                 try builder.deferFeature(.{
                     .feature = .forced_overwrite,
@@ -2261,16 +2267,17 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
             .feature = .unsupported_root_feature,
             .detail = path,
         });
-    for (model.triggers.pending) |queued| {
-        if (queued.packages.len == 0)
-            try builder.deferFeature(.{ .feature = .trigger, .detail = queued.trigger });
-        for (queued.packages) |awaiting| try builder.deferFeature(.{
-            .feature = .trigger,
-            .package = awaiting.package.name,
-            .architecture = awaiting.package.architecture,
-            .detail = queued.trigger,
-        });
-    }
+    if (!builder.request.trigger_execution)
+        for (model.triggers.pending) |queued| {
+            if (queued.packages.len == 0)
+                try builder.deferFeature(.{ .feature = .trigger, .detail = queued.trigger });
+            for (queued.packages) |awaiting| try builder.deferFeature(.{
+                .feature = .trigger,
+                .package = awaiting.package.name,
+                .architecture = awaiting.package.architecture,
+                .detail = queued.trigger,
+            });
+        };
     for (model.diversions) |record| try builder.deferFeature(.{
         .feature = .diversion,
         .package = record.package orelse "",
@@ -2303,12 +2310,13 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .architecture = item.identity.architecture,
                 .detail = script.name,
             });
-        for (archive.triggers) |trigger| try builder.deferFeature(.{
-            .feature = .trigger,
-            .package = item.identity.name,
-            .architecture = item.identity.architecture,
-            .detail = trigger.target,
-        });
+        if (!builder.request.trigger_execution)
+            for (archive.triggers) |trigger| try builder.deferFeature(.{
+                .feature = .trigger,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = trigger.target,
+            });
         for (archive.metadata) |member| try builder.deferFeature(.{
             .feature = .package_metadata,
             .package = item.identity.name,
@@ -2330,26 +2338,28 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .architecture = prior.architecture,
                 .detail = script.kind.suffix(),
             });
-        if (prior.trigger_declarations) |declarations| {
+        if (!builder.request.trigger_execution) if (prior.trigger_declarations) |declarations| {
             for (declarations) |declaration| try builder.deferFeature(.{
                 .feature = .trigger,
                 .package = prior.name,
                 .architecture = prior.architecture,
                 .detail = declaration.name,
             });
-        }
-        for (prior.triggers_pending) |trigger| try builder.deferFeature(.{
-            .feature = .trigger,
-            .package = prior.name,
-            .architecture = prior.architecture,
-            .detail = trigger,
-        });
-        for (prior.triggers_awaited) |trigger| try builder.deferFeature(.{
-            .feature = .trigger,
-            .package = prior.name,
-            .architecture = prior.architecture,
-            .detail = trigger,
-        });
+        };
+        if (!builder.request.trigger_execution)
+            for (prior.triggers_pending) |trigger| try builder.deferFeature(.{
+                .feature = .trigger,
+                .package = prior.name,
+                .architecture = prior.architecture,
+                .detail = trigger,
+            });
+        if (!builder.request.trigger_execution)
+            for (prior.triggers_awaited) |trigger| try builder.deferFeature(.{
+                .feature = .trigger,
+                .package = prior.name,
+                .architecture = prior.architecture,
+                .detail = trigger,
+            });
     }
 }
 
@@ -5517,6 +5527,7 @@ fn proveCaseEvidence(builder: *Builder) PlanError!void {
 /// to be activated. Trigger processing belongs to a later roadmap item, so
 /// the transaction is handed off instead of silently skipping the activation.
 fn inspectPublicationTriggers(builder: *Builder) PlanError!void {
+    if (builder.request.trigger_execution) return;
     const state = builder.database.model.triggers;
     if (state.interests.len == 0) return;
     var packages_by_name: std.StringHashMapUnmanaged(
@@ -6470,6 +6481,26 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             }
             break :block scripts;
         } else &.{};
+        const trigger_declarations = if (builder.request.trigger_execution) block: {
+            const declarations = try builder.arena.alloc(
+                package_database.TriggerDeclaration,
+                model.triggers.len,
+            );
+            for (model.triggers, 0..) |trigger, index| {
+                declarations[index] = .{
+                    .kind = switch (trigger.directive) {
+                        .interest => .interest,
+                        .interest_await => .interest_await,
+                        .interest_noawait => .interest_noawait,
+                        .activate => .activate,
+                        .activate_await => .activate_await,
+                        .activate_noawait => .activate_noawait,
+                    },
+                    .name = trigger.target,
+                };
+            }
+            break :block if (declarations.len == 0) null else declarations;
+        } else null;
         try changes.append(builder.allocator, .{ .put_package = .{
             .fields = try statusFields(builder, item, model, .unpacked),
             .paths = item.list_paths.items,
@@ -6478,7 +6509,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
                 null
             else
                 item.declared_conffiles.items,
-            .trigger_declarations = null,
+            .trigger_declarations = trigger_declarations,
             .scripts = lifecycle_scripts,
         } });
     }
@@ -7008,6 +7039,61 @@ fn captureDatabaseSnapshotInto(
         root,
         package_database.database_directory ++ "/" ++ package_database.triggers_unincorp_path,
         limits.max_database_file_bytes,
+    );
+    var named_triggers: std.ArrayList(package_database.NamedTriggerEntry) = .empty;
+    defer named_triggers.deinit(owned);
+    var triggers_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.triggers_directory,
+    ));
+    defer triggers_dir.close(root.io);
+    var triggers_iterator = triggers_dir.iterate();
+    while (try triggers_iterator.next(root.io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "File") or
+            std.mem.eql(u8, entry.name, "Unincorp") or
+            std.mem.eql(u8, entry.name, "Lock"))
+            continue;
+        if (named_triggers.items.len >= limits.max_named_trigger_files)
+            return error.DatabaseCaptureLimit;
+        const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.triggers_directory,
+                name,
+            },
+        );
+        const file = (try captureDatabaseFile(
+            owned,
+            root,
+            path,
+            limits.max_database_file_bytes,
+        )) orelse return error.DatabaseCaptureChanged;
+        try named_triggers.append(owned, .{
+            .name = name,
+            .bytes = file.bytes,
+            .kind = file.kind,
+            .mode = file.mode,
+        });
+    }
+    std.mem.sort(
+        package_database.NamedTriggerEntry,
+        named_triggers.items,
+        {},
+        struct {
+            fn less(
+                _: void,
+                left: package_database.NamedTriggerEntry,
+                right: package_database.NamedTriggerEntry,
+            ) bool {
+                return std.mem.order(u8, left.name, right.name) == .lt;
+            }
+        }.less,
+    );
+    snapshot.triggers_named = try owned.dupe(
+        package_database.NamedTriggerEntry,
+        named_triggers.items,
     );
 
     var info: std.ArrayList(package_database.InfoEntry) = .empty;
@@ -7909,8 +7995,9 @@ fn phasePreflight(
         return .{ .outcome = .refused, .detail = "conffile_policy_mismatch" };
     if (database.model.pending_updates.len != 0)
         return .{ .outcome = .refused, .detail = "updates_pending" };
-    if (database.model.triggers.interests.len != 0 or
-        database.model.triggers.pending.len != 0)
+    if (!request.planning.trigger_execution and
+        (database.model.triggers.interests.len != 0 or
+            database.model.triggers.pending.len != 0))
         return .{ .outcome = .handoff, .detail = "trigger" };
     if (database.model.diversions.len != 0)
         return .{ .outcome = .handoff, .detail = "diversion" };
@@ -8251,6 +8338,52 @@ fn phaseStatusFields(
     return allocator.dupe(package_database.StatusField, fields.items);
 }
 
+fn triggerStatusFields(
+    allocator: std.mem.Allocator,
+    record: package_database.PackageRecord,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+    pending: []const []const u8,
+    awaited: []const []const u8,
+) ![]const package_database.StatusField {
+    const base = try phaseStatusFields(
+        allocator,
+        record,
+        want,
+        error_state,
+        current,
+        config_version,
+        record.conffiles,
+    );
+    var fields: std.ArrayList(package_database.StatusField) = .empty;
+    defer fields.deinit(allocator);
+    for (base) |field| {
+        if (std.ascii.eqlIgnoreCase(field.name, "Triggers-Pending") or
+            std.ascii.eqlIgnoreCase(field.name, "Triggers-Awaited"))
+            continue;
+        try fields.append(allocator, field);
+    }
+    if (pending.len != 0) {
+        const lines = try allocator.alloc([]const u8, 1);
+        lines[0] = try std.mem.join(allocator, " ", pending);
+        try fields.append(allocator, .{
+            .name = "Triggers-Pending",
+            .value_lines = lines,
+        });
+    }
+    if (awaited.len != 0) {
+        const lines = try allocator.alloc([]const u8, 1);
+        lines[0] = try std.mem.join(allocator, " ", awaited);
+        try fields.append(allocator, .{
+            .name = "Triggers-Awaited",
+            .value_lines = lines,
+        });
+    }
+    return allocator.dupe(package_database.StatusField, fields.items);
+}
+
 fn findDatabaseConffile(
     record: package_database.PackageRecord,
     path: []const u8,
@@ -8461,7 +8594,8 @@ fn materializeConfigure(
 
     for (bound.items) |*archive| {
         if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
-            archive.model.triggers.len != 0 or
+            (!request.planning.trigger_execution and
+                archive.model.triggers.len != 0) or
             archive.model.metadata.len != 0)
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
         const record = database.model.find(
@@ -8478,7 +8612,8 @@ fn materializeConfigure(
             record.status.error_state != .ok or
             record.status.want == .hold or
             (request.borrowed_attempt == null and record.scripts.len != 0) or
-            record.trigger_declarations != null or
+            (!request.planning.trigger_execution and
+                record.trigger_declarations != null) or
             record.triggers_pending.len != 0 or
             record.triggers_awaited.len != 0)
             return .{ .outcome = .refused, .detail = "package_not_unpacked" };
@@ -9016,7 +9151,8 @@ fn materializeRemoval(
             configVersionField(record.*) == .invalid)
             return .{ .outcome = .refused, .detail = "config_version" };
         if ((request.borrowed_attempt == null and record.scripts.len != 0) or
-            record.trigger_declarations != null or
+            (!request.planning.trigger_execution and
+                record.trigger_declarations != null) or
             record.triggers_pending.len != 0 or record.triggers_awaited.len != 0)
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
 
@@ -9104,7 +9240,8 @@ fn materializeRemoval(
                     .remove_package = record.identity(),
                 });
             } else {
-                if (retained_paths.items.len == 0)
+                if (retained_paths.items.len == 0 and
+                    !request.planning.trigger_execution)
                     try retained_paths.append(
                         allocator,
                         package_database.root_list_path,
@@ -9175,6 +9312,39 @@ fn materializeRemoval(
         try intents.append(allocator, .{ .remove_directory = .{
             .path = path,
             .removal = .allow_absent,
+        } });
+    }
+    if (request.planning.trigger_execution) {
+        var interests: std.ArrayList(package_database.TriggerInterest) = .empty;
+        defer interests.deinit(allocator);
+        for (database.model.triggers.interests) |interest| {
+            var owner: ?u32 = null;
+            for (database.model.packages, 0..) |record, index| {
+                if (!std.mem.eql(u8, record.name, interest.package.name))
+                    continue;
+                if (interest.package.architecture.len != 0 and
+                    !std.mem.eql(
+                        u8,
+                        record.architecture,
+                        interest.package.architecture,
+                    ))
+                    continue;
+                if (owner != null and interest.package.architecture.len == 0)
+                    return .{
+                        .outcome = .refused,
+                        .detail = "ambiguous_trigger_owner",
+                    };
+                owner = @intCast(index);
+            }
+            if (owner != null and selected_owners.contains(owner.?)) continue;
+            try interests.append(allocator, interest);
+        }
+        try changes.append(allocator, .{ .set_trigger_state = .{
+            .interests = try owned.dupe(
+                package_database.TriggerInterest,
+                interests.items,
+            ),
+            .pending = database.model.triggers.pending,
         } });
     }
     var database_plan = switch (try package_database_changes.plan(
@@ -9731,6 +9901,123 @@ fn materializeRestoredPackageState(
         database_intents.intents,
         databasePhaseEvidence(database_plan),
         conffilePhaseDigest("lifecycle-restored-state", database_plan, null),
+        null,
+        true,
+    );
+}
+
+const TriggerPackageUpdate = struct {
+    package: package_database.Identity,
+    want: package_database.Want = .install,
+    error_state: package_database.ErrorState = .ok,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+    pending: []const []const u8 = &.{},
+    awaited: []const []const u8 = &.{},
+};
+
+fn materializeTriggerDatabase(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    updates: []const TriggerPackageUpdate,
+    trigger_state: ?package_database.TriggerState,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var changes: std.ArrayList(package_database_changes.Change) = .empty;
+    defer changes.deinit(allocator);
+    for (updates) |update| {
+        const record = database.model.find(
+            update.package.name,
+            update.package.architecture,
+        ) orelse return .{
+            .outcome = .refused,
+            .detail = "trigger_package_missing",
+        };
+        const fields = try triggerStatusFields(
+            owned,
+            record.*,
+            update.want,
+            update.error_state,
+            update.current,
+            update.config_version,
+            update.pending,
+            update.awaited,
+        );
+        try changes.append(allocator, .{ .put_package = .{
+            .fields = fields,
+            .paths = record.paths,
+            .md5sums = record.md5sums,
+            .declared_conffiles = record.declared_conffiles,
+            .trigger_declarations = record.trigger_declarations,
+            .scripts = try stagedInstalledScripts(
+                owned,
+                request.root,
+                record.*,
+                request.planning.limits.database.limits.max_info_file_bytes,
+            ),
+        } });
+    }
+    if (trigger_state) |state|
+        try changes.append(allocator, .{ .set_trigger_state = state });
+    if (changes.items.len == 0)
+        return .{ .outcome = .applied, .detail = "trigger_database_unchanged" };
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        changes.items,
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| return .{
+            .outcome = .refused,
+            .detail = @tagName(diagnostic.code),
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        database_intents.intents,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest("trigger-database", database_plan, null),
         null,
         true,
     );
@@ -10363,6 +10650,7 @@ const ExternalMaterializationOperation = enum {
     configure,
     remove,
     purge,
+    process_triggers,
 };
 
 const ExternalConffilePolicy = enum {
@@ -10404,11 +10692,14 @@ const ExternalLifecycleRequest = struct {
     packages: []const ExternalPackageSelection = &.{},
     ordered_actions: ?[]const ExternalLifecycleAction = null,
     fault: ?[]const u8 = null,
+    triggers: bool = false,
+    defer_triggers: bool = false,
 };
 
 const LifecycleOutcome = enum {
     applied,
     script_failed,
+    trigger_failed,
     recovery_required,
     handoff,
     refused,
@@ -10450,6 +10741,69 @@ fn lifecycleArchiveScriptKind(
         .postrm => .postrm,
         .config => null,
     };
+}
+
+fn lifecycleTriggerKind(
+    kind: package_database.TriggerDeclarationKind,
+) native_program.TriggerKind {
+    return switch (kind) {
+        .interest => .interest,
+        .interest_await => .interest_await,
+        .interest_noawait => .interest_noawait,
+        .activate => .activate,
+        .activate_await => .activate_await,
+        .activate_noawait => .activate_noawait,
+    };
+}
+
+fn lifecycleArchiveTriggerKind(
+    kind: archive_application.TriggerDirective,
+) native_program.TriggerKind {
+    return switch (kind) {
+        .interest => .interest,
+        .interest_await => .interest_await,
+        .interest_noawait => .interest_noawait,
+        .activate => .activate,
+        .activate_await => .activate_await,
+        .activate_noawait => .activate_noawait,
+    };
+}
+
+fn lifecycleDeclarationsDigest(
+    allocator: std.mem.Allocator,
+    declarations: []const native_program.TriggerDeclaration,
+) ![32]u8 {
+    const sorted = try allocator.dupe(
+        native_program.TriggerDeclaration,
+        declarations,
+    );
+    defer allocator.free(sorted);
+    std.mem.sort(
+        native_program.TriggerDeclaration,
+        sorted,
+        {},
+        struct {
+            fn less(
+                _: void,
+                left: native_program.TriggerDeclaration,
+                right: native_program.TriggerDeclaration,
+            ) bool {
+                const name = std.mem.order(u8, left.name, right.name);
+                if (name != .eq) return name == .lt;
+                return @intFromEnum(left.kind) < @intFromEnum(right.kind);
+            }
+        }.less,
+    );
+    var hash = Sha256.init(.{});
+    hash.update("debz-native-transaction-program-trigger-declarations-v1\x00");
+    for (sorted) |declaration| {
+        hash.update(&[_]u8{@intFromEnum(declaration.kind)});
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, declaration.name.len, .little);
+        hash.update(&length);
+        hash.update(declaration.name);
+    }
+    return hash.finalResult();
 }
 
 fn lifecycleOwnedPathsDigest(record: package_database.PackageRecord) [32]u8 {
@@ -10518,6 +10872,18 @@ fn lifecycleInstalledEvidence(
                 .obsolete = conffile.obsolete,
             };
         }
+        const triggers = try allocator.alloc(
+            native_program.TriggerDeclaration,
+            if (record.trigger_declarations) |value| value.len else 0,
+        );
+        if (record.trigger_declarations) |declarations| {
+            for (declarations, 0..) |declaration, trigger_index| {
+                triggers[trigger_index] = .{
+                    .kind = lifecycleTriggerKind(declaration.kind),
+                    .name = declaration.name,
+                };
+            }
+        }
         result[index] = .{
             .name = record.name,
             .version = record.version,
@@ -10529,6 +10895,9 @@ fn lifecycleInstalledEvidence(
             .owned_paths_sha256 = lifecycleOwnedPathsDigest(record),
             .scripts = scripts,
             .conffiles = conffiles,
+            .triggers = triggers,
+            .triggers_pending = record.triggers_pending,
+            .triggers_awaited = record.triggers_awaited,
         };
     }
     return result;
@@ -10574,6 +10943,16 @@ fn lifecycleArchiveEvidence(
                 .remove_on_upgrade = conffile.remove_on_upgrade,
             };
         }
+        const triggers = try allocator.alloc(
+            native_program.TriggerDeclaration,
+            model.triggers.len,
+        );
+        for (model.triggers, 0..) |trigger, trigger_index| {
+            triggers[trigger_index] = .{
+                .kind = lifecycleArchiveTriggerKind(trigger.directive),
+                .name = trigger.target,
+            };
+        }
         const artifact_id = hex(32, model.provenance().sha256);
         const origin: exact_lock_v2.PackageOrigin = .{ .local_artifact = .{
             .artifact_id = artifact_id,
@@ -10595,10 +10974,136 @@ fn lifecycleArchiveEvidence(
             .application_sha256 = model.digest,
             .scripts = scripts[0..script_count],
             .conffiles = conffiles,
+            .triggers = triggers,
             .essential = model.facts.essential,
         };
     }
     return result;
+}
+
+fn lifecycleTriggerAuthority(
+    allocator: std.mem.Allocator,
+    external: ExternalLifecycleRequest,
+    database: package_database.Database,
+    installed: []const native_program.InstalledPackage,
+    archives: []const native_program.Archive,
+    base_final_state: []const native_authorization.FinalPackage,
+) !?native_authorization.TriggerAuthority {
+    if (!external.triggers) return null;
+    var handlers: std.ArrayList(native_authorization.TriggerHandler) = .empty;
+    var callers: std.ArrayList(native_authorization.TriggerCaller) = .empty;
+    var allowed: std.ArrayList([]const u8) = .empty;
+    var incoming: std.StringHashMapUnmanaged(void) = .empty;
+    defer incoming.deinit(allocator);
+    for (archives) |archive| {
+        const key = try std.fmt.allocPrint(
+            allocator,
+            "{s}\x00{s}",
+            .{ archive.package, archive.architecture },
+        );
+        try incoming.put(allocator, key, {});
+        var postinst: ?native_program.ArchiveScript = null;
+        for (archive.scripts) |script| {
+            try callers.append(allocator, .{
+                .package = archive.package,
+                .version = archive.version,
+                .architecture = archive.architecture,
+                .source = .new_package,
+                .kind = script.kind,
+                .script_sha256 = script.sha256,
+            });
+            if (script.kind == .postinst) postinst = script;
+        }
+        var interested = false;
+        for (archive.triggers) |declaration| {
+            if (!declaration.kind.isInterest()) continue;
+            interested = true;
+            try appendUniqueText(allocator, &allowed, declaration.name);
+        }
+        if (interested) {
+            const script = postinst orelse return error.TriggerHandlerMissing;
+            try handlers.append(allocator, .{
+                .package = archive.package,
+                .version = archive.version,
+                .architecture = archive.architecture,
+                .source = .new_package,
+                .postinst_sha256 = script.sha256,
+                .declarations_sha256 = try lifecycleDeclarationsDigest(
+                    allocator,
+                    archive.triggers,
+                ),
+            });
+        }
+    }
+    for (installed) |package| {
+        const key = try std.fmt.allocPrint(
+            allocator,
+            "{s}\x00{s}",
+            .{ package.name, package.architecture },
+        );
+        var postinst: ?native_program.InstalledScript = null;
+        for (package.scripts) |script| {
+            try callers.append(allocator, .{
+                .package = package.name,
+                .version = package.version,
+                .architecture = package.architecture,
+                .source = .installed_package,
+                .kind = script.kind,
+                .script_sha256 = script.sha256,
+            });
+            if (script.kind == .postinst) postinst = script;
+        }
+        if (incoming.contains(key)) continue;
+        var interested = false;
+        for (package.triggers) |declaration| {
+            if (!declaration.kind.isInterest()) continue;
+            interested = true;
+            try appendUniqueText(allocator, &allowed, declaration.name);
+        }
+        if (interested) {
+            const script = postinst orelse return error.TriggerHandlerMissing;
+            try handlers.append(allocator, .{
+                .package = package.name,
+                .version = package.version,
+                .architecture = package.architecture,
+                .source = .installed_package,
+                .postinst_sha256 = script.sha256,
+                .declarations_sha256 = try lifecycleDeclarationsDigest(
+                    allocator,
+                    package.triggers,
+                ),
+            });
+        }
+    }
+    if (handlers.items.len == 0 or allowed.items.len == 0)
+        return error.TriggerAuthorityEmpty;
+    return .{
+        .mode = if (external.operation == .process_triggers)
+            .process_pending
+        else
+            .transaction,
+        .defer_triggers = external.defer_triggers,
+        .initial_state_sha256 = native_trigger.stateDigest(database.model),
+        .handlers = try allocator.dupe(
+            native_authorization.TriggerHandler,
+            handlers.items,
+        ),
+        .callers = try allocator.dupe(
+            native_authorization.TriggerCaller,
+            callers.items,
+        ),
+        .allowed_triggers = try allocator.dupe([]const u8, allowed.items),
+        .maximum_invocations = 256,
+        .final_mode = if (external.defer_triggers)
+            .derive_from_activations
+        else
+            .exact,
+        .base_final_state_sha256 = if (external.defer_triggers)
+            native_authorization.finalStateDigest(base_final_state)
+        else
+            null,
+        .maximum_activations = if (external.defer_triggers) 256 else 0,
+    };
 }
 
 fn lifecycleActionKind(
@@ -10611,6 +11116,7 @@ fn lifecycleActionKind(
         .reinstall, .configure => .reinstall,
         .remove => .remove,
         .purge => .purge,
+        .process_triggers => .reinstall,
     };
 }
 
@@ -10619,7 +11125,7 @@ fn lifecycleFinalState(
     external: ExternalLifecycleRequest,
     database: package_database.Database,
     models: []archive_application.Model,
-) ![]const native_authorization.FinalPackage {
+) ![]native_authorization.FinalPackage {
     var result: std.ArrayList(native_authorization.FinalPackage) = .empty;
     for (database.model.packages) |record| {
         var replaced = false;
@@ -10674,6 +11180,508 @@ fn lifecycleFinalState(
         .dpkg_selection_hold = false,
     });
     return result.toOwnedSlice(allocator);
+}
+
+const SimulatedTriggerPackage = struct {
+    name: []const u8,
+    architecture: []const u8,
+    values: std.ArrayList([]const u8) = .empty,
+};
+
+const RuntimeTriggerEvent = struct {
+    origin: enum { automatic, dynamic },
+    source: package_database.Identity,
+    trigger: []const u8,
+    activation_awaits: bool,
+    listeners: []const package_database.TriggerInterest,
+};
+
+fn appendRuntimeTriggerEvent(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+    source: package_database.Identity,
+    trigger: []const u8,
+    activation_awaits: bool,
+    interests: []const package_database.TriggerInterest,
+    origin: @FieldType(RuntimeTriggerEvent, "origin"),
+) !void {
+    var listeners: std.ArrayList(package_database.TriggerInterest) = .empty;
+    defer listeners.deinit(allocator);
+    for (interests) |interest| {
+        if (std.mem.eql(u8, interest.trigger, trigger))
+            try listeners.append(allocator, .{
+                .trigger = try allocator.dupe(u8, interest.trigger),
+                .package = .{
+                    .name = try allocator.dupe(u8, interest.package.name),
+                    .architecture = try allocator.dupe(
+                        u8,
+                        interest.package.architecture,
+                    ),
+                },
+                .await_mode = interest.await_mode,
+            });
+    }
+    if (listeners.items.len == 0) return;
+    try events.append(allocator, .{
+        .origin = origin,
+        .source = .{
+            .name = try allocator.dupe(u8, source.name),
+            .architecture = try allocator.dupe(u8, source.architecture),
+        },
+        .trigger = try allocator.dupe(u8, trigger),
+        .activation_awaits = activation_awaits,
+        .listeners = try allocator.dupe(
+            package_database.TriggerInterest,
+            listeners.items,
+        ),
+    });
+}
+
+fn collectArchiveTriggerEvents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    model: *const archive_application.Model,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+) !void {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    const source: package_database.Identity = .{
+        .name = model.facts.package,
+        .architecture = model.facts.architecture,
+    };
+    var work: usize = 0;
+    for (model.triggers) |declaration| {
+        if (declaration.kind != .activate) continue;
+        try appendRuntimeTriggerEvent(
+            allocator,
+            events,
+            source,
+            declaration.target,
+            declaration.await_policy == .awaited,
+            database.model.triggers.interests,
+            .automatic,
+        );
+    }
+    var seen_file: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_file.deinit(allocator);
+    for (database.model.triggers.interests) |interest| {
+        if (interest.trigger.len == 0 or interest.trigger[0] != '/' or
+            !(try archiveTouchesFileTrigger(
+                model,
+                interest.trigger,
+                &work,
+                (Limits{}).max_work,
+            )))
+            continue;
+        if ((try seen_file.getOrPut(allocator, interest.trigger)).found_existing)
+            continue;
+        try appendRuntimeTriggerEvent(
+            allocator,
+            events,
+            source,
+            interest.trigger,
+            true,
+            database.model.triggers.interests,
+            .automatic,
+        );
+    }
+}
+
+fn collectRemovalTriggerEvents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    package: native_program.PackageRef,
+    expected_owned_paths: native_program.Digest,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+) !void {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    const record = database.model.find(package.name, package.architecture) orelse return;
+    const expected = parseHex(32, &expected_owned_paths) orelse
+        return error.InvalidLifecycleProgram;
+    if (!std.mem.eql(
+        u8,
+        &expected,
+        &lifecycleOwnedPathsDigest(record.*),
+    )) return error.MaterializationProgramDigest;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    var work: usize = 0;
+    for (database.model.triggers.interests) |interest| {
+        if (interest.trigger.len == 0 or interest.trigger[0] != '/') continue;
+        const prefix = interest.trigger[1..];
+        var touched = false;
+        for (record.paths orelse &.{}) |listed| {
+            work = std.math.add(usize, work, 1) catch
+                return error.TriggerWorkLimit;
+            if (work > (Limits{}).max_work) return error.TriggerWorkLimit;
+            const path = relativeListPath(listed) orelse continue;
+            if (std.mem.eql(u8, path, prefix) or
+                (path.len > prefix.len and path[prefix.len] == '/' and
+                    std.mem.startsWith(u8, path, prefix)))
+                touched = true;
+        }
+        if (!touched or (try seen.getOrPut(allocator, interest.trigger)).found_existing)
+            continue;
+        try appendRuntimeTriggerEvent(
+            allocator,
+            events,
+            record.identity(),
+            interest.trigger,
+            true,
+            database.model.triggers.interests,
+            .automatic,
+        );
+    }
+}
+
+fn simulatedTriggerPackage(
+    allocator: std.mem.Allocator,
+    packages: *std.ArrayList(SimulatedTriggerPackage),
+    index: *std.StringHashMapUnmanaged(usize),
+    name: []const u8,
+    architecture: []const u8,
+) !*SimulatedTriggerPackage {
+    var key_buffer: [512]u8 = undefined;
+    const key = try std.fmt.bufPrint(
+        &key_buffer,
+        "{s}\x00{s}",
+        .{ name, architecture },
+    );
+    if (index.get(key)) |position| return &packages.items[position];
+    const stored = try allocator.dupe(u8, key);
+    const position = packages.items.len;
+    try packages.append(allocator, .{
+        .name = name,
+        .architecture = architecture,
+    });
+    try index.put(allocator, stored, position);
+    return &packages.items[position];
+}
+
+fn appendUniqueText(
+    allocator: std.mem.Allocator,
+    values: *std.ArrayList([]const u8),
+    text: []const u8,
+) !void {
+    for (values.items) |value| {
+        if (std.mem.eql(u8, value, text)) return;
+    }
+    try values.append(allocator, text);
+}
+
+fn simulateTriggerActivation(
+    allocator: std.mem.Allocator,
+    registry: []const package_database.TriggerInterest,
+    pending: *std.ArrayList(SimulatedTriggerPackage),
+    pending_index: *std.StringHashMapUnmanaged(usize),
+    awaited: *std.ArrayList(SimulatedTriggerPackage),
+    awaited_index: *std.StringHashMapUnmanaged(usize),
+    source_name: []const u8,
+    source_architecture: []const u8,
+    trigger: []const u8,
+    activation_awaits: bool,
+) !void {
+    for (registry) |listener| {
+        if (!std.mem.eql(u8, listener.trigger, trigger)) continue;
+        const handler = try simulatedTriggerPackage(
+            allocator,
+            pending,
+            pending_index,
+            listener.package.name,
+            if (listener.package.architecture.len == 0)
+                source_architecture
+            else
+                listener.package.architecture,
+        );
+        try appendUniqueText(allocator, &handler.values, trigger);
+        if (activation_awaits and listener.await_mode == .awaited) {
+            const source = try simulatedTriggerPackage(
+                allocator,
+                awaited,
+                awaited_index,
+                source_name,
+                source_architecture,
+            );
+            try appendUniqueText(allocator, &source.values, listener.package.name);
+        }
+    }
+}
+
+fn archiveTouchesFileTrigger(
+    model: *const archive_application.Model,
+    trigger: []const u8,
+    work: *usize,
+    maximum_work: usize,
+) !bool {
+    if (trigger.len < 2 or trigger[0] != '/') return false;
+    const relative = trigger[1..];
+    for (model.files) |file| {
+        work.* = std.math.add(usize, work.*, 1) catch
+            return error.TriggerWorkLimit;
+        if (work.* > maximum_work) return error.TriggerWorkLimit;
+        if (std.mem.eql(u8, file.path, relative) or
+            (file.path.len > relative.len and
+                file.path[relative.len] == '/' and
+                std.mem.startsWith(u8, file.path, relative)))
+            return true;
+    }
+    return false;
+}
+
+fn derivedHandlerAuthorized(
+    authority: native_authorization.TriggerAuthority,
+    listener: package_database.TriggerInterest,
+    architecture: []const u8,
+) bool {
+    for (authority.handlers) |handler| {
+        if (std.mem.eql(u8, handler.package, listener.package.name) and
+            std.mem.eql(
+                u8,
+                handler.architecture,
+                if (listener.package.architecture.len == 0)
+                    architecture
+                else
+                    listener.package.architecture,
+            ))
+            return true;
+    }
+    return false;
+}
+
+fn derivedTriggerAllowed(
+    authority: native_authorization.TriggerAuthority,
+    trigger: []const u8,
+) bool {
+    for (authority.allowed_triggers) |allowed| {
+        if (std.mem.eql(u8, allowed, trigger)) return true;
+    }
+    return false;
+}
+
+fn deriveDeferredFinalState(
+    allocator: std.mem.Allocator,
+    authorization: native_authorization.Authorization,
+    initial_model: package_database.Model,
+    events: []const RuntimeTriggerEvent,
+) ![]native_authorization.FinalPackage {
+    const authority = authorization.trigger_authority orelse
+        return error.InvalidTriggerAuthority;
+    var activation_count: usize = events.len;
+    for (initial_model.triggers.pending) |queued| {
+        activation_count = std.math.add(
+            usize,
+            activation_count,
+            queued.packages.len + @intFromBool(queued.noawait),
+        ) catch return error.InvalidTriggerAuthority;
+    }
+    if (authority.final_mode != .derive_from_activations or
+        authority.base_final_state_sha256 == null or
+        authority.maximum_activations == 0 or
+        activation_count > authority.maximum_activations)
+        return error.InvalidTriggerAuthority;
+    const base_digest = native_authorization.finalStateDigest(
+        authorization.final_state,
+    );
+    if (!std.mem.eql(
+        u8,
+        &base_digest,
+        &authority.base_final_state_sha256.?,
+    )) return error.InvalidTriggerAuthority;
+    const final_state = try allocator.dupe(
+        native_authorization.FinalPackage,
+        authorization.final_state,
+    );
+    for (final_state) |*package| {
+        if ((package.state != .installed and package.state != .config_files) or
+            package.triggers_pending.len != 0 or
+            package.triggers_awaited.len != 0)
+            return error.InvalidTriggerAuthority;
+        package.triggers_pending = &.{};
+        package.triggers_awaited = &.{};
+    }
+    var pending: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    defer {
+        for (pending.items) |*entry| entry.values.deinit(allocator);
+        pending.deinit(allocator);
+    }
+    var pending_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer pending_index.deinit(allocator);
+    var awaited: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    defer {
+        for (awaited.items) |*entry| entry.values.deinit(allocator);
+        awaited.deinit(allocator);
+    }
+    var awaited_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer awaited_index.deinit(allocator);
+    for (initial_model.packages) |record| {
+        if (authorization.findAction(record.name, record.architecture) != null)
+            continue;
+        if (record.triggers_pending.len != 0) {
+            const entry = try simulatedTriggerPackage(
+                allocator,
+                &pending,
+                &pending_index,
+                record.name,
+                record.architecture,
+            );
+            var index = record.triggers_pending.len;
+            while (index != 0) {
+                index -= 1;
+                try appendUniqueText(
+                    allocator,
+                    &entry.values,
+                    record.triggers_pending[index],
+                );
+            }
+        }
+        if (record.triggers_awaited.len != 0) {
+            const entry = try simulatedTriggerPackage(
+                allocator,
+                &awaited,
+                &awaited_index,
+                record.name,
+                record.architecture,
+            );
+            for (record.triggers_awaited) |name|
+                try appendUniqueText(allocator, &entry.values, name);
+        }
+    }
+    for (initial_model.triggers.pending) |queued| {
+        if (!derivedTriggerAllowed(authority, queued.trigger))
+            return error.InvalidTriggerActivation;
+        for (initial_model.triggers.interests) |listener| {
+            if (!std.mem.eql(u8, listener.trigger, queued.trigger)) continue;
+            if (!derivedHandlerAuthorized(
+                authority,
+                listener,
+                authorization.target_architecture,
+            )) return error.InvalidTriggerActivation;
+        }
+        if (queued.packages.len == 0) {
+            try simulateTriggerActivation(
+                allocator,
+                initial_model.triggers.interests,
+                &pending,
+                &pending_index,
+                &awaited,
+                &awaited_index,
+                "",
+                authorization.target_architecture,
+                queued.trigger,
+                false,
+            );
+        } else {
+            for (queued.packages) |source| {
+                try simulateTriggerActivation(
+                    allocator,
+                    initial_model.triggers.interests,
+                    &pending,
+                    &pending_index,
+                    &awaited,
+                    &awaited_index,
+                    source.package.name,
+                    if (source.package.architecture.len == 0)
+                        authorization.target_architecture
+                    else
+                        source.package.architecture,
+                    queued.trigger,
+                    true,
+                );
+            }
+        }
+    }
+    for (events) |event| {
+        if (!derivedTriggerAllowed(authority, event.trigger))
+            return error.InvalidTriggerActivation;
+        for (event.listeners) |listener| {
+            if (!derivedHandlerAuthorized(
+                authority,
+                listener,
+                authorization.target_architecture,
+            )) return error.InvalidTriggerActivation;
+        }
+        if (event.origin == .automatic and
+            authorization.findAction(
+                event.source.name,
+                event.source.architecture,
+            ) == null)
+            return error.InvalidTriggerActivation;
+        if (event.origin == .dynamic and event.source.name.len != 0) {
+            var caller = false;
+            for (authority.callers) |candidate| {
+                if (std.mem.eql(u8, candidate.package, event.source.name) and
+                    std.mem.eql(
+                        u8,
+                        candidate.architecture,
+                        event.source.architecture,
+                    ))
+                    caller = true;
+            }
+            if (!caller) return error.InvalidTriggerActivation;
+        }
+        try simulateTriggerActivation(
+            allocator,
+            event.listeners,
+            &pending,
+            &pending_index,
+            &awaited,
+            &awaited_index,
+            event.source.name,
+            if (event.source.architecture.len == 0)
+                authorization.target_architecture
+            else
+                event.source.architecture,
+            event.trigger,
+            event.activation_awaits,
+        );
+    }
+    for (final_state) |*package| {
+        var key_buffer: [512]u8 = undefined;
+        const key = try std.fmt.bufPrint(
+            &key_buffer,
+            "{s}\x00{s}",
+            .{ package.name, package.architecture },
+        );
+        if (pending_index.get(key)) |position| {
+            const values = pending.items[position].values.items;
+            const reversed = try allocator.alloc([]const u8, values.len);
+            for (values, 0..) |value, index|
+                reversed[values.len - index - 1] = value;
+            package.triggers_pending = reversed;
+            package.state = .triggers_pending;
+        }
+        if (awaited_index.get(key)) |position| {
+            package.triggers_awaited = try allocator.dupe(
+                []const u8,
+                awaited.items[position].values.items,
+            );
+            package.state = .triggers_awaited;
+        }
+    }
+    return final_state;
 }
 
 fn compileLifecycleProgram(
@@ -10731,7 +11739,8 @@ fn compileLifecycleProgram(
             .artifact = null,
         });
     };
-    if (actions.items.len == 0) return null;
+    if (actions.items.len == 0 and external.operation != .process_triggers)
+        return null;
 
     var ordered: std.ArrayList(solver.OrderedAction) = .empty;
     if (external.ordered_actions) |reviewed| {
@@ -10774,12 +11783,21 @@ fn compileLifecycleProgram(
             .version = action.version,
             .architecture = action.architecture,
         }),
+        .process_triggers => {},
     }
     const final_state = try lifecycleFinalState(
         owned,
         external,
         database,
         models,
+    );
+    const trigger_authority = try lifecycleTriggerAuthority(
+        owned,
+        external,
+        database,
+        installed,
+        archives,
+        final_state,
     );
     var request_sha256: [32]u8 = undefined;
     Sha256.hash(raw_request, &request_sha256, .{});
@@ -10812,6 +11830,7 @@ fn compileLifecycleProgram(
         },
         .actions = actions.items,
         .final_state = final_state,
+        .trigger_authority = trigger_authority,
     });
     errdefer authorization.deinit();
     const compiled = native_program.compile(allocator, .{
@@ -10820,6 +11839,7 @@ fn compileLifecycleProgram(
         .installed = .{
             .generation_sha256 = database.generation.sha256,
             .packages = installed,
+            .trigger_state_sha256 = native_trigger.stateDigest(database.model),
             .updates_pending = database.model.pending_updates.len != 0,
         },
         .archives = archives,
@@ -10892,6 +11912,7 @@ fn lifecyclePhaseRequest(
             .conffiles = .unpack,
             .conffile_policy = policy,
             .lifecycle_execution = true,
+            .trigger_execution = program.trigger_authority != null,
             .lifecycle_sequences = sequences,
         },
         .locks = locks,
@@ -11228,6 +12249,829 @@ fn lifecycleRestoredPackageState(
     );
 }
 
+fn lifecycleTriggerDatabase(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    updates: []const TriggerPackageUpdate,
+    trigger_state: ?package_database.TriggerState,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    return materializeTriggerDatabase(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        updates,
+        trigger_state,
+    );
+}
+
+fn lifecycleSyncTriggerRegistry(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var interests: std.ArrayList(package_database.TriggerInterest) = .empty;
+    defer interests.deinit(allocator);
+    for (database.model.packages) |record| {
+        for (record.trigger_declarations orelse &.{}) |declaration| {
+            if (!declaration.kind.isInterest()) continue;
+            try interests.append(allocator, .{
+                .trigger = try owned.dupe(u8, declaration.name),
+                .package = .{
+                    .name = try owned.dupe(u8, record.name),
+                    .architecture = if (std.mem.eql(
+                        u8,
+                        record.info_stem,
+                        record.name,
+                    ))
+                        ""
+                    else
+                        try owned.dupe(u8, record.architecture),
+                },
+                .await_mode = declaration.kind.awaitMode(),
+            });
+        }
+    }
+    return lifecycleTriggerDatabase(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{},
+        .{
+            .interests = try owned.dupe(
+                package_database.TriggerInterest,
+                interests.items,
+            ),
+            .pending = database.model.triggers.pending,
+        },
+    );
+}
+
+fn lifecycleApplyTriggerEvents(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    events: []const RuntimeTriggerEvent,
+    clear_queue: bool,
+) !MaterializationResult {
+    if (events.len == 0 and !clear_queue)
+        return .{ .outcome = .applied, .detail = "no_trigger_events" };
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var pending: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    defer {
+        for (pending.items) |*entry| entry.values.deinit(owned);
+        pending.deinit(owned);
+    }
+    var pending_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer pending_index.deinit(owned);
+    var awaited: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    defer {
+        for (awaited.items) |*entry| entry.values.deinit(owned);
+        awaited.deinit(owned);
+    }
+    var awaited_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer awaited_index.deinit(owned);
+    for (database.model.packages) |record| {
+        if (record.triggers_pending.len != 0) {
+            const entry = try simulatedTriggerPackage(
+                owned,
+                &pending,
+                &pending_index,
+                record.name,
+                record.architecture,
+            );
+            var index = record.triggers_pending.len;
+            while (index != 0) {
+                index -= 1;
+                try appendUniqueText(
+                    owned,
+                    &entry.values,
+                    record.triggers_pending[index],
+                );
+            }
+        }
+        if (record.triggers_awaited.len != 0) {
+            const entry = try simulatedTriggerPackage(
+                owned,
+                &awaited,
+                &awaited_index,
+                record.name,
+                record.architecture,
+            );
+            for (record.triggers_awaited) |name|
+                try appendUniqueText(owned, &entry.values, name);
+        }
+    }
+    for (events) |event| {
+        for (event.listeners) |listener| {
+            const handler = try simulatedTriggerPackage(
+                owned,
+                &pending,
+                &pending_index,
+                listener.package.name,
+                if (listener.package.architecture.len == 0)
+                    program.target_architecture
+                else
+                    listener.package.architecture,
+            );
+            try appendUniqueText(owned, &handler.values, event.trigger);
+            if (event.activation_awaits and listener.await_mode == .awaited) {
+                const source = try simulatedTriggerPackage(
+                    owned,
+                    &awaited,
+                    &awaited_index,
+                    event.source.name,
+                    event.source.architecture,
+                );
+                try appendUniqueText(owned, &source.values, listener.package.name);
+            }
+        }
+    }
+    var updates: std.ArrayList(TriggerPackageUpdate) = .empty;
+    defer updates.deinit(allocator);
+    for (database.model.packages) |record| {
+        var key_buffer: [512]u8 = undefined;
+        const key = try std.fmt.bufPrint(
+            &key_buffer,
+            "{s}\x00{s}",
+            .{ record.name, record.architecture },
+        );
+        const pending_position = pending_index.get(key);
+        const awaited_position = awaited_index.get(key);
+        if (pending_position == null and awaited_position == null) continue;
+        const pending_values = if (pending_position) |position|
+            pending.items[position].values.items
+        else
+            &.{};
+        const reversed = try owned.alloc([]const u8, pending_values.len);
+        for (pending_values, 0..) |trigger, index|
+            reversed[pending_values.len - index - 1] = trigger;
+        const awaited_values = if (awaited_position) |position|
+            awaited.items[position].values.items
+        else
+            &.{};
+        try updates.append(allocator, .{
+            .package = record.identity(),
+            .current = if (awaited_values.len != 0)
+                .triggers_awaited
+            else
+                .triggers_pending,
+            .config_version = null,
+            .pending = reversed,
+            .awaited = awaited_values,
+        });
+    }
+    return lifecycleTriggerDatabase(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        updates.items,
+        .{
+            .interests = database.model.triggers.interests,
+            .pending = if (clear_queue) &.{} else database.model.triggers.pending,
+        },
+    );
+}
+
+fn lifecyclePublishDerivedFinalState(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    initial_model: package_database.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    events: []const RuntimeTriggerEvent,
+) !MaterializationResult {
+    const expected = try deriveDeferredFinalState(
+        scratch,
+        authorization.*,
+        initial_model,
+        events,
+    );
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    var updates: std.ArrayList(TriggerPackageUpdate) = .empty;
+    defer updates.deinit(allocator);
+    for (expected) |package| {
+        if (package.state == .config_files) continue;
+        const record = database.model.find(
+            package.name,
+            package.architecture,
+        ) orelse return .{
+            .outcome = .refused,
+            .detail = "derived_trigger_package_missing",
+        };
+        try updates.append(allocator, .{
+            .package = record.identity(),
+            .current = switch (package.state) {
+                .installed => .installed,
+                .triggers_pending => .triggers_pending,
+                .triggers_awaited => .triggers_awaited,
+                .config_files => unreachable,
+            },
+            .config_version = null,
+            .pending = package.triggers_pending,
+            .awaited = package.triggers_awaited,
+        });
+    }
+    return lifecycleTriggerDatabase(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        updates.items,
+        .{
+            .interests = database.model.triggers.interests,
+            .pending = &.{},
+        },
+    );
+}
+
+fn lifecycleIncorporateTriggerQueue(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    activation_allocator: ?std.mem.Allocator,
+    activation_log: ?*std.ArrayList(RuntimeTriggerEvent),
+    apply_events: bool,
+    initial_pending: []const package_database.PendingTrigger,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "trigger_queue_rejected" },
+    };
+    defer database.deinit();
+    if (database.model.triggers.pending.len == 0)
+        return .{ .outcome = .applied, .detail = "trigger_queue_empty" };
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    defer events.deinit(owned);
+    for (database.model.triggers.pending) |pending| {
+        if (pending.packages.len == 0) {
+            try appendRuntimeTriggerEvent(
+                owned,
+                &events,
+                .{ .name = "", .architecture = "" },
+                pending.trigger,
+                false,
+                database.model.triggers.interests,
+                .dynamic,
+            );
+        } else {
+            for (pending.packages) |source| {
+                try appendRuntimeTriggerEvent(
+                    owned,
+                    &events,
+                    .{
+                        .name = source.package.name,
+                        .architecture = if (source.package.architecture.len == 0)
+                            program.target_architecture
+                        else
+                            source.package.architecture,
+                    },
+                    pending.trigger,
+                    true,
+                    database.model.triggers.interests,
+                    .dynamic,
+                );
+            }
+            if (pending.noawait)
+                try appendRuntimeTriggerEvent(
+                    owned,
+                    &events,
+                    .{ .name = "", .architecture = "" },
+                    pending.trigger,
+                    false,
+                    database.model.triggers.interests,
+                    .dynamic,
+                );
+        }
+    }
+    if (activation_log) |log| {
+        const destination = activation_allocator orelse return error.InvalidLifecycleProgram;
+        for (database.model.triggers.pending) |pending| {
+            const initial = for (initial_pending) |candidate| {
+                if (std.mem.eql(u8, candidate.trigger, pending.trigger))
+                    break candidate;
+            } else null;
+            for (pending.packages) |source| {
+                var existed = false;
+                if (initial) |before| for (before.packages) |candidate| {
+                    if (package_database.Identity.eql(
+                        source.package,
+                        candidate.package,
+                    )) existed = true;
+                };
+                if (existed) continue;
+                try appendRuntimeTriggerEvent(
+                    destination,
+                    log,
+                    .{
+                        .name = source.package.name,
+                        .architecture = if (source.package.architecture.len == 0)
+                            program.target_architecture
+                        else
+                            source.package.architecture,
+                    },
+                    pending.trigger,
+                    true,
+                    database.model.triggers.interests,
+                    .dynamic,
+                );
+            }
+            if (pending.noawait and
+                (initial == null or !initial.?.noawait))
+                try appendRuntimeTriggerEvent(
+                    destination,
+                    log,
+                    .{ .name = "", .architecture = "" },
+                    pending.trigger,
+                    false,
+                    database.model.triggers.interests,
+                    .dynamic,
+                );
+        }
+    }
+    if (apply_events)
+        return lifecycleApplyTriggerEvents(
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            events.items,
+            true,
+        );
+    return lifecycleTriggerDatabase(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{},
+        .{
+            .interests = database.model.triggers.interests,
+            .pending = &.{},
+        },
+    );
+}
+
+const PendingTriggerHandler = struct {
+    package: native_program.PackageIdentity,
+    state_sha256: [32]u8,
+    triggers: []const []const u8,
+};
+
+fn nextPendingTriggerHandler(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+) !?PendingTriggerHandler {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    const state_sha256 = native_trigger.stateDigest(database.model);
+    for (database.model.packages) |record| {
+        if (record.triggers_pending.len == 0) continue;
+        const triggers = try allocator.alloc(
+            []const u8,
+            record.triggers_pending.len,
+        );
+        for (record.triggers_pending, 0..) |trigger, index|
+            triggers[record.triggers_pending.len - index - 1] =
+                try allocator.dupe(u8, trigger);
+        return .{
+            .package = .{
+                .name = try allocator.dupe(u8, record.name),
+                .version = try allocator.dupe(u8, record.version),
+                .architecture = try allocator.dupe(u8, record.architecture),
+            },
+            .state_sha256 = state_sha256,
+            .triggers = triggers,
+        };
+    }
+    return null;
+}
+
+fn triggerHandlerBinding(
+    program: native_program.Program,
+    package: native_program.PackageIdentity,
+) ?native_program.TriggerHandlerBinding {
+    const authority = program.trigger_authority orelse return null;
+    for (authority.handlers) |handler| {
+        if (std.mem.eql(u8, handler.package.name, package.name) and
+            std.mem.eql(u8, handler.package.version, package.version) and
+            std.mem.eql(
+                u8,
+                handler.package.architecture,
+                package.architecture,
+            ))
+            return handler;
+    }
+    return null;
+}
+
+fn lifecycleCompleteTriggerHandler(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    handler: native_program.PackageIdentity,
+    failure: ?struct {
+        config_version: ?[]const u8,
+        error_state: package_database.ErrorState = .ok,
+    },
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var updates: std.ArrayList(TriggerPackageUpdate) = .empty;
+    defer updates.deinit(allocator);
+    for (database.model.packages) |record| {
+        if (std.mem.eql(u8, record.name, handler.name) and
+            std.mem.eql(u8, record.architecture, handler.architecture))
+        {
+            try updates.append(allocator, .{
+                .package = record.identity(),
+                .current = if (failure != null)
+                    .half_configured
+                else if (record.triggers_awaited.len != 0)
+                    .triggers_awaited
+                else
+                    .installed,
+                .error_state = if (failure) |value| value.error_state else .ok,
+                .config_version = if (failure) |value| value.config_version else null,
+                .pending = &.{},
+                .awaited = if (failure == null) record.triggers_awaited else &.{},
+            });
+            continue;
+        }
+        var awaited: std.ArrayList([]const u8) = .empty;
+        defer awaited.deinit(owned);
+        for (record.triggers_awaited) |name| {
+            if (!std.mem.eql(u8, name, handler.name))
+                try awaited.append(owned, name);
+        }
+        if (awaited.items.len == record.triggers_awaited.len) continue;
+        try updates.append(allocator, .{
+            .package = record.identity(),
+            .current = if (awaited.items.len == 0)
+                .installed
+            else
+                .triggers_awaited,
+            .config_version = null,
+            .pending = record.triggers_pending,
+            .awaited = try owned.dupe([]const u8, awaited.items),
+        });
+    }
+    return lifecycleTriggerDatabase(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        updates.items,
+        .{
+            .interests = database.model.triggers.interests,
+            .pending = database.model.triggers.pending,
+        },
+    );
+}
+
+fn lifecycleProcessTriggers(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    sequence: u32,
+    inject_unknown: bool,
+) !LifecycleResult {
+    var incorporated = try lifecycleIncorporateTriggerQueue(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        null,
+        null,
+        true,
+        &.{},
+    );
+    if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
+    var produced: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer produced.deinit(allocator);
+    var used_fault = false;
+    var invocation_count: u32 = 0;
+    const maximum_invocations = program.trigger_authority.?.maximum_invocations;
+    while (try nextPendingTriggerHandler(
+        scratch,
+        root,
+        program.target_architecture,
+    )) |handler| {
+        if (invocation_count >= maximum_invocations)
+            return .{
+                .outcome = .trigger_failed,
+                .detail = "trigger_invocation_limit",
+                .program_sha256 = program.digest_sha256,
+            };
+        invocation_count += 1;
+        const binding = triggerHandlerBinding(program.*, handler.package) orelse
+            return .{ .outcome = .refused, .detail = "trigger_handler_unbound" };
+        const joined = try std.mem.join(scratch, " ", handler.triggers);
+        const arguments = [_][]const u8{ "triggered", joined };
+        const outcome = try runLifecycleScript(
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            attempt,
+            sequence,
+            handler.package,
+            handler.package,
+            .postinst,
+            switch (binding.source) {
+                .installed_package => .installed_package,
+                .new_package => .new_package,
+            },
+            binding.postinst_sha256,
+            &arguments,
+            inject_unknown and !used_fault,
+        );
+        used_fault = true;
+        const code = switch (outcome) {
+            .recovery_required => return .{
+                .outcome = .recovery_required,
+                .detail = "trigger_script_outcome_unknown",
+                .program_sha256 = program.digest_sha256,
+            },
+            .exited => |value| value,
+        };
+        if (code != 0) {
+            const failed = try lifecycleCompleteTriggerHandler(
+                allocator,
+                root,
+                install_root,
+                program,
+                authorization,
+                locks,
+                attempt,
+                operation,
+                policy,
+                handler.package,
+                .{ .config_version = handler.package.version },
+            );
+            if (lifecycleMaterializationFailure(failed)) |failure| return failure;
+            return .{
+                .outcome = .trigger_failed,
+                .detail = "triggered_postinst",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+        const completed = try lifecycleCompleteTriggerHandler(
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            handler.package,
+            null,
+        );
+        if (lifecycleMaterializationFailure(completed)) |failure| return failure;
+        incorporated = try lifecycleIncorporateTriggerQueue(
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            null,
+            null,
+            true,
+            &.{},
+        );
+        if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
+        const next = (try nextPendingTriggerHandler(
+            scratch,
+            root,
+            program.target_architecture,
+        )) orelse return .{
+            .outcome = .applied,
+            .detail = "triggers_processed",
+            .program_sha256 = program.digest_sha256,
+        };
+        const self_cycle = std.mem.eql(u8, next.package.name, handler.package.name) and
+            std.mem.eql(
+                u8,
+                next.package.architecture,
+                handler.package.architecture,
+            ) and std.mem.eql(u8, &next.state_sha256, &handler.state_sha256);
+        if (self_cycle or produced.contains(next.state_sha256)) {
+            const failed = try lifecycleCompleteTriggerHandler(
+                allocator,
+                root,
+                install_root,
+                program,
+                authorization,
+                locks,
+                attempt,
+                operation,
+                policy,
+                next.package,
+                .{
+                    .config_version = next.package.version,
+                },
+            );
+            if (lifecycleMaterializationFailure(failed)) |failure| return failure;
+            return .{
+                .outcome = .trigger_failed,
+                .detail = "trigger_cycle_no_progress",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+        try produced.put(allocator, next.state_sha256, {});
+    }
+    return .{
+        .outcome = .applied,
+        .detail = "triggers_processed",
+        .program_sha256 = program.digest_sha256,
+    };
+}
+
 fn lifecycleAuxiliary(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -11274,6 +13118,113 @@ const lifecycle_script_directories = [_][]const u8{
 
 fn lifecycleScriptPolicy() maintainer_script.Policy {
     return .{ .script_directories = &lifecycle_script_directories };
+}
+
+fn publishTriggerAuthority(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    attempt: *root_operation.Attempt,
+) !?[]u8 {
+    const authority = program.trigger_authority orelse return null;
+    const handlers = try allocator.alloc(native_trigger.Handler, authority.handlers.len);
+    defer allocator.free(handlers);
+    for (authority.handlers, 0..) |handler, index| {
+        handlers[index] = .{
+            .package = handler.package.name,
+            .version = handler.package.version,
+            .architecture = handler.package.architecture,
+            .source = switch (handler.source) {
+                .installed_package => .installed_package,
+                .new_package => .new_package,
+            },
+            .postinst_sha256 = parseHex(
+                32,
+                &handler.postinst_sha256,
+            ) orelse return error.InvalidLifecycleProgram,
+            .declarations_sha256 = parseHex(
+                32,
+                &handler.declarations_sha256,
+            ) orelse return error.InvalidLifecycleProgram,
+        };
+    }
+    const callers = try allocator.alloc(native_trigger.Caller, authority.callers.len);
+    defer allocator.free(callers);
+    for (authority.callers, 0..) |caller, index| {
+        callers[index] = .{
+            .package = caller.package.name,
+            .version = caller.package.version,
+            .architecture = caller.package.architecture,
+            .source = switch (caller.source) {
+                .installed_package => .installed_package,
+                .new_package => .new_package,
+            },
+            .kind = caller.kind,
+            .script_sha256 = parseHex(
+                32,
+                &caller.script_sha256,
+            ) orelse return error.InvalidLifecycleProgram,
+        };
+    }
+    const bytes = try native_trigger.authorityJson(allocator, .{
+        .program_sha256 = parseHex(
+            32,
+            &program.digest_sha256,
+        ) orelse return error.InvalidLifecycleProgram,
+        .attempt_id = attempt.record().attempt_id,
+        .initial_state_sha256 = parseHex(
+            32,
+            &authority.initial_state_sha256,
+        ) orelse return error.InvalidLifecycleProgram,
+        .handlers = handlers,
+        .callers = callers,
+        .allowed_triggers = authority.allowed_triggers,
+        .maximum_invocations = authority.maximum_invocations,
+        .final_mode = switch (authority.final_mode) {
+            .exact => .exact,
+            .derive_from_activations => .derive_from_activations,
+        },
+        .base_final_state_sha256 = if (authority.base_final_state_sha256) |digest|
+            parseHex(32, &digest) orelse return error.InvalidLifecycleProgram
+        else
+            null,
+        .maximum_activations = authority.maximum_activations,
+    });
+    errdefer allocator.free(bytes);
+    if (bytes.len > native_trigger.maximum_document_bytes)
+        return error.TriggerAuthorityTooLarge;
+    try root.publishFile(
+        try root_fs.Path.init(native_trigger.authority_path),
+        bytes,
+        .{
+            .permissions = if (builtin.os.tag == .windows)
+                .default_file
+            else
+                .fromMode(0o600),
+            .overwrite = .fail_if_exists,
+            .durable = true,
+        },
+    );
+    return bytes;
+}
+
+fn clearTriggerAuthority(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    expected: ?[]const u8,
+) !void {
+    const bytes = expected orelse return;
+    const path = try root_fs.Path.init(native_trigger.authority_path);
+    const observed = try root.readFileAlloc(
+        allocator,
+        path,
+        native_trigger.maximum_document_bytes,
+    );
+    defer allocator.free(observed);
+    if (!std.mem.eql(u8, bytes, observed))
+        return error.TriggerAuthorityChanged;
+    try root.removeFile(path);
+    try root.syncDirectory(try root_fs.Path.init(root_operation.namespace_path));
 }
 
 const LifecycleStaging = struct {
@@ -11650,13 +13601,15 @@ fn runLifecycleScript(
     attempt: *root_operation.Attempt,
     sequence: u32,
     target: native_program.PackageIdentity,
+    bound_owner: ?native_program.PackageIdentity,
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
     script_sha256: native_program.Digest,
     arguments: []const []const u8,
     inject_unknown: bool,
 ) !LifecycleScriptOutcome {
-    const package = try lifecycleScriptOwner(authorization.*, target, source);
+    const package = bound_owner orelse
+        try lifecycleScriptOwner(authorization.*, target, source);
     const path = try lifecycleScriptPath(
         allocator,
         root,
@@ -11821,6 +13774,7 @@ fn postUnpackHook(
         context.attempt,
         context.script.sequence,
         context.script.call.package,
+        null,
         context.script.call.kind,
         context.script.call.source,
         context.script.call.script_sha256,
@@ -11846,6 +13800,7 @@ fn postUnpackHook(
             context.attempt,
             context.script.sequence,
             context.script.call.package,
+            null,
             unwind.kind,
             unwind.source,
             unwind.script_sha256,
@@ -11881,6 +13836,7 @@ fn postUnpackHook(
             context.attempt,
             context.script.sequence,
             context.script.call.package,
+            null,
             call.kind,
             call.source,
             call.script_sha256,
@@ -12002,31 +13958,56 @@ fn lifecycleDatabaseMatchesProgram(
 }
 
 fn lifecycleFinalClosureMatches(
-    authorization: native_authorization.Authorization,
+    expected_state: []const native_authorization.FinalPackage,
     database: package_database.Database,
 ) bool {
-    if (database.model.packages.len != authorization.final_state.len)
+    if (database.model.packages.len != expected_state.len)
         return false;
-    for (authorization.final_state) |expected| {
+    for (expected_state) |expected| {
         const record = database.model.find(
             expected.name,
             expected.architecture,
         ) orelse return false;
-        if (!std.mem.eql(u8, record.version, expected.version) or
-            record.status.error_state != .ok)
-            return false;
-        const state_matches = switch (expected.state) {
-            .installed => record.status.current == .installed,
-            .config_files => record.status.current == .config_files,
-        };
-        if (!state_matches) return false;
-        const want_matches = if (expected.dpkg_selection_hold)
-            record.status.want == .hold
-        else switch (expected.state) {
-            .installed => record.status.want == .install,
-            .config_files => record.status.want == .deinstall,
-        };
-        if (!want_matches) return false;
+        if (!lifecycleFinalPackageMatches(expected, record.*)) return false;
+    }
+    return true;
+}
+
+fn lifecycleFinalPackageMatches(
+    expected: native_authorization.FinalPackage,
+    record: package_database.PackageRecord,
+) bool {
+    if (!std.mem.eql(u8, record.version, expected.version) or
+        record.status.error_state != .ok)
+        return false;
+    const state_matches = switch (expected.state) {
+        .installed => record.status.current == .installed,
+        .config_files => record.status.current == .config_files,
+        .triggers_pending => record.status.current == .triggers_pending,
+        .triggers_awaited => record.status.current == .triggers_awaited,
+    };
+    if (!state_matches) return false;
+    if (!textSlicesEqual(
+        expected.triggers_pending,
+        record.triggers_pending,
+    ) or
+        !textSlicesEqual(
+            expected.triggers_awaited,
+            record.triggers_awaited,
+        ))
+        return false;
+    return if (expected.dpkg_selection_hold)
+        record.status.want == .hold
+    else switch (expected.state) {
+        .installed, .triggers_pending, .triggers_awaited => record.status.want == .install,
+        .config_files => record.status.want == .deinstall,
+    };
+}
+
+fn textSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
     }
     return true;
 }
@@ -12035,7 +14016,7 @@ fn verifyLifecycleFinalClosure(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
-    authorization: native_authorization.Authorization,
+    expected_state: []const native_authorization.FinalPackage,
 ) !bool {
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
@@ -12052,7 +14033,7 @@ fn verifyLifecycleFinalClosure(
         .diagnostic => return false,
     };
     defer database.deinit();
-    return lifecycleFinalClosureMatches(authorization, database);
+    return lifecycleFinalClosureMatches(expected_state, database);
 }
 
 fn executeLifecycleProgram(
@@ -12170,18 +14151,31 @@ fn executeLifecycleProgram(
             .program_sha256 = program.digest_sha256,
         };
     }
+    try attempt.advance(allocator, .{
+        .state = .preflight,
+        .phase = .preflight,
+    });
 
     const scratch_arena = try allocator.create(std.heap.ArenaAllocator);
     defer allocator.destroy(scratch_arena);
     scratch_arena.* = .init(allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
+    const trigger_authority_bytes = try publishTriggerAuthority(
+        allocator,
+        root,
+        program.*,
+        &attempt,
+    );
+    defer if (trigger_authority_bytes) |bytes| allocator.free(bytes);
     var staging: LifecycleStaging = .{};
     defer staging.deinit(allocator);
     var configured: std.StringHashMapUnmanaged(void) = .empty;
     defer configured.deinit(allocator);
     var consumed_scripts: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer consumed_scripts.deinit(allocator);
+    var trigger_events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    defer trigger_events.deinit(scratch);
     var fault_used = false;
     var crossed_configure_barrier = false;
     var status_old_baseline = try scratch.dupe(
@@ -12312,6 +14306,7 @@ fn executeLifecycleProgram(
                                 &attempt,
                                 hook_context.script.sequence,
                                 intent.package,
+                                null,
                                 compensation.kind,
                                 compensation.source,
                                 compensation.script_sha256,
@@ -12403,6 +14398,11 @@ fn executeLifecycleProgram(
                     );
                     if (lifecycleMaterializationFailure(restored)) |failure|
                         return failure;
+                    try clearTriggerAuthority(
+                        allocator,
+                        root,
+                        trigger_authority_bytes,
+                    );
                     try finishLifecycleAttempt(
                         allocator,
                         &attempt,
@@ -12419,6 +14419,45 @@ fn executeLifecycleProgram(
                 }
             }
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            if (program.trigger_authority != null) {
+                const synced = try lifecycleSyncTriggerRegistry(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                );
+                if (lifecycleMaterializationFailure(synced)) |failure|
+                    return failure;
+                const model_index = lifecycleArchiveIndex(
+                    models,
+                    intent.package,
+                ) orelse return error.InvalidLifecycleProgram;
+                const artifact = lifecycleProgramArtifact(
+                    program.*,
+                    intent.package,
+                ) orelse return error.InvalidLifecycleProgram;
+                const application = parseHex(
+                    32,
+                    &artifact.application_sha256,
+                ) orelse return error.InvalidLifecycleProgram;
+                if (!std.mem.eql(
+                    u8,
+                    &application,
+                    &models[model_index].digest,
+                )) return error.InvalidLifecycleProgram;
+                try collectArchiveTriggerEvents(
+                    scratch,
+                    root,
+                    program.target_architecture,
+                    &models[model_index],
+                    &trigger_events,
+                );
+            }
         },
         .configure_barrier => {
             crossed_configure_barrier = true;
@@ -12500,6 +14539,15 @@ fn executeLifecycleProgram(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
         .remove_package_files => |intent| {
+            if (program.trigger_authority != null)
+                try collectRemovalTriggerEvents(
+                    scratch,
+                    root,
+                    program.target_architecture,
+                    intent.package.ref(),
+                    intent.owned_paths_sha256,
+                    &trigger_events,
+                );
             const result = try lifecycleRemovePackage(
                 allocator,
                 root,
@@ -12514,6 +14562,21 @@ fn executeLifecycleProgram(
                 false,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            if (program.trigger_authority != null) {
+                const synced = try lifecycleSyncTriggerRegistry(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                );
+                if (lifecycleMaterializationFailure(synced)) |failure|
+                    return failure;
+            }
         },
         .purge_package_files => |intent| {
             const result = try lifecycleRemovePackage(
@@ -12530,6 +14593,21 @@ fn executeLifecycleProgram(
                 true,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            if (program.trigger_authority != null) {
+                const synced = try lifecycleSyncTriggerRegistry(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                );
+                if (lifecycleMaterializationFailure(synced)) |failure|
+                    return failure;
+            }
         },
         .run_maintainer_script => |call| {
             if (consumed_scripts.contains(step.sequence)) continue;
@@ -12565,6 +14643,7 @@ fn executeLifecycleProgram(
                 &attempt,
                 step.sequence,
                 call.package,
+                null,
                 call.kind,
                 call.source,
                 call.script_sha256,
@@ -12592,6 +14671,7 @@ fn executeLifecycleProgram(
                     &attempt,
                     step.sequence,
                     call.package,
+                    null,
                     unwind.kind,
                     unwind.source,
                     unwind.script_sha256,
@@ -12637,6 +14717,7 @@ fn executeLifecycleProgram(
                     &attempt,
                     step.sequence,
                     call.package,
+                    null,
                     compensation.kind,
                     compensation.source,
                     compensation.script_sha256,
@@ -12853,6 +14934,11 @@ fn executeLifecycleProgram(
                 if (lifecycleMaterializationFailure(restored)) |failure|
                     return failure;
             }
+            try clearTriggerAuthority(
+                allocator,
+                root,
+                trigger_authority_bytes,
+            );
             try finishLifecycleAttempt(allocator, &attempt, program_sha256, false);
             attempt.release();
             attempt_active = false;
@@ -12862,13 +14948,139 @@ fn executeLifecycleProgram(
                 .program_sha256 = program.digest_sha256,
             };
         },
-        .record_trigger_interests,
-        .activate_trigger,
-        .process_deferred_triggers,
-        => return .{
-            .outcome = .handoff,
-            .detail = "trigger",
-            .program_sha256 = program.digest_sha256,
+        .record_trigger_interests, .activate_trigger => {
+            if (program.trigger_authority == null)
+                return .{
+                    .outcome = .handoff,
+                    .detail = "trigger",
+                    .program_sha256 = program.digest_sha256,
+                };
+        },
+        .process_deferred_triggers => {
+            if (program.trigger_authority == null)
+                return .{
+                    .outcome = .handoff,
+                    .detail = "trigger",
+                    .program_sha256 = program.digest_sha256,
+                };
+            if (program.trigger_authority.?.defer_triggers) {
+                const incorporated = try lifecycleIncorporateTriggerQueue(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    scratch,
+                    &trigger_events,
+                    false,
+                    initial_model.triggers.pending,
+                );
+                if (lifecycleMaterializationFailure(incorporated)) |failure|
+                    return failure;
+                const derived = try lifecyclePublishDerivedFinalState(
+                    allocator,
+                    scratch,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    initial_model,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    trigger_events.items,
+                );
+                if (lifecycleMaterializationFailure(derived)) |failure|
+                    return failure;
+                continue;
+            }
+            const applied_events = try lifecycleApplyTriggerEvents(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                trigger_events.items,
+                false,
+            );
+            if (lifecycleMaterializationFailure(applied_events)) |failure|
+                return failure;
+            const trigger_result = try lifecycleProcessTriggers(
+                allocator,
+                scratch,
+                root,
+                external.root,
+                program,
+                authorization,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                step.sequence,
+                external.fault != null and std.mem.eql(
+                    u8,
+                    external.fault.?,
+                    "after_triggered_postinst_before_record",
+                ),
+            );
+            switch (trigger_result.outcome) {
+                .applied => {},
+                .recovery_required => return trigger_result,
+                .trigger_failed => {
+                    const cleanup = try cleanupLifecycleStaging(
+                        allocator,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        locks,
+                        &attempt,
+                        operation,
+                        conffile_policy,
+                        &staging,
+                    );
+                    if (lifecycleMaterializationFailure(cleanup)) |failure|
+                        return failure;
+                    const restored = try restoreLifecycleStatusOld(
+                        allocator,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        locks,
+                        &attempt,
+                        operation,
+                        conffile_policy,
+                        status_old_baseline,
+                    );
+                    if (lifecycleMaterializationFailure(restored)) |failure|
+                        return failure;
+                    try clearTriggerAuthority(
+                        allocator,
+                        root,
+                        trigger_authority_bytes,
+                    );
+                    try finishLifecycleAttempt(
+                        allocator,
+                        &attempt,
+                        program_sha256,
+                        false,
+                    );
+                    attempt.release();
+                    attempt_active = false;
+                    return trigger_result;
+                },
+                .script_failed, .handoff, .refused => return trigger_result,
+            }
         },
     };
 
@@ -12898,11 +15110,31 @@ fn executeLifecycleProgram(
         status_old_baseline,
     );
     if (lifecycleMaterializationFailure(restored)) |failure| return failure;
+    const expected_final_state =
+        if (program.trigger_authority) |trigger|
+            if (trigger.final_mode == .derive_from_activations)
+                deriveDeferredFinalState(
+                    scratch,
+                    authorization.*,
+                    initial_model,
+                    trigger_events.items,
+                ) catch {
+                    try attempt.requireRecovery(allocator, .verification);
+                    return .{
+                        .outcome = .recovery_required,
+                        .detail = "derived_final_state_failed",
+                        .program_sha256 = program.digest_sha256,
+                    };
+                }
+            else
+                authorization.final_state
+        else
+            authorization.final_state;
     const closure_matches = verifyLifecycleFinalClosure(
         allocator,
         root,
         program.target_architecture,
-        authorization.*,
+        expected_final_state,
     ) catch {
         try attempt.requireRecovery(allocator, .verification);
         return .{
@@ -12919,6 +15151,11 @@ fn executeLifecycleProgram(
             .program_sha256 = program.digest_sha256,
         };
     }
+    try clearTriggerAuthority(
+        allocator,
+        root,
+        trigger_authority_bytes,
+    );
     try finishLifecycleAttempt(allocator, &attempt, program_sha256, true);
     attempt.release();
     attempt_active = false;
@@ -13002,7 +15239,7 @@ fn externalProductOperation(value: ExternalMaterializationOperation) product_api
         .install, .downgrade => .install,
         .upgrade => .upgrade,
         .reinstall => .reinstall,
-        .configure => .install,
+        .configure, .process_triggers => .install,
         .remove, .purge => .remove,
     };
 }
@@ -13030,13 +15267,14 @@ test "native_unpack.test.materialization external fixture" {
     const external = parsed.value;
     const archive_phase = switch (external.operation) {
         .install, .upgrade, .downgrade, .reinstall, .configure => true,
-        .remove, .purge => false,
+        .remove, .purge, .process_triggers => false,
     };
     if (!absolute_path.nonRoot(external.root) or
         !absolute_path.nonRoot(external.report) or
         (archive_phase != (external.archives.len != 0)) or
         ((external.operation == .remove or external.operation == .purge) and
             external.packages.len == 0) or
+        external.operation == .process_triggers or
         (!std.mem.eql(u8, external.architecture, "amd64") and
             !std.mem.eql(u8, external.architecture, "arm64")))
         return error.InvalidExternalMaterializationRequest;
@@ -13176,7 +15414,7 @@ test "native_unpack.test.materialization external fixture" {
                     installed.parsed_version.order(incoming_version) != .eq)
                     return error.InvalidExternalOperation;
             },
-            .remove, .purge => unreachable,
+            .remove, .purge, .process_triggers => unreachable,
         }
         steps[index] = unpackStep(
             artifact,
@@ -13406,6 +15644,319 @@ test "native_unpack.test.lifecycle detects stale post-compilation database gener
     try testing.expect(!lifecycleDatabaseMatchesProgram(program, matching, 3));
 }
 
+test "native_unpack.test.trigger authority binds old and new scripts of every kind" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const installed_scripts = [_]native_program.InstalledScript{
+        .{ .kind = .preinst, .sha256 = @splat(0x11) },
+        .{ .kind = .postinst, .sha256 = @splat(0x12) },
+        .{ .kind = .prerm, .sha256 = @splat(0x13) },
+        .{ .kind = .postrm, .sha256 = @splat(0x14) },
+    };
+    const archive_scripts = [_]native_program.ArchiveScript{
+        .{ .kind = .preinst, .sha256 = @splat(0x21) },
+        .{ .kind = .postinst, .sha256 = @splat(0x22) },
+        .{ .kind = .prerm, .sha256 = @splat(0x23) },
+        .{ .kind = .postrm, .sha256 = @splat(0x24) },
+    };
+    const installed_triggers = [_]native_program.TriggerDeclaration{.{
+        .kind = .interest_noawait,
+        .name = "debz-trigger",
+    }};
+    const archive_triggers = [_]native_program.TriggerDeclaration{.{
+        .kind = .interest_await,
+        .name = "debz-trigger",
+    }};
+    const installed = [_]native_program.InstalledPackage{.{
+        .name = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .state = .installed,
+        .scripts = &installed_scripts,
+        .triggers = &installed_triggers,
+    }};
+    const archives = [_]native_program.Archive{.{
+        .package = "demo",
+        .version = "2",
+        .architecture = "amd64",
+        .sha256 = @splat(0x31),
+        .size = 1,
+        .origin = .{ .authenticated_repository = .{
+            .repository_id = @splat('0'),
+            .repository_snapshot_sha256 = @splat(0x32),
+        } },
+        .application_sha256 = @splat(0x33),
+        .scripts = &archive_scripts,
+        .triggers = &archive_triggers,
+    }};
+    var database_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer database_arena.deinit();
+    const database: package_database.Database = .{
+        .model = .{
+            .native_architecture = "amd64",
+            .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+            .packages = &.{},
+        },
+        .generation = .{ .sha256 = @splat(0), .file_count = 0, .total_bytes = 0 },
+        .arena = &database_arena,
+        .backing_allocator = testing.allocator,
+    };
+    const authority = (try lifecycleTriggerAuthority(
+        allocator,
+        .{
+            .root = "/srv/root",
+            .architecture = "amd64",
+            .archives = &.{},
+            .operation = .upgrade,
+            .report = "/srv/report",
+            .triggers = true,
+        },
+        database,
+        &installed,
+        &archives,
+        &.{.{
+            .name = "demo",
+            .version = "2",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        }},
+    )).?;
+    try testing.expectEqual(@as(usize, 8), authority.callers.len);
+    for (std.enums.values(maintainer_script.Kind)) |kind| {
+        var old_seen = false;
+        var new_seen = false;
+        for (authority.callers) |caller| {
+            if (caller.kind != kind) continue;
+            if (caller.source == .installed_package and
+                std.mem.eql(u8, caller.version, "1"))
+                old_seen = true;
+            if (caller.source == .new_package and
+                std.mem.eql(u8, caller.version, "2"))
+                new_seen = true;
+        }
+        try testing.expect(old_seen and new_seen);
+    }
+    try testing.expectEqual(@as(usize, 1), authority.handlers.len);
+    try testing.expectEqual(
+        native_authorization.TriggerScriptSource.new_package,
+        authority.handlers[0].source,
+    );
+}
+
+test "native_unpack.test.derived trigger closure rejects missing reordered and unrelated changes" {
+    const final_state = [_]native_authorization.FinalPackage{
+        .{
+            .name = "receiver",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "source",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+    };
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .install,
+        .package = "source",
+        .version = "1",
+        .architecture = "amd64",
+        .prior_version = null,
+        .artifact = null,
+    }};
+    const handlers = [_]native_authorization.TriggerHandler{.{
+        .package = "receiver",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .postinst_sha256 = @splat(0x11),
+        .declarations_sha256 = @splat(0x12),
+    }};
+    const callers = [_]native_authorization.TriggerCaller{.{
+        .package = "source",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .new_package,
+        .kind = .postinst,
+        .script_sha256 = @splat(0x13),
+    }};
+    const base_digest = native_authorization.finalStateDigest(&final_state);
+    const authorization: native_authorization.Authorization = .{
+        .backend = .native,
+        .target_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .install_root = "/srv/root",
+        .root_identity_sha256 = @splat(0),
+        .request_sha256 = @splat(0),
+        .solver_policy_sha256 = @splat(0),
+        .executor_policy_sha256 = @splat(0),
+        .plan_sha256 = @splat(0),
+        .exact_lock = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = @splat(0),
+        },
+        .policy = .{ .conffile = .keep_existing, .force = &.{}, .allow_host_root = false },
+        .actions = &actions,
+        .final_state = &final_state,
+        .trigger_authority = .{
+            .mode = .transaction,
+            .defer_triggers = true,
+            .initial_state_sha256 = @splat(0),
+            .handlers = &handlers,
+            .callers = &callers,
+            .allowed_triggers = &.{ "debz-a", "debz-b" },
+            .maximum_invocations = 8,
+            .final_mode = .derive_from_activations,
+            .base_final_state_sha256 = base_digest,
+            .maximum_activations = 8,
+        },
+        .final_state_sha256 = base_digest,
+        .digest_sha256 = @splat(0),
+    };
+    const listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "debz-a",
+        .package = .{ .name = "receiver", .architecture = "" },
+        .await_mode = .awaited,
+    }};
+    const second_listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "debz-b",
+        .package = .{ .name = "receiver", .architecture = "" },
+        .await_mode = .awaited,
+    }};
+    const events = [_]RuntimeTriggerEvent{
+        .{
+            .origin = .automatic,
+            .source = .{ .name = "source", .architecture = "amd64" },
+            .trigger = "debz-a",
+            .activation_awaits = true,
+            .listeners = &listeners,
+        },
+        .{
+            .origin = .automatic,
+            .source = .{ .name = "source", .architecture = "amd64" },
+            .trigger = "debz-b",
+            .activation_awaits = true,
+            .listeners = &second_listeners,
+        },
+    };
+    const initial_model: package_database.Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .packages = &.{},
+    };
+    var tampered = authorization;
+    tampered.trigger_authority.?.base_final_state_sha256.?[0] ^= 1;
+    try testing.expectError(
+        error.InvalidTriggerAuthority,
+        deriveDeferredFinalState(
+            testing.allocator,
+            tampered,
+            initial_model,
+            &events,
+        ),
+    );
+    tampered = authorization;
+    tampered.trigger_authority.?.final_mode = .exact;
+    try testing.expectError(
+        error.InvalidTriggerAuthority,
+        deriveDeferredFinalState(
+            testing.allocator,
+            tampered,
+            initial_model,
+            &events,
+        ),
+    );
+    tampered = authorization;
+    tampered.trigger_authority.?.maximum_activations = 1;
+    try testing.expectError(
+        error.InvalidTriggerAuthority,
+        deriveDeferredFinalState(
+            testing.allocator,
+            tampered,
+            initial_model,
+            &events,
+        ),
+    );
+    var derived_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer derived_arena.deinit();
+    const expected = try deriveDeferredFinalState(
+        derived_arena.allocator(),
+        authorization,
+        initial_model,
+        &events,
+    );
+    try testing.expectEqualStrings("debz-b", expected[0].triggers_pending[0]);
+    try testing.expectEqualStrings("debz-a", expected[0].triggers_pending[1]);
+    try testing.expectEqualStrings(
+        "receiver",
+        expected[1].triggers_awaited[0],
+    );
+
+    const Record = struct {
+        fn make(
+            name: []const u8,
+            version: []const u8,
+            state: package_database.CurrentState,
+            pending: []const []const u8,
+            awaited: []const []const u8,
+        ) !package_database.PackageRecord {
+            return .{
+                .name = name,
+                .architecture = "amd64",
+                .version = version,
+                .parsed_version = try version_module.DebianVersion.parse(version),
+                .status = .{ .want = .install, .error_state = .ok, .current = state },
+                .multi_arch = null,
+                .essential = false,
+                .protected = false,
+                .fields = &.{},
+                .conffiles = &.{},
+                .triggers_pending = pending,
+                .triggers_awaited = awaited,
+                .info_stem = name,
+                .paths = &.{},
+                .md5sums = null,
+                .declared_conffiles = null,
+                .trigger_declarations = null,
+                .scripts = &.{},
+            };
+        }
+    };
+    var receiver = try Record.make(
+        "receiver",
+        "1",
+        .triggers_pending,
+        expected[0].triggers_pending,
+        &.{},
+    );
+    var source = try Record.make(
+        "source",
+        "1",
+        .triggers_awaited,
+        &.{},
+        expected[1].triggers_awaited,
+    );
+    try testing.expect(lifecycleFinalPackageMatches(expected[0], receiver));
+    try testing.expect(lifecycleFinalPackageMatches(expected[1], source));
+    receiver.triggers_pending = &.{ "debz-a", "debz-b" };
+    try testing.expect(!lifecycleFinalPackageMatches(expected[0], receiver));
+    receiver.triggers_pending = &.{"debz-b"};
+    try testing.expect(!lifecycleFinalPackageMatches(expected[0], receiver));
+    source.triggers_awaited = &.{ "receiver", "extra" };
+    try testing.expect(!lifecycleFinalPackageMatches(expected[1], source));
+    source.triggers_awaited = expected[1].triggers_awaited;
+    source.version = "9";
+    try testing.expect(!lifecycleFinalPackageMatches(expected[1], source));
+}
+
 test "native_unpack.test.lifecycle external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_LIFECYCLE_REQUEST") orelse
         return error.SkipZigTest;
@@ -13429,13 +15980,14 @@ test "native_unpack.test.lifecycle external fixture" {
     const external = parsed.value;
     const archive_phase = switch (external.operation) {
         .install, .upgrade, .downgrade, .reinstall, .configure => true,
-        .remove, .purge => false,
+        .remove, .purge, .process_triggers => false,
     };
     if (!absolute_path.nonRoot(external.root) or
         !absolute_path.nonRoot(external.report) or
         (archive_phase != (external.archives.len != 0)) or
         ((external.operation == .remove or external.operation == .purge) and
             external.packages.len == 0) or
+        (external.operation == .process_triggers and !external.triggers) or
         (!std.mem.eql(u8, external.architecture, "amd64") and
             !std.mem.eql(u8, external.architecture, "arm64")))
         return error.InvalidExternalLifecycleRequest;
@@ -13449,6 +16001,11 @@ test "native_unpack.test.lifecycle external fixture" {
                 u8,
                 fault,
                 "after_upgrade_postrm_before_record",
+            ) and
+            !std.mem.eql(
+                u8,
+                fault,
+                "after_triggered_postinst_before_record",
             ))
             return error.InvalidExternalLifecycleRequest;
     }
@@ -13506,12 +16063,24 @@ test "native_unpack.test.lifecycle external fixture" {
         .{},
     )) {
         .database => |value| value,
-        .diagnostic => return error.InvalidExternalDatabase,
+        .diagnostic => {
+            if (external.triggers) {
+                try writeLifecycleReport(
+                    testing.allocator,
+                    testing.io,
+                    external.report,
+                    .{ .outcome = .refused, .detail = "database_rejected" },
+                );
+                return;
+            }
+            return error.InvalidExternalDatabase;
+        },
     };
     defer database.deinit();
     if (database.model.pending_updates.len != 0 or
-        database.model.triggers.interests.len != 0 or
-        database.model.triggers.pending.len != 0 or
+        (!external.triggers and
+            (database.model.triggers.interests.len != 0 or
+                database.model.triggers.pending.len != 0)) or
         database.model.diversions.len != 0 or
         database.model.stat_overrides.len != 0 or
         database.model.opaque_info.len != 0)
@@ -13561,7 +16130,8 @@ test "native_unpack.test.lifecycle external fixture" {
             .diagnostic => return error.InvalidExternalArchive,
         };
         errdefer model.deinit();
-        if (model.triggers.len != 0 or model.metadata.len != 0 or
+        if ((!external.triggers and model.triggers.len != 0) or
+            model.metadata.len != 0 or
             model.script(.config) != null)
         {
             model.deinit();

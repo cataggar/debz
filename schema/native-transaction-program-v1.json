@@ -21,6 +21,7 @@
     "final_state_sha256",
     "policy",
     "script_policy_sha256",
+    "trigger_authority",
     "installed_database",
     "artifacts",
     "artifacts_sha256",
@@ -82,6 +83,12 @@
     },
     "script_policy_sha256": {
       "$ref": "#/$defs/sha256"
+    },
+    "trigger_authority": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/triggerAuthority" }
+      ]
     },
     "installed_database": {
       "$ref": "#/$defs/databaseBinding"
@@ -227,6 +234,7 @@
       "required": [
         "generation_sha256",
         "evidence_sha256",
+        "trigger_state_sha256",
         "package_count"
       ],
       "properties": {
@@ -236,9 +244,91 @@
         "evidence_sha256": {
           "$ref": "#/$defs/sha256"
         },
+        "trigger_state_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
         "package_count": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "triggerHandlerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "source", "postinst_sha256", "declarations_sha256"],
+      "properties": {
+        "package": { "$ref": "#/$defs/identity" },
+        "source": { "enum": ["installed_package", "new_package"] },
+        "postinst_sha256": { "$ref": "#/$defs/sha256" },
+        "declarations_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "triggerCallerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "source", "kind", "script_sha256"],
+      "properties": {
+        "package": { "$ref": "#/$defs/identity" },
+        "source": { "enum": ["installed_package", "new_package"] },
+        "kind": { "enum": ["preinst", "postinst", "prerm", "postrm"] },
+        "script_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "triggerAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "defer_triggers",
+        "initial_state_sha256",
+        "handlers",
+        "callers",
+        "allowed_triggers",
+        "maximum_invocations",
+        "final_mode",
+        "base_final_state_sha256",
+        "maximum_activations"
+      ],
+      "properties": {
+        "mode": { "enum": ["transaction", "process_pending"] },
+        "defer_triggers": { "type": "boolean" },
+        "initial_state_sha256": { "$ref": "#/$defs/sha256" },
+        "handlers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/triggerHandlerBinding" }
+        },
+        "callers": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/triggerCallerBinding" }
+        },
+        "allowed_triggers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "maximum_invocations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "final_mode": {
+          "enum": ["exact", "derive_from_activations"]
+        },
+        "base_final_state_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        },
+        "maximum_activations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
         }
       }
     },
@@ -1275,7 +1365,9 @@
         "additionalProperties": false,
         "required": [
           "pending",
-          "pending_sha256"
+          "pending_sha256",
+          "authority_sha256",
+          "dynamic"
         ],
         "properties": {
           "pending": {
@@ -1286,6 +1378,15 @@
           },
           "pending_sha256": {
             "$ref": "#/$defs/sha256"
+          },
+          "authority_sha256": {
+            "oneOf": [
+              { "type": "null" },
+              { "$ref": "#/$defs/sha256" }
+            ]
+          },
+          "dynamic": {
+            "type": "boolean"
           }
         }
       },
@@ -1345,7 +1446,9 @@
         "required": [
           "final_state_sha256",
           "installed_count",
-          "config_files_count"
+          "config_files_count",
+          "triggers_pending_count",
+          "triggers_awaited_count"
         ],
         "properties": {
           "final_state_sha256": {
@@ -1356,6 +1459,14 @@
             "minimum": 0
           },
           "config_files_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "triggers_pending_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "triggers_awaited_count": {
             "type": "integer",
             "minimum": 0
           }

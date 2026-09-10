@@ -142,6 +142,35 @@ pub const TriggerDeclaration = struct {
     name: []const u8,
 };
 
+pub const TriggerScriptSource = enum { installed_package, new_package };
+
+pub const TriggerHandlerBinding = struct {
+    package: PackageIdentity,
+    source: TriggerScriptSource,
+    postinst_sha256: Digest,
+    declarations_sha256: Digest,
+};
+
+pub const TriggerCallerBinding = struct {
+    package: PackageIdentity,
+    source: TriggerScriptSource,
+    kind: maintainer_script.Kind,
+    script_sha256: Digest,
+};
+
+pub const TriggerAuthority = struct {
+    mode: native_authorization.TriggerMode,
+    defer_triggers: bool,
+    initial_state_sha256: Digest,
+    handlers: []const TriggerHandlerBinding,
+    callers: []const TriggerCallerBinding,
+    allowed_triggers: []const []const u8,
+    maximum_invocations: u32,
+    final_mode: native_authorization.TriggerFinalMode = .exact,
+    base_final_state_sha256: ?Digest = null,
+    maximum_activations: u32 = 0,
+};
+
 /// Which validated bytes a maintainer-script call must execute: the script
 /// recorded for the installed package, or the script carried by the package
 /// being unpacked.
@@ -361,6 +390,8 @@ pub const PendingTrigger = struct {
 pub const DeferredTriggerWork = struct {
     pending: []const PendingTrigger,
     pending_sha256: Digest,
+    authority_sha256: ?Digest = null,
+    dynamic: bool = false,
 };
 
 pub const BarrierReason = enum {
@@ -393,6 +424,8 @@ pub const FinalVerification = struct {
     final_state_sha256: Digest,
     installed_count: u64,
     config_files_count: u64,
+    triggers_pending_count: u64 = 0,
+    triggers_awaited_count: u64 = 0,
 };
 
 pub const ProvenanceRequirement = struct {
@@ -486,6 +519,7 @@ pub const PolicyBinding = struct {
 pub const DatabaseBinding = struct {
     generation_sha256: Digest,
     evidence_sha256: Digest,
+    trigger_state_sha256: Digest = @splat('0'),
     package_count: u64,
 };
 
@@ -539,6 +573,7 @@ pub const Program = struct {
     final_state_sha256: Digest,
     policy: PolicyBinding,
     script_policy_sha256: Digest,
+    trigger_authority: ?TriggerAuthority = null,
     installed_database: DatabaseBinding,
     artifacts: []const ProgramArtifact,
     artifacts_sha256: Digest,
@@ -634,6 +669,8 @@ pub const InstalledPackage = struct {
     scripts: []const InstalledScript = &.{},
     conffiles: []const InstalledConffile = &.{},
     triggers: []const TriggerDeclaration = &.{},
+    triggers_pending: []const []const u8 = &.{},
+    triggers_awaited: []const []const u8 = &.{},
 };
 
 /// The exact installed-database generation the transaction consumed. The
@@ -641,6 +678,7 @@ pub const InstalledPackage = struct {
 pub const InstalledDatabase = struct {
     generation_sha256: [32]u8,
     packages: []const InstalledPackage = &.{},
+    trigger_state_sha256: [32]u8 = @splat(0),
     /// Nonempty `var/lib/dpkg/updates` is interrupted publication and requires
     /// explicit recovery before another mutation.
     updates_pending: bool = false,
@@ -1197,6 +1235,46 @@ fn pendingDigest(pending: []const PendingTrigger) [32]u8 {
     return hasher.finalResult();
 }
 
+fn triggerAuthorityDigest(
+    authority: native_authorization.TriggerAuthority,
+) [32]u8 {
+    var hasher = Sha256.init(.{});
+    hasher.update("debz-native-trigger-authority-v1\x00");
+    updateByte(&hasher, @intFromEnum(authority.mode));
+    updateByte(&hasher, @intFromBool(authority.defer_triggers));
+    hasher.update(&authority.initial_state_sha256);
+    for (authority.handlers) |handler| {
+        updateString(&hasher, handler.package);
+        updateString(&hasher, handler.version);
+        updateString(&hasher, handler.architecture);
+        updateByte(&hasher, @intFromEnum(handler.source));
+        hasher.update(&handler.postinst_sha256);
+        hasher.update(&handler.declarations_sha256);
+    }
+    for (authority.callers) |caller| {
+        updateString(&hasher, caller.package);
+        updateString(&hasher, caller.version);
+        updateString(&hasher, caller.architecture);
+        updateByte(&hasher, @intFromEnum(caller.source));
+        updateByte(&hasher, @intFromEnum(caller.kind));
+        hasher.update(&caller.script_sha256);
+    }
+    for (authority.allowed_triggers) |trigger| updateString(&hasher, trigger);
+    var count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count, authority.maximum_invocations, .little);
+    hasher.update(&count);
+    updateByte(&hasher, @intFromEnum(authority.final_mode));
+    if (authority.base_final_state_sha256) |digest| {
+        updateByte(&hasher, 1);
+        hasher.update(&digest);
+    } else {
+        updateByte(&hasher, 0);
+    }
+    std.mem.writeInt(u32, &count, authority.maximum_activations, .little);
+    hasher.update(&count);
+    return hasher.finalResult();
+}
+
 fn installedEvidenceDigest(packages: []const InstalledPackage) [32]u8 {
     var hasher = Sha256.init(.{});
     hasher.update("debz-native-transaction-program-installed-evidence-v1\x00");
@@ -1212,6 +1290,11 @@ fn installedEvidenceDigest(packages: []const InstalledPackage) [32]u8 {
         hasher.update(&scriptsDigest(package.scripts));
         hasher.update(&conffilesDigest(package.conffiles));
         hasher.update(&declarationsDigest(package.triggers));
+        for (package.triggers_pending) |trigger| updateString(&hasher, trigger);
+        updateByte(&hasher, 0xff);
+        for (package.triggers_awaited) |package_name|
+            updateString(&hasher, package_name);
+        updateByte(&hasher, 0xfe);
     }
     return hasher.finalResult();
 }
@@ -1281,7 +1364,20 @@ fn validateBinding(self: *Compiler) CompileError!void {
     if (!std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v2.schema_id) or
         authorization.exact_lock.version != exact_lock_v2.schema_version)
         return self.reject(.{ .code = .unsupported_lock_generation });
-    if (authorization.actions.len == 0) return self.reject(.{ .code = .empty_program });
+    if (authorization.actions.len == 0 and
+        (authorization.trigger_authority == null or
+            authorization.trigger_authority.?.mode != .process_pending))
+        return self.reject(.{ .code = .empty_program });
+    if (authorization.trigger_authority) |trigger| {
+        if (!std.mem.eql(
+            u8,
+            &trigger.initial_state_sha256,
+            &self.input.installed.trigger_state_sha256,
+        )) return self.reject(.{
+            .code = .policy_mismatch,
+            .detail = "trigger state",
+        });
+    }
     if (!std.mem.eql(
         u8,
         &authorization.root_identity_sha256,
@@ -1339,15 +1435,29 @@ fn buildInstalled(self: *Compiler) CompileError!void {
             package.name,
             package.triggers,
         );
+        packages[index].triggers_pending = try self.triggerNames(
+            package.triggers_pending,
+        );
+        packages[index].triggers_awaited = try self.triggerNames(
+            package.triggers_awaited,
+        );
         conffile_total = std.math.add(usize, conffile_total, package.conffiles.len) catch
             return self.reject(.{ .code = .limit_exceeded, .detail = "conffiles" });
-        trigger_total = std.math.add(usize, trigger_total, package.triggers.len) catch
+        trigger_total = std.math.add(
+            usize,
+            trigger_total,
+            package.triggers.len + package.triggers_pending.len +
+                package.triggers_awaited.len,
+        ) catch
             return self.reject(.{ .code = .limit_exceeded, .detail = "triggers" });
         if (conffile_total > self.limits.conffiles)
             return self.reject(.{ .code = .limit_exceeded, .detail = "conffiles" });
         if (trigger_total > self.limits.triggers)
             return self.reject(.{ .code = .limit_exceeded, .detail = "triggers" });
-        try self.charge(package.conffiles.len + package.triggers.len);
+        try self.charge(
+            package.conffiles.len + package.triggers.len +
+                package.triggers_pending.len + package.triggers_awaited.len,
+        );
     }
     std.mem.sort(InstalledPackage, packages, {}, lessInstalled);
     try self.installed_index.ensureTotalCapacity(self.arena, @intCast(packages.len));
@@ -1850,6 +1960,15 @@ fn lastStep(self: *Compiler) u32 {
 fn validateOrdering(self: *Compiler) CompileError!void {
     const authorization = self.input.authorization;
     const ordered = self.input.ordered_actions;
+    if (ordered.len == 0 and
+        authorization.trigger_authority != null and
+        authorization.trigger_authority.?.mode == .process_pending)
+    {
+        if (authorization.actions.len != 0)
+            return self.reject(.{ .code = .ordering_mismatch });
+        self.ordered_action_index = &.{};
+        return;
+    }
     if (ordered.len == 0)
         return self.reject(.{ .code = .missing_ordered_action, .detail = "empty lifecycle" });
     self.ordered_action_index = try self.arena.alloc(usize, ordered.len);
@@ -2869,7 +2988,8 @@ fn emitConfigure(
                 .{ .state = .half_configured, .unwind = null, .recovery_required = false },
             );
         }
-        last = try emitActivations(self, entry_index, last);
+        if (self.input.authorization.trigger_authority == null)
+            last = try emitActivations(self, entry_index, last);
         const state: PackageState = if (entry.awaiting_trigger) .triggers_awaited else .installed;
         _ = try self.addStep(.configure, &.{last}, .{ .record_package_state = .{
             .package = package_identity,
@@ -2981,7 +3101,189 @@ fn triggerCapable(entry: Modeled) bool {
     };
 }
 
+fn compileTriggerAuthority(self: *Compiler) CompileError!?TriggerAuthority {
+    const authorized = self.input.authorization.trigger_authority orelse return null;
+    const handlers = try self.arena.alloc(
+        TriggerHandlerBinding,
+        authorized.handlers.len,
+    );
+    for (authorized.handlers, 0..) |handler, index| {
+        const entry_index = self.modeled_index.get(.{
+            .name = handler.package,
+            .architecture = handler.architecture,
+        }) orelse return self.reject(.{
+            .code = .missing_installed_package,
+            .package = handler.package,
+            .architecture = handler.architecture,
+        });
+        const entry = self.modeled[entry_index];
+        const source: TriggerScriptSource = switch (handler.source) {
+            .installed_package => .installed_package,
+            .new_package => .new_package,
+        };
+        const digest: ?[32]u8 = switch (source) {
+            .installed_package => installedScript(self, entry, .postinst),
+            .new_package => if (entry.archive) |archive|
+                archiveScriptDigest(self.prepared[archive], .postinst)
+            else
+                null,
+        };
+        const declarations: []const TriggerDeclaration = switch (source) {
+            .installed_package => if (entry.installed) |installed|
+                self.installed[installed].triggers
+            else
+                &.{},
+            .new_package => if (entry.archive) |archive|
+                self.prepared[archive].triggers
+            else
+                &.{},
+        };
+        const version: ?[]const u8 = switch (source) {
+            .installed_package => if (entry.installed) |installed|
+                self.installed[installed].version
+            else
+                null,
+            .new_package => if (entry.archive) |archive|
+                self.input.archives[archive].version
+            else
+                null,
+        };
+        if (digest == null or version == null or
+            !std.mem.eql(u8, version.?, handler.version) or
+            !std.mem.eql(u8, &digest.?, &handler.postinst_sha256) or
+            !std.mem.eql(
+                u8,
+                &declarationsDigest(declarations),
+                &handler.declarations_sha256,
+            ))
+            return self.reject(.{
+                .code = .missing_script_evidence,
+                .detail = "trigger handler",
+                .package = handler.package,
+                .architecture = handler.architecture,
+            });
+        handlers[index] = .{
+            .package = try self.identity(
+                handler.package,
+                handler.version,
+                handler.architecture,
+            ),
+            .source = source,
+            .postinst_sha256 = hex(32, handler.postinst_sha256),
+            .declarations_sha256 = hex(32, handler.declarations_sha256),
+        };
+    }
+    const callers = try self.arena.alloc(
+        TriggerCallerBinding,
+        authorized.callers.len,
+    );
+    for (authorized.callers, 0..) |caller, index| {
+        const entry_index = self.modeled_index.get(.{
+            .name = caller.package,
+            .architecture = caller.architecture,
+        }) orelse return self.reject(.{
+            .code = .missing_installed_package,
+            .package = caller.package,
+            .architecture = caller.architecture,
+        });
+        const entry = self.modeled[entry_index];
+        const source: TriggerScriptSource = switch (caller.source) {
+            .installed_package => .installed_package,
+            .new_package => .new_package,
+        };
+        const digest: ?[32]u8 = switch (source) {
+            .installed_package => installedScript(self, entry, caller.kind),
+            .new_package => if (entry.archive) |archive|
+                archiveScriptDigest(self.prepared[archive], caller.kind)
+            else
+                null,
+        };
+        const version: ?[]const u8 = switch (source) {
+            .installed_package => if (entry.installed) |installed|
+                self.installed[installed].version
+            else
+                null,
+            .new_package => if (entry.archive) |archive|
+                self.input.archives[archive].version
+            else
+                null,
+        };
+        if (digest == null or version == null or
+            !std.mem.eql(u8, version.?, caller.version) or
+            !std.mem.eql(u8, &digest.?, &caller.script_sha256))
+            return self.reject(.{
+                .code = .missing_script_evidence,
+                .detail = "trigger caller",
+                .package = caller.package,
+                .architecture = caller.architecture,
+            });
+        callers[index] = .{
+            .package = try self.identity(
+                caller.package,
+                caller.version,
+                caller.architecture,
+            ),
+            .source = source,
+            .kind = caller.kind,
+            .script_sha256 = hex(32, caller.script_sha256),
+        };
+    }
+    const allowed = try self.arena.alloc(
+        []const u8,
+        authorized.allowed_triggers.len,
+    );
+    for (authorized.allowed_triggers, 0..) |trigger, index| {
+        var interested = false;
+        for (handlers) |handler| {
+            const entry = self.modeled[self.modeled_index.get(handler.package.ref()).?];
+            const declarations: []const TriggerDeclaration = switch (handler.source) {
+                .installed_package => self.installed[entry.installed.?].triggers,
+                .new_package => self.prepared[entry.archive.?].triggers,
+            };
+            for (declarations) |declaration| {
+                if (declaration.kind.isInterest() and
+                    std.mem.eql(u8, declaration.name, trigger))
+                    interested = true;
+            }
+        }
+        if (!interested)
+            return self.reject(.{
+                .code = .invalid_trigger_metadata,
+                .detail = "authorized trigger has no handler",
+                .path = trigger,
+            });
+        allowed[index] = try self.arena.dupe(u8, trigger);
+    }
+    return .{
+        .mode = authorized.mode,
+        .defer_triggers = authorized.defer_triggers,
+        .initial_state_sha256 = hex(32, authorized.initial_state_sha256),
+        .handlers = handlers,
+        .callers = callers,
+        .allowed_triggers = allowed,
+        .maximum_invocations = authorized.maximum_invocations,
+        .final_mode = authorized.final_mode,
+        .base_final_state_sha256 = if (authorized.base_final_state_sha256) |digest|
+            hex(32, digest)
+        else
+            null,
+        .maximum_activations = authorized.maximum_activations,
+    };
+}
+
 fn emitTriggerWork(self: *Compiler) CompileError!void {
+    if (self.input.authorization.trigger_authority) |authority| {
+        const last = lastStep(self);
+        _ = try self.addStep(.trigger, &.{last}, .{
+            .process_deferred_triggers = .{
+                .pending = &.{},
+                .pending_sha256 = hex(32, self.input.installed.trigger_state_sha256),
+                .authority_sha256 = hex(32, triggerAuthorityDigest(authority)),
+                .dynamic = true,
+            },
+        });
+        return;
+    }
     var indices: std.ArrayList(u32) = .empty;
     defer indices.deinit(self.arena);
     var pending: std.ArrayList(PendingTrigger) = .empty;
@@ -3117,9 +3419,13 @@ fn emitVerification(self: *Compiler) CompileError!void {
     const authorization = self.input.authorization;
     var installed_count: u64 = 0;
     var config_files_count: u64 = 0;
+    var triggers_pending_count: u64 = 0;
+    var triggers_awaited_count: u64 = 0;
     for (authorization.final_state) |package| switch (package.state) {
         .installed => installed_count += 1,
         .config_files => config_files_count += 1,
+        .triggers_pending => triggers_pending_count += 1,
+        .triggers_awaited => triggers_awaited_count += 1,
     };
     const publish = try self.addStep(
         .verify,
@@ -3133,6 +3439,8 @@ fn emitVerification(self: *Compiler) CompileError!void {
         .final_state_sha256 = hex(32, authorization.final_state_sha256),
         .installed_count = installed_count,
         .config_files_count = config_files_count,
+        .triggers_pending_count = triggers_pending_count,
+        .triggers_awaited_count = triggers_awaited_count,
     } });
     _ = try self.addStep(.verify, &.{verify}, .{ .publish_provenance = .{
         .authorization_sha256 = hex(32, authorization.digest_sha256),
@@ -3146,6 +3454,45 @@ fn validateFinalState(self: *Compiler) CompileError!void {
     for (self.modeled) |entry| {
         try self.charge(1);
         const final = authorization.findFinalPackage(entry.name, entry.architecture);
+        if (authorization.trigger_authority != null) {
+            if (entry.state == .not_installed) {
+                if (final != null)
+                    return self.reject(.{
+                        .code = .final_state_contradiction,
+                        .detail = "removed trigger package remains",
+                        .package = entry.name,
+                        .architecture = entry.architecture,
+                    });
+                continue;
+            }
+            const package = final orelse return self.reject(.{
+                .code = .missing_final_package,
+                .package = entry.name,
+                .architecture = entry.architecture,
+            });
+            const version = currentVersion(self, entry) orelse
+                return self.reject(.{
+                    .code = .final_state_contradiction,
+                    .detail = "version",
+                    .package = entry.name,
+                });
+            if (!std.mem.eql(u8, package.version, version) or
+                package.dpkg_selection_hold != entry.hold)
+                return self.reject(.{
+                    .code = .final_state_contradiction,
+                    .detail = "trigger final package",
+                    .package = entry.name,
+                    .architecture = entry.architecture,
+                });
+            if (package.state == .config_files and entry.state != .config_files)
+                return self.reject(.{
+                    .code = .final_state_contradiction,
+                    .detail = "config-files trigger package",
+                    .package = entry.name,
+                    .architecture = entry.architecture,
+                });
+            continue;
+        }
         switch (entry.state) {
             .not_installed => if (final != null) return self.reject(.{
                 .code = .final_state_contradiction,
@@ -3248,9 +3595,14 @@ fn assemble(self: *Compiler) CompileError!Program {
             .allow_host_root = authorization.policy.allow_host_root,
         },
         .script_policy_sha256 = self.script_policy_sha256,
+        .trigger_authority = try compileTriggerAuthority(self),
         .installed_database = .{
             .generation_sha256 = hex(32, self.input.installed.generation_sha256),
             .evidence_sha256 = hex(32, installedEvidenceDigest(self.installed)),
+            .trigger_state_sha256 = hex(
+                32,
+                self.input.installed.trigger_state_sha256,
+            ),
             .package_count = self.installed.len,
         },
         .artifacts = try self.artifacts.toOwnedSlice(self.arena),
@@ -3360,6 +3712,132 @@ fn validScriptArguments(arguments: []const []const u8) bool {
     return true;
 }
 
+fn compiledTriggerAuthorityDigest(authority: TriggerAuthority) ?[32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update("debz-native-trigger-authority-v1\x00");
+    updateByte(&hash, @intFromEnum(authority.mode));
+    updateByte(&hash, @intFromBool(authority.defer_triggers));
+    const initial = parseDigest(&authority.initial_state_sha256) orelse return null;
+    hash.update(&initial);
+    for (authority.handlers) |handler| {
+        updateString(&hash, handler.package.name);
+        updateString(&hash, handler.package.version);
+        updateString(&hash, handler.package.architecture);
+        updateByte(&hash, @intFromEnum(handler.source));
+        const postinst = parseDigest(&handler.postinst_sha256) orelse return null;
+        const declarations = parseDigest(&handler.declarations_sha256) orelse return null;
+        hash.update(&postinst);
+        hash.update(&declarations);
+    }
+    for (authority.callers) |caller| {
+        updateString(&hash, caller.package.name);
+        updateString(&hash, caller.package.version);
+        updateString(&hash, caller.package.architecture);
+        updateByte(&hash, @intFromEnum(caller.source));
+        updateByte(&hash, @intFromEnum(caller.kind));
+        const script = parseDigest(&caller.script_sha256) orelse return null;
+        hash.update(&script);
+    }
+    for (authority.allowed_triggers) |trigger| updateString(&hash, trigger);
+    var count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count, authority.maximum_invocations, .little);
+    hash.update(&count);
+    updateByte(&hash, @intFromEnum(authority.final_mode));
+    if (authority.base_final_state_sha256) |digest| {
+        const parsed = parseDigest(&digest) orelse return null;
+        updateByte(&hash, 1);
+        hash.update(&parsed);
+    } else {
+        updateByte(&hash, 0);
+    }
+    std.mem.writeInt(u32, &count, authority.maximum_activations, .little);
+    hash.update(&count);
+    return hash.finalResult();
+}
+
+fn parseDigest(value: *const Digest) ?[32]u8 {
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, value) catch return null;
+    return result;
+}
+
+fn validateTriggerAuthority(authority: TriggerAuthority) bool {
+    if (authority.handlers.len == 0 or
+        authority.handlers.len > native_authorization.maximum_trigger_handlers or
+        authority.callers.len > native_authorization.maximum_trigger_callers or
+        authority.allowed_triggers.len == 0 or
+        authority.allowed_triggers.len > native_authorization.maximum_authorized_triggers or
+        authority.maximum_invocations == 0 or
+        authority.maximum_invocations >
+            native_authorization.maximum_trigger_invocations)
+        return false;
+    switch (authority.final_mode) {
+        .exact => if (authority.defer_triggers or
+            authority.base_final_state_sha256 != null or
+            authority.maximum_activations != 0)
+            return false,
+        .derive_from_activations => if (!authority.defer_triggers or
+            authority.mode != .transaction or
+            authority.base_final_state_sha256 == null or
+            authority.maximum_activations == 0 or
+            authority.maximum_activations >
+                native_authorization.maximum_trigger_activations)
+            return false,
+    }
+    for (authority.handlers, 0..) |handler, index| {
+        if (index != 0 and !lessTriggerHandlerBinding(
+            authority.handlers[index - 1],
+            handler,
+        )) return false;
+    }
+    for (authority.callers, 0..) |caller, index| {
+        if (index != 0 and !lessTriggerCallerBinding(
+            authority.callers[index - 1],
+            caller,
+        )) return false;
+    }
+    for (authority.allowed_triggers, 0..) |trigger, index| {
+        if (!validTrigger(trigger)) return false;
+        if (index != 0 and std.mem.order(
+            u8,
+            authority.allowed_triggers[index - 1],
+            trigger,
+        ) != .lt) return false;
+    }
+    return compiledTriggerAuthorityDigest(authority) != null;
+}
+
+fn lessTriggerHandlerBinding(
+    left: TriggerHandlerBinding,
+    right: TriggerHandlerBinding,
+) bool {
+    const name = std.mem.order(u8, left.package.name, right.package.name);
+    if (name != .eq) return name == .lt;
+    return std.mem.order(
+        u8,
+        left.package.architecture,
+        right.package.architecture,
+    ) == .lt;
+}
+
+fn lessTriggerCallerBinding(
+    left: TriggerCallerBinding,
+    right: TriggerCallerBinding,
+) bool {
+    const name = std.mem.order(u8, left.package.name, right.package.name);
+    if (name != .eq) return name == .lt;
+    const architecture = std.mem.order(
+        u8,
+        left.package.architecture,
+        right.package.architecture,
+    );
+    if (architecture != .eq) return architecture == .lt;
+    const kind = @intFromEnum(left.kind);
+    const other_kind = @intFromEnum(right.kind);
+    if (kind != other_kind) return kind < other_kind;
+    return @intFromEnum(left.source) < @intFromEnum(right.source);
+}
+
 /// Revalidates a decoded document exactly as strictly as compilation validated
 /// the program it published.
 pub fn validateDocument(program: Program) DecodeError!void {
@@ -3368,6 +3846,16 @@ pub fn validateDocument(program: Program) DecodeError!void {
     switch (program.backend) {
         .native => {},
         .legacy_dpkg => return error.UnsupportedBackend,
+    }
+    if (program.trigger_authority) |authority| {
+        if (!validateTriggerAuthority(authority)) return error.InvalidProgram;
+        if (authority.final_mode == .derive_from_activations and
+            !std.mem.eql(
+                u8,
+                &authority.base_final_state_sha256.?,
+                &program.final_state_sha256,
+            ))
+            return error.InvalidProgram;
     }
     if (!std.mem.eql(u8, program.exact_lock.schema, exact_lock_v2.schema_id) or
         program.exact_lock.version != exact_lock_v2.schema_version)
@@ -3443,9 +3931,23 @@ pub fn validateDocument(program: Program) DecodeError!void {
             },
             .activate_trigger => |activation| if (!validTrigger(activation.trigger))
                 return error.InvalidProgram,
-            .process_deferred_triggers => |work| for (work.pending) |entry| {
-                for (entry.triggers) |trigger| {
-                    if (!validTrigger(trigger)) return error.InvalidProgram;
+            .process_deferred_triggers => |work| {
+                for (work.pending) |entry| {
+                    for (entry.triggers) |trigger| {
+                        if (!validTrigger(trigger)) return error.InvalidProgram;
+                    }
+                }
+                if (work.dynamic) {
+                    const authority = program.trigger_authority orelse
+                        return error.InvalidProgram;
+                    const expected = compiledTriggerAuthorityDigest(authority) orelse
+                        return error.InvalidProgram;
+                    const actual = work.authority_sha256 orelse
+                        return error.InvalidProgram;
+                    if (!std.mem.eql(u8, &hex(32, expected), &actual))
+                        return error.InvalidProgram;
+                } else if (work.authority_sha256 != null) {
+                    return error.InvalidProgram;
                 }
             },
             else => {},
@@ -4142,6 +4644,96 @@ test "native_program.test.compensation vectors are strictly bounded and validate
         @intCast(call.failure.compensations.len + 1);
     steps[script_index].operation = .{ .run_maintainer_script = call };
     try testing.expectError(error.InvalidProgram, validateDocument(program));
+}
+
+test "native_program.test.trigger-only authority compiles without package actions" {
+    const declarations = [_]TriggerDeclaration{.{
+        .kind = .interest_noawait,
+        .name = "debz-trigger",
+    }};
+    const scripts = [_]InstalledScript{.{
+        .kind = .postinst,
+        .sha256 = @splat(0x41),
+    }};
+    const handlers = [_]native_authorization.TriggerHandler{.{
+        .package = "handler",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .postinst_sha256 = @splat(0x41),
+        .declarations_sha256 = declarationsDigest(&declarations),
+    }};
+    const callers = [_]native_authorization.TriggerCaller{.{
+        .package = "handler",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .kind = .postinst,
+        .script_sha256 = @splat(0x41),
+    }};
+    const final_state = [_]native_authorization.FinalPackage{.{
+        .name = "handler",
+        .version = "1",
+        .architecture = "amd64",
+        .state = .installed,
+        .dpkg_selection_hold = false,
+    }};
+    var authorization = try native_authorization.create(testing.allocator, .{
+        .backend = .native,
+        .target_architecture = "amd64",
+        .install_root = "/srv/root",
+        .request_sha256 = @splat(1),
+        .solver_policy_sha256 = @splat(2),
+        .executor_policy_sha256 = @splat(3),
+        .plan_sha256 = @splat(4),
+        .exact_lock = testLock(),
+        .policy = .{ .conffile = .keep_existing },
+        .actions = &.{},
+        .final_state = &final_state,
+        .trigger_authority = .{
+            .mode = .process_pending,
+            .defer_triggers = false,
+            .initial_state_sha256 = @splat(0x42),
+            .handlers = &handlers,
+            .callers = &callers,
+            .allowed_triggers = &.{"debz-trigger"},
+            .maximum_invocations = 8,
+        },
+    });
+    defer authorization.deinit();
+    const installed = [_]InstalledPackage{.{
+        .name = "handler",
+        .version = "1",
+        .architecture = "amd64",
+        .state = .triggers_pending,
+        .scripts = &scripts,
+        .triggers = &declarations,
+        .triggers_pending = &.{"debz-trigger"},
+    }};
+    var owned = try expectProgram(compile(testing.allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &.{},
+        .installed = .{
+            .generation_sha256 = @splat(0x71),
+            .packages = &installed,
+            .trigger_state_sha256 = @splat(0x42),
+        },
+    }));
+    defer owned.deinit();
+    try testing.expect(owned.program.trigger_authority != null);
+    try testing.expectEqual(
+        @as(usize, 1),
+        owned.program.countSteps(.process_deferred_triggers),
+    );
+    const document = try owned.program.canonicalJson(testing.allocator);
+    defer testing.allocator.free(document);
+    var decoded = try decode(
+        testing.allocator,
+        document,
+        maximum_document_bytes,
+    );
+    defer decoded.deinit();
+    try testing.expect(decoded.program.trigger_authority != null);
 }
 
 /// Every conffile decision the compiler can reach, keyed by the three digests

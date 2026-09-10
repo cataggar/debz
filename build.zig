@@ -587,6 +587,50 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-lifecycle", "Compare native lifecycle scripts and package states with dpkg")
         .dependOn(&native_lifecycle.step);
 
+    const native_trigger_helper = b.addExecutable(.{
+        .name = "native-trigger-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_trigger_helper.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = target.result.cpu.arch,
+                .os_tag = .linux,
+                .abi = .musl,
+            }),
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .linkage = .static,
+    });
+    b.step("native-trigger-helper", "Build the private trigger helper without installing it")
+        .dependOn(&native_trigger_helper.step);
+    const native_trigger_queue_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_trigger.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_native_trigger_queue_tests = b.addRunArtifact(native_trigger_queue_tests);
+    b.step("test-native-trigger-helper", "Run private native trigger queue and helper tests")
+        .dependOn(&run_native_trigger_queue_tests.step);
+    test_step.dependOn(&run_native_trigger_queue_tests.step);
+    const native_triggers = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/test-native-triggers.py",
+    });
+    native_triggers.addArtifactArg(native_lifecycle_tests);
+    native_triggers.addArg("--native-helper");
+    native_triggers.addArtifactArg(native_trigger_helper);
+    const native_trigger_oracle_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_triggers.py" },
+    );
+    native_triggers.step.dependOn(&native_trigger_oracle_tests.step);
+    native_triggers.step.dependOn(&run_native_trigger_queue_tests.step);
+    test_step.dependOn(&native_trigger_oracle_tests.step);
+    b.step("test-native-triggers", "Compare native trigger activation and processing with dpkg")
+        .dependOn(&native_triggers.step);
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -791,6 +835,7 @@ fn installReleaseFiles(
         "native-lifecycle.md",
         "native-transaction-engine-v1.md",
         "native-transaction-program.md",
+        "native-triggers.md",
         "native-unpack.md",
         "openpgp-verifier.md",
         "package-acquisition.md",

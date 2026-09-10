@@ -4,8 +4,8 @@
 //! This module owns the v1 database surfaces selected by
 //! `doc/native-transaction-engine-v1.md`: `status`, `status-old`, `updates/`,
 //! `arch`, `info/*.list`, `info/*.md5sums`, `info/*.conffiles`,
-//! `info/*.triggers`, the maintainer scripts, `triggers/File`,
-//! `triggers/Unincorp`, `diversions`, and `statoverride`.
+//! `info/*.triggers`, the maintainer scripts, `triggers/File`, named trigger
+//! registries, `triggers/Unincorp`, `diversions`, and `statoverride`.
 //!
 //! The module is deliberately filesystem free. Callers supply an already
 //! captured, bounded `Snapshot` of one database generation and receive a typed
@@ -41,6 +41,7 @@ pub const diversions_path = "diversions";
 pub const statoverride_path = "statoverride";
 pub const info_directory = "info";
 pub const updates_directory = "updates";
+pub const triggers_directory = "triggers";
 pub const triggers_file_path = "triggers/File";
 pub const triggers_unincorp_path = "triggers/Unincorp";
 /// `info/format` records the on-disk info-directory format. V1 supports 1.
@@ -66,6 +67,7 @@ pub const Limits = struct {
     max_trigger_declarations_per_package: usize = 4096,
     max_trigger_name_bytes: usize = 4096,
     max_trigger_interests: usize = 200_000,
+    max_named_trigger_files: usize = 200_000,
     max_pending_triggers: usize = 200_000,
     max_packages_per_pending_trigger: usize = 4096,
     max_triggers_per_package: usize = 4096,
@@ -151,6 +153,13 @@ pub const UpdateEntry = struct {
     }
 };
 
+pub const NamedTriggerEntry = struct {
+    name: []const u8,
+    bytes: []const u8 = &.{},
+    kind: EntryKind = .regular,
+    mode: u32 = 0o644,
+};
+
 /// One captured database generation. Absent optional members mean the file
 /// does not exist in the root; an entry with empty bytes means the file exists
 /// and is empty.
@@ -162,6 +171,7 @@ pub const Snapshot = struct {
     statoverride: ?FileEntry = null,
     triggers_file: ?FileEntry = null,
     triggers_unincorp: ?FileEntry = null,
+    triggers_named: []const NamedTriggerEntry = &.{},
     info: []const InfoEntry = &.{},
     updates: []const UpdateEntry = &.{},
 };
@@ -286,6 +296,7 @@ pub const PendingPackage = struct {
 pub const PendingTrigger = struct {
     trigger: []const u8,
     packages: []const PendingPackage,
+    noawait: bool = false,
 };
 
 pub const TriggerState = struct {
@@ -495,6 +506,7 @@ pub const Surface = enum {
     info_format,
     triggers_file,
     triggers_unincorp,
+    triggers_named,
     diversions,
     statoverride,
     cross_file,
@@ -517,6 +529,7 @@ pub const Surface = enum {
             => info_directory,
             .triggers_file => triggers_file_path,
             .triggers_unincorp => triggers_unincorp_path,
+            .triggers_named => triggers_directory,
             .diversions => diversions_path,
             .statoverride => statoverride_path,
             .cross_file, .generation, .change_set => database_directory,
@@ -1613,6 +1626,59 @@ const Importer = struct {
         return try self.arena.dupe(TriggerInterest, interests.items);
     }
 
+    fn parseNamedTriggerInterests(
+        self: *Importer,
+        trigger: []const u8,
+        bytes: []const u8,
+    ) ImportError![]const TriggerInterest {
+        var interests: std.ArrayList(TriggerInterest) = .empty;
+        defer interests.deinit(self.scratch);
+        var seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer seen.deinit();
+        var lines = Lines.init(bytes);
+        while (lines.next()) |line| {
+            const value = try self.text(.triggers_named, trigger, line);
+            if (value.len == 0) {
+                return self.fail(.triggers_named, .empty_line, trigger, line.number);
+            }
+            if (interests.items.len >= self.options.limits.max_trigger_interests) {
+                return self.fail(.triggers_named, .trigger_limit, trigger, line.number);
+            }
+            var tokens = std.mem.tokenizeScalar(u8, value, ' ');
+            const package_text = tokens.next() orelse
+                return self.fail(.triggers_named, .invalid_trigger_record, trigger, line.number);
+            if (tokens.next() != null) {
+                return self.fail(.triggers_named, .invalid_trigger_record, trigger, line.number);
+            }
+            const parsed = self.parsePendingPackage(package_text) orelse
+                return self.fail(.triggers_named, .invalid_trigger_record, trigger, line.number);
+            seen.beginKey();
+            try seen.appendKey(parsed.package.name);
+            try seen.appendKey(parsed.package.architecture);
+            if (!try seen.insertKey()) {
+                return self.fail(
+                    .triggers_named,
+                    .duplicate_trigger_interest,
+                    trigger,
+                    line.number,
+                );
+            }
+            try interests.append(self.scratch, .{
+                .trigger = trigger,
+                .package = parsed.package,
+                .await_mode = parsed.await_mode,
+            });
+        }
+        if (interests.items.len == 0)
+            return self.fail(
+                .triggers_named,
+                .invalid_trigger_record,
+                trigger,
+                null,
+            );
+        return try self.arena.dupe(TriggerInterest, interests.items);
+    }
+
     fn parsePendingTriggers(self: *Importer, bytes: []const u8) ImportError![]const PendingTrigger {
         var pending: std.ArrayList(PendingTrigger) = .empty;
         defer pending.deinit(self.scratch);
@@ -1646,8 +1712,21 @@ const Importer = struct {
             }
             var packages: std.ArrayList(PendingPackage) = .empty;
             defer packages.deinit(self.scratch);
+            var noawait = false;
             seen_packages.reset();
             while (tokens.next()) |package_text| {
+                if (std.mem.eql(u8, package_text, "-")) {
+                    if (noawait) {
+                        return self.fail(
+                            .triggers_unincorp,
+                            .invalid_trigger_record,
+                            triggers_unincorp_path,
+                            line.number,
+                        );
+                    }
+                    noawait = true;
+                    continue;
+                }
                 if (packages.items.len >= self.options.limits.max_packages_per_pending_trigger) {
                     return self.fail(
                         .triggers_unincorp,
@@ -1662,6 +1741,14 @@ const Importer = struct {
                     triggers_unincorp_path,
                     line.number,
                 );
+                if (parsed.await_mode != .awaited) {
+                    return self.fail(
+                        .triggers_unincorp,
+                        .invalid_trigger_record,
+                        triggers_unincorp_path,
+                        line.number,
+                    );
+                }
                 seen_packages.beginKey();
                 try seen_packages.appendKey(parsed.package.name);
                 try seen_packages.appendKey(parsed.package.architecture);
@@ -1681,7 +1768,7 @@ const Importer = struct {
                     .await_mode = parsed.await_mode,
                 });
             }
-            if (packages.items.len == 0) {
+            if (packages.items.len == 0 and !noawait) {
                 return self.fail(
                     .triggers_unincorp,
                     .invalid_trigger_record,
@@ -1700,18 +1787,19 @@ const Importer = struct {
             try pending.append(self.scratch, .{
                 .trigger = trigger,
                 .packages = try self.arena.dupe(PendingPackage, packages.items),
+                .noawait = noawait,
             });
         }
         return try self.arena.dupe(PendingTrigger, pending.items);
     }
 
-    /// dpkg spells a noawait package reference with a leading `/`.
+    /// Interest registries spell a noawait listener with `/noawait`.
     fn parsePendingPackage(self: *Importer, token: []const u8) ?PendingPackage {
         var text_value = token;
         var await_mode: AwaitMode = .awaited;
-        if (text_value.len != 0 and text_value[0] == '/') {
+        if (std.mem.endsWith(u8, text_value, "/noawait")) {
             await_mode = .noawait;
-            text_value = text_value[1..];
+            text_value = text_value[0 .. text_value.len - "/noawait".len];
         }
         if (text_value.len > self.options.limits.max_package_name_bytes) return null;
         if (std.mem.indexOfScalar(u8, text_value, ':')) |colon| {
@@ -2034,7 +2122,9 @@ const Importer = struct {
             record.scripts = try self.arena.dupe(MaintainerScript, scripts[position].items);
         }
 
-        const interests: []const TriggerInterest = if (try self.consume(
+        var trigger_interests: std.ArrayList(TriggerInterest) = .empty;
+        defer trigger_interests.deinit(self.scratch);
+        const file_interests: []const TriggerInterest = if (try self.consume(
             .triggers_file,
             triggers_file_path,
             snapshot.triggers_file,
@@ -2043,6 +2133,62 @@ const Importer = struct {
             try self.parseTriggerInterests(bytes)
         else
             &.{};
+        try trigger_interests.appendSlice(self.scratch, file_interests);
+        if (snapshot.triggers_named.len > limits.max_named_trigger_files) {
+            return self.fail(.triggers_named, .trigger_limit, triggers_directory, null);
+        }
+        var named_seen: MembershipIndex = .{ .allocator = self.scratch };
+        defer named_seen.deinit();
+        for (snapshot.triggers_named) |entry| {
+            if (entry.name.len == 0 or
+                entry.name.len > limits.max_trigger_name_bytes or
+                entry.name[0] == '/' or
+                std.mem.indexOfScalar(u8, entry.name, '/') != null or
+                !validTriggerName(entry.name) or
+                std.mem.eql(u8, entry.name, "File") or
+                std.mem.eql(u8, entry.name, "Unincorp") or
+                std.mem.eql(u8, entry.name, "Lock"))
+            {
+                return self.fail(
+                    .triggers_named,
+                    .invalid_trigger_name,
+                    entry.name,
+                    null,
+                );
+            }
+            if (!try named_seen.insert(entry.name)) {
+                return self.fail(
+                    .triggers_named,
+                    .duplicate_trigger_interest,
+                    entry.name,
+                    null,
+                );
+            }
+            const bytes = (try self.consume(
+                .triggers_named,
+                entry.name,
+                .{
+                    .bytes = entry.bytes,
+                    .kind = entry.kind,
+                    .mode = entry.mode,
+                },
+                limits.max_database_file_bytes,
+            )) orelse unreachable;
+            const named = try self.parseNamedTriggerInterests(entry.name, bytes);
+            if (trigger_interests.items.len + named.len > limits.max_trigger_interests) {
+                return self.fail(
+                    .triggers_named,
+                    .trigger_limit,
+                    entry.name,
+                    null,
+                );
+            }
+            try trigger_interests.appendSlice(self.scratch, named);
+        }
+        const interests = try self.arena.dupe(
+            TriggerInterest,
+            trigger_interests.items,
+        );
         const pending: []const PendingTrigger = if (try self.consume(
             .triggers_unincorp,
             triggers_unincorp_path,
@@ -2269,6 +2415,21 @@ pub fn generation(
     }
     for (snapshot.info) |entry| {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ info_directory, entry.name });
+        errdefer allocator.free(path);
+        try entries.append(allocator, .{
+            .path = path,
+            .kind = entry.kind,
+            .mode = entry.mode,
+            .size = entry.bytes.len,
+            .sha256 = digestOf(entry.bytes),
+        });
+    }
+    for (snapshot.triggers_named) |entry| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ triggers_directory, entry.name },
+        );
         errdefer allocator.free(path);
         try entries.append(allocator, .{
             .path = path,
@@ -2517,10 +2678,16 @@ const Validator = struct {
         for (self.model.triggers.interests) |interest| {
             if (interest.trigger.len == 0 or
                 interest.trigger.len > limits.max_trigger_name_bytes or
-                interest.trigger[0] != '/' or
                 !validTriggerName(interest.trigger))
             {
-                return self.fail(.triggers_file, .invalid_trigger_name, interest.package.name);
+                return self.fail(
+                    if (interest.trigger.len != 0 and interest.trigger[0] == '/')
+                        .triggers_file
+                    else
+                        .triggers_named,
+                    .invalid_trigger_name,
+                    interest.package.name,
+                );
             }
             const position = self.lookup(interest.package.name, interest.package.architecture) orelse
                 return self.fail(.triggers_file, .unknown_trigger_package, interest.package.name);
@@ -2560,7 +2727,7 @@ const Validator = struct {
             if (!try self.names.insert(entry.trigger)) {
                 return self.fail(.triggers_unincorp, .duplicate_pending_trigger, "");
             }
-            if (entry.packages.len == 0) {
+            if (entry.packages.len == 0 and !entry.noawait) {
                 return self.fail(.triggers_unincorp, .invalid_trigger_record, "");
             }
             if (entry.packages.len > limits.max_packages_per_pending_trigger) {
@@ -2568,6 +2735,9 @@ const Validator = struct {
             }
             self.paths.reset();
             for (entry.packages) |package| {
+                if (package.await_mode != .awaited) {
+                    return self.fail(.triggers_unincorp, .invalid_trigger_record, "");
+                }
                 const position = self.lookup(
                     package.package.name,
                     package.package.architecture,
@@ -2911,12 +3081,12 @@ fn writeTriggerPackage(
     package: Identity,
     await_mode: AwaitMode,
 ) std.Io.Writer.Error!void {
-    if (await_mode == .noawait) try writer.writeByte('/');
     if (package.architecture.len == 0) {
         try writer.writeAll(package.name);
     } else {
         try writer.print("{s}:{s}", .{ package.name, package.architecture });
     }
+    if (await_mode == .noawait) try writer.writeAll("/noawait");
 }
 
 pub fn writeTriggerInterests(
@@ -2926,7 +3096,24 @@ pub fn writeTriggerInterests(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     for (interests) |interest| {
+        if (interest.trigger.len == 0 or interest.trigger[0] != '/') continue;
         output.writer.print("{s} ", .{interest.trigger}) catch return error.OutOfMemory;
+        writeTriggerPackage(&output.writer, interest.package, interest.await_mode) catch
+            return error.OutOfMemory;
+        output.writer.writeByte('\n') catch return error.OutOfMemory;
+    }
+    return output.toOwnedSlice() catch error.OutOfMemory;
+}
+
+pub fn writeNamedTriggerInterests(
+    allocator: std.mem.Allocator,
+    trigger: []const u8,
+    interests: []const TriggerInterest,
+) std.mem.Allocator.Error![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (interests) |interest| {
+        if (!std.mem.eql(u8, interest.trigger, trigger)) continue;
         writeTriggerPackage(&output.writer, interest.package, interest.await_mode) catch
             return error.OutOfMemory;
         output.writer.writeByte('\n') catch return error.OutOfMemory;
@@ -2944,8 +3131,11 @@ pub fn writePendingTriggers(
         output.writer.writeAll(entry.trigger) catch return error.OutOfMemory;
         for (entry.packages) |package| {
             output.writer.writeByte(' ') catch return error.OutOfMemory;
-            writeTriggerPackage(&output.writer, package.package, package.await_mode) catch
+            writeTriggerPackage(&output.writer, package.package, .awaited) catch
                 return error.OutOfMemory;
+        }
+        if (entry.noawait) {
+            output.writer.writeAll(" -") catch return error.OutOfMemory;
         }
         output.writer.writeByte('\n') catch return error.OutOfMemory;
     }
@@ -3197,6 +3387,55 @@ test "package_database.test.canonical writers reproduce the imported generation"
     const arch_bytes = try writeArchitectures(testing.allocator, model.foreign_architectures);
     defer testing.allocator.free(arch_bytes);
     try testing.expectEqualStrings(test_fixtures.arch, arch_bytes);
+}
+
+test "package_database.test.named trigger registry and noawait queue marker round trip" {
+    var info: [test_fixtures.info.len]InfoEntry = undefined;
+    @memcpy(&info, test_fixtures.info);
+    for (&info) |*entry| {
+        if (std.mem.eql(u8, entry.name, "toolz.triggers"))
+            entry.bytes = "interest-noawait debz-named\n";
+    }
+    const named = [_]NamedTriggerEntry{.{
+        .name = "debz-named",
+        .bytes = "toolz/noawait\n",
+    }};
+    var snapshot = test_fixtures.snapshot();
+    snapshot.info = &info;
+    snapshot.triggers_file = null;
+    snapshot.triggers_named = &named;
+    snapshot.triggers_unincorp = regularFile("debz-named -\n");
+    var database = switch (try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    try testing.expectEqual(@as(usize, 1), database.model.triggers.interests.len);
+    try testing.expectEqualStrings(
+        "debz-named",
+        database.model.triggers.interests[0].trigger,
+    );
+    try testing.expectEqual(AwaitMode.noawait, database.model.triggers.interests[0].await_mode);
+    try testing.expect(database.model.triggers.pending[0].noawait);
+    try testing.expectEqual(@as(usize, 0), database.model.triggers.pending[0].packages.len);
+
+    const interests = try writeNamedTriggerInterests(
+        testing.allocator,
+        "debz-named",
+        database.model.triggers.interests,
+    );
+    defer testing.allocator.free(interests);
+    try testing.expectEqualStrings("toolz/noawait\n", interests);
+    const pending = try writePendingTriggers(
+        testing.allocator,
+        database.model.triggers.pending,
+    );
+    defer testing.allocator.free(pending);
+    try testing.expectEqualStrings("debz-named -\n", pending);
 }
 
 test "package_database.test.unknown status fields survive a semantic round trip" {

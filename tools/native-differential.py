@@ -32,6 +32,7 @@ SCENARIO_OPERATIONS = frozenset(
         "reinstall",
         "remove",
         "purge",
+        "process_triggers",
         "recover",
     }
 )

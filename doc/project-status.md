@@ -89,6 +89,20 @@ script traces, payload visibility, and resulting package/filesystem state with
 real dpkg, including failures and dependency/bootstrap cases. Production native
 selection remains unavailable. See [Native lifecycle execution](native-lifecycle.md).
 
+Item 13 extends that private lifecycle with named/file trigger registration,
+await/noawait activation, explicit deferral, and trigger-only processing.
+Compiled trigger authority binds unchanged handlers and dynamic callers
+without fake archive actions; final evidence includes actual pending/awaited
+states. Deferred dynamic activation uses an explicitly authorized transition
+from the bound base closure, not an expected state copied from observed
+status. A private native helper records script-driven activation without
+invoking dpkg-trigger in candidate execution. `test-native-triggers` covers
+ordering, coalescing, failures, and cycles against real dpkg, with native
+amd64/arm64 Debug and ReleaseSafe CI wiring. Unknown triggered-script outcomes
+retain invocation/authority evidence and block re-entry. The helper is not
+installed in releases, and production native remains unavailable. See
+[Native trigger execution](native-triggers.md).
+
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
 already opened root descriptor, never resolves a component through a symbolic
