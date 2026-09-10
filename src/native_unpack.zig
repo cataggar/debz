@@ -15,12 +15,12 @@
 //! ownership and conflict resolution, `Replaces`, hard links, symbolic links,
 //! modes, ownership, modification times, directory transitions, the package
 //! `.list`, and `md5sums`. A private, isolated-root materialization adapter
-//! composes the existing mutation engine for item 10b's real-dpkg fixtures.
-//! Neither the planner nor adapter is a public native executor.
-//! Configuration, conffiles, scripts, triggers,
-//! removal, and purge belong to the following roadmap items. A package that
-//! needs one of them is refused with an explicit typed handoff before any
-//! mutation, never approximated and never overwritten as ordinary data.
+//! composes the existing mutation engine for real-dpkg data, conffile, removal,
+//! and lifecycle fixtures. The lifecycle interpreter consumes a compiled
+//! native program, runs validated scripts in an isolated root, and retains
+//! durable evidence for ambiguous outcomes. Neither adapter is a public native
+//! executor; triggers and other unsupported features still hand off before
+//! mutation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,6 +28,8 @@ const absolute_path = @import("absolute_path.zig");
 const archive_application = @import("archive_application.zig");
 const control_record = @import("control_record.zig");
 const dpkg_status = @import("dpkg_status.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
+const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
 const package_database = @import("package_database.zig");
@@ -37,6 +39,7 @@ const relation = @import("relation.zig");
 const root_fs = @import("root_fs.zig");
 const root_mutation = @import("root_mutation.zig");
 const root_operation = @import("root_operation.zig");
+const solver = @import("solver.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const version_module = @import("debian_version.zig");
@@ -991,6 +994,10 @@ const Request = struct {
     unsupported_root_features: []const []const u8 = &.{},
     conffiles: ConffileCapability = .handoff,
     conffile_policy: transaction_executor.ConffilePolicy = .keep_existing,
+    /// Private lifecycle execution may interpret one compiled data step at a
+    /// time while retaining the complete parent program as authority.
+    lifecycle_execution: bool = false,
+    lifecycle_sequences: []const u32 = &.{},
     limits: Limits = .{},
 };
 
@@ -1696,22 +1703,24 @@ fn validateProgram(builder: *Builder) PlanError!void {
     }
 
     const database = builder.database;
-    if (!std.mem.eql(
-        u8,
-        &program.installed_database.generation_sha256,
-        &hex(32, database.generation.sha256),
-    ))
-        return builder.fail(.{
-            .surface = .database,
-            .code = .database_generation_mismatch,
-            .path = package_database.database_directory,
-        });
-    if (program.installed_database.package_count != database.model.packages.len)
-        return builder.fail(.{
-            .surface = .database,
-            .code = .database_generation_mismatch,
-            .path = package_database.database_directory,
-        });
+    if (!builder.request.lifecycle_execution) {
+        if (!std.mem.eql(
+            u8,
+            &program.installed_database.generation_sha256,
+            &hex(32, database.generation.sha256),
+        ))
+            return builder.fail(.{
+                .surface = .database,
+                .code = .database_generation_mismatch,
+                .path = package_database.database_directory,
+            });
+        if (program.installed_database.package_count != database.model.packages.len)
+            return builder.fail(.{
+                .surface = .database,
+                .code = .database_generation_mismatch,
+                .path = package_database.database_directory,
+            });
+    }
     if (database.model.pending_updates.len != 0)
         return builder.fail(.{
             .surface = .database,
@@ -1725,13 +1734,18 @@ fn validateProgram(builder: *Builder) PlanError!void {
 /// does not implement.
 fn collectSteps(builder: *Builder) PlanError!void {
     const program = builder.request.program;
+    const lifecycle = builder.request.lifecycle_execution;
     var unpacks: usize = 0;
     var barrier_seen = false;
     var removal_handoff = false;
     for (program.steps) |step| {
         switch (step.operation) {
             .materialize_bootstrap_payload => |intent| {
-                if (barrier_seen) try builder.deferFeature(.{
+                if (lifecycle and !containsSequence(
+                    builder.request.lifecycle_sequences,
+                    step.sequence,
+                )) continue;
+                if (!lifecycle and barrier_seen) try builder.deferFeature(.{
                     .feature = .configure_barrier,
                     .package = intent.package.name,
                     .architecture = intent.package.architecture,
@@ -1746,8 +1760,12 @@ fn collectSteps(builder: *Builder) PlanError!void {
                 );
             },
             .unpack_package => |intent| {
+                if (lifecycle and !containsSequence(
+                    builder.request.lifecycle_sequences,
+                    step.sequence,
+                )) continue;
                 unpacks += 1;
-                if (barrier_seen) try builder.deferFeature(.{
+                if (!lifecycle and barrier_seen) try builder.deferFeature(.{
                     .feature = .configure_barrier,
                     .package = intent.package.name,
                     .architecture = intent.package.architecture,
@@ -1769,8 +1787,11 @@ fn collectSteps(builder: *Builder) PlanError!void {
                         .architecture = intent.package.architecture,
                     });
             },
-            .configure_barrier => barrier_seen = true,
+            .configure_barrier => if (!lifecycle) {
+                barrier_seen = true;
+            },
             .remove_package_files => |intent| {
+                if (lifecycle) continue;
                 removal_handoff = true;
                 try builder.deferFeature(.{
                     .feature = .package_removal,
@@ -1779,6 +1800,7 @@ fn collectSteps(builder: *Builder) PlanError!void {
                 });
             },
             .purge_package_files => |intent| {
+                if (lifecycle) continue;
                 removal_handoff = true;
                 try builder.deferFeature(.{
                     .feature = .package_purge,
@@ -1786,18 +1808,20 @@ fn collectSteps(builder: *Builder) PlanError!void {
                     .architecture = intent.package.architecture,
                 });
             },
-            .run_maintainer_script => |call| try builder.deferFeature(.{
-                .feature = .maintainer_script,
-                .package = call.package.name,
-                .architecture = call.package.architecture,
-                .detail = @tagName(call.kind),
-            }),
-            .apply_conffile_decision => |decision| try builder.deferFeature(.{
-                .feature = .conffile_decision,
-                .package = decision.package.name,
-                .architecture = decision.package.architecture,
-                .detail = decision.path,
-            }),
+            .run_maintainer_script => |call| if (!lifecycle)
+                try builder.deferFeature(.{
+                    .feature = .maintainer_script,
+                    .package = call.package.name,
+                    .architecture = call.package.architecture,
+                    .detail = @tagName(call.kind),
+                }),
+            .apply_conffile_decision => |decision| if (!lifecycle)
+                try builder.deferFeature(.{
+                    .feature = .conffile_decision,
+                    .package = decision.package.name,
+                    .architecture = decision.package.architecture,
+                    .detail = decision.path,
+                }),
             .record_trigger_interests => |record| try builder.deferFeature(.{
                 .feature = .trigger,
                 .package = record.package.name,
@@ -1820,7 +1844,8 @@ fn collectSteps(builder: *Builder) PlanError!void {
             else => {},
         }
     }
-    if (!removal_handoff and (unpacks == 0 or builder.work.items.len == 0))
+    if (!removal_handoff and
+        ((!lifecycle and unpacks == 0) or builder.work.items.len == 0))
         return builder.fail(.{ .surface = .program, .code = .program_incomplete });
     if (removal_handoff) return;
     if (builder.work.items.len > builder.limits.max_packages)
@@ -1832,11 +1857,19 @@ fn collectSteps(builder: *Builder) PlanError!void {
         for (builder.work.items) |item| {
             if (item.artifact == input.artifact) bound = true;
         }
+
         if (!bound) return builder.fail(.{
             .surface = .artifact,
             .code = .artifact_unbound,
         });
     }
+}
+
+fn containsSequence(sequences: []const u32, sequence: u32) bool {
+    for (sequences) |candidate| {
+        if (candidate == sequence) return true;
+    }
+    return false;
 }
 
 /// Finds or creates the work entry for one package, binding its artifact,
@@ -2263,12 +2296,13 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .architecture = item.identity.architecture,
                 .detail = conffile.path,
             });
-        for (archive.scripts) |script| try builder.deferFeature(.{
-            .feature = .maintainer_script,
-            .package = item.identity.name,
-            .architecture = item.identity.architecture,
-            .detail = script.name,
-        });
+        if (!builder.request.lifecycle_execution)
+            for (archive.scripts) |script| try builder.deferFeature(.{
+                .feature = .maintainer_script,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = script.name,
+            });
         for (archive.triggers) |trigger| try builder.deferFeature(.{
             .feature = .trigger,
             .package = item.identity.name,
@@ -2289,12 +2323,13 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .architecture = prior.architecture,
                 .detail = conffile.path,
             });
-        for (prior.scripts) |script| try builder.deferFeature(.{
-            .feature = .maintainer_script,
-            .package = prior.name,
-            .architecture = prior.architecture,
-            .detail = script.kind.suffix(),
-        });
+        if (!builder.request.lifecycle_execution)
+            for (prior.scripts) |script| try builder.deferFeature(.{
+                .feature = .maintainer_script,
+                .package = prior.name,
+                .architecture = prior.architecture,
+                .detail = script.kind.suffix(),
+            });
         if (prior.trigger_declarations) |declarations| {
             for (declarations) |declaration| try builder.deferFeature(.{
                 .feature = .trigger,
@@ -6415,6 +6450,26 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
     }
     for (builder.work.items) |*item| {
         const model = item.model;
+        const lifecycle_scripts = if (builder.request.lifecycle_execution) block: {
+            const scripts = try builder.arena.alloc(
+                package_database_changes.StagedScript,
+                model.scripts.len,
+            );
+            for (model.scripts, 0..) |script, index| {
+                const kind = databaseScriptKind(script.kind) orelse
+                    return builder.fail(.{
+                        .surface = .publication,
+                        .code = .program_incomplete,
+                        .package = item.identity.name,
+                    });
+                scripts[index] = .{
+                    .kind = kind,
+                    .bytes = model.scriptBytes(script),
+                    .mode = script.mode,
+                };
+            }
+            break :block scripts;
+        } else &.{};
         try changes.append(builder.allocator, .{ .put_package = .{
             .fields = try statusFields(builder, item, model, .unpacked),
             .paths = item.list_paths.items,
@@ -6424,7 +6479,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             else
                 item.declared_conffiles.items,
             .trigger_declarations = null,
-            .scripts = &.{},
+            .scripts = lifecycle_scripts,
         } });
     }
     const result = package_database_changes.plan(
@@ -6822,6 +6877,9 @@ const MaterializationRequest = struct {
     planning: Request,
     locks: root_operation.LockBackend,
     operation: product_api.Operation,
+    borrowed_attempt: ?*root_operation.Attempt = null,
+    raw_status_verification: bool = false,
+    mutation_last_step: ?*u32 = null,
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
 };
@@ -7071,17 +7129,24 @@ fn bindMaterializationArchives(
     allocator: std.mem.Allocator,
     request: Request,
 ) !?BoundArchives {
-    const items = try allocator.alloc(BoundArchive, request.program.artifacts.len);
+    const lifecycle = request.lifecycle_execution;
+    const items = try allocator.alloc(
+        BoundArchive,
+        if (lifecycle) request.archives.len else request.program.artifacts.len,
+    );
     var initialized: usize = 0;
     var transferred = false;
     defer if (!transferred) {
         for (items[0..initialized]) |*item| item.model.deinit();
         allocator.free(items);
     };
-    for (request.program.artifacts, 0..) |artifact, index| {
+    for (request.program.artifacts) |artifact| {
         const input = for (request.archives) |candidate| {
             if (candidate.artifact == artifact.index) break candidate;
-        } else return null;
+        } else {
+            if (lifecycle) continue;
+            return null;
+        };
         const archive_sha256 = parseHex(32, &artifact.sha256) orelse return null;
         const application_sha256 = parseHex(
             32,
@@ -7113,7 +7178,7 @@ fn bindMaterializationArchives(
             artifact.index,
             application_sha256,
         ) catch return null;
-        items[index] = .{
+        items[initialized] = .{
             .artifact = artifact.index,
             .bytes = input.bytes,
             .model = model,
@@ -7122,6 +7187,7 @@ fn bindMaterializationArchives(
         initialized += 1;
         model_transferred = true;
     }
+    if (initialized != items.len) return null;
     transferred = true;
     return .{ .items = items, .allocator = allocator };
 }
@@ -7576,42 +7642,62 @@ fn materialize(
         .schema = request.planning.program.exact_lock.schema,
         .digest_sha256 = lock_digest,
     };
+    const borrowed = request.borrowed_attempt != null;
+    const lifecycle_artifacts = parseHex(
+        32,
+        &request.planning.program.artifacts_sha256,
+    ) orelse return error.MaterializationProgramDigest;
     const operation_evidence: root_operation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = planned.digest,
+        .plan_sha256 = if (borrowed) program_sha256 else planned.digest,
         .exact_lock = exact_lock,
         .database_generation_sha256 = planned.database.base_generation.sha256,
-        .artifact_evidence_sha256 = artifact_evidence,
+        .artifact_evidence_sha256 = if (borrowed)
+            lifecycle_artifacts
+        else
+            artifact_evidence,
     };
     const mutation_evidence: root_mutation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = planned.digest,
+        .plan_sha256 = if (borrowed) program_sha256 else planned.digest,
         .exact_lock = exact_lock,
-        .database_generation_sha256 = planned.database.base_generation.sha256,
+        .database_generation_sha256 = if (borrowed)
+            null
+        else
+            planned.database.base_generation.sha256,
         .database_plan_sha256 = planned.database.digest,
-        .artifact_evidence_sha256 = artifact_evidence,
+        .artifact_evidence_sha256 = if (borrowed)
+            lifecycle_artifacts
+        else
+            artifact_evidence,
     };
 
-    var coordinator = try root_operation.Coordinator.open(
-        request.io,
-        request.root,
-        request.install_root,
-        request.locks,
-    );
-    var attempt = try coordinator.acquire(allocator, .{
-        .intent = .mutation,
-        .existing = .reclaim_resolved,
-        .backend = .native,
-        .operation = .{ .package_transaction = request.operation },
-        .request_sha256 = request_sha256,
-        .policy_sha256 = policy_sha256,
-        .evidence = operation_evidence,
-        .target_architecture = request.planning.program.target_architecture,
-        .foreign_architectures = request.planning.program.foreign_architectures,
-    });
-    defer attempt.release();
+    var owned_attempt: root_operation.Attempt = undefined;
+    var owns_attempt = false;
+    if (request.borrowed_attempt == null) {
+        var coordinator = try root_operation.Coordinator.open(
+            request.io,
+            request.root,
+            request.install_root,
+            request.locks,
+        );
+        owned_attempt = try coordinator.acquire(allocator, .{
+            .intent = .mutation,
+            .existing = .reclaim_resolved,
+            .backend = .native,
+            .operation = .{ .package_transaction = request.operation },
+            .request_sha256 = request_sha256,
+            .policy_sha256 = policy_sha256,
+            .evidence = operation_evidence,
+            .target_architecture = request.planning.program.target_architecture,
+            .foreign_architectures = request.planning.program.foreign_architectures,
+        });
+        owns_attempt = true;
+    }
+    const attempt = request.borrowed_attempt orelse &owned_attempt;
+    defer if (owns_attempt) attempt.release();
 
     const preflight_result = root_mutation.preflight(
         allocator,
@@ -7621,12 +7707,12 @@ fn materialize(
             .limits = request.mutation_limits,
         },
     ) catch |err| {
-        try attempt.abandonIfPreMutation(allocator);
+        if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
         return err;
     };
     var mutation_plan = switch (preflight_result) {
         .diagnostic => |diagnostic| {
-            try attempt.abandonIfPreMutation(allocator);
+            if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
             return .{
                 .outcome = .refused,
                 .detail = @tagName(diagnostic.code),
@@ -7635,12 +7721,17 @@ fn materialize(
         .plan => |value| value,
     };
     defer mutation_plan.deinit();
+    if (request.mutation_last_step) |slot|
+        slot.* = if (mutation_plan.steps.len == 0)
+            0
+        else
+            @intCast(mutation_plan.steps.len - 1);
 
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
         request.root,
-        &attempt,
+        attempt,
         &mutation_plan,
         mutation_evidence,
         .{
@@ -7650,7 +7741,7 @@ fn materialize(
         },
     ) catch |err| switch (err) {
         error.Rejected => {
-            try attempt.abandonIfPreMutation(allocator);
+            if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
             return .{
                 .outcome = .refused,
                 .detail = if (refusal) |diagnostic|
@@ -7722,6 +7813,17 @@ fn materialize(
         };
     }
 
+    if (!owns_attempt) {
+        try root_mutation.clear(&engine);
+        return .{
+            .outcome = switch (mutation_report.outcome) {
+                .applied => .applied,
+                .rolled_back => .rolled_back,
+                .recovery_required => unreachable,
+            },
+            .detail = @tagName(mutation_report.stage),
+        };
+    }
     try attempt.advance(allocator, .{
         .state = .verifying,
         .phase = .verification,
@@ -7791,12 +7893,13 @@ fn phasePreflight(
             &program.digest_sha256,
             &hex(32, materializationProgramDigest(program.*)),
         ) or
-        !std.mem.eql(
-            u8,
-            &program.installed_database.generation_sha256,
-            &hex(32, database.generation.sha256),
-        ) or
-        program.installed_database.package_count != database.model.packages.len)
+        (request.borrowed_attempt == null and
+            (!std.mem.eql(
+                u8,
+                &program.installed_database.generation_sha256,
+                &hex(32, database.generation.sha256),
+            ) or
+                program.installed_database.package_count != database.model.packages.len)))
         return .{ .outcome = .refused, .detail = "program_binding_mismatch" };
     if (request.planning.root_identity_sha256) |expected| {
         if (!std.mem.eql(u8, &expected, &root_identity))
@@ -7852,44 +7955,57 @@ fn executePhaseMaterialization(
         .schema = request.planning.program.exact_lock.schema,
         .digest_sha256 = lock_digest,
     };
+    const borrowed = request.borrowed_attempt != null;
+    const lifecycle_artifacts = parseHex(
+        32,
+        &request.planning.program.artifacts_sha256,
+    ) orelse return error.MaterializationProgramDigest;
     const operation_evidence: root_operation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = null,
+        .plan_sha256 = if (borrowed) program_sha256 else null,
         .exact_lock = exact_lock,
         .database_generation_sha256 = database_evidence.base_generation.sha256,
-        .artifact_evidence_sha256 = artifact_evidence,
+        .artifact_evidence_sha256 = if (borrowed)
+            lifecycle_artifacts
+        else
+            artifact_evidence,
     };
-    var coordinator = try root_operation.Coordinator.open(
-        request.io,
-        request.root,
-        request.install_root,
-        request.locks,
-    );
-    var attempt = try coordinator.acquire(allocator, .{
-        .intent = .mutation,
-        .existing = .reclaim_resolved,
-        .backend = .native,
-        .operation = .{ .package_transaction = request.operation },
-        .request_sha256 = request_sha256,
-        .policy_sha256 = policy_sha256,
-        .evidence = operation_evidence,
-        .target_architecture = request.planning.program.target_architecture,
-        .foreign_architectures = request.planning.program.foreign_architectures,
-    });
-    var attempt_open = true;
-    defer if (attempt_open) attempt.release();
+    var owned_attempt: root_operation.Attempt = undefined;
+    var owns_attempt = false;
+    if (request.borrowed_attempt == null) {
+        var coordinator = try root_operation.Coordinator.open(
+            request.io,
+            request.root,
+            request.install_root,
+            request.locks,
+        );
+        owned_attempt = try coordinator.acquire(allocator, .{
+            .intent = .mutation,
+            .existing = .reclaim_resolved,
+            .backend = .native,
+            .operation = .{ .package_transaction = request.operation },
+            .request_sha256 = request_sha256,
+            .policy_sha256 = policy_sha256,
+            .evidence = operation_evidence,
+            .target_architecture = request.planning.program.target_architecture,
+            .foreign_architectures = request.planning.program.foreign_architectures,
+        });
+        owns_attempt = true;
+    }
+    const attempt = request.borrowed_attempt orelse &owned_attempt;
+    defer if (owns_attempt) attempt.release();
     const preflight_result = root_mutation.preflight(
         allocator,
         request.root,
         .{ .intents = intents, .limits = request.mutation_limits },
     ) catch |err| {
-        try attempt.abandonIfPreMutation(allocator);
+        if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
         return err;
     };
     var mutation_plan = switch (preflight_result) {
         .diagnostic => |diagnostic| {
-            try attempt.abandonIfPreMutation(allocator);
+            if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
             return .{
                 .outcome = .refused,
                 .detail = @tagName(diagnostic.code),
@@ -7905,17 +8021,23 @@ fn executePhaseMaterialization(
     const mutation_evidence: root_mutation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = phase_digest,
+        .plan_sha256 = if (borrowed) program_sha256 else phase_digest,
         .exact_lock = exact_lock,
-        .database_generation_sha256 = database_evidence.base_generation.sha256,
+        .database_generation_sha256 = if (borrowed)
+            null
+        else
+            database_evidence.base_generation.sha256,
         .database_plan_sha256 = database_evidence.digest,
-        .artifact_evidence_sha256 = artifact_evidence,
+        .artifact_evidence_sha256 = if (borrowed)
+            lifecycle_artifacts
+        else
+            artifact_evidence,
     };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
         request.root,
-        &attempt,
+        attempt,
         &mutation_plan,
         mutation_evidence,
         .{
@@ -7925,7 +8047,7 @@ fn executePhaseMaterialization(
         },
     ) catch |err| switch (err) {
         error.Rejected => {
-            try attempt.abandonIfPreMutation(allocator);
+            if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
             return .{
                 .outcome = .refused,
                 .detail = if (refusal) |diagnostic|
@@ -7968,19 +8090,62 @@ fn executePhaseMaterialization(
                 "recovery_required",
         };
     if (report.outcome == .applied) {
-        verifyMaterializedDatabase(
-            allocator,
-            request.root,
-            request.planning.program.target_architecture,
-            request.planning.limits.database,
-            database_evidence,
-            require_status_old,
-        ) catch {
+        const verified = if (request.raw_status_verification) block: {
+            const status_path = package_database.database_directory ++ "/" ++
+                package_database.status_path;
+            const status_digest = rootFileSha256(
+                allocator,
+                request.root,
+                status_path,
+                request.planning.limits.database.limits.max_status_bytes,
+            ) catch break :block false;
+            if (!std.mem.eql(
+                u8,
+                &status_digest,
+                &database_evidence.resulting_status.sha256,
+            )) break :block false;
+            if (require_status_old) {
+                const old_path = package_database.database_directory ++ "/" ++
+                    package_database.status_old_path;
+                const old_digest = rootFileSha256(
+                    allocator,
+                    request.root,
+                    old_path,
+                    request.planning.limits.database.limits.max_status_bytes,
+                ) catch break :block false;
+                if (!std.mem.eql(
+                    u8,
+                    &old_digest,
+                    &database_evidence.base_status.sha256,
+                )) break :block false;
+            }
+            break :block true;
+        } else block: {
+            verifyMaterializedDatabase(
+                allocator,
+                request.root,
+                request.planning.program.target_architecture,
+                request.planning.limits.database,
+                database_evidence,
+                require_status_old,
+            ) catch break :block false;
+            break :block true;
+        };
+        if (!verified) {
             try attempt.requireRecovery(allocator, .verification);
             return .{
                 .outcome = .recovery_required,
                 .detail = "database_verification_failed",
             };
+        }
+    }
+    if (!owns_attempt) {
+        try root_mutation.clear(&engine);
+        engine.deinit();
+        engine_open = false;
+        return .{
+            .outcome = if (report.outcome == .applied) .applied else .rolled_back,
+            .detail = @tagName(report.stage),
         };
     }
     try attempt.advance(allocator, .{
@@ -7997,8 +8162,6 @@ fn executePhaseMaterialization(
     try attempt.clear();
     engine.deinit();
     engine_open = false;
-    attempt.release();
-    attempt_open = false;
     return .{
         .outcome = if (report.outcome == .applied) .applied else .rolled_back,
         .detail = @tagName(report.stage),
@@ -8009,6 +8172,7 @@ fn phaseStatusFields(
     allocator: std.mem.Allocator,
     record: package_database.PackageRecord,
     want: package_database.Want,
+    error_state: package_database.ErrorState,
     current: package_database.CurrentState,
     config_version: ?[]const u8,
     conffiles: []const package_database.ConffileEntry,
@@ -8023,9 +8187,13 @@ fn phaseStatusFields(
             const lines = try allocator.alloc([]const u8, 1);
             lines[0] = try std.fmt.allocPrint(
                 allocator,
-                "{s} ok {s}",
+                "{s} {s} {s}",
                 .{
                     @tagName(want),
+                    switch (error_state) {
+                        .ok => "ok",
+                        .reinst_required => "reinstreq",
+                    },
                     package_database.currentStateSpelling(current),
                 },
             );
@@ -8181,6 +8349,39 @@ fn appendArchiveConffileIntent(
     try intents.append(allocator, intent);
 }
 
+fn databaseScriptKind(kind: archive_application.ScriptKind) ?package_database.ScriptKind {
+    return switch (kind) {
+        .preinst => .preinst,
+        .postinst => .postinst,
+        .prerm => .prerm,
+        .postrm => .postrm,
+        .config => null,
+    };
+}
+
+fn stagedArchiveScripts(
+    allocator: std.mem.Allocator,
+    archive: *const BoundArchive,
+) ![]const package_database_changes.StagedScript {
+    const scripts = try allocator.alloc(
+        package_database_changes.StagedScript,
+        archive.model.scripts.len,
+    );
+    var count: usize = 0;
+    errdefer allocator.free(scripts);
+    for (archive.model.scripts) |script| {
+        const kind = databaseScriptKind(script.kind) orelse
+            return error.UnsupportedMaintainerScript;
+        scripts[count] = .{
+            .kind = kind,
+            .bytes = archive.model.scriptBytes(script),
+            .mode = script.mode,
+        };
+        count += 1;
+    }
+    return scripts[0..count];
+}
+
 fn conffilePhaseDigest(
     operation: []const u8,
     database_plan: package_database_changes.Plan,
@@ -8259,7 +8460,7 @@ fn materializeConfigure(
     var compared_bytes: u64 = 0;
 
     for (bound.items) |*archive| {
-        if (archive.model.scripts.len != 0 or
+        if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
             archive.model.triggers.len != 0 or
             archive.model.metadata.len != 0)
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
@@ -8270,11 +8471,13 @@ fn materializeConfigure(
             .outcome = .refused,
             .detail = "package_not_installed",
         };
-        if (record.status.current != .unpacked or
+        if ((record.status.current != .unpacked and
+            !(request.borrowed_attempt != null and
+                record.status.current == .half_configured)) or
             !std.mem.eql(u8, record.version, archive.model.facts.version) or
             record.status.error_state != .ok or
             record.status.want == .hold or
-            record.scripts.len != 0 or
+            (request.borrowed_attempt == null and record.scripts.len != 0) or
             record.trigger_declarations != null or
             record.triggers_pending.len != 0 or
             record.triggers_awaited.len != 0)
@@ -8470,17 +8673,23 @@ fn materializeConfigure(
             owned,
             record.*,
             .install,
+            .ok,
             .installed,
             null,
             resulting.items,
         );
+        const lifecycle_scripts: []const package_database_changes.StagedScript =
+            if (request.borrowed_attempt != null)
+                try stagedArchiveScripts(owned, archive)
+            else
+                &.{};
         try changes.append(allocator, .{ .put_package = .{
             .fields = fields,
             .paths = record.paths,
             .md5sums = record.md5sums,
             .declared_conffiles = record.declared_conffiles,
             .trigger_declarations = record.trigger_declarations,
-            .scripts = &.{},
+            .scripts = lifecycle_scripts,
         } });
     }
     var database_plan = switch (try package_database_changes.plan(
@@ -8573,6 +8782,87 @@ const RemovalCandidate = struct {
     path: []const u8,
     directory: bool,
 };
+
+fn retainedPostrmScript(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    record: package_database.PackageRecord,
+    maximum_bytes: usize,
+) ![]const package_database_changes.StagedScript {
+    for (record.scripts) |script| {
+        if (script.kind != .postrm) continue;
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}.postrm",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                record.info_stem,
+            },
+        );
+        const bytes = try root.readFileAlloc(
+            allocator,
+            try root_fs.Path.init(path),
+            maximum_bytes,
+        );
+        if (bytes.len != script.size) return error.InstalledScriptMismatch;
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &script.sha256))
+            return error.InstalledScriptMismatch;
+        const result = try allocator.alloc(
+            package_database_changes.StagedScript,
+            1,
+        );
+        result[0] = .{
+            .kind = .postrm,
+            .bytes = bytes,
+            .mode = script.mode,
+        };
+        return result;
+    }
+    return &.{};
+}
+
+fn stagedInstalledScripts(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    record: package_database.PackageRecord,
+    maximum_bytes: usize,
+) ![]const package_database_changes.StagedScript {
+    const result = try allocator.alloc(
+        package_database_changes.StagedScript,
+        record.scripts.len,
+    );
+    for (record.scripts, 0..) |script, index| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}.{s}",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                record.info_stem,
+                script.kind.suffix(),
+            },
+        );
+        const bytes = try root.readFileAlloc(
+            allocator,
+            try root_fs.Path.init(path),
+            maximum_bytes,
+        );
+        if (bytes.len != script.size) return error.InstalledScriptMismatch;
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &script.sha256))
+            return error.InstalledScriptMismatch;
+        result[index] = .{
+            .kind = script.kind,
+            .bytes = bytes,
+            .mode = script.mode,
+        };
+    }
+    return result;
+}
 
 fn materializeRemoval(
     allocator: std.mem.Allocator,
@@ -8725,7 +9015,8 @@ fn materializeRemoval(
         if (record.field("Config-Version") != null and
             configVersionField(record.*) == .invalid)
             return .{ .outcome = .refused, .detail = "config_version" };
-        if (record.scripts.len != 0 or record.trigger_declarations != null or
+        if ((request.borrowed_attempt == null and record.scripts.len != 0) or
+            record.trigger_declarations != null or
             record.triggers_pending.len != 0 or record.triggers_awaited.len != 0)
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
 
@@ -8808,14 +9099,45 @@ fn materializeRemoval(
         };
 
         if (purge or record.conffiles.len == 0) {
-            try changes.append(allocator, .{
-                .remove_package = record.identity(),
-            });
+            if (purge or request.borrowed_attempt == null or record.scripts.len == 0) {
+                try changes.append(allocator, .{
+                    .remove_package = record.identity(),
+                });
+            } else {
+                if (retained_paths.items.len == 0)
+                    try retained_paths.append(
+                        allocator,
+                        package_database.root_list_path,
+                    );
+                const fields = try phaseStatusFields(
+                    owned,
+                    record.*,
+                    .deinstall,
+                    .ok,
+                    .config_files,
+                    removalConfigVersion(record.*),
+                    record.conffiles,
+                );
+                try changes.append(allocator, .{ .put_package = .{
+                    .fields = fields,
+                    .paths = try owned.dupe([]const u8, retained_paths.items),
+                    .md5sums = null,
+                    .declared_conffiles = null,
+                    .trigger_declarations = null,
+                    .scripts = try retainedPostrmScript(
+                        owned,
+                        request.root,
+                        record.*,
+                        request.planning.limits.database.limits.max_info_file_bytes,
+                    ),
+                } });
+            }
         } else {
             const fields = try phaseStatusFields(
                 owned,
                 record.*,
                 .deinstall,
+                .ok,
                 .config_files,
                 removalConfigVersion(record.*),
                 record.conffiles,
@@ -8826,7 +9148,15 @@ fn materializeRemoval(
                 .md5sums = null,
                 .declared_conffiles = null,
                 .trigger_declarations = null,
-                .scripts = &.{},
+                .scripts = if (request.borrowed_attempt != null)
+                    try retainedPostrmScript(
+                        owned,
+                        request.root,
+                        record.*,
+                        request.planning.limits.database.limits.max_info_file_bytes,
+                    )
+                else
+                    &.{},
             } });
         }
     }
@@ -8885,6 +9215,524 @@ fn materializeRemoval(
         ),
         null,
         false,
+    );
+}
+
+fn unchangedDatabaseEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    options: package_database.Options,
+) !DatabasePhaseEvidence {
+    var captured = try captureDatabaseSnapshot(allocator, root, options);
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
+        options,
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database.deinit();
+    const generation = database.generation;
+    var digest = Sha256.init(.{});
+    digest.update(digest_domain);
+    hashText(&digest, "lifecycle-unchanged-database");
+    hashText(&digest, &generation.sha256);
+    return .{
+        .base_generation = generation,
+        .base_status = database.model.status,
+        .resulting_status = database.model.status,
+        .digest = digest.finalResult(),
+    };
+}
+
+fn lifecycleAuxiliaryMutation(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    intents: []const root_mutation.Intent,
+    label: []const u8,
+) !MaterializationResult {
+    const evidence = try unchangedDatabaseEvidence(
+        allocator,
+        request.root,
+        request.planning.program.target_architecture,
+        request.planning.limits.database,
+    );
+    var digest = Sha256.init(.{});
+    digest.update(digest_domain);
+    hashText(&digest, "lifecycle-auxiliary");
+    hashText(&digest, label);
+    hashText(&digest, &evidence.base_generation.sha256);
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        intents,
+        evidence,
+        digest.finalResult(),
+        null,
+        false,
+    );
+}
+
+fn materializeStateRecord(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    state: native_program.StateRecord,
+    want_override: ?package_database.Want,
+    error_override: ?package_database.ErrorState,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    if (phasePreflight(request, database)) |result| return result;
+    const record = database.model.find(
+        state.package.name,
+        state.package.architecture,
+    );
+    if (record == null) {
+        if (state.remove_entry) return .{ .outcome = .applied, .detail = "already_absent" };
+        return .{ .outcome = .refused, .detail = "package_not_installed" };
+    }
+    const change: package_database_changes.Change = if (state.remove_entry)
+        .{ .remove_package = record.?.identity() }
+    else
+        .{ .set_state = .{
+            .identity = record.?.identity(),
+            .want = want_override orelse if (state.hold)
+                .hold
+            else if (state.state == .config_files)
+                .deinstall
+            else
+                .install,
+            .error_state = error_override orelse .ok,
+            .current = state.state,
+        } };
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        &.{change},
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| return .{
+            .outcome = .refused,
+            .detail = @tagName(diagnostic.code),
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        database_intents.intents,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest("lifecycle-state", database_plan, null),
+        null,
+        true,
+    );
+}
+
+fn materializeFreshFailureRecord(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    package: native_program.PackageIdentity,
+    unwind_succeeded: bool,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    if (database.model.find(package.name, package.architecture) != null)
+        return .{ .outcome = .refused, .detail = "package_already_present" };
+
+    const status = if (unwind_succeeded)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}Package: {s}\nStatus: install ok not-installed\nArchitecture: {s}\n\n",
+            .{
+                captured.snapshot.status.bytes,
+                package.name,
+                package.architecture,
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}Package: {s}\nStatus: install reinstreq half-installed\n" ++
+                "Architecture: {s}\nVersion: {s}\n\n",
+            .{
+                captured.snapshot.status.bytes,
+                package.name,
+                package.architecture,
+                package.version,
+            },
+        );
+    defer allocator.free(status);
+    var status_sha256: [32]u8 = undefined;
+    Sha256.hash(status, &status_sha256, .{});
+    const status_path = package_database.database_directory ++ "/" ++
+        package_database.status_path;
+    const status_old_path = package_database.database_directory ++ "/" ++
+        package_database.status_old_path;
+    const status_entry = try request.root.entry(try root_fs.Path.init(status_path));
+    const old_entry = try request.root.entryIfExists(
+        try root_fs.Path.init(status_old_path),
+    );
+    var empty_sha256: [32]u8 = undefined;
+    Sha256.hash("", &empty_sha256, .{});
+    const trigger_lock_path = package_database.database_directory ++
+        "/triggers/Lock";
+    const trigger_unincorp_path = package_database.database_directory ++
+        "/triggers/Unincorp";
+    const trigger_lock = try request.root.entryIfExists(
+        try root_fs.Path.init(trigger_lock_path),
+    );
+    const trigger_unincorp = try request.root.entryIfExists(
+        try root_fs.Path.init(trigger_unincorp_path),
+    );
+    const intents = [_]root_mutation.Intent{
+        .{ .file = .{
+            .path = status_path,
+            .bytes = status,
+            .mode = status_entry.mode,
+            .uid = status_entry.uid,
+            .gid = status_entry.gid,
+            .overwrite = .replace,
+            .expected_sha256 = status_sha256,
+        } },
+        .{ .file = .{
+            .path = status_old_path,
+            .bytes = captured.snapshot.status.bytes,
+            .mode = if (old_entry) |entry| entry.mode else status_entry.mode,
+            .uid = if (old_entry) |entry| entry.uid else status_entry.uid,
+            .gid = if (old_entry) |entry| entry.gid else status_entry.gid,
+            .overwrite = if (old_entry == null) .require_absent else .replace,
+            .expected_sha256 = database.model.status.sha256,
+        } },
+        .{ .file = .{
+            .path = trigger_lock_path,
+            .bytes = "",
+            .mode = 0o600,
+            .uid = 0,
+            .gid = 0,
+            .overwrite = if (trigger_lock == null) .require_absent else .replace,
+            .expected_sha256 = empty_sha256,
+        } },
+        .{ .file = .{
+            .path = trigger_unincorp_path,
+            .bytes = "",
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+            .overwrite = if (trigger_unincorp == null) .require_absent else .replace,
+            .expected_sha256 = empty_sha256,
+        } },
+    };
+    var phase_digest = Sha256.init(.{});
+    phase_digest.update(digest_domain);
+    hashText(&phase_digest, "fresh-script-failure");
+    hashText(&phase_digest, &database.generation.sha256);
+    hashText(&phase_digest, &status_sha256);
+    const evidence: DatabasePhaseEvidence = .{
+        .base_generation = database.generation,
+        .base_status = database.model.status,
+        .resulting_status = .{
+            .sha256 = status_sha256,
+            .size = status.len,
+            .package_count = database.model.status.package_count + 1,
+        },
+        .digest = phase_digest.finalResult(),
+    };
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        &intents,
+        evidence,
+        evidence.digest,
+        null,
+        true,
+    );
+}
+
+fn materializeDetailedState(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    package: native_program.PackageIdentity,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const record = database.model.find(
+        package.name,
+        package.architecture,
+    ) orelse return .{ .outcome = .refused, .detail = "package_not_installed" };
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const fields = try phaseStatusFields(
+        owned,
+        record.*,
+        want,
+        error_state,
+        current,
+        config_version,
+        record.conffiles,
+    );
+    const scripts = try stagedInstalledScripts(
+        owned,
+        request.root,
+        record.*,
+        request.planning.limits.database.limits.max_info_file_bytes,
+    );
+    const change: package_database_changes.Change = .{ .put_package = .{
+        .fields = fields,
+        .paths = record.paths,
+        .md5sums = record.md5sums,
+        .declared_conffiles = record.declared_conffiles,
+        .trigger_declarations = record.trigger_declarations,
+        .scripts = scripts,
+    } };
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        &.{change},
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| return .{
+            .outcome = .refused,
+            .detail = @tagName(diagnostic.code),
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        database_intents.intents,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest("lifecycle-detailed-state", database_plan, null),
+        null,
+        true,
+    );
+}
+
+fn snapshotScripts(
+    allocator: std.mem.Allocator,
+    snapshot: package_database.Snapshot,
+    record: package_database.PackageRecord,
+) ![]const package_database_changes.StagedScript {
+    const scripts = try allocator.alloc(
+        package_database_changes.StagedScript,
+        record.scripts.len,
+    );
+    for (record.scripts, 0..) |script, index| {
+        const name = try std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}",
+            .{ record.info_stem, script.kind.suffix() },
+        );
+        const entry = for (snapshot.info) |candidate| {
+            if (std.mem.eql(u8, candidate.name, name)) break candidate;
+        } else return error.InstalledScriptMissing;
+        if (entry.kind != .regular or entry.bytes.len != script.size)
+            return error.InstalledScriptMismatch;
+        var digest: [32]u8 = undefined;
+        Sha256.hash(entry.bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &script.sha256))
+            return error.InstalledScriptMismatch;
+        scripts[index] = .{
+            .kind = script.kind,
+            .bytes = entry.bytes,
+            .mode = entry.mode,
+        };
+    }
+    return scripts;
+}
+
+fn materializeRestoredPackageState(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    initial_snapshot: package_database.Snapshot,
+    initial_model: package_database.Model,
+    package: native_program.PackageIdentity,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(
+        allocator,
+        request.root,
+        request.planning.limits.database,
+    );
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(
+        &captured.snapshot,
+        request.planning.program.target_architecture,
+    );
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = request.planning.program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        request.planning.limits.database,
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    const initial = initial_model.find(
+        package.name,
+        package.architecture,
+    ) orelse return .{ .outcome = .refused, .detail = "initial_package_missing" };
+    const current_record = database.model.find(
+        package.name,
+        package.architecture,
+    );
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const fields = try phaseStatusFields(
+        owned,
+        initial.*,
+        want,
+        error_state,
+        current,
+        config_version,
+        initial.conffiles,
+    );
+    const change: package_database_changes.Change = .{ .put_package = .{
+        .fields = fields,
+        .paths = if (current_record) |record| record.paths else initial.paths,
+        .md5sums = initial.md5sums,
+        .declared_conffiles = initial.declared_conffiles,
+        .trigger_declarations = initial.trigger_declarations,
+        .scripts = try snapshotScripts(owned, initial_snapshot, initial.*),
+    } };
+    var database_plan = switch (try package_database_changes.plan(
+        allocator,
+        database,
+        &.{change},
+        .{ .database = request.planning.limits.database },
+    )) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| return .{
+            .outcome = .refused,
+            .detail = @tagName(diagnostic.code),
+        },
+    };
+    defer database_plan.deinit();
+    const directory = try request.root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var database_intents = switch (try root_mutation.lowerDatabasePlan(
+        allocator,
+        database_plan,
+        .{ .uid = directory.uid, .gid = directory.gid },
+    )) {
+        .intents => |value| value,
+        .diagnostic => return error.MaterializationDatabaseMismatch,
+    };
+    defer database_intents.deinit();
+    return executePhaseMaterialization(
+        allocator,
+        request,
+        database_intents.intents,
+        databasePhaseEvidence(database_plan),
+        conffilePhaseDigest("lifecycle-restored-state", database_plan, null),
+        null,
+        true,
     );
 }
 
@@ -9538,6 +10386,2549 @@ const ExternalMaterializationRequest = struct {
     packages: []const ExternalPackageSelection = &.{},
 };
 
+const ExternalLifecycleAction = struct {
+    sequence: usize,
+    kind: solver.OrderedActionKind,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+};
+
+const ExternalLifecycleRequest = struct {
+    root: []const u8,
+    architecture: []const u8,
+    archives: []const []const u8,
+    operation: ExternalMaterializationOperation,
+    report: []const u8,
+    policy: ExternalConffilePolicy = .keep_existing,
+    packages: []const ExternalPackageSelection = &.{},
+    ordered_actions: ?[]const ExternalLifecycleAction = null,
+    fault: ?[]const u8 = null,
+};
+
+const LifecycleOutcome = enum {
+    applied,
+    script_failed,
+    recovery_required,
+    handoff,
+    refused,
+};
+
+const LifecycleResult = struct {
+    outcome: LifecycleOutcome,
+    detail: []const u8,
+    program_sha256: ?[64]u8 = null,
+};
+
+const CompiledLifecycle = struct {
+    authorization: native_authorization.OwnedAuthorization,
+    program: native_program.OwnedProgram,
+
+    fn deinit(self: *CompiledLifecycle) void {
+        self.program.deinit();
+        self.authorization.deinit();
+        self.* = undefined;
+    }
+};
+
+fn lifecycleScriptKind(kind: package_database.ScriptKind) maintainer_script.Kind {
+    return switch (kind) {
+        .preinst => .preinst,
+        .postinst => .postinst,
+        .prerm => .prerm,
+        .postrm => .postrm,
+    };
+}
+
+fn lifecycleArchiveScriptKind(
+    kind: archive_application.ScriptKind,
+) ?maintainer_script.Kind {
+    return switch (kind) {
+        .preinst => .preinst,
+        .postinst => .postinst,
+        .prerm => .prerm,
+        .postrm => .postrm,
+        .config => null,
+    };
+}
+
+fn lifecycleOwnedPathsDigest(record: package_database.PackageRecord) [32]u8 {
+    var hash = Sha256.init(.{});
+    hash.update(digest_domain);
+    hashText(&hash, "lifecycle-owned-paths");
+    for (record.paths orelse &.{}) |path| hashText(&hash, path);
+    return hash.finalResult();
+}
+
+fn lifecycleConfiguredVersion(
+    record: package_database.PackageRecord,
+) ?[]const u8 {
+    return switch (record.status.current) {
+        .installed, .triggers_awaited, .triggers_pending, .config_files => record.version,
+        .unpacked, .half_configured => switch (configVersionField(record)) {
+            .valid => |value| value,
+            .absent, .invalid => null,
+        },
+        else => null,
+    };
+}
+
+fn lifecycleInstalledEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    model: package_database.Model,
+) ![]const native_program.InstalledPackage {
+    const result = try allocator.alloc(
+        native_program.InstalledPackage,
+        model.packages.len,
+    );
+    var compared_bytes: u64 = 0;
+    for (model.packages, 0..) |record, index| {
+        const scripts = try allocator.alloc(
+            native_program.InstalledScript,
+            record.scripts.len,
+        );
+        for (record.scripts, 0..) |script, script_index| {
+            scripts[script_index] = .{
+                .kind = lifecycleScriptKind(script.kind),
+                .sha256 = script.sha256,
+            };
+        }
+        const conffiles = try allocator.alloc(
+            native_program.InstalledConffile,
+            record.conffiles.len,
+        );
+        for (record.conffiles, 0..) |conffile, conffile_index| {
+            const recorded = switch (conffile.digest) {
+                .md5 => |value| value,
+                .new_conffile => return error.UnsupportedLifecycleConffile,
+            };
+            const observed = try rootMd5ForConffile(
+                allocator,
+                root,
+                conffile.path,
+                (Limits{}).max_compare_bytes,
+                &compared_bytes,
+                (Limits{}).max_compared_bytes,
+            );
+            conffiles[conffile_index] = .{
+                .path = conffile.path,
+                .recorded_md5 = recorded,
+                .on_disk_md5 = if (observed) |value| value.md5 else null,
+                .obsolete = conffile.obsolete,
+            };
+        }
+        result[index] = .{
+            .name = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
+            .state = record.status.current,
+            .configured_version = lifecycleConfiguredVersion(record),
+            .hold = record.status.want == .hold,
+            .essential = record.essential,
+            .owned_paths_sha256 = lifecycleOwnedPathsDigest(record),
+            .scripts = scripts,
+            .conffiles = conffiles,
+        };
+    }
+    return result;
+}
+
+fn lifecycleArchiveEvidence(
+    allocator: std.mem.Allocator,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+) ![]const native_program.Archive {
+    const result = try allocator.alloc(native_program.Archive, models.len);
+    for (models, archive_bytes, 0..) |*model, bytes, index| {
+        const scripts = try allocator.alloc(
+            native_program.ArchiveScript,
+            model.scripts.len,
+        );
+        var script_count: usize = 0;
+        for (model.scripts) |script| {
+            const kind = lifecycleArchiveScriptKind(script.kind) orelse
+                return error.UnsupportedMaintainerScript;
+            scripts[script_count] = .{
+                .kind = kind,
+                .sha256 = script.sha256,
+                .size = script.size,
+            };
+            script_count += 1;
+        }
+        const conffiles = try allocator.alloc(
+            native_program.ArchiveConffile,
+            model.conffiles.len,
+        );
+        for (model.conffiles, 0..) |conffile, conffile_index| {
+            const path = try std.fmt.allocPrint(allocator, "/{s}", .{conffile.path});
+            const file = model.findFile(conffile.path);
+            conffiles[conffile_index] = .{
+                .path = path,
+                .md5 = if (conffile.remove_on_upgrade)
+                    null
+                else if (file) |entry|
+                    entry.md5 orelse digestMd5(try model.fileBytes(entry.*))
+                else
+                    return error.UnsupportedLifecycleConffile,
+                .remove_on_upgrade = conffile.remove_on_upgrade,
+            };
+        }
+        const artifact_id = hex(32, model.provenance().sha256);
+        const origin: exact_lock_v2.PackageOrigin = .{ .local_artifact = .{
+            .artifact_id = artifact_id,
+            .sha256 = model.provenance().sha256,
+            .size = bytes.len,
+            .package = model.facts.package,
+            .version = model.facts.version,
+            .architecture = model.facts.architecture,
+            .acquisition_url = "file:///native-lifecycle-fixture.deb",
+            .trust_mode = .pinned_sha256,
+        } };
+        result[index] = .{
+            .package = model.facts.package,
+            .version = model.facts.version,
+            .architecture = model.facts.architecture,
+            .sha256 = model.provenance().sha256,
+            .size = bytes.len,
+            .origin = origin,
+            .application_sha256 = model.digest,
+            .scripts = scripts[0..script_count],
+            .conffiles = conffiles,
+            .essential = model.facts.essential,
+        };
+    }
+    return result;
+}
+
+fn lifecycleActionKind(
+    operation: ExternalMaterializationOperation,
+) solver.ActionKind {
+    return switch (operation) {
+        .install => .install,
+        .upgrade => .upgrade,
+        .downgrade => .downgrade,
+        .reinstall, .configure => .reinstall,
+        .remove => .remove,
+        .purge => .purge,
+    };
+}
+
+fn lifecycleFinalState(
+    allocator: std.mem.Allocator,
+    external: ExternalLifecycleRequest,
+    database: package_database.Database,
+    models: []archive_application.Model,
+) ![]const native_authorization.FinalPackage {
+    var result: std.ArrayList(native_authorization.FinalPackage) = .empty;
+    for (database.model.packages) |record| {
+        var replaced = false;
+        for (models) |model| {
+            if (std.mem.eql(u8, record.name, model.facts.package) and
+                std.mem.eql(u8, record.architecture, model.facts.architecture))
+            {
+                replaced = true;
+                break;
+            }
+        }
+        var selected_removal = false;
+        for (external.packages) |selection| {
+            if (std.mem.eql(u8, record.name, selection.name) and
+                std.mem.eql(u8, record.architecture, selection.architecture))
+            {
+                selected_removal = true;
+                break;
+            }
+        }
+        if (replaced) continue;
+        if (selected_removal) {
+            if (external.operation == .remove and
+                (record.conffiles.len != 0 or record.script(.postrm) != null))
+                try result.append(allocator, .{
+                    .name = record.name,
+                    .version = record.version,
+                    .architecture = record.architecture,
+                    .state = .config_files,
+                    .dpkg_selection_hold = record.status.want == .hold,
+                });
+            continue;
+        }
+        const state: native_authorization.FinalState = switch (record.status.current) {
+            .installed, .triggers_awaited, .triggers_pending => .installed,
+            .config_files => .config_files,
+            else => continue,
+        };
+        try result.append(allocator, .{
+            .name = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
+            .state = state,
+            .dpkg_selection_hold = record.status.want == .hold,
+        });
+    }
+    for (models) |model| try result.append(allocator, .{
+        .name = model.facts.package,
+        .version = model.facts.version,
+        .architecture = model.facts.architecture,
+        .state = .installed,
+        .dpkg_selection_hold = false,
+    });
+    return result.toOwnedSlice(allocator);
+}
+
+fn compileLifecycleProgram(
+    allocator: std.mem.Allocator,
+    raw_request: []const u8,
+    external: ExternalLifecycleRequest,
+    root: root_fs.Root,
+    database: package_database.Database,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+) !?CompiledLifecycle {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+
+    const installed = try lifecycleInstalledEvidence(owned, root, database.model);
+    const archives = try lifecycleArchiveEvidence(owned, models, archive_bytes);
+    var actions: std.ArrayList(native_authorization.Action) = .empty;
+    for (archives, 0..) |archive, index| {
+        const prior = database.model.find(archive.package, archive.architecture);
+        const kind = lifecycleActionKind(external.operation);
+        try actions.append(owned, .{
+            .sequence = index,
+            .kind = kind,
+            .package = archive.package,
+            .version = archive.version,
+            .architecture = archive.architecture,
+            .prior_version = if (kind == .install)
+                null
+            else if (prior) |record|
+                record.version
+            else
+                return error.InvalidExternalOperation,
+            .artifact = .{
+                .sha256 = archive.sha256,
+                .size = archive.size,
+                .origin = archive.origin,
+            },
+        });
+    }
+    if (models.len == 0) for (external.packages) |selection| {
+        const record = database.model.find(
+            selection.name,
+            selection.architecture,
+        ) orelse continue;
+        try actions.append(owned, .{
+            .sequence = actions.items.len,
+            .kind = lifecycleActionKind(external.operation),
+            .package = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
+            .prior_version = record.version,
+            .artifact = null,
+        });
+    };
+    if (actions.items.len == 0) return null;
+
+    var ordered: std.ArrayList(solver.OrderedAction) = .empty;
+    if (external.ordered_actions) |reviewed| {
+        for (reviewed) |entry| try ordered.append(owned, .{
+            .sequence = entry.sequence,
+            .kind = entry.kind,
+            .package = entry.package,
+            .version = entry.version,
+            .architecture = entry.architecture,
+        });
+    } else switch (external.operation) {
+        .install, .upgrade, .downgrade, .reinstall => {
+            for (actions.items) |action| try ordered.append(owned, .{
+                .sequence = ordered.items.len,
+                .kind = .unpack,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            });
+            const action = actions.items[actions.items.len - 1];
+            try ordered.append(owned, .{
+                .sequence = ordered.items.len,
+                .kind = .configure_pending,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            });
+        },
+        .configure => for (actions.items) |action| try ordered.append(owned, .{
+            .sequence = ordered.items.len,
+            .kind = .configure_pending,
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        }),
+        .remove, .purge => for (actions.items) |action| try ordered.append(owned, .{
+            .sequence = ordered.items.len,
+            .kind = if (external.operation == .purge) .purge else .remove,
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        }),
+    }
+    const final_state = try lifecycleFinalState(
+        owned,
+        external,
+        database,
+        models,
+    );
+    var request_sha256: [32]u8 = undefined;
+    Sha256.hash(raw_request, &request_sha256, .{});
+    var binding_hash = Sha256.init(.{});
+    binding_hash.update(digest_domain);
+    hashText(&binding_hash, "lifecycle-authorization");
+    hashText(&binding_hash, &request_sha256);
+    hashText(&binding_hash, &database.generation.sha256);
+    for (archives) |archive| hashText(&binding_hash, &archive.sha256);
+    const binding = binding_hash.finalResult();
+    var authorization = try native_authorization.create(allocator, .{
+        .backend = .native,
+        .target_architecture = external.architecture,
+        .foreign_architectures = database.model.foreign_architectures,
+        .install_root = external.root,
+        .request_sha256 = request_sha256,
+        .solver_policy_sha256 = binding,
+        .executor_policy_sha256 = binding,
+        .plan_sha256 = binding,
+        .exact_lock = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = binding,
+        },
+        .policy = .{
+            .conffile = switch (external.policy) {
+                .keep_existing => .keep_existing,
+                .use_package_version => .use_package_version,
+            },
+        },
+        .actions = actions.items,
+        .final_state = final_state,
+    });
+    errdefer authorization.deinit();
+    const compiled = native_program.compile(allocator, .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = ordered.items,
+        .installed = .{
+            .generation_sha256 = database.generation.sha256,
+            .packages = installed,
+            .updates_pending = database.model.pending_updates.len != 0,
+        },
+        .archives = archives,
+        .script_policy = lifecycleScriptPolicy(),
+    });
+    var program = switch (compiled) {
+        .program => |value| value,
+        .diagnostic => {
+            authorization.deinit();
+            return null;
+        },
+    };
+    errdefer program.deinit();
+    if (!program.program.matchesAuthorization(authorization.authorization))
+        return error.InvalidLifecycleProgram;
+    return .{ .authorization = authorization, .program = program };
+}
+
+fn lifecycleArchiveIndex(
+    models: []archive_application.Model,
+    package: native_program.PackageIdentity,
+) ?usize {
+    for (models, 0..) |model, index| {
+        if (std.mem.eql(u8, model.facts.package, package.name) and
+            std.mem.eql(u8, model.facts.version, package.version) and
+            std.mem.eql(u8, model.facts.architecture, package.architecture))
+            return index;
+    }
+    return null;
+}
+
+fn lifecycleProgramArtifact(
+    program: native_program.Program,
+    package: native_program.PackageIdentity,
+) ?native_program.ProgramArtifact {
+    for (program.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.package.name, package.name) and
+            std.mem.eql(u8, artifact.package.version, package.version) and
+            std.mem.eql(u8, artifact.package.architecture, package.architecture))
+            return artifact;
+    }
+    return null;
+}
+
+fn lifecyclePhaseRequest(
+    root: root_fs.Root,
+    install_root: []const u8,
+    snapshot: package_database.Snapshot,
+    archives: []const ArchiveInput,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    sequences: []const u32,
+) MaterializationRequest {
+    return .{
+        .io = root.io,
+        .root = root,
+        .install_root = install_root,
+        .planning = .{
+            .program = program,
+            .authorization = authorization,
+            .snapshot = snapshot,
+            .archives = archives,
+            .root = root,
+            .root_identity_sha256 = transaction_recovery.rootIdentity(install_root),
+            .interoperability = .isolated_root,
+            .conffiles = .unpack,
+            .conffile_policy = policy,
+            .lifecycle_execution = true,
+            .lifecycle_sequences = sequences,
+        },
+        .locks = locks,
+        .operation = operation,
+        .borrowed_attempt = attempt,
+    };
+}
+
+fn lifecycleDataStep(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+    hooks: root_mutation.Hooks,
+    mutation_last_step: ?*u32,
+) !MaterializationResult {
+    const model_index = lifecycleArchiveIndex(models, package) orelse
+        return .{ .outcome = .refused, .detail = "archive_missing" };
+    const artifact = lifecycleProgramArtifact(program.*, package) orelse
+        return .{ .outcome = .refused, .detail = "artifact_missing" };
+    const input = [_]ArchiveInput{.{
+        .artifact = artifact.index,
+        .bytes = archive_bytes[model_index],
+    }};
+    const sequences = [_]u32{sequence};
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var request = lifecyclePhaseRequest(
+        root,
+        install_root,
+        captured.snapshot,
+        &input,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &sequences,
+    );
+    request.hooks = hooks;
+    request.mutation_last_step = mutation_last_step;
+    return materialize(allocator, request);
+}
+
+fn lifecycleConfigurePackage(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageRef,
+) !MaterializationResult {
+    var artifact: ?native_program.ProgramArtifact = null;
+    var model_index: ?usize = null;
+    for (program.artifacts) |candidate| {
+        if (std.mem.eql(u8, candidate.package.name, package.name) and
+            std.mem.eql(u8, candidate.package.architecture, package.architecture))
+        {
+            artifact = candidate;
+            model_index = lifecycleArchiveIndex(models, candidate.package);
+            break;
+        }
+    }
+    const selected = artifact orelse
+        return .{ .outcome = .refused, .detail = "artifact_missing" };
+    const index = model_index orelse
+        return .{ .outcome = .refused, .detail = "archive_missing" };
+    const input = [_]ArchiveInput{.{
+        .artifact = selected.index,
+        .bytes = archive_bytes[index],
+    }};
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    return materializeConfigure(allocator, lifecyclePhaseRequest(
+        root,
+        install_root,
+        captured.snapshot,
+        &input,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{},
+    ));
+}
+
+fn lifecycleRemovePackage(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageRef,
+    purge: bool,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    const selection = [_]ExternalPackageSelection{.{
+        .name = package.name,
+        .architecture = package.architecture,
+    }};
+    return materializeRemoval(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        &selection,
+        purge,
+    );
+}
+
+fn lifecycleStateStep(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    state: native_program.StateRecord,
+    want: ?package_database.Want,
+    error_state: ?package_database.ErrorState,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var current = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer current.deinit();
+    const record = current.model.find(state.package.name, state.package.architecture);
+    const expected_want: package_database.Want = want orelse if (state.hold)
+        .hold
+    else if (state.state == .config_files)
+        .deinstall
+    else
+        .install;
+    const expected_error: package_database.ErrorState = error_state orelse .ok;
+    if ((state.remove_entry and record == null) or
+        (!state.remove_entry and record != null and
+            record.?.status.current == state.state and
+            record.?.status.want == expected_want and
+            record.?.status.error_state == expected_error))
+        return .{ .outcome = .applied, .detail = "state_already_recorded" };
+    return materializeStateRecord(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        state,
+        want,
+        error_state,
+    );
+}
+
+fn lifecycleFreshFailure(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    unwind_succeeded: bool,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var request = lifecyclePhaseRequest(
+        root,
+        install_root,
+        captured.snapshot,
+        &.{},
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{},
+    );
+    request.raw_status_verification = true;
+    return materializeFreshFailureRecord(
+        allocator,
+        request,
+        package,
+        unwind_succeeded,
+    );
+}
+
+fn lifecycleDetailedState(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    return materializeDetailedState(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        package,
+        want,
+        error_state,
+        current,
+        config_version,
+    );
+}
+
+fn lifecycleRestoredPackageState(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    initial_snapshot: package_database.Snapshot,
+    initial_model: package_database.Model,
+    package: native_program.PackageIdentity,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    return materializeRestoredPackageState(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        initial_snapshot,
+        initial_model,
+        package,
+        want,
+        error_state,
+        current,
+        config_version,
+    );
+}
+
+fn lifecycleAuxiliary(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    intents: []const root_mutation.Intent,
+    label: []const u8,
+) !MaterializationResult {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    return lifecycleAuxiliaryMutation(
+        allocator,
+        lifecyclePhaseRequest(
+            root,
+            install_root,
+            captured.snapshot,
+            &.{},
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+        ),
+        intents,
+        label,
+    );
+}
+
+const lifecycle_script_record_path =
+    "var/lib/debz/native-lifecycle-script-v1.json";
+const lifecycle_tmp_ci = "var/lib/debz-lifecycle-scripts";
+const lifecycle_script_directories = [_][]const u8{
+    lifecycle_tmp_ci,
+    "var/lib/dpkg/info",
+};
+
+fn lifecycleScriptPolicy() maintainer_script.Policy {
+    return .{ .script_directories = &lifecycle_script_directories };
+}
+
+const LifecycleStaging = struct {
+    paths: std.ArrayList([]const u8) = .empty,
+    packages: std.StringHashMapUnmanaged(void) = .empty,
+    directory_created: bool = false,
+
+    fn deinit(self: *LifecycleStaging, allocator: std.mem.Allocator) void {
+        self.paths.deinit(allocator);
+        self.packages.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn lifecyclePackageKey(
+    allocator: std.mem.Allocator,
+    package: native_program.PackageIdentity,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\x00{s}",
+        .{ package.name, package.architecture },
+    );
+}
+
+fn stageLifecycleScripts(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    models: []archive_application.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    const key = try lifecyclePackageKey(scratch, package);
+    if (staging.packages.contains(key))
+        return .{ .outcome = .applied, .detail = "already_staged" };
+
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    const directory = try root.entryIfExists(try root_fs.Path.init(lifecycle_tmp_ci));
+    if (directory) |entry| {
+        if (entry.kind != .directory)
+            return .{ .outcome = .refused, .detail = "tmp_ci_not_directory" };
+    } else {
+        try intents.append(allocator, .{ .directory = .{
+            .path = lifecycle_tmp_ci,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+            .overwrite = .require_absent,
+        } });
+        staging.directory_created = true;
+    }
+
+    if (lifecycleArchiveIndex(models, package)) |model_index| {
+        const model = &models[model_index];
+        for (model.scripts) |script| {
+            const kind = lifecycleArchiveScriptKind(script.kind) orelse
+                return .{ .outcome = .handoff, .detail = "config_script" };
+            const path = try std.fmt.allocPrint(
+                scratch,
+                "{s}/{s}.{s}",
+                .{ lifecycle_tmp_ci, package.name, @tagName(kind) },
+            );
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+            try intents.append(allocator, .{ .file = .{
+                .path = path,
+                .bytes = model.scriptBytes(script),
+                .mode = script.mode,
+                .uid = 0,
+                .gid = 0,
+                .overwrite = .require_absent,
+                .expected_sha256 = script.sha256,
+            } });
+            try staging.paths.append(allocator, path);
+        }
+    }
+
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = program.target_architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    if (database.model.find(package.name, package.architecture)) |record| {
+        for (record.scripts) |script| {
+            const kind = lifecycleScriptKind(script.kind);
+            const source = try std.fmt.allocPrint(
+                scratch,
+                "{s}/{s}/{s}.{s}",
+                .{
+                    package_database.database_directory,
+                    package_database.info_directory,
+                    record.info_stem,
+                    @tagName(kind),
+                },
+            );
+            const path = try std.fmt.allocPrint(
+                scratch,
+                "{s}/{s}:{s}.{s}",
+                .{ lifecycle_tmp_ci, package.name, package.architecture, @tagName(kind) },
+            );
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
+            try intents.append(allocator, .{ .copy = .{
+                .path = path,
+                .source = source,
+                .source_sha256 = script.sha256,
+                .mode = script.mode,
+                .uid = 0,
+                .gid = 0,
+                .overwrite = .require_absent,
+            } });
+            try staging.paths.append(allocator, path);
+        }
+    }
+    const result = try lifecycleAuxiliary(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        intents.items,
+        "stage-scripts",
+    );
+    if (result.outcome == .applied)
+        try staging.packages.put(allocator, key, {});
+    return result;
+}
+
+fn cleanupLifecycleStaging(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    if (staging.paths.items.len == 0 and !staging.directory_created)
+        return .{ .outcome = .applied, .detail = "nothing_staged" };
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    for (staging.paths.items) |path| try intents.append(allocator, .{ .remove = .{
+        .path = path,
+        .removal = .allow_absent,
+    } });
+    if (staging.directory_created)
+        try intents.append(allocator, .{ .remove_directory = .{
+            .path = lifecycle_tmp_ci,
+            .removal = .allow_absent,
+        } });
+    return lifecycleAuxiliary(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        intents.items,
+        "cleanup-scripts",
+    );
+}
+
+fn lifecycleInstalledScriptPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+) ![]const u8 {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    const record = database.model.find(package.name, package.architecture) orelse
+        return error.InstalledScriptMissing;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}.{s}",
+        .{
+            package_database.database_directory,
+            package_database.info_directory,
+            record.info_stem,
+            @tagName(kind),
+        },
+    );
+}
+
+fn lifecycleScriptPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+) ![]const u8 {
+    const staged = switch (source) {
+        .new_package => try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}.{s}",
+            .{ lifecycle_tmp_ci, package.name, @tagName(kind) },
+        ),
+        .installed_package => try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}:{s}.{s}",
+            .{ lifecycle_tmp_ci, package.name, package.architecture, @tagName(kind) },
+        ),
+    };
+    if (try root.entryIfExists(try root_fs.Path.init(staged)) != null)
+        return staged;
+    allocator.free(staged);
+    return lifecycleInstalledScriptPath(
+        allocator,
+        root,
+        architecture,
+        package,
+        kind,
+    );
+}
+
+const LifecycleScriptRecord = struct {
+    schema: []const u8 = "https://debz.dev/schema/native-lifecycle-script-v1",
+    program_sha256: []const u8,
+    step: u32,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    kind: []const u8,
+    source: []const u8,
+    script_sha256: []const u8,
+    arguments: []const []const u8,
+    outcome: []const u8,
+    exit_code: ?u8,
+};
+
+fn lifecycleScriptRecordBytes(
+    allocator: std.mem.Allocator,
+    program: native_program.Program,
+    step: u32,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+    outcome: []const u8,
+    exit_code: ?u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try std.json.Stringify.value(
+        LifecycleScriptRecord{
+            .program_sha256 = &program.digest_sha256,
+            .step = step,
+            .package = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .kind = @tagName(kind),
+            .source = @tagName(source),
+            .script_sha256 = &script_sha256,
+            .arguments = arguments,
+            .outcome = outcome,
+            .exit_code = exit_code,
+        },
+        .{ .whitespace = .minified },
+        &output.writer,
+    );
+    try output.writer.writeByte('\n');
+    return output.toOwnedSlice();
+}
+
+fn publishLifecycleScriptRecord(
+    root: root_fs.Root,
+    bytes: []const u8,
+    overwrite: root_fs.OverwritePolicy,
+) !void {
+    try root.publishFile(
+        try root_fs.Path.init(lifecycle_script_record_path),
+        bytes,
+        .{
+            .permissions = if (builtin.os.tag == .windows)
+                .default_file
+            else
+                .fromMode(0o600),
+            .overwrite = overwrite,
+            .durable = true,
+        },
+    );
+}
+
+fn clearLifecycleScriptRecord(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    expected: []const u8,
+) !void {
+    const path = try root_fs.Path.init(lifecycle_script_record_path);
+    const observed = try root.readFileAlloc(
+        allocator,
+        path,
+        64 * 1024,
+    );
+    defer allocator.free(observed);
+    if (!std.mem.eql(u8, observed, expected))
+        return error.LifecycleScriptRecordChanged;
+    try root.removeFile(path);
+    try root.syncDirectory(try root_fs.Path.init(root_operation.namespace_path));
+}
+
+const LifecycleScriptOutcome = union(enum) {
+    exited: u8,
+    recovery_required,
+};
+
+fn lifecycleScriptOwner(
+    authorization: native_authorization.Authorization,
+    target: native_program.PackageIdentity,
+    source: native_program.ScriptSource,
+) !native_program.PackageIdentity {
+    return switch (source) {
+        .new_package => target,
+        .installed_package => .{
+            .name = target.name,
+            .version = (authorization.findAction(
+                target.name,
+                target.architecture,
+            ) orelse return error.InvalidLifecycleProgram).prior_version orelse
+                return error.InvalidLifecycleProgram,
+            .architecture = target.architecture,
+        },
+    };
+}
+
+fn runLifecycleScript(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    attempt: *root_operation.Attempt,
+    sequence: u32,
+    target: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+    inject_unknown: bool,
+) !LifecycleScriptOutcome {
+    const package = try lifecycleScriptOwner(authorization.*, target, source);
+    const path = try lifecycleScriptPath(
+        allocator,
+        root,
+        program.target_architecture,
+        package,
+        kind,
+        source,
+    );
+    defer allocator.free(path);
+    const expected = parseHex(32, &script_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const observed = try rootFileSha256(allocator, root, path, 64 * 1024 * 1024);
+    if (!std.mem.eql(u8, &expected, &observed))
+        return error.InstalledScriptMismatch;
+
+    const in_flight = try lifecycleScriptRecordBytes(
+        allocator,
+        program.*,
+        sequence,
+        package,
+        kind,
+        source,
+        script_sha256,
+        arguments,
+        "in_flight",
+        null,
+    );
+    defer allocator.free(in_flight);
+    publishLifecycleScriptRecord(
+        root,
+        in_flight,
+        .fail_if_exists,
+    ) catch {
+        try attempt.requireRecovery(allocator, .script);
+        return .recovery_required;
+    };
+    try attempt.advance(allocator, .{
+        .state = .mutating,
+        .phase = .script,
+    });
+
+    var launcher: maintainer_script.SystemLauncher = .{};
+    var report = try maintainer_script.run(allocator, .{
+        .root = install_root,
+        .identity = .{
+            .package = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .kind = kind,
+            .script_path = path,
+            .script_sha256 = expected,
+        },
+        .arguments = arguments,
+        .policy = lifecycleScriptPolicy(),
+    }, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+
+    if (inject_unknown) {
+        try attempt.requireRecovery(allocator, .script);
+        return .recovery_required;
+    }
+    const code = switch (report.outcome) {
+        .exited => |value| value,
+        else => {
+            try attempt.requireRecovery(allocator, .script);
+            return .recovery_required;
+        },
+    };
+    const observed_record = try lifecycleScriptRecordBytes(
+        allocator,
+        program.*,
+        sequence,
+        package,
+        kind,
+        source,
+        script_sha256,
+        arguments,
+        "exited",
+        code,
+    );
+    defer allocator.free(observed_record);
+    publishLifecycleScriptRecord(
+        root,
+        observed_record,
+        .replace,
+    ) catch {
+        try attempt.requireRecovery(allocator, .script);
+        return .recovery_required;
+    };
+    try attempt.advance(allocator, .{
+        .state = .mutating,
+        .phase = .script,
+    });
+    clearLifecycleScriptRecord(
+        allocator,
+        root,
+        observed_record,
+    ) catch {
+        try attempt.requireRecovery(allocator, .script);
+        return .recovery_required;
+    };
+    return .{ .exited = code };
+}
+
+const PostUnpackScript = struct {
+    sequence: u32,
+    call: native_program.ScriptCall,
+};
+
+fn postUnpackScript(
+    program: native_program.Program,
+    unpack_sequence: u32,
+    package: native_program.PackageIdentity,
+) ?PostUnpackScript {
+    for (program.steps) |step| {
+        if (step.sequence <= unpack_sequence) continue;
+        switch (step.operation) {
+            .run_maintainer_script => |call| {
+                if (step.phase != .unpack) return null;
+                if (call.kind == .postrm and call.source == .installed_package and
+                    std.mem.eql(u8, call.package.name, package.name) and
+                    std.mem.eql(u8, call.package.architecture, package.architecture))
+                    return .{ .sequence = step.sequence, .call = call };
+            },
+            .apply_conffile_decision, .record_package_state => {},
+            else => if (step.phase != .unpack) return null,
+        }
+    }
+    return null;
+}
+
+const PostUnpackHook = struct {
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    attempt: *root_operation.Attempt,
+    target_step: u32,
+    script: PostUnpackScript,
+    inject_unknown: bool = false,
+    fired: bool = false,
+    rollback_required: bool = false,
+    failed_compensation: ?u32 = null,
+};
+
+fn postUnpackHook(
+    context_ptr: ?*anyopaque,
+    boundary: root_mutation.Boundary,
+    index: u32,
+) root_mutation.HookError!void {
+    const context: *PostUnpackHook = @ptrCast(@alignCast(context_ptr.?));
+    if (context.fired or boundary != .verify or index != context.target_step)
+        return;
+    context.fired = true;
+    const primary = runLifecycleScript(
+        context.allocator,
+        context.root,
+        context.install_root,
+        context.program,
+        context.authorization,
+        context.attempt,
+        context.script.sequence,
+        context.script.call.package,
+        context.script.call.kind,
+        context.script.call.source,
+        context.script.call.script_sha256,
+        context.script.call.arguments,
+        context.inject_unknown,
+    ) catch {
+        context.attempt.requireRecovery(context.allocator, .script) catch
+            return error.SimulatedCrash;
+        return error.SimulatedCrash;
+    };
+    const code = switch (primary) {
+        .exited => |value| value,
+        .recovery_required => return error.SimulatedCrash,
+    };
+    if (code == 0) return;
+    if (context.script.call.failure.unwind) |unwind| {
+        const unwind_outcome = runLifecycleScript(
+            context.allocator,
+            context.root,
+            context.install_root,
+            context.program,
+            context.authorization,
+            context.attempt,
+            context.script.sequence,
+            context.script.call.package,
+            unwind.kind,
+            unwind.source,
+            unwind.script_sha256,
+            unwind.arguments,
+            false,
+        ) catch {
+            context.attempt.requireRecovery(context.allocator, .script) catch
+                return error.SimulatedCrash;
+            return error.SimulatedCrash;
+        };
+        const unwind_code = switch (unwind_outcome) {
+            .exited => |value| value,
+            .recovery_required => return error.SimulatedCrash,
+        };
+        if (unwind_code == 0 and
+            context.script.call.failure.resume_after_unwind)
+            return;
+    }
+    const rollback_after =
+        context.script.call.failure.rollback_after_compensations orelse 0;
+    if (rollback_after > context.script.call.failure.compensations.len)
+        return error.AccessDenied;
+    for (
+        context.script.call.failure.compensations[0..rollback_after],
+        0..,
+    ) |call, compensation_index| {
+        const outcome = runLifecycleScript(
+            context.allocator,
+            context.root,
+            context.install_root,
+            context.program,
+            context.authorization,
+            context.attempt,
+            context.script.sequence,
+            context.script.call.package,
+            call.kind,
+            call.source,
+            call.script_sha256,
+            call.arguments,
+            false,
+        ) catch {
+            context.attempt.requireRecovery(context.allocator, .script) catch
+                return error.SimulatedCrash;
+            return error.SimulatedCrash;
+        };
+        const compensation_code = switch (outcome) {
+            .exited => |value| value,
+            .recovery_required => return error.SimulatedCrash,
+        };
+        if (compensation_code != 0) {
+            context.failed_compensation = @intCast(compensation_index);
+            break;
+        }
+    }
+    context.rollback_required = true;
+    return error.AccessDenied;
+}
+
+fn lifecycleMaterializationFailure(
+    result: MaterializationResult,
+) ?LifecycleResult {
+    return switch (result.outcome) {
+        .applied => null,
+        .rolled_back => .{ .outcome = .script_failed, .detail = result.detail },
+        .recovery_required => .{
+            .outcome = .recovery_required,
+            .detail = result.detail,
+        },
+        .handoff => .{ .outcome = .handoff, .detail = result.detail },
+        .refused => .{ .outcome = .refused, .detail = result.detail },
+    };
+}
+
+fn restoreLifecycleStatusOld(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    initial_status: []const u8,
+) !MaterializationResult {
+    var digest: [32]u8 = undefined;
+    Sha256.hash(initial_status, &digest, .{});
+    const path = package_database.database_directory ++ "/" ++
+        package_database.status_old_path;
+    const current = try root.entryIfExists(try root_fs.Path.init(path));
+    const intent = [_]root_mutation.Intent{.{ .file = .{
+        .path = path,
+        .bytes = initial_status,
+        .mode = if (current) |entry| entry.mode else 0o644,
+        .uid = if (current) |entry| entry.uid else 0,
+        .gid = if (current) |entry| entry.gid else 0,
+        .overwrite = if (current == null) .require_absent else .replace,
+        .expected_sha256 = digest,
+    } }};
+    return lifecycleAuxiliary(
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &intent,
+        "restore-status-old",
+    );
+}
+
+fn finishLifecycleAttempt(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    program_sha256: [32]u8,
+    succeeded: bool,
+) !void {
+    try attempt.advance(allocator, .{
+        .state = .verifying,
+        .phase = .verification,
+    });
+    try attempt.complete(
+        allocator,
+        if (succeeded) .succeeded else .failed_after_mutation,
+    );
+    try attempt.publishProvenance(allocator, program_sha256);
+    try attempt.clear();
+}
+
+fn lifecycleOperationWant(
+    operation: ExternalMaterializationOperation,
+) package_database.Want {
+    return switch (operation) {
+        .remove => .deinstall,
+        .purge => .purge,
+        else => .install,
+    };
+}
+
+fn lifecycleDatabaseMatchesProgram(
+    program: native_program.Program,
+    generation: package_database.Generation,
+    package_count: usize,
+) bool {
+    const expected = parseHex(
+        32,
+        &program.installed_database.generation_sha256,
+    ) orelse return false;
+    return std.mem.eql(u8, &expected, &generation.sha256) and
+        program.installed_database.package_count == package_count;
+}
+
+fn lifecycleFinalClosureMatches(
+    authorization: native_authorization.Authorization,
+    database: package_database.Database,
+) bool {
+    if (database.model.packages.len != authorization.final_state.len)
+        return false;
+    for (authorization.final_state) |expected| {
+        const record = database.model.find(
+            expected.name,
+            expected.architecture,
+        ) orelse return false;
+        if (!std.mem.eql(u8, record.version, expected.version) or
+            record.status.error_state != .ok)
+            return false;
+        const state_matches = switch (expected.state) {
+            .installed => record.status.current == .installed,
+            .config_files => record.status.current == .config_files,
+        };
+        if (!state_matches) return false;
+        const want_matches = if (expected.dpkg_selection_hold)
+            record.status.want == .hold
+        else switch (expected.state) {
+            .installed => record.status.want == .install,
+            .config_files => record.status.want == .deinstall,
+        };
+        if (!want_matches) return false;
+    }
+    return true;
+}
+
+fn verifyLifecycleFinalClosure(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    authorization: native_authorization.Authorization,
+) !bool {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return false,
+    };
+    defer database.deinit();
+    return lifecycleFinalClosureMatches(authorization, database);
+}
+
+fn executeLifecycleProgram(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    compiled: *CompiledLifecycle,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    initial_snapshot: package_database.Snapshot,
+    initial_model: package_database.Model,
+    locks: root_operation.LockBackend,
+) !LifecycleResult {
+    const program = &compiled.program.program;
+    const authorization = &compiled.authorization.authorization;
+    const program_sha256 = parseHex(32, &program.digest_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const request_sha256 = parseHex(32, &program.request_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const policy_sha256 = parseHex(32, &program.executor_policy_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const lock_sha256 = parseHex(32, &program.exact_lock.digest_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const artifact_evidence = parseHex(32, &program.artifacts_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    const initial_database = parseHex(
+        32,
+        &program.installed_database.generation_sha256,
+    ) orelse return error.InvalidLifecycleProgram;
+    const operation = externalProductOperation(external.operation);
+    const conffile_policy: transaction_executor.ConffilePolicy = switch (external.policy) {
+        .keep_existing => .keep_existing,
+        .use_package_version => .use_package_version,
+    };
+    var coordinator = try root_operation.Coordinator.open(
+        root.io,
+        root,
+        external.root,
+        locks,
+    );
+    var attempt = coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = operation },
+        .request_sha256 = request_sha256,
+        .policy_sha256 = policy_sha256,
+        .evidence = .{
+            .authorization_sha256 = authorization.digest_sha256,
+            .program_sha256 = program_sha256,
+            .plan_sha256 = program_sha256,
+            .exact_lock = .{
+                .schema = program.exact_lock.schema,
+                .version = program.exact_lock.version,
+                .digest_sha256 = lock_sha256,
+            },
+            .database_generation_sha256 = initial_database,
+            .artifact_evidence_sha256 = artifact_evidence,
+        },
+        .target_architecture = program.target_architecture,
+        .foreign_architectures = program.foreign_architectures,
+    }) catch |err| switch (err) {
+        error.RecoveryRequired,
+        error.OperationInProgress,
+        error.ProvenancePending,
+        => return .{
+            .outcome = .recovery_required,
+            .detail = @errorName(err),
+            .program_sha256 = program.digest_sha256,
+        },
+        else => return err,
+    };
+    var attempt_active = true;
+    defer if (attempt_active) attempt.release();
+
+    var locked_capture = captureDatabaseSnapshot(allocator, root, .{}) catch |err| {
+        try attempt.abandonIfPreMutation(allocator);
+        return err;
+    };
+    defer locked_capture.deinit();
+    normalizeCapturedNativeArchitecture(
+        &locked_capture.snapshot,
+        program.target_architecture,
+    );
+    var locked_database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = program.target_architecture,
+            .snapshot = locked_capture.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = "locked_database_rejected",
+                .program_sha256 = program.digest_sha256,
+            };
+        },
+    };
+    defer locked_database.deinit();
+    if (!lifecycleDatabaseMatchesProgram(
+        program.*,
+        locked_database.generation,
+        locked_database.model.packages.len,
+    )) {
+        try attempt.abandonIfPreMutation(allocator);
+        attempt.release();
+        attempt_active = false;
+        return .{
+            .outcome = .refused,
+            .detail = "database_generation_drift",
+            .program_sha256 = program.digest_sha256,
+        };
+    }
+
+    const scratch_arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(scratch_arena);
+    scratch_arena.* = .init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+    var staging: LifecycleStaging = .{};
+    defer staging.deinit(allocator);
+    var configured: std.StringHashMapUnmanaged(void) = .empty;
+    defer configured.deinit(allocator);
+    var consumed_scripts: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer consumed_scripts.deinit(allocator);
+    var fault_used = false;
+    var crossed_configure_barrier = false;
+    var status_old_baseline = try scratch.dupe(
+        u8,
+        locked_capture.snapshot.status.bytes,
+    );
+
+    for (program.steps) |step| switch (step.operation) {
+        .assert_authorization,
+        .assert_root_state,
+        .assert_database_generation,
+        .assert_installed_package,
+        .assert_package_absent,
+        .assert_path_ownership,
+        .revalidate_artifact,
+        .publish_database_generation,
+        .verify_final_state,
+        .publish_provenance,
+        => {},
+        .materialize_bootstrap_payload => |intent| {
+            const result = try lifecycleDataStep(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                models,
+                archive_bytes,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                step.sequence,
+                intent.package,
+                .{},
+                null,
+            );
+            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+        },
+        .unpack_package => |intent| {
+            if (crossed_configure_barrier) {
+                status_old_baseline = try root.readFileAlloc(
+                    scratch,
+                    try root_fs.Path.init(
+                        package_database.database_directory ++ "/" ++
+                            package_database.status_path,
+                    ),
+                    (package_database.Limits{}).max_status_bytes,
+                );
+                crossed_configure_barrier = false;
+            }
+            const post_unpack = postUnpackScript(program.*, step.sequence, intent.package);
+            var hook_context: PostUnpackHook = undefined;
+            const hooks: root_mutation.Hooks = if (post_unpack) |script| block: {
+                hook_context = .{
+                    .allocator = allocator,
+                    .root = root,
+                    .install_root = external.root,
+                    .program = program,
+                    .authorization = authorization,
+                    .attempt = &attempt,
+                    .target_step = 0,
+                    .script = script,
+                    .inject_unknown = external.fault != null and
+                        std.mem.eql(
+                            u8,
+                            external.fault.?,
+                            "after_upgrade_postrm_before_record",
+                        ),
+                };
+                break :block .{
+                    .context = &hook_context,
+                    .beforeFn = postUnpackHook,
+                };
+            } else .{};
+            const result = try lifecycleDataStep(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                models,
+                archive_bytes,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                step.sequence,
+                intent.package,
+                hooks,
+                if (post_unpack != null) &hook_context.target_step else null,
+            );
+            if (post_unpack != null) {
+                if (hook_context.fired)
+                    try consumed_scripts.put(
+                        allocator,
+                        hook_context.script.sequence,
+                        {},
+                    );
+                if (hook_context.rollback_required) {
+                    if (result.outcome != .rolled_back) {
+                        try attempt.requireRecovery(allocator, .script);
+                        return .{
+                            .outcome = .recovery_required,
+                            .detail = "upgrade_rollback_failed",
+                            .program_sha256 = program.digest_sha256,
+                        };
+                    }
+                    const compensation_start =
+                        hook_context.script.call.failure
+                            .rollback_after_compensations orelse
+                        return error.InvalidLifecycleProgram;
+                    if (compensation_start >
+                        hook_context.script.call.failure.compensations.len)
+                        return error.InvalidLifecycleProgram;
+                    var failed_compensation = hook_context.failed_compensation;
+                    if (failed_compensation == null) {
+                        rollback_compensations: for (
+                            hook_context.script.call.failure.compensations[compensation_start..],
+                            compensation_start..,
+                        ) |compensation, compensation_index| {
+                            const compensation_outcome = try runLifecycleScript(
+                                allocator,
+                                root,
+                                external.root,
+                                program,
+                                authorization,
+                                &attempt,
+                                hook_context.script.sequence,
+                                intent.package,
+                                compensation.kind,
+                                compensation.source,
+                                compensation.script_sha256,
+                                compensation.arguments,
+                                false,
+                            );
+                            switch (compensation_outcome) {
+                                .exited => |compensation_code| {
+                                    if (compensation_code != 0) {
+                                        failed_compensation = @intCast(
+                                            compensation_index,
+                                        );
+                                        break :rollback_compensations;
+                                    }
+                                },
+                                .recovery_required => return .{
+                                    .outcome = .recovery_required,
+                                    .detail = "rollback_compensation_unknown",
+                                    .program_sha256 = program.digest_sha256,
+                                },
+                            }
+                        }
+                    }
+                    if (failed_compensation) |failed_index| {
+                        const compensation =
+                            hook_context.script.call.failure.compensations[
+                                failed_index
+                            ];
+                        const failed_state: package_database.CurrentState =
+                            if (compensation.kind == .postinst)
+                                .unpacked
+                            else
+                                .half_installed;
+                        const failed_error: package_database.ErrorState =
+                            if (compensation.kind == .postinst)
+                                .ok
+                            else
+                                .reinst_required;
+                        const action = authorization.findAction(
+                            intent.package.name,
+                            intent.package.architecture,
+                        ) orelse return error.InvalidLifecycleProgram;
+                        const result_state = try lifecycleRestoredPackageState(
+                            allocator,
+                            root,
+                            external.root,
+                            program,
+                            authorization,
+                            locks,
+                            &attempt,
+                            operation,
+                            conffile_policy,
+                            initial_snapshot,
+                            initial_model,
+                            intent.package,
+                            .install,
+                            failed_error,
+                            failed_state,
+                            action.prior_version,
+                        );
+                        if (lifecycleMaterializationFailure(result_state)) |failure|
+                            return failure;
+                    }
+                    const cleanup = try cleanupLifecycleStaging(
+                        allocator,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        locks,
+                        &attempt,
+                        operation,
+                        conffile_policy,
+                        &staging,
+                    );
+                    if (lifecycleMaterializationFailure(cleanup)) |failure|
+                        return failure;
+                    const restored = try restoreLifecycleStatusOld(
+                        allocator,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        locks,
+                        &attempt,
+                        operation,
+                        conffile_policy,
+                        status_old_baseline,
+                    );
+                    if (lifecycleMaterializationFailure(restored)) |failure|
+                        return failure;
+                    try finishLifecycleAttempt(
+                        allocator,
+                        &attempt,
+                        program_sha256,
+                        false,
+                    );
+                    attempt.release();
+                    attempt_active = false;
+                    return .{
+                        .outcome = .script_failed,
+                        .detail = "postrm",
+                        .program_sha256 = program.digest_sha256,
+                    };
+                }
+            }
+            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+        },
+        .configure_barrier => {
+            crossed_configure_barrier = true;
+        },
+        .apply_conffile_decision => |decision| {
+            const package = decision.package.ref();
+            const key = try std.fmt.allocPrint(
+                scratch,
+                "{s}\x00{s}",
+                .{ package.name, package.architecture },
+            );
+            if (!configured.contains(key)) {
+                const result = try lifecycleConfigurePackage(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    models,
+                    archive_bytes,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    package,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+                try configured.put(allocator, key, {});
+            }
+        },
+        .record_package_state => |state| {
+            if (state.state == .half_installed or
+                state.state == .half_configured)
+                continue;
+            if ((state.state == .installed or
+                state.state == .triggers_awaited or
+                state.state == .triggers_pending) and
+                lifecycleProgramArtifact(program.*, state.package) != null)
+            {
+                const key = try std.fmt.allocPrint(
+                    scratch,
+                    "{s}\x00{s}",
+                    .{ state.package.name, state.package.architecture },
+                );
+                if (!configured.contains(key)) {
+                    const result = try lifecycleConfigurePackage(
+                        allocator,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        models,
+                        archive_bytes,
+                        locks,
+                        &attempt,
+                        operation,
+                        conffile_policy,
+                        state.package.ref(),
+                    );
+                    if (lifecycleMaterializationFailure(result)) |failure|
+                        return failure;
+                    try configured.put(allocator, key, {});
+                }
+            }
+            const result = try lifecycleStateStep(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                state,
+                lifecycleOperationWant(external.operation),
+                null,
+            );
+            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+        },
+        .remove_package_files => |intent| {
+            const result = try lifecycleRemovePackage(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                intent.package.ref(),
+                false,
+            );
+            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+        },
+        .purge_package_files => |intent| {
+            const result = try lifecycleRemovePackage(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                intent.package.ref(),
+                true,
+            );
+            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+        },
+        .run_maintainer_script => |call| {
+            if (consumed_scripts.contains(step.sequence)) continue;
+            const staged = try stageLifecycleScripts(
+                allocator,
+                scratch,
+                root,
+                external.root,
+                program,
+                authorization,
+                models,
+                locks,
+                &attempt,
+                operation,
+                conffile_policy,
+                call.package,
+                &staging,
+            );
+            if (lifecycleMaterializationFailure(staged)) |failure| return failure;
+            const inject_unknown = !fault_used and external.fault != null and
+                std.mem.eql(
+                    u8,
+                    external.fault.?,
+                    "after_script_before_record",
+                );
+            if (inject_unknown) fault_used = true;
+            const outcome = try runLifecycleScript(
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                &attempt,
+                step.sequence,
+                call.package,
+                call.kind,
+                call.source,
+                call.script_sha256,
+                call.arguments,
+                inject_unknown,
+            );
+            const code = switch (outcome) {
+                .recovery_required => return .{
+                    .outcome = .recovery_required,
+                    .detail = "script_outcome_unknown",
+                    .program_sha256 = program.digest_sha256,
+                },
+                .exited => |value| value,
+            };
+            if (code == 0) continue;
+
+            var unwind_succeeded = call.failure.unwind == null;
+            if (call.failure.unwind) |unwind| {
+                const unwind_outcome = try runLifecycleScript(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    &attempt,
+                    step.sequence,
+                    call.package,
+                    unwind.kind,
+                    unwind.source,
+                    unwind.script_sha256,
+                    unwind.arguments,
+                    false,
+                );
+                unwind_succeeded = switch (unwind_outcome) {
+                    .recovery_required => return .{
+                        .outcome = .recovery_required,
+                        .detail = "unwind_outcome_unknown",
+                        .program_sha256 = program.digest_sha256,
+                    },
+                    .exited => |value| value == 0,
+                };
+            }
+
+            const upgrading = call.arguments.len != 0 and
+                std.mem.eql(u8, call.arguments[0], "upgrade");
+            if (call.failure.resume_after_unwind and unwind_succeeded)
+                continue;
+
+            const action = authorization.findAction(
+                call.package.name,
+                call.package.architecture,
+            );
+            const prior_version = if (action) |value| value.prior_version else null;
+            if (call.failure.rollback_after_compensations != null) {
+                try attempt.requireRecovery(allocator, .script);
+                return .{
+                    .outcome = .recovery_required,
+                    .detail = "rollback_boundary_missed",
+                    .program_sha256 = program.digest_sha256,
+                };
+            }
+            var failed_compensation: ?native_program.Unwind = null;
+            compensations: for (call.failure.compensations) |compensation| {
+                const compensation_outcome = try runLifecycleScript(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    &attempt,
+                    step.sequence,
+                    call.package,
+                    compensation.kind,
+                    compensation.source,
+                    compensation.script_sha256,
+                    compensation.arguments,
+                    false,
+                );
+                switch (compensation_outcome) {
+                    .exited => |compensation_code| if (compensation_code != 0) {
+                        failed_compensation = compensation;
+                        break :compensations;
+                    },
+                    .recovery_required => return .{
+                        .outcome = .recovery_required,
+                        .detail = "compensation_outcome_unknown",
+                        .program_sha256 = program.digest_sha256,
+                    },
+                }
+            }
+
+            var staging_cleaned = false;
+            if (upgrading and prior_version != null and
+                failed_compensation != null)
+            {
+                const compensation = failed_compensation.?;
+                const failed_state: package_database.CurrentState =
+                    if (compensation.kind == .postinst)
+                        .unpacked
+                    else
+                        .half_installed;
+                const failed_error: package_database.ErrorState =
+                    if (compensation.kind == .postinst)
+                        .ok
+                    else
+                        .reinst_required;
+                const result = try lifecycleRestoredPackageState(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    initial_snapshot,
+                    initial_model,
+                    call.package,
+                    .install,
+                    failed_error,
+                    failed_state,
+                    prior_version,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure|
+                    return failure;
+            } else if (call.kind == .preinst and
+                call.source == .new_package and
+                call.arguments.len == 1 and
+                std.mem.eql(u8, call.arguments[0], "install") and
+                action != null and action.?.prior_version == null)
+            {
+                const cleanup = try cleanupLifecycleStaging(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    &staging,
+                );
+                if (lifecycleMaterializationFailure(cleanup)) |failure|
+                    return failure;
+                staging_cleaned = true;
+                const result = try lifecycleFreshFailure(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    call.package,
+                    unwind_succeeded,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            } else if (call.kind == .prerm and
+                call.arguments.len != 0 and
+                std.mem.eql(u8, call.arguments[0], "remove") and
+                !unwind_succeeded)
+            {
+                const result = try lifecycleDetailedState(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    call.package,
+                    .deinstall,
+                    .ok,
+                    .half_configured,
+                    if (action) |value| value.prior_version else null,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            } else if (call.kind == .postrm and
+                call.arguments.len != 0 and
+                std.mem.eql(u8, call.arguments[0], "remove"))
+            {
+                const result = try lifecycleRestoredPackageState(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    initial_snapshot,
+                    initial_model,
+                    call.package,
+                    lifecycleOperationWant(external.operation),
+                    .ok,
+                    .half_installed,
+                    if (action) |value| value.prior_version else null,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            } else if (call.kind == .postrm and
+                call.arguments.len != 0 and
+                std.mem.eql(u8, call.arguments[0], "purge"))
+            {
+                const result = try lifecycleDetailedState(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    call.package,
+                    .purge,
+                    .ok,
+                    .config_files,
+                    null,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            } else {
+                var failure_state: native_program.StateRecord = .{
+                    .package = call.package,
+                    .state = call.failure.state,
+                    .hold = false,
+                    .remove_entry = false,
+                };
+                if (upgrading and prior_version != null)
+                    failure_state.state = .installed;
+                if (call.kind == .prerm and
+                    call.arguments.len != 0 and
+                    std.mem.eql(u8, call.arguments[0], "remove") and
+                    unwind_succeeded)
+                    failure_state.state = .installed;
+                const result = try lifecycleStateStep(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    failure_state,
+                    lifecycleOperationWant(external.operation),
+                    null,
+                );
+                if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            }
+            if (!staging_cleaned) {
+                const cleanup = try cleanupLifecycleStaging(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    &staging,
+                );
+                if (lifecycleMaterializationFailure(cleanup)) |failure| return failure;
+            }
+            if (!staging_cleaned) {
+                const restored = try restoreLifecycleStatusOld(
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    &attempt,
+                    operation,
+                    conffile_policy,
+                    status_old_baseline,
+                );
+                if (lifecycleMaterializationFailure(restored)) |failure|
+                    return failure;
+            }
+            try finishLifecycleAttempt(allocator, &attempt, program_sha256, false);
+            attempt.release();
+            attempt_active = false;
+            return .{
+                .outcome = .script_failed,
+                .detail = @tagName(call.kind),
+                .program_sha256 = program.digest_sha256,
+            };
+        },
+        .record_trigger_interests,
+        .activate_trigger,
+        .process_deferred_triggers,
+        => return .{
+            .outcome = .handoff,
+            .detail = "trigger",
+            .program_sha256 = program.digest_sha256,
+        },
+    };
+
+    const cleanup = try cleanupLifecycleStaging(
+        allocator,
+        root,
+        external.root,
+        program,
+        authorization,
+        locks,
+        &attempt,
+        operation,
+        conffile_policy,
+        &staging,
+    );
+    if (lifecycleMaterializationFailure(cleanup)) |failure| return failure;
+    const restored = try restoreLifecycleStatusOld(
+        allocator,
+        root,
+        external.root,
+        program,
+        authorization,
+        locks,
+        &attempt,
+        operation,
+        conffile_policy,
+        status_old_baseline,
+    );
+    if (lifecycleMaterializationFailure(restored)) |failure| return failure;
+    const closure_matches = verifyLifecycleFinalClosure(
+        allocator,
+        root,
+        program.target_architecture,
+        authorization.*,
+    ) catch {
+        try attempt.requireRecovery(allocator, .verification);
+        return .{
+            .outcome = .recovery_required,
+            .detail = "final_closure_verification_failed",
+            .program_sha256 = program.digest_sha256,
+        };
+    };
+    if (!closure_matches) {
+        try attempt.requireRecovery(allocator, .verification);
+        return .{
+            .outcome = .recovery_required,
+            .detail = "final_closure_mismatch",
+            .program_sha256 = program.digest_sha256,
+        };
+    }
+    try finishLifecycleAttempt(allocator, &attempt, program_sha256, true);
+    attempt.release();
+    attempt_active = false;
+    return .{
+        .outcome = .applied,
+        .detail = "completed",
+        .program_sha256 = program.digest_sha256,
+    };
+}
+
 fn readAbsoluteFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -9574,6 +12965,35 @@ fn writeMaterializationReport(
     });
     defer file.close(io);
     try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+}
+
+fn writeLifecycleReport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    result: LifecycleResult,
+) !void {
+    const Wire = struct {
+        outcome: []const u8,
+        detail: []const u8,
+        program_sha256: ?[]const u8,
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try std.json.Stringify.value(
+        Wire{
+            .outcome = @tagName(result.outcome),
+            .detail = result.detail,
+            .program_sha256 = if (result.program_sha256) |*digest| digest else null,
+        },
+        .{ .whitespace = .minified },
+        &output.writer,
+    );
+    try output.writer.writeByte('\n');
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, output.written());
     try file.sync(io);
 }
 
@@ -9839,6 +13259,413 @@ test "native_unpack.test.materialization external fixture" {
         else => try materialize(testing.allocator, phase_request),
     };
     try writeMaterializationReport(
+        testing.allocator,
+        testing.io,
+        external.report,
+        result,
+    );
+}
+
+/// dpkg still rotates `status` into `status-old` when remove or purge names no
+/// present package. Authorization v1 cannot encode an action for an absent
+/// identity, so this bounded path performs only that database bookkeeping and
+/// cannot run scripts or touch package-owned data.
+fn applyAbsentLifecycleNoOp(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: root_fs.Root,
+    install_root: []const u8,
+    architecture: []const u8,
+    request_bytes: []const u8,
+    selections: []const ExternalPackageSelection,
+) !LifecycleResult {
+    var digest: [32]u8 = undefined;
+    Sha256.hash(request_bytes, &digest, .{});
+    var locks: root_operation.SystemLockBackend = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    var coordinator = try root_operation.Coordinator.open(
+        io,
+        root,
+        install_root,
+        locks.interface(),
+    );
+    var attempt = coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = .remove },
+        .request_sha256 = digest,
+        .policy_sha256 = digest,
+        .target_architecture = architecture,
+    }) catch |err| switch (err) {
+        error.RecoveryRequired,
+        error.OperationInProgress,
+        error.ProvenancePending,
+        => return .{ .outcome = .recovery_required, .detail = @errorName(err) },
+        else => return err,
+    };
+    defer attempt.release();
+
+    var captured = captureDatabaseSnapshot(allocator, root, .{}) catch |err| {
+        try attempt.abandonIfPreMutation(allocator);
+        return err;
+    };
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{ .outcome = .refused, .detail = "locked_database_rejected" };
+        },
+    };
+    defer database.deinit();
+    for (selections) |selection| {
+        if (database.model.find(selection.name, selection.architecture) != null) {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{ .outcome = .refused, .detail = "absent_package_changed" };
+        }
+    }
+
+    const status_old_path = package_database.database_directory ++ "/" ++
+        package_database.status_old_path;
+    const old = try root.entryIfExists(try root_fs.Path.init(status_old_path));
+    var status_sha256: [32]u8 = undefined;
+    Sha256.hash(captured.snapshot.status.bytes, &status_sha256, .{});
+    const intent = [_]root_mutation.Intent{.{ .file = .{
+        .path = status_old_path,
+        .bytes = captured.snapshot.status.bytes,
+        .mode = if (old) |entry| entry.mode else 0o644,
+        .uid = if (old) |entry| entry.uid else 0,
+        .gid = if (old) |entry| entry.gid else 0,
+        .overwrite = if (old == null) .require_absent else .replace,
+        .expected_sha256 = status_sha256,
+    } }};
+    var mutation_plan = switch (try root_mutation.preflight(
+        allocator,
+        root,
+        .{ .intents = &intent },
+    )) {
+        .plan => |value| value,
+        .diagnostic => {
+            try attempt.abandonIfPreMutation(allocator);
+            return .{ .outcome = .refused, .detail = "no_op_preflight_rejected" };
+        },
+    };
+    defer mutation_plan.deinit();
+    var engine = try root_mutation.prepare(
+        allocator,
+        root,
+        &attempt,
+        &mutation_plan,
+        .{
+            .plan_sha256 = mutation_plan.steps_sha256,
+            .database_generation_sha256 = database.generation.sha256,
+        },
+        .{},
+    );
+    defer engine.deinit();
+    const report = try root_mutation.apply(&engine, .fromPlan(&mutation_plan));
+    if (report.outcome == .recovery_required)
+        return .{ .outcome = .recovery_required, .detail = "no_op_recovery_required" };
+    if (report.outcome != .applied)
+        return .{ .outcome = .refused, .detail = "no_op_rolled_back" };
+    try attempt.advance(allocator, .{
+        .state = .verifying,
+        .phase = .verification,
+    });
+    try attempt.complete(allocator, .succeeded);
+    try attempt.publishProvenance(allocator, mutation_plan.steps_sha256);
+    try root_mutation.clear(&engine);
+    try attempt.clear();
+    return .{ .outcome = .applied, .detail = "already_absent" };
+}
+
+test "native_unpack.test.lifecycle detects stale post-compilation database generation" {
+    const compiled_generation: [32]u8 = @splat(0x41);
+    const program = testProgram(compiled_generation, 2, &.{}, &.{});
+    const matching: package_database.Generation = .{
+        .sha256 = compiled_generation,
+        .file_count = 7,
+        .total_bytes = 1024,
+    };
+    try testing.expect(lifecycleDatabaseMatchesProgram(program, matching, 2));
+
+    var stale = matching;
+    stale.sha256[0] ^= 1;
+    try testing.expect(!lifecycleDatabaseMatchesProgram(program, stale, 2));
+    try testing.expect(!lifecycleDatabaseMatchesProgram(program, matching, 3));
+}
+
+test "native_unpack.test.lifecycle external fixture" {
+    const raw_request = std.c.getenv("DEBZ_NATIVE_LIFECYCLE_REQUEST") orelse
+        return error.SkipZigTest;
+    const request_path = std.mem.span(raw_request);
+    if (!absolute_path.nonRoot(request_path))
+        return error.InvalidExternalLifecycleRequest;
+    const request_bytes = try readAbsoluteFile(
+        testing.allocator,
+        testing.io,
+        request_path,
+        1024 * 1024,
+    );
+    defer testing.allocator.free(request_bytes);
+    var parsed = try std.json.parseFromSlice(
+        ExternalLifecycleRequest,
+        testing.allocator,
+        request_bytes,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    const external = parsed.value;
+    const archive_phase = switch (external.operation) {
+        .install, .upgrade, .downgrade, .reinstall, .configure => true,
+        .remove, .purge => false,
+    };
+    if (!absolute_path.nonRoot(external.root) or
+        !absolute_path.nonRoot(external.report) or
+        (archive_phase != (external.archives.len != 0)) or
+        ((external.operation == .remove or external.operation == .purge) and
+            external.packages.len == 0) or
+        (!std.mem.eql(u8, external.architecture, "amd64") and
+            !std.mem.eql(u8, external.architecture, "arm64")))
+        return error.InvalidExternalLifecycleRequest;
+    for (external.archives) |path| {
+        if (!absolute_path.nonRoot(path))
+            return error.InvalidExternalLifecycleRequest;
+    }
+    if (external.fault) |fault| {
+        if (!std.mem.eql(u8, fault, "after_script_before_record") and
+            !std.mem.eql(
+                u8,
+                fault,
+                "after_upgrade_postrm_before_record",
+            ))
+            return error.InvalidExternalLifecycleRequest;
+    }
+
+    var root_dir = try std.Io.Dir.openDirAbsolute(testing.io, external.root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer root_dir.close(testing.io);
+    const root: root_fs.Root = .init(testing.io, root_dir);
+    const marker = try root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init(".debz-native-disposable"),
+        128,
+    );
+    defer testing.allocator.free(marker);
+    if (!std.mem.eql(
+        u8,
+        marker,
+        "debz native materialization fixture v1\n",
+    )) return error.InvalidExternalLifecycleRequest;
+    var inspection_locks: root_operation.SystemLockBackend = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+    };
+    const inspection_coordinator = try root_operation.Coordinator.open(
+        testing.io,
+        root,
+        external.root,
+        inspection_locks.interface(),
+    );
+    if (try inspection_coordinator.inspect(testing.allocator)) |value| {
+        var active = value;
+        defer active.deinit();
+        if (active.record.state.blocksMutation()) {
+            try writeLifecycleReport(
+                testing.allocator,
+                testing.io,
+                external.report,
+                .{ .outcome = .recovery_required, .detail = "active_attempt" },
+            );
+            return;
+        }
+    }
+
+    var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, external.architecture);
+    var database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{
+            .native_architecture = external.architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    if (database.model.pending_updates.len != 0 or
+        database.model.triggers.interests.len != 0 or
+        database.model.triggers.pending.len != 0 or
+        database.model.diversions.len != 0 or
+        database.model.stat_overrides.len != 0 or
+        database.model.opaque_info.len != 0)
+    {
+        try writeLifecycleReport(
+            testing.allocator,
+            testing.io,
+            external.report,
+            .{ .outcome = .handoff, .detail = "unsupported_database_state" },
+        );
+        return;
+    }
+
+    const archive_bytes = try testing.allocator.alloc([]u8, external.archives.len);
+    defer testing.allocator.free(archive_bytes);
+    const models = try testing.allocator.alloc(
+        archive_application.Model,
+        external.archives.len,
+    );
+    defer testing.allocator.free(models);
+    var initialized: usize = 0;
+    defer {
+        for (models[0..initialized]) |*model| model.deinit();
+        for (archive_bytes[0..initialized]) |bytes|
+            testing.allocator.free(bytes);
+    }
+    var total_archive_bytes: u64 = 0;
+    for (external.archives, 0..) |path, index| {
+        const bytes = try readAbsoluteFile(
+            testing.allocator,
+            testing.io,
+            path,
+            1024 * 1024 * 1024,
+        );
+        errdefer testing.allocator.free(bytes);
+        archive_bytes[index] = bytes;
+        total_archive_bytes = try std.math.add(u64, total_archive_bytes, bytes.len);
+        if (total_archive_bytes > (Limits{}).max_archive_bytes)
+            return error.FileTooLarge;
+        var model = switch (archive_application.prepare(
+            testing.allocator,
+            bytes,
+            .{ .local = .{} },
+            .{},
+        )) {
+            .model => |value| value,
+            .diagnostic => return error.InvalidExternalArchive,
+        };
+        errdefer model.deinit();
+        if (model.triggers.len != 0 or model.metadata.len != 0 or
+            model.script(.config) != null)
+        {
+            model.deinit();
+            try writeLifecycleReport(
+                testing.allocator,
+                testing.io,
+                external.report,
+                .{ .outcome = .handoff, .detail = "unsupported_archive_metadata" },
+            );
+            return;
+        }
+        models[index] = model;
+        initialized += 1;
+    }
+
+    if (external.operation == .remove) {
+        var any_action = false;
+        for (external.packages) |selection| {
+            if (database.model.find(selection.name, selection.architecture) != null)
+                any_action = true;
+        }
+        if (!any_action) {
+            const result = try applyAbsentLifecycleNoOp(
+                testing.allocator,
+                testing.io,
+                root,
+                external.root,
+                external.architecture,
+                request_bytes,
+                external.packages,
+            );
+            try writeLifecycleReport(
+                testing.allocator,
+                testing.io,
+                external.report,
+                result,
+            );
+            return;
+        }
+    }
+    if (external.operation == .purge) {
+        var any_action = false;
+        for (external.packages) |selection| {
+            if (database.model.find(selection.name, selection.architecture) != null)
+                any_action = true;
+        }
+        if (!any_action) {
+            const result = try applyAbsentLifecycleNoOp(
+                testing.allocator,
+                testing.io,
+                root,
+                external.root,
+                external.architecture,
+                request_bytes,
+                external.packages,
+            );
+            try writeLifecycleReport(
+                testing.allocator,
+                testing.io,
+                external.report,
+                result,
+            );
+            return;
+        }
+    }
+
+    var compiled = (try compileLifecycleProgram(
+        testing.allocator,
+        request_bytes,
+        external,
+        root,
+        database,
+        models,
+        archive_bytes,
+    )) orelse {
+        try writeLifecycleReport(
+            testing.allocator,
+            testing.io,
+            external.report,
+            .{ .outcome = .refused, .detail = "program_compile_rejected" },
+        );
+        return;
+    };
+    defer compiled.deinit();
+    var locks: root_operation.SystemLockBackend = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+    };
+    const result = executeLifecycleProgram(
+        testing.allocator,
+        root,
+        external,
+        &compiled,
+        models,
+        archive_bytes,
+        captured.snapshot,
+        database.model,
+        locks.interface(),
+    ) catch |err| LifecycleResult{
+        .outcome = .recovery_required,
+        .detail = @errorName(err),
+        .program_sha256 = compiled.program.program.digest_sha256,
+    };
+    try writeLifecycleReport(
         testing.allocator,
         testing.io,
         external.report,

@@ -480,10 +480,13 @@ pub fn validate(request: Request) ?RejectionReason {
         return .invalid_script_name;
 
     if (request.arguments.len > policy.limits.maximum_arguments) return .too_many_arguments;
-    for (request.arguments) |argument| {
-        if (argument.len == 0 or
+    for (request.arguments, 0..) |argument, index| {
+        const allowed_empty = request.identity.kind == .postinst and
+            request.arguments.len == 2 and index == 1 and
+            std.mem.eql(u8, request.arguments[0], "configure");
+        if ((!allowed_empty and argument.len == 0) or
             argument.len > policy.limits.maximum_argument_bytes or
-            argument[0] == '-' or
+            (argument.len != 0 and argument[0] == '-') or
             !validText(argument))
             return .invalid_argument;
     }
@@ -1452,6 +1455,15 @@ fn testRequest() Request {
     };
 }
 
+test "maintainer_script.test.fresh postinst preserves empty prior version argument" {
+    var request = testRequest();
+    request.arguments = &.{ "configure", "" };
+    try testing.expect(validate(request) == null);
+    request.identity.kind = .preinst;
+    request.identity.script_path = "var/lib/dpkg/info/demo.preinst";
+    try testing.expectEqual(RejectionReason.invalid_argument, validate(request).?);
+}
+
 test "maintainer_script.test.unsafe requests are rejected before any spawn" {
     const Case = struct {
         reason: RejectionReason,
@@ -1665,6 +1677,23 @@ test "maintainer_script.test.invocation binds the selected root program and evid
         &policyDigest(.{}),
         &report.evidence.policy_sha256,
     );
+}
+
+test "maintainer_script.test.launcher receives fresh postinst empty argument" {
+    var request = testRequest();
+    request.arguments = &.{ "configure", "" };
+    var launcher: RecordingLauncher = .{};
+    var report = try run(
+        testing.allocator,
+        request,
+        .{ .launcher = launcher.interface() },
+    );
+    defer report.deinit();
+
+    const invocation = launcher.invocation.?;
+    try testing.expectEqual(@as(usize, 3), invocation.argv.len);
+    try testing.expectEqualStrings("configure", invocation.argv[1]);
+    try testing.expectEqualStrings("", invocation.argv[2]);
 }
 
 test "maintainer_script.test.outcomes remain exactly distinguishable" {

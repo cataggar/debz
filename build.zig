@@ -561,6 +561,23 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-conffiles", "Compare native conffile and remove/purge phases with dpkg")
         .dependOn(&native_conffiles.step);
 
+    const native_lifecycle_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.lifecycle external fixture"},
+    });
+    const native_lifecycle = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/test-native-lifecycle.py",
+    });
+    native_lifecycle.addArtifactArg(native_lifecycle_tests);
+    const native_lifecycle_oracle_tests = b.addSystemCommand(
+        &.{ "python3", "-m", "unittest", "tools/test_native_lifecycle.py" },
+    );
+    native_lifecycle.step.dependOn(&native_lifecycle_oracle_tests.step);
+    test_step.dependOn(&native_lifecycle_oracle_tests.step);
+    b.step("test-native-lifecycle", "Compare native lifecycle scripts and package states with dpkg")
+        .dependOn(&native_lifecycle.step);
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -762,6 +779,7 @@ fn installReleaseFiles(
         "maintainer-script-runner.md",
         "multi-repository-policy.md",
         "native-conffiles.md",
+        "native-lifecycle.md",
         "native-transaction-engine-v1.md",
         "native-transaction-program.md",
         "native-unpack.md",

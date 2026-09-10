@@ -74,10 +74,20 @@ amd64/arm64 CI runs that gate and `test-native-conffiles` in Debug and ReleaseSa
 The latter compares each unpack/configure/remove/purge phase against dpkg,
 including preservation of local and co-owned contents. Zero timestamps on
 newly materialized directories are explicitly refused, not approximated.
-Production execution, lifecycle, recovery, and provenance integration remain
-later roadmap work. See
+Production execution, recovery, and provenance integration remain later
+roadmap work. See
 [Native unpack and file ownership](native-unpack.md) and
 [Native conffile and removal acceptance](native-conffiles.md).
+
+Item 12 adds private compiled lifecycle execution using the actual audited
+chroot script runner under one root-operation attempt. It models exact old/new
+script arguments and configured-version evidence, known failures and
+compensating calls, bootstrap payload materialization, Pre-Depends barriers,
+and deterministic configure groups. In-flight script evidence blocks re-entry
+when an outcome was not durably recorded. `test-native-lifecycle` compares
+script traces, payload visibility, and resulting package/filesystem state with
+real dpkg, including failures and dependency/bootstrap cases. Production native
+selection remains unavailable. See [Native lifecycle execution](native-lifecycle.md).
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an

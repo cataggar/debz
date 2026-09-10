@@ -17,7 +17,7 @@ Compilation consumes exactly four kinds of evidence plus explicit policy:
 |---|---|
 | `authorization` | The reviewed [native transaction authorization](exact-locks-and-provenance.md), which binds the backend, exact closure lock v2 generation, request/solver-policy/executor-policy/plan digests, install root and root identity, target and foreign architectures, mutation policy, every ordered action, and the exact intended final closure. |
 | `ordered_actions` | The reviewed plan's ordered lifecycle: bootstrap extraction, removals, purges, unpacks, and configure barriers. |
-| `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded and observed digests, and trigger declarations. |
+| `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, last configured version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded and observed digests, and trigger declarations. |
 | `archives` | One validated archive per archive-producing action: identity, digest, size, authenticated origin, application-inventory digest, maintainer-script digests, packaged conffiles with the digest each shipped file carries (absent exactly for `remove-on-upgrade`), trigger declarations, and `Replaces` names. |
 
 Preflight also supplies the ownership conflicts it found and any root feature it
@@ -75,12 +75,12 @@ No step contains a shell command, and no step is a free-form escape hatch.
 The compiler expands the authorized actions into dpkg-compatible transitions:
 
 - fresh install: `preinst install`, unpack/stage conffiles, `unpacked`,
-  configure barrier, conffile decisions, `postinst configure`, `installed`;
+  configure barrier, conffile decisions, `postinst configure ""`, `installed`;
 - install over `config-files`: the recorded version is replayed as the
   `install` and `configure` argument;
 - upgrade, downgrade, and reinstall: old `prerm upgrade <new>`, new `preinst
-  upgrade <old>`, unpack, old `postrm upgrade <new>`, `unpacked`, configure
-  barrier, conffile decisions, then `postinst configure <old>`;
+  upgrade <old> <new>`, unpack, old `postrm upgrade <new>`, `unpacked`, configure
+  barrier, conffile decisions, then `postinst configure <last-configured>`;
 - remove: `prerm remove`, `half-installed`, owned-file removal retaining
   conffiles, `postrm remove`, `config-files`; without residual conffiles or
   `postrm`, remove drops the status record instead;
@@ -90,6 +90,23 @@ The compiler expands the authorized actions into dpkg-compatible transitions:
 - essential bootstrap materialization precedes all other lifecycle work, and
   each `Pre-Depends` barrier configures every pending package before the next
   unpack. A dependency cycle configures its whole group at one barrier.
+
+An unpacked package need not have been configured: upgrading it does not call
+its old prerm, and the new postinst still receives an empty previous version
+when there is no configured-version evidence. A same-version reinstall
+authorization can also carry a configure-only barrier for an unpacked or
+half-configured package; it must retain the matching archive evidence and
+cannot invent another unpack.
+
+`ScriptFailure` binds the primary unwind, whether its successful completion
+permits continuing, up to eight additional compensating calls, and the
+optional managed-data rollback boundary between those calls. For example,
+failed old prerm/postrm can continue after a successful incoming
+`failed-upgrade <old> <new>` call. Terminal upgrade failure can require old
+`preinst abort-upgrade <new>`, data restoration, new
+`postrm abort-upgrade <old> <new>`, and old `postinst abort-upgrade <new>`.
+A failed compensation is not successful restoration; its resulting package
+state and whether later compensations run are part of lifecycle execution.
 
 Maintainer scripts are emitted only when the corresponding evidence proves the
 script exists, so the program never plans a call to a script that is not there.
@@ -195,7 +212,7 @@ The canonical document is minified JSON in fixed field order. `digest_sha256`
 is a domain-separated SHA-256 over the complete document with its own digest
 field replaced by 64 ASCII zeros, so every other field, including the artifact
 and step sub-digests, is bound. Changing any mutation- or security-relevant
-input, such as the database generation, an application digest, a script digest,
+input, such as the database generation, configured-version evidence, an application digest, a script digest,
 a conffile digest, the environment policy, or the reviewed mutation policy,
 changes the program digest.
 
