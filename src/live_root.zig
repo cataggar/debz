@@ -801,34 +801,42 @@ const open_tree_clone: u32 = 1;
 const open_tree_cloexec: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 
 fn openTreeClone(fd: i32, recursive: bool) Error!i32 {
+    return fdResult(cloneMountDescriptor(fd, recursive));
+}
+
+/// Allocation-free descriptor mount ABI shared by the audited child boundaries.
+pub fn cloneMountDescriptor(fd: i32, recursive: bool) usize {
     const flags = open_tree_clone | open_tree_cloexec | linux.AT.EMPTY_PATH |
         @as(u32, if (recursive) linux.AT.RECURSIVE else 0);
-    const raw = linux.syscall3(
+    return linux.syscall3(
         .open_tree,
         @bitCast(@as(isize, fd)),
         @intFromPtr(@as([*:0]const u8, "")),
         flags,
     );
-    return fdResult(raw);
 }
 
-const MountAttribute = extern struct {
+pub const MountAttribute = extern struct {
     attr_set: u64 = 0,
     attr_clear: u64 = 0,
     propagation: u64 = linux.MS.PRIVATE,
     user_namespace_fd: u64 = 0,
 };
 
-fn makeDetachedPrivate(fd: i32) Error!void {
-    const attribute: MountAttribute = .{};
-    const raw = linux.syscall5(
+pub fn setMountAttributes(fd: i32, recursive: bool, attribute: *const MountAttribute) usize {
+    return linux.syscall5(
         .mount_setattr,
         @bitCast(@as(isize, fd)),
         @intFromPtr(@as([*:0]const u8, "")),
-        linux.AT.EMPTY_PATH | linux.AT.RECURSIVE,
-        @intFromPtr(&attribute),
+        linux.AT.EMPTY_PATH | @as(u32, if (recursive) linux.AT.RECURSIVE else 0),
+        @intFromPtr(attribute),
         @sizeOf(MountAttribute),
     );
+}
+
+fn makeDetachedPrivate(fd: i32) Error!void {
+    const attribute: MountAttribute = .{};
+    const raw = setMountAttributes(fd, true, &attribute);
     switch (linux.errno(raw)) {
         .SUCCESS => {},
         .ACCES, .PERM => return error.NotPrivileged,

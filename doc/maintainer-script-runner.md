@@ -91,6 +91,35 @@ A spawned script runs with:
   signalling. Every `SIGTERM`/`SIGKILL`, including the final descendant sweep,
   is issued before the reap, and the reap is always the last operation.
 
+## Private helper exposure
+
+Experimental native integration can supply an optional `HelperMount` in a
+runner request. Its source and existing target are pinned regular files in the
+same root; initialization checks the bounded source bytes against the trusted
+helper digest. The binding must remain alive throughout one invocation.
+
+The child unshares its mount namespace, disables mount propagation, reopens the
+paths without symlinks in the new namespace, and matches their pinned inode
+identities. It then mounts the helper over the target using descriptor-based
+mount operations. The helper view is read-only, nosuid, nodev and executable.
+Both normal command lookup and absolute invocation paths see that helper, but
+the package-owned target bytes and the parent's mount namespace are unchanged.
+Alternate-root execution still enters the verified root before executing the
+script. The fixed environment and `PATH` do not change.
+
+`SystemLauncher.probeHelper` exercises the same mount and root setup without
+executing a script. The production adapter must require an exited-zero probe
+before package mutation. This requires Linux mount-namespace privileges
+(`CAP_SYS_ADMIN`) and working `openat2`, `open_tree`, `mount_setattr`, and
+`move_mount` support; setup failures retain their exact errno rather than
+falling back to an unmodified helper. `Report.helper` identifies the source,
+target and helper digest, which are also bound into invocation evidence.
+Requests without a helper retain their existing execution and digest contract.
+
+The privileged `test-native-helper-namespace` target requires the positive
+mount path, proves named and absolute helper execution, rejects writes through
+the mount, preserves the original target, and proves alternate-root isolation.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:

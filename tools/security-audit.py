@@ -225,7 +225,7 @@ def audit_production_sources() -> None:
     ):
         fail(f"native child-process boundary changed: {child_calls!r}")
     namespace_paths = sorted({call.rsplit(":", 1)[0] for call in namespace_calls})
-    if namespace_paths not in ([], ["src/live_root.zig"]):
+    if namespace_paths not in ([], ["src/live_root.zig", "src/maintainer_script.zig"]):
         fail(f"native namespace boundary changed: {namespace_calls!r}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
