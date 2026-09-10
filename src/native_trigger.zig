@@ -113,12 +113,14 @@ const WireScriptRecord = struct {
 
 pub const ActiveScript = struct {
     program_sha256: [32]u8,
+    step: u32 = 0,
     package: []const u8,
     version: []const u8,
     architecture: []const u8,
     kind: maintainer_script.Kind,
     source: ScriptSource,
     script_sha256: [32]u8,
+    arguments: []const []const u8 = &.{},
 };
 
 pub const OwnedActiveScript = struct {
@@ -306,12 +308,14 @@ pub fn decodeActiveScript(
     return .{
         .script = .{
             .program_sha256 = try parseHex(parsed.value.program_sha256),
+            .step = parsed.value.step,
             .package = parsed.value.package,
             .version = parsed.value.version,
             .architecture = parsed.value.architecture,
             .kind = kind,
             .source = parsed.value.source,
             .script_sha256 = try parseHex(parsed.value.script_sha256),
+            .arguments = parsed.value.arguments,
         },
         .parsed = parsed,
     };

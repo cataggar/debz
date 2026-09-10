@@ -29,6 +29,13 @@ SOURCE = "debz-trigger-source"
 TRIGGER = "debz-test-trigger"
 
 
+def validate_native_helper(helper: Path) -> None:
+    if hashlib.sha256(helper.read_bytes()).digest() == hashlib.sha256(
+        Path("/usr/bin/dpkg-trigger").read_bytes()
+    ).digest():
+        raise AssertionError("native acceptance cannot use the reference dpkg-trigger executable")
+
+
 def snapshot(root: Path) -> dict:
     return m.oracle.capture(
         root, excludes=(*m.oracle.DEFAULT_EXCLUDES, m.GUARD, HELPER.as_posix()),
@@ -574,10 +581,8 @@ def main() -> int:
             raise RuntimeError(f"missing reference prerequisite: {command}")
     executable = arguments.native_test.resolve(strict=True) if arguments.native_test else None
     helper = arguments.native_helper.resolve(strict=True) if arguments.native_helper else None
-    if helper is not None and hashlib.sha256(helper.read_bytes()).digest() == hashlib.sha256(
-        Path("/usr/bin/dpkg-trigger").read_bytes()
-    ).digest():
-        raise AssertionError("native acceptance cannot use the reference dpkg-trigger executable")
+    if helper is not None:
+        validate_native_helper(helper)
     architecture = subprocess.run(
         ["dpkg", "--print-architecture"], check=True, capture_output=True,
         text=True, timeout=10,

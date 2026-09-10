@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-trigger-events-v1",
+  "title": "debz native trigger activation evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "intent_sha256",
+    "events",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-trigger-events-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": {
+        "$ref": "#/$defs/event"
+      }
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "listener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trigger",
+        "package",
+        "architecture",
+        "await_mode"
+      ],
+      "properties": {
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "architecture": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "await_mode": {
+          "enum": [
+            "awaited",
+            "noawait"
+          ]
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "source_package",
+        "source_architecture",
+        "trigger",
+        "activation_awaits",
+        "listeners"
+      ],
+      "properties": {
+        "origin": {
+          "enum": [
+            "automatic",
+            "dynamic"
+          ]
+        },
+        "source_package": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "source_architecture": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "activation_awaits": {
+          "type": "boolean"
+        },
+        "listeners": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 200000,
+          "items": {
+            "$ref": "#/$defs/listener"
+          }
+        }
+      }
+    }
+  }
+}

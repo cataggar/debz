@@ -2747,6 +2747,10 @@ pub const Options = struct {
     cancellation: transaction_executor.Cancellation = transaction_executor.Cancellation.never(),
     deadline: ?transaction_executor.Deadline = null,
     limits: Limits = .{},
+    /// Private high-level interpreters may replay a phase under an already
+    /// authenticated recovering root operation. Ordinary callers remain
+    /// unable to start new work from the recovering state.
+    allow_recovery_continuation: bool = false,
     /// Receives the typed refusal when `prepare` fails closed before anything
     /// durable exists. The diagnostic borrows caller input, never the plan
     /// arena, so it outlives the refused call.
@@ -3087,6 +3091,19 @@ pub fn prepare(
             .phase = .mutation,
             .evidence = attemptEvidence(evidence),
         }) catch |err| return mapAttemptError(err),
+        // A native interpreter recovery keeps the outer attempt in its typed
+        // recovering state while it replays a phase proven not to have
+        // completed. The immutable journal still binds the same attempt and
+        // exact evidence as an ordinary mutating phase.
+        .recovering => {
+            if (!options.allow_recovery_continuation)
+                return error.AttemptNotMutable;
+            attempt.advance(allocator, .{
+                .state = .recovering,
+                .phase = .mutation,
+                .evidence = attemptEvidence(evidence),
+            }) catch |err| return mapAttemptError(err);
+        },
         else => return error.AttemptNotMutable,
     }
     const record = attempt.record();
@@ -3266,8 +3283,17 @@ pub fn apply(engine: *Engine, content: Content) Error!Report {
     }
     // Staging, backups, and every target change are mutations of the selected
     // root, so the coordinator learns about them before the first one.
-    engine.attempt.markMutationStarted(engine.allocator, .mutation) catch |err|
-        return mapAttemptError(err);
+    if (engine.attempt.record().state == .recovering) {
+        if (!engine.options.allow_recovery_continuation)
+            return error.AttemptNotMutable;
+        engine.attempt.advance(engine.allocator, .{
+            .state = .recovering,
+            .phase = .mutation,
+        }) catch |err| return mapAttemptError(err);
+    } else {
+        engine.attempt.markMutationStarted(engine.allocator, .mutation) catch |err|
+            return mapAttemptError(err);
+    }
     try engine.publishStage(.applying);
 
     var applied: usize = 0;

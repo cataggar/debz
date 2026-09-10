@@ -2,8 +2,9 @@
 
 Item 13 extends the private native lifecycle with trigger registration,
 activation, deferral, and processing. Production native selection remains
-unavailable. Full recovery/provenance orchestration and production integration
-remain later roadmap items.
+unavailable. [Native recovery and provenance](native-recovery.md) supplies the
+durable continuation layer; production integration remains a later roadmap
+item.
 
 ## Compatibility boundary
 

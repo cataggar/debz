@@ -436,6 +436,83 @@
       "expected": "recovery-required"
     },
     {
+      "id": "native-recovery-prepared",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["native-step-journal", "persisted-artifact", "real-process-crash", "no-reauthorization"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-filesystem",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["native-step-journal", "mutation-journal", "filesystem", "real-process-crash"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-database",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["native-step-journal", "mutation-journal", "database", "status-old", "real-process-crash"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-script-prepared",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["script-prepared", "no-start-proof", "exactly-once", "real-process-crash"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-script-recorded",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["recorded-outcome", "native-continuation", "no-replay", "real-process-crash"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-script-unknown",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["script-in-flight", "unknown-outcome", "recovery-provenance", "reentry-blocked"],
+      "expected": "recovery-required"
+    },
+    {
+      "id": "native-recovery-unpack-script-unknown",
+      "initial": "healthy",
+      "operations": ["upgrade", "recover"],
+      "features": ["old-postrm", "active-unpack-journal", "unknown-outcome", "no-rollback", "reentry-blocked"],
+      "expected": "recovery-required"
+    },
+    {
+      "id": "native-recovery-failure-compensation",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["known-failure", "compiled-compensation", "no-replay", "failure-provenance"],
+      "expected": "failure"
+    },
+    {
+      "id": "native-recovery-trigger-recorded",
+      "initial": "healthy",
+      "operations": ["install", "recover"],
+      "features": ["native-helper", "trigger-chain", "recorded-outcome", "activation-once", "no-replay"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-provenance-completion",
+      "initial": "fresh",
+      "operations": ["install", "recover"],
+      "features": ["provenance-before-clear", "immutable-terminal-receipt", "retained-detailed-evidence", "idempotent-cleanup", "real-process-crash"],
+      "expected": "success-after-recovery"
+    },
+    {
+      "id": "native-recovery-changed-evidence",
+      "initial": "corrupt",
+      "operations": ["recover"],
+      "features": ["persisted-program", "persisted-artifact", "journal-chain", "generation-binding", "completed-phase-drift", "stale-receipt-active-attempt", "orphaned-script-evidence", "fail-closed"],
+      "expected": "recovery-required"
+    },
+    {
       "id": "unpack-data-only",
       "initial": "fresh",
       "operations": ["install"],

@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-intent-v1",
+  "title": "debz native execution intent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "install_root",
+    "root_identity_sha256",
+    "root_inode",
+    "operation",
+    "architecture",
+    "policy",
+    "triggers",
+    "defer_triggers",
+    "staging_directory_initially_present",
+    "packages",
+    "ordered_actions",
+    "request_sha256",
+    "policy_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "exact_lock_sha256",
+    "artifact_evidence_sha256",
+    "database_generation_sha256",
+    "initial_trigger_state_sha256",
+    "authorization_path",
+    "program_path",
+    "blobs",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-execution-intent-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "attempt_id": {
+      "$ref": "#/$defs/digest"
+    },
+    "install_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "root_identity_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "root_inode": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "operation": {
+      "enum": [
+        "install",
+        "upgrade",
+        "downgrade",
+        "reinstall",
+        "configure",
+        "remove",
+        "purge",
+        "process_triggers"
+      ]
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "policy": {
+      "enum": [
+        "keep_existing",
+        "use_package_version"
+      ]
+    },
+    "triggers": {
+      "type": "boolean"
+    },
+    "defer_triggers": {
+      "type": "boolean"
+    },
+    "staging_directory_initially_present": {
+      "type": "boolean"
+    },
+    "packages": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": {
+        "$ref": "#/$defs/package"
+      }
+    },
+    "ordered_actions": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": {
+        "$ref": "#/$defs/orderedAction"
+      }
+    },
+    "request_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "policy_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "authorization_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "program_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "exact_lock_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "artifact_evidence_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "database_generation_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "initial_trigger_state_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "authorization_path": {
+      "const": "native-transaction-authorization-v1.json"
+    },
+    "program_path": {
+      "const": "native-transaction-program-v1.json"
+    },
+    "blobs": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": {
+        "$ref": "#/$defs/blob"
+      }
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "architecture"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "orderedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "kind",
+        "package",
+        "version",
+        "architecture"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "key",
+        "logical_path",
+        "storage_path",
+        "size",
+        "sha256",
+        "mode",
+        "entry_kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "request",
+            "artifact",
+            "installed_script",
+            "database"
+          ]
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "logical_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "storage_path": {
+          "type": "string",
+          "pattern": "^var/lib/debz/native-recovery-v1/"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "mode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095
+        },
+        "entry_kind": {
+          "enum": [
+            "regular",
+            "directory",
+            "symlink",
+            "other"
+          ]
+        }
+      }
+    }
+  }
+}

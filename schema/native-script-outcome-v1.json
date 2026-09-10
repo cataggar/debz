@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-script-outcome-v1",
+  "title": "debz native script outcome v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "intent_sha256",
+    "action",
+    "package",
+    "package_version",
+    "architecture",
+    "kind",
+    "source",
+    "script_sha256",
+    "arguments",
+    "environment",
+    "disposition",
+    "spawned",
+    "invocation_sha256",
+    "stdout_sha256",
+    "stderr_sha256",
+    "combined_sha256",
+    "stdout_hex",
+    "stderr_hex",
+    "combined_hex",
+    "output_bytes",
+    "output_limit",
+    "terminated_process_group",
+    "escalated_to_kill",
+    "issued_descendant_sweep",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-script-outcome-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "action": {
+      "$ref": "#/$defs/action"
+    },
+    "package": {
+      "type": "string",
+      "minLength": 1
+    },
+    "package_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "preinst",
+        "postinst",
+        "prerm",
+        "postrm"
+      ]
+    },
+    "source": {
+      "enum": [
+        "new_package",
+        "installed_package"
+      ]
+    },
+    "script_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "arguments": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "string"
+      }
+    },
+    "environment": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "disposition": {
+      "enum": [
+        "exited",
+        "signaled",
+        "timed_out",
+        "cancelled",
+        "setup_failed",
+        "output_limit_exceeded",
+        "rejected"
+      ]
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 255
+    },
+    "signal": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "setup_stage": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "setup_errno": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "rejection_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spawned": {
+      "type": "boolean"
+    },
+    "invocation_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "stdout_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "stderr_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "combined_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "stdout_hex": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*$",
+      "maxLength": 2097152
+    },
+    "stderr_hex": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*$",
+      "maxLength": 2097152
+    },
+    "combined_hex": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*$",
+      "maxLength": 2097152
+    },
+    "output_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "output_limit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "terminated_process_group": {
+      "type": "boolean"
+    },
+    "escalated_to_kill": {
+      "type": "boolean"
+    },
+    "issued_descendant_sweep": {
+      "type": "boolean"
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "program_step",
+        "substep",
+        "ordinal"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "script",
+            "compensation",
+            "trigger"
+          ]
+        },
+        "program_step": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "substep": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

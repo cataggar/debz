@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-transaction-provenance-v1",
+  "title": "debz native transaction provenance v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "backend",
+    "install_root",
+    "root_identity_sha256",
+    "root_inode",
+    "operation",
+    "request_sha256",
+    "policy_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "exact_lock_sha256",
+    "artifact_evidence_sha256",
+    "initial_database_generation_sha256",
+    "execution_intent_sha256",
+    "progress_head_sha256",
+    "progress_record_count",
+    "script_outcomes_sha256",
+    "trigger_evidence_sha256",
+    "final_database_generation_sha256",
+    "final_state_sha256",
+    "recovered_phase_count",
+    "evidence_root",
+    "evidence_files",
+    "evidence_files_sha256",
+    "final_state_kind",
+    "outcome",
+    "detail",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-transaction-provenance-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "attempt_id": {
+      "$ref": "#/$defs/digest"
+    },
+    "backend": {
+      "const": "native"
+    },
+    "install_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "root_identity_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "root_inode": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "package_transaction"
+          ],
+          "properties": {
+            "package_transaction": {
+              "enum": [
+                "install",
+                "upgrade",
+                "reinstall",
+                "remove"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository_bootstrap"
+          ],
+          "properties": {
+            "repository_bootstrap": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "request_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "policy_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "authorization_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "program_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "exact_lock_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "artifact_evidence_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "initial_database_generation_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "execution_intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "progress_head_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "progress_record_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 200000
+    },
+    "script_outcomes_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "trigger_evidence_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "final_database_generation_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "final_state_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "recovered_phase_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evidence_root": {
+      "type": "string",
+      "pattern": "^var/lib/debz/native-receipts-v1/[0-9a-f]{64}$"
+    },
+    "evidence_files": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/evidenceFile"
+      }
+    },
+    "evidence_files_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "final_state_kind": {
+      "const": "package_database_closure_v1"
+    },
+    "outcome": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "recovery_required"
+      ]
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evidenceAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "program_step",
+        "substep",
+        "ordinal"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "filesystem",
+            "database",
+            "script",
+            "compensation",
+            "trigger",
+            "verification",
+            "provenance",
+            "cleanup"
+          ]
+        },
+        "program_step": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "substep": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "sha256",
+        "document_sha256",
+        "action",
+        "size"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "authorization",
+            "program",
+            "intent",
+            "progress",
+            "managed_state",
+            "trigger_events",
+            "script_outcome",
+            "active_script",
+            "root_operation",
+            "root_mutation_journal",
+            "root_mutation_progress"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^var/lib/debz/native-receipts-v1/[0-9a-f]{64}/"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "document_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "action": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/evidenceAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

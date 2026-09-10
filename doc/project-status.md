@@ -103,6 +103,19 @@ retain invocation/authority evidence and block re-entry. The helper is not
 installed in releases, and production native remains unavailable. See
 [Native trigger execution](native-triggers.md).
 
+Item 14 adds private native-step journaling, persisted execution inputs, and
+recovery/provenance orchestration. Recovery consumes the original compiled
+authority without caller archives or recompilation, delegates primitive repair
+to the root-mutation layer, and never reruns an unknowable script invocation.
+Exact recorded outcomes and trigger continuation can advance once; terminal
+provenance must be durable before the active operation is cleared.
+Managed-state checkpoints reject drift after completed phases, and immutable
+per-attempt receipts retain detailed execution evidence after workspace cleanup.
+`test-native-recovery` exercises actual process crashes and repeated recovery
+against independent root/trace/provenance assertions. Production native
+selection remains unavailable. See
+[Native recovery and provenance](native-recovery.md).
+
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
 already opened root descriptor, never resolves a component through a symbolic
