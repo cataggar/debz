@@ -610,6 +610,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }),
+        .filters = &.{"native_trigger "},
     });
     const run_native_trigger_queue_tests = b.addRunArtifact(native_trigger_queue_tests);
     b.step("test-native-trigger-helper", "Run private native trigger queue and helper tests")
