@@ -68,7 +68,8 @@ const lock_options_help =
     \\Exact-lock options:
     \\  --lock-input PATH --lock-output PATH
     \\  --transaction-backend legacy_dpkg|native
-    \\    Native currently supports plan/download only; mutation remains unavailable.
+    \\    Native mutation requires a v2 lock and a supported non-host root.
+    \\    Native recovery uses persisted evidence, without repository or lock inputs.
     \\
 ;
 

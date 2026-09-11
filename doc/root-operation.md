@@ -387,7 +387,7 @@ provenance says only that the transaction completion was durably witnessed and
 that its detailed publication was interrupted.
 
 The statement's digest is what `publishProvenance` binds, so a discharged
-attempt is always traceable to it. A normal, uninterrupted completion is
+attempt is always traceable to it. A normal, uninterrupted legacy completion is
 unaffected: it publishes its own provenance digest and clears the intent
 without ever writing this document.
 
@@ -397,13 +397,14 @@ without ever writing this document.
 
 `production_backend.withRepositories` reserves the root at rank 0 before
 repository loading, refresh, acquisition, journal writes, and the executor.
-The selected transaction backend is validated before that, so an unavailable
-native mutation/recovery selection still fails before any root access. Non-mutating operations —
+Unavailable command-shaped selections are refused before that. Native core
+execution instead owns a typed runtime attempt and never enters the legacy
+executor bridge. Non-mutating operations —
 `refresh`, `download`, `plan`, `list-installed`, `list-available`, `info`,
 `provides`, `why`, `clean` — never reserve the root and stay usable while
 another attempt holds it.
 
-Boundaries published for one product mutation:
+Boundaries published for one legacy product mutation:
 
 1. `reserved` when the attempt is taken;
 2. `preflight` once the reviewed plan digest and exact-lock binding exist;
@@ -412,6 +413,16 @@ Boundaries published for one product mutation:
    executor's own transaction state justifies;
 5. `verifying`, then `completed` with the outcome;
 6. provenance published, then the active intent cleared.
+
+Native execution binds complete prepared-program evidence in preflight and
+publishes its own mutation boundaries. A verified terminal native receipt backs
+both success and known failure. Outer completion and its receipt-bound
+provenance become durable before native acknowledgment and outer record cleanup.
+Generic acquisition cannot reclaim a program-bound native record, even before
+package mutation or after outer provenance publication; explicit native recovery
+finishes acknowledgment. An orphan native intent also blocks new attempts and
+legacy recovery. Pre-mutation abandonment requires a separate native evidence
+check, not just the caller record's state.
 
 A failure after mutation stays at `recovery_required`. `debz recover` takes the
 attempt with `Intent.recovery`, which adopts existing evidence instead of

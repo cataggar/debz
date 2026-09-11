@@ -295,18 +295,24 @@ for arguments in \
     "remove demo" \
     "reinstall demo" \
     "upgrade demo" \
-    "upgrade-all" \
-    "recover"
+    "upgrade-all"
 do
     set +e
     output=$("$debz" $arguments $common --transaction-backend native \
         --assume-yes --conffile keep-existing 2>cli-test-stderr)
     status_code=$?
     set -e
-    test "$status_code" -eq 3
+    test "$status_code" -eq 2
     test ! -s cli-test-stderr
-    printf '%s' "$output" | grep -q '"id":"transaction_backend_unavailable"'
+    printf '%s' "$output" | grep -q '"id":"configuration_required"'
 done
+
+output=$("$debz" recover $common --transaction-backend native \
+    --assume-yes --conffile keep-existing 2>cli-test-stderr)
+test ! -s cli-test-stderr
+printf '%s' "$output" | grep -q '"exit_status":0'
+printf '%s' "$output" | grep -q '"changed":false'
+test ! -e "$root/var/lib/debz/root-operation-v1.json"
 
 for arguments in \
     "plan --json demo --transaction-backend unknown" \

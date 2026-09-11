@@ -11,7 +11,8 @@ network-derived input.
 
 - Zig 0.16.0 and liblzma development files;
 - Python 3 with `cryptography`;
-- `dpkg` only for the full install/configure/remove/recovery lane.
+- `dpkg` for full/native lanes; native execution also requires Linux private
+  mount-namespace privileges (use `DEBZ_INTEGRATION_SUDO=1` when needed).
 
 Run one profile:
 
@@ -23,7 +24,7 @@ zig build test-integration
 ```
 
 Accepted suites are `debian-stable` and `ubuntu-26.04`; architectures are
-`amd64` and `arm64`; modes are `smoke` and `full`. Full mode requires `dpkg`
+`amd64` and `arm64`; modes are `smoke`, `native`, and `full`. Full mode requires `dpkg`
 and fails rather than skipping transaction assertions.
 Refresh, planning, verified downloads, cache replay, payload validation, policy,
 and reproducibility remain mandatory on every host. No qemu or foreign
@@ -32,9 +33,15 @@ executable is used. Foreign packages contain inert data only.
 The core native planning lane resolves a real v2 lock, compares its repository
 and package evidence with the legacy closure, verifies its independent digest
 and backend-bound policy, and exercises cold download and cache-only replay.
-It rejects v1 input, changed policy, and native mutation without creating a
-root-operation record or changing installed state. This does not claim native
-transaction parity or enable product mutation.
+It rejects v1 input and changed policy. A missing helper target refuses native
+execution without changing package state or leaving an active root record.
+The focused `native` mode and full lane use a real package-owned helper target
+to exercise native install, exact-lock reinstall, no-op upgrade, retained-package
+closure, receipt/evidence hashes, receipt-bound outer completion, and recovery
+without repositories or cache/state access. A scripted package also exercises
+automatically derived trigger authority, private helper invocation, coalesced
+activation, and the final triggered postinst trace. This does not claim full
+native transaction parity.
 
 ## Support claims
 

@@ -25,11 +25,14 @@ test ! -L "$workspace"
 case "$suite:$architecture:$mode" in
   debian-stable:amd64:smoke|debian-stable:arm64:smoke|ubuntu-26.04:amd64:smoke|ubuntu-26.04:arm64:smoke) ;;
   debian-stable:amd64:full|debian-stable:arm64:full|ubuntu-26.04:amd64:full|ubuntu-26.04:arm64:full) ;;
+  debian-stable:amd64:native|debian-stable:arm64:native|ubuntu-26.04:amd64:native|ubuntu-26.04:arm64:native) ;;
   *) echo "unsupported integration tuple: $suite/$architecture/$mode" >&2; exit 2 ;;
 esac
 
 rm -rf "$workspace"
 mkdir -p "$root/var/lib/dpkg" "$root/var/lib/debz" "$cache" "$state"
+mkdir -p "$root/var/lib/dpkg/info" "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/triggers"
+printf '1\n' >"$root/var/lib/dpkg/info/format"
 : >"$root/var/lib/dpkg/status"
 python3 tools/generate-integration-repository.py \
   --output "$repo" --suite "$suite" --architecture "$architecture"
@@ -154,12 +157,108 @@ native_unavailable=$("$debz" install $native_common --lock-input "$native_lock" 
   --assume-yes --noninteractive --conffile keep-existing base-dep 2>"$stderr_file")
 native_unavailable_status=$?
 set -e
-test "$native_unavailable_status" -eq 3
+test "$native_unavailable_status" -eq 7
 test ! -s "$stderr_file"
-printf '%s' "$native_unavailable" | grep -q '"id":"transaction_backend_unavailable"'
+printf '%s' "$native_unavailable" | grep -q 'NativeHelperTargetMissing'
 test ! -s "$root/var/lib/dpkg/status"
 test ! -e "$root/var/lib/debz/root-operation-v1.json"
-test ! -e "$root/var/lib/debz/root-operation.lock"
+test ! -e "$root/var/lib/debz/native-execution-intent-v1.json"
+test ! -e "$root/var/lib/debz/native-helper-cache-v1"
+
+if [ "$mode" != smoke ]; then
+  privileged=
+  if [ "$use_sudo" = 1 ]; then privileged="sudo -n"; fi
+  native_root="$workspace/native-root"
+  native_state="$workspace/native-unused-state"
+  mkdir -p "$native_root/var/lib/dpkg"
+  : >"$native_root/var/lib/dpkg/status"
+  $privileged dpkg --root="$native_root" --install \
+    "$repo/pool/main/native-helper-target_1.0-1_$architecture.deb" \
+    >"$workspace/native-seed.log" 2>&1
+  native_execution="--install-root $native_root --cache-path $native_cache --state-path $native_state --architecture $architecture --source $source_file --keyring $keyring --transaction-backend native --json"
+  native_execution_lock="$workspace/native-execution.lock.json"
+  # Keep private cache files under one UID across planning and execution.
+  run_mutating_json plan $native_execution --lock-output "$native_execution_lock" base-dep | grep -q '"exit_status":0'
+  run_mutating_json install $native_execution --lock-input "$native_execution_lock" \
+    --assume-yes --noninteractive --conffile keep-existing base-dep |
+    grep -q '"changed":true'
+  $privileged python3 - "$native_root" "$native_execution_lock" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+lock = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
+assert {entry["name"] for entry in lock["packages"]} == {"base-dep", "essential-core", "native-helper-target"}
+namespace = root / "var/lib/debz"
+receipt = json.loads((namespace / "native-transaction-provenance-v1.json").read_bytes())
+completion = json.loads((namespace / "root-operation-completion-v1.json").read_bytes())
+assert receipt["outcome"] == "succeeded"
+assert receipt["backend"] == completion["backend"] == "native"
+assert receipt["attempt_id"] == completion["attempt_id"]
+assert receipt["install_root"] == str(root)
+assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
+assert completion["transaction_provenance"]["schema"] == receipt["schema"]
+assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
+assert completion["journal"]["status"] == "absent"
+for evidence in receipt["evidence_files"]:
+    data = (root / evidence["path"]).read_bytes()
+    assert len(data) == evidence["size"]
+    assert hashlib.sha256(data).hexdigest() == evidence["sha256"]
+assert (root / "usr/share/debz-fixtures/base-dep").is_file()
+assert (root / "usr/bin/dpkg-trigger").read_bytes().startswith(b"native-helper-target=")
+for path in ("root-operation-v1.json", "native-execution-intent-v1.json", "native-recovery-v1"):
+    assert not (namespace / path).exists()
+PY
+  run_mutating_json install $native_execution --lock-input "$native_execution_lock" \
+    --assume-yes --noninteractive --conffile keep-existing --cache-only base-dep |
+    grep -q '"changed":true'
+  native_noop_lock="$workspace/native-noop.lock.json"
+  run_mutating_json plan $native_execution --lock-output "$native_noop_lock" | grep -q '"exit_status":0'
+  run_mutating_json upgrade-all $native_execution --lock-input "$native_noop_lock" \
+    --assume-yes --noninteractive --conffile keep-existing --cache-only |
+    grep -q '"changed":false'
+  run_mutating_json recover --install-root "$native_root" --architecture "$architecture" \
+    --cache-path "$workspace/native-recovery-unused-cache" --state-path "$native_state" \
+    --transaction-backend native --assume-yes --json | grep -q '"changed":false'
+  test ! -e "$workspace/native-recovery-unused-cache"
+  test ! -e "$native_state"
+  $privileged python3 -B - "$native_root" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("runtime", "tools/test-apt-system-acceptance.py")
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+runtime.copy_program(Path(sys.argv[1]), Path("/bin/sh"), "/bin/sh")
+PY
+  native_trigger_lock="$workspace/native-trigger.lock.json"
+  run_mutating_json plan $native_execution --lock-output "$native_trigger_lock" native-trigger-pkg | grep -q '"exit_status":0'
+  run_mutating_json install $native_execution --lock-input "$native_trigger_lock" \
+    --assume-yes --noninteractive --conffile keep-existing native-trigger-pkg |
+    grep -q '"changed":true'
+  $privileged python3 - "$native_root" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+trace = (root / "native-trigger-trace").read_text().splitlines()
+assert trace == ["configure ", "triggered native-fixture"], trace
+receipt = json.loads((root / "var/lib/debz/native-transaction-provenance-v1.json").read_bytes())
+assert receipt["outcome"] == "succeeded"
+authorization_file = next(entry for entry in receipt["evidence_files"] if entry["kind"] == "authorization")
+authorization = json.loads((root / authorization_file["path"]).read_bytes())
+assert authorization["trigger_authority"]["allowed_triggers"] == ["native-fixture"]
+assert not (root / "var/lib/debz/native-execution-intent-v1.json").exists()
+PY
+  if [ "$mode" = native ]; then
+    printf 'integration-root: %s/%s native core passed\n' "$suite" "$architecture"
+    exit 0
+  fi
+fi
 
 package_cache_root="$workspace/package-cache"
 package_cache_archives="$workspace/package-cache-archives"

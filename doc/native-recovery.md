@@ -2,8 +2,8 @@
 
 Items 14 and 15b provide durable execution boundaries around the compiled native
 lifecycle, including the experimental caller-owned `debz.native_runtime` API.
-Product/CLI native execution/recovery remains unavailable; this does not enable a
-product cutover or change legacy recovery.
+Core product/CLI native execution and persisted-input recovery are experimental;
+this does not enable a product cutover or change legacy recovery.
 
 ## Durable execution authority
 
@@ -217,12 +217,26 @@ operation workflow, the caller passes the exact `digest_sha256` to
 recovery after active cleanup are supported. The caller still owns outer
 completion, provenance, and lock release.
 
-Core native v2 lock planning and download are available, but product/CLI
-execution and recovery still require receipt/result integration.
+`prepare(allocator, request)` captures full database, installed script/conffile,
+archive, origin, and trigger evidence under the caller's held attempt. Its
+result owns a prepared program or diagnostic, or explicitly reports an
+unchanged validated closure without creating an executable authorization.
+It accepts no fixture configuration. `canAbandon` checks both the caller state
+and native active/terminal evidence before permitting pre-mutation abandonment;
+the outer record's pre-mutation flag alone is insufficient.
+
+Core product/CLI planning, download, execution, and recovery use these typed
+contracts. Native mutation requires a reviewed v2 lock and a supported non-host
+root. Native recovery accepts no new repository or lock inputs and reads only
+the original persisted execution evidence. Terminal success and known failure
+bind `root-operation-completion-v1.json` to the exact native receipt, publish
+the outer provenance transition, acknowledge native evidence, and finally clear
+the caller's active record. Every boundary is restartable. Generic acquisition
+cannot reclaim a native program-bound attempt in either the pre-intent or
+pending-acknowledgment window, and an orphan native intent blocks other engines.
 Empty v2 closures now represent last-package removal or purge,
 with explicit action authorization and retained configuration modeled separately.
-Product native receipt/result integration, remaining consumers, and full pinned
-parity remain roadmap work.
+Remaining consumer integration and full pinned parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 
 ## Independent acceptance

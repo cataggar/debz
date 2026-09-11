@@ -98,10 +98,12 @@ commands additionally require `--conffile keep-existing` or
 `--transaction-backend legacy_dpkg|native` selects the core backend; omission
 retains `legacy_dpkg`. Embedders select the same backend with
 `ProductionBackend.transaction_backend`, without changing product API v1
-request or result encoding. Native currently supports non-mutating planning
-and verified download only. Native install/remove/upgrade/reinstall/recovery
-remain `transaction_backend_unavailable` before repository or root access,
-including when a command-shaped executor is injected. There is no fallback.
+request or result encoding. Experimental core native execution requires an
+explicit reviewed v2 lock, confirmation, conffile policy, authenticated
+repositories, and a supported non-host Linux root. The existing package-owned
+`usr/bin/dpkg-trigger` target and private mount-namespace privileges are required;
+missing targets refuse without placeholders. Native execution never calls the
+command-shaped executor, including injected executors. There is no fallback.
 
 Native `plan`/`download` resolve and replay exact-lock v2 from authenticated
 repository evidence. They do not convert v1 locks or invent local-artifact
@@ -111,6 +113,27 @@ backend silently accepts the other's format. Native package downloads bind
 identity, repository/snapshot, SHA-256, and size before cache or transport
 access, including cache-only replay. The separate `package-cache` commands
 and other consumer contracts remain v1-only where documented.
+
+Native execution captures the complete database and acquired archive evidence
+under its caller-owned root attempt, derives trigger authority, and revalidates
+the compiled program before mutation. An unchanged validated closure returns
+`changed: false` without inventing an execution receipt. A terminal native
+success or known failure publishes native provenance, binds outer completion
+to that exact receipt, acknowledges native evidence, and only then clears the
+outer record. The v1 result summary identifies the receipt digest and retained
+evidence directory; it does not fabricate legacy command reports.
+
+`recover --transaction-backend native --install-root ROOT --assume-yes`
+uses the original persisted request, program, archive, policy, and helper
+evidence. It accepts no replacement repository/keyring/lock inputs or force
+policy and does not open cache or state directories. Native evidence always
+lives under `ROOT/var/lib/debz`; `--state-path` does not relocate it. Recovery
+of a known terminal failure reports exit 7 after receipt-backed cleanup;
+unknown script outcomes and invalid evidence remain blocked with exit 8.
+Recovered transactions report whether the original attempt reached mutation;
+recovery with no outstanding execution reports `changed: false`.
+Orchestrated workflow execution/recovery and other consumers remain gated
+until their separate native integration.
 
 The standalone binary instantiates `ProductionBackend`. A non-mutating `plan`
 or `download` may use `--lock-output` without `--lock-input` to resolve an
@@ -122,10 +145,10 @@ keyring, status, confirmation, conffile, or exact-lock inputs are reported as
 typed errors for the affected command; there is no global backend-unavailable
 result. Exact-lock input is enforced by planning, acquisition, and execution.
 When both lock options are supplied, the validated input is atomically
-published at the output path. Successful locked transactions atomically publish
+published at the output path. Successful locked legacy transactions atomically publish
 `transaction-result.json` under the explicit state path.
 
-`recover` resolves an interrupted transaction. When the root's active attempt
+Legacy `recover` resolves an interrupted transaction. When the root's active attempt
 is already `completed` and only owes provenance — a crash between the terminal
 record and its published provenance — `recover` discharges that obligation
 without running dpkg again: it verifies any `transaction-result.json` that

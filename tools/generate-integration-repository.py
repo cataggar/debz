@@ -86,6 +86,8 @@ def build_deb(
     failing_postinst: bool = False,
     conffile: bool = False,
     trigger: str | None = None,
+    helper_target: bool = False,
+    native_trigger: bool = False,
 ) -> bytes:
     control_fields = {
         "Package": package,
@@ -103,8 +105,16 @@ def build_deb(
         control_entries.append(("./conffiles", b"/etc/debz-fixture.conf\n", 0o644))
     if trigger:
         control_entries.append(("./triggers", f"interest-noawait {trigger}\n".encode(), 0o644))
+    if native_trigger:
+        control_entries.append(("./triggers", b"interest-noawait native-fixture\nactivate-noawait native-fixture\n", 0o644))
+        control_entries.append(("./postinst", (
+            b'#!/bin/sh\nset -e\nprintf "%s\\n" "$*" >>/native-trigger-trace\n'
+            b'if [ "$1" = configure ]; then /usr/bin/dpkg-trigger --no-await native-fixture; fi\n'
+        ), 0o755))
     payload_path = "./etc/debz-fixture.conf" if conffile else f"./usr/share/debz-fixtures/{package}"
     data = f"{package}={version}:{architecture}\n".encode()
+    if helper_target:
+        payload_path = "./usr/bin/dpkg-trigger"
     return (
         b"!<arch>\n"
         + ar_member("debian-binary", b"2.0\n")
@@ -118,6 +128,8 @@ def package_specs(suite: str, architecture: str):
     return [
         ("ca-certificates", "20240203", "all", {}, {}),
         ("base-dep", "1.0-1", architecture, {}, {}),
+        ("native-helper-target", "1.0-1", architecture, {}, {"helper_target": True}),
+        ("native-trigger-pkg", "1.0-1", architecture, {}, {"native_trigger": True}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
         ("alt-b", "2.0-1", architecture, {}, {}),
