@@ -51,6 +51,7 @@ for schema in \
   exact-closure-lock-v1.json \
   exact-closure-lock-v2.json \
   native-execution-request-v1.json \
+  native-execution-request-v2.json \
   package-cache-error-v1.json \
   package-cache-fingerprint-v1.json \
   package-cache-result-v1.json \

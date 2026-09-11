@@ -4,6 +4,7 @@
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
 const native_operation = @import("native_operation.zig");
+const native_helper = @import("native_helper.zig");
 const native_program = @import("native_program.zig");
 const native_recovery = @import("native_recovery.zig");
 const root_fs = @import("root_fs.zig");
@@ -15,6 +16,8 @@ pub const Digest = native_recovery.Digest;
 pub const schema_id = "https://debz.dev/schema/native-execution-request-v1";
 pub const logical_path = "request/native-execution-request-v1.json";
 pub const maximum_document_bytes = 64 * 1024;
+pub const helper_schema_id = "https://debz.dev/schema/native-execution-request-v2";
+pub const helper_logical_path = "request/native-execution-request-v2.json";
 
 pub const Caller = struct {
     attempt_id: Digest,
@@ -63,6 +66,118 @@ pub const OwnedDocument = struct {
         self.* = undefined;
     }
 };
+
+pub const HelperDocument = struct {
+    schema: []const u8 = helper_schema_id,
+    version: u32 = 2,
+    execution: Document,
+    helper: native_helper.Binding,
+    digest_sha256: Digest = @splat('0'),
+};
+
+pub const OwnedHelperDocument = struct {
+    document: HelperDocument,
+    parsed: std.json.Parsed(HelperDocument),
+
+    pub fn deinit(self: *OwnedHelperDocument) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const OwnedRequest = union(enum) {
+    plain: OwnedDocument,
+    isolated_helper: OwnedHelperDocument,
+
+    pub fn deinit(self: *OwnedRequest) void {
+        switch (self.*) {
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    pub fn execution(self: OwnedRequest) Document {
+        return switch (self) {
+            .plain => |value| value.document,
+            .isolated_helper => |value| value.document.execution,
+        };
+    }
+
+    pub fn helper(self: OwnedRequest) ?native_helper.Binding {
+        return switch (self) {
+            .plain => null,
+            .isolated_helper => |value| value.document.helper,
+        };
+    }
+
+    pub fn documentDigest(self: OwnedRequest) Digest {
+        return switch (self) {
+            inline else => |value| value.document.digest_sha256,
+        };
+    }
+
+    pub fn logicalPath(self: OwnedRequest) []const u8 {
+        return switch (self) {
+            .plain => logical_path,
+            .isolated_helper => helper_logical_path,
+        };
+    }
+};
+
+fn helperDigest(document: HelperDocument) Digest {
+    var payload = document;
+    payload.digest_sha256 = @splat('0');
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll("debz-native-execution-request-v2\x00") catch unreachable;
+    std.json.Stringify.value(payload, .{ .whitespace = .minified }, &sink.writer) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return native_recovery.hexDigest(sink.hasher.finalResult());
+}
+
+pub fn withHelper(document: Document, helper: native_helper.Binding) !HelperDocument {
+    try validate(document);
+    try helper.validate();
+    var result: HelperDocument = .{ .execution = document, .helper = helper };
+    result.digest_sha256 = helperDigest(result);
+    return result;
+}
+
+pub fn encodeWithHelper(allocator: std.mem.Allocator, document: HelperDocument) ![]u8 {
+    if (!std.mem.eql(u8, document.schema, helper_schema_id) or document.version != 2)
+        return error.InvalidExecutionRequest;
+    try validate(document.execution);
+    try document.helper.validate();
+    if (!std.mem.eql(u8, &document.digest_sha256, &helperDigest(document)))
+        return error.DigestMismatch;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    std.json.Stringify.value(document, .{ .whitespace = .minified }, &output.writer) catch
+        return error.OutOfMemory;
+    output.writer.writeByte('\n') catch return error.OutOfMemory;
+    if (output.written().len > maximum_document_bytes) return error.LimitExceeded;
+    return output.toOwnedSlice();
+}
+
+pub fn decodePersisted(allocator: std.mem.Allocator, bytes: []const u8) !OwnedRequest {
+    if (bytes.len > maximum_document_bytes) return error.LimitExceeded;
+    const Header = struct { schema: []const u8, version: u32 };
+    var header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    if (std.mem.eql(u8, header.value.schema, schema_id) and header.value.version == 1)
+        return .{ .plain = try decode(allocator, bytes) };
+    if (!std.mem.eql(u8, header.value.schema, helper_schema_id) or header.value.version != 2)
+        return error.InvalidExecutionRequest;
+    var parsed = try std.json.parseFromSlice(HelperDocument, allocator, bytes, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+    const canonical = try encodeWithHelper(allocator, parsed.value);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalDocument;
+    return .{ .isolated_helper = .{ .document = parsed.value, .parsed = parsed } };
+}
 
 fn digest(document: Document) Digest {
     var payload = document;
@@ -275,4 +390,35 @@ test "native_execution_request.test.rejects rehashed invalid fields and changed 
     document.defer_triggers = true;
     seal(&document);
     try std.testing.expectError(error.InvalidExecutionRequest, validate(document));
+}
+
+fn roundTripHelper(allocator: std.mem.Allocator) !void {
+    const source = native_helper.bundled();
+    const digest_bytes = std.fmt.bytesToHex(source.sha256, .lower);
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}.bin", .{ native_helper.directory, digest_bytes });
+    defer allocator.free(path);
+    const plain = fixtureDocument();
+    const document = try withHelper(plain, .{
+        .source_path = path,
+        .target_path = native_helper.target_path,
+        .sha256 = digest_bytes,
+        .size = source.bytes.len,
+    });
+    const bytes = try encodeWithHelper(allocator, document);
+    defer allocator.free(bytes);
+    var parsed = try decodePersisted(allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(document.digest_sha256, parsed.documentDigest());
+    try std.testing.expectEqual(plain.digest_sha256, parsed.execution().digest_sha256);
+    try parsed.helper().?.matches(source);
+    const old_bytes = try encode(allocator, plain);
+    defer allocator.free(old_bytes);
+    var old = try decodePersisted(allocator, old_bytes);
+    defer old.deinit();
+    try std.testing.expect(old.helper() == null);
+    try std.testing.expectEqual(plain.digest_sha256, old.documentDigest());
+}
+
+test "native_execution_request.test.helper wrapper preserves v1 bytes and handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, roundTripHelper, .{});
 }

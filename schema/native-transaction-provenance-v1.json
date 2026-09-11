@@ -232,6 +232,7 @@
         "kind": {
           "enum": [
             "execution_request",
+            "helper_binary",
             "authorization",
             "program",
             "intent",

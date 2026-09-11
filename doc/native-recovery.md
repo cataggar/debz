@@ -126,9 +126,38 @@ files have been removed. The caller separately owns its completion statement,
 provenance discharge and root-attempt release. Unresolved native work cannot
 be acknowledged as completed.
 
-These adapters are still private. Helper deployment/capability enforcement and
-public product/CLI wiring remain required before experimental native selection
-can be exposed; legacy stays default and there is no fallback.
+### Isolated helper request v2
+
+[`native-execution-request-v2`](../schema/native-execution-request-v2.json)
+wraps the unchanged v1 execution mapping together with a helper source path,
+target path, byte digest and size. It has a separate v2 digest domain; existing
+v1 requests and receipts keep their original bytes and remain readable.
+
+`debz.native_helper` makes the statically linked native trigger helper available
+as a build-bound embedded payload. The helper-aware private adapter stages
+verified bytes under the content-addressed
+`var/lib/debz/native-helper-cache-v1/` directory, with read/execute-only
+permissions, and requires a successful namespace setup probe before package
+mutation. Existing cache entries are verified, never overwritten. The cache is
+not active recovery evidence and can be reused after acknowledgment.
+
+Every script invocation pins the source and current target again and mounts the
+helper only inside that script's private mount namespace. The invocation digest
+binds the helper identity. Recovery requires the persisted v2 binding, the exact
+trusted helper bytes and a successful probe; it cannot silently downgrade to
+helper-free execution or repair a changed source from caller input. Completed
+receipts retain the helper binary and are independently readable after active
+cleanup.
+
+An absent `usr/bin/dpkg-trigger` target is explicitly refused before package
+mutation. No placeholder is created, and no existing target is overwritten.
+Plans that remove the target's owning package, omit the target from its
+replacement archive, or replace it with a non-regular entry are also refused.
+Fresh-root target creation is outside this increment.
+
+These adapters are still private. Public product/CLI wiring remains required
+before experimental native selection can be exposed; legacy stays default and
+there is no fallback.
 
 ## Independent acceptance
 
@@ -160,6 +189,12 @@ completion pending until acknowledgment, and reject a rehashed request that
 substitutes caller policy. Mixed genuine production-preparation units cover
 install/remove and install/purge, including repeated recovery after outer
 database work and interrupted acknowledgment cleanup.
+
+Helper-aware cases retain the original package-owned helper bytes and inode
+through execution, crashes and acknowledgment, including dynamic trigger
+processing. The oracle recomputes every helper-bound invocation digest from
+retained request, program and script evidence. Missing targets, changed helper
+bytes and attempted helper-free recovery are refused.
 
 ```sh
 zig build test-native-recovery -j2

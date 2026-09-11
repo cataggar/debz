@@ -594,6 +594,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/native_trigger_helper.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = target.result.cpu.arch,
+                .cpu_model = target.query.cpu_model,
+                .cpu_features_add = target.query.cpu_features_add,
+                .cpu_features_sub = target.query.cpu_features_sub,
                 .os_tag = .linux,
                 .abi = .musl,
             }),
@@ -604,6 +607,9 @@ pub fn build(b: *std.Build) void {
     });
     b.step("native-trigger-helper", "Build the private trigger helper without installing it")
         .dependOn(&native_trigger_helper.step);
+    debz.addAnonymousImport("debz_native_trigger_helper", .{
+        .root_source_file = native_trigger_helper.getEmittedBin(),
+    });
     const native_trigger_queue_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/native_trigger.zig"),
@@ -635,7 +641,7 @@ pub fn build(b: *std.Build) void {
 
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "native_recovery.test.", "native_provenance.test.", "native_execution_request.test." },
+        .filters = &.{ "native_recovery.test.", "native_provenance.test.", "native_execution_request.test.", "native_helper.test." },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
     b.step("test-native-recovery-unit", "Run native execution journal and provenance tests")
@@ -906,6 +912,7 @@ fn installReleaseFiles(
         "native-execution-intent-v1.json",
         "native-execution-progress-v1.json",
         "native-execution-request-v1.json",
+        "native-execution-request-v2.json",
         "native-managed-state-v1.json",
         "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",

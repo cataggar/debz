@@ -116,6 +116,13 @@ falling back to an unmodified helper. `Report.helper` identifies the source,
 target and helper digest, which are also bound into invocation evidence.
 Requests without a helper retain their existing execution and digest contract.
 
+The private native runtime now supplies build-bound helper bytes through
+`debz.native_helper`, records the deployment in a v2 execution request, and
+requires the probe before package mutation. It refuses absent targets without
+creating placeholders. Helper-aware recovery revalidates the original binding;
+it never falls back to a package-owned executable. See
+[native recovery and helper deployment](native-recovery.md#isolated-helper-request-v2).
+
 The privileged `test-native-helper-namespace` target requires the positive
 mount path, proves named and absolute helper execution, rejects writes through
 the mount, preserves the original target, and proves alternate-root isolation.

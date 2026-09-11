@@ -54,8 +54,9 @@ revalidate it under the appropriate locks.
 
 This is an item-15b integration foundation, not a public native executor.
 The private [caller-owned recovery boundary](native-recovery.md) now persists
-production request bindings and leaves outer completion to its owner. Isolated
-helper deployment and public product/CLI selection still require integration. Legacy remains
+production request bindings and leaves outer completion to its owner. Its
+helper-aware variant binds isolated helper deployment and capability probing;
+public product/CLI selection still requires integration. Legacy remains
 the default, and native selection cannot fall back to the legacy executor.
 
 ## Output

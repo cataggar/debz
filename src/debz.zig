@@ -251,6 +251,7 @@ pub const native_authorization = @import("native_authorization.zig");
 pub const native_program = @import("native_program.zig");
 pub const native_preparation = @import("native_preparation.zig");
 pub const native_execution_request = @import("native_execution_request.zig");
+pub const native_helper = @import("native_helper.zig");
 pub const native_unpack = @import("native_unpack.zig");
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
@@ -609,6 +610,7 @@ test {
     _ = native_unpack;
     _ = native_preparation;
     _ = native_execution_request;
+    _ = native_helper;
     _ = transaction_engine;
     _ = transaction_provenance;
     _ = transaction_provenance_v2;

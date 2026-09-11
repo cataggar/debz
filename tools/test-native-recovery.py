@@ -17,6 +17,13 @@ import subprocess
 import tempfile
 
 import jsonschema
+try:
+    from referencing import Registry, Resource
+except ModuleNotFoundError as error:
+    if error.name != "referencing":
+        raise
+    Registry = None
+    Resource = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +84,7 @@ def native(
     crash_at: str | None = None,
     caller_owned: bool = False,
     acknowledge_native: bool = False,
+    isolated_helper: bool = False,
 ) -> dict | None:
     m.reference_command(root)
     if operation == "recover" and (archives or packages or crash_at is not None):
@@ -94,6 +102,10 @@ def native(
         request["crash_at"] = crash_at
     if caller_owned:
         request["caller_owned"] = True
+    if isolated_helper:
+        if not caller_owned:
+            raise ValueError("isolated helper belongs to the native caller")
+        request["isolated_helper"] = True
     if acknowledge_native:
         if not caller_owned or operation != "recover":
             raise ValueError("native acknowledgment belongs to the recovering caller")
@@ -168,7 +180,17 @@ def assert_digest(value: dict, schema: str) -> None:
 
 @cache
 def validator(schema: str) -> jsonschema.Draft202012Validator:
-    return jsonschema.Draft202012Validator(document(ROOT / "schema" / f"{schema}.json"))
+    definition = document(ROOT / "schema" / f"{schema}.json")
+    execution = document(ROOT / "schema/native-execution-request-v1.json")
+    if Registry is not None and Resource is not None:
+        registry = Registry().with_resource(execution["$id"], Resource.from_contents(execution))
+        return jsonschema.Draft202012Validator(definition, registry=registry)
+    return jsonschema.Draft202012Validator(
+        definition,
+        resolver=jsonschema.RefResolver.from_schema(
+            definition, store={execution["$id"]: execution},
+        ),
+    )
 
 
 def namespace_path(root: Path, name: str) -> Path:
@@ -209,6 +231,8 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             continue
         value = json.loads(raw)
         schema = EVIDENCE_SCHEMAS[kind]
+        if kind == "execution_request" and value.get("version") == 2:
+            schema = "native-execution-request-v2"
         validator(schema).validate(value)
         assert_digest(value, schema)
         if value["digest_sha256"] != entry["document_sha256"]:
@@ -225,13 +249,21 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
     request_blobs = [blob for blob in documents["intent"][0]["blobs"] if blob["kind"] == "request"]
     if len(request_blobs) != 1:
         raise AssertionError("intent did not retain exactly one request binding")
-    if request_blobs[0]["logical_path"] == "request/native-execution-request-v1.json":
+    if request_blobs[0]["logical_path"] in (
+        "request/native-execution-request-v1.json", "request/native-execution-request-v2.json",
+    ):
         requests = documents.get("execution_request", [])
         if len(requests) != 1:
             raise AssertionError("missing or duplicated retained execution_request")
         request_bytes = canonical(requests[0]) + b"\n"
         if hashlib.sha256(request_bytes).hexdigest() != request_blobs[0]["sha256"]:
             raise AssertionError("retained production request differs from the execution intent")
+        if requests[0]["version"] == 2:
+            helper = requests[0]["helper"]
+            binaries = [entry for entry in proof["evidence_files"] if entry["kind"] == "helper_binary"]
+            if len(binaries) != 1 or binaries[0]["sha256"] != helper["sha256"] or binaries[0]["size"] != helper["size"]:
+                raise AssertionError("retained helper differs from the original request")
+            assert_digest(requests[0]["execution"], "native-execution-request-v1")
     elif "execution_request" in documents:
         raise AssertionError("private intent cannot substitute a production request")
     return documents
@@ -312,6 +344,47 @@ def assert_script_output(script: dict) -> None:
         source = lifecycle.scripts(script["package"], script["package_version"])
     if hashlib.sha256(source[script["kind"]]).hexdigest() != script["script_sha256"]:
         raise AssertionError("retained outcome identifies different script bytes")
+
+
+def assert_helper_invocations(request: dict, program: dict, scripts: list[dict]) -> None:
+    def text(value: str) -> bytes:
+        encoded = value.encode()
+        return len(encoded).to_bytes(8, "little") + encoded
+
+    helper = request["helper"]
+    for script in scripts:
+        name, architecture, kind = script["package"], script["architecture"], script["kind"]
+        staged_name = name if script["source"] == "new_package" else f"{name}:{architecture}"
+        paths = (
+            f"var/lib/debz-lifecycle-scripts/{staged_name}.{kind}",
+            f"var/lib/dpkg/info/{name}.{kind}",
+            f"var/lib/dpkg/info/{name}:{architecture}.{kind}",
+        )
+        environment = hashlib.sha256(
+            b"debz-maintainer-script-environment-v1\0"
+            + b"".join(text(entry["key"]) + text(entry["value"]) for entry in script["environment"])
+        ).digest()
+        matched = False
+        for path in paths:
+            argv = hashlib.sha256(
+                b"debz-maintainer-script-argv-v1\0"
+                + b"".join(text(argument) for argument in ["/" + path, *script["arguments"]])
+            ).digest()
+            invocation = (
+                b"debz-maintainer-script-invocation-v1\0"
+                + b"".join(text(value) for value in (
+                    request["execution"]["install_root"], "chroot", name,
+                    script["package_version"], architecture, kind, path,
+                ))
+                + bytes.fromhex(script["script_sha256"]) + argv + environment
+                + bytes.fromhex(program["script_policy_sha256"])
+                + b"debz-maintainer-script-helper-mount-v1\0"
+                + text(helper["source_path"]) + text(helper["target_path"])
+                + bytes.fromhex(helper["sha256"])
+            )
+            matched |= hashlib.sha256(invocation).hexdigest() == script["invocation_sha256"]
+        if not matched:
+            raise AssertionError("script invocation did not bind the isolated helper")
 
 
 def assert_final_database(root: Path, architecture: str, proof: dict) -> None:
@@ -403,6 +476,8 @@ def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
     retained_binding = intent_binding(intent)
     if "execution_request" in retained:
         request = retained["execution_request"][0]
+        if request["version"] == 2:
+            request = request["execution"]
         caller = request["caller"]
         program = retained["program"][0]
         for field in ("request_sha256", "solver_policy_sha256", "executor_policy_sha256", "plan_sha256", "script_policy_sha256"):
@@ -426,6 +501,8 @@ def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
     assert_progress(value, retained["progress"][0], scripts)
     for script in scripts:
         assert_script_output(script)
+    if retained.get("execution_request", [{}])[0].get("version") == 2:
+        assert_helper_invocations(retained["execution_request"][0], retained["program"][0], scripts)
     assert_script_trace(root, value, scripts)
     managed = retained["managed_state"][0]
     for snapshot in (managed["stable"], managed["transient"]):
@@ -461,6 +538,7 @@ class Scenario(triggers.Scenario):
         failure: bool = False,
         compare_reference: bool = True,
         caller_owned: bool = False,
+        isolated_helper: bool = False,
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
@@ -476,6 +554,7 @@ class Scenario(triggers.Scenario):
             operation, archives, self.environment, destination,
             trigger_execution=trigger_execution, defer=defer, crash_at=boundary,
             caller_owned=caller_owned,
+            isolated_helper=isolated_helper,
         )
         binding = intent_binding(document(self.candidate / INTENT, 16 * 1024 * 1024))
         if caller_owned:
@@ -493,19 +572,24 @@ class Scenario(triggers.Scenario):
         return binding
 
     def recover(self, *, trigger_execution: bool = False, label: str = "recover",
-                caller_owned: bool = False, acknowledge_native: bool = False) -> dict:
+                caller_owned: bool = False, acknowledge_native: bool = False,
+                isolated_helper: bool = False) -> dict:
         destination = self.directory / label
         destination.mkdir()
         report = native(
             self.executable, self.candidate, self.architecture, "recover", [],
             self.environment, destination, trigger_execution=trigger_execution,
             caller_owned=caller_owned, acknowledge_native=acknowledge_native,
+            isolated_helper=isolated_helper,
         )
         assert report is not None
         return report
 
-    def caller_completed(self, binding: dict, *, failure: bool = False) -> None:
-        report = self.recover(caller_owned=True)
+    def caller_completed(self, binding: dict, *, failure: bool = False, isolated_helper: bool = False) -> None:
+        helper_path = self.candidate / triggers.HELPER
+        helper_before = helper_path.read_bytes() if isolated_helper else None
+        helper_inode = helper_path.stat().st_ino if isolated_helper else None
+        report = self.recover(caller_owned=True, isolated_helper=isolated_helper)
         expected_outcome = "script_failed" if failure else "applied"
         if report["outcome"] != expected_outcome:
             raise AssertionError(f"caller-owned recovery failed: {report}")
@@ -520,10 +604,10 @@ class Scenario(triggers.Scenario):
         if completion.exists():
             raise AssertionError("native program published outer completion")
         before = triggers.snapshot(self.candidate)
-        repeated = self.recover(caller_owned=True, label="repeat-before-ack")
+        repeated = self.recover(caller_owned=True, isolated_helper=isolated_helper, label="repeat-before-ack")
         if repeated["outcome"] != expected_outcome or m.oracle.differences(before, triggers.snapshot(self.candidate)):
             raise AssertionError("caller-owned repeated recovery reran package work")
-        acknowledged = self.recover(caller_owned=True, acknowledge_native=True, label="caller-ack")
+        acknowledged = self.recover(caller_owned=True, isolated_helper=isolated_helper, acknowledge_native=True, label="caller-ack")
         if acknowledged["outcome"] != expected_outcome:
             raise AssertionError(f"caller acknowledgment failed: {acknowledged}")
         for path in (OPERATION, INTENT, NAMESPACE / "native-recovery-v1"):
@@ -535,6 +619,8 @@ class Scenario(triggers.Scenario):
             raise AssertionError("acknowledgment replaced native provenance")
         if document(completion)["attempt_id"] != binding["attempt_id"]:
             raise AssertionError("caller completion changed the original attempt")
+        if isolated_helper and (helper_path.read_bytes() != helper_before or helper_path.stat().st_ino != helper_inode):
+            raise AssertionError("isolated helper changed the package-owned target")
         print(f"{self.directory.name}: caller-owned crash/recovery and acknowledgment passed", flush=True)
 
     def completed(self, binding: dict, *, trigger_execution: bool = False, failure: bool = False) -> None:
@@ -609,6 +695,55 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
             workspace / "packages" / label, environment, architecture, version,
             package=name, scripts=lifecycle.scripts(name, version) if scripts else None,
         )
+
+    for boundary in ("after_execution_intent", "after_script_outcome", "after_provenance"):
+        current = case(f"isolated-helper-{boundary}")
+        shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+        original = (current.candidate / triggers.HELPER).read_bytes()
+        original_inode = (current.candidate / triggers.HELPER).stat().st_ino
+        archive = package(f"isolated-helper-{boundary}")
+        binding = current.crash("install", [archive], boundary, caller_owned=True, isolated_helper=True)
+        if (current.candidate / triggers.HELPER).read_bytes() != original or (current.candidate / triggers.HELPER).stat().st_ino != original_inode:
+            raise AssertionError("helper exposure changed the target before interruption")
+        current.caller_completed(binding, isolated_helper=True)
+
+    current = case("isolated-helper-target-absent")
+    (current.candidate / triggers.HELPER).unlink()
+    archive = package("isolated-helper-target-absent")
+    destination = current.directory / "refuse"
+    destination.mkdir()
+    before = triggers.snapshot(current.candidate)
+    report = native(executable, current.candidate, architecture, "install", [archive],
+                    environment, destination, caller_owned=True, isolated_helper=True)
+    if report is None or report["detail"] != "NativeHelperTargetMissing":
+        raise AssertionError(f"missing target was not refused: {report}")
+    if document(current.candidate / OPERATION)["mutation_started"]:
+        raise AssertionError("missing target crossed the mutation boundary")
+    for path in (triggers.HELPER, INTENT, NAMESPACE / "native-helper-cache-v1"):
+        if (current.candidate / path).exists():
+            raise AssertionError(f"missing target created unexpected state: {path}")
+    if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+        raise AssertionError("missing target refusal changed package state")
+    print("isolated-helper-target-absent: refused before mutation without a placeholder", flush=True)
+
+    for changed in ("downgrade", "bytes"):
+        current = case(f"isolated-helper-changed-{changed}")
+        shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+        archive = package(f"isolated-helper-changed-{changed}")
+        current.crash("install", [archive], "after_execution_intent", caller_owned=True, isolated_helper=True)
+        intent = document(current.candidate / INTENT, 16 * 1024 * 1024)
+        request_blob = next(blob for blob in intent["blobs"] if blob["kind"] == "request")
+        request = document(current.candidate / request_blob["storage_path"])
+        if changed == "bytes":
+            m.write(current.candidate / request["helper"]["source_path"], b"changed helper\n", 0o500)
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(caller_owned=True, isolated_helper=changed != "downgrade")
+        expected_detail = "HelperDigestMismatch" if changed == "bytes" else "NativeHelperBindingRequired"
+        if report["outcome"] != "recovery_required" or report["detail"] != expected_detail:
+            raise AssertionError(f"unsafe helper recovery was not refused: {report}")
+        if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+            raise AssertionError("unsafe helper recovery changed package state")
+        print(f"isolated-helper-changed-{changed}: recovery stayed blocked", flush=True)
 
     for boundary in ("after_execution_intent", "during_filesystem_publication",
                      "after_script_outcome", "after_provenance"):
@@ -756,6 +891,20 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
         ("automatic", triggers.SOURCE, "debz-a"), ("dynamic", first_name, "debz-b"),
     ]:
         raise AssertionError(f"receipt lost or replayed trigger activations: {activations}")
+
+    isolated = case("isolated-helper-trigger-outcome")
+    isolated.seed(first, second)
+    shutil.copy2("/usr/bin/dpkg-trigger", isolated.candidate / triggers.HELPER)
+    isolated_source = m.make_package(
+        workspace / "packages/isolated-trigger-source", environment, architecture, "1",
+        package=triggers.SOURCE, triggers=b"activate-noawait debz-a\n",
+        scripts=triggers.script_set(triggers.SOURCE, "1"),
+    )
+    isolated_binding = isolated.crash(
+        "install", [isolated_source], "after_trigger_outcome", trigger_execution=True,
+        caller_owned=True, isolated_helper=True,
+    )
+    isolated.caller_completed(isolated_binding, isolated_helper=True)
 
     for changed in ("intent", "progress", "artifact", "managed-root", "completed-phase"):
         current = case(f"changed-{changed}")
