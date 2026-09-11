@@ -275,7 +275,10 @@ cutover.
 `transaction_engine` owns explicit backend selection. `legacy_dpkg` remains
 the default while native work is incomplete. Roadmap item 10a adds only the
 descriptive unpack/ownership planner; it exports no apply or recovery
-capability. Selecting `native` therefore returns a typed unavailable result
+capability. Item 15b separately exposes caller-owned prepared-program execution
+and native receipts through `debz.native_runtime`, with mandatory trusted helper
+isolation. Product/CLI lock and result integration is still incomplete.
+Selecting `native` through the command-shaped boundary returns an unavailable result
 before repository acquisition, journal access, database access, or root
 mutation even if a command-shaped executor was injected. Selection never falls
 back to `legacy_dpkg`.

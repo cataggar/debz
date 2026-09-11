@@ -20,8 +20,9 @@
 //! native program, runs validated scripts in an isolated root, and retains
 //! durable evidence for ambiguous outcomes. Its private trigger extension
 //! models named/file interests, deferred queues, dynamic helper activation,
-//! failures, and bounded cycle detection. None of these adapters is a public
-//! native executor; other unsupported features still hand off before mutation.
+//! failures, and bounded cycle detection. The experimental Runtime exposes
+//! caller-owned typed execution with mandatory helper isolation; fixture
+//! adapters remain private and unsupported work never falls back to dpkg.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11154,7 +11155,7 @@ fn lifecycleInstalledEvidence(
 fn lifecycleArchiveEvidence(
     allocator: std.mem.Allocator,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
 ) ![]const native_program.Archive {
     if (models.len != archive_bytes.len) return error.ArchiveEvidenceMismatch;
     const origins = try allocator.alloc(exact_lock_v2.PackageOrigin, models.len);
@@ -11177,7 +11178,7 @@ fn lifecycleArchiveEvidence(
 fn programArchiveEvidence(
     allocator: std.mem.Allocator,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     origins: []const exact_lock_v2.PackageOrigin,
 ) ![]const native_program.Archive {
     if (models.len != archive_bytes.len or models.len != origins.len)
@@ -12073,7 +12074,7 @@ fn compileLifecycleProgram(
     root: root_fs.Root,
     database: package_database.Database,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
 ) !?CompiledLifecycle {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     defer allocator.destroy(arena);
@@ -12314,7 +12315,7 @@ fn lifecycleDataStep(
     program: *const native_program.Program,
     authorization: *const native_authorization.Authorization,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     locks: root_operation.LockBackend,
     attempt: *root_operation.Attempt,
     operation: product_api.Operation,
@@ -12363,7 +12364,7 @@ fn lifecycleConfigurePackage(
     program: *const native_program.Program,
     authorization: *const native_authorization.Authorization,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     locks: root_operation.LockBackend,
     attempt: *root_operation.Attempt,
     operation: product_api.Operation,
@@ -15757,7 +15758,7 @@ fn prepareNativeRecovery(
     external: ExternalLifecycleRequest,
     compiled: *const CompiledLifecycle,
     raw_request: []const u8,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
     attempt: *root_operation.Attempt,
     production_request: ?native_execution_request.Document,
@@ -16368,7 +16369,7 @@ fn recoverNativeRootMutation(
 
 const RecoveredLifecycleInputs = struct {
     snapshot: package_database.Snapshot,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     models: []archive_application.Model,
 };
 
@@ -16404,7 +16405,7 @@ fn artifactBlobIndex(key: []const u8) !usize {
 
 const ProductionArchives = struct {
     models: []archive_application.Model,
-    bytes: [][]u8,
+    bytes: []const []const u8,
 };
 
 // All allocations belong to the execution/recovery arena. Application models
@@ -16412,10 +16413,10 @@ const ProductionArchives = struct {
 fn productionArchives(
     allocator: std.mem.Allocator,
     artifacts: []const native_program.ProgramArtifact,
-    bytes: []const []u8,
+    bytes: []const []const u8,
 ) !ProductionArchives {
     if (bytes.len != artifacts.len) return error.RecoveryArtifactBindingMismatch;
-    var by_digest: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty;
+    var by_digest: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
     defer by_digest.deinit(allocator);
     for (bytes) |archive| {
         var sha256: [32]u8 = undefined;
@@ -16425,7 +16426,7 @@ fn productionArchives(
         entry.value_ptr.* = archive;
     }
     const models = try allocator.alloc(archive_application.Model, bytes.len);
-    const ordered = try allocator.alloc([]u8, bytes.len);
+    const ordered = try allocator.alloc([]const u8, bytes.len);
     for (artifacts, 0..) |artifact, index| {
         if (artifact.index != index) return error.RecoveryArtifactBindingMismatch;
         const sha256 = native_recovery.parseDigest(artifact.sha256) orelse
@@ -17271,11 +17272,197 @@ fn productionLifecycleRequest(
     };
 }
 
+/// Experimental caller-owned runtime. Product/CLI backend selection remains
+/// separate; this interface never accepts fixture requests or alternate helpers.
+pub const Runtime = struct {
+    pub const Request = struct {
+        attempt: *root_operation.Attempt,
+        prepared: *native_preparation.Prepared,
+        archives: []const []const u8,
+        operation: native_recovery.Operation,
+    };
+
+    pub const Outcome = enum { succeeded, failed, recovery_required, refused };
+
+    pub const Report = struct {
+        outcome: Outcome,
+        /// Static diagnostic text; only the optional receipt owns memory.
+        detail: []const u8,
+        program_sha256: ?native_recovery.Digest,
+        receipt: ?native_provenance.OwnedDocument = null,
+
+        pub fn deinit(self: *Report) void {
+            if (self.receipt) |*receipt| receipt.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Preparation must bind this exact script policy.
+    pub fn scriptPolicy() maintainer_script.Policy {
+        return lifecycleScriptPolicy();
+    }
+
+    /// Borrows the caller's held attempt and prepared inputs. Never completes,
+    /// releases, or abandons the caller's operation, including on refusal.
+    pub fn execute(allocator: std.mem.Allocator, request: Runtime.Request) !Report {
+        return executeWithCrash(allocator, request, null);
+    }
+
+    fn executeWithCrash(
+        allocator: std.mem.Allocator,
+        request: Runtime.Request,
+        crash_at: ?native_recovery.CrashPoint,
+    ) !Report {
+        const root = try validateAttempt(request.attempt);
+        try native_program.validateDocument(request.prepared.program.program);
+        const authorization_bytes = try request.prepared.authorization.authorization.canonicalJson(allocator);
+        defer allocator.free(authorization_bytes);
+        var authorization = try native_authorization.decode(
+            allocator,
+            authorization_bytes,
+            native_authorization.maximum_document_bytes,
+        );
+        defer authorization.deinit();
+        if (!request.prepared.program.program.matchesAuthorization(authorization.authorization))
+            return error.InvalidLifecycleProgram;
+        const result = try executePreparedNativeProgramWithHelper(
+            allocator,
+            root,
+            request.prepared,
+            request.archives,
+            request.attempt,
+            request.attempt.coordinator.locks,
+            request.operation,
+            crash_at,
+            native_helper.bundled(),
+        );
+        return report(allocator, request.attempt, result);
+    }
+
+    /// Recovery consumes only persisted evidence from the original attempt.
+    pub fn recover(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
+        const root = try validateAttempt(attempt);
+        if (try readCompletion(allocator, attempt)) |receipt|
+            return completedReport(receipt);
+        const result = try recoverPreparedNativeProgramWithHelper(
+            allocator,
+            root,
+            attempt,
+            attempt.coordinator.locks,
+            null,
+            native_helper.bundled(),
+        );
+        return report(allocator, attempt, result);
+    }
+
+    /// Returns independently owned terminal evidence without probing or
+    /// requiring the current package-owned helper target.
+    pub fn readCompletion(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+    ) !?native_provenance.OwnedDocument {
+        const root = try validateAttempt(attempt);
+        var receipt = try readProductionCompletion(allocator, root, attempt) orelse return null;
+        errdefer receipt.deinit();
+        const bytes = try retainedNativeBytes(allocator, root, receipt.document, .execution_request);
+        defer allocator.free(bytes);
+        var request = try native_execution_request.decodePersisted(allocator, bytes);
+        defer request.deinit();
+        const helper = request.helper() orelse return error.NativeHelperBindingRequired;
+        try helper.matches(native_helper.bundled());
+        return receipt;
+    }
+
+    /// Clears only native active evidence after an exact receipt acknowledgment.
+    /// The caller still owns outer completion, provenance, cleanup, and its lock.
+    pub fn acknowledge(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        expected_receipt: native_provenance.Digest,
+    ) !void {
+        var receipt = try readCompletion(allocator, attempt) orelse return error.RecoveryEvidenceMissing;
+        defer receipt.deinit();
+        if (!std.mem.eql(u8, &receipt.document.digest_sha256, &expected_receipt))
+            return error.InvalidRecoveryProvenance;
+        try acknowledgePreparedNativeProgram(
+            allocator,
+            attempt.coordinator.root,
+            attempt,
+            expected_receipt,
+        );
+    }
+
+    fn validateAttempt(attempt: *root_operation.Attempt) !root_fs.Root {
+        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        if (!attempt.locked()) return error.LockLost;
+        const record = attempt.record();
+        if (record.backend != .native) return error.OperationBackendMismatch;
+        if (std.mem.eql(u8, record.install_root, "/")) return error.HostRootNotSupported;
+        const root = attempt.coordinator.root;
+        if (!std.mem.eql(u8, record.install_root, attempt.coordinator.install_root))
+            return error.OperationRootMismatch;
+        var named = try root_fs.openAbsoluteRoot(root.io, record.install_root);
+        defer named.close();
+        const held = try root.rootEntry();
+        const resolved = try named.root.rootEntry();
+        if (held.inode != resolved.inode or held.device != resolved.device)
+            return error.OperationRootMismatch;
+        var host = try root_fs.openAbsoluteRoot(root.io, "/");
+        defer host.close();
+        const host_entry = try host.root.rootEntry();
+        if (held.inode == host_entry.inode and held.device == host_entry.device)
+            return error.HostRootNotSupported;
+        return root;
+    }
+
+    fn completedReport(receipt: native_provenance.OwnedDocument) Report {
+        return .{
+            .outcome = if (receipt.document.outcome == .succeeded) .succeeded else .failed,
+            .detail = "awaiting_caller_acknowledgment",
+            .program_sha256 = receipt.document.program_sha256,
+            .receipt = receipt,
+        };
+    }
+
+    fn report(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        result: LifecycleResult,
+    ) !Report {
+        switch (result.outcome) {
+            .applied, .script_failed, .trigger_failed => {
+                const receipt = try readCompletion(allocator, attempt) orelse
+                    return error.RecoveryEvidenceMissing;
+                if ((result.outcome == .applied) != (receipt.document.outcome == .succeeded)) {
+                    var invalid = receipt;
+                    invalid.deinit();
+                    return error.InvalidRecoveryProvenance;
+                }
+                return completedReport(receipt);
+            },
+            .recovery_required, .refused, .handoff => {
+                const recovery_required = result.outcome == .recovery_required or
+                    attempt.record().mutation_started or
+                    try attempt.coordinator.root.entryIfExists(
+                        try root_fs.Path.init(native_recovery.intent_path),
+                    ) != null;
+                if (recovery_required and attempt.record().mutation_started)
+                    try attempt.requireRecovery(allocator, attempt.record().phase);
+                return .{
+                    .outcome = if (recovery_required) .recovery_required else .refused,
+                    .detail = result.detail,
+                    .program_sha256 = result.program_sha256,
+                };
+            },
+        }
+    }
+};
+
 fn executePreparedNativeProgram(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     compiled: *CompiledLifecycle,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     attempt: *root_operation.Attempt,
     locks: root_operation.LockBackend,
     operation: native_recovery.Operation,
@@ -17322,7 +17509,7 @@ fn executePreparedNativeProgramWithHelper(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     compiled: *CompiledLifecycle,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     attempt: *root_operation.Attempt,
     locks: root_operation.LockBackend,
     operation: native_recovery.Operation,
@@ -17627,7 +17814,7 @@ fn executeLifecycleProgram(
     external: ExternalLifecycleRequest,
     compiled: *CompiledLifecycle,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
     initial_model: package_database.Model,
     locks: root_operation.LockBackend,
@@ -17656,7 +17843,7 @@ fn executeLifecycleProgramInOperation(
     external: ExternalLifecycleRequest,
     compiled: *CompiledLifecycle,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
     initial_model: package_database.Model,
     locks: root_operation.LockBackend,
@@ -17688,7 +17875,7 @@ fn executeLifecycleProgramWithRequest(
     external: ExternalLifecycleRequest,
     compiled: *CompiledLifecycle,
     models: []archive_application.Model,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
     initial_model: package_database.Model,
     locks: root_operation.LockBackend,
@@ -19927,12 +20114,27 @@ test "native_unpack.test.derived trigger closure rejects missing reordered and u
     try testing.expect(!lifecycleFinalPackageMatches(expected[1], source));
 }
 
+fn typedRuntimeFixtureResult(report: Runtime.Report) LifecycleResult {
+    return .{
+        .outcome = switch (report.outcome) {
+            .succeeded => .applied,
+            .failed => .script_failed,
+            .recovery_required => .recovery_required,
+            .refused => .refused,
+        },
+        .detail = report.detail,
+        .program_sha256 = report.program_sha256,
+        .attempt_id = if (report.receipt) |receipt| receipt.document.attempt_id else null,
+        .provenance_path = if (report.receipt != null) native_provenance.document_path else null,
+    };
+}
+
 fn callerOwnedLifecycleFixture(
     root: root_fs.Root,
     external: ExternalLifecycleRequest,
     locks: root_operation.LockBackend,
     compiled: ?*CompiledLifecycle,
-    archive_bytes: []const []u8,
+    archive_bytes: []const []const u8,
     raw_request: []const u8,
 ) !LifecycleResult {
     const allocator = testing.allocator;
@@ -19952,19 +20154,36 @@ fn callerOwnedLifecycleFixture(
             .evidence = record.evidence(),
         });
         defer attempt.release();
-        const result = try recoverPreparedNativeProgramWithHelper(
+        const result = if (external.isolated_helper) block: {
+            var report = try Runtime.recover(allocator, &attempt);
+            defer report.deinit();
+            break :block typedRuntimeFixtureResult(report);
+        } else try recoverPreparedNativeProgramWithHelper(
             allocator,
             root,
             &attempt,
             locks,
             null,
-            if (external.isolated_helper) native_helper.bundled() else null,
+            null,
         );
         if (external.acknowledge_native) {
-            var receipt = try readProductionCompletion(allocator, root, &attempt) orelse
+            var receipt = (if (external.isolated_helper)
+                try Runtime.readCompletion(allocator, &attempt)
+            else
+                try readProductionCompletion(allocator, root, &attempt)) orelse
                 return error.RecoveryEvidenceMissing;
             defer receipt.deinit();
-            try acknowledgePreparedNativeProgram(allocator, root, &attempt, receipt.document.digest_sha256);
+            if (external.isolated_helper) {
+                try testing.expectError(error.InvalidRecoveryProvenance, Runtime.acknowledge(allocator, &attempt, @splat('0')));
+                try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null);
+                try Runtime.acknowledge(allocator, &attempt, receipt.document.digest_sha256);
+                try Runtime.acknowledge(allocator, &attempt, receipt.document.digest_sha256);
+                var repeated = try Runtime.recover(allocator, &attempt);
+                defer repeated.deinit();
+                try testing.expectEqual(result.outcome, typedRuntimeFixtureResult(repeated).outcome);
+                try testing.expect(attempt.locked());
+                try testing.expectEqual(root_operation.Outcome.pending, attempt.record().outcome);
+            } else try acknowledgePreparedNativeProgram(allocator, root, &attempt, receipt.document.digest_sha256);
             if (attempt.record().state != .recovering)
                 try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification });
             try attempt.complete(allocator, if (receipt.document.outcome == .succeeded) .succeeded else .failed_after_mutation);
@@ -20002,6 +20221,20 @@ fn callerOwnedLifecycleFixture(
         .target_architecture = external.architecture,
     });
     defer attempt.release();
+    if (external.isolated_helper) {
+        const request: Runtime.Request = .{
+            .attempt = &attempt,
+            .prepared = compiled.?,
+            .archives = archive_bytes,
+            .operation = std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
+        };
+        var report = if (external.crash_at) |crash|
+            try Runtime.executeWithCrash(allocator, request, crash)
+        else
+            try Runtime.execute(allocator, request);
+        defer report.deinit();
+        return typedRuntimeFixtureResult(report);
+    }
     return executePreparedNativeProgramWithHelper(
         allocator,
         root,
@@ -20011,7 +20244,7 @@ fn callerOwnedLifecycleFixture(
         locks,
         std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
         external.crash_at,
-        if (external.isolated_helper) native_helper.bundled() else null,
+        null,
     );
 }
 
@@ -20459,6 +20692,77 @@ test "native_unpack.test.production preparation drives a mixed install and remov
     try testPreparedMixedLifecycle(false, .owned);
 }
 
+test "native_unpack.test.public runtime refuses missing helpers before package mutation" {
+    try testPreparedMixedLifecycle(false, .public_missing_helper);
+}
+
+test "native_unpack.test.public runtime requires a held native attempt and its physical named root" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var other: Fixture = undefined;
+    try other.init(empty_status, &.{});
+    defer other.deinit();
+    var root_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(testing.io, fixture.root(), install_root, locks.interface());
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+    });
+    defer attempt.release();
+    const before = attempt.record().digest_sha256;
+    try testing.expect(try Runtime.readCompletion(testing.allocator, &attempt) == null);
+    var refusal = try Runtime.report(testing.allocator, &attempt, .{
+        .outcome = .handoff,
+        .detail = "unsupported_fixture",
+    });
+    defer refusal.deinit();
+    try testing.expectEqual(Runtime.Outcome.refused, refusal.outcome);
+    try testing.expect(refusal.receipt == null);
+    coordinator.root = other.root();
+    try testing.expectError(error.OperationRootMismatch, Runtime.recover(testing.allocator, &attempt));
+    coordinator.root = fixture.root();
+    try testing.expectEqual(before, attempt.record().digest_sha256);
+    try attempt.abandonIfPreMutation(testing.allocator);
+    locks.loseAll();
+    try testing.expectError(error.LockLost, Runtime.recover(testing.allocator, &attempt));
+}
+
+test "native_unpack.test.public runtime refuses legacy and host-root identities without changing the attempt" {
+    for ([_]bool{ false, true }) |host| {
+        var fixture: Fixture = undefined;
+        try fixture.init(empty_status, &.{});
+        defer fixture.deinit();
+        var root_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const install_root = if (host) "/" else try fixtureInstallRoot(&fixture, &root_buffer);
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try root_operation.Coordinator.open(testing.io, fixture.root(), install_root, locks.interface());
+        var attempt = try coordinator.acquire(testing.allocator, .{
+            .backend = if (host) .native else .legacy_dpkg,
+            .operation = .{ .package_transaction = .install },
+            .request_sha256 = @splat(0x11),
+            .policy_sha256 = @splat(0x22),
+            .target_architecture = "amd64",
+        });
+        defer attempt.release();
+        const before = attempt.record().digest_sha256;
+        try testing.expectError(
+            if (host) error.HostRootNotSupported else error.OperationBackendMismatch,
+            Runtime.recover(testing.allocator, &attempt),
+        );
+        try testing.expectEqual(before, attempt.record().digest_sha256);
+        try testing.expect(attempt.locked());
+        try attempt.abandonIfPreMutation(testing.allocator);
+    }
+}
+
 test "native_unpack.test.production preparation drives a mixed install and purge program" {
     try testPreparedMixedLifecycle(true, .owned);
 }
@@ -20543,6 +20847,7 @@ const MixedLifecycleCase = enum {
     production,
     production_resume,
     helper_target_removed,
+    public_missing_helper,
     stale_database,
     wrong_plan,
     foreign_root,
@@ -20786,6 +21091,22 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         return;
     }
     const production = case == .production or case == .production_resume;
+    if (case == .public_missing_helper) {
+        try testing.expectError(error.NativeHelperTargetMissing, Runtime.execute(testing.allocator, .{
+            .attempt = &caller,
+            .prepared = &compiled,
+            .archives = &.{bytes},
+            .operation = .install,
+        }));
+        try testing.expect(caller.locked());
+        try testing.expect(!caller.record().mutation_started);
+        try testing.expectEqual(root_operation.State.preflight, caller.record().state);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_helper.directory)) == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+        try caller.abandonIfPreMutation(testing.allocator);
+        return;
+    }
     if (case == .production_resume) {
         try native_operation.bind(testing.allocator, root, &caller, compiled.program.program);
         const document = try native_execution_request.create(root, &caller, compiled.program.program, .install);
@@ -20802,6 +21123,15 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             document,
             null,
         );
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        var refused = try Runtime.report(testing.allocator, &caller, .{
+            .outcome = .handoff,
+            .detail = "unsupported_fixture",
+        });
+        defer refused.deinit();
+        try testing.expectEqual(Runtime.Outcome.recovery_required, refused.outcome);
+        try testing.expect(!caller.record().mutation_started);
+        try testing.expectError(error.NativeHelperBindingRequired, Runtime.recover(testing.allocator, &caller));
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
     }
     const result = if (case == .production_resume)
@@ -20881,6 +21211,13 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             var receipt = try readProductionCompletion(testing.allocator, root, &caller) orelse
                 return error.TestUnexpectedResult;
             defer receipt.deinit();
+            try testing.expectError(error.NativeHelperBindingRequired, Runtime.readCompletion(testing.allocator, &caller));
+            try testing.expectError(error.NativeHelperBindingRequired, Runtime.recover(testing.allocator, &caller));
+            try testing.expectError(error.NativeHelperBindingRequired, Runtime.acknowledge(
+                testing.allocator,
+                &caller,
+                receipt.document.digest_sha256,
+            ));
             try testing.expectEqual(native_provenance.Outcome.succeeded, receipt.document.outcome);
             try testing.expectEqual(request.document.caller.request_sha256, receipt.document.request_sha256);
             try testing.expectEqual(request.document.caller.policy_sha256, receipt.document.policy_sha256);

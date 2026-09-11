@@ -213,6 +213,23 @@ class RecoveryOracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "native backend"):
             acceptance.assert_binding({**value, "backend": "legacy_dpkg"}, binding)
 
+    def test_caller_binding_preserves_outer_operation_and_hash_domains(self) -> None:
+        m.write(self.root / acceptance.INTENT, json.dumps({
+            "operation": "install",
+            "request_sha256": "a" * 64, "policy_sha256": "b" * 64,
+            "database_generation_sha256": "c" * 64, "digest_sha256": "d" * 64,
+        }).encode())
+        m.write(self.root / acceptance.OPERATION, json.dumps({
+            "surface": "repository_bootstrap", "operation": "add",
+            "request_sha256": "e" * 64, "policy_sha256": "f" * 64,
+        }).encode())
+        binding = acceptance.caller_binding(self.root)
+        self.assertEqual(binding["operation"], {"repository_bootstrap": "add"})
+        self.assertEqual(binding["request_sha256"], "e" * 64)
+        self.assertEqual(binding["policy_sha256"], "f" * 64)
+        self.assertEqual(binding["initial_database_generation_sha256"], "c" * 64)
+        self.assertEqual(binding["execution_intent_sha256"], "d" * 64)
+
     def test_report_cannot_point_outside_native_namespace(self) -> None:
         for path in ("/etc/passwd", "var/lib/debz/../../outside", "var/lib/debz-other/proof.json"):
             with self.subTest(path=path):

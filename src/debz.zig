@@ -253,6 +253,7 @@ pub const native_preparation = @import("native_preparation.zig");
 pub const native_execution_request = @import("native_execution_request.zig");
 pub const native_helper = @import("native_helper.zig");
 pub const native_unpack = @import("native_unpack.zig");
+pub const native_runtime = native_unpack.Runtime;
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
 pub const transaction_result_summary = @import("transaction_result_summary.zig");
@@ -566,12 +567,18 @@ test "empty solver context can be created and destroyed" {
     context.destroy();
 }
 
-test "native unpack exports no executable surface" {
+test "native_unpack.test.public runtime keeps fixture adapters private" {
     try std.testing.expect(!@hasDecl(native_unpack, "plan"));
     try std.testing.expect(!@hasDecl(native_unpack, "execute"));
     try std.testing.expect(!@hasDecl(native_unpack, "recover"));
     try std.testing.expect(!@hasDecl(native_unpack, "release"));
     try std.testing.expect(!@hasDecl(native_unpack, "captureDatabase"));
+    try std.testing.expect(@hasDecl(native_runtime, "execute"));
+    try std.testing.expect(@hasDecl(native_runtime, "recover"));
+    try std.testing.expect(@hasDecl(native_runtime, "acknowledge"));
+    try std.testing.expect(!@hasDecl(native_runtime, "executeWithCrash"));
+    try std.testing.expect(!@hasField(native_runtime.Request, "helper"));
+    try std.testing.expect(!@hasField(native_runtime.Request, "crash_at"));
 }
 
 test {
