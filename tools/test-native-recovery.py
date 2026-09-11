@@ -1090,6 +1090,192 @@ def exercise_core(executable: Path, helper: Path, workspace: Path, environment: 
         print(f"{name}: native outcome and original evidence preserved", flush=True)
 
 
+def workflow(
+    executable: Path, request: dict, destination: Path, environment: dict,
+    *, completion_crash: str | None = None,
+) -> dict | None:
+    m.reference_command(Path(request["options"]["install_root"]))
+    destination.mkdir()
+    request_path = destination / "workflow.request.json"
+    report_path = destination / "workflow.report.json"
+    m.write(request_path, json.dumps({
+        "workflow": request, "report": str(report_path),
+        "completion_crash": completion_crash,
+    }).encode())
+    with (destination / "workflow.log").open("wb") as output:
+        result = subprocess.run(
+            [str(executable)],
+            env={**environment, "DEBZ_NATIVE_WORKFLOW_REQUEST": str(request_path)},
+            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            timeout=120, check=False,
+        )
+    expected = CRASH_EXIT if completion_crash else 0
+    if result.returncode != expected:
+        raise AssertionError(f"workflow exited {result.returncode}, expected {expected}: {destination}")
+    if completion_crash:
+        assert not report_path.exists()
+        return None
+    return document(report_path, 64 * 1024)
+
+
+def exercise_workflows(executable: Path, workspace: Path, environment: dict, architecture: str) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "debz_workflow_repository", ROOT / "tools/generate-integration-repository.py",
+    )
+    assert spec and spec.loader
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    repository = workspace / "workflow-repository"
+    generator.write_repository(repository, "debian-stable", architecture)
+    source = workspace / "workflow.sources"
+    keyring = repository / "fixture-keyring.gpg"
+    m.write(source, (
+        f"Types: deb\nURIs: file://{repository}\nSuites: debian-stable\n"
+        f"Components: main\nArchitectures: {architecture}\nSigned-By: {keyring}\n"
+    ).encode())
+
+    def archive(name: str) -> Path:
+        return repository / f"pool/main/{name}_1.0-1_{architecture}.deb"
+
+    def scenario(name: str) -> lifecycle.Scenario:
+        current = lifecycle.Scenario(workspace, name, executable, architecture, environment)
+        current.seed(archive("native-helper-target"))
+        current.seed(archive("essential-core"))
+        return current
+
+    def request(current: lifecycle.Scenario, operation: str, mode: str, names: list[str]) -> dict:
+        options = {
+            "install_root": str(current.candidate),
+            "cache_path": str(current.directory / ("unused-cache" if mode == "recover" else "cache")),
+            "state_path": str(current.directory / ("unused-state" if mode == "recover" else "state")),
+            "architecture": architecture, "assume_yes": True,
+            "conffile": "keep_existing", "noninteractive": True,
+        }
+        if mode != "recover":
+            options.update(source_paths=[str(source)], keyring_paths=[str(keyring)])
+            options["lock_output_path" if mode == "plan_only" else "lock_input_path"] = str(
+                current.directory / "workflow.lock.json"
+            )
+        return {
+            "operation": operation, "mode": mode,
+            "selectors": [{"name": name} for name in names], "options": options,
+        }
+
+    def run(current: lifecycle.Scenario, label: str, value: dict, *, exit_status: int = 0) -> dict:
+        result = workflow(executable, value, current.directory / label, environment)
+        assert result["exit_status"] == exit_status, result
+        return result
+
+    def assert_completion(current: lifecycle.Scenario, lock: dict) -> None:
+        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        validator(PROVENANCE_SCHEMA).validate(receipt)
+        assert_digest(receipt, PROVENANCE_SCHEMA)
+        retained_documents(current.candidate, receipt)
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
+        assert completion["attempt_id"] == receipt["attempt_id"]
+        assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
+        assert completion["journal"]["status"] == "absent"
+        assert_final_database(current.candidate, architecture, receipt)
+        for path in (OPERATION, INTENT, NAMESPACE / "native-recovery-v1"):
+            assert not (current.candidate / path).exists(), path
+
+    names = ["scenario-main", "conffile-pkg"]
+    current = scenario("workflow-batch")
+    planned = run(current, "plan-install", request(current, "install", "plan_only", names))
+    assert {item["package"] for item in planned["items"]} == {*names, "base-dep"}
+    lock = document(current.directory / "workflow.lock.json")
+    assert lock["version"] == 2
+    installed = run(current, "install", request(current, "install", "execute", list(reversed(names))))
+    assert installed["changed"]
+    reference_dir = current.directory / "reference-install"
+    reference_dir.mkdir()
+    assert lifecycle.reference_phase(
+        current.expected, [archive(name) for name in ["base-dep", *names]], "install",
+        environment, reference_dir, packages=[],
+    ) == 0
+    compare(current.expected, current.candidate)
+    assert_completion(current, lock)
+    receipt_before = (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
+    run(current, "plan-unchanged", request(current, "upgrade_all", "plan_only", []))
+    unchanged = run(current, "unchanged", request(current, "upgrade_all", "execute", []))
+    assert not unchanged["changed"]
+    assert receipt_before == (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
+    run(current, "plan-remove", request(current, "remove", "plan_only", names))
+    removal_lock = document(current.directory / "workflow.lock.json")
+    removed = run(current, "remove", request(current, "remove", "execute", names))
+    assert removed["changed"]
+    reference_dir = current.directory / "reference-remove"
+    reference_dir.mkdir()
+    assert lifecycle.reference_phase(
+        current.expected, [], "remove", environment, reference_dir,
+        packages=[{"name": name, "architecture": architecture} for name in names],
+    ) == 0
+    compare(current.expected, current.candidate)
+    assert_completion(current, removal_lock)
+    print("workflow-batch: v2 install/remove parity and unchanged closure passed", flush=True)
+
+    current = scenario("workflow-known-failure")
+    failed_names = ["scenario-main", "fail-script"]
+    run(current, "plan", request(current, "install", "plan_only", failed_names))
+    failure_lock = document(current.directory / "workflow.lock.json")
+    failed = run(
+        current, "execute", request(current, "install", "execute", failed_names), exit_status=7,
+    )
+    assert failed["changed"]
+    assert_completion(current, failure_lock)
+    receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+    assert receipt["outcome"] == "failed"
+    completed = run(current, "recover", request(current, "install", "recover", failed_names))
+    assert not completed["changed"]
+    print("workflow-known-failure: terminal failure receipt and cleanup passed", flush=True)
+
+    for boundary in (
+        "after_native_receipt", "after_completed_record", "after_owed_provenance_document",
+        "after_provenance_published", "after_native_acknowledged",
+    ):
+        current = scenario(f"workflow-{boundary}")
+        run(current, "plan", request(current, "install", "plan_only", names))
+        lock = document(current.directory / "workflow.lock.json")
+        workflow(
+            executable, request(current, "install", "execute", names),
+            current.directory / "crash", environment, completion_crash=boundary,
+        )
+        record_before = (current.candidate / OPERATION).read_bytes()
+        state_before = triggers.snapshot(current.candidate)
+        recovery = request(current, "install", "recover", list(reversed(names)))
+        if boundary == "after_native_receipt":
+            run(current, "deferred-owner", {**recovery, "defer_recovery_clear": True}, exit_status=3)
+            assert (current.candidate / OPERATION).read_bytes() == record_before
+            for index, change in enumerate((
+                {"operation": "remove"},
+                {"selectors": [{"name": "different"}]},
+                {"options": {**recovery["options"], "recommends": True}},
+                {"options": {**recovery["options"], "conffile": "use_package_version"}},
+            )):
+                run(current, f"wrong-original-{index}", {**recovery, **change}, exit_status=8)
+                assert (current.candidate / OPERATION).read_bytes() == record_before
+            for index, (field, value) in enumerate((
+                ("lock_input_path", str(current.directory / "workflow.lock.json")),
+                ("source_paths", [str(source)]),
+                ("keyring_paths", [str(keyring)]),
+                ("force", ["overwrite"]),
+            )):
+                run(current, f"replacement-{index}", {
+                    **recovery, "options": {**recovery["options"], field: value},
+                }, exit_status=2)
+                assert (current.candidate / OPERATION).read_bytes() == record_before
+        result = run(current, "recover", recovery)
+        assert result["changed"]
+        assert not m.oracle.differences(state_before, triggers.snapshot(current.candidate))
+        assert_completion(current, lock)
+        repeated = run(current, "recover-again", recovery)
+        assert not repeated["changed"]
+        assert not (current.directory / "unused-cache").exists()
+        assert not (current.directory / "unused-state").exists()
+        print(f"workflow-{boundary}: original-request recovery and receipt completion passed", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
@@ -1129,6 +1315,7 @@ def main() -> int:
             if not arguments.core_only:
                 exercise(executable, helper, workspace, environment, architecture)
             exercise_core(executable, helper, workspace, environment, architecture)
+            exercise_workflows(executable, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")

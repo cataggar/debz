@@ -239,6 +239,14 @@ with explicit action authorization and retained configuration modeled separately
 Remaining consumer integration and full pinned parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 
+The internal non-deferred batch workflow uses the same native receipt and
+completion protocol. Its recovery request must match the original operation,
+canonical selectors, and request policy before any abandonment or replay.
+Actual-process coverage includes signed-repository batch install/remove,
+unchanged closures, known failure, all five receipt/completion crash boundaries,
+and refusal of mismatched requests or replacement recovery inputs. Deferred
+outer ownership and its consumer-specific acknowledgment remain gated.
+
 ## Independent acceptance
 
 `tools/test-native-recovery.py` runs native execution in real guarded chroots

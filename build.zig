@@ -573,7 +573,10 @@ pub fn build(b: *std.Build) void {
 
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"native_unpack.test.lifecycle external fixture"},
+        .filters = &.{
+            "native_unpack.test.lifecycle external fixture",
+            "production workflow external native fixture",
+        },
     });
     const native_lifecycle = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",

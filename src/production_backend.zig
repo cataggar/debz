@@ -231,8 +231,8 @@ pub const Backend = struct {
     }
 
     /// Executes the internal semantic-operation/mode contract. Planning and
-    /// downloading cannot reserve or mutate the root. Execution and recovery
-    /// require an explicit exact lock, confirmation, and conffile policy.
+    /// downloading cannot reserve or mutate the root. Native recovery uses
+    /// persisted authority; legacy recovery still requires the reviewed lock.
     pub fn executeWorkflow(
         self: *Backend,
         allocator: std.mem.Allocator,
@@ -245,22 +245,30 @@ pub const Backend = struct {
         };
         if (!count_valid)
             return api.failure(operation, .usage, .invalid_request, "invalid workflow selector count");
+        if (self.transaction_backend == .native and
+            (workflow.mode == .reserve or workflow.defer_recovery_clear or
+                workflow.orchestration_id != null or workflow.recovery_review_claim != null or
+                workflow.expected_ownership_marker != null or workflow.root_attempt_id != null or
+                workflow.reconciliation_claim != null or workflow.finalize_ownership or
+                workflow.ownership_acknowledgment != null or workflow.recovery_acknowledgment != null))
+            return api.failure(operation, .unavailable, .transaction_backend_unavailable, "native deferred workflow ownership is not available");
         if (workflow.mode == .plan_only and workflow.options.lock_output_path == null)
             return api.failure(operation, .usage, .configuration_required, "plan-only workflow requires an exact-lock output path");
         if (workflow.mode == .reserve or
             workflow.mode == .execute or
             workflow.mode == .recover)
         {
-            if (workflow.options.lock_input_path == null)
+            if (workflow.options.lock_input_path == null and
+                !(self.transaction_backend == .native and workflow.mode == .recover))
                 return api.failure(operation, .usage, .configuration_required, "execution and recovery require an exact-lock input");
             if (!workflow.options.assume_yes)
                 return api.failure(operation, .usage, .confirmation_required, "execution and recovery require explicit confirmation");
             if (workflow.options.conffile == .unspecified)
                 return api.failure(operation, .usage, .conffile_policy_required, "execution and recovery require an explicit conffile policy");
         }
-        if (workflow.mode == .reserve or
+        if (self.transaction_backend == .legacy_dpkg and (workflow.mode == .reserve or
             workflow.mode == .execute or
-            workflow.mode == .recover)
+            workflow.mode == .recover))
         {
             _ = self.selectedExecutor() catch return api.failure(
                 operation,
@@ -295,6 +303,9 @@ pub const Backend = struct {
             .packages = packages,
             .options = workflow.options,
         };
+        if (self.transaction_backend == .native and workflow.mode == .recover)
+            return self.recoverNative(allocator, request, workflowSemanticSurface(workflow.operation)) catch |err|
+                mapRuntimeError(operation, err);
         if (workflow.reconciliation_claim) |claim| {
             if (workflow.mode != .recover or
                 workflow.orchestration_id == null or
@@ -635,7 +646,7 @@ pub const Backend = struct {
             return api.failure(request.operation, .usage, .invalid_request, "exact-lock options are not valid for this command");
         return switch (request.operation) {
             .recover => if (self.transaction_backend == .native)
-                self.recoverNative(allocator, request)
+                self.recoverNative(allocator, request, null)
             else
                 self.withRepositories(allocator, request, null),
             .list_installed => self.listInstalled(allocator, request),
@@ -653,7 +664,12 @@ pub const Backend = struct {
         );
     }
 
-    fn recoverNative(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
+    fn recoverNative(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        workflow_operation: ?api.Operation,
+    ) !api.Result {
         if (!request.options.assume_yes)
             return api.failure(.recover, .usage, .confirmation_required, "native recovery requires explicit confirmation");
         if (request.options.lock_input_path != null or request.options.lock_output_path != null or
@@ -671,6 +687,14 @@ pub const Backend = struct {
         const attempt = guard.active().?;
         if (attempt.record().operation != .package_transaction)
             return blockedRecovery(.recover, "native attempt belongs to a different product surface");
+        if (workflow_operation) |original_operation| {
+            var original_request = request;
+            original_request.operation = original_operation;
+            if (attempt.adopted and
+                (attempt.record().operation.package_transaction != original_operation or
+                    !std.mem.eql(u8, &attempt.record().request_sha256, &productRequestDigest(original_request))))
+                return blockedRecovery(.recover, "native workflow recovery does not match the original operation, selectors, and request policy");
+        }
         if (try native_runtime.canAbandon(allocator, attempt)) {
             try guard.abandonNativeIfSafe();
             return success(.recover, false, "no native execution requires recovery", &.{});
@@ -868,8 +892,6 @@ pub const Backend = struct {
     ) !api.Result {
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
-        if (workflow != null)
-            return api.failure(request.operation, .unavailable, .transaction_backend_unavailable, "native orchestrated execution is not available");
         if (request.options.lock_input_path == null)
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v2 exact-lock input");
         if (!request.options.assume_yes or request.options.conffile == .unspecified)
@@ -885,7 +907,7 @@ pub const Backend = struct {
         defer guard.deinit();
         if (guard.open(allocator, request, .{ .package_transaction = request.operation })) |failure|
             return failure;
-        const result = self.withRepositoriesGuarded(allocator, request, null, &guard) catch |err| failure: {
+        const result = self.withRepositoriesGuarded(allocator, request, workflow, &guard) catch |err| failure: {
             const attempt = guard.active().?;
             if (!try native_runtime.canAbandon(allocator, attempt)) {
                 var blocked = blockedRecovery(request.operation, try std.fmt.allocPrint(
@@ -5012,6 +5034,93 @@ test "production workflow native execution requires a reviewed lock before repos
     try std.testing.expect(!result.changed);
 }
 
+test "production workflow external native fixture" {
+    const raw_path = std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") orelse return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const bytes = try readFile(allocator, std.testing.io, std.mem.span(raw_path), 1024 * 1024);
+    const External = struct {
+        workflow: WorkflowRequest,
+        report: []const u8,
+        completion_crash: ?CompletionPoint = null,
+    };
+    const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
+    defer parsed.deinit();
+    const external = parsed.value;
+    if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
+        !@import("absolute_path.zig").nonRoot(external.report))
+        return error.InvalidExternalWorkflowRequest;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, external.workflow.options.install_root);
+    defer root.close();
+    const marker = try root.root.readFileAlloc(
+        allocator,
+        try root_fs.Path.init(".debz-native-disposable"),
+        128,
+    );
+    if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
+        return error.InvalidExternalWorkflowRequest;
+    const Crash = struct {
+        point: ?CompletionPoint,
+        fn hit(context: *anyopaque, point: CompletionPoint) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.point == point) std.process.exit(native_recovery.crash_exit_code);
+        }
+        fn rejectLegacy(_: *anyopaque, _: transaction_executor.Invocation) anyerror!transaction_executor.ProcessResult {
+            return error.UnexpectedLegacyProcess;
+        }
+    };
+    var crash: Crash = .{ .point = external.completion_crash };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+        .now_unix = 1_788_796_860,
+        .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
+        .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
+    };
+    const result = try backend.executeWorkflow(allocator, external.workflow);
+    const output = try result.canonicalJson(allocator);
+    var report_dir = try openAbsoluteDirectory(std.testing.io, std.fs.path.dirname(external.report).?);
+    defer report_dir.close(std.testing.io);
+    try report_dir.writeFile(std.testing.io, .{
+        .sub_path = std.fs.path.basename(external.report),
+        .data = output,
+    });
+}
+
+test "production workflow native deferred ownership refuses before root access" {
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
+    const base: WorkflowRequest = .{
+        .operation = .install,
+        .mode = .execute,
+        .selectors = &.{ .{ .name = "first" }, .{ .name = "second" } },
+        .options = .{
+            .install_root = "/native-workflow-unavailable-root",
+            .cache_path = "/native-workflow-unavailable-cache",
+            .state_path = "/native-workflow-unavailable-state",
+            .architecture = "amd64",
+            .lock_input_path = "/native-workflow-unavailable-lock",
+            .assume_yes = true,
+            .conffile = .keep_existing,
+        },
+    };
+    for (0..5) |variant| {
+        var request = base;
+        switch (variant) {
+            0 => request.mode = .reserve,
+            1 => request.orchestration_id = [_]u8{1} ** 32,
+            2 => request.defer_recovery_clear = true,
+            3 => request.root_attempt_id = [_]u8{2} ** 32,
+            4 => request.finalize_ownership = true,
+            else => unreachable,
+        }
+        const result = try backend.executeWorkflow(std.testing.allocator, request);
+        try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+        try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, result.diagnostics[0].id);
+        try std.testing.expect(!result.changed);
+    }
+}
+
 fn containsString(values: []const []const u8, target: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, target)) return true;
     return false;
@@ -5712,7 +5821,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     try std.testing.expectEqual(@as(usize, 0), process.calls);
 }
 
-test "production workflow native empty removal locks replay without enabling mutation" {
+test "production workflow native empty removal locks replay without enabling deferred ownership" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5759,6 +5868,7 @@ test "production workflow native empty removal locks replay without enabling mut
     request.options.lock_output_path = null;
     request.options.assume_yes = true;
     request.options.conffile = .keep_existing;
+    request.orchestration_id = [_]u8{0x43} ** 32;
     const blocked = try backend.executeWorkflow(allocator, request);
     try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, blocked.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 0), process.calls);
