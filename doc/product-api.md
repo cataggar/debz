@@ -158,8 +158,24 @@ the original operation, request policy, completion, native receipt, and exact
 reviewed v2 owner where present. It acknowledges native evidence before clearing
 the root record or owner marker, and retries do not replay package work.
 Callbacks refuse physical host roots and orphan native intents, including
-otherwise idempotent cleanup requests. Native clean reconciliation remains
-explicitly unavailable.
+otherwise idempotent cleanup requests. Unresolved native programs, workspaces,
+progress, script/trigger evidence, and mutation journals also prevent a
+recordless callback from treating the root as clean.
+
+Internal native clean-reconciliation claims require an independently retained
+exact owner token and a root with no record, owner marker, or active native
+evidence. The pre-mutation claim binds the outer generation, state, profile,
+lock digest, and canonical semantic request; the post-mutation claim binds
+the original execute-request digest and the outer caller's lock/evidence
+digests. Reviewed claims preserve exact v2 ownership. They reserve the root
+against other operations until explicit finalization, including across
+interrupted publication or cleanup.
+
+These claims protect root exclusion only. They do not verify a package
+closure, publish a native completion receipt, or authorize package work; the
+outer caller remains responsible for authenticating its lock and completion
+evidence. Like other native recovery callbacks, they accept no replacement
+repository, keyring, lock-path, or force inputs and open no cache/state paths.
 The apt/system orchestrator, repository/bootstrap, package-family, and Actions
 consumers remain gated until their separate native contracts are integrated.
 

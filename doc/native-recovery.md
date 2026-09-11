@@ -223,7 +223,11 @@ result owns a prepared program or diagnostic, or explicitly reports an
 unchanged validated closure without creating an executable authorization.
 It accepts no fixture configuration. `canAbandon` checks both the caller state
 and native active/terminal evidence before permitting pre-mutation abandonment;
-the outer record's pre-mutation flag alone is insufficient.
+the outer record's pre-mutation flag alone is insufficient. The shared
+`hasActiveEvidence(allocator, root)` inspection, used under the caller's held
+root lock, also recognizes orphan programs, workspaces, progress, script/trigger
+evidence, and mutation journals. Completed retained provenance is not active
+execution evidence.
 
 Core product/CLI planning, download, execution, and recovery use these typed
 contracts. Native mutation requires a reviewed v2 lock and a supported non-host
@@ -268,10 +272,21 @@ review ownership. Native cleanup precedes marker acknowledgment and root-record
 clearing. Independently retained owner evidence supports retries after native
 cleanup, marker acknowledgment, record clearing, and marker clearing; none of
 these retries accesses replacement repositories or replays package scripts.
-Damaged completion or receipt evidence and orphan active intents refuse cleanup.
+Damaged completion or receipt evidence and orphan active evidence refuse cleanup.
 Physical host-root denial also applies to acknowledgment and finalization.
-Native clean reconciliation and consumer-specific public integration remain
-gated.
+
+Clean reconciliation is an internal exclusion-only handoff for an outer caller
+that has already authenticated its state and evidence. It requires a retained
+exact owner token, an absent root record/marker, and no active native evidence
+under the same root lock. Pre-mutation claims bind the outer state, profile,
+lock digest, and semantic request; post-mutation claims bind the original
+execute request and the outer caller's lock/evidence digests. Both preserve
+reviewed v2 ownership and require explicit exact-owner finalization. A claim
+does not verify package closure or manufacture a native completion receipt.
+It accepts no replacement recovery inputs or cache/state access. Actual-process
+coverage interrupts claim publication and finalization while retaining the
+outer token independently of the candidate root. Consumer-specific public
+integration remains gated.
 
 ## Independent acceptance
 

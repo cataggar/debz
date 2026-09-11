@@ -17288,14 +17288,19 @@ pub const Runtime = struct {
         return lifecycleScriptPolicy();
     }
 
+    /// Read under the caller's root lock before treating a root as clean.
+    /// Completed retained provenance is not active execution evidence.
+    pub fn hasActiveEvidence(allocator: std.mem.Allocator, root: root_fs.Root) !bool {
+        return try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null or
+            try orphanNativeEvidenceDetail(allocator, root) != null;
+    }
+
     /// A pre-mutation caller record alone cannot prove that no native intent
     /// was published. Callers may abandon only after this additional check.
     pub fn canAbandon(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !bool {
         const root = try validateAttempt(attempt);
         if (!attempt.record().state.provenPreMutation()) return false;
-        if (try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null or
-            try orphanNativeEvidenceDetail(allocator, root) != null)
-            return false;
+        if (try hasActiveEvidence(allocator, root)) return false;
         if (try readCompletion(allocator, attempt)) |value| {
             var receipt = value;
             defer receipt.deinit();

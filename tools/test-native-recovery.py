@@ -1093,7 +1093,7 @@ def exercise_core(executable: Path, helper: Path, workspace: Path, environment: 
 def workflow(
     executable: Path, request: dict, destination: Path, environment: dict,
     *, completion_crash: str | None = None, owner_evidence: Path | None = None,
-    acknowledgment: str | None = None,
+    acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1103,6 +1103,7 @@ def workflow(
         "workflow": request, "report": str(report_path),
         "completion_crash": completion_crash,
         "owner_evidence": str(owner_evidence) if owner_evidence else None,
+        "reconciliation_owner_output": str(reconciliation_owner_output) if reconciliation_owner_output else None,
         "acknowledgment": acknowledgment,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
@@ -1114,7 +1115,11 @@ def workflow(
         )
     expected = CRASH_EXIT if completion_crash else 0
     if result.returncode != expected:
-        raise AssertionError(f"workflow exited {result.returncode}, expected {expected}: {destination}")
+        with (destination / "workflow.log").open("rb") as output:
+            output.seek(0, os.SEEK_END)
+            output.seek(max(0, output.tell() - 8192))
+            detail = output.read(8192).decode(errors="replace")
+        raise AssertionError(f"workflow exited {result.returncode}, expected {expected}: {destination}\n{detail}")
     if completion_crash:
         assert not report_path.exists()
         return None
@@ -1447,6 +1452,51 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
     assert_completion(current, lock)
     assert not (current.candidate / owner_path).exists()
     print("workflow-owned-known-failure: honest failure outcome retained through acknowledgment", flush=True)
+
+    for pre_mutation in (True, False):
+        for claim_boundary, finalize_boundary in (
+            ("before_reconciliation_marker_publish", "before_ownership_marker_clear"),
+            ("after_reconciliation_marker_publish", "after_ownership_marker_clear"),
+        ):
+            current = scenario(f"workflow-reconciliation-{pre_mutation}-{claim_boundary}")
+            run(current, "plan", request(current, "upgrade_all", "plan_only", []))
+            lock = document(current.directory / "workflow.lock.json")
+            recovery = owned_request(current, "upgrade_all", "recover", [])
+            binding = {"exact_lock_sha256": list(bytes.fromhex(lock["digest_sha256"]))}
+            if pre_mutation:
+                binding.update(
+                    outer_generation=1, outer_state_sha256=[31] * 32,
+                    profile_sha256=[32] * 32, profile_reference_sha256=[33] * 32,
+                )
+            else:
+                binding["evidence_sha256"] = [34] * 32
+            claim = {**recovery, "reconciliation_claim": {
+                "pre_mutation" if pre_mutation else "post_mutation": binding,
+            }}
+            proof = current.directory / "trusted-reconciliation.owner.json"
+            before = triggers.snapshot(current.candidate)
+            workflow(executable, claim, current.directory / "claim-crash", environment,
+                     completion_crash=claim_boundary, reconciliation_owner_output=proof)
+            expected = document(proof)
+            assert expected["state"] == ("pre_mutation_reconciliation_claim" if pre_mutation else "released")
+            if claim_boundary == "before_reconciliation_marker_publish":
+                assert not (current.candidate / owner_path).exists()
+                run(current, "changed-request", {**claim, "operation": "remove", "selectors": [{"name": "different"}]},
+                    owner_evidence=proof, exit_status=8)
+                run(current, "claim", claim, owner_evidence=proof)
+            assert (current.candidate / owner_path).read_bytes() == proof.read_bytes()
+            run(current, "repeat-claim", claim, owner_evidence=proof, exit_status=8)
+            workflow(executable, recovery, current.directory / "finalize-crash", environment,
+                     completion_crash=finalize_boundary, owner_evidence=proof, acknowledgment="ownership")
+            run(current, "finalize", recovery, owner_evidence=proof, acknowledgment="ownership")
+            run(current, "finalize-again", recovery, owner_evidence=proof, acknowledgment="ownership")
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            for path in (OPERATION, INTENT, owner_path, NAMESPACE / "root-operation-completion-v1.json",
+                         NAMESPACE / "native-transaction-provenance-v1.json"):
+                assert not (current.candidate / path).exists(), path
+            assert not (current.directory / "unused-cache").exists()
+            assert not (current.directory / "unused-state").exists()
+            print(f"workflow-reconciliation-{pre_mutation}-{claim_boundary}: exact exclusion and finalization passed", flush=True)
 
 
 def main() -> int:
