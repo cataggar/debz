@@ -33,6 +33,7 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
+const native_preparation = @import("native_preparation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_trigger = @import("native_trigger.zig");
@@ -11094,7 +11095,7 @@ fn lifecycleInstalledEvidence(
             const observed = try rootMd5ForConffile(
                 allocator,
                 root,
-                conffile.path,
+                relativeListPath(conffile.path) orelse return error.UnsupportedLifecycleConffile,
                 (Limits{}).max_compare_bytes,
                 &compared_bytes,
                 (Limits{}).max_compared_bytes,
@@ -11142,8 +11143,35 @@ fn lifecycleArchiveEvidence(
     models: []archive_application.Model,
     archive_bytes: []const []u8,
 ) ![]const native_program.Archive {
+    if (models.len != archive_bytes.len) return error.ArchiveEvidenceMismatch;
+    const origins = try allocator.alloc(exact_lock_v2.PackageOrigin, models.len);
+    defer allocator.free(origins);
+    for (models, archive_bytes, 0..) |model, bytes, index| {
+        origins[index] = .{ .local_artifact = .{
+            .artifact_id = hex(32, model.provenance().sha256),
+            .sha256 = model.provenance().sha256,
+            .size = bytes.len,
+            .package = model.facts.package,
+            .version = model.facts.version,
+            .architecture = model.facts.architecture,
+            .acquisition_url = "file:///native-lifecycle-fixture.deb",
+            .trust_mode = .pinned_sha256,
+        } };
+    }
+    return programArchiveEvidence(allocator, models, archive_bytes, origins);
+}
+
+fn programArchiveEvidence(
+    allocator: std.mem.Allocator,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    origins: []const exact_lock_v2.PackageOrigin,
+) ![]const native_program.Archive {
+    if (models.len != archive_bytes.len or models.len != origins.len)
+        return error.ArchiveEvidenceMismatch;
     const result = try allocator.alloc(native_program.Archive, models.len);
-    for (models, archive_bytes, 0..) |*model, bytes, index| {
+    for (models, archive_bytes, origins, 0..) |*model, bytes, origin, index| {
+        try model.verifyArtifactBinding(bytes);
         const scripts = try allocator.alloc(
             native_program.ArchiveScript,
             model.scripts.len,
@@ -11187,17 +11215,6 @@ fn lifecycleArchiveEvidence(
                 .name = trigger.target,
             };
         }
-        const artifact_id = hex(32, model.provenance().sha256);
-        const origin: exact_lock_v2.PackageOrigin = .{ .local_artifact = .{
-            .artifact_id = artifact_id,
-            .sha256 = model.provenance().sha256,
-            .size = bytes.len,
-            .package = model.facts.package,
-            .version = model.facts.version,
-            .architecture = model.facts.architecture,
-            .acquisition_url = "file:///native-lifecycle-fixture.deb",
-            .trust_mode = .pinned_sha256,
-        } };
         result[index] = .{
             .package = model.facts.package,
             .version = model.facts.version,
@@ -15436,13 +15453,16 @@ fn finishLifecycleAttempt(
     return;
 }
 
-fn lifecycleOperationWant(
-    operation: ExternalMaterializationOperation,
+fn lifecyclePackageWant(
+    action: ?native_authorization.Action,
+    hold: bool,
 ) package_database.Want {
-    return switch (operation) {
+    // A transaction may install one package and remove another. Trigger-only
+    // participants have no package action and retain their selection hold.
+    return switch (if (action) |value| value.kind else solver.ActionKind.install) {
         .remove => .deinstall,
         .purge => .purge,
-        else => .install,
+        else => if (hold) .hold else .install,
     };
 }
 
@@ -17630,6 +17650,16 @@ fn executeLifecycleProgram(
         },
         .apply_conffile_decision => |decision| {
             const package = decision.package.ref();
+            if (decision.action == .retain_on_remove or decision.action == .delete_on_purge) {
+                const action = authorization.findAction(package.name, package.architecture) orelse
+                    return error.InvalidLifecycleProgram;
+                if ((decision.action == .retain_on_remove and action.kind != .remove) or
+                    (decision.action == .delete_on_purge and action.kind != .purge))
+                    return error.InvalidLifecycleProgram;
+                // Removal and purge publish their conffiles with the matching
+                // file phase; neither operation has an archive to configure.
+                continue;
+            }
             const key = try std.fmt.allocPrint(
                 scratch,
                 "{s}\x00{s}",
@@ -17699,7 +17729,10 @@ fn executeLifecycleProgram(
                 operation,
                 conffile_policy,
                 state,
-                lifecycleOperationWant(external.operation),
+                lifecyclePackageWant(
+                    authorization.findAction(state.package.name, state.package.architecture),
+                    state.hold,
+                ),
                 null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
@@ -18024,7 +18057,7 @@ fn executeLifecycleProgram(
                     initial_snapshot,
                     initial_model,
                     call.package,
-                    lifecycleOperationWant(external.operation),
+                    lifecyclePackageWant(action, false),
                     .ok,
                     .half_installed,
                     if (action) |value| value.prior_version else null,
@@ -18076,7 +18109,7 @@ fn executeLifecycleProgram(
                     operation,
                     conffile_policy,
                     failure_state,
-                    lifecycleOperationWant(external.operation),
+                    lifecyclePackageWant(action, failure_state.hold),
                     null,
                 );
                 if (lifecycleMaterializationFailure(result)) |failure| return failure;
@@ -19531,6 +19564,209 @@ test "native_unpack.test.lifecycle external fixture" {
         external.report,
         result,
     );
+}
+
+test "native_unpack.test.production preparation drives a mixed install and removal program" {
+    try testPreparedMixedLifecycle(false);
+}
+
+test "native_unpack.test.production preparation drives a mixed install and purge program" {
+    try testPreparedMixedLifecycle(true);
+}
+
+fn testPreparedMixedLifecycle(purge: bool) !void {
+    const status = try std.fmt.allocPrint(
+        testing.allocator,
+        "Package: old\nStatus: install ok installed\nVersion: 2.0\nArchitecture: amd64\n" ++
+            "Conffiles:\n /etc/old.conf {s}\n\n",
+        .{hex(16, digestMd5("old configuration\n"))},
+    );
+    defer testing.allocator.free(status);
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &.{.{
+        .name = "old.list",
+        .bytes = "/.\n/etc\n/etc/old.conf\n/usr\n/usr/share\n/usr/share/old\n",
+    }});
+    defer fixture.deinit();
+    const root = fixture.root();
+    for ([_][]const u8{ "etc", "usr", "usr/share" }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    try root.publishFile(try root_fs.Path.init("etc/old.conf"), "old configuration\n", .{});
+    try root.publishFile(try root_fs.Path.init("usr/share/old"), "old payload\n", .{});
+
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/app", .content = "new payload\n", .mode = 0o644 },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "app", .version = "1.2" }, &data);
+    defer testing.allocator.free(bytes);
+    var models = [_]archive_application.Model{try modelOf(bytes)};
+    defer models[0].deinit();
+    var database = try fixture.database();
+    defer database.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(0x22);
+    const origin: exact_lock_v2.PackageOrigin = .{ .authenticated_repository = .{
+        .repository_id = repository_id,
+        .repository_snapshot_sha256 = snapshot,
+    } };
+    const archives = try programArchiveEvidence(arena.allocator(), &models, &.{bytes}, &.{origin});
+    var lock = try exact_lock_v2.create(testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(3),
+            .index_sha256 = @splat(4),
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "app",
+            .version = "1.2",
+            .architecture = "amd64",
+            .origin = origin,
+            .sha256 = models[0].provenance().sha256,
+            .declared_size = bytes.len,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var actions = [_]solver.PlanAction{
+        .{
+            .kind = .install,
+            .package = "app",
+            .version = "1.2",
+            .architecture = "amd64",
+            .repository = .{ .id = repository_id, .priority = 500 },
+            .sha256 = hex(32, models[0].provenance().sha256),
+            .package_size = bytes.len,
+            .installed_size_delta_bytes = 0,
+            .source_package = "app",
+            .prior_installed = null,
+            .requested = true,
+            .reason = .explicit_request,
+            .selected_origin = null,
+        },
+        .{
+            .kind = if (purge) .purge else .remove,
+            .package = "old",
+            .version = "2.0",
+            .architecture = "amd64",
+            .repository = null,
+            .sha256 = null,
+            .package_size = null,
+            .installed_size_delta_bytes = 0,
+            .source_package = "old",
+            .prior_installed = .{
+                .package = "old",
+                .version = "2.0",
+                .architecture = "amd64",
+                .installed_size_kib = null,
+            },
+            .requested = false,
+            .reason = .replacement,
+            .selected_origin = null,
+        },
+    };
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = if (purge) .purge else .remove, .package = "old", .version = "2.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .unpack, .package = "app", .version = "1.2", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .configure_pending, .package = "app", .version = "1.2", .architecture = "amd64" },
+    };
+    const solver_plan: solver.Plan = .{
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &ordered,
+        .summary = .{},
+        .download_bytes = bytes.len,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = testing.allocator,
+        .arena = undefined,
+    };
+    var root_buffer: [4096]u8 = undefined;
+    const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    var preparation = try native_preparation.prepare(testing.allocator, .{
+        .plan = &solver_plan,
+        .exact_lock = &lock.lock,
+        .install_root = install_root,
+        .policy = .{ .conffile = .keep_existing },
+        .script_policy = lifecycleScriptPolicy(),
+        .installed = .{
+            .generation_sha256 = database.generation.sha256,
+            .packages = try lifecycleInstalledEvidence(arena.allocator(), root, database.model),
+            .trigger_state_sha256 = native_trigger.stateDigest(database.model),
+        },
+        .archives = archives,
+    });
+    defer preparation.deinit();
+    var compiled: CompiledLifecycle = switch (preparation) {
+        .prepared => |value| .{ .authorization = value.authorization, .program = value.program },
+        .diagnostic => |value| {
+            std.debug.print("production preparation failed: {any}\n", .{value.diagnostic});
+            return error.TestUnexpectedResult;
+        },
+    };
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    const result = try executeLifecycleProgram(
+        testing.allocator,
+        root,
+        .{
+            .root = install_root,
+            .architecture = "amd64",
+            .archives = &.{},
+            .operation = .install,
+            .report = "",
+        },
+        &compiled,
+        &models,
+        &.{bytes},
+        fixture.snapshot(),
+        database.model,
+        locks.interface(),
+        null,
+        null,
+    );
+    if (result.outcome != .applied) {
+        std.debug.print("mixed native execution failed: {any}\n", .{result});
+        return error.TestUnexpectedResult;
+    }
+    var final = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer final.deinit();
+    var imported = switch (try package_database.importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = final.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer imported.deinit();
+    try testing.expectEqual(package_database.Want.install, imported.model.find("app", "amd64").?.status.want);
+    if (purge) {
+        try testing.expect(imported.model.find("old", "amd64") == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("etc/old.conf")) == null);
+    } else {
+        try testing.expectEqual(package_database.Want.deinstall, imported.model.find("old", "amd64").?.status.want);
+        try testing.expectEqual(package_database.CurrentState.config_files, imported.model.find("old", "amd64").?.status.current);
+        const conffile = try root.readFileAlloc(testing.allocator, try root_fs.Path.init("etc/old.conf"), 4096);
+        defer testing.allocator.free(conffile);
+        try testing.expectEqualStrings("old configuration\n", conffile);
+    }
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/old")) == null);
+    const payload = try root.readFileAlloc(testing.allocator, try root_fs.Path.init("usr/share/app"), 4096);
+    defer testing.allocator.free(payload);
+    try testing.expectEqualStrings("new payload\n", payload);
 }
 
 test "native_unpack.test.materialization adapter applies data-only plan" {

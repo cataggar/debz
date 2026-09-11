@@ -29,6 +29,34 @@ application modules. Those modules may produce the evidence; they cannot relax
 what the compiler validates, because the compiler revalidates every
 relationship between the four inputs independently.
 
+### Production preparation
+
+`debz.native_preparation.prepare` derives an owned native authorization and
+compiled program from a real solver plan, an exact-closure-lock v2, validated
+installed/archive evidence, and explicit executor/script policy. It verifies
+the lock's contents against its digest, preserves repository snapshot and local
+artifact origins, and binds the actual request, solver-policy, executor-policy,
+and plan digests. It never synthesizes fixture JSON or converts a v1 lock.
+
+The final closure includes every locked installed package, unchanged residual
+configuration records, and the residual records required by each remove action.
+Purge and removals without conffiles or postrm omit the removed record. Unplanned
+closure drift, changed retained holds, mismatched prior identities, missing
+archives, and trigger work without reviewed authority fail preparation.
+Mixed transactions derive selections and conffile handling per package action,
+not from the enclosing install/upgrade operation.
+
+Preparation has no mutation or command dependencies. Successful output owns
+both documents; compiler diagnostics own their text, including after temporary
+authorization and caller input are released. Acquisition and root preflight
+remain responsible for producing validated evidence, and execution must
+revalidate it under the appropriate locks.
+
+This is an item-15b integration foundation, not a public native executor.
+Caller-owned operation completion, production recovery inputs, isolated helper
+deployment, and product/CLI selection still require integration. Legacy remains
+the default, and native selection cannot fall back to the legacy executor.
+
 ## Output
 
 A program binds the authorization digest, backend, install root and root

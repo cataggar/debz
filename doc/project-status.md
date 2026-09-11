@@ -116,6 +116,14 @@ against independent root/trace/provenance assertions. Production native
 selection remains unavailable. See
 [Native recovery and provenance](native-recovery.md).
 
+Item 15b's `debz.native_preparation` foundation binds actual solver plans and
+exact-lock v2 documents to native authorization and compiled programs without
+fixture request hashes or command-shaped reports. It preserves authenticated
+origins and the complete installed/residual closure, and the private interpreter
+accepts its mixed install/remove and install/purge programs. Production
+execution/recovery ownership, helper deployment, and CLI integration remain
+incomplete; native selection is still unavailable and legacy remains default.
+
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
 already opened root descriptor, never resolves a component through a symbolic
