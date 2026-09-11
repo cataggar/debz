@@ -4596,6 +4596,74 @@ test "solver.test.v1 exact lock replay remains repository-only schema v2" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"origin\":") == null);
 }
 
+test "solver.test.empty v2 lock constrains removals without bypassing authorization or holds" {
+    var database = try parsedDatabase(
+        "Package: app\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\nDepends: lib\n\n" ++
+            "Package: lib\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n",
+    );
+    defer database.deinit();
+    var policies = [_]InstalledPolicy{
+        .{ .name = "app", .architecture = "amd64", .install_reason = .manual, .held = false },
+        .{ .name = "lib", .architecture = "amd64", .install_reason = .automatic, .held = false },
+    };
+    const removals = [_]PackageSelector{ .{ .name = "app" }, .{ .name = "lib" } };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var input: PlanInput = .{
+        .repositories = &.{},
+        .installed = .{
+            .records = database.packages,
+            .native_architecture = "amd64",
+            .policies = &policies,
+            .hold_authority = .explicit_policy,
+        },
+        .target_architecture = "amd64",
+        .request = .{ .remove = &removals },
+        .policy = .{ .allow_remove_dependencies = true },
+        .exact_lock_v2 = &lock.lock,
+    };
+    for ([_]usize{ 1, 0 }) |start| {
+        input.installed.records = database.packages[start..];
+        input.installed.policies = policies[start..];
+        input.request = .{ .remove = removals[start..] };
+        var result = try planTransaction(std.testing.allocator, input);
+        switch (result) {
+            .plan => |*plan| {
+                defer plan.deinit();
+                try std.testing.expectEqual(2 - start, plan.actions.len);
+                try std.testing.expectEqual(@as(u64, 0), plan.download_bytes);
+                for (plan.actions) |action| {
+                    try std.testing.expectEqual(ActionKind.remove, action.kind);
+                    try std.testing.expect(action.requested);
+                    try std.testing.expectEqual(ActionReason.explicit_request, action.reason);
+                }
+            },
+            .failure => |*failure| {
+                defer failure.deinit();
+                std.debug.print("empty v2 lock removal failed: {any}\n", .{failure.problems});
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    input.request = .{ .remove = removals[0..1] };
+    var unrequested = (try planTransaction(std.testing.allocator, input)).failure;
+    defer unrequested.deinit();
+    try std.testing.expectEqual(ProblemKind.reverse_dependency, unrequested.problems[0].kind);
+    input.request = .{ .remove = &removals };
+    policies[1].held = true;
+    var held = (try planTransaction(std.testing.allocator, input)).failure;
+    defer held.deinit();
+    try std.testing.expectEqual(ProblemKind.held_violation, held.problems[0].kind);
+}
+
 test "solver.test.local planning failures use v3 while repository failures remain v2" {
     const digest: [32]u8 = @splat(0x44);
     const artifact_id: source.RepositoryId = .{

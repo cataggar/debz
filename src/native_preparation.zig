@@ -348,6 +348,66 @@ test "native_preparation.test.remove preserves an already residual record withou
     try std.testing.expectEqual(.config_files, authorization.findFinalPackage("old", "amd64").?.state);
 }
 
+test "native_preparation.test.empty lock requires every removal and preserves residual configuration" {
+    const fixture = try Fixture.init(std.testing.allocator, false);
+    defer fixture.deinit(std.testing.allocator);
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = fixture.lock.lock.target_architecture,
+        .request_sha256 = fixture.lock.lock.request_sha256,
+        .policy_sha256 = fixture.lock.lock.policy_sha256,
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    fixture.plan.actions = fixture.actions[1..];
+    fixture.plan.ordered_actions = fixture.ordered[0..1];
+    fixture.plan.download_bytes = 0;
+    var request = fixture.request();
+    request.exact_lock = &lock.lock;
+    request.archives = &.{};
+    request.installed.packages = fixture.installed[0..1];
+    for ([_]bool{ false, true }) |purge| {
+        fixture.actions[1].kind = if (purge) .purge else .remove;
+        fixture.ordered[0].kind = if (purge) .purge else .remove;
+        var result = try prepare(std.testing.allocator, request);
+        defer result.deinit();
+        const prepared = try preparedResult(&result);
+        const authorization = prepared.authorization.authorization;
+        try std.testing.expectEqual(@as(usize, 1), authorization.actions.len);
+        try std.testing.expectEqual(fixture.actions[1].kind, authorization.actions[0].kind);
+        try std.testing.expect(authorization.actions[0].artifact == null);
+        try std.testing.expectEqual(@as(usize, 0), prepared.program.program.artifacts.len);
+        try std.testing.expectEqual(lock.lock.digest_sha256, authorization.exact_lock.digest_sha256);
+        try std.testing.expect(prepared.program.program.matchesAuthorization(authorization));
+        if (purge) {
+            try std.testing.expectEqual(@as(usize, 0), authorization.final_state.len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), authorization.final_state.len);
+            try std.testing.expectEqual(.config_files, authorization.final_state[0].state);
+        }
+    }
+    fixture.actions[1].kind = .remove;
+    fixture.ordered[0].kind = .remove;
+    fixture.installed[0].conffiles = &.{};
+    var data_only = try prepare(std.testing.allocator, request);
+    defer data_only.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try preparedResult(&data_only)).authorization.authorization.final_state.len);
+
+    request.installed.packages = &fixture.installed;
+    try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+    request.installed.packages = fixture.installed[0..1];
+    fixture.plan.actions = &.{};
+    fixture.plan.ordered_actions = &.{};
+    try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+    request.installed.packages = &.{};
+    try std.testing.expectError(error.EmptyProgram, prepare(std.testing.allocator, request));
+    fixture.plan.actions = fixture.actions[0..1];
+    fixture.plan.ordered_actions = fixture.ordered[1..];
+    try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+}
+
 test "native_preparation.test.local origins are preserved and not reinterpreted as repository origins" {
     const fixture = try Fixture.init(std.testing.allocator, true);
     defer fixture.deinit(std.testing.allocator);

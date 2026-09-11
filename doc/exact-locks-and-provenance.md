@@ -19,6 +19,21 @@ does not authoritatively retain archive origin. Final verification additionally
 requires the completed journal's local archive digest and the plan's exact
 origin, digest, and size evidence. V1 decoding and replay remain unchanged.
 
+V2 also permits an empty installed-package closure, including removal or purge
+of the last installed package. Its repository and local-artifact arrays must
+then be empty: the usual unused-evidence rejection still applies. The target
+architecture, request and policy digests, canonical encoding, and digest
+verification remain mandatory. Existing nonempty locks keep identical bytes
+and hashes; older releases reject the newly supported empty v2 locks.
+
+An empty lock does not authorize deleting an installed database. Native
+preparation still requires explicit remove/purge actions for every installed
+package omitted from the closure, and rejects a missing install artifact or
+an unauthorized retained package. A removal can leave residual configuration;
+that `config-files` state belongs in the separate native final-state authority,
+not the lock's installed-package closure. Purge must remove the residual state.
+V1 creation, decoding, and schema are unchanged.
+
 Exact-lock v2 keeps its complete-closure meaning by default. The transaction
 executor also exposes a separately policy-digested `locked_packages` mode for
 repository-add operations whose lock intentionally contains only non-remove

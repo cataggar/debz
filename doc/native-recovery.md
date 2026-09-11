@@ -218,8 +218,10 @@ recovery after active cleanup are supported. The caller still owns outer
 completion, provenance, and lock release.
 
 Core product/CLI wiring remains required before experimental backend selection
-can be exposed. Genuine v2 lock/result integration, empty-removal closure
-support, remaining consumers, and full pinned parity remain roadmap work.
+can be exposed. Empty v2 closures now represent last-package removal or purge,
+with explicit action authorization and retained configuration modeled separately.
+Genuine product v2 lock/result integration, remaining consumers, and full pinned
+parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 
 ## Independent acceptance
