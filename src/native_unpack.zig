@@ -5825,13 +5825,14 @@ fn emitTriggerHandoff(
 
 /// Canonical `.list` and `md5sums` content for one unpacked package.
 ///
-/// The list is dpkg's exact ownership publication: the root record `/.` plus
-/// every archive-owned path in canonical absolute spelling. Synthesized
+/// The list is dpkg's exact ownership publication: every archive-owned path,
+/// including `/.` only when the archive has a root entry. Synthesized
 /// parent directories are not published, because the package does not own
 /// them. `md5sums` covers the regular payload files and the hard links that
 /// share their content, and never a directory or a symbolic link.
 fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
-    try item.list_paths.append(builder.allocator, package_database.root_list_path);
+    if (item.model.root != null)
+        try item.list_paths.append(builder.allocator, package_database.root_list_path);
     for (item.paths.items) |planned| {
         if (planned.synthesized) continue;
         const archive_file = if (planned.archive_entry) |index|
@@ -5876,7 +5877,8 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
             try absoluteSpelling(builder, conffile.path),
         );
     }
-    std.mem.sort([]const u8, item.list_paths.items[1..], {}, lessPath);
+    const first_payload_path: usize = if (item.model.root != null) 1 else 0;
+    std.mem.sort([]const u8, item.list_paths.items[first_payload_path..], {}, lessPath);
     std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
 }
 
@@ -21566,6 +21568,45 @@ test "native_unpack.test.materialization adapter applies data-only plan" {
     try testing.expect(try fixture.root().entryIfExists(
         try root_fs.Path.init(root_mutation.journal_path),
     ) == null);
+}
+
+test "native_unpack.test.ownership lists include only archive-declared root entries" {
+    for ([_]bool{ false, true }) |include_root| {
+        for ([_]bool{ false, true }) |include_file| {
+            var fixture: Fixture = undefined;
+            try fixture.init(empty_status, &.{});
+            defer fixture.deinit();
+            var data = [_]Entry{
+                .{ .path = "usr/share/demo/file", .content = "payload\n" },
+                .{ .path = "!file", .content = "sort before root\n" },
+            };
+            const end: usize = if (include_file) data.len else 0;
+            const bytes = try buildOwnedArchive(
+                .{ .package = "demo", .version = "1", .data_root = include_root },
+                data[0..end],
+            );
+            defer testing.allocator.free(bytes);
+            var model = try modelOf(bytes);
+            defer model.deinit();
+            const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+            var artifacts: [1]native_program.ProgramArtifact = undefined;
+            const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+            var planned = try expectPlan(try planFor(
+                &fixture,
+                &program,
+                &.{.{ .artifact = 0, .bytes = bytes }},
+            ));
+            defer planned.deinit();
+            const list = planned.database.find("info/demo.list") orelse return error.TestUnexpectedResult;
+            const expected = if (include_root)
+                if (include_file) "/.\n/!file\n/usr/share/demo/file\n" else "/.\n"
+            else if (include_file)
+                "/!file\n/usr/share/demo/file\n"
+            else
+                "";
+            try testing.expectEqualStrings(expected, list.bytes);
+        }
+    }
 }
 
 test "native_unpack.test.materialization rejects stale inputs before mutation" {

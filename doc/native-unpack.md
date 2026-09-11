@@ -182,6 +182,11 @@ All transaction claimants are validated even when an unchanged installed
 object and topology, it dominates publication: acted siblings update ownership
 only and no redundant payload replacement is described.
 
+Incoming `.list` files include `/.` only when the payload archive declares its
+root directory. An archive without that entry does not acquire root ownership;
+an empty payload without a root entry publishes an empty list. Synthesized
+parent directories likewise do not become package-owned paths.
+
 When `Replaces` transfers a path, the plan records a `Displacement` and rewrites
 only the surviving holder's `.list`, filtering that original ordered spelling
 in place so `/.` and every unaffected alias spelling remain intact. Its

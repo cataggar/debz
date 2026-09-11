@@ -132,8 +132,20 @@ of a known terminal failure reports exit 7 after receipt-backed cleanup;
 unknown script outcomes and invalid evidence remain blocked with exit 8.
 Recovered transactions report whether the original attempt reached mutation;
 recovery with no outstanding execution reports `changed: false`.
-Orchestrated workflow execution/recovery and other consumers remain gated
-until their separate native integration.
+The internal `ProductionBackend.executeWorkflow` seam also supports native
+batch install/remove and upgrade-all without an outer ownership handoff.
+Planning and execution share the same canonical selectors and genuine v2
+authority. Workflow recovery supplies the original semantic operation,
+selectors, and request policy (recommends, repository priority, conffile, and
+downgrade settings), which must match the held original attempt; it accepts
+no replacement repository, keyring, lock, or force inputs. Recovery still uses
+only persisted native execution evidence. With no outstanding attempt it
+reports no changes.
+
+Native reservation, deferred ownership, reconciliation, and acknowledgment
+requests remain explicitly unavailable before root or repository access.
+The apt/system orchestrator, repository/bootstrap, package-family, and Actions
+consumers remain gated until their separate native contracts are integrated.
 
 The standalone binary instantiates `ProductionBackend`. A non-mutating `plan`
 or `download` may use `--lock-output` without `--lock-input` to resolve an

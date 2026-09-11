@@ -1427,6 +1427,7 @@ const TestArchive = struct {
     control_fields: []const u8 = "",
     control: []const TestEntry = &.{},
     data: []const TestEntry = &.{},
+    data_root: bool = true,
 };
 
 fn writeOctal(field: []u8, value: u64) void {
@@ -1470,10 +1471,11 @@ fn appendTarEntry(
     try tar.appendNTimes(allocator, 0, padding);
 }
 
-fn buildTar(allocator: std.mem.Allocator, entries: []const TestEntry) ![]u8 {
+fn buildTar(allocator: std.mem.Allocator, entries: []const TestEntry, include_root: bool) ![]u8 {
     var tar: std.ArrayList(u8) = .empty;
     errdefer tar.deinit(allocator);
-    try appendTarEntry(allocator, &tar, "./", .{ .path = ".", .kind = '5', .mode = 0o755 });
+    if (include_root)
+        try appendTarEntry(allocator, &tar, "./", .{ .path = ".", .kind = '5', .mode = 0o755 });
     for (entries) |entry| {
         const path = try std.fmt.allocPrint(allocator, "./{s}", .{entry.path});
         defer allocator.free(path);
@@ -1517,9 +1519,9 @@ fn buildArchive(allocator: std.mem.Allocator, options: TestArchive) ![]u8 {
     try control_entries.append(allocator, .{ .path = "control", .content = control_text });
     try control_entries.appendSlice(allocator, options.control);
 
-    const control_tar = try buildTar(allocator, control_entries.items);
+    const control_tar = try buildTar(allocator, control_entries.items, true);
     defer allocator.free(control_tar);
-    const data_tar = try buildTar(allocator, options.data);
+    const data_tar = try buildTar(allocator, options.data, options.data_root);
     defer allocator.free(data_tar);
 
     var ar: std.ArrayList(u8) = .empty;
