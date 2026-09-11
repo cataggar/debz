@@ -34,6 +34,7 @@ const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
 const native_preparation = @import("native_preparation.zig");
+const native_execution_request = @import("native_execution_request.zig");
 const native_operation = @import("native_operation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
@@ -10936,6 +10937,8 @@ const ExternalLifecycleRequest = struct {
     defer_triggers: bool = false,
     recovery: bool = false,
     crash_at: ?native_recovery.CrashPoint = null,
+    caller_owned: bool = false,
+    acknowledge_native: bool = false,
 };
 
 const LifecycleOutcome = enum {
@@ -10955,16 +10958,7 @@ const LifecycleResult = struct {
     provenance_path: ?[]const u8 = null,
 };
 
-const CompiledLifecycle = struct {
-    authorization: native_authorization.OwnedAuthorization,
-    program: native_program.OwnedProgram,
-
-    fn deinit(self: *CompiledLifecycle) void {
-        self.program.deinit();
-        self.authorization.deinit();
-        self.* = undefined;
-    }
-};
+const CompiledLifecycle = native_preparation.Prepared;
 
 fn lifecycleScriptKind(kind: package_database.ScriptKind) maintainer_script.Kind {
     return switch (kind) {
@@ -14356,6 +14350,21 @@ fn retainNativeEvidence(
         .receipt_name = "intent.json",
         .document_sha256 = intent.digest_sha256,
     });
+    for (intent.blobs) |blob| {
+        if (blob.kind != .request or
+            !std.mem.eql(u8, blob.logical_path, native_execution_request.logical_path))
+            continue;
+        const bytes = try native_recovery.verifyBlob(scratch, root, blob);
+        var request = try native_execution_request.decode(scratch, bytes);
+        defer request.deinit();
+        try native_execution_request.validateIntent(request.document, intent);
+        try sources.append(scratch, .{
+            .kind = .execution_request,
+            .source_path = blob.storage_path,
+            .receipt_name = "execution-request.json",
+            .document_sha256 = request.document.digest_sha256,
+        });
+    }
     try sources.append(scratch, .{
         .kind = .progress,
         .source_path = native_recovery.progress_path,
@@ -15255,7 +15264,7 @@ fn finishLifecycleAttempt(
     }
 
     var record = attempt.record();
-    if (record.state != .completed) {
+    if (!runtime.caller_owned and record.state != .completed) {
         if (record.state != .recovering) try attempt.advance(allocator, .{
             .state = .verifying,
             .phase = .verification,
@@ -15399,6 +15408,10 @@ fn finishLifecycleAttempt(
         );
     } else false;
     try native_provenance.publish(allocator, root, provenance);
+    if (runtime.caller_owned) {
+        runtime.crash.hit(.after_provenance);
+        return;
+    }
 
     var statement = try root_operation_completion.create(allocator, .{
         .record = record,
@@ -15443,7 +15456,16 @@ fn finishLifecycleAttempt(
     runtime.crash.hit(.after_provenance);
     try attempt.clear();
     runtime.crash.hit(.after_active_clear);
-    for (progress.document.records) |entry| {
+    try cleanupNativeExecutionEvidence(allocator, root, owned_intent.intent, progress.document);
+}
+
+fn cleanupNativeExecutionEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent: native_recovery.Intent,
+    progress: native_recovery.ProgressDocument,
+) !void {
+    for (progress.records) |entry| {
         if (entry.action.kind != .script and
             entry.action.kind != .compensation and
             entry.action.kind != .trigger)
@@ -15458,8 +15480,7 @@ fn finishLifecycleAttempt(
             else => return err,
         };
     }
-    try native_recovery.cleanup(allocator, root, owned_intent.intent);
-    return;
+    try native_recovery.cleanup(allocator, root, intent);
 }
 
 fn lifecyclePackageWant(
@@ -15643,7 +15664,20 @@ fn prepareNativeRecovery(
     archive_bytes: []const []u8,
     initial_snapshot: package_database.Snapshot,
     attempt: *root_operation.Attempt,
+    production_request: ?native_execution_request.Document,
 ) !native_recovery.Runtime {
+    if (production_request) |request| {
+        try native_execution_request.validateBinding(request, root, attempt, compiled.program.program);
+        var decoded = try native_execution_request.decode(allocator, raw_request);
+        defer decoded.deinit();
+        if (!std.mem.eql(u8, &decoded.document.digest_sha256, &request.digest_sha256))
+            return error.RecoveryRequestBindingMismatch;
+    } else {
+        var observed: [32]u8 = undefined;
+        Sha256.hash(raw_request, &observed, .{});
+        if (!std.mem.eql(u8, &native_recovery.hexDigest(observed), &compiled.program.program.request_sha256))
+            return error.InvalidLifecycleProgram;
+    }
     for ([_][]const u8{
         native_recovery.workspace_directory,
         native_recovery.artifact_directory,
@@ -15680,17 +15714,6 @@ fn prepareNativeRecovery(
         compiled.program.program,
     );
 
-    const expected_request_sha256 = parseHex(
-        32,
-        &compiled.program.program.request_sha256,
-    ) orelse return error.InvalidLifecycleProgram;
-    var observed_request_sha256: [32]u8 = undefined;
-    Sha256.hash(raw_request, &observed_request_sha256, .{});
-    if (!std.mem.eql(
-        u8,
-        &expected_request_sha256,
-        &observed_request_sha256,
-    )) return error.InvalidLifecycleProgram;
     var blobs: std.ArrayList(native_recovery.Blob) = .empty;
     try appendRecoveryBlob(
         allocator,
@@ -15698,7 +15721,7 @@ fn prepareNativeRecovery(
         &blobs,
         .request,
         "request",
-        "request/native-lifecycle.json",
+        if (production_request != null) native_execution_request.logical_path else "request/native-lifecycle.json",
         raw_request,
         .regular,
         0o600,
@@ -15904,6 +15927,7 @@ fn prepareNativeRecovery(
         .digest_sha256 = @splat('0'),
     };
     native_recovery.sealIntent(&intent);
+    if (production_request) |request| try native_execution_request.validateIntent(request, intent);
     try native_recovery.publishIntent(allocator, root, intent);
     try native_recovery.initializeProgress(
         allocator,
@@ -15926,6 +15950,7 @@ fn prepareNativeRecovery(
         .intent_sha256 = intent.digest_sha256,
         .crash = .{ .selected = external.crash_at },
         .staging_directory_initially_present = staging_directory_initially_present,
+        .caller_owned = production_request != null,
     };
 }
 
@@ -16273,11 +16298,66 @@ fn artifactBlobIndex(key: []const u8) !usize {
         error.InvalidRecoveryIntent;
 }
 
+const ProductionArchives = struct {
+    models: []archive_application.Model,
+    bytes: [][]u8,
+};
+
+// All allocations belong to the execution/recovery arena. Application models
+// are reproduced from the exact program-bound bytes before any script runs.
+fn productionArchives(
+    allocator: std.mem.Allocator,
+    artifacts: []const native_program.ProgramArtifact,
+    bytes: []const []u8,
+) !ProductionArchives {
+    if (bytes.len != artifacts.len) return error.RecoveryArtifactBindingMismatch;
+    var by_digest: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty;
+    defer by_digest.deinit(allocator);
+    for (bytes) |archive| {
+        var sha256: [32]u8 = undefined;
+        Sha256.hash(archive, &sha256, .{});
+        const entry = try by_digest.getOrPut(allocator, sha256);
+        if (entry.found_existing) return error.RecoveryArtifactBindingMismatch;
+        entry.value_ptr.* = archive;
+    }
+    const models = try allocator.alloc(archive_application.Model, bytes.len);
+    const ordered = try allocator.alloc([]u8, bytes.len);
+    for (artifacts, 0..) |artifact, index| {
+        if (artifact.index != index) return error.RecoveryArtifactBindingMismatch;
+        const sha256 = native_recovery.parseDigest(artifact.sha256) orelse
+            return error.RecoveryArtifactBindingMismatch;
+        ordered[index] = by_digest.get(sha256) orelse return error.RecoveryArtifactBindingMismatch;
+        models[index] = switch (archive_application.revalidate(
+            allocator,
+            ordered[index],
+            .{ .local = .{
+                .size = artifact.size,
+                .sha256 = sha256,
+                .identity = .{
+                    .package = artifact.package.name,
+                    .version = artifact.package.version,
+                    .architecture = artifact.package.architecture,
+                },
+            } },
+            .{},
+            native_recovery.parseDigest(artifact.application_sha256) orelse
+                return error.RecoveryArtifactBindingMismatch,
+        )) {
+            .model => |value| value,
+            .diagnostic => return error.RecoveryArtifactBindingMismatch,
+        };
+        if (models[index].metadata.len != 0 or models[index].script(.config) != null)
+            return error.InvalidExternalArchive;
+    }
+    return .{ .models = models, .bytes = ordered };
+}
+
 fn loadRecoveredLifecycleInputs(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     intent: native_recovery.Intent,
     program: native_program.Program,
+    production: bool,
 ) !RecoveredLifecycleInputs {
     const artifacts = try allocator.alloc(?[]u8, program.artifacts.len);
     @memset(artifacts, null);
@@ -16353,6 +16433,12 @@ fn loadRecoveredLifecycleInputs(
     );
 
     const archive_bytes = try allocator.alloc([]u8, artifacts.len);
+    for (artifacts, 0..) |maybe_bytes, index|
+        archive_bytes[index] = maybe_bytes orelse return error.InvalidRecoveryIntent;
+    if (production) {
+        const validated = try productionArchives(allocator, program.artifacts, archive_bytes);
+        return .{ .snapshot = snapshot, .archive_bytes = validated.bytes, .models = validated.models };
+    }
     const models = try allocator.alloc(archive_application.Model, artifacts.len);
     for (artifacts, 0..) |maybe_bytes, index| {
         const bytes = maybe_bytes orelse return error.InvalidRecoveryIntent;
@@ -17019,6 +17105,7 @@ fn recoverLifecycleProgram(
         root,
         intent.intent,
         compiled.program.program,
+        false,
     );
     var initial_database = switch (try package_database.importSnapshot(
         owned,
@@ -17057,6 +17144,254 @@ fn recoverLifecycleProgram(
         intent.intent,
         null,
     );
+}
+
+fn productionLifecycleRequest(
+    document: native_execution_request.Document,
+    crash_at: ?native_recovery.CrashPoint,
+) ExternalLifecycleRequest {
+    return .{
+        .root = document.install_root,
+        .architecture = document.architecture,
+        .archives = &.{},
+        .operation = std.meta.stringToEnum(ExternalMaterializationOperation, @tagName(document.operation)).?,
+        .policy = switch (document.policy) {
+            .keep_existing => .keep_existing,
+            .use_package_version => .use_package_version,
+        },
+        .report = "",
+        .triggers = document.triggers,
+        .defer_triggers = document.defer_triggers,
+        .recovery = true,
+        .crash_at = crash_at,
+    };
+}
+
+fn executePreparedNativeProgram(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    compiled: *CompiledLifecycle,
+    archive_bytes: []const []u8,
+    attempt: *root_operation.Attempt,
+    locks: root_operation.LockBackend,
+    operation: native_recovery.Operation,
+    crash_at: ?native_recovery.CrashPoint,
+) !LifecycleResult {
+    const program = compiled.program.program;
+    if (!std.mem.eql(u8, &program.script_policy_sha256, &native_recovery.hexDigest(
+        maintainer_script.policyDigest(lifecycleScriptPolicy()),
+    ))) return error.UnsupportedScriptPolicy;
+    try native_operation.bind(allocator, root, attempt, program);
+    if (try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null or
+        try orphanNativeEvidenceDetail(allocator, root) != null)
+        return error.NativeRecoveryRequired;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const document = try native_execution_request.create(root, attempt, program, operation);
+    const bytes = try native_execution_request.encode(scratch, document);
+    var request = try native_execution_request.decode(scratch, bytes);
+    defer request.deinit();
+    const archives = try productionArchives(scratch, program.artifacts, archive_bytes);
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(allocator, .{
+        .native_architecture = program.target_architecture,
+        .snapshot = captured.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    return executeLifecycleProgramWithRequest(
+        allocator,
+        root,
+        productionLifecycleRequest(request.document, crash_at),
+        compiled,
+        archives.models,
+        archives.bytes,
+        captured.snapshot,
+        database.model,
+        locks,
+        null,
+        bytes,
+        attempt,
+        request.document,
+    );
+}
+
+fn retainedNativeBytes(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    receipt: native_provenance.Document,
+    kind: native_provenance.EvidenceKind,
+) ![]u8 {
+    for (receipt.evidence_files) |file| {
+        if (file.kind == kind)
+            return root.readFileAlloc(allocator, try root_fs.Path.init(file.path), native_provenance.maximum_evidence_file_bytes);
+    }
+    return error.RecoveryEvidenceMissing;
+}
+
+fn readProductionCompletion(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+) !?native_provenance.OwnedDocument {
+    var receipt = try native_provenance.read(allocator, root) orelse return null;
+    errdefer receipt.deinit();
+    if (!std.mem.eql(u8, &receipt.document.attempt_id, &native_recovery.hexDigest(attempt.attemptId())) or
+        receipt.document.outcome == .recovery_required)
+    {
+        receipt.deinit();
+        return null;
+    }
+    try native_provenance.verifyEvidence(allocator, root, receipt.document);
+    const request_bytes = try retainedNativeBytes(allocator, root, receipt.document, .execution_request);
+    defer allocator.free(request_bytes);
+    var request = try native_execution_request.decode(allocator, request_bytes);
+    defer request.deinit();
+    const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
+    defer allocator.free(program_bytes);
+    var program = try native_program.decode(allocator, program_bytes, native_program.maximum_document_bytes);
+    defer program.deinit();
+    try native_execution_request.validateBinding(request.document, root, attempt, program.program);
+    const document = receipt.document;
+    if (!std.mem.eql(u8, &document.program_sha256, &request.document.program.program_sha256) or
+        !std.mem.eql(u8, &document.request_sha256, &request.document.caller.request_sha256) or
+        !std.mem.eql(u8, &document.policy_sha256, &request.document.caller.policy_sha256) or
+        !document.operation.eql(request.document.caller.operation) or
+        !std.mem.eql(u8, document.install_root, request.document.install_root) or
+        document.root_inode != request.document.root_inode)
+        return error.InvalidRecoveryProvenance;
+    if (try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null) {
+        var active = try native_recovery.readIntent(allocator, root);
+        defer active.deinit();
+        try native_execution_request.validateIntent(request.document, active.intent);
+        if (!std.mem.eql(u8, &active.intent.digest_sha256, &document.execution_intent_sha256))
+            return error.InvalidRecoveryIntent;
+    }
+    if (try root.entryIfExists(try root_fs.Path.init(native_recovery.progress_path)) != null) {
+        var progress = try native_recovery.readProgress(allocator, root);
+        defer progress.deinit();
+        if (!std.mem.eql(u8, &progress.document.intent_sha256, &document.execution_intent_sha256) or
+            !std.mem.eql(u8, &progress.document.head_sha256, &document.progress_head_sha256))
+            return error.InvalidRecoveryProgress;
+    }
+    return receipt;
+}
+
+fn productionCompletionResult(receipt: native_provenance.Document) LifecycleResult {
+    return .{
+        .outcome = if (receipt.outcome == .succeeded) .applied else .script_failed,
+        .detail = "awaiting_caller_acknowledgment",
+        .program_sha256 = receipt.program_sha256,
+        .attempt_id = receipt.attempt_id,
+        .provenance_path = native_provenance.document_path,
+    };
+}
+
+fn recoverPreparedNativeProgram(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    locks: root_operation.LockBackend,
+    crash_at: ?native_recovery.CrashPoint,
+) !LifecycleResult {
+    if (try readProductionCompletion(allocator, root, attempt)) |value| {
+        var receipt = value;
+        defer receipt.deinit();
+        return productionCompletionResult(receipt.document);
+    }
+    var intent = try native_recovery.readIntent(allocator, root);
+    defer intent.deinit();
+    const request_blob = for (intent.intent.blobs) |blob| {
+        if (blob.kind == .request) break blob;
+    } else return error.RecoveryEvidenceMissing;
+    if (!std.mem.eql(u8, request_blob.logical_path, native_execution_request.logical_path))
+        return error.ProductionRecoveryRequestRequired;
+    const request_bytes = try native_recovery.verifyBlob(allocator, root, request_blob);
+    defer allocator.free(request_bytes);
+    var request = try native_execution_request.decode(allocator, request_bytes);
+    defer request.deinit();
+    var namespace = try root.openDirectory(try root_fs.Path.init(root_operation.namespace_path));
+    defer namespace.close(root.io);
+    const authorization_store = try native_authorization.Store.init(root.io, namespace, native_recovery.authorization_name);
+    const program_store = try native_program.Store.init(root.io, namespace, native_recovery.program_name);
+    var authorization = try authorization_store.read(allocator, native_recovery.maximum_intent_bytes);
+    defer authorization.deinit();
+    var program = try program_store.read(allocator, native_recovery.maximum_intent_bytes);
+    defer program.deinit();
+    var compiled: CompiledLifecycle = .{ .authorization = authorization, .program = program };
+    try native_execution_request.validateBinding(request.document, root, attempt, program.program);
+    try native_execution_request.validateIntent(request.document, intent.intent);
+    if (!std.mem.eql(u8, &program.program.script_policy_sha256, &native_recovery.hexDigest(
+        maintainer_script.policyDigest(lifecycleScriptPolicy()),
+    ))) return error.UnsupportedScriptPolicy;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const inputs = try loadRecoveredLifecycleInputs(arena.allocator(), root, intent.intent, program.program, true);
+    var database = switch (try package_database.importSnapshot(allocator, .{
+        .native_architecture = program.program.target_architecture,
+        .snapshot = inputs.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalDatabase,
+    };
+    defer database.deinit();
+    if (!lifecycleDatabaseMatchesProgram(program.program, database.generation, database.model.packages.len) or
+        !std.mem.eql(u8, &native_recovery.hexDigest(native_trigger.stateDigest(database.model)), &intent.intent.initial_trigger_state_sha256))
+        return error.RecoveryDatabaseBindingMismatch;
+    if (attempt.record().mutation_started)
+        try attempt.beginRecovery(allocator, attempt.record().phase);
+    return executeLifecycleProgramWithRequest(
+        allocator,
+        root,
+        productionLifecycleRequest(request.document, crash_at),
+        &compiled,
+        inputs.models,
+        inputs.archive_bytes,
+        inputs.snapshot,
+        database.model,
+        locks,
+        intent.intent,
+        null,
+        attempt,
+        request.document,
+    );
+}
+
+fn acknowledgePreparedNativeProgram(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+) !void {
+    var receipt = try readProductionCompletion(allocator, root, attempt) orelse
+        return error.RecoveryEvidenceMissing;
+    defer receipt.deinit();
+    if (!std.mem.eql(u8, &receipt.document.digest_sha256, &expected_receipt))
+        return error.InvalidRecoveryProvenance;
+    const intent_bytes = try retainedNativeBytes(allocator, root, receipt.document, .intent);
+    defer allocator.free(intent_bytes);
+    var intent = try native_recovery.decodeIntent(allocator, intent_bytes);
+    defer intent.deinit();
+    const progress_bytes = try retainedNativeBytes(allocator, root, receipt.document, .progress);
+    defer allocator.free(progress_bytes);
+    var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
+    defer progress.deinit();
+    if (!std.mem.eql(u8, &intent.intent.digest_sha256, &receipt.document.execution_intent_sha256) or
+        !std.mem.eql(u8, &progress.document.intent_sha256, &intent.intent.digest_sha256) or
+        !std.mem.eql(u8, &progress.document.head_sha256, &receipt.document.progress_head_sha256))
+        return error.InvalidRecoveryProvenance;
+    if (try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null) {
+        var active = try native_recovery.readIntent(allocator, root);
+        defer active.deinit();
+        if (!std.mem.eql(u8, &active.intent.digest_sha256, &intent.intent.digest_sha256))
+            return error.InvalidRecoveryIntent;
+    }
+    try cleanupNativeExecutionEvidence(allocator, root, intent.intent, progress.document);
 }
 
 fn executeLifecycleProgram(
@@ -17102,11 +17437,45 @@ fn executeLifecycleProgramInOperation(
     raw_request: ?[]const u8,
     borrowed_attempt: ?*root_operation.Attempt,
 ) !LifecycleResult {
+    return executeLifecycleProgramWithRequest(
+        allocator,
+        root,
+        external,
+        compiled,
+        models,
+        archive_bytes,
+        initial_snapshot,
+        initial_model,
+        locks,
+        recovery_intent,
+        raw_request,
+        borrowed_attempt,
+        null,
+    );
+}
+
+fn executeLifecycleProgramWithRequest(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    compiled: *CompiledLifecycle,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    initial_snapshot: package_database.Snapshot,
+    initial_model: package_database.Model,
+    locks: root_operation.LockBackend,
+    recovery_intent: ?native_recovery.Intent,
+    raw_request: ?[]const u8,
+    borrowed_attempt: ?*root_operation.Attempt,
+    production_request: ?native_execution_request.Document,
+) !LifecycleResult {
     // The private v1 recovery request cannot describe a caller-owned
     // operation. Do not persist it as if it were a production request.
-    if (borrowed_attempt != null and
+    if (borrowed_attempt != null and production_request == null and
         (external.recovery or recovery_intent != null or raw_request != null))
         return error.ProductionRecoveryRequestRequired;
+    if (production_request != null and borrowed_attempt == null)
+        return error.CallerOwnedOperationRequired;
     const program = &compiled.program.program;
     const authorization = &compiled.authorization.authorization;
     if (!program.matchesAuthorization(authorization.*) or
@@ -17178,6 +17547,8 @@ fn executeLifecycleProgramInOperation(
     defer if (borrowed_attempt == null) attempt.release();
     if (borrowed_attempt != null)
         try native_operation.bind(allocator, root, attempt, program.*);
+    if (production_request) |request|
+        try native_execution_request.validateBinding(request, root, attempt, program.*);
     if (recovery_intent) |intent| {
         if (!std.mem.eql(
             u8,
@@ -17255,6 +17626,7 @@ fn executeLifecycleProgramInOperation(
             .crash = .{ .selected = external.crash_at },
             .recovering = true,
             .staging_directory_initially_present = intent.staging_directory_initially_present,
+            .caller_owned = production_request != null,
         };
         active_native_recovery = &recovery_runtime;
         const script_recovery = classifyActiveScriptBeforeMutationRecovery(
@@ -17337,6 +17709,7 @@ fn executeLifecycleProgramInOperation(
             archive_bytes,
             initial_snapshot,
             attempt,
+            production_request,
         );
         active_native_recovery = &recovery_runtime;
         recovery_runtime.crash.hit(.after_execution_intent);
@@ -17356,7 +17729,7 @@ fn executeLifecycleProgramInOperation(
                 return error.InvalidRecoveryProgress;
             const terminal_succeeded = record.result == .succeeded or
                 record.result == .recovered;
-            if (borrowed_attempt == null) try finishLifecycleAttempt(
+            if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
                 allocator,
                 root,
                 attempt,
@@ -17630,7 +18003,7 @@ fn executeLifecycleProgramInOperation(
                         root,
                         trigger_authority_bytes,
                     );
-                    if (borrowed_attempt == null) try finishLifecycleAttempt(
+                    if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
                         allocator,
                         root,
                         attempt,
@@ -18195,7 +18568,7 @@ fn executeLifecycleProgramInOperation(
                 root,
                 trigger_authority_bytes,
             );
-            if (borrowed_attempt == null) try finishLifecycleAttempt(
+            if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
                 allocator,
                 root,
                 attempt,
@@ -18330,7 +18703,7 @@ fn executeLifecycleProgramInOperation(
                         root,
                         trigger_authority_bytes,
                     );
-                    if (borrowed_attempt == null) try finishLifecycleAttempt(
+                    if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
                         allocator,
                         root,
                         attempt,
@@ -18416,7 +18789,7 @@ fn executeLifecycleProgramInOperation(
         root,
         trigger_authority_bytes,
     );
-    if (borrowed_attempt == null) try finishLifecycleAttempt(
+    if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
         allocator,
         root,
         attempt,
@@ -19276,6 +19649,86 @@ test "native_unpack.test.derived trigger closure rejects missing reordered and u
     try testing.expect(!lifecycleFinalPackageMatches(expected[1], source));
 }
 
+fn callerOwnedLifecycleFixture(
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    locks: root_operation.LockBackend,
+    compiled: ?*CompiledLifecycle,
+    archive_bytes: []const []u8,
+    raw_request: []const u8,
+) !LifecycleResult {
+    const allocator = testing.allocator;
+    var coordinator = try root_operation.Coordinator.open(root.io, root, external.root, locks);
+    if (external.operation == .recover) {
+        var previous = try coordinator.inspect(allocator) orelse return error.RecoveryEvidenceMissing;
+        defer previous.deinit();
+        const record = previous.record;
+        var attempt = try coordinator.acquire(allocator, .{
+            .intent = .recovery,
+            .backend = .native,
+            .operation = record.operation,
+            .request_sha256 = record.request_sha256,
+            .policy_sha256 = record.policy_sha256,
+            .target_architecture = record.target_architecture,
+            .foreign_architectures = record.foreign_architectures,
+            .evidence = record.evidence(),
+        });
+        defer attempt.release();
+        const result = try recoverPreparedNativeProgram(allocator, root, &attempt, locks, null);
+        if (external.acknowledge_native) {
+            var receipt = try readProductionCompletion(allocator, root, &attempt) orelse
+                return error.RecoveryEvidenceMissing;
+            defer receipt.deinit();
+            try acknowledgePreparedNativeProgram(allocator, root, &attempt, receipt.document.digest_sha256);
+            if (attempt.record().state != .recovering)
+                try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification });
+            try attempt.complete(allocator, if (receipt.document.outcome == .succeeded) .succeeded else .failed_after_mutation);
+            var completion = try root_operation_completion.create(allocator, .{
+                .record = attempt.record(),
+                .transaction_provenance = .{
+                    .status = .already_present,
+                    .schema = native_provenance.schema_id,
+                    .document_sha256 = native_recovery.parseDigest(receipt.document.digest_sha256).?,
+                    .detail = "caller-acknowledged native fixture",
+                },
+                .journal = .{ .status = .absent, .detail = "native phases completed" },
+                .discharge = .{
+                    .surface = .repository_bootstrap,
+                    .operation = "add",
+                    .request_sha256 = attempt.record().request_sha256,
+                },
+            });
+            defer completion.deinit();
+            const store: root_operation_completion.Store = .init(root);
+            try store.publish(allocator, completion.document);
+            try attempt.publishProvenance(allocator, completion.document.digest_sha256);
+            try attempt.clear();
+        }
+        return result;
+    }
+    var caller_hash = Sha256.init(.{});
+    caller_hash.update("debz-native-caller-fixture-v1\x00");
+    caller_hash.update(raw_request);
+    var attempt = try coordinator.acquire(allocator, .{
+        .backend = .native,
+        .operation = .{ .repository_bootstrap = .add },
+        .request_sha256 = caller_hash.finalResult(),
+        .policy_sha256 = @splat(0x72),
+        .target_architecture = external.architecture,
+    });
+    defer attempt.release();
+    return executePreparedNativeProgram(
+        allocator,
+        root,
+        compiled.?,
+        archive_bytes,
+        &attempt,
+        locks,
+        std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
+        external.crash_at,
+    );
+}
+
 test "native_unpack.test.lifecycle external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_LIFECYCLE_REQUEST") orelse
         return error.SkipZigTest;
@@ -19297,6 +19750,9 @@ test "native_unpack.test.lifecycle external fixture" {
     );
     defer parsed.deinit();
     const external = parsed.value;
+    if ((external.caller_owned and (!external.recovery or external.fault != null)) or
+        (external.acknowledge_native and (!external.caller_owned or external.operation != .recover)))
+        return error.InvalidExternalLifecycleRequest;
     const archive_phase = switch (external.operation) {
         .install, .upgrade, .downgrade, .reinstall, .configure => true,
         .remove, .purge, .process_triggers, .recover => false,
@@ -19354,12 +19810,19 @@ test "native_unpack.test.lifecycle external fixture" {
             .allocator = testing.allocator,
             .io = testing.io,
         };
-        var result = recoverLifecycleProgram(
+        var result = (if (external.caller_owned) callerOwnedLifecycleFixture(
+            root,
+            external,
+            recovery_locks.interface(),
+            null,
+            &.{},
+            request_bytes,
+        ) else recoverLifecycleProgram(
             testing.allocator,
             root,
             external,
             recovery_locks.interface(),
-        ) catch |err| LifecycleResult{
+        )) catch |err| LifecycleResult{
             .outcome = .recovery_required,
             .detail = @errorName(err),
         };
@@ -19579,7 +20042,14 @@ test "native_unpack.test.lifecycle external fixture" {
         .allocator = testing.allocator,
         .io = testing.io,
     };
-    var result = executeLifecycleProgram(
+    var result = (if (external.caller_owned) callerOwnedLifecycleFixture(
+        root,
+        external,
+        locks.interface(),
+        &compiled,
+        archive_bytes,
+        request_bytes,
+    ) else executeLifecycleProgram(
         testing.allocator,
         root,
         external,
@@ -19591,7 +20061,7 @@ test "native_unpack.test.lifecycle external fixture" {
         locks.interface(),
         null,
         request_bytes,
-    ) catch |err| LifecycleResult{
+    )) catch |err| LifecycleResult{
         .outcome = .recovery_required,
         .detail = @errorName(err),
         .program_sha256 = compiled.program.program.digest_sha256,
@@ -19618,6 +20088,60 @@ test "native_unpack.test.borrowed native interpreter preserves caller hashes loc
     try testPreparedMixedLifecycle(true, .borrowed);
 }
 
+test "native_unpack.test.production request persists distinct bindings and awaits caller acknowledgment" {
+    try testPreparedMixedLifecycle(false, .production);
+    try testPreparedMixedLifecycle(true, .production);
+}
+
+test "native_unpack.test.production recovery resumes persisted preparation without fixture request hashes" {
+    try testPreparedMixedLifecycle(false, .production_resume);
+    try testPreparedMixedLifecycle(true, .production_resume);
+}
+
+test "native_unpack.test.production archives are rebound by digest rather than supplied order" {
+    var first_data = [_]Entry{
+        .{ .path = "first-file", .content = "first\n", .mode = 0o644 },
+    };
+    const first_bytes = try buildOwnedArchive(.{ .package = "first" }, &first_data);
+    defer testing.allocator.free(first_bytes);
+    var second_data = [_]Entry{
+        .{ .path = "second-file", .content = "second\n", .mode = 0o644 },
+    };
+    const second_bytes = try buildOwnedArchive(.{ .package = "second" }, &second_data);
+    defer testing.allocator.free(second_bytes);
+    var first = try modelOf(first_bytes);
+    defer first.deinit();
+    var second = try modelOf(second_bytes);
+    defer second.deinit();
+    var artifacts = [_]native_program.ProgramArtifact{
+        testArtifact(0, &first, first_bytes.len),
+        testArtifact(1, &second, second_bytes.len),
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rebound = try productionArchives(arena.allocator(), &artifacts, &.{ second_bytes, first_bytes });
+    try testing.expectEqualStrings("first", rebound.models[0].facts.package);
+    try testing.expectEqualStrings("second", rebound.models[1].facts.package);
+    try testing.expectEqualStrings(first_bytes, rebound.bytes[0]);
+    try testing.expectEqualStrings(second_bytes, rebound.bytes[1]);
+    try testing.expectError(error.RecoveryArtifactBindingMismatch, productionArchives(
+        arena.allocator(),
+        &artifacts,
+        &.{first_bytes},
+    ));
+    try testing.expectError(error.RecoveryArtifactBindingMismatch, productionArchives(
+        arena.allocator(),
+        &artifacts,
+        &.{ first_bytes, first_bytes },
+    ));
+    artifacts[0].application_sha256 = @splat('0');
+    try testing.expectError(error.RecoveryArtifactBindingMismatch, productionArchives(
+        arena.allocator(),
+        &artifacts,
+        &.{ first_bytes, second_bytes },
+    ));
+}
+
 test "native_unpack.test.borrowed preflight refusals leave operation cleanup to the caller" {
     try testPreparedMixedLifecycle(false, .stale_database);
     try testPreparedMixedLifecycle(false, .wrong_plan);
@@ -19631,6 +20155,8 @@ test "native_unpack.test.borrowed preflight refusals leave operation cleanup to 
 const MixedLifecycleCase = enum {
     owned,
     borrowed,
+    production,
+    production_resume,
     stale_database,
     wrong_plan,
     foreign_root,
@@ -19856,20 +20382,52 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         } else try caller.abandonIfPreMutation(testing.allocator);
         return;
     }
-    const result = try executeLifecycleProgramInOperation(
-        testing.allocator,
-        root,
-        external,
-        &compiled,
-        &models,
-        &.{bytes},
-        fixture.snapshot(),
-        database.model,
-        locks.interface(),
-        null,
-        null,
-        if (case == .owned) null else &caller,
-    );
+    const production = case == .production or case == .production_resume;
+    if (case == .production_resume) {
+        try native_operation.bind(testing.allocator, root, &caller, compiled.program.program);
+        const document = try native_execution_request.create(root, &caller, compiled.program.program, .install);
+        const request_bytes = try native_execution_request.encode(arena.allocator(), document);
+        _ = try prepareNativeRecovery(
+            arena.allocator(),
+            root,
+            productionLifecycleRequest(document, null),
+            &compiled,
+            request_bytes,
+            &.{bytes},
+            fixture.snapshot(),
+            &caller,
+            document,
+        );
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+    }
+    const result = if (case == .production_resume)
+        try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null)
+    else if (production)
+        try executePreparedNativeProgram(
+            testing.allocator,
+            root,
+            &compiled,
+            &.{bytes},
+            &caller,
+            locks.interface(),
+            .install,
+            null,
+        )
+    else
+        try executeLifecycleProgramInOperation(
+            testing.allocator,
+            root,
+            external,
+            &compiled,
+            &models,
+            &.{bytes},
+            fixture.snapshot(),
+            database.model,
+            locks.interface(),
+            null,
+            null,
+            if (case == .owned) null else &caller,
+        );
     if (case == .stale_database) {
         try testing.expectEqual(LifecycleOutcome.refused, result.outcome);
         try testing.expectEqualStrings("database_generation_drift", result.detail);
@@ -19885,7 +20443,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         std.debug.print("mixed native execution failed: {any}\n", .{result});
         return error.TestUnexpectedResult;
     }
-    if (case == .borrowed) {
+    if (case == .borrowed or production) {
         try testing.expect(caller.locked());
         try testing.expectEqual(root_operation.State.mutating, caller.record().state);
         try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
@@ -19896,6 +20454,69 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expectEqual(compiled.authorization.authorization.digest_sha256, caller.record().authorization_sha256.?);
         try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);
         try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation_completion.document_path)) == null);
+        if (production) {
+            var intent = try native_recovery.readIntent(testing.allocator, root);
+            defer intent.deinit();
+            const blob = intent.intent.blobs[0];
+            try testing.expectEqual(native_recovery.BlobKind.request, blob.kind);
+            try testing.expectEqualStrings(native_execution_request.logical_path, blob.logical_path);
+            try testing.expect(!std.mem.eql(u8, &blob.sha256, &intent.intent.request_sha256));
+            const request_bytes = try native_recovery.verifyBlob(testing.allocator, root, blob);
+            defer testing.allocator.free(request_bytes);
+            var request = try native_execution_request.decode(testing.allocator, request_bytes);
+            defer request.deinit();
+            try native_execution_request.validateBinding(request.document, root, &caller, compiled.program.program);
+            try testing.expectError(error.InvalidRecoveryIntent, validatePersistedLifecycleRequest(testing.allocator, root, intent.intent));
+            var changed_request = request.document;
+            changed_request.caller.policy_sha256 = @splat('3');
+            native_execution_request.seal(&changed_request);
+            try testing.expectError(error.RecoveryRequestBindingMismatch, native_execution_request.validateBinding(changed_request, root, &caller, compiled.program.program));
+            const noncanonical = try std.mem.concat(testing.allocator, u8, &.{ request_bytes, "\n" });
+            defer testing.allocator.free(noncanonical);
+            try testing.expectError(error.NonCanonicalDocument, native_execution_request.decode(testing.allocator, noncanonical));
+            var receipt = try readProductionCompletion(testing.allocator, root, &caller) orelse
+                return error.TestUnexpectedResult;
+            defer receipt.deinit();
+            try testing.expectEqual(native_provenance.Outcome.succeeded, receipt.document.outcome);
+            try testing.expectEqual(request.document.caller.request_sha256, receipt.document.request_sha256);
+            try testing.expectEqual(request.document.caller.policy_sha256, receipt.document.policy_sha256);
+            try testing.expectError(error.NativeRecoveryRequired, executePreparedNativeProgram(
+                testing.allocator,
+                root,
+                &compiled,
+                &.{bytes},
+                &caller,
+                locks.interface(),
+                .install,
+                null,
+            ));
+            // Outer work may change the database after native completion. A
+            // repeated native recovery consumes the receipt, not package work.
+            const current_status = try root.readFileAlloc(arena.allocator(), try root_fs.Path.init("var/lib/dpkg/status"), 1024 * 1024);
+            const outer_status = try std.mem.concat(arena.allocator(), u8, &.{ current_status, "\n" });
+            try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), outer_status, .{});
+            const repeated = try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null);
+            try testing.expectEqual(LifecycleOutcome.applied, repeated.outcome);
+            try testing.expectEqualStrings("awaiting_caller_acknowledgment", repeated.detail);
+            try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
+            try testing.expectError(error.InvalidRecoveryProvenance, acknowledgePreparedNativeProgram(
+                testing.allocator,
+                root,
+                &caller,
+                @splat('0'),
+            ));
+            try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null);
+            // Retry also works if a previous acknowledgment stopped partway
+            // through cleanup: immutable evidence supplies the original set.
+            try root.removeFile(try root_fs.Path.init(native_recovery.progress_path));
+            try acknowledgePreparedNativeProgram(testing.allocator, root, &caller, receipt.document.digest_sha256);
+            try acknowledgePreparedNativeProgram(testing.allocator, root, &caller, receipt.document.digest_sha256);
+            try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+            try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.workspace_directory)) == null);
+            try native_provenance.verifyEvidence(testing.allocator, root, receipt.document);
+            const after_ack = try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null);
+            try testing.expectEqual(LifecycleOutcome.applied, after_ack.outcome);
+        }
         try caller.advance(testing.allocator, .{ .state = .mutating, .phase = .mutation });
         try caller.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
         try caller.complete(testing.allocator, .succeeded);

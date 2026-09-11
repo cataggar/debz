@@ -59,9 +59,13 @@ bridge cannot be treated as native authority.
 The private v1 owned execution/recovery path retains its original binding for
 compatibility. Its fixture request cannot describe the separate caller hash
 domains, so borrowing it as a production recovery request is explicitly
-refused before mutation. Production request persistence, recovery, helper
-deployment, and CLI selection remain pending item-15b integration; this
-internal ownership boundary does not enable public native execution.
+refused before mutation. The separate typed
+[production request and recovery boundary](native-recovery.md#caller-owned-production-request-and-completion)
+persists both hash domains, resumes original inputs, and publishes native
+terminal evidence without completing the caller. Cleanup requires explicit
+receipt acknowledgment. Helper deployment and public runtime/CLI selection
+remain pending item-15b integration; these private boundaries do not enable
+public native execution.
 
 ## Independent reference acceptance
 

@@ -1,7 +1,7 @@
 # Native recovery and provenance
 
-Item 14 adds a private durable execution boundary around the compiled native
-lifecycle. Production native selection remains unavailable; this does not
+Items 14 and 15b provide private durable execution boundaries around the compiled
+native lifecycle, including caller-owned operations. Production native selection remains unavailable; this does not
 enable a CLI or product cutover and does not change legacy recovery.
 
 ## Durable execution authority
@@ -58,6 +58,8 @@ Neither a completed handler nor its queued activation may be duplicated.
 
 ## Provenance and completion
 
+### Private v1 operation ownership
+
 Detailed native provenance binds the original execution and progress head to
 phase results, script outcomes, trigger work, verification, recovery history,
 and terminal outcome. Publication occurs under the same outer root lock:
@@ -86,6 +88,48 @@ record must not leave stale workspace state that permanently blocks the next
 operation. Unresolved mutation or script evidence remains a typed recovery
 requirement rather than a successful transaction.
 
+### Caller-owned production request and completion
+
+`debz.native_execution_request` defines the canonical
+[`native-execution-request-v1`](../schema/native-execution-request-v1.json)
+document. It separately binds the caller's attempt, operation, request and
+policy to the native program's solver request/policy, executor policy, actual
+solver plan, authorization, lock, artifacts, initial database and script policy.
+Root path, physical inode, architecture and runtime options are also bound.
+The request has its own domain-separated semantic digest and canonical bytes
+with a trailing newline.
+
+The existing intent v1 stores this document as a separately byte-hashed request
+blob. Its native request hash continues to mean the solver/lock request, not the
+hash of this new document. No fields or hash domains are added to existing
+intent, program, progress or provenance documents. Private fixture requests
+remain readable but cannot authorize caller-owned recovery.
+
+The private typed adapter persists this mapping before package mutation and
+reproduces application models from exact program-bound archive bytes. Supplied
+archives are matched by digest rather than caller ordering. Recovery loads the
+original database and archives, without re-solving or accepting replacement
+caller inputs, under the original caller-owned root attempt.
+
+Native package completion publishes terminal native progress and provenance
+without completing, clearing or releasing the outer operation. The immutable
+receipt bundle includes the production request as `execution_request`
+evidence. Repository/configuration work can continue while the outer operation
+remains pending. Repeated native recovery consumes that terminal receipt,
+rather than rerunning scripts or mistaking later outer database changes for
+unfinished package work.
+
+Only explicit acknowledgment of the exact native receipt digest under the
+original caller's held lock removes active native recovery evidence. Cleanup
+can be retried from immutable retained intent/progress even after some active
+files have been removed. The caller separately owns its completion statement,
+provenance discharge and root-attempt release. Unresolved native work cannot
+be acknowledged as completed.
+
+These adapters are still private. Helper deployment/capability enforcement and
+public product/CLI wiring remain required before experimental native selection
+can be exposed; legacy stays default and there is no fallback.
+
 ## Independent acceptance
 
 `tools/test-native-recovery.py` runs native execution in real guarded chroots
@@ -108,6 +152,14 @@ trigger continuation, completion windows, and changed intent/progress/artifact
 or managed-root evidence, including drift after a completed phase and stale
 receipts with newer unresolved work. Existing exhaustive primitive crash coverage is
 reused rather than duplicated as a cross-product.
+
+Caller-owned fixtures additionally crash at preparation, filesystem publication,
+recorded script outcomes and native provenance publication. They preserve
+distinct caller hashes, exercise known failure compensation, leave outer
+completion pending until acknowledgment, and reject a rehashed request that
+substitutes caller policy. Mixed genuine production-preparation units cover
+install/remove and install/purge, including repeated recovery after outer
+database work and interrupted acknowledgment cleanup.
 
 ```sh
 zig build test-native-recovery -j2

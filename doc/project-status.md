@@ -123,9 +123,12 @@ origins and the complete installed/residual closure, and the private interpreter
 accepts its mixed install/remove and install/purge programs. Its caller-owned
 operation boundary preserves the outer request/policy/plan hashes and leaves
 the caller's lock, mutation state, completion, and cleanup under caller control.
-Production request persistence/recovery, helper deployment, and CLI integration
-remain incomplete; native selection is still unavailable and legacy remains
-default.
+Its versioned `debz.native_execution_request` now persists distinct caller and
+program bindings. Private typed recovery restores the original inputs, publishes
+native terminal receipts without completing the outer operation, and retains
+active evidence until the caller acknowledges the exact receipt. Helper
+deployment/capability enforcement and public runtime/CLI integration remain
+incomplete; native selection is still unavailable and legacy remains default.
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
