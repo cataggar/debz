@@ -89,6 +89,18 @@ pub const WorkflowRequest = struct {
     finalize_ownership: bool = false,
     ownership_acknowledgment: ?WorkflowOwnershipAcknowledgment = null,
     recovery_acknowledgment: ?WorkflowRecoveryAcknowledgment = null,
+
+    fn directive(self: WorkflowRequest) WorkflowDirective {
+        return .{
+            .operation = self.operation,
+            .mode = self.mode,
+            .defer_recovery_clear = self.defer_recovery_clear,
+            .orchestration_id = self.orchestration_id,
+            .recovery_review_claim = self.recovery_review_claim,
+            .expected_ownership_marker = self.expected_ownership_marker,
+            .root_attempt_id = self.root_attempt_id,
+        };
+    }
 };
 
 const WorkflowDirective = struct {
@@ -245,13 +257,22 @@ pub const Backend = struct {
         };
         if (!count_valid)
             return api.failure(operation, .usage, .invalid_request, "invalid workflow selector count");
-        if (self.transaction_backend == .native and
-            (workflow.mode == .reserve or workflow.defer_recovery_clear or
-                workflow.orchestration_id != null or workflow.recovery_review_claim != null or
-                workflow.expected_ownership_marker != null or workflow.root_attempt_id != null or
-                workflow.reconciliation_claim != null or workflow.finalize_ownership or
-                workflow.ownership_acknowledgment != null or workflow.recovery_acknowledgment != null))
-            return api.failure(operation, .unavailable, .transaction_backend_unavailable, "native deferred workflow ownership is not available");
+        if (self.transaction_backend == .native) {
+            if (workflow.reconciliation_claim != null or
+                (workflow.expected_ownership_marker != null and
+                    workflow.expected_ownership_marker.?.state == .pre_mutation_reconciliation_claim) or
+                (workflow.ownership_acknowledgment != null and
+                    workflow.ownership_acknowledgment.?.marker.state == .pre_mutation_reconciliation_claim))
+                return api.failure(operation, .unavailable, .transaction_backend_unavailable, "native clean reconciliation is not available");
+            if (workflow.orchestration_id == null and
+                (workflow.mode == .reserve or workflow.defer_recovery_clear or
+                    workflow.recovery_review_claim != null or workflow.expected_ownership_marker != null or
+                    workflow.root_attempt_id != null))
+                return api.failure(operation, .usage, .invalid_request, "native ownership requests require an outer attempt identity");
+            if (workflow.orchestration_id != null and
+                (workflow.mode == .plan_only or workflow.mode == .download_only))
+                return api.failure(operation, .usage, .invalid_request, "non-mutating native workflows cannot acquire ownership");
+        }
         if (workflow.mode == .plan_only and workflow.options.lock_output_path == null)
             return api.failure(operation, .usage, .configuration_required, "plan-only workflow requires an exact-lock output path");
         if (workflow.mode == .reserve or
@@ -303,9 +324,9 @@ pub const Backend = struct {
             .packages = packages,
             .options = workflow.options,
         };
-        if (self.transaction_backend == .native and workflow.mode == .recover)
-            return self.recoverNative(allocator, request, workflowSemanticSurface(workflow.operation)) catch |err|
-                mapRuntimeError(operation, err);
+        if (self.transaction_backend == .native and workflow.mode == .recover and
+            nativeRecoveryHasReplacement(workflow.options))
+            return api.failure(operation, .usage, .invalid_request, "native recovery uses persisted inputs, not replacement repositories, locks, or force policy");
         if (workflow.reconciliation_claim) |claim| {
             if (workflow.mode != .recover or
                 workflow.orchestration_id == null or
@@ -350,6 +371,7 @@ pub const Backend = struct {
                 workflow.operation,
                 acknowledgment,
                 workflow.recovery_review_claim,
+                workflow.expected_ownership_marker,
             ) catch |err| mapRuntimeError(operation, err);
         }
         if (workflow.finalize_ownership) {
@@ -384,15 +406,11 @@ pub const Backend = struct {
                 .invalid_request,
                 "unexpected orchestration ownership acknowledgment",
             );
-        return self.withRepositories(allocator, request, .{
-            .operation = workflow.operation,
-            .mode = workflow.mode,
-            .defer_recovery_clear = workflow.defer_recovery_clear,
-            .orchestration_id = workflow.orchestration_id,
-            .recovery_review_claim = workflow.recovery_review_claim,
-            .expected_ownership_marker = workflow.expected_ownership_marker,
-            .root_attempt_id = workflow.root_attempt_id,
-        }) catch |err| mapRuntimeError(operation, err);
+        if (self.transaction_backend == .native and workflow.mode == .recover)
+            return self.recoverNative(allocator, request, workflow.directive()) catch |err|
+                mapRuntimeError(operation, err);
+        return self.withRepositories(allocator, request, workflow.directive()) catch |err|
+            mapRuntimeError(operation, err);
     }
 
     pub fn packageCacheFingerprint(
@@ -668,13 +686,11 @@ pub const Backend = struct {
         self: *Backend,
         allocator: std.mem.Allocator,
         request: api.Request,
-        workflow_operation: ?api.Operation,
+        workflow: ?WorkflowDirective,
     ) !api.Result {
         if (!request.options.assume_yes)
             return api.failure(.recover, .usage, .confirmation_required, "native recovery requires explicit confirmation");
-        if (request.options.lock_input_path != null or request.options.lock_output_path != null or
-            request.options.source_paths.len != 0 or request.options.config_paths.len != 0 or
-            request.options.keyring_paths.len != 0 or request.options.force.len != 0)
+        if (nativeRecoveryHasReplacement(request.options))
             return api.failure(.recover, .usage, .invalid_request, "native recovery uses persisted inputs, not replacement repositories, locks, or force policy");
         var guard: RootOperationGuard = .{
             .backend = self,
@@ -682,12 +698,14 @@ pub const Backend = struct {
             .native_owned = true,
         };
         defer guard.deinit();
+        guard.applyWorkflow(workflow);
         if (guard.open(allocator, request, .{ .package_transaction = .recover })) |failure|
             return failure;
         const attempt = guard.active().?;
         if (attempt.record().operation != .package_transaction)
             return blockedRecovery(.recover, "native attempt belongs to a different product surface");
-        if (workflow_operation) |original_operation| {
+        if (workflow) |directive| {
+            const original_operation = workflowSemanticSurface(directive.operation);
             var original_request = request;
             original_request.operation = original_operation;
             if (attempt.adopted and
@@ -786,6 +804,12 @@ pub const Backend = struct {
             !std.mem.eql(u8, &document.transaction_provenance.document_sha256.?, &receipt_digest) or
             document.transaction_provenance.status == .unavailable or document.journal.status != .absent)
             return error.InvalidNativeCompletion;
+        const defer_clear = guard.orchestration_id != null and
+            (guard.ownership_marker == null or guard.ownership_marker.?.state != .released) and
+            (guard.preserve_settled or receipt.outcome == .failed or
+                (guard.ownership_marker != null and guard.ownership_marker.?.state == .pending));
+        if (defer_clear)
+            try guard.retainNativeCompletion(allocator, document);
         if (attempt.record().provenance == .pending) {
             if (!std.mem.eql(u8, &document.record_digest_sha256, &attempt.record().digest_sha256) or
                 document.record_generation != attempt.record().generation)
@@ -796,9 +820,25 @@ pub const Backend = struct {
             !std.mem.eql(u8, &attempt.record().provenance_sha256.?, &document.digest_sha256))
             return error.InvalidNativeCompletion;
         try guard.crash(.after_provenance_published);
-        try native_runtime.acknowledge(allocator, attempt, receipt.digest_sha256);
-        try guard.crash(.after_native_acknowledged);
-        try attempt.clear();
+        if (defer_clear) {
+            guard.preserve_settled = true;
+            try guard.crash(.before_deferred_recovery_return);
+        } else {
+            try native_runtime.acknowledge(allocator, attempt, receipt.digest_sha256);
+            try guard.crash(.after_native_acknowledged);
+            if (guard.orchestration_id == null) {
+                try attempt.clear();
+            } else {
+                _ = try guard.coordinator.store().retainOwnedTerminal(allocator, .{
+                    .authorization = root_operation.authorizationFromTrustedMarker(
+                        guard.ownership_marker orelse return error.AuthorizationEvidenceMissing,
+                    ),
+                    .terminal_state = .released,
+                    .observer = guard.cleanupObserver(),
+                });
+                guard.preserve_settled = true;
+            }
+        }
         if (receipt.outcome == .succeeded)
             return success(request.operation, true, summary, &.{});
         var failed = api.failure(request.operation, .transaction, .transaction_failed, summary);
@@ -905,8 +945,20 @@ pub const Backend = struct {
             .native_owned = true,
         };
         defer guard.deinit();
+        guard.applyWorkflow(workflow);
         if (guard.open(allocator, request, .{ .package_transaction = request.operation })) |failure|
             return failure;
+        const held = guard.active().?;
+        if (held.adopted and
+            (!std.mem.eql(u8, &held.record().request_sha256, &productRequestDigest(request)) or
+                !std.mem.eql(u8, &held.record().policy_sha256, &planningPolicyDigest(.native, request.options))))
+            return blockedRecovery(request.operation, "native reservation belongs to a different request or policy");
+        if (held.record().program_sha256 != null or !held.record().state.provenPreMutation())
+            return blockedRecovery(request.operation, "native execution has already been prepared; recover the original persisted attempt");
+        if (workflowMode(request.operation, workflow) == .reserve) {
+            guard.preserve_pre_mutation = true;
+            return success(request.operation, false, "root operation ownership reserved", &.{});
+        }
         const result = self.withRepositoriesGuarded(allocator, request, workflow, &guard) catch |err| failure: {
             const attempt = guard.active().?;
             if (!try native_runtime.canAbandon(allocator, attempt)) {
@@ -946,26 +998,7 @@ pub const Backend = struct {
         defer local_guard.deinit();
         const guard = native_guard orelse &local_guard;
         if (native_guard == null) {
-            guard.preserve_settled = if (workflow) |directive|
-                directive.mode == .recover and directive.defer_recovery_clear
-            else
-                false;
-            guard.orchestration_id = if (workflow) |directive|
-                directive.orchestration_id
-            else
-                null;
-            guard.recovery_review_claim = if (workflow) |directive|
-                directive.recovery_review_claim
-            else
-                null;
-            guard.expected_ownership_marker = if (workflow) |directive|
-                directive.expected_ownership_marker
-            else
-                null;
-            guard.root_attempt_id = if (workflow) |directive|
-                directive.root_attempt_id
-            else
-                null;
+            guard.applyWorkflow(workflow);
             if (guard.preserve_settled and
                 guard.orchestration_id == null)
                 return api.failure(
@@ -1837,6 +1870,7 @@ pub const Backend = struct {
         semantic_operation: WorkflowSemanticOperation,
         acknowledgment: WorkflowRecoveryAcknowledgment,
         recovery_review_claim: ?root_operation.RecoveryReviewClaim,
+        expected_ownership_marker: ?root_operation.DeferredAcknowledgment,
     ) !api.Result {
         var owned_root = root_fs.openAbsoluteRoot(
             self.io,
@@ -1846,12 +1880,15 @@ pub const Backend = struct {
             "the live root is unavailable while acknowledging recovery",
         );
         defer owned_root.close();
+        if (self.transaction_backend == .native)
+            validateNativeRoot(self.io, owned_root.root) catch |err|
+                return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
             .io = self.io,
         };
         const lock_backend = locks.interface();
-        const coordinator = root_operation.Coordinator.open(
+        var coordinator = root_operation.Coordinator.open(
             self.io,
             owned_root.root,
             request.options.install_root,
@@ -1887,6 +1924,9 @@ pub const Backend = struct {
             ),
         };
         defer if (record) |*owned| owned.deinit();
+        if (self.transaction_backend == .native and record == null and
+            try owned_root.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null)
+            return blockedRecovery(request.operation, "native acknowledgment lost its original active record");
         if (marker == null) {
             if (record != null) return blockedRecovery(
                 request.operation,
@@ -1948,6 +1988,9 @@ pub const Backend = struct {
             );
         }
         var observed_marker = marker.?;
+        if (self.transaction_backend == .native and
+            !nativeAcknowledgmentMatchesOwner(observed_marker, expected_ownership_marker, recovery_review_claim))
+            return blockedRecovery(request.operation, "native acknowledgment requires the authenticated exact v2 owner");
         if (observed_marker.state == .bound or
             observed_marker.completion_sha256 == null or
             observed_marker.provenance_sha256 == null or
@@ -2007,7 +2050,7 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery acknowledgment token is stale or foreign",
             );
-        if (observed_marker.state == .pending) {
+        if (observed_marker.state == .pending or (self.transaction_backend == .native and record != null)) {
             const active = if (record) |owned|
                 owned.record
             else
@@ -2052,6 +2095,14 @@ pub const Backend = struct {
                 );
         }
         var acknowledged_marker = observed_marker;
+        if (self.transaction_backend == .native) {
+            if (record) |owned| {
+                self.acknowledgeNativeCompletion(allocator, &coordinator, token, owned, document) catch |err| switch (err) {
+                    error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+                    else => return nativeFailure(request.operation, err, owned.record.mutation_started),
+                };
+            }
+        }
         if (observed_marker.state == .pending) {
             if (self.completion_crash) |crash|
                 try crash.hit(.before_deferred_acknowledged);
@@ -2093,7 +2144,8 @@ pub const Backend = struct {
             owned.deinit();
             record = null;
         }
-        _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
+        if (self.transaction_backend == .legacy_dpkg)
+            _ = deleteRecoveryIntent(self.io, request.options.state_path) catch {};
         return success(
             request.operation,
             false,
@@ -2140,12 +2192,15 @@ pub const Backend = struct {
             "the live root is unavailable while finalizing ownership",
         );
         defer owned_root.close();
+        if (self.transaction_backend == .native)
+            validateNativeRoot(self.io, owned_root.root) catch |err|
+                return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
             .io = self.io,
         };
         const lock_backend = locks.interface();
-        const coordinator = root_operation.Coordinator.open(
+        var coordinator = root_operation.Coordinator.open(
             self.io,
             owned_root.root,
             request.options.install_root,
@@ -2171,6 +2226,9 @@ pub const Backend = struct {
             "lower ownership record is unreadable",
         );
         defer if (record) |*owned| owned.deinit();
+        if (self.transaction_backend == .native and record == null and
+            try owned_root.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null)
+            return blockedRecovery(request.operation, "native ownership lost its original active record");
         if (marker == null) {
             if (record != null) return blockedRecovery(
                 request.operation,
@@ -2271,6 +2329,8 @@ pub const Backend = struct {
         else
             acknowledgment.marker;
         if (observed.state == .pre_mutation_reconciliation_claim) {
+            if (self.transaction_backend == .native)
+                return blockedRecovery(request.operation, "native clean reconciliation is not available");
             const claim = observed.pre_mutation_claim orelse
                 return blockedRecovery(
                     request.operation,
@@ -2429,6 +2489,26 @@ pub const Backend = struct {
             request.operation,
             "lower ownership record is unfinished, incompatible, or foreign",
         );
+        var native_completion: ?root_operation_completion.OwnedDocument = null;
+        defer if (native_completion) |*value| value.deinit();
+        if (self.transaction_backend == .native) {
+            if (record) |owned| {
+                if (owned.record.backend != .native or owned.record.operation != .package_transaction or
+                    owned.record.operation.package_transaction != workflowSemanticSurface(workflow_operation))
+                    return blockedRecovery(request.operation, "native ownership belongs to a different backend or operation");
+                if (owned.record.program_sha256 != null) {
+                    native_completion = root_operation_completion.Store.init(owned_root.root).read(allocator) catch |err| switch (err) {
+                        error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+                        else => return blockedRecovery(request.operation, "native ownership completion is unreadable"),
+                    };
+                    if (native_completion == null or
+                        !nativeCompletionMatchesRecord(native_completion.?.document, owned.record, request))
+                        return blockedRecovery(request.operation, "native ownership completion is missing, stale, or foreign");
+                } else if (try owned_root.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null) {
+                    return blockedRecovery(request.operation, "native ownership has unbound active evidence");
+                }
+            }
+        }
         if (recovery_review_claim) |expected_review| {
             store.exchangeRecoveryReviewClaimForOwnership(
                 allocator,
@@ -2454,6 +2534,11 @@ pub const Backend = struct {
                     expected_review,
                 );
         }
+        if (native_completion) |value|
+            self.acknowledgeNativeCompletion(allocator, &coordinator, token, record.?, value.document) catch |err| switch (err) {
+                error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+                else => return nativeFailure(request.operation, err, record.?.record.mutation_started),
+            };
         store.cleanupOwned(allocator, .{
             .authorization = root_operation.authorizationFromTrustedMarker(observed),
             .terminal_state = if (compatibility == .abandoned_without_record or
@@ -2477,6 +2562,41 @@ pub const Backend = struct {
             "lower orchestration ownership finalized",
             &.{},
         );
+    }
+
+    fn acknowledgeNativeCompletion(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        coordinator: *root_operation.Coordinator,
+        token: root_operation.LockToken,
+        owned: root_operation.OwnedRecord,
+        completion: root_operation_completion.Document,
+    ) !void {
+        // The acknowledgment path already owns this real rank-0 lock and
+        // record. Borrow both for native cleanup without a second acquisition
+        // or transferring their release/deinit responsibilities.
+        var borrowed: root_operation.Attempt = .{
+            .coordinator = coordinator,
+            .token = token,
+            .owned = owned,
+            .entered = .initEmpty(),
+            .highest = .root_operation,
+            .adopted = true,
+            .bridge = .none,
+        };
+        var receipt = try native_runtime.readCompletion(allocator, &borrowed) orelse
+            return error.NativeReceiptRequired;
+        defer receipt.deinit();
+        const digest = native_recovery.parseDigest(receipt.document.digest_sha256) orelse
+            return error.InvalidNativeReceipt;
+        const expected_outcome: root_operation.Outcome =
+            if (receipt.document.outcome == .succeeded) .succeeded else .failed_after_mutation;
+        if (completion.transaction_provenance.document_sha256 == null or
+            !std.mem.eql(u8, &digest, &completion.transaction_provenance.document_sha256.?) or
+            completion.outcome != expected_outcome)
+            return error.InvalidNativeCompletion;
+        try native_runtime.acknowledge(allocator, &borrowed, receipt.document.digest_sha256);
+        if (self.completion_crash) |crash| try crash.hit(.after_native_acknowledged);
     }
 
     fn claimWorkflowReconciliation(
@@ -3057,11 +3177,75 @@ fn productRequestDigest(request: api.Request) [32]u8 {
     return hash.finalResult();
 }
 
+fn validateNativeRoot(io: std.Io, root: root_fs.Root) !void {
+    var host = root_fs.openAbsoluteRoot(io, "/") catch return error.HostRootNotSupported;
+    defer host.close();
+    const held = try root.rootEntry();
+    const host_entry = try host.root.rootEntry();
+    if (held.device == host_entry.device and held.inode == host_entry.inode)
+        return error.HostRootNotSupported;
+}
+
+fn nativeRecoveryHasReplacement(options: api.CommonOptions) bool {
+    return options.lock_input_path != null or options.lock_output_path != null or
+        options.source_paths.len != 0 or options.config_paths.len != 0 or
+        options.keyring_paths.len != 0 or options.force.len != 0;
+}
+
+fn nativeAcknowledgmentMatchesOwner(
+    observed: root_operation.DeferredAcknowledgment,
+    expected: ?root_operation.DeferredAcknowledgment,
+    review: ?root_operation.RecoveryReviewClaim,
+) bool {
+    if (observed.document_version != root_operation.deferred_ack_v2_schema_version) return true;
+    var owner = expected orelse return false;
+    if (owner.state == .pending and observed.state == .acknowledged) {
+        const acknowledged = root_operation.createDeferredAcknowledgment(.{
+            .state = .acknowledged,
+            .attempt_id = owner.attempt_id,
+            .completion_sha256 = owner.completion_sha256,
+            .provenance_sha256 = owner.provenance_sha256,
+            .acknowledgment_id = owner.acknowledgment_id,
+        }) catch return false;
+        owner = if (owner.document_version == root_operation.deferred_ack_v2_schema_version)
+            root_operation.carryDeferredAcknowledgmentReviewOwner(acknowledged, owner) catch return false
+        else
+            acknowledged;
+    }
+    if (review) |claim| {
+        if (observed.recovery_review_claim_sha256 != null and
+            std.mem.eql(u8, &observed.recovery_review_claim_sha256.?, &claim.digest_sha256))
+            owner = root_operation.bindDeferredAcknowledgmentToRecoveryReview(owner, claim) catch return false;
+    }
+    return root_operation.deferredAcknowledgmentExactEqual(observed, owner);
+}
+
+fn nativeCompletionMatchesRecord(
+    document: root_operation_completion.Document,
+    record: root_operation.Record,
+    recovery_request: api.Request,
+) bool {
+    if (record.backend != .native or record.operation != .package_transaction or
+        record.state != .completed or record.provenance != .published or
+        record.provenance_sha256 == null or !document.bindsRecord(record))
+        return false;
+    var original_request = recovery_request;
+    original_request.operation = record.operation.package_transaction;
+    return std.mem.eql(u8, &record.request_sha256, &productRequestDigest(original_request)) and
+        std.mem.eql(u8, &record.provenance_sha256.?, &document.digest_sha256) and
+        document.journal.status == .absent and
+        document.transaction_provenance.status == .already_present and
+        document.transaction_provenance.document_sha256 != null and
+        std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id);
+}
+
 fn recoveryCompletionMatchesRecord(
     document: root_operation_completion.Document,
     record: root_operation.Record,
     recovery_request: api.Request,
 ) bool {
+    if (record.backend == .native)
+        return nativeCompletionMatchesRecord(document, record, recovery_request);
     const original_operation: api.Operation = switch (record.operation) {
         .package_transaction => |operation| operation,
         .repository_bootstrap => return false,
@@ -3181,6 +3365,48 @@ const RootOperationGuard = struct {
 
     const Completion = enum { succeeded, failed, recovered };
 
+    fn applyWorkflow(self: *RootOperationGuard, workflow: ?WorkflowDirective) void {
+        const directive = workflow orelse return;
+        self.preserve_settled = directive.mode == .recover and directive.defer_recovery_clear;
+        self.orchestration_id = directive.orchestration_id;
+        self.recovery_review_claim = directive.recovery_review_claim;
+        self.expected_ownership_marker = directive.expected_ownership_marker;
+        self.root_attempt_id = directive.root_attempt_id;
+    }
+
+    fn retainNativeCompletion(
+        self: *RootOperationGuard,
+        allocator: std.mem.Allocator,
+        document: root_operation_completion.Document,
+    ) !void {
+        const owner = self.ownership_marker orelse return error.AuthorizationEvidenceMissing;
+        if (owner.state != .bound and owner.state != .pending)
+            return error.InvalidNativeCompletion;
+        const base = try root_operation.createDeferredAcknowledgment(.{
+            .state = .pending,
+            .attempt_id = self.active().?.record().attempt_id,
+            .completion_sha256 = document.digest_sha256,
+            .provenance_sha256 = document.digest_sha256,
+            .acknowledgment_id = self.orchestration_id.?,
+        });
+        const pending = if (owner.recovery_review_claim_sha256 != null)
+            try root_operation.carryDeferredAcknowledgmentReviewOwner(base, owner)
+        else
+            base;
+        const store = self.coordinator.store();
+        const current = try store.readDeferredAcknowledgment(allocator) orelse
+            return error.AuthorizationEvidenceMissing;
+        if (!root_operation.deferredAcknowledgmentExactEqual(current, owner))
+            return error.InvalidNativeCompletion;
+        if (owner.state == .pending) {
+            if (!root_operation.deferredAcknowledgmentExactEqual(owner, pending))
+                return error.InvalidNativeCompletion;
+        } else {
+            try store.publishDeferredAcknowledgment(allocator, pending);
+        }
+        self.ownership_marker = pending;
+    }
+
     /// Pointer to the live attempt, never a copy: every boundary must be
     /// published on the record this guard owns.
     fn active(self: *RootOperationGuard) ?*root_operation.Attempt {
@@ -3246,17 +3472,9 @@ const RootOperationGuard = struct {
             .invalid_request,
             "install root is unsafe or unavailable",
         );
-        if (self.native_owned) {
-            var host = root_fs.openAbsoluteRoot(self.backend.io, "/") catch
-                return nativeFailure(request.operation, error.HostRootNotSupported, false);
-            defer host.close();
-            const held = self.owned_root.?.root.rootEntry() catch |err|
+        if (self.native_owned)
+            validateNativeRoot(self.backend.io, self.owned_root.?.root) catch |err|
                 return nativeFailure(request.operation, err, false);
-            const host_entry = host.root.rootEntry() catch |err|
-                return nativeFailure(request.operation, err, false);
-            if (held.device == host_entry.device and held.inode == host_entry.inode)
-                return nativeFailure(request.operation, error.HostRootNotSupported, false);
-        }
         self.locks = .{ .allocator = allocator, .io = self.backend.io };
         self.coordinator = root_operation.Coordinator.open(
             self.backend.io,
@@ -3266,7 +3484,12 @@ const RootOperationGuard = struct {
         ) catch |err| return mapRootOperationError(request.operation, err);
         self.coordinator.now_unix = self.backend.now_unix;
         self.attempt = self.coordinator.acquire(allocator, .{
-            .intent = if (request.operation == .recover) .recovery else .mutation,
+            .intent = if (request.operation == .recover)
+                .recovery
+            else if (self.native_owned and self.orchestration_id != null)
+                .same_operation
+            else
+                .mutation,
             // A record that never left the pre-mutation states is durable
             // proof that nothing was touched, so a crashed attempt does not
             // strand the root. Anything from the executor bridge onwards is
@@ -3612,9 +3835,20 @@ const RootOperationGuard = struct {
 
     fn abandonNativeIfSafe(self: *RootOperationGuard) !void {
         const attempt = self.active() orelse return;
-        if (self.crashed or !attempt.record().state.provenPreMutation()) return;
-        if (try native_runtime.canAbandon(self.allocator, attempt))
+        if (self.crashed or self.preserve_pre_mutation or !attempt.record().state.provenPreMutation()) return;
+        if (!try native_runtime.canAbandon(self.allocator, attempt)) return;
+        if (self.orchestration_id == null) {
             try attempt.abandonIfPreMutation(self.allocator);
+        } else {
+            try attempt.complete(self.allocator, .abandoned_before_mutation);
+            _ = try self.coordinator.store().retainOwnedTerminal(self.allocator, .{
+                .authorization = root_operation.authorizationFromTrustedMarker(
+                    self.ownership_marker orelse return error.AuthorizationEvidenceMissing,
+                ),
+                .terminal_state = .abandoned,
+                .observer = self.cleanupObserver(),
+            });
+        }
     }
 };
 
@@ -5044,6 +5278,8 @@ test "production workflow external native fixture" {
         workflow: WorkflowRequest,
         report: []const u8,
         completion_crash: ?CompletionPoint = null,
+        owner_evidence: ?[]const u8 = null,
+        acknowledgment: ?enum { ownership, recovery } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
@@ -5078,7 +5314,36 @@ test "production workflow external native fixture" {
         .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
     };
-    const result = try backend.executeWorkflow(allocator, external.workflow);
+    var requested = external.workflow;
+    if (external.owner_evidence) |path| {
+        const owner = try root_operation.decodeDeferredAcknowledgment(
+            allocator,
+            try readFile(allocator, std.testing.io, path, root_operation.maximum_document_bytes),
+        );
+        requested.expected_ownership_marker = owner;
+        if (external.acknowledgment) |kind| switch (kind) {
+            .ownership => {
+                requested.finalize_ownership = true;
+                requested.ownership_acknowledgment = .{
+                    .attempt_id = owner.attempt_id,
+                    .marker_sha256 = owner.digest_sha256,
+                    .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(owner),
+                    .acknowledgment_id = owner.acknowledgment_id,
+                    .marker = owner,
+                };
+            },
+            .recovery => {
+                requested.defer_recovery_clear = true;
+                requested.recovery_acknowledgment = .{
+                    .attempt_id = owner.attempt_id,
+                    .completion_sha256 = owner.completion_sha256 orelse return error.InvalidExternalWorkflowRequest,
+                    .provenance_sha256 = owner.provenance_sha256 orelse return error.InvalidExternalWorkflowRequest,
+                    .acknowledgment_id = owner.acknowledgment_id,
+                };
+            },
+        };
+    } else if (external.acknowledgment != null) return error.InvalidExternalWorkflowRequest;
+    const result = try backend.executeWorkflow(allocator, requested);
     const output = try result.canonicalJson(allocator);
     var report_dir = try openAbsoluteDirectory(std.testing.io, std.fs.path.dirname(external.report).?);
     defer report_dir.close(std.testing.io);
@@ -5088,7 +5353,111 @@ test "production workflow external native fixture" {
     });
 }
 
-test "production workflow native deferred ownership refuses before root access" {
+test "production workflow required_security.native acknowledgment preserves exact reviewed ownership" {
+    const claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = @splat(1),
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(2),
+        .profile_sha256 = @splat(3),
+        .profile_reference_sha256 = @splat(4),
+        .exact_lock_sha256 = @splat(5),
+        .semantic_request_sha256 = @splat(6),
+        .mutation_status = .changed,
+        .outer_transaction_sha256 = @splat(7),
+        .nonce = @splat(8),
+    });
+    const base = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(9),
+        .completion_sha256 = @splat(10),
+        .provenance_sha256 = @splat(11),
+        .acknowledgment_id = claim.outer_attempt_id,
+    });
+    const pending = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, claim);
+    var other_claim = claim;
+    other_claim.nonce = @splat(12);
+    other_claim = try root_operation.createRecoveryReviewClaim(other_claim);
+    const foreign = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, other_claim);
+    try std.testing.expectEqualSlices(u8, &pending.digest_sha256, &foreign.digest_sha256);
+    const acknowledged = try root_operation.carryDeferredAcknowledgmentReviewOwner(
+        try root_operation.createDeferredAcknowledgment(.{
+            .state = .acknowledged,
+            .attempt_id = base.attempt_id,
+            .completion_sha256 = base.completion_sha256,
+            .provenance_sha256 = base.provenance_sha256,
+            .acknowledgment_id = base.acknowledgment_id,
+        }),
+        pending,
+    );
+    for ([_]root_operation.DeferredAcknowledgment{ pending, acknowledged }) |observed| {
+        try std.testing.expect(nativeAcknowledgmentMatchesOwner(observed, pending, null));
+        try std.testing.expect(nativeAcknowledgmentMatchesOwner(observed, pending, claim));
+        try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, null, null));
+        try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, base, null));
+        try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, foreign, null));
+        try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, foreign, other_claim));
+    }
+}
+
+test "production workflow required_security.native callbacks refuse host roots and orphan intents" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
+    defer fixture.deinit();
+    const owner = try root_operation.createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(1),
+        .acknowledgment_id = @splat(2),
+    });
+    var owned_root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer owned_root.close();
+    const store = root_operation.Store.init(owned_root.root);
+    try store.ensureNamespace();
+    try owned_root.root.publishFile(try root_fs.Path.init(native_recovery.intent_path), "orphan", .{});
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
+    for ([_][]const u8{ "/", fixture.install_root }) |install_root| {
+        for ([_]bool{ false, true }) |recovery| {
+            var options = fixture.options();
+            options.install_root = install_root;
+            options.lock_input_path = null;
+            options.source_paths = &.{};
+            options.keyring_paths = &.{};
+            options.assume_yes = true;
+            options.conffile = .keep_existing;
+            const result = try backend.executeWorkflow(allocator, .{
+                .operation = .upgrade_all,
+                .mode = .recover,
+                .options = options,
+                .orchestration_id = owner.acknowledgment_id,
+                .defer_recovery_clear = recovery,
+                .finalize_ownership = !recovery,
+                .ownership_acknowledgment = if (recovery) null else .{
+                    .attempt_id = owner.attempt_id,
+                    .marker_sha256 = owner.digest_sha256,
+                    .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(owner),
+                    .acknowledgment_id = owner.acknowledgment_id,
+                    .marker = owner,
+                },
+                .recovery_acknowledgment = if (!recovery) null else .{
+                    .attempt_id = owner.attempt_id,
+                    .completion_sha256 = @splat(3),
+                    .provenance_sha256 = @splat(4),
+                    .acknowledgment_id = owner.acknowledgment_id,
+                },
+            });
+            try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+        }
+    }
+    try std.testing.expect((try store.readDeferredAcknowledgment(allocator)) == null);
+    try std.testing.expect((try store.read(allocator)) == null);
+    const intent = try owned_root.root.readFileAlloc(allocator, try root_fs.Path.init(native_recovery.intent_path), 32);
+    try std.testing.expectEqualStrings("orphan", intent);
+}
+
+test "production workflow native ownership requires an outer identity before root access" {
     var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
     const base: WorkflowRequest = .{
         .operation = .install,
@@ -5108,15 +5477,22 @@ test "production workflow native deferred ownership refuses before root access" 
         var request = base;
         switch (variant) {
             0 => request.mode = .reserve,
-            1 => request.orchestration_id = [_]u8{1} ** 32,
+            1 => request.expected_ownership_marker = try root_operation.createDeferredAcknowledgment(.{
+                .state = .bound,
+                .attempt_id = @splat(1),
+                .acknowledgment_id = @splat(2),
+            }),
             2 => request.defer_recovery_clear = true,
             3 => request.root_attempt_id = [_]u8{2} ** 32,
-            4 => request.finalize_ownership = true,
+            4 => {
+                request.mode = .plan_only;
+                request.orchestration_id = @splat(1);
+            },
             else => unreachable,
         }
         const result = try backend.executeWorkflow(std.testing.allocator, request);
-        try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
-        try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, result.diagnostics[0].id);
+        try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
+        try std.testing.expectEqual(api.ErrorId.invalid_request, result.diagnostics[0].id);
         try std.testing.expect(!result.changed);
     }
 }
@@ -5821,7 +6197,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     try std.testing.expectEqual(@as(usize, 0), process.calls);
 }
 
-test "production workflow native empty removal locks replay without enabling deferred ownership" {
+test "production workflow native empty removal locks replay without enabling clean reconciliation" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5869,6 +6245,10 @@ test "production workflow native empty removal locks replay without enabling def
     request.options.assume_yes = true;
     request.options.conffile = .keep_existing;
     request.orchestration_id = [_]u8{0x43} ** 32;
+    request.reconciliation_claim = .{ .post_mutation = .{
+        .exact_lock_sha256 = lock.native.lock.digest_sha256,
+        .evidence_sha256 = @splat(0x44),
+    } };
     const blocked = try backend.executeWorkflow(allocator, request);
     try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, blocked.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 0), process.calls);

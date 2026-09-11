@@ -1092,7 +1092,8 @@ def exercise_core(executable: Path, helper: Path, workspace: Path, environment: 
 
 def workflow(
     executable: Path, request: dict, destination: Path, environment: dict,
-    *, completion_crash: str | None = None,
+    *, completion_crash: str | None = None, owner_evidence: Path | None = None,
+    acknowledgment: str | None = None,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1101,6 +1102,8 @@ def workflow(
     m.write(request_path, json.dumps({
         "workflow": request, "report": str(report_path),
         "completion_crash": completion_crash,
+        "owner_evidence": str(owner_evidence) if owner_evidence else None,
+        "acknowledgment": acknowledgment,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
         result = subprocess.run(
@@ -1161,8 +1164,8 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
             "selectors": [{"name": name} for name in names], "options": options,
         }
 
-    def run(current: lifecycle.Scenario, label: str, value: dict, *, exit_status: int = 0) -> dict:
-        result = workflow(executable, value, current.directory / label, environment)
+    def run(current: lifecycle.Scenario, label: str, value: dict, *, exit_status: int = 0, **options) -> dict:
+        result = workflow(executable, value, current.directory / label, environment, **options)
         assert result["exit_status"] == exit_status, result
         return result
 
@@ -1245,7 +1248,7 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
         state_before = triggers.snapshot(current.candidate)
         recovery = request(current, "install", "recover", list(reversed(names)))
         if boundary == "after_native_receipt":
-            run(current, "deferred-owner", {**recovery, "defer_recovery_clear": True}, exit_status=3)
+            run(current, "deferred-owner", {**recovery, "defer_recovery_clear": True}, exit_status=2)
             assert (current.candidate / OPERATION).read_bytes() == record_before
             for index, change in enumerate((
                 {"operation": "remove"},
@@ -1274,6 +1277,176 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
         assert not (current.directory / "unused-cache").exists()
         assert not (current.directory / "unused-state").exists()
         print(f"workflow-{boundary}: original-request recovery and receipt completion passed", flush=True)
+
+    owner_path = NAMESPACE / "root-operation-deferred-ack-v1.json"
+
+    def owned_request(current, operation, mode, selected):
+        return {**request(current, operation, mode, selected), "orchestration_id": [17] * 32}
+
+    def retain_owner(current, label):
+        path = current.directory / f"{label}.owner.json"
+        m.write(path, m.oracle._read_bounded(current.candidate / owner_path, 1024 * 1024))
+        return path
+
+    current = scenario("workflow-owned-success")
+    run(current, "plan", request(current, "install", "plan_only", names))
+    lock = document(current.directory / "workflow.lock.json")
+    run(current, "reserve", {
+        **owned_request(current, "install", "reserve", names), "root_attempt_id": [34] * 32,
+    })
+    bound = retain_owner(current, "bound")
+    reserved = (current.candidate / OPERATION).read_bytes()
+    assert document(bound)["state"] == "bound"
+    assert document(bound)["attempt_id"] == "22" * 32
+    assert not (current.candidate / INTENT).exists()
+    run(current, "changed-request", owned_request(current, "install", "execute", ["different"]),
+        owner_evidence=bound, exit_status=8)
+    assert (current.candidate / OPERATION).read_bytes() == reserved
+    run(current, "execute", owned_request(current, "install", "execute", list(reversed(names))),
+        owner_evidence=bound)
+    assert_completion(current, lock)
+    released = retain_owner(current, "released")
+    assert document(released)["state"] == "released"
+    finalization = owned_request(current, "install", "recover", names)
+    run(current, "finalize", finalization, owner_evidence=released, acknowledgment="ownership")
+    run(current, "finalize-again", finalization, owner_evidence=released, acknowledgment="ownership")
+    assert not (current.candidate / owner_path).exists()
+    print("workflow-owned-success: reservation, native receipt, and exact owner finalization passed", flush=True)
+
+    for boundary in ("after_provenance_published", "after_ownership_terminal_publish", "after_ownership_record_clear"):
+        current = scenario(f"workflow-finalize-{boundary}")
+        run(current, "plan", request(current, "install", "plan_only", names))
+        lock = document(current.directory / "workflow.lock.json")
+        run(current, "reserve", owned_request(current, "install", "reserve", names))
+        bound = retain_owner(current, "bound")
+        workflow(executable, owned_request(current, "install", "execute", names),
+                 current.directory / "execute-crash", environment, completion_crash=boundary,
+                 owner_evidence=bound)
+        retained = retain_owner(current, "terminal")
+        finalization = owned_request(current, "install", "recover", names)
+        before = triggers.snapshot(current.candidate)
+        if boundary == "after_provenance_published":
+            completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+            original_completion = completion_path.read_bytes()
+            m.write(completion_path, b"{}\n")
+            run(current, "damaged-completion", finalization, owner_evidence=retained,
+                acknowledgment="ownership", exit_status=8)
+            m.write(completion_path, original_completion)
+            workflow(executable, finalization, current.directory / "finalize-crash", environment,
+                     completion_crash="after_native_acknowledged", owner_evidence=retained,
+                     acknowledgment="ownership")
+        else:
+            run(current, "recover", {**finalization, "defer_recovery_clear": True},
+                owner_evidence=retained, exit_status=8 if boundary == "after_ownership_record_clear" else 0)
+        run(current, "finalize", finalization, owner_evidence=retained, acknowledgment="ownership")
+        assert_completion(current, lock)
+        assert not (current.candidate / owner_path).exists()
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        print(f"workflow-finalize-{boundary}: exact owner cleanup converged without replay", flush=True)
+
+    for preflight_failure in (False, True):
+        current = scenario(f"workflow-owned-abandon-{preflight_failure}")
+        selected = names if preflight_failure else []
+        operation = "install" if preflight_failure else "upgrade_all"
+        run(current, "plan", request(current, operation, "plan_only", selected))
+        run(current, "reserve", owned_request(current, operation, "reserve", selected))
+        bound = retain_owner(current, "bound")
+        execution = owned_request(current, operation, "execute", selected)
+        if preflight_failure:
+            invalid_source = current.directory / "invalid.sources"
+            m.write(invalid_source, b"not-an-apt-source\n")
+            execution["options"]["source_paths"] = [str(invalid_source)]
+        result = run(current, "execute", execution, owner_evidence=bound,
+                     exit_status=2 if preflight_failure else 0)
+        assert not result["changed"]
+        abandoned = retain_owner(current, "abandoned")
+        assert document(abandoned)["state"] == "abandoned"
+        assert not (current.candidate / OPERATION).exists()
+        run(current, "finalize", owned_request(current, operation, "recover", selected),
+            owner_evidence=abandoned, acknowledgment="ownership")
+        assert not (current.candidate / owner_path).exists()
+    print("workflow-owned-abandon: unchanged and refused attempts preserve exact owner handoff", flush=True)
+
+    for execution_boundary, acknowledgment_boundary in zip((
+        "after_native_receipt", "after_completed_record", "after_owed_provenance_document",
+        "after_provenance_published", "after_native_acknowledged",
+    ), (
+        "after_native_acknowledged", "after_deferred_acknowledged",
+        "before_deferred_record_cleared", "after_deferred_record_cleared",
+        "after_deferred_marker_cleared",
+    ), strict=True):
+        current = scenario(f"workflow-owned-{execution_boundary}")
+        run(current, "plan", request(current, "install", "plan_only", names))
+        lock = document(current.directory / "workflow.lock.json")
+        run(current, "reserve", owned_request(current, "install", "reserve", names))
+        bound = retain_owner(current, "bound")
+        workflow(executable, owned_request(current, "install", "execute", names),
+                 current.directory / "execute-crash", environment,
+                 completion_crash=execution_boundary, owner_evidence=bound)
+        original = (current.candidate / OPERATION).read_bytes()
+        recovery = {**owned_request(current, "install", "recover", names), "defer_recovery_clear": True}
+        run(current, "foreign-recovery", {**recovery, "orchestration_id": [18] * 32},
+            owner_evidence=bound, exit_status=8)
+        assert (current.candidate / OPERATION).read_bytes() == original
+        before = triggers.snapshot(current.candidate)
+        recovery_owner = bound
+        if execution_boundary == "after_completed_record":
+            workflow(executable, recovery, current.directory / "pending-publication-crash", environment,
+                     completion_crash="after_owed_provenance_document", owner_evidence=bound)
+            recovery_owner = retain_owner(current, "pending-prepublication")
+            assert document(recovery_owner)["state"] == "pending"
+            assert document(current.candidate / OPERATION)["provenance"] == "pending"
+        run(current, "recover", recovery, owner_evidence=recovery_owner)
+        pending = retain_owner(current, "pending")
+        assert document(pending)["state"] == "pending"
+        published = (current.candidate / OPERATION).read_bytes()
+        run(current, "recover-again", recovery, owner_evidence=pending)
+        assert (current.candidate / OPERATION).read_bytes() == published
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        run(current, "foreign-acknowledgment", {**recovery, "orchestration_id": [18] * 32},
+            owner_evidence=pending, acknowledgment="recovery", exit_status=2)
+        assert (current.candidate / OPERATION).read_bytes() == published
+        if execution_boundary == "after_native_receipt":
+            run(current, "wrong-operation-acknowledgment", {**recovery, "operation": "remove"},
+                owner_evidence=pending, acknowledgment="recovery", exit_status=8)
+            receipt_path = current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"
+            original_receipt = receipt_path.read_bytes()
+            m.write(receipt_path, b"{}\n")
+            run(current, "damaged-receipt", recovery, owner_evidence=pending,
+                acknowledgment="recovery", exit_status=8)
+            assert (current.candidate / OPERATION).read_bytes() == published
+            assert (current.candidate / owner_path).read_bytes() == pending.read_bytes()
+            assert (current.candidate / INTENT).exists()
+            m.write(receipt_path, original_receipt)
+        workflow(executable, recovery, current.directory / "acknowledgment-crash", environment,
+                 completion_crash=acknowledgment_boundary, owner_evidence=pending,
+                 acknowledgment="recovery")
+        run(current, "acknowledge", recovery, owner_evidence=pending, acknowledgment="recovery")
+        run(current, "acknowledge-again", recovery, owner_evidence=pending, acknowledgment="recovery")
+        assert_completion(current, lock)
+        assert not (current.candidate / owner_path).exists()
+        assert not (current.directory / "unused-cache").exists()
+        assert not (current.directory / "unused-state").exists()
+        print(f"workflow-owned-{execution_boundary}: deferred receipt acknowledgment crash convergence passed", flush=True)
+
+    current = scenario("workflow-owned-known-failure")
+    run(current, "plan", request(current, "install", "plan_only", failed_names))
+    lock = document(current.directory / "workflow.lock.json")
+    run(current, "reserve", owned_request(current, "install", "reserve", failed_names))
+    bound = retain_owner(current, "bound")
+    workflow(executable, owned_request(current, "install", "execute", failed_names),
+             current.directory / "pending-publication-crash", environment,
+             completion_crash="after_owed_provenance_document", owner_evidence=bound)
+    pending = retain_owner(current, "pending")
+    assert document(pending)["state"] == "pending"
+    assert document(current.candidate / OPERATION)["outcome"] == "failed_after_mutation"
+    assert document(current.candidate / OPERATION)["provenance"] == "pending"
+    recovery = {**owned_request(current, "install", "recover", failed_names), "defer_recovery_clear": True}
+    run(current, "recover", recovery, owner_evidence=pending, exit_status=7)
+    run(current, "acknowledge", recovery, owner_evidence=pending, acknowledgment="recovery")
+    assert_completion(current, lock)
+    assert not (current.candidate / owner_path).exists()
+    print("workflow-owned-known-failure: honest failure outcome retained through acknowledgment", flush=True)
 
 
 def main() -> int:

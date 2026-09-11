@@ -911,7 +911,7 @@ pub fn deferredRecordCompatibility(
         .pending => switch (value.provenance) {
             .published => if (value.state == .completed and
                 value.mutation_started and
-                (value.outcome == .succeeded or value.outcome == .recovered) and
+                deferredTerminalOutcome(value) and
                 value.provenance_sha256 != null and
                 marker.provenance_sha256 != null and
                 std.mem.eql(
@@ -925,7 +925,7 @@ pub fn deferredRecordCompatibility(
             .pending => if (allow_pending_provenance and
                 value.state == .completed and
                 value.mutation_started and
-                (value.outcome == .succeeded or value.outcome == .recovered))
+                deferredTerminalOutcome(value))
                 .pending_prepublication
             else
                 .incompatible,
@@ -933,7 +933,7 @@ pub fn deferredRecordCompatibility(
         },
         .acknowledged => if (value.state == .completed and
             value.mutation_started and
-            (value.outcome == .succeeded or value.outcome == .recovered) and
+            deferredTerminalOutcome(value) and
             value.provenance == .published and
             value.provenance_sha256 != null and
             marker.provenance_sha256 != null and
@@ -947,6 +947,11 @@ pub fn deferredRecordCompatibility(
             .incompatible,
         .pre_mutation_reconciliation_claim => unreachable,
     };
+}
+
+fn deferredTerminalOutcome(record: Record) bool {
+    return record.outcome == .succeeded or record.outcome == .recovered or
+        (record.backend == .native and record.outcome == .failed_after_mutation);
 }
 
 fn preMutationClaimBindingEqual(
@@ -3234,6 +3239,29 @@ pub const Coordinator = struct {
                 if (!deferredAcknowledgmentExactEqual(marker, expected))
                     return error.RecoveryRequired;
             }
+            if (prior != null and prior.?.record.backend == .native and
+                prior.?.record.program_sha256 != null and request.backend == .native and
+                request.intent == .recovery and request.adopt_settled_for_acknowledgment and
+                (marker.state == .bound or marker.state == .released or marker.state == .pending))
+            {
+                const owner = request.orchestration_id orelse return error.RecoveryRequired;
+                if (!std.mem.eql(u8, &owner, &marker.acknowledgment_id) or
+                    !recordMatchesDeferredAcknowledgment(prior.?.record, marker, true))
+                    return error.RecoveryRequired;
+                // Native receipt acknowledgment must run before any deferred
+                // terminal-marker cleanup can discard the original record.
+                const adopted = prior.?;
+                prior = null;
+                return .{
+                    .coordinator = self,
+                    .token = token,
+                    .owned = adopted,
+                    .entered = .initEmpty(),
+                    .highest = .root_operation,
+                    .adopted = true,
+                    .bridge = adoptedBridge(adopted.record.state),
+                };
+            }
         }
         if (deferred) |marker| switch (marker.state) {
             .acknowledged => return error.RecoveryRequired,
@@ -3247,6 +3275,8 @@ pub const Coordinator = struct {
                     &orchestration_id,
                     &marker.acknowledgment_id,
                 )) return error.RecoveryRequired;
+                if (request.backend == .native)
+                    return error.ResolvedAttemptPresent;
                 store_handle.cleanupOwned(allocator, .{
                     .authorization = authorizationFromTrustedMarker(marker),
                     .terminal_state = marker.state,
@@ -4190,6 +4220,71 @@ test "root_operation.test.native pre-intent and pending-ack bindings cannot be r
         var adopted = try coordinator.acquire(testing.allocator, recovery);
         defer adopted.release();
         try testing.expectEqual(original, adopted.record().digest_sha256);
+    }
+}
+
+test "root_operation.test.native deferred recovery adopts without terminal owner cleanup" {
+    for ([_]DeferredAcknowledgmentState{ .bound, .released, .pending }) |state| {
+        for ([_]Outcome{ .succeeded, .failed_after_mutation }) |outcome| {
+            if (outcome == .failed_after_mutation and state != .pending) continue;
+            var directory = testing.tmpDir(.{ .iterate = true });
+            defer directory.cleanup();
+            var locks: TestLockBackend = .{ .allocator = testing.allocator };
+            defer locks.deinit();
+            var coordinator = try Coordinator.open(testing.io, .init(testing.io, directory.dir), "/target", locks.interface());
+            const request: Request = .{
+                .backend = .native,
+                .operation = .{ .package_transaction = .install },
+                .request_sha256 = @splat(1),
+                .policy_sha256 = @splat(2),
+                .target_architecture = "amd64",
+                .evidence = .{ .program_sha256 = @splat(3) },
+                .orchestration_id = @splat(4),
+            };
+            var attempt = try coordinator.acquire(testing.allocator, request);
+            try attempt.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+            try attempt.markMutationStarted(testing.allocator, .mutation);
+            try attempt.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+            try attempt.complete(testing.allocator, outcome);
+            const store = coordinator.store();
+            var marker = (try store.readDeferredAcknowledgment(testing.allocator)).?;
+            if (state == .pending) {
+                marker = try createDeferredAcknowledgment(.{
+                    .state = .pending,
+                    .attempt_id = attempt.record().attempt_id,
+                    .completion_sha256 = @splat(5),
+                    .provenance_sha256 = @splat(6),
+                    .acknowledgment_id = request.orchestration_id.?,
+                });
+                try store.publishDeferredAcknowledgment(testing.allocator, marker);
+                try testing.expectEqual(DeferredRecordCompatibility.pending_prepublication, deferredRecordCompatibility(attempt.record(), marker, true));
+            }
+            try attempt.publishProvenance(testing.allocator, @splat(6));
+            if (state == .released)
+                marker = try store.terminalizeDeferredAcknowledgment(testing.allocator, marker, .released);
+            const record_digest = attempt.record().digest_sha256;
+            attempt.release();
+            var recovery = request;
+            recovery.intent = .recovery;
+            recovery.adopt_settled_for_acknowledgment = true;
+            recovery.orchestration_id = @splat(7);
+            try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, recovery));
+            recovery.orchestration_id = request.orchestration_id;
+            var adopted = try coordinator.acquire(testing.allocator, recovery);
+            defer adopted.release();
+            try testing.expect(adopted.adopted);
+            try testing.expectEqual(record_digest, adopted.record().digest_sha256);
+            const retained = (try store.readDeferredAcknowledgment(testing.allocator)).?;
+            try testing.expect(deferredAcknowledgmentExactEqual(marker, retained));
+            if (outcome == .failed_after_mutation) {
+                try testing.expectEqual(DeferredRecordCompatibility.pending_published, deferredRecordCompatibility(adopted.record(), marker, false));
+                const acknowledged = try store.acknowledgeDeferredAcknowledgment(testing.allocator, marker);
+                try testing.expectEqual(DeferredRecordCompatibility.acknowledged_published, deferredRecordCompatibility(adopted.record(), acknowledged, false));
+                var legacy = adopted.record();
+                legacy.backend = .legacy_dpkg;
+                try testing.expectEqual(DeferredRecordCompatibility.incompatible, deferredRecordCompatibility(legacy, acknowledged, false));
+            }
+        }
     }
 }
 

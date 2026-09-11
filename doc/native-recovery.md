@@ -239,13 +239,39 @@ with explicit action authorization and retained configuration modeled separately
 Remaining consumer integration and full pinned parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 
-The internal non-deferred batch workflow uses the same native receipt and
-completion protocol. Its recovery request must match the original operation,
+The internal batch workflow uses the same native receipt and completion
+protocol. Its recovery request must match the original operation,
 canonical selectors, and request policy before any abandonment or replay.
 Actual-process coverage includes signed-repository batch install/remove,
 unchanged closures, known failure, all five receipt/completion crash boundaries,
-and refusal of mismatched requests or replacement recovery inputs. Deferred
-outer ownership and its consumer-specific acknowledgment remain gated.
+and refusal of mismatched requests or replacement recovery inputs.
+
+An outer-owned workflow can reserve a pre-mutation attempt and later execute
+that exact request. Unchanged or refused pre-mutation attempts retain an
+abandoned owner marker. Normal owned success acknowledges native evidence
+before clearing the root record, leaving a released owner marker for explicit
+outer finalization. A released marker is not silently consumed by a new native
+acquisition; a recovery interrupted before record clearing finishes the release
+without moving the owner backward to pending.
+
+With deferred recovery, completion first publishes a pending owner marker,
+then the root provenance transition. Both marker digests bind the native
+completion document directly; native provenance does not use the legacy
+command-journal wrapper digest. The completed root record and native evidence
+remain until the outer caller durably retains the exact completion token.
+Owned known failures also use pending acknowledgment while preserving their
+terminal failure outcome and exit 7. Unknown outcomes remain blocked.
+
+Acknowledgment uses the caller's existing rank-0 lock, validates receipt-backed
+completion against the original request, and preserves authenticated exact v2
+review ownership. Native cleanup precedes marker acknowledgment and root-record
+clearing. Independently retained owner evidence supports retries after native
+cleanup, marker acknowledgment, record clearing, and marker clearing; none of
+these retries accesses replacement repositories or replays package scripts.
+Damaged completion or receipt evidence and orphan active intents refuse cleanup.
+Physical host-root denial also applies to acknowledgment and finalization.
+Native clean reconciliation and consumer-specific public integration remain
+gated.
 
 ## Independent acceptance
 
