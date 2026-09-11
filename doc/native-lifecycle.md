@@ -39,6 +39,30 @@ path can only rotate status-old bookkeeping after confirming the selected
 packages are absent. It cannot run scripts, change package data, bypass active
 recovery evidence, or claim to have executed a compiled package lifecycle.
 
+### Caller-owned operation boundary
+
+The interpreter can also borrow an existing native root-operation attempt.
+`native_operation.bind` checks the held root descriptor, backend, architecture,
+and canonical program, then adds write-once authorization, program, actual
+solver-plan, exact-lock, database-generation, and artifact evidence. It does not
+replace the caller's operation, request hash, policy hash, or attempt identity.
+Native phase journals consume those exact bindings rather than substituting
+the program digest for the caller's solver-plan digest.
+
+A borrowed interpreter neither acquires a second root lock nor releases the
+caller's lock. Preflight refusal leaves abandonment to the caller; successful
+package work leaves the outer attempt mutating and unfinished so subsequent
+repository/configuration work can still run. Only the outer owner may publish
+its completion/provenance and clear its record. A pending legacy executor
+bridge cannot be treated as native authority.
+
+The private v1 owned execution/recovery path retains its original binding for
+compatibility. Its fixture request cannot describe the separate caller hash
+domains, so borrowing it as a production recovery request is explicitly
+refused before mutation. Production request persistence, recovery, helper
+deployment, and CLI selection remain pending item-15b integration; this
+internal ownership boundary does not enable public native execution.
+
 ## Independent reference acceptance
 
 Run on native Linux amd64 or arm64 with `dpkg`, `dpkg-deb`, `ldd`, `/bin/sh`, and
