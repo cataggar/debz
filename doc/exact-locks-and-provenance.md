@@ -70,8 +70,11 @@ the tagged closure directly from authenticated repository snapshots, while
 native replay refuses v1 input. Its solver-policy digest is SHA-256 of
 `debz.product-native-solver-policy-v1\0` followed by the existing 32-byte solver
 policy digest. Legacy core resolution/replay keeps its original v1 format and
-policy bytes. Native product mutation/recovery remains unavailable until the
-native receipt and outer-completion contracts are integrated.
+policy bytes. Core native mutation consumes an explicit reviewed v2 lock and
+publishes a native receipt rather than legacy command provenance. Core recovery
+consumes persisted inputs without re-resolution or replacement locks, binds outer
+completion to that receipt, and acknowledges native evidence before clearing the
+caller record. Other consumers remain independently gated.
 
 The separate `debz package-cache` interface supports canonical v1 locks only.
 `fingerprint` rejects unsupported schema versions, noncanonical/tampered

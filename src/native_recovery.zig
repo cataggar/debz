@@ -18,7 +18,7 @@ pub fn parseDigest(value: Digest) ?[32]u8 {
     return result;
 }
 
-pub const intent_path = "var/lib/debz/native-execution-intent-v1.json";
+pub const intent_path = root_operation.native_intent_path;
 pub const progress_path = "var/lib/debz/native-execution-progress-v1.log";
 pub const authorization_name = "native-transaction-authorization-v1.json";
 pub const program_name = "native-transaction-program-v1.json";

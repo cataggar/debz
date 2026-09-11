@@ -277,8 +277,8 @@ the default while native work is incomplete. Roadmap item 10a adds only the
 descriptive unpack/ownership planner; it exports no apply or recovery
 capability. Item 15b separately exposes caller-owned prepared-program execution
 and native receipts through `debz.native_runtime`, with mandatory trusted helper
-isolation. Core product/CLI v2 planning and download are available, but native
-execution/recovery and receipt/result integration remain incomplete.
+isolation. Core product/CLI v2 planning, download, execution, and receipt-backed
+recovery use this typed boundary; remaining consumers stay separately gated.
 Selecting `native` through the command-shaped boundary returns an unavailable result
 before repository acquisition, journal access, database access, or root
 mutation even if a command-shaped executor was injected. Selection never falls

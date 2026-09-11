@@ -607,7 +607,12 @@ pub fn build(b: *std.Build) void {
     });
     b.step("native-trigger-helper", "Build the private trigger helper without installing it")
         .dependOn(&native_trigger_helper.step);
-    debz.addAnonymousImport("debz_native_trigger_helper", .{
+    for ([_]*std.Build.Module{
+        debz,
+        production_backend_test_module,
+        apt_system_command_test_module,
+        apt_system_orchestrator_test_module,
+    }) |module| module.addAnonymousImport("debz_native_trigger_helper", .{
         .root_source_file = native_trigger_helper.getEmittedBin(),
     });
     const native_trigger_queue_tests = b.addTest(.{
@@ -654,6 +659,8 @@ pub fn build(b: *std.Build) void {
     native_recovery.addArtifactArg(native_lifecycle_tests);
     native_recovery.addArg("--native-helper");
     native_recovery.addArtifactArg(native_trigger_helper);
+    if (b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false)
+        native_recovery.addArg("--core-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );

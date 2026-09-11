@@ -88,8 +88,8 @@ compensating calls, bootstrap payload materialization, Pre-Depends barriers,
 and deterministic configure groups. In-flight script evidence blocks re-entry
 when an outcome was not durably recorded. `test-native-lifecycle` compares
 script traces, payload visibility, and resulting package/filesystem state with
-real dpkg, including failures and dependency/bootstrap cases. Production native
-selection remains unavailable. See [Native lifecycle execution](native-lifecycle.md).
+real dpkg, including failures and dependency/bootstrap cases. Core native
+integration is described below. See [Native lifecycle execution](native-lifecycle.md).
 
 Item 13 extends that private lifecycle with named/file trigger registration,
 await/noawait activation, explicit deferral, and trigger-only processing.
@@ -102,7 +102,7 @@ invoking dpkg-trigger in candidate execution. `test-native-triggers` covers
 ordering, coalescing, failures, and cycles against real dpkg, with native
 amd64/arm64 Debug and ReleaseSafe CI wiring. Unknown triggered-script outcomes
 retain invocation/authority evidence and block re-entry. The helper is not
-installed in releases, and production native remains unavailable. See
+installed as a standalone release executable; core execution embeds it. See
 [Native trigger execution](native-triggers.md).
 
 Item 14 adds private native-step journaling, persisted execution inputs, and
@@ -114,8 +114,8 @@ provenance must be durable before the active operation is cleared.
 Managed-state checkpoints reject drift after completed phases, and immutable
 per-attempt receipts retain detailed execution evidence after workspace cleanup.
 `test-native-recovery` exercises actual process crashes and repeated recovery
-against independent root/trace/provenance assertions. Production native
-selection remains unavailable. See
+against independent root/trace/provenance assertions. Core native
+integration is described below. See
 [Native recovery and provenance](native-recovery.md).
 
 Item 15b's `debz.native_preparation` foundation binds actual solver plans and
@@ -141,8 +141,13 @@ It accepts prepared programs and immutable archive bytes rather than fixture
 requests or command-shaped executor inputs, and refuses host or mismatched
 roots. The core CLI now supports explicit `--transaction-backend native` for
 genuine v2 lock planning/replay and verified download, with backend-bound solver
-policy and no v1 conversion. Product native mutation/recovery and receipt/result
-integration remain unavailable; legacy remains default. See the
+policy and no v1 conversion. Experimental core native mutation now captures
+complete production evidence and executes prepared programs under the caller's
+root attempt. Persisted-input recovery and receipt-backed outer completion
+acknowledge native evidence before clearing the caller record, including known
+terminal failure. Native pre-intent and pending-ack records cannot be generically
+reclaimed. Orchestrated consumers and full parity remain pending; legacy remains
+default. See the
 [typed runtime contract](native-recovery.md#experimental-typed-runtime-api).
 Exact-lock v2 permits an empty installed closure for last-package removal/purge,
 without changing existing lock bytes or hashes. Native preparation still binds

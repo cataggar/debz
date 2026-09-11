@@ -85,6 +85,8 @@ def native(
     caller_owned: bool = False,
     acknowledge_native: bool = False,
     isolated_helper: bool = False,
+    core_product: bool = False,
+    completion_crash: str | None = None,
 ) -> dict | None:
     m.reference_command(root)
     if operation == "recover" and (archives or packages or crash_at is not None):
@@ -102,6 +104,14 @@ def native(
         request["crash_at"] = crash_at
     if caller_owned:
         request["caller_owned"] = True
+    if core_product:
+        if not caller_owned or not isolated_helper:
+            raise ValueError("core recovery requires a typed helper-bound caller")
+        request["core_product"] = True
+    if completion_crash is not None:
+        if not core_product or operation != "recover":
+            raise ValueError("completion crashes belong to core recovery")
+        request["core_completion_crash"] = completion_crash
     if isolated_helper:
         if not caller_owned:
             raise ValueError("isolated helper belongs to the native caller")
@@ -118,12 +128,12 @@ def native(
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
             timeout=120, check=False,
         )
-    expected_exit = CRASH_EXIT if crash_at is not None else 0
+    expected_exit = CRASH_EXIT if crash_at is not None or completion_crash is not None else 0
     if result.returncode != expected_exit:
         raise AssertionError(
             f"native {operation}: exit {result.returncode}, expected {expected_exit}; {destination}"
         )
-    if crash_at is not None:
+    if crash_at is not None or completion_crash is not None:
         if report_path.exists():
             raise AssertionError("crash produced a normal completion report")
         return None
@@ -547,6 +557,7 @@ class Scenario(triggers.Scenario):
         compare_reference: bool = True,
         caller_owned: bool = False,
         isolated_helper: bool = False,
+        core_product: bool = False,
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
@@ -563,6 +574,7 @@ class Scenario(triggers.Scenario):
             trigger_execution=trigger_execution, defer=defer, crash_at=boundary,
             caller_owned=caller_owned,
             isolated_helper=isolated_helper,
+            core_product=core_product,
         )
         binding = caller_binding(self.candidate) if caller_owned else intent_binding(
             document(self.candidate / INTENT, 16 * 1024 * 1024),
@@ -579,7 +591,7 @@ class Scenario(triggers.Scenario):
 
     def recover(self, *, trigger_execution: bool = False, label: str = "recover",
                 caller_owned: bool = False, acknowledge_native: bool = False,
-                isolated_helper: bool = False) -> dict:
+                isolated_helper: bool = False, core_product: bool = False) -> dict:
         destination = self.directory / label
         destination.mkdir()
         report = native(
@@ -587,6 +599,7 @@ class Scenario(triggers.Scenario):
             self.environment, destination, trigger_execution=trigger_execution,
             caller_owned=caller_owned, acknowledge_native=acknowledge_native,
             isolated_helper=isolated_helper,
+            core_product=core_product,
         )
         assert report is not None
         return report
@@ -1002,11 +1015,87 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
         current.blocked(binding)
 
 
+def exercise_core(executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str) -> None:
+    for boundary in (
+        "after_native_receipt", "after_completed_record", "after_owed_provenance_document",
+        "after_provenance_published", "after_native_acknowledged",
+    ):
+        current = Scenario(workspace, f"core-{boundary}", executable, helper, architecture, environment)
+        shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+        archive = m.make_package(
+            workspace / "packages" / boundary, environment, architecture, "1",
+            scripts=lifecycle.scripts(m.PACKAGE, "1"),
+        )
+        binding = current.crash(
+            "install", [archive], "after_execution_intent",
+            caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        destination = current.directory / "completion-crash"
+        destination.mkdir()
+        native(executable, current.candidate, architecture, "recover", [], environment, destination,
+               caller_owned=True, isolated_helper=True, core_product=True, completion_crash=boundary)
+        assert (current.candidate / OPERATION).exists()
+        assert (current.candidate / INTENT).exists() == (boundary != "after_native_acknowledged")
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(caller_owned=True, isolated_helper=True, core_product=True)
+        if report["outcome"] != "applied":
+            raise AssertionError(f"core completion did not converge: {report}")
+        compare(current.expected, current.candidate)
+        if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+            raise AssertionError("core completion recovery reran package work")
+        proof_path, proof_bytes = provenance(current.candidate, report, binding)
+        receipt = document(proof_path, 16 * 1024 * 1024)
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert completion["attempt_id"] == binding["attempt_id"]
+        assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
+        assert completion["journal"]["status"] == "absent"
+        for path in (OPERATION, INTENT, NAMESPACE / "native-recovery-v1"):
+            assert not (current.candidate / path).exists(), path
+        repeated = current.recover(caller_owned=True, isolated_helper=True, core_product=True, label="repeat")
+        assert repeated["outcome"] == "applied"
+        assert proof_path.read_bytes() == proof_bytes
+        print(f"core-{boundary}: receipt-backed completion and acknowledgment passed", flush=True)
+
+    for known in (True, False):
+        name = "core-known-failure" if known else "core-unknown-script"
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+        archive = m.make_package(
+            workspace / "packages" / name, environment, architecture, "1",
+            scripts=lifecycle.scripts(m.PACKAGE, "1"),
+        )
+        if known:
+            lifecycle.Scenario.fail(current, f"{m.PACKAGE}@1:preinst:install")
+        binding = current.crash(
+            "install", [archive],
+            "after_failure_outcome" if known else "after_script_return_before_outcome",
+            failure=known, compare_reference=known,
+            caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(caller_owned=True, isolated_helper=True, core_product=True)
+        if known:
+            assert report["outcome"] == "script_failed", report
+            compare(current.expected, current.candidate)
+            provenance(current.candidate, report, binding)
+            completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+            assert completion["outcome"] == "failed_after_mutation"
+            assert not (current.candidate / OPERATION).exists()
+            assert not (current.candidate / INTENT).exists()
+        else:
+            assert report["outcome"] == "recovery_required", report
+            assert (current.candidate / INTENT).exists()
+            assert document(current.candidate / OPERATION)["attempt_id"] == binding["attempt_id"]
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        print(f"{name}: native outcome and original evidence preserved", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
     parser.add_argument("--native-helper", type=Path, required=True)
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument("--core-only", action="store_true")
     arguments = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -1036,7 +1125,10 @@ def main() -> int:
     try:
         with context as temporary:
             workspace = Path(temporary)
-            exercise(executable, helper, workspace, m.fixture_environment(workspace), architecture)
+            environment = m.fixture_environment(workspace)
+            if not arguments.core_only:
+                exercise(executable, helper, workspace, environment, architecture)
+            exercise_core(executable, helper, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")

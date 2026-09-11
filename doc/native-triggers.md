@@ -1,10 +1,10 @@
 # Native trigger execution
 
 Item 13 extends the private native lifecycle with trigger registration,
-activation, deferral, and processing. Production native execution remains
-unavailable. [Native recovery and provenance](native-recovery.md) supplies the
-durable continuation layer; production integration remains a later roadmap
-item.
+activation, deferral, and processing. Experimental core native execution derives
+trigger authority from captured database and archive evidence.
+[Native recovery and provenance](native-recovery.md) supplies the durable
+continuation layer; remaining consumers and cutover are later roadmap work.
 
 ## Compatibility boundary
 

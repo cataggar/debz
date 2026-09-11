@@ -21,6 +21,9 @@ const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const native_runtime = @import("native_unpack.zig").Runtime;
+const native_recovery = @import("native_recovery.zig");
+const native_provenance = @import("native_provenance.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = transaction_engine.Executor;
@@ -132,6 +135,8 @@ pub const CompletionPoint = enum {
     /// The record carries its provenance digest but the active intent has not
     /// been cleared yet.
     after_provenance_published,
+    after_native_receipt,
+    after_native_acknowledged,
     /// A deferred recovery has prepared its success result while the exact
     /// completed/published lower record still remains durable.
     before_deferred_recovery_return,
@@ -614,7 +619,7 @@ pub const Backend = struct {
     }
 
     fn route(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
-        if (usesPackageTransaction(request.operation)) {
+        if (usesPackageTransaction(request.operation) and self.transaction_backend == .legacy_dpkg) {
             _ = self.selectedExecutor() catch return api.failure(
                 request.operation,
                 .unavailable,
@@ -629,6 +634,10 @@ pub const Backend = struct {
             })
             return api.failure(request.operation, .usage, .invalid_request, "exact-lock options are not valid for this command");
         return switch (request.operation) {
+            .recover => if (self.transaction_backend == .native)
+                self.recoverNative(allocator, request)
+            else
+                self.withRepositories(allocator, request, null),
             .list_installed => self.listInstalled(allocator, request),
             .why => self.why(allocator, request),
             .clean => self.clean(allocator, request),
@@ -642,6 +651,135 @@ pub const Backend = struct {
             self.executor,
             self.native_executor,
         );
+    }
+
+    fn recoverNative(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
+        if (!request.options.assume_yes)
+            return api.failure(.recover, .usage, .confirmation_required, "native recovery requires explicit confirmation");
+        if (request.options.lock_input_path != null or request.options.lock_output_path != null or
+            request.options.source_paths.len != 0 or request.options.config_paths.len != 0 or
+            request.options.keyring_paths.len != 0 or request.options.force.len != 0)
+            return api.failure(.recover, .usage, .invalid_request, "native recovery uses persisted inputs, not replacement repositories, locks, or force policy");
+        var guard: RootOperationGuard = .{
+            .backend = self,
+            .allocator = allocator,
+            .native_owned = true,
+        };
+        defer guard.deinit();
+        if (guard.open(allocator, request, .{ .package_transaction = .recover })) |failure|
+            return failure;
+        const attempt = guard.active().?;
+        if (attempt.record().operation != .package_transaction)
+            return blockedRecovery(.recover, "native attempt belongs to a different product surface");
+        if (try native_runtime.canAbandon(allocator, attempt)) {
+            try guard.abandonNativeIfSafe();
+            return success(.recover, false, "no native execution requires recovery", &.{});
+        }
+        var report = native_runtime.recover(allocator, attempt) catch |err|
+            return nativeFailure(.recover, err, attempt.record().mutation_started);
+        defer report.deinit();
+        return self.finishNative(allocator, request, &guard, report) catch |err|
+            nativeFailure(.recover, err, attempt.record().mutation_started);
+    }
+
+    fn finishNative(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        guard: *RootOperationGuard,
+        report: native_runtime.Report,
+    ) !api.Result {
+        _ = self;
+        const attempt = guard.active().?;
+        if (report.outcome == .refused or report.outcome == .recovery_required) {
+            var failure = api.failure(
+                request.operation,
+                if (report.outcome == .recovery_required) .recovery else .transaction,
+                if (report.outcome == .recovery_required) .root_operation_recovery_required else .transaction_failed,
+                try std.fmt.allocPrint(allocator, "native {s}: {s}", .{ @tagName(report.outcome), report.detail }),
+            );
+            failure.changed = attempt.record().mutation_started;
+            return failure;
+        }
+        const receipt = (report.receipt orelse return error.NativeReceiptRequired).document;
+        const receipt_digest = native_recovery.parseDigest(receipt.digest_sha256) orelse
+            return error.InvalidNativeReceipt;
+        if (!attempt.record().mutation_started or
+            (report.outcome == .succeeded) != (receipt.outcome == .succeeded))
+            return error.InvalidNativeReceipt;
+        const summary = try std.fmt.allocPrint(allocator, "native transaction {s}; receipt sha256={s}; evidence={s}", .{
+            @tagName(receipt.outcome), receipt.digest_sha256, receipt.evidence_root,
+        });
+        errdefer allocator.free(summary);
+        try guard.crash(.after_native_receipt);
+        const outcome: root_operation.Outcome = if (receipt.outcome == .succeeded) .succeeded else .failed_after_mutation;
+        if (attempt.record().state != .completed) {
+            switch (attempt.record().state) {
+                .mutating => try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification }),
+                .recovery_required => try attempt.beginRecovery(allocator, attempt.record().phase),
+                .verifying, .recovering => {},
+                else => return error.InvalidNativeReceipt,
+            }
+            try attempt.complete(allocator, outcome);
+        } else if (attempt.record().outcome != outcome) return error.InvalidNativeReceipt;
+        try guard.crash(.after_completed_record);
+
+        const store = root_operation_completion.Store.init(attempt.coordinator.root);
+        var completion = try store.read(allocator);
+        defer if (completion) |*value| value.deinit();
+        if (completion) |*value| {
+            if (!std.mem.eql(u8, &value.document.attempt_id, &attempt.record().attempt_id)) {
+                if (attempt.record().provenance == .published)
+                    return error.InvalidNativeCompletion;
+                value.deinit();
+                completion = null;
+            }
+        }
+        if (completion == null) {
+            if (attempt.record().provenance != .pending)
+                return error.InvalidNativeCompletion;
+            completion = try root_operation_completion.create(allocator, .{
+                .record = attempt.record(),
+                .transaction_provenance = .{
+                    .status = .already_present,
+                    .schema = native_provenance.schema_id,
+                    .document_sha256 = receipt_digest,
+                    .detail = "verified terminal native receipt",
+                },
+                .journal = .{ .status = .absent, .detail = "native receipt binds native phase journals; no command journal" },
+                .discharge = .{
+                    .surface = .package_transaction,
+                    .operation = request.operation.spelling(),
+                    .request_sha256 = productRequestDigest(request),
+                },
+            });
+            try store.publish(allocator, completion.?.document);
+        }
+        const document = completion.?.document;
+        if (!document.bindsRecord(attempt.record()) or
+            !std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id) or
+            document.transaction_provenance.document_sha256 == null or
+            !std.mem.eql(u8, &document.transaction_provenance.document_sha256.?, &receipt_digest) or
+            document.transaction_provenance.status == .unavailable or document.journal.status != .absent)
+            return error.InvalidNativeCompletion;
+        if (attempt.record().provenance == .pending) {
+            if (!std.mem.eql(u8, &document.record_digest_sha256, &attempt.record().digest_sha256) or
+                document.record_generation != attempt.record().generation)
+                return error.InvalidNativeCompletion;
+            try guard.crash(.after_owed_provenance_document);
+            try attempt.publishProvenance(allocator, document.digest_sha256);
+        } else if (attempt.record().provenance_sha256 == null or
+            !std.mem.eql(u8, &attempt.record().provenance_sha256.?, &document.digest_sha256))
+            return error.InvalidNativeCompletion;
+        try guard.crash(.after_provenance_published);
+        try native_runtime.acknowledge(allocator, attempt, receipt.digest_sha256);
+        try guard.crash(.after_native_acknowledged);
+        try attempt.clear();
+        if (receipt.outcome == .succeeded)
+            return success(request.operation, true, summary, &.{});
+        var failed = api.failure(request.operation, .transaction, .transaction_failed, summary);
+        failed.changed = true;
+        return failed;
     }
 
     fn listInstalled(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
@@ -728,6 +866,49 @@ pub const Backend = struct {
         request: api.Request,
         workflow: ?WorkflowDirective,
     ) !api.Result {
+        if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
+            return self.withRepositoriesGuarded(allocator, request, workflow, null);
+        if (workflow != null)
+            return api.failure(request.operation, .unavailable, .transaction_backend_unavailable, "native orchestrated execution is not available");
+        if (request.options.lock_input_path == null)
+            return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v2 exact-lock input");
+        if (!request.options.assume_yes or request.options.conffile == .unspecified)
+            return api.failure(request.operation, .usage, .configuration_required, "native execution requires confirmation and an explicit conffile policy");
+        if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
+            request.options.keyring_paths.len == 0)
+            return api.failure(request.operation, .usage, .configuration_required, "native execution requires authenticated repository configuration");
+        var guard: RootOperationGuard = .{
+            .backend = self,
+            .allocator = allocator,
+            .native_owned = true,
+        };
+        defer guard.deinit();
+        if (guard.open(allocator, request, .{ .package_transaction = request.operation })) |failure|
+            return failure;
+        const result = self.withRepositoriesGuarded(allocator, request, null, &guard) catch |err| failure: {
+            const attempt = guard.active().?;
+            if (!try native_runtime.canAbandon(allocator, attempt)) {
+                var blocked = blockedRecovery(request.operation, try std.fmt.allocPrint(
+                    allocator,
+                    "native execution requires recovery: {s}",
+                    .{@errorName(err)},
+                ));
+                blocked.changed = attempt.record().mutation_started;
+                break :failure blocked;
+            }
+            break :failure nativeFailure(request.operation, err, false);
+        };
+        try guard.abandonNativeIfSafe();
+        return result;
+    }
+
+    fn withRepositoriesGuarded(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        workflow: ?WorkflowDirective,
+        native_guard: ?*RootOperationGuard,
+    ) !api.Result {
         if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "repository command requires --source or --config");
         if (request.options.keyring_paths.len == 0)
@@ -737,41 +918,43 @@ pub const Backend = struct {
         // reach — acquisition staging, the transaction journal, and the
         // executor's own target locks — happens inside this attempt, so a
         // repository bootstrap or a second package transaction cannot overlap
-        // it. The selected transaction backend was already proven available in
-        // `route`, so an unavailable native selection still fails before any
-        // root access.
-        var guard: RootOperationGuard = .{ .backend = self, .allocator = allocator };
-        defer guard.deinit();
-        guard.preserve_settled = if (workflow) |directive|
-            directive.mode == .recover and directive.defer_recovery_clear
-        else
-            false;
-        guard.orchestration_id = if (workflow) |directive|
-            directive.orchestration_id
-        else
-            null;
-        guard.recovery_review_claim = if (workflow) |directive|
-            directive.recovery_review_claim
-        else
-            null;
-        guard.expected_ownership_marker = if (workflow) |directive|
-            directive.expected_ownership_marker
-        else
-            null;
-        guard.root_attempt_id = if (workflow) |directive|
-            directive.root_attempt_id
-        else
-            null;
-        if (guard.preserve_settled and
-            guard.orchestration_id == null)
-            return api.failure(
-                request.operation,
-                .internal,
-                .internal_error,
-                "deferred recovery requires an acknowledgment identity",
-            );
-        if (workflowRootOperation(request.operation, workflow)) |operation| {
-            if (guard.open(allocator, request, operation)) |failure| return failure;
+        // it. Native core execution supplies its held guard and dispatches to
+        // the typed runtime before constructing legacy executor dependencies.
+        var local_guard: RootOperationGuard = .{ .backend = self, .allocator = allocator };
+        defer local_guard.deinit();
+        const guard = native_guard orelse &local_guard;
+        if (native_guard == null) {
+            guard.preserve_settled = if (workflow) |directive|
+                directive.mode == .recover and directive.defer_recovery_clear
+            else
+                false;
+            guard.orchestration_id = if (workflow) |directive|
+                directive.orchestration_id
+            else
+                null;
+            guard.recovery_review_claim = if (workflow) |directive|
+                directive.recovery_review_claim
+            else
+                null;
+            guard.expected_ownership_marker = if (workflow) |directive|
+                directive.expected_ownership_marker
+            else
+                null;
+            guard.root_attempt_id = if (workflow) |directive|
+                directive.root_attempt_id
+            else
+                null;
+            if (guard.preserve_settled and
+                guard.orchestration_id == null)
+                return api.failure(
+                    request.operation,
+                    .internal,
+                    .internal_error,
+                    "deferred recovery requires an acknowledgment identity",
+                );
+            if (workflowRootOperation(request.operation, workflow)) |operation| {
+                if (guard.open(allocator, request, operation)) |failure| return failure;
+            }
         }
         if (workflowMode(request.operation, workflow) == .reserve) {
             guard.preserve_pre_mutation = true;
@@ -793,7 +976,7 @@ pub const Backend = struct {
         if (workflowMode(request.operation, workflow) == .recover) {
             if (try self.dischargeOwedProvenance(
                 allocator,
-                &guard,
+                guard,
                 request,
                 if (workflow) |directive|
                     directive.defer_recovery_clear
@@ -1163,6 +1346,44 @@ pub const Backend = struct {
             return planResultChanged(allocator, request.operation, plan.*, false, "packages downloaded and verified");
 
         const executor_policy = try executionPolicy(allocator, effective_request);
+        if (self.transaction_backend == .native) {
+            const archives = try allocator.alloc([]const u8, verified.items.len);
+            defer allocator.free(archives);
+            for (verified.items, archives) |package, *bytes| bytes.* = package.bytes;
+            var preparation = try native_runtime.prepare(allocator, .{
+                .attempt = guard.active().?,
+                .plan = plan,
+                .exact_lock = native_lock orelse return error.NativeExactLockRequired,
+                .archives = archives,
+                .policy = executor_policy,
+            });
+            defer preparation.deinit();
+            const prepared = switch (preparation) {
+                .unchanged => return planResultChanged(allocator, request.operation, plan.*, false, "native transaction has no package changes"),
+                .prepared => |*value| value,
+                .diagnostic => |value| return api.failure(
+                    request.operation,
+                    .transaction,
+                    .transaction_failed,
+                    try std.fmt.allocPrint(allocator, "native preparation refused: {s}: {s}", .{
+                        @tagName(value.diagnostic.code), value.diagnostic.detail,
+                    }),
+                ),
+            };
+            const planned = try planResult(allocator, request.operation, plan.*);
+            var report = try native_runtime.execute(allocator, .{
+                .attempt = guard.active().?,
+                .prepared = prepared,
+                .archives = archives,
+                .operation = if (plan.actions.len == 0) .process_triggers else nativeOperation(request.operation),
+            });
+            defer report.deinit();
+            var result = try self.finishNative(allocator, request, guard, report);
+            if (result.exit_status == .success) {
+                result.items = planned.items;
+            }
+            return result;
+        }
         var system_process = transaction_executor.SystemProcessRunner{ .allocator = allocator, .io = self.io };
         defer system_process.deinit();
         var system_files = transaction_executor.SystemFileSystem{ .allocator = allocator, .io = self.io };
@@ -1216,7 +1437,7 @@ pub const Backend = struct {
             )) |failure| return failure;
             if (try self.dischargeOwedProvenance(
                 allocator,
-                &guard,
+                guard,
                 request,
                 if (workflow) |directive|
                     directive.defer_recovery_clear
@@ -2933,6 +3154,8 @@ const RootOperationGuard = struct {
     expected_ownership_marker: ?root_operation.DeferredAcknowledgment = null,
     ownership_marker: ?root_operation.DeferredAcknowledgment = null,
     root_attempt_id: ?[32]u8 = null,
+    /// Native cleanup is explicit and receipt-backed, never inferred by deinit.
+    native_owned: bool = false,
 
     const Completion = enum { succeeded, failed, recovered };
 
@@ -3001,6 +3224,17 @@ const RootOperationGuard = struct {
             .invalid_request,
             "install root is unsafe or unavailable",
         );
+        if (self.native_owned) {
+            var host = root_fs.openAbsoluteRoot(self.backend.io, "/") catch
+                return nativeFailure(request.operation, error.HostRootNotSupported, false);
+            defer host.close();
+            const held = self.owned_root.?.root.rootEntry() catch |err|
+                return nativeFailure(request.operation, err, false);
+            const host_entry = host.root.rootEntry() catch |err|
+                return nativeFailure(request.operation, err, false);
+            if (held.device == host_entry.device and held.inode == host_entry.inode)
+                return nativeFailure(request.operation, error.HostRootNotSupported, false);
+        }
         self.locks = .{ .allocator = allocator, .io = self.backend.io };
         self.coordinator = root_operation.Coordinator.open(
             self.backend.io,
@@ -3019,23 +3253,22 @@ const RootOperationGuard = struct {
             .backend = self.backend.transaction_backend,
             .operation = operation,
             .request_sha256 = productRequestDigest(request),
-            .policy_sha256 = package_cache_workflow.solverPolicyDigest(
-                request.options.recommends,
-                request.options.allow_downgrade,
-                switch (request.options.repository_policy) {
-                    .strict_priority => .strict_priority,
-                    .best_version => .best_version,
-                },
-            ),
+            .policy_sha256 = planningPolicyDigest(self.backend.transaction_backend, request.options),
             .target_architecture = request.options.architecture,
+            .foreign_architectures = if (self.native_owned) request.options.foreign_architectures else &.{},
             .wait_ms = request.options.lock_wait_ms,
-            .adopt_settled_for_acknowledgment = self.preserve_settled,
+            .adopt_settled_for_acknowledgment = self.preserve_settled or self.native_owned,
             .orchestration_id = self.orchestration_id,
             .recovery_review_claim = self.recovery_review_claim,
             .expected_deferred_acknowledgment = self.expected_ownership_marker,
             .attempt_id = self.root_attempt_id,
             .acquisition_observer = self.acquisitionObserver(),
         }) catch |err| return mapRootOperationError(request.operation, err);
+        if (self.attempt.?.record().backend != self.backend.transaction_backend) {
+            self.preserve_pre_mutation = true;
+            self.preserve_settled = true;
+            return blockedRecovery(request.operation, "active attempt belongs to a different transaction backend");
+        }
         if (self.orchestration_id) |orchestration_id| {
             const store = self.coordinator.store();
             const existing = store.readDeferredAcknowledgment(
@@ -3316,7 +3549,7 @@ const RootOperationGuard = struct {
             // here simply leaves the record, which the next attempt reports.
             // A simulated crash unwinds without any of this: the record must
             // survive exactly as the dead process left it.
-            if (value.locked() and !self.crashed and
+            if (value.locked() and !self.crashed and !self.native_owned and
                 !self.preserve_pre_mutation)
             {
                 if (value.record().state.provenPreMutation()) {
@@ -3354,7 +3587,35 @@ const RootOperationGuard = struct {
         if (self.owned_root) |*value| value.close();
         self.owned_root = null;
     }
+
+    fn abandonNativeIfSafe(self: *RootOperationGuard) !void {
+        const attempt = self.active() orelse return;
+        if (self.crashed or !attempt.record().state.provenPreMutation()) return;
+        if (try native_runtime.canAbandon(self.allocator, attempt))
+            try attempt.abandonIfPreMutation(self.allocator);
+    }
 };
+
+fn nativeOperation(operation: api.Operation) native_recovery.Operation {
+    return switch (operation) {
+        .install => .install,
+        .remove => .remove,
+        .upgrade, .upgrade_all => .upgrade,
+        .reinstall => .reinstall,
+        else => unreachable,
+    };
+}
+
+fn nativeFailure(operation: api.Operation, err: anyerror, changed: bool) api.Result {
+    var result = api.failure(
+        operation,
+        if (operation == .recover) .recovery else .transaction,
+        if (operation == .recover) .recovery_failed else .transaction_failed,
+        @errorName(err),
+    );
+    result.changed = changed;
+    return result;
+}
 
 /// Name of the detailed transaction provenance document a locked product
 /// transaction publishes under the explicit state path.
@@ -4724,7 +4985,7 @@ fn mapRuntimeError(operation: api.Operation, err: anyerror) api.Result {
     };
 }
 
-test "production backend rejects unavailable native transaction before repository work" {
+test "production workflow native execution requires a reviewed lock before repository work" {
     var backend: Backend = .{
         .io = std.testing.io,
         .transaction_backend = .native,
@@ -4742,10 +5003,10 @@ test "production backend rejects unavailable native transaction before repositor
             .conffile = .keep_existing,
         },
     }, backend.interface());
-    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+    try std.testing.expectEqual(api.ExitStatus.usage, result.exit_status);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostic_count);
     try std.testing.expectEqual(
-        api.ErrorId.transaction_backend_unavailable,
+        api.ErrorId.configuration_required,
         result.diagnostics[0].id,
     );
     try std.testing.expect(!result.changed);

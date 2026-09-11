@@ -80,6 +80,20 @@ pub const Result = union(enum) {
 
 const IdentityIndex = std.StringHashMapUnmanaged(usize);
 
+pub const ResultWithNoChanges = union(enum) {
+    prepared: Prepared,
+    diagnostic: OwnedDiagnostic,
+    unchanged,
+
+    pub fn deinit(self: *ResultWithNoChanges) void {
+        switch (self.*) {
+            .unchanged => {},
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 fn identity(allocator: std.mem.Allocator, name: []const u8, architecture: []const u8) ![]const u8 {
     if (name.len == 0 or architecture.len == 0 or
         name.len > native_program.maximum_identity_bytes or
@@ -403,6 +417,15 @@ test "native_preparation.test.empty lock requires every removal and preserves re
     try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
     request.installed.packages = &.{};
     try std.testing.expectError(error.EmptyProgram, prepare(std.testing.allocator, request));
+    var unchanged = try prepareOrUnchanged(std.testing.allocator, request);
+    defer unchanged.deinit();
+    try std.testing.expect(unchanged == .unchanged);
+    request.installed.packages = fixture.installed[0..1];
+    try std.testing.expectError(error.LockClosureMismatch, prepareOrUnchanged(std.testing.allocator, request));
+    request.installed.packages = &.{};
+    request.archives = fixture.archives[0..1];
+    try std.testing.expectError(error.InvalidEmptyProgram, prepareOrUnchanged(std.testing.allocator, request));
+    request.archives = &.{};
     fixture.plan.actions = fixture.actions[0..1];
     fixture.plan.ordered_actions = fixture.ordered[1..];
     try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
@@ -536,6 +559,20 @@ test "native_preparation.test.all preparation and diagnostic allocation failures
 /// Unlike the fixture compiler, every hash here has its production meaning:
 /// lock request, solver policy, executor policy, plan, and archive origin.
 pub fn prepare(allocator: std.mem.Allocator, request: Request) !Result {
+    return switch (try prepareImpl(allocator, request, false)) {
+        .prepared => |value| .{ .prepared = value },
+        .diagnostic => |value| .{ .diagnostic = value },
+        .unchanged => unreachable,
+    };
+}
+
+/// Classifies an unchanged, fully verified closure without inventing an
+/// executable authorization or a terminal execution receipt.
+pub fn prepareOrUnchanged(allocator: std.mem.Allocator, request: Request) !ResultWithNoChanges {
+    return prepareImpl(allocator, request, true);
+}
+
+fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: bool) !ResultWithNoChanges {
     if (request.plan.actions.len > native_authorization.maximum_actions or
         request.plan.ordered_actions.len > native_program.maximum_steps or
         request.installed.packages.len > native_program.maximum_installed_packages or
@@ -663,6 +700,13 @@ pub fn prepare(allocator: std.mem.Allocator, request: Request) !Result {
         for (request.archives) |archive| {
             if (archive.triggers.len != 0) return error.TriggerAuthorityRequired;
         }
+    }
+    if (allow_unchanged and actions.len == 0 and request.trigger_authority == null) {
+        if (request.plan.ordered_actions.len != 0 or request.archives.len != 0 or
+            request.installed.updates_pending or request.unsupported_features.len != 0 or
+            request.ownership_conflicts.len != 0)
+            return error.InvalidEmptyProgram;
+        return .unchanged;
     }
     var authorization = try native_authorization.create(allocator, .{
         .backend = .native,

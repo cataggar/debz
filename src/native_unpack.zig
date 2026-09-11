@@ -10949,6 +10949,8 @@ const ExternalLifecycleRequest = struct {
     crash_at: ?native_recovery.CrashPoint = null,
     caller_owned: bool = false,
     acknowledge_native: bool = false,
+    core_product: bool = false,
+    core_completion_crash: ?@import("production_backend.zig").CompletionPoint = null,
     isolated_helper: bool = false,
 };
 
@@ -11246,15 +11248,21 @@ fn programArchiveEvidence(
     return result;
 }
 
+const TriggerPreparation = struct {
+    enabled: bool,
+    mode: native_authorization.TriggerMode = .transaction,
+    defer_triggers: bool = false,
+};
+
 fn lifecycleTriggerAuthority(
     allocator: std.mem.Allocator,
-    external: ExternalLifecycleRequest,
+    options: TriggerPreparation,
     database: package_database.Database,
     installed: []const native_program.InstalledPackage,
     archives: []const native_program.Archive,
     base_final_state: []const native_authorization.FinalPackage,
 ) !?native_authorization.TriggerAuthority {
-    if (!external.triggers) return null;
+    if (!options.enabled) return null;
     var handlers: std.ArrayList(native_authorization.TriggerHandler) = .empty;
     var callers: std.ArrayList(native_authorization.TriggerCaller) = .empty;
     var allowed: std.ArrayList([]const u8) = .empty;
@@ -11343,11 +11351,8 @@ fn lifecycleTriggerAuthority(
     if (handlers.items.len == 0 or allowed.items.len == 0)
         return error.TriggerAuthorityEmpty;
     return .{
-        .mode = if (external.operation == .process_triggers)
-            .process_pending
-        else
-            .transaction,
-        .defer_triggers = external.defer_triggers,
+        .mode = options.mode,
+        .defer_triggers = options.defer_triggers,
         .initial_state_sha256 = native_trigger.stateDigest(database.model),
         .handlers = try allocator.dupe(
             native_authorization.TriggerHandler,
@@ -11359,15 +11364,15 @@ fn lifecycleTriggerAuthority(
         ),
         .allowed_triggers = try allocator.dupe([]const u8, allowed.items),
         .maximum_invocations = 256,
-        .final_mode = if (external.defer_triggers)
+        .final_mode = if (options.defer_triggers)
             .derive_from_activations
         else
             .exact,
-        .base_final_state_sha256 = if (external.defer_triggers)
+        .base_final_state_sha256 = if (options.defer_triggers)
             native_authorization.finalStateDigest(base_final_state)
         else
             null,
-        .maximum_activations = if (external.defer_triggers) 256 else 0,
+        .maximum_activations = if (options.defer_triggers) 256 else 0,
     };
 }
 
@@ -12177,7 +12182,11 @@ fn compileLifecycleProgram(
     );
     const trigger_authority = try lifecycleTriggerAuthority(
         owned,
-        external,
+        .{
+            .enabled = external.triggers,
+            .mode = if (external.operation == .process_triggers) .process_pending else .transaction,
+            .defer_triggers = external.defer_triggers,
+        },
         database,
         installed,
         archives,
@@ -17072,6 +17081,27 @@ fn recoverLifecycleProgram(
     );
     const active_record = try cleanup_coordinator.inspect(allocator);
     if (active_record == null) {
+        // Private pre-integration executions cleared the caller record before
+        // native cleanup. Hold rank 0 while verifying terminal receipts, but
+        // never manufacture a replacement attempt over their remaining intent.
+        const cleanup_lock = try locks.acquire(.{
+            .rank = .root_operation,
+            .root = root,
+            .identity = cleanup_coordinator.identity,
+            .path = root_operation.lock_path,
+            .wait_ms = 0,
+            .cancellation = .never(),
+        });
+        defer locks.release(cleanup_lock);
+        if (try cleanup_coordinator.inspect(allocator)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ActiveAttemptChanged;
+        }
+        var locked_intent = try native_recovery.readIntent(allocator, root);
+        defer locked_intent.deinit();
+        if (!std.mem.eql(u8, &locked_intent.intent.digest_sha256, &intent.intent.digest_sha256))
+            return error.InvalidRecoveryIntent;
         var progress = try native_recovery.readProgress(allocator, root);
         defer progress.deinit();
         const terminal = native_recovery.latest(
@@ -17117,59 +17147,6 @@ fn recoverLifecycleProgram(
                 &completion.document.transaction_provenance.document_sha256.?,
                 &provenance_digest,
             )) return error.InvalidRecoveryProvenance;
-        const program = compiled.program.program;
-        var cleanup_attempt = try cleanup_coordinator.acquire(allocator, .{
-            .intent = .mutation,
-            .existing = .fail,
-            .backend = .native,
-            .operation = .{
-                .package_transaction = externalProductOperation(
-                    switch (intent.intent.operation) {
-                        .install => .install,
-                        .upgrade => .upgrade,
-                        .downgrade => .downgrade,
-                        .reinstall => .reinstall,
-                        .configure => .configure,
-                        .remove => .remove,
-                        .purge => .purge,
-                        .process_triggers => .process_triggers,
-                    },
-                ),
-            },
-            .request_sha256 = native_recovery.parseDigest(
-                intent.intent.request_sha256,
-            ) orelse return error.InvalidRecoveryIntent,
-            .policy_sha256 = native_recovery.parseDigest(
-                intent.intent.policy_sha256,
-            ) orelse return error.InvalidRecoveryIntent,
-            .evidence = .{
-                .authorization_sha256 = native_recovery.parseDigest(
-                    intent.intent.authorization_sha256,
-                ),
-                .program_sha256 = native_recovery.parseDigest(
-                    intent.intent.program_sha256,
-                ),
-                .plan_sha256 = native_recovery.parseDigest(
-                    intent.intent.program_sha256,
-                ),
-                .exact_lock = .{
-                    .schema = program.exact_lock.schema,
-                    .version = program.exact_lock.version,
-                    .digest_sha256 = native_recovery.parseDigest(
-                        intent.intent.exact_lock_sha256,
-                    ) orelse return error.InvalidRecoveryIntent,
-                },
-                .database_generation_sha256 = native_recovery.parseDigest(
-                    intent.intent.database_generation_sha256,
-                ),
-                .artifact_evidence_sha256 = native_recovery.parseDigest(
-                    intent.intent.artifact_evidence_sha256,
-                ),
-            },
-            .target_architecture = program.target_architecture,
-            .foreign_architectures = program.foreign_architectures,
-        });
-        defer cleanup_attempt.release();
         for (progress.document.records) |entry| {
             if (entry.action.kind != .script and
                 entry.action.kind != .compensation and
@@ -17186,7 +17163,6 @@ fn recoverLifecycleProgram(
             };
         }
         try native_recovery.cleanup(allocator, root, intent.intent);
-        try cleanup_attempt.abandonIfPreMutation(allocator);
         return .{
             .outcome = switch (provenance.document.outcome) {
                 .succeeded => .applied,
@@ -17275,6 +17251,14 @@ fn productionLifecycleRequest(
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
+    pub const PrepareRequest = struct {
+        attempt: *root_operation.Attempt,
+        plan: *const solver.Plan,
+        exact_lock: *const exact_lock_v2.Lock,
+        archives: []const []const u8,
+        policy: transaction_executor.Policy,
+    };
+
     pub const Request = struct {
         attempt: *root_operation.Attempt,
         prepared: *native_preparation.Prepared,
@@ -17300,6 +17284,115 @@ pub const Runtime = struct {
     /// Preparation must bind this exact script policy.
     pub fn scriptPolicy() maintainer_script.Policy {
         return lifecycleScriptPolicy();
+    }
+
+    /// A pre-mutation caller record alone cannot prove that no native intent
+    /// was published. Callers may abandon only after this additional check.
+    pub fn canAbandon(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !bool {
+        const root = try validateAttempt(attempt);
+        if (!attempt.record().state.provenPreMutation()) return false;
+        if (try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null or
+            try orphanNativeEvidenceDetail(allocator, root) != null)
+            return false;
+        if (try readCompletion(allocator, attempt)) |value| {
+            var receipt = value;
+            defer receipt.deinit();
+            return false;
+        }
+        return true;
+    }
+
+    /// Captures complete root evidence and validates acquired bytes against
+    /// their genuine lock origins. This does not publish native active intent.
+    pub fn prepare(allocator: std.mem.Allocator, request: PrepareRequest) !native_preparation.ResultWithNoChanges {
+        const root = try validateAttempt(request.attempt);
+        if (!request.attempt.record().state.provenPreMutation())
+            return error.OperationNotMutable;
+        if (!std.mem.eql(u8, request.attempt.record().target_architecture, request.plan.target_architecture))
+            return error.OperationArchitectureMismatch;
+        if (request.archives.len > native_program.maximum_artifacts)
+            return error.LimitExceeded;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        var captured = try captureDatabaseSnapshot(allocator, root, .{});
+        defer captured.deinit();
+        normalizeCapturedNativeArchitecture(&captured.snapshot, request.plan.target_architecture);
+        var database = switch (try package_database.importSnapshot(allocator, .{
+            .native_architecture = request.plan.target_architecture,
+            .snapshot = captured.snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.InvalidNativeDatabase,
+        };
+        defer database.deinit();
+        const foreign = request.attempt.record().foreign_architectures;
+        if (foreign.len != database.model.foreign_architectures.len)
+            return error.OperationArchitectureMismatch;
+        for (foreign, database.model.foreign_architectures) |expected, actual|
+            if (!std.mem.eql(u8, expected, actual)) return error.OperationArchitectureMismatch;
+        if (database.model.pending_updates.len != 0 or
+            database.model.diversions.len != 0 or database.model.stat_overrides.len != 0 or
+            database.model.opaque_info.len != 0)
+            return error.UnsupportedNativeDatabase;
+        const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
+        const models = try temporary.alloc(archive_application.Model, request.archives.len);
+        const origins = try temporary.alloc(exact_lock_v2.PackageOrigin, request.archives.len);
+        var total_bytes: u64 = 0;
+        for (request.archives, 0..) |bytes, index| {
+            total_bytes = std.math.add(u64, total_bytes, bytes.len) catch
+                return error.LimitExceeded;
+            if (total_bytes > (Limits{}).max_archive_bytes)
+                return error.LimitExceeded;
+            models[index] = switch (archive_application.prepare(temporary, bytes, .{ .local = .{} }, .{})) {
+                .model => |value| value,
+                .diagnostic => return error.InvalidNativeArchive,
+            };
+            const model = &models[index];
+            const locked = request.exact_lock.findPackage(
+                model.facts.package,
+                model.facts.version,
+                model.facts.architecture,
+            ) orelse return error.ArchiveEvidenceMismatch;
+            if (locked.declared_size != bytes.len or
+                !std.mem.eql(u8, &locked.sha256, &model.provenance().sha256))
+                return error.ArchiveEvidenceMismatch;
+            if (model.metadata.len != 0 or model.script(.config) != null)
+                return error.UnsupportedNativeArchive;
+            origins[index] = locked.origin;
+        }
+        const archives = try programArchiveEvidence(temporary, models, request.archives, origins);
+        var triggers = database.model.triggers.interests.len != 0 or
+            database.model.triggers.pending.len != 0;
+        for (installed) |package| {
+            triggers = triggers or package.triggers.len != 0 or
+                package.triggers_pending.len != 0 or package.triggers_awaited.len != 0;
+        }
+        for (archives) |archive| triggers = triggers or archive.triggers.len != 0;
+        const authority = try lifecycleTriggerAuthority(
+            temporary,
+            .{ .enabled = triggers, .mode = if (request.plan.actions.len == 0) .process_pending else .transaction },
+            database,
+            installed,
+            archives,
+            &.{},
+        );
+        return native_preparation.prepareOrUnchanged(allocator, .{
+            .plan = request.plan,
+            .exact_lock = request.exact_lock,
+            .install_root = request.attempt.record().install_root,
+            .policy = request.policy,
+            .script_policy = scriptPolicy(),
+            .foreign_architectures = database.model.foreign_architectures,
+            .installed = .{
+                .generation_sha256 = database.generation.sha256,
+                .packages = installed,
+                .trigger_state_sha256 = native_trigger.stateDigest(database.model),
+                .updates_pending = database.model.pending_updates.len != 0,
+            },
+            .archives = archives,
+            .trigger_authority = authority,
+        });
     }
 
     /// Borrows the caller's held attempt and prepared inputs. Never completes,
@@ -19861,14 +19954,7 @@ test "native_unpack.test.trigger authority binds old and new scripts of every ki
     };
     const authority = (try lifecycleTriggerAuthority(
         allocator,
-        .{
-            .root = "/srv/root",
-            .architecture = "amd64",
-            .archives = &.{},
-            .operation = .upgrade,
-            .report = "/srv/report",
-            .triggers = true,
-        },
+        .{ .enabled = true },
         database,
         &installed,
         &archives,
@@ -20215,7 +20301,15 @@ fn callerOwnedLifecycleFixture(
     caller_hash.update(raw_request);
     var attempt = try coordinator.acquire(allocator, .{
         .backend = .native,
-        .operation = .{ .repository_bootstrap = .add },
+        .operation = if (external.core_product)
+            .{ .package_transaction = switch (external.operation) {
+                .remove, .purge => .remove,
+                .upgrade => .upgrade,
+                .reinstall => .reinstall,
+                else => .install,
+            } }
+        else
+            .{ .repository_bootstrap = .add },
         .request_sha256 = caller_hash.finalResult(),
         .policy_sha256 = @splat(0x72),
         .target_architecture = external.architecture,
@@ -20271,6 +20365,8 @@ test "native_unpack.test.lifecycle external fixture" {
     const external = parsed.value;
     if ((external.caller_owned and (!external.recovery or external.fault != null)) or
         (external.acknowledge_native and (!external.caller_owned or external.operation != .recover)) or
+        (external.core_product and (!external.caller_owned or !external.isolated_helper)) or
+        (external.core_completion_crash != null and (!external.core_product or external.operation != .recover)) or
         (external.isolated_helper and !external.caller_owned))
         return error.InvalidExternalLifecycleRequest;
     const archive_phase = switch (external.operation) {
@@ -20326,6 +20422,46 @@ test "native_unpack.test.lifecycle external fixture" {
         if (external.archives.len != 0 or external.packages.len != 0 or
             external.ordered_actions != null or external.fault != null)
             return error.InvalidExternalLifecycleRequest;
+        if (external.core_product) {
+            const product = @import("production_backend.zig");
+            const api = @import("product_api.zig");
+            const Crash = struct {
+                point: ?product.CompletionPoint,
+                fn hit(context: *anyopaque, point: product.CompletionPoint) anyerror!void {
+                    const self: *@This() = @ptrCast(@alignCast(context));
+                    if (self.point == point) std.process.exit(native_recovery.crash_exit_code);
+                }
+            };
+            var crash: Crash = .{ .point = external.core_completion_crash };
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var backend: product.Backend = .{
+                .io = testing.io,
+                .transaction_backend = .native,
+                .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
+            };
+            const result = try api.execute(arena.allocator(), .{
+                .operation = .recover,
+                .options = .{
+                    .install_root = external.root,
+                    .cache_path = try std.fmt.allocPrint(arena.allocator(), "{s}/unused-cache", .{external.root}),
+                    .state_path = try std.fmt.allocPrint(arena.allocator(), "{s}/unused-state", .{external.root}),
+                    .architecture = external.architecture,
+                    .assume_yes = true,
+                },
+            }, backend.interface());
+            var report: LifecycleResult = .{
+                .outcome = switch (result.exit_status) {
+                    .success => .applied,
+                    .transaction => .script_failed,
+                    else => .recovery_required,
+                },
+                .detail = result.summary,
+            };
+            try attachLifecycleProvenance(arena.allocator(), root, &report);
+            try writeLifecycleReport(testing.allocator, testing.io, external.report, report);
+            return;
+        }
         var recovery_locks: root_operation.SystemLockBackend = .{
             .allocator = testing.allocator,
             .io = testing.io,
@@ -20696,6 +20832,11 @@ test "native_unpack.test.public runtime refuses missing helpers before package m
     try testPreparedMixedLifecycle(false, .public_missing_helper);
 }
 
+test "native_unpack.test.runtime preparation captures genuine archive and complete root evidence" {
+    try testPreparedMixedLifecycle(false, .captured_preparation);
+    try testPreparedMixedLifecycle(true, .captured_preparation);
+}
+
 test "native_unpack.test.public runtime requires a held native attempt and its physical named root" {
     var fixture: Fixture = undefined;
     try fixture.init(empty_status, &.{});
@@ -20854,6 +20995,7 @@ const MixedLifecycleCase = enum {
     empty_closure,
     helper_target_removed,
     public_missing_helper,
+    captured_preparation,
     stale_database,
     wrong_plan,
     foreign_root,
@@ -21052,6 +21194,42 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             try caller.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
     }
     defer if (case != .owned) caller.release();
+    if (case == .captured_preparation) {
+        const original = caller.record().digest_sha256;
+        const request: Runtime.PrepareRequest = .{
+            .attempt = &caller,
+            .plan = &solver_plan,
+            .exact_lock = &lock.lock,
+            .archives = &.{bytes},
+            .policy = .{ .conffile = .keep_existing },
+        };
+        var captured_preparation = try Runtime.prepare(testing.allocator, request);
+        defer captured_preparation.deinit();
+        const captured_program = switch (captured_preparation) {
+            .prepared => |value| value.program.program,
+            .diagnostic, .unchanged => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqualStrings(&compiled.program.program.digest_sha256, &captured_program.digest_sha256);
+        try testing.expectEqual(original, caller.record().digest_sha256);
+        try testing.expect(try Runtime.canAbandon(testing.allocator, &caller));
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        var missing = request;
+        missing.archives = &.{};
+        var refused = try Runtime.prepare(testing.allocator, missing);
+        defer refused.deinit();
+        try testing.expect(refused == .diagnostic);
+        try testing.expectEqual(.missing_archive, refused.diagnostic.diagnostic.code);
+        var changed_lock = lock.lock;
+        var changed_package = lock.lock.packages[0];
+        changed_package.sha256[0] ^= 1;
+        changed_lock.packages = &.{changed_package};
+        var changed_request = request;
+        changed_request.exact_lock = &changed_lock;
+        try testing.expectError(error.ArchiveEvidenceMismatch, Runtime.prepare(testing.allocator, changed_request));
+        try caller.abandonIfPreMutation(testing.allocator);
+        return;
+    }
     const external: ExternalLifecycleRequest = .{
         .root = install_root,
         .architecture = "amd64",

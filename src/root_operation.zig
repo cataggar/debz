@@ -63,6 +63,7 @@ pub const record_path = namespace_path ++ "/" ++ record_name;
 pub const deferred_ack_path = namespace_path ++ "/" ++ deferred_ack_name;
 pub const recovery_review_path = deferred_ack_path;
 pub const lock_path = namespace_path ++ "/" ++ lock_name;
+pub const native_intent_path = namespace_path ++ "/native-execution-intent-v1.json";
 
 /// Transaction backend the attempt is bound to. A record written for one
 /// backend is never reinterpreted as another backend's evidence.
@@ -3149,6 +3150,30 @@ pub const Coordinator = struct {
             )) return error.RootIdentityMismatch;
         }
 
+        const continuing_native = request.intent == .same_operation and prior != null and
+            prior.?.record.backend == .native and !prior.?.record.clearable() and
+            bindsSameOperation(prior.?.record, request);
+        if (request.backend != .native or prior == null or (request.intent != .recovery and !continuing_native)) {
+            if ((self.root.entryIfExists(root_fs.Path.init(native_intent_path) catch unreachable) catch
+                return error.RecordCorrupt) != null)
+                return error.RecoveryRequired;
+        }
+        // Native intent can precede package mutation, and native acknowledgment
+        // follows outer completion. Neither window permits generic reclamation,
+        // including reclamation performed by deferred-owner cleanup below.
+        if (prior) |value| {
+            if (value.record.backend == .native and request.intent == .recovery and request.backend != .native)
+                return error.AttemptMismatch;
+            if (value.record.backend == .native and value.record.program_sha256 != null and
+                value.record.outcome != .abandoned_before_mutation)
+            {
+                if (request.intent == .recovery) {
+                    if (value.record.clearable() and !request.adopt_settled_for_acknowledgment)
+                        return error.RecoveryRequired;
+                } else if (!continuing_native) return error.RecoveryRequired;
+            }
+        }
+
         var deferred = store_handle.readDeferredAcknowledgment(
             allocator,
         ) catch return error.RecordCorrupt;
@@ -4122,6 +4147,72 @@ pub const TestLockBackend = struct {
 };
 
 const testing = std.testing;
+
+test "root_operation.test.native pre-intent and pending-ack bindings cannot be reclaimed by either backend" {
+    for ([_]bool{ false, true }) |completed| {
+        var directory = testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        var locks: TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try Coordinator.open(testing.io, .init(testing.io, directory.dir), "/target", locks.interface());
+        const request: Request = .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .install },
+            .request_sha256 = @splat(1),
+            .policy_sha256 = @splat(2),
+            .target_architecture = "amd64",
+            .evidence = .{ .program_sha256 = @splat(3) },
+        };
+        var attempt = try coordinator.acquire(testing.allocator, request);
+        try attempt.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+        if (completed) {
+            try attempt.markMutationStarted(testing.allocator, .mutation);
+            try attempt.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+            try attempt.complete(testing.allocator, .succeeded);
+            try attempt.publishProvenance(testing.allocator, @splat(4));
+        }
+        const original = attempt.record().digest_sha256;
+        attempt.release();
+        for ([_]Backend{ .native, .legacy_dpkg }) |backend| {
+            var replacement = request;
+            replacement.backend = backend;
+            replacement.existing = .reclaim_resolved;
+            try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, replacement));
+        }
+        var recovery = request;
+        recovery.intent = .recovery;
+        recovery.backend = .legacy_dpkg;
+        try testing.expectError(error.AttemptMismatch, coordinator.acquire(testing.allocator, recovery));
+        recovery.backend = .native;
+        if (completed)
+            try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, recovery));
+        recovery.adopt_settled_for_acknowledgment = true;
+        var adopted = try coordinator.acquire(testing.allocator, recovery);
+        defer adopted.release();
+        try testing.expectEqual(original, adopted.record().digest_sha256);
+    }
+}
+
+test "root_operation.test.orphan native intent blocks new attempts and legacy recovery" {
+    var directory = testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    const root = root_fs.Root.init(testing.io, directory.dir);
+    try root.createDirectoryPath(try root_fs.Path.init(namespace_path), root_fs.default_directory_permissions);
+    try root.publishFile(try root_fs.Path.init(native_intent_path), "unreadable native intent\n", .{});
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try Coordinator.open(testing.io, root, "/target", locks.interface());
+    var request = testRequest(.{ .package_transaction = .install });
+    for ([_]Backend{ .native, .legacy_dpkg }) |backend| {
+        request.backend = backend;
+        try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, request));
+    }
+    request.intent = .recovery;
+    try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, request));
+    request.backend = .native;
+    try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, request));
+    try testing.expect(try coordinator.store().read(testing.allocator) == null);
+}
 
 const test_root = "/target";
 const test_other_root = "/other";
