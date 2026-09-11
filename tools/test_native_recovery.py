@@ -141,6 +141,61 @@ class RecoveryOracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "isolated helper"):
             acceptance.assert_helper_invocations(request, {"script_policy_sha256": "c" * 64}, [script])
 
+    def test_helper_request_schema_supports_jsonschema_without_referencing(self) -> None:
+        compatibility = importlib.util.module_from_spec(SPEC)
+        with mock.patch.dict("sys.modules", {"referencing": None}):
+            SPEC.loader.exec_module(compatibility)
+        self.assertIsNone(compatibility.Registry)
+        self.assertIsNone(compatibility.Resource)
+
+        execution = {
+            "schema": "https://debz.dev/schema/native-execution-request-v1",
+            "version": 1, "backend": "native", "completion_owner": "caller",
+            "install_root": str(self.root), "root_identity_sha256": "a" * 64,
+            "root_inode": self.root.stat().st_ino, "architecture": "amd64",
+            "caller": {
+                "attempt_id": "b" * 64, "operation": {"package_transaction": "install"},
+                "request_sha256": "c" * 64, "policy_sha256": "d" * 64,
+            },
+            "program": {
+                field: "e" * 64 for field in (
+                    "request_sha256", "solver_policy_sha256", "executor_policy_sha256",
+                    "plan_sha256", "authorization_sha256", "program_sha256",
+                    "exact_lock_sha256", "artifact_evidence_sha256",
+                    "database_generation_sha256", "script_policy_sha256",
+                )
+            },
+            "operation": "install", "policy": "keep_existing", "triggers": True,
+            "defer_triggers": False, "digest_sha256": "f" * 64,
+        }
+        request = {
+            "schema": "https://debz.dev/schema/native-execution-request-v2",
+            "version": 2, "execution": execution,
+            "helper": {
+                "source_path": f"var/lib/debz/native-helper-cache-v1/{'a' * 64}.bin",
+                "target_path": "usr/bin/dpkg-trigger", "sha256": "a" * 64, "size": 1,
+            },
+            "digest_sha256": "b" * 64,
+        }
+        for module in (acceptance, compatibility):
+            with self.subTest(registry=module.Registry is not None):
+                with mock.patch("socket.socket.connect") as connect:
+                    connect.side_effect = AssertionError("schema resolution must remain local")
+                    module.validator("native-execution-request-v1").validate(execution)
+                    validator = module.validator("native-execution-request-v2")
+                    validator.validate(request)
+                    invalid = {
+                        **execution,
+                        "program": {**execution["program"], "script_policy_sha256": "invalid"},
+                    }
+                    with self.assertRaises(module.jsonschema.ValidationError) as error:
+                        validator.validate({**request, "execution": invalid})
+                    self.assertEqual(
+                        list(error.exception.absolute_path),
+                        ["execution", "program", "script_policy_sha256"],
+                    )
+                    connect.assert_not_called()
+
     def test_provenance_is_bound_to_original_execution(self) -> None:
         binding = {
             "attempt_id": "a" * 64, "program_sha256": "b" * 64,

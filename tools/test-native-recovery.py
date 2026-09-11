@@ -17,7 +17,13 @@ import subprocess
 import tempfile
 
 import jsonschema
-from referencing import Registry, Resource
+try:
+    from referencing import Registry, Resource
+except ModuleNotFoundError as error:
+    if error.name != "referencing":
+        raise
+    Registry = None
+    Resource = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,10 +180,16 @@ def assert_digest(value: dict, schema: str) -> None:
 
 @cache
 def validator(schema: str) -> jsonschema.Draft202012Validator:
+    definition = document(ROOT / "schema" / f"{schema}.json")
     execution = document(ROOT / "schema/native-execution-request-v1.json")
-    registry = Registry().with_resource(execution["$id"], Resource.from_contents(execution))
+    if Registry is not None and Resource is not None:
+        registry = Registry().with_resource(execution["$id"], Resource.from_contents(execution))
+        return jsonschema.Draft202012Validator(definition, registry=registry)
     return jsonschema.Draft202012Validator(
-        document(ROOT / "schema" / f"{schema}.json"), registry=registry,
+        definition,
+        resolver=jsonschema.RefResolver.from_schema(
+            definition, store={execution["$id"]: execution},
+        ),
     )
 
 
