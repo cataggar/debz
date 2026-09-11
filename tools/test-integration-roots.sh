@@ -224,7 +224,7 @@ PY
     --transaction-backend native --assume-yes --json | grep -q '"changed":false'
   test ! -e "$workspace/native-recovery-unused-cache"
   test ! -e "$native_state"
-  $privileged python3 - "$native_root" <<'PY'
+  $privileged python3 -B - "$native_root" <<'PY'
 import importlib.util
 from pathlib import Path
 import sys
