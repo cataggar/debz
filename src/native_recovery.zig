@@ -1,5 +1,6 @@
 const std = @import("std");
 const maintainer_script = @import("maintainer_script.zig");
+const native_helper = @import("native_helper.zig");
 const absolute_path = @import("absolute_path.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
@@ -613,6 +614,7 @@ pub const Runtime = struct {
     recovered_phase_count: u64 = 0,
     staging_directory_initially_present: bool = false,
     caller_owned: bool = false,
+    helper_binding: ?native_helper.Binding = null,
 
     pub fn append(
         self: *Runtime,

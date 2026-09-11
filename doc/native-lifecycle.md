@@ -63,9 +63,11 @@ refused before mutation. The separate typed
 [production request and recovery boundary](native-recovery.md#caller-owned-production-request-and-completion)
 persists both hash domains, resumes original inputs, and publishes native
 terminal evidence without completing the caller. Cleanup requires explicit
-receipt acknowledgment. Helper deployment and public runtime/CLI selection
-remain pending item-15b integration; these private boundaries do not enable
-public native execution.
+receipt acknowledgment. The helper-aware variant embeds and stages trusted
+helper bytes, probes namespace capability before package mutation, and records
+the isolated helper binding in a v2 request. Missing targets are refused without
+creating placeholders. Public runtime/CLI selection remains pending item-15b
+integration; these private boundaries do not enable public native execution.
 
 ## Independent reference acceptance
 

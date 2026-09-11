@@ -119,6 +119,28 @@ class RecoveryOracleTests(unittest.TestCase):
                         )
                     run.assert_not_called()
 
+    def test_isolated_helper_requires_caller_ownership(self) -> None:
+        with mock.patch.object(acceptance.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "native caller"):
+                acceptance.native(
+                    self.workspace / "driver", self.root, "amd64", "install",
+                    [], {}, self.workspace, isolated_helper=True,
+                )
+            run.assert_not_called()
+
+    def test_isolated_invocation_evidence_cannot_be_omitted(self) -> None:
+        request = {
+            "execution": {"install_root": "/fixture"},
+            "helper": {"source_path": "var/lib/debz/helper", "target_path": "usr/bin/dpkg-trigger", "sha256": "a" * 64},
+        }
+        script = {
+            "package": "example", "architecture": "amd64", "kind": "postinst",
+            "source": "new_package", "package_version": "1", "environment": [],
+            "arguments": ["configure", ""], "script_sha256": "b" * 64, "invocation_sha256": "0" * 64,
+        }
+        with self.assertRaisesRegex(AssertionError, "isolated helper"):
+            acceptance.assert_helper_invocations(request, {"script_policy_sha256": "c" * 64}, [script])
+
     def test_provenance_is_bound_to_original_execution(self) -> None:
         binding = {
             "attempt_id": "a" * 64, "program_sha256": "b" * 64,

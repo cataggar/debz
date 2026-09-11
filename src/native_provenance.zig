@@ -34,6 +34,7 @@ pub const Outcome = enum {
 };
 
 pub const EvidenceKind = enum {
+    helper_binary,
     execution_request,
     authorization,
     program,
@@ -69,9 +70,28 @@ pub const EvidenceSource = struct {
     source_path: []const u8,
     receipt_name: []const u8,
     document_sha256: ?Digest = null,
+    expected_sha256: ?Digest = null,
     action: ?native_recovery.Action = null,
     required: bool = true,
 };
+
+test "native_provenance.test.retention checks bound bytes before publishing a helper receipt" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.publishFile(try root_fs.Path.init("helper-input"), "helper bytes", .{});
+    const attempt: Digest = @splat('a');
+    const sources = [_]EvidenceSource{.{
+        .kind = .helper_binary,
+        .source_path = "helper-input",
+        .receipt_name = "helper.bin",
+        .expected_sha256 = @splat('0'),
+    }};
+    try testing.expectError(error.EvidenceChanged, retainEvidence(testing.allocator, root, attempt, &sources));
+    const destination = receipts_directory ++ "/" ++ ("a" ** 64) ++ "/helper.bin";
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(destination)) == null);
+}
 
 pub const RetainedEvidence = struct {
     root_path: []const u8,
@@ -208,6 +228,12 @@ pub fn retainEvidence(
         ) catch return error.EvidenceTooLarge;
         if (total_bytes > maximum_evidence_total_bytes)
             return error.EvidenceTooLarge;
+        var sha256: [32]u8 = undefined;
+        Sha256.hash(bytes, &sha256, .{});
+        if (source.expected_sha256) |expected| {
+            if (!std.mem.eql(u8, &expected, &hexDigest(sha256)))
+                return error.EvidenceChanged;
+        }
         const destination = try std.fmt.allocPrint(
             owned,
             "{s}/{s}",
@@ -236,8 +262,6 @@ pub fn retainEvidence(
             },
             else => return err,
         };
-        var sha256: [32]u8 = undefined;
-        Sha256.hash(bytes, &sha256, .{});
         try files.append(owned, .{
             .kind = source.kind,
             .path = destination,
@@ -350,6 +374,7 @@ pub fn validate(document: Document) !void {
             => if (file.document_sha256 == null)
                 return error.InvalidEvidence,
             .active_script,
+            .helper_binary,
             .root_mutation_journal,
             .root_mutation_progress,
             => {},

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-request-v2",
+  "title": "debz native execution request with isolated helper v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "execution", "helper", "digest_sha256"],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/native-execution-request-v2"},
+    "version": {"const": 2},
+    "execution": {"$ref": "https://debz.dev/schema/native-execution-request-v1"},
+    "helper": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "target_path", "sha256", "size"],
+      "properties": {
+        "source_path": {
+          "type": "string",
+          "pattern": "^var/lib/debz/native-helper-cache-v1/[0-9a-f]{64}\\.bin$"
+        },
+        "target_path": {"const": "usr/bin/dpkg-trigger"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 33554432}
+      }
+    },
+    "digest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
