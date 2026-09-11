@@ -108,6 +108,17 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertEqual(request["archives"], [])
         self.assertEqual(request["packages"], [])
 
+    def test_native_acknowledgment_requires_recovering_caller(self) -> None:
+        for operation, caller in (("install", True), ("recover", False)):
+            with self.subTest(operation=operation, caller=caller):
+                with mock.patch.object(acceptance.subprocess, "run") as run:
+                    with self.assertRaisesRegex(ValueError, "recovering caller"):
+                        acceptance.native(
+                            self.workspace / "driver", self.root, "amd64", operation,
+                            [], {}, self.workspace, caller_owned=caller, acknowledge_native=True,
+                        )
+                    run.assert_not_called()
+
     def test_provenance_is_bound_to_original_execution(self) -> None:
         binding = {
             "attempt_id": "a" * 64, "program_sha256": "b" * 64,

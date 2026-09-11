@@ -231,6 +231,7 @@
       "properties": {
         "kind": {
           "enum": [
+            "execution_request",
             "authorization",
             "program",
             "intent",

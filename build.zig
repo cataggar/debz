@@ -635,7 +635,7 @@ pub fn build(b: *std.Build) void {
 
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "native_recovery.test.", "native_provenance.test." },
+        .filters = &.{ "native_recovery.test.", "native_provenance.test.", "native_execution_request.test." },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
     b.step("test-native-recovery-unit", "Run native execution journal and provenance tests")
@@ -905,6 +905,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "native-execution-intent-v1.json",
         "native-execution-progress-v1.json",
+        "native-execution-request-v1.json",
         "native-managed-state-v1.json",
         "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",

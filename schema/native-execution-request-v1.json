@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-request-v1",
+  "title": "debz caller-owned native execution request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "backend", "completion_owner", "install_root",
+    "root_identity_sha256", "root_inode", "architecture", "caller", "program",
+    "operation", "policy", "triggers", "defer_triggers", "digest_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/native-execution-request-v1"},
+    "version": {"const": 1},
+    "backend": {"const": "native"},
+    "completion_owner": {"const": "caller"},
+    "install_root": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "root_identity_sha256": {"$ref": "#/$defs/digest"},
+    "root_inode": {"type": "integer", "minimum": 0},
+    "architecture": {"type": "string", "minLength": 1, "maxLength": 256},
+    "caller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_id", "operation", "request_sha256", "policy_sha256"],
+      "properties": {
+        "attempt_id": {"$ref": "#/$defs/digest"},
+        "operation": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["package_transaction"],
+              "properties": {
+                "package_transaction": {"enum": ["install", "upgrade", "reinstall", "remove"]}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repository_bootstrap"],
+              "properties": {"repository_bootstrap": {"const": "add"}}
+            }
+          ]
+        },
+        "request_sha256": {"$ref": "#/$defs/digest"},
+        "policy_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "program": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_sha256", "solver_policy_sha256", "executor_policy_sha256",
+        "plan_sha256", "authorization_sha256", "program_sha256",
+        "exact_lock_sha256", "artifact_evidence_sha256",
+        "database_generation_sha256", "script_policy_sha256"
+      ],
+      "properties": {
+        "request_sha256": {"$ref": "#/$defs/digest"},
+        "solver_policy_sha256": {"$ref": "#/$defs/digest"},
+        "executor_policy_sha256": {"$ref": "#/$defs/digest"},
+        "plan_sha256": {"$ref": "#/$defs/digest"},
+        "authorization_sha256": {"$ref": "#/$defs/digest"},
+        "program_sha256": {"$ref": "#/$defs/digest"},
+        "exact_lock_sha256": {"$ref": "#/$defs/digest"},
+        "artifact_evidence_sha256": {"$ref": "#/$defs/digest"},
+        "database_generation_sha256": {"$ref": "#/$defs/digest"},
+        "script_policy_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "operation": {
+      "enum": ["install", "upgrade", "downgrade", "reinstall", "configure", "remove", "purge", "process_triggers"]
+    },
+    "policy": {"enum": ["keep_existing", "use_package_version"]},
+    "triggers": {"type": "boolean"},
+    "defer_triggers": {"type": "boolean"},
+    "digest_sha256": {"$ref": "#/$defs/digest"}
+  },
+  "allOf": [{
+    "if": {"properties": {"defer_triggers": {"const": true}}},
+    "then": {"properties": {"triggers": {"const": true}}}
+  }],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

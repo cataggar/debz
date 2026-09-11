@@ -281,6 +281,11 @@ pub fn readIntent(
         maximum_intent_bytes,
     );
     defer allocator.free(bytes);
+    return decodeIntent(allocator, bytes);
+}
+
+pub fn decodeIntent(allocator: std.mem.Allocator, bytes: []const u8) !OwnedIntent {
+    if (bytes.len > maximum_intent_bytes) return error.LimitExceeded;
     var parsed = try std.json.parseFromSlice(
         Intent,
         allocator,
@@ -507,6 +512,11 @@ pub fn readProgress(
         maximum_progress_bytes,
     );
     defer allocator.free(bytes);
+    return decodeProgress(allocator, bytes);
+}
+
+pub fn decodeProgress(allocator: std.mem.Allocator, bytes: []const u8) !OwnedProgress {
+    if (bytes.len > maximum_progress_bytes) return error.LimitExceeded;
     var parsed = try std.json.parseFromSlice(
         ProgressDocument,
         allocator,
@@ -602,6 +612,7 @@ pub const Runtime = struct {
     recovering: bool = false,
     recovered_phase_count: u64 = 0,
     staging_directory_initially_present: bool = false,
+    caller_owned: bool = false,
 
     pub fn append(
         self: *Runtime,

@@ -44,6 +44,7 @@ BINDING_FIELDS = (
     "execution_intent_sha256",
 )
 EVIDENCE_SCHEMAS = {
+    "execution_request": "native-execution-request-v1",
     "authorization": "native-transaction-authorization-v1",
     "program": "native-transaction-program-v1",
     "intent": "native-execution-intent-v1",
@@ -74,6 +75,8 @@ def native(
     trigger_execution: bool = False,
     defer: bool = False,
     crash_at: str | None = None,
+    caller_owned: bool = False,
+    acknowledge_native: bool = False,
 ) -> dict | None:
     m.reference_command(root)
     if operation == "recover" and (archives or packages or crash_at is not None):
@@ -89,6 +92,12 @@ def native(
     }
     if crash_at is not None:
         request["crash_at"] = crash_at
+    if caller_owned:
+        request["caller_owned"] = True
+    if acknowledge_native:
+        if not caller_owned or operation != "recover":
+            raise ValueError("native acknowledgment belongs to the recovering caller")
+        request["acknowledge_native"] = True
     m.write(request_path, json.dumps(request).encode())
     with (destination / "native.log").open("wb") as output:
         result = subprocess.run(
@@ -206,13 +215,25 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             raise AssertionError("retained semantic digest differs from the manifest")
         if kind == "script_outcome" and value["action"] != entry["action"]:
             raise AssertionError("retained script has a different invocation identity")
-        if kind not in ("authorization", "program", "intent"):
+        if kind not in ("authorization", "program", "intent", "execution_request"):
             if value["intent_sha256"] != proof["execution_intent_sha256"]:
                 raise AssertionError("retained evidence belongs to another execution intent")
         documents.setdefault(kind, []).append(value)
-    for kind in EVIDENCE_SCHEMAS.keys() - {"script_outcome"}:
+    for kind in EVIDENCE_SCHEMAS.keys() - {"script_outcome", "execution_request"}:
         if len(documents.get(kind, [])) != 1:
             raise AssertionError(f"missing or duplicated retained {kind}")
+    request_blobs = [blob for blob in documents["intent"][0]["blobs"] if blob["kind"] == "request"]
+    if len(request_blobs) != 1:
+        raise AssertionError("intent did not retain exactly one request binding")
+    if request_blobs[0]["logical_path"] == "request/native-execution-request-v1.json":
+        requests = documents.get("execution_request", [])
+        if len(requests) != 1:
+            raise AssertionError("missing or duplicated retained execution_request")
+        request_bytes = canonical(requests[0]) + b"\n"
+        if hashlib.sha256(request_bytes).hexdigest() != request_blobs[0]["sha256"]:
+            raise AssertionError("retained production request differs from the execution intent")
+    elif "execution_request" in documents:
+        raise AssertionError("private intent cannot substitute a production request")
     return documents
 
 
@@ -379,7 +400,22 @@ def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
         raise AssertionError("provenance disagrees with the actual terminal outcome")
     retained = retained_documents(root, value)
     intent = retained["intent"][0]
-    assert_binding(value, intent_binding(intent))
+    retained_binding = intent_binding(intent)
+    if "execution_request" in retained:
+        request = retained["execution_request"][0]
+        caller = request["caller"]
+        program = retained["program"][0]
+        for field in ("request_sha256", "solver_policy_sha256", "executor_policy_sha256", "plan_sha256", "script_policy_sha256"):
+            if request["program"][field] != program[field]:
+                raise AssertionError(f"production request lost its native {field}")
+        if request["program"]["program_sha256"] != program["digest_sha256"]:
+            raise AssertionError("production request lost its native program")
+        if caller["attempt_id"] != intent["attempt_id"]:
+            raise AssertionError("production request lost its caller attempt")
+        retained_binding.update({field: caller[field] for field in ("operation", "request_sha256", "policy_sha256")})
+        if caller["request_sha256"] == program["request_sha256"]:
+            raise AssertionError("fixture did not exercise distinct caller and native request hashes")
+    assert_binding(value, retained_binding)
     for kind, field in (
         ("authorization", "authorization_sha256"), ("program", "program_sha256"),
         ("intent", "execution_intent_sha256"), ("trigger_events", "trigger_evidence_sha256"),
@@ -424,6 +460,7 @@ class Scenario(triggers.Scenario):
         defer: bool = False,
         failure: bool = False,
         compare_reference: bool = True,
+        caller_owned: bool = False,
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
@@ -438,8 +475,13 @@ class Scenario(triggers.Scenario):
             self.executable, self.candidate, self.architecture,
             operation, archives, self.environment, destination,
             trigger_execution=trigger_execution, defer=defer, crash_at=boundary,
+            caller_owned=caller_owned,
         )
         binding = intent_binding(document(self.candidate / INTENT, 16 * 1024 * 1024))
+        if caller_owned:
+            caller = document(self.candidate / OPERATION)
+            binding.update({field: caller[field] for field in ("request_sha256", "policy_sha256")})
+            binding["operation"] = {caller["surface"]: caller["operation"]}
         if boundary != "after_active_clear" and document(self.candidate / OPERATION)["backend"] != "native":
             raise AssertionError("crashed process lost native operation evidence")
         for archive in archives:
@@ -450,15 +492,50 @@ class Scenario(triggers.Scenario):
         )
         return binding
 
-    def recover(self, *, trigger_execution: bool = False, label: str = "recover") -> dict:
+    def recover(self, *, trigger_execution: bool = False, label: str = "recover",
+                caller_owned: bool = False, acknowledge_native: bool = False) -> dict:
         destination = self.directory / label
         destination.mkdir()
         report = native(
             self.executable, self.candidate, self.architecture, "recover", [],
             self.environment, destination, trigger_execution=trigger_execution,
+            caller_owned=caller_owned, acknowledge_native=acknowledge_native,
         )
         assert report is not None
         return report
+
+    def caller_completed(self, binding: dict, *, failure: bool = False) -> None:
+        report = self.recover(caller_owned=True)
+        expected_outcome = "script_failed" if failure else "applied"
+        if report["outcome"] != expected_outcome:
+            raise AssertionError(f"caller-owned recovery failed: {report}")
+        compare(self.expected, self.candidate)
+        proof_path, proof_bytes = provenance(self.candidate, report, binding)
+        caller = document(self.candidate / OPERATION)
+        if caller["state"] not in ("mutating", "recovering") or caller["outcome"] != "pending":
+            raise AssertionError("native program completed the caller's operation")
+        if not (self.candidate / INTENT).exists():
+            raise AssertionError("native recovery cleaned evidence before caller acknowledgment")
+        completion = self.candidate / NAMESPACE / "root-operation-completion-v1.json"
+        if completion.exists():
+            raise AssertionError("native program published outer completion")
+        before = triggers.snapshot(self.candidate)
+        repeated = self.recover(caller_owned=True, label="repeat-before-ack")
+        if repeated["outcome"] != expected_outcome or m.oracle.differences(before, triggers.snapshot(self.candidate)):
+            raise AssertionError("caller-owned repeated recovery reran package work")
+        acknowledged = self.recover(caller_owned=True, acknowledge_native=True, label="caller-ack")
+        if acknowledged["outcome"] != expected_outcome:
+            raise AssertionError(f"caller acknowledgment failed: {acknowledged}")
+        for path in (OPERATION, INTENT, NAMESPACE / "native-recovery-v1"):
+            if (self.candidate / path).exists():
+                raise AssertionError(f"acknowledgment left active evidence: {path}")
+        if m.oracle.differences(before, triggers.snapshot(self.candidate)):
+            raise AssertionError("acknowledgment reran package work")
+        if m.oracle._read_bounded(proof_path, 16 * 1024 * 1024) != proof_bytes:
+            raise AssertionError("acknowledgment replaced native provenance")
+        if document(completion)["attempt_id"] != binding["attempt_id"]:
+            raise AssertionError("caller completion changed the original attempt")
+        print(f"{self.directory.name}: caller-owned crash/recovery and acknowledgment passed", flush=True)
 
     def completed(self, binding: dict, *, trigger_execution: bool = False, failure: bool = False) -> None:
         report = self.recover(trigger_execution=trigger_execution)
@@ -532,6 +609,44 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
             workspace / "packages" / label, environment, architecture, version,
             package=name, scripts=lifecycle.scripts(name, version) if scripts else None,
         )
+
+    for boundary in ("after_execution_intent", "during_filesystem_publication",
+                     "after_script_outcome", "after_provenance"):
+        current = case(f"caller-{boundary}")
+        archive = package(f"caller-{boundary}")
+        binding = current.crash("install", [archive], boundary, caller_owned=True)
+        current.caller_completed(binding)
+
+    current = case("caller-known-failure")
+    archive = package("caller-failure")
+    lifecycle.Scenario.fail(current, f"{m.PACKAGE}@1:preinst:install")
+    binding = current.crash("install", [archive], "after_failure_outcome", failure=True, caller_owned=True)
+    current.caller_completed(binding, failure=True)
+
+    current = case("caller-changed-request")
+    archive = package("caller-changed-request")
+    current.crash("install", [archive], "after_execution_intent", caller_owned=True)
+    intent = document(current.candidate / INTENT, 16 * 1024 * 1024)
+    request_blob = next(blob for blob in intent["blobs"] if blob["kind"] == "request")
+    request_path = current.candidate / request_blob["storage_path"]
+    request = document(request_path)
+    request["caller"]["policy_sha256"] = "f" * 64
+    request["digest_sha256"] = "0" * 64
+    request["digest_sha256"] = digest("debz-native-execution-request-v1\0", request)
+    request_bytes = canonical(request) + b"\n"
+    m.write(request_path, request_bytes)
+    request_blob["sha256"] = hashlib.sha256(request_bytes).hexdigest()
+    request_blob["size"] = len(request_bytes)
+    intent["digest_sha256"] = "0" * 64
+    intent["digest_sha256"] = digest("debz-native-execution-intent-v1\0", intent)
+    m.write(current.candidate / INTENT, canonical(intent) + b"\n")
+    before = triggers.snapshot(current.candidate)
+    report = current.recover(caller_owned=True)
+    if report["outcome"] != "recovery_required" or report["detail"] != "RecoveryRequestBindingMismatch":
+        raise AssertionError(f"rehashed production request was not refused against its caller: {report}")
+    if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+        raise AssertionError("changed production request allowed package mutation")
+    print("caller-changed-request: rehashed caller substitution stayed blocked", flush=True)
 
     for boundary in (
         "after_execution_intent", "during_filesystem_publication",

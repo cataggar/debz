@@ -34,6 +34,7 @@ pub const Outcome = enum {
 };
 
 pub const EvidenceKind = enum {
+    execution_request,
     authorization,
     program,
     intent,
@@ -337,6 +338,7 @@ pub fn validate(document: Document) !void {
         if (file.kind != .script_outcome and file.action != null)
             return error.InvalidEvidence;
         switch (file.kind) {
+            .execution_request,
             .authorization,
             .program,
             .intent,
