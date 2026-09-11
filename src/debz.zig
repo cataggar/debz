@@ -249,6 +249,7 @@ pub const exact_lock = @import("exact_lock.zig");
 pub const exact_lock_v2 = @import("exact_lock_v2.zig");
 pub const native_authorization = @import("native_authorization.zig");
 pub const native_program = @import("native_program.zig");
+pub const native_preparation = @import("native_preparation.zig");
 pub const native_unpack = @import("native_unpack.zig");
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
@@ -605,6 +606,7 @@ test {
     _ = native_authorization;
     _ = native_program;
     _ = native_unpack;
+    _ = native_preparation;
     _ = transaction_engine;
     _ = transaction_provenance;
     _ = transaction_provenance_v2;

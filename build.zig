@@ -473,6 +473,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "native_authorization.test.",
             "native_program.test.",
+            "native_preparation.test.",
             "transaction_engine.test.",
         },
     });

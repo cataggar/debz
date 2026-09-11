@@ -96,9 +96,9 @@ fn recoverLegacy(
     return transaction_executor.recover(allocator, request, dependencies);
 }
 
-/// Item 10 is planning-only. Native selection never accepts an injected
-/// command-shaped executor and remains unavailable before acquisition or
-/// mutation until a later integration supplies the real native capability.
+/// Native preparation returns a typed authorization and program, not a
+/// command-shaped executor. Selection remains unavailable before acquisition
+/// or mutation until the production execution/recovery capability is wired.
 pub fn select(
     kind: Kind,
     legacy_dpkg: Executor,
