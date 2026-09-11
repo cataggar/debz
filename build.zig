@@ -300,7 +300,7 @@ pub fn build(b: *std.Build) void {
     production_backend_test_module.link_libc = true;
     const production_backend_tests = b.addTest(.{
         .root_module = production_backend_test_module,
-        .filters = &.{"production workflow"},
+        .filters = &.{"production "},
     });
     const run_production_backend_tests = b.addRunArtifact(production_backend_tests);
     const required_production_security_tests = b.addTest(.{
@@ -312,7 +312,7 @@ pub fn build(b: *std.Build) void {
     );
     const production_backend_test_step = b.step(
         "test-production-backend",
-        "Run production backend workflow and exact-lock tests",
+        "Run production backend core, workflow, and exact-lock tests",
     );
     production_backend_test_step.dependOn(&run_production_backend_tests.step);
     production_backend_test_step.dependOn(

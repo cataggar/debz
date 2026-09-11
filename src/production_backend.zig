@@ -7950,6 +7950,8 @@ test "production explicit file reads reject symlinked parents" {
 }
 
 test "production backend authenticates an explicit file repository" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
@@ -8003,7 +8005,7 @@ test "production backend authenticates an explicit file repository" {
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
     };
-    const result = try api.execute(std.testing.allocator, .{
+    const result = try api.execute(arena.allocator(), .{
         .operation = .list_available,
         .options = .{
             .install_root = install_root,
@@ -8018,7 +8020,9 @@ test "production backend authenticates an explicit file repository" {
     try std.testing.expect(result.items.len != 0);
 }
 
-test "production exact lock imports and validates the installed baseline" {
+test "production exact lock retains and validates the installed baseline without selectors" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
@@ -8072,9 +8076,8 @@ test "production exact lock imports and validates the installed baseline" {
     defer std.testing.allocator.free(lock_path);
 
     var backend: Backend = .{ .io = std.testing.io, .now_unix = fixture.created + 30 };
-    const resolved = try api.execute(std.testing.allocator, .{
+    const resolved = try api.execute(arena.allocator(), .{
         .operation = .plan,
-        .packages = &.{"hello"},
         .options = .{
             .install_root = install_root,
             .source_paths = &.{source_path},
@@ -8086,6 +8089,7 @@ test "production exact lock imports and validates the installed baseline" {
         },
     }, backend.interface());
     try std.testing.expectEqual(api.ExitStatus.success, resolved.exit_status);
+    try std.testing.expectEqual(@as(usize, 0), resolved.items.len);
     const lock_bytes = try readFile(
         std.testing.allocator,
         std.testing.io,
@@ -8116,9 +8120,8 @@ test "production exact lock imports and validates the installed baseline" {
         \\
         ,
     });
-    const drift = try api.execute(std.testing.allocator, .{
+    const drift = try api.execute(arena.allocator(), .{
         .operation = .plan,
-        .packages = &.{"hello"},
         .options = .{
             .install_root = install_root,
             .source_paths = &.{source_path},
@@ -8142,9 +8145,8 @@ test "production exact lock imports and validates the installed baseline" {
         \\
         ,
     });
-    const missing = try api.execute(std.testing.allocator, .{
+    const missing = try api.execute(arena.allocator(), .{
         .operation = .plan,
-        .packages = &.{"hello"},
         .options = .{
             .install_root = install_root,
             .source_paths = &.{source_path},
@@ -8159,6 +8161,8 @@ test "production exact lock imports and validates the installed baseline" {
 }
 
 test "production backend mutation uses injected process runner" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     const fixture = @import("fixtures/openpgp.zig");
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
@@ -8216,7 +8220,7 @@ test "production backend mutation uses injected process runner" {
         .now_unix = fixture.created + 30,
         .process_runner = fake.interface(),
     };
-    const result = try api.execute(std.testing.allocator, .{
+    const result = try api.execute(arena.allocator(), .{
         .operation = .remove,
         .packages = &.{"removable"},
         .options = .{
