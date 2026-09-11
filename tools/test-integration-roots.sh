@@ -96,6 +96,71 @@ run_json plan $common --lock-input "$resolved_lock" --lock-output "$workspace/ba
   grep -q '"exit_status":0'
 cmp "$resolved_lock" "$workspace/base-dep.copy.lock.json"
 
+native_cache="$workspace/native-cache"
+native_lock="$workspace/base-dep.native.lock.json"
+native_common="--install-root $root --cache-path $native_cache --state-path $state --architecture $architecture --source $source_file --keyring $keyring --transaction-backend native --json"
+run_json plan $native_common --lock-output "$native_lock" base-dep | grep -q '"exit_status":0'
+run_json plan $native_common --lock-input "$native_lock" --lock-output "$workspace/base-dep.native.copy.lock.json" base-dep |
+  grep -q '"exit_status":0'
+cmp "$native_lock" "$workspace/base-dep.native.copy.lock.json"
+run_json download $native_common --lock-input "$native_lock" base-dep | grep -q '"changed":false'
+run_json download $native_common --lock-input "$native_lock" --cache-only base-dep | grep -q '"changed":false'
+python3 - "$resolved_lock" "$native_lock" "$native_cache" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+legacy = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+native = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
+assert native["schema"] == "https://debz.dev/schema/exact-closure-lock-v2"
+assert native["version"] == 2
+assert native["request_sha256"] == legacy["request_sha256"]
+assert native["policy_sha256"] == hashlib.sha256(
+    b"debz.product-native-solver-policy-v1\0" + bytes.fromhex(legacy["policy_sha256"])
+).hexdigest()
+assert native["repositories"] == legacy["repositories"]
+assert native["local_artifacts"] == []
+assert len(native["packages"]) == len(legacy["packages"])
+for package, previous in zip(native["packages"], legacy["packages"]):
+    origin = package["origin"]
+    assert origin["type"] == "authenticated_repository"
+    for field in ("repository_id", "repository_snapshot_sha256"):
+        assert origin[field] == previous[field]
+    for field in ("name", "version", "architecture", "sha256", "declared_size", "retention", "dpkg_selection_hold"):
+        assert package[field] == previous[field]
+    data = (pathlib.Path(sys.argv[3]) / "packages-v1/objects" / package["sha256"]).read_bytes()
+    assert len(data) == package["declared_size"]
+    assert hashlib.sha256(data).hexdigest() == package["sha256"]
+expected = native.pop("digest_sha256")
+assert hashlib.sha256(json.dumps(native, separators=(",", ":")).encode()).hexdigest() == expected
+PY
+set +e
+native_wrong_version=$("$debz" plan $native_common --lock-input "$resolved_lock" base-dep 2>"$stderr_file")
+native_wrong_version_status=$?
+set -e
+test "$native_wrong_version_status" -eq 5
+test ! -s "$stderr_file"
+printf '%s' "$native_wrong_version" | grep -q '"id":"lock_verification_failed"'
+set +e
+native_wrong_policy=$("$debz" plan $native_common --lock-input "$native_lock" --recommends base-dep 2>"$stderr_file")
+native_wrong_policy_status=$?
+set -e
+test "$native_wrong_policy_status" -eq 5
+test ! -s "$stderr_file"
+printf '%s' "$native_wrong_policy" | grep -q '"id":"lock_verification_failed"'
+set +e
+native_unavailable=$("$debz" install $native_common --lock-input "$native_lock" \
+  --assume-yes --noninteractive --conffile keep-existing base-dep 2>"$stderr_file")
+native_unavailable_status=$?
+set -e
+test "$native_unavailable_status" -eq 3
+test ! -s "$stderr_file"
+printf '%s' "$native_unavailable" | grep -q '"id":"transaction_backend_unavailable"'
+test ! -s "$root/var/lib/dpkg/status"
+test ! -e "$root/var/lib/debz/root-operation-v1.json"
+test ! -e "$root/var/lib/debz/root-operation.lock"
+
 package_cache_root="$workspace/package-cache"
 package_cache_archives="$workspace/package-cache-archives"
 mkdir -p "$package_cache_archives"
@@ -105,18 +170,9 @@ printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-
 printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v1"'
 printf '%s' "$fingerprint" | grep -q '"cas_layout":"packages-v1"'
 
-python3 - "$resolved_lock" "$workspace/unsupported-v2.lock.json" <<'PY'
-import json
-import pathlib
-import sys
-value = json.loads(pathlib.Path(sys.argv[1]).read_text())
-value["schema"] = "https://debz.dev/schema/exact-closure-lock-v2"
-value["version"] = 2
-pathlib.Path(sys.argv[2]).write_text(json.dumps(value, separators=(",", ":")) + "\n")
-PY
 set +e
 unsupported=$("$debz" package-cache fingerprint \
-  --lock-input "$workspace/unsupported-v2.lock.json" \
+  --lock-input "$native_lock" \
   --cache-path "$package_cache_root" --architecture "$architecture" --json \
   2>"$stderr_file")
 unsupported_status=$?

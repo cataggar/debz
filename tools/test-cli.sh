@@ -280,6 +280,49 @@ test ! -s cli-test-stderr
 printf '%s' "$output" | grep -q '"operation":"why"'
 printf '%s' "$output" | grep -q '"exit_status":0'
 
+for command in plan download; do
+    set +e
+    output=$("$debz" "$command" $common --transaction-backend native demo 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"id":"configuration_required"'
+done
+
+for arguments in \
+    "install demo" \
+    "remove demo" \
+    "reinstall demo" \
+    "upgrade demo" \
+    "upgrade-all" \
+    "recover"
+do
+    set +e
+    output=$("$debz" $arguments $common --transaction-backend native \
+        --assume-yes --conffile keep-existing 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 3
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"id":"transaction_backend_unavailable"'
+done
+
+for arguments in \
+    "plan --json demo --transaction-backend unknown" \
+    "plan --json demo --transaction-backend native --transaction-backend legacy_dpkg" \
+    "plan --json demo --transaction-backend" \
+    "list-installed --json --transaction-backend native"
+do
+    set +e
+    output=$("$debz" $arguments $common 2>cli-test-stderr)
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stderr
+    printf '%s' "$output" | grep -q '"id":"invalid_request"'
+done
+
 for command in refresh list-available; do
     extra=
     test "$command" != refresh || extra=--assume-yes

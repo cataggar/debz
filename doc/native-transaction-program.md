@@ -57,7 +57,7 @@ Preparation is pure; execution is available separately through the experimental
 The [caller-owned recovery boundary](native-recovery.md) persists
 production request bindings and leaves outer completion to its owner. Its
 helper-aware variant binds isolated helper deployment and capability probing;
-public product/CLI selection still requires integration. Legacy remains
+public product/CLI execution/recovery still requires integration. Legacy remains
 the default, and native selection cannot fall back to the legacy executor.
 
 ## Output
@@ -209,7 +209,7 @@ installed ownership evidence, not unrestricted runtime path discovery.
 The private interpreter consumes this authority under the lifecycle's single
 outer lock and durable invocation protocol. Known trigger failures,
 no-progress cycles, and unknown invocation outcomes are distinct. Production
-native selection remains unavailable; see
+native transaction execution remains unavailable; see
 [Native trigger execution](native-triggers.md).
 
 ## Validation

@@ -67,6 +67,8 @@ const status_option_help =
 const lock_options_help =
     \\Exact-lock options:
     \\  --lock-input PATH --lock-output PATH
+    \\  --transaction-backend legacy_dpkg|native
+    \\    Native currently supports plan/download only; mutation remains unavailable.
     \\
 ;
 
@@ -244,6 +246,7 @@ const transaction_result_help =
 
 const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory };
 const SingleOption = enum {
+    transaction_backend,
     install_root,
     cache_path,
     state_path,
@@ -348,7 +351,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
     var requested_output: api.OutputFormat = .human;
-    const request = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
+    const parsed = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
         if (requested_output == .json) {
             const invalid = api.failure(operation, .usage, .invalid_request, @errorName(err));
             try render(init.arena.allocator(), stdout, stderr, .json, invalid);
@@ -361,7 +364,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
 
-    var backend_context: debz.ProductionBackend = .{ .io = init.io };
+    const request = parsed.request;
+    var backend_context: debz.ProductionBackend = .{
+        .io = init.io,
+        .transaction_backend = parsed.transaction_backend,
+    };
     const result = api.execute(init.arena.allocator(), request, .{
         .context = &backend_context,
         .executeFn = debz.ProductionBackend.executeOpaque,
@@ -1423,12 +1430,17 @@ fn usesTransactions(operation: api.Operation) bool {
     return operation.mutates() and operation != .refresh and operation != .clean;
 }
 
+const ParsedProductCommand = struct {
+    request: api.Request,
+    transaction_backend: debz.transaction_engine.Kind,
+};
+
 fn parse(
     allocator: std.mem.Allocator,
     operation: api.Operation,
     args: *std.process.Args.Iterator,
     requested_output: *api.OutputFormat,
-) CliError!api.Request {
+) CliError!ParsedProductCommand {
     var packages: std.ArrayList([]const u8) = .empty;
     var sources: std.ArrayList([]const u8) = .empty;
     var configs: std.ArrayList([]const u8) = .empty;
@@ -1436,6 +1448,7 @@ fn parse(
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
     var seen: std.EnumSet(SingleOption) = .initEmpty();
+    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
     var options: api.CommonOptions = .{
         .install_root = "",
         .cache_path = "",
@@ -1480,6 +1493,11 @@ fn parse(
         } else if (std.mem.eql(u8, argument, "--credential-reference")) {
             try setOnce(&seen, .credential_reference);
             options.credential_reference = try next(args);
+        } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
+            if (!supportsExactLocks(operation)) return error.InvalidArguments;
+            try setOnce(&seen, .transaction_backend);
+            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
+                return error.InvalidArguments;
         } else if (std.mem.eql(u8, argument, "--lock-input")) {
             try setOnce(&seen, .lock_input);
             options.lock_input_path = try next(args);
@@ -1523,9 +1541,12 @@ fn parse(
     options.foreign_architectures = try foreign_architectures.toOwnedSlice(allocator);
     options.force = try forces.toOwnedSlice(allocator);
     return .{
-        .operation = operation,
-        .packages = try packages.toOwnedSlice(allocator),
-        .options = options,
+        .request = .{
+            .operation = operation,
+            .packages = try packages.toOwnedSlice(allocator),
+            .options = options,
+        },
+        .transaction_backend = transaction_backend,
     };
 }
 
