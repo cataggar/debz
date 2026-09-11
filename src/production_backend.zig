@@ -20,6 +20,7 @@ const live_root = @import("live_root.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = transaction_engine.Executor;
@@ -938,12 +939,19 @@ pub const Backend = struct {
         if (request.options.lock_output_path != null and request.options.lock_input_path == null and
             mode != .plan_only and mode != .download_only)
             return api.failure(request.operation, .usage, .configuration_required, "--lock-output without --lock-input is restricted to non-mutating plan or download lock resolution");
-        var lock: ?exact_lock.OwnedLock = if (request.options.lock_input_path) |path|
-            readLock(allocator, self.io, path) catch
-                return api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
+        var lock: ?ProductLock = if (request.options.lock_input_path) |path|
+            readProductLock(allocator, self.io, path, self.transaction_backend) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return if (self.transaction_backend == .legacy_dpkg)
+                    api.failure(request.operation, .planning, .planning_failed, "exact lock is invalid")
+                else
+                    api.failure(request.operation, .planning, .lock_verification_failed, "exact lock is invalid or does not match the selected backend's lock version"),
+            }
         else
             null;
         defer if (lock) |*value| value.deinit();
+        const legacy_lock = if (lock) |*value| value.legacyLock() else null;
+        const native_lock = if (lock) |*value| value.nativeLock() else null;
         const selectors = try allocator.alloc(solver.PackageSelector, effective_request.packages.len);
         defer allocator.free(selectors);
         for (effective_request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
@@ -953,18 +961,11 @@ pub const Backend = struct {
             workflow,
             selectors,
         );
-        const solver_policy_digest = package_cache_workflow.solverPolicyDigest(
-            effective_request.options.recommends,
-            effective_request.options.allow_downgrade,
-            switch (effective_request.options.repository_policy) {
-                .strict_priority => .strict_priority,
-                .best_version => .best_version,
-            },
-        );
+        const solver_policy_digest = planningPolicyDigest(self.transaction_backend, effective_request.options);
         if (lock) |*value| {
-            if (!std.mem.eql(u8, &semantic_request_digest, &value.lock.request_sha256))
+            if (!std.mem.eql(u8, &semantic_request_digest, &value.requestDigest()))
                 return api.failure(request.operation, .planning, .lock_verification_failed, "exact lock semantic request does not match the requested operation and selectors");
-            if (!std.mem.eql(u8, &solver_policy_digest, &value.lock.policy_sha256))
+            if (!std.mem.eql(u8, &solver_policy_digest, &value.policyDigest()))
                 return api.failure(request.operation, .planning, .lock_verification_failed, "exact lock solver policy does not match the effective request policy");
         }
         var planning = try solver.planTransaction(allocator, .{
@@ -983,7 +984,8 @@ pub const Backend = struct {
                 .allow_downgrade = effective_request.options.allow_downgrade,
                 .strict_repository_priority = effective_request.options.repository_policy == .strict_priority,
             },
-            .exact_lock = if (lock) |*value| &value.lock else null,
+            .exact_lock = legacy_lock,
+            .exact_lock_v2 = native_lock,
         });
         defer switch (planning) {
             .plan => |*value| value.deinit(),
@@ -999,13 +1001,14 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
-        var generated_lock: ?exact_lock.OwnedLock = null;
+        var generated_lock: ?ProductLock = null;
         defer if (generated_lock) |*value| value.deinit();
         if (request.options.lock_output_path) |path| {
             if (lock) |*value| {
-                try writeLock(allocator, self.io, path, value.lock);
+                try value.write(allocator, self.io, path);
             } else {
-                generated_lock = lockFromPlan(
+                generated_lock = resolveProductLock(
+                    self.transaction_backend,
                     allocator,
                     effective_request,
                     refreshed,
@@ -1023,7 +1026,7 @@ pub const Backend = struct {
                             try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
                         ),
                     };
-                try writeLock(allocator, self.io, path, generated_lock.?.lock);
+                try generated_lock.?.write(allocator, self.io, path);
             }
         }
         if (mode == .plan_only) return planResult(allocator, request.operation, plan.*);
@@ -1033,10 +1036,14 @@ pub const Backend = struct {
         // means a resumed attempt can prove which plan it was reserved for.
         if (try guard.preflight(allocator, request.operation, .{
             .plan_sha256 = transaction_executor.planDigest(plan.*),
-            .exact_lock = if (lock) |*value| .{
+            .exact_lock = if (legacy_lock) |value| .{
                 .schema = exact_lock.schema_id,
                 .version = exact_lock.schema_version,
-                .digest_sha256 = value.lock.digest_sha256,
+                .digest_sha256 = value.digest_sha256,
+            } else if (native_lock) |value| .{
+                .schema = exact_lock_v2.schema_id,
+                .version = exact_lock_v2.schema_version,
+                .digest_sha256 = value.digest_sha256,
             } else null,
         })) |failure| return failure;
 
@@ -1080,8 +1087,14 @@ pub const Backend = struct {
                         .proxy = try proxyPolicy(request.options.proxy),
                         .credentials = credentials,
                     },
-                    .exact_lock_package = if (lock) |*value|
-                        value.lock.findPackage(action.package, action.version, action.architecture)
+                    .exact_lock_package = if (legacy_lock) |value|
+                        value.findPackage(action.package, action.version, action.architecture)
+                    else
+                        null,
+                    .exact_lock_v2_package = if (native_lock orelse
+                        if (generated_lock) |*value| value.nativeLock() else null) |value|
+                        value.findPackage(action.package, action.version, action.architecture) orelse
+                            return error.PlanOutsideLockedClosure
                     else
                         null,
                 },
@@ -1180,7 +1193,7 @@ pub const Backend = struct {
                 .plan = plan,
                 .install_root = request.options.install_root,
                 .policy = executor_policy,
-                .exact_lock = if (lock) |*value| &value.lock else null,
+                .exact_lock = legacy_lock,
             }, dependencies);
             defer report.deinit();
             if (!report.succeeded()) {
@@ -1231,7 +1244,7 @@ pub const Backend = struct {
             .install_root = request.options.install_root,
             .artifacts = artifacts.items,
             .policy = executor_policy,
-            .exact_lock = if (lock) |*value| &value.lock else null,
+            .exact_lock = legacy_lock,
         }, dependencies);
         defer report.deinit();
         if (!report.succeeded()) {
@@ -1255,14 +1268,14 @@ pub const Backend = struct {
         try guard.crash(.after_completed_record);
         try deleteRecoveryIntent(self.io, request.options.state_path);
         try guard.crash(.after_recovery_intent_deleted);
-        if (lock) |*value| {
+        if (legacy_lock) |value| {
             var verify: transaction_provenance.VerifyDiagnostic = .{};
             writeExecutionProvenance(
                 allocator,
                 self.io,
                 request,
                 refreshed,
-                value.lock,
+                value.*,
                 report,
                 dependencies.status,
                 &verify,
@@ -4170,6 +4183,83 @@ fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
     return file;
 }
 
+const ProductLock = union(transaction_engine.Kind) {
+    legacy_dpkg: exact_lock.OwnedLock,
+    native: exact_lock_v2.OwnedLock,
+
+    fn deinit(self: *ProductLock) void {
+        switch (self.*) {
+            inline else => |*owned| owned.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    fn legacyLock(self: *const ProductLock) ?*const exact_lock.Lock {
+        return switch (self.*) {
+            .legacy_dpkg => |*owned| &owned.lock,
+            .native => null,
+        };
+    }
+
+    fn nativeLock(self: *const ProductLock) ?*const exact_lock_v2.Lock {
+        return switch (self.*) {
+            .native => |*owned| &owned.lock,
+            .legacy_dpkg => null,
+        };
+    }
+
+    fn requestDigest(self: ProductLock) [32]u8 {
+        return switch (self) {
+            inline else => |owned| owned.lock.request_sha256,
+        };
+    }
+
+    fn policyDigest(self: ProductLock) [32]u8 {
+        return switch (self) {
+            inline else => |owned| owned.lock.policy_sha256,
+        };
+    }
+
+    fn write(self: ProductLock, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        switch (self) {
+            .legacy_dpkg => |owned| try writeLock(allocator, io, path, owned.lock),
+            .native => |owned| try writeLockVersion(exact_lock_v2, allocator, io, path, owned.lock),
+        }
+    }
+};
+
+fn planningPolicyDigest(backend: transaction_engine.Kind, options: api.CommonOptions) [32]u8 {
+    const legacy = package_cache_workflow.solverPolicyDigest(
+        options.recommends,
+        options.allow_downgrade,
+        switch (options.repository_policy) {
+            .strict_priority => .strict_priority,
+            .best_version => .best_version,
+        },
+    );
+    if (backend == .legacy_dpkg) return legacy;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz.product-native-solver-policy-v1\x00");
+    hash.update(&legacy);
+    return hash.finalResult();
+}
+
+fn readProductLock(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    backend: transaction_engine.Kind,
+) !ProductLock {
+    switch (backend) {
+        .legacy_dpkg => return .{ .legacy_dpkg = try readLock(allocator, io, path) },
+        .native => {
+            const bytes = try readFile(allocator, io, path, exact_lock_v2.maximum_document_bytes);
+            defer allocator.free(bytes);
+            return .{ .native = try exact_lock_v2.decode(allocator, bytes, exact_lock_v2.maximum_document_bytes) };
+        },
+    }
+}
+
 fn readLock(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !exact_lock.OwnedLock {
     const bytes = try readFile(allocator, io, path, exact_lock.maximum_document_bytes);
     defer allocator.free(bytes);
@@ -4182,15 +4272,26 @@ fn writeLock(
     path: []const u8,
     lock: exact_lock.Lock,
 ) !void {
+    return writeLockVersion(exact_lock, allocator, io, path, lock);
+}
+
+fn writeLockVersion(
+    comptime Lock: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    lock: Lock.Lock,
+) !void {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
     const leaf = std.fs.path.basename(path);
     var dir = try openAbsoluteDirectory(io, parent);
     defer dir.close(io);
-    const store = try exact_lock.Store.init(io, dir, leaf);
+    const store = try Lock.Store.init(io, dir, leaf);
     try store.writeAtomic(allocator, lock);
 }
 
-fn lockFromPlan(
+fn resolveProductLock(
+    backend: transaction_engine.Kind,
     allocator: std.mem.Allocator,
     request: api.Request,
     refreshed: *repository_policy.RefreshResult,
@@ -4198,7 +4299,34 @@ fn lockFromPlan(
     plan: solver.Plan,
     semantic_request_digest: [32]u8,
     solver_policy_digest: [32]u8,
-) !exact_lock.OwnedLock {
+) !ProductLock {
+    switch (backend) {
+        inline else => |kind| {
+            const Lock = if (kind == .native) exact_lock_v2 else exact_lock;
+            return @unionInit(ProductLock, @tagName(kind), try lockFromPlan(
+                Lock,
+                allocator,
+                request,
+                refreshed,
+                installed,
+                plan,
+                semantic_request_digest,
+                solver_policy_digest,
+            ));
+        },
+    }
+}
+
+fn lockFromPlan(
+    comptime Lock: type,
+    allocator: std.mem.Allocator,
+    request: api.Request,
+    refreshed: *repository_policy.RefreshResult,
+    installed: []const dpkg_status.Package,
+    plan: solver.Plan,
+    semantic_request_digest: [32]u8,
+    solver_policy_digest: [32]u8,
+) !Lock.OwnedLock {
     var packages: std.ArrayList(exact_lock.Package) = .empty;
     defer packages.deinit(allocator);
     var repository_ids: std.ArrayList([64]u8) = .empty;
@@ -4268,7 +4396,7 @@ fn lockFromPlan(
             .dpkg_selection_hold = package.status.want == .hold,
         });
     }
-    if (packages.items.len == 0) {
+    if (Lock == exact_lock and packages.items.len == 0) {
         for (refreshed.universe.repositories) |repository| {
             var repository_id: [64]u8 = undefined;
             @memcpy(&repository_id, repository.repository_id.slice());
@@ -4276,7 +4404,7 @@ fn lockFromPlan(
         }
     }
 
-    var repositories: std.ArrayList(exact_lock.Repository) = .empty;
+    var repositories: std.ArrayList(Lock.Repository) = .empty;
     defer repositories.deinit(allocator);
     var signer_storage: std.ArrayList([][20]u8) = .empty;
     defer {
@@ -4308,6 +4436,38 @@ fn lockFromPlan(
         });
     }
 
+    if (Lock == exact_lock_v2) {
+        // These entries came directly from authenticated resolution above,
+        // never from decoding or reinterpreting a legacy lock.
+        const native_packages = try allocator.alloc(exact_lock_v2.Package, packages.items.len);
+        defer allocator.free(native_packages);
+        for (packages.items, native_packages) |package, *native| native.* = .{
+            .name = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = package.repository_id,
+                .repository_snapshot_sha256 = package.repository_snapshot_sha256,
+            } },
+            .sha256 = package.sha256,
+            .declared_size = package.declared_size,
+            .retention = switch (package.retention) {
+                .requested => .requested,
+                .dependency => .dependency,
+                .retained => .retained,
+            },
+            .dpkg_selection_hold = package.dpkg_selection_hold,
+        };
+        return exact_lock_v2.create(allocator, .{
+            .target_architecture = request.options.architecture,
+            .request_sha256 = semantic_request_digest,
+            .policy_sha256 = solver_policy_digest,
+            .repositories = repositories.items,
+            .local_artifacts = &.{},
+            .packages = native_packages,
+            .verified_origins = true,
+        });
+    }
     return exact_lock.create(allocator, .{
         .target_architecture = request.options.architecture,
         .request_sha256 = semantic_request_digest,
@@ -5181,6 +5341,11 @@ test "production workflow reconciliation claims are distinct durable exclusive a
 }
 
 test "production workflow plans a successful batch install into one exact lock" {
+    try testWorkflowLockPlanning(.legacy_dpkg);
+    try testWorkflowLockPlanning(.native);
+}
+
+fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5201,6 +5366,7 @@ test "production workflow plans a successful batch install into one exact lock" 
     var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = kind,
         .now_unix = 1_788_796_860,
         .process_runner = process.interface(),
     };
@@ -5224,20 +5390,28 @@ test "production workflow plans a successful batch install into one exact lock" 
         exact_lock.maximum_document_bytes,
     );
     defer allocator.free(lock_bytes);
-    var lock = try exact_lock.decode(
+    var lock = try readProductLock(
         allocator,
-        lock_bytes,
-        exact_lock.maximum_document_bytes,
+        std.testing.io,
+        fixture.lock_path,
+        kind,
     );
     defer lock.deinit();
-    try std.testing.expectEqual(@as(usize, 3), lock.lock.packages.len);
     var requested: usize = 0;
     var dependencies: usize = 0;
-    for (lock.lock.packages) |package| switch (package.retention) {
-        .requested => requested += 1,
-        .dependency => dependencies += 1,
-        .retained => {},
-    };
+    switch (lock) {
+        inline else => |owned| {
+            try std.testing.expectEqual(@as(usize, 3), owned.lock.packages.len);
+            for (owned.lock.packages) |package| switch (package.retention) {
+                .requested => requested += 1,
+                .dependency => dependencies += 1,
+                .retained => {},
+            };
+        },
+    }
+    try std.testing.expectEqual(planningPolicyDigest(kind, options), lock.policyDigest());
+    if (kind == .native)
+        try std.testing.expect(!std.mem.eql(u8, &lock.policyDigest(), &planningPolicyDigest(.legacy_dpkg, options)));
     try std.testing.expectEqual(@as(usize, 2), requested);
     try std.testing.expectEqual(@as(usize, 1), dependencies);
 
@@ -5259,6 +5433,80 @@ test "production workflow plans a successful batch install into one exact lock" 
     );
     defer allocator.free(replay_bytes);
     try std.testing.expectEqualStrings(lock_bytes, replay_bytes);
+
+    backend.transaction_backend = if (kind == .native) .legacy_dpkg else .native;
+    const crossed = try backend.executeWorkflow(allocator, .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = replay_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.planning, crossed.exit_status);
+    const after_refusal = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock.maximum_document_bytes);
+    defer allocator.free(after_refusal);
+    try std.testing.expectEqualStrings(replay_bytes, after_refusal);
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer root.close();
+    try std.testing.expect(try root.root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+}
+
+test "production workflow native empty removal locks replay without enabling mutation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const status = "Package: removable\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n";
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, status);
+    defer fixture.deinit();
+    var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .native,
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+        .process_runner = process.interface(),
+    };
+    const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    var request: WorkflowRequest = .{
+        .operation = .remove,
+        .mode = .plan_only,
+        .selectors = &selectors,
+        .options = options,
+    };
+    const planned = try backend.executeWorkflow(allocator, request);
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+    defer lock.deinit();
+    try std.testing.expectEqual(@as(usize, 0), lock.native.lock.packages.len);
+    try std.testing.expectEqual(@as(usize, 0), lock.native.lock.repositories.len);
+    try std.testing.expectEqual(@as(usize, 0), lock.native.lock.local_artifacts.len);
+    request.options.lock_input_path = fixture.lock_path;
+    request.options.lock_output_path = fixture.second_lock_path;
+    const replay = try backend.executeWorkflow(allocator, request);
+    try std.testing.expectEqual(api.ExitStatus.success, replay.exit_status);
+    var reread = try readProductLock(allocator, std.testing.io, fixture.second_lock_path, .native);
+    defer reread.deinit();
+    try std.testing.expectEqual(lock.native.lock.digest_sha256, reread.native.lock.digest_sha256);
+    request.options.recommends = true;
+    const drift = try backend.executeWorkflow(allocator, request);
+    try std.testing.expectEqual(api.ErrorId.lock_verification_failed, drift.diagnostics[0].id);
+    request.options.recommends = false;
+    request.mode = .execute;
+    request.options.lock_output_path = null;
+    request.options.assume_yes = true;
+    request.options.conffile = .keep_existing;
+    const blocked = try backend.executeWorkflow(allocator, request);
+    try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, blocked.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+    const unchanged = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(4096));
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(status, unchanged);
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer root.close();
+    try std.testing.expect(try root.root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
 }
 
 test "production workflow plan-only batches do not mutate and removal locks replay" {

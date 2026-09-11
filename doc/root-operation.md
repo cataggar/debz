@@ -398,7 +398,7 @@ without ever writing this document.
 `production_backend.withRepositories` reserves the root at rank 0 before
 repository loading, refresh, acquisition, journal writes, and the executor.
 The selected transaction backend is validated before that, so an unavailable
-native selection still fails before any root access. Non-mutating operations —
+native mutation/recovery selection still fails before any root access. Non-mutating operations —
 `refresh`, `download`, `plan`, `list-installed`, `list-available`, `info`,
 `provides`, `why`, `clean` — never reserve the root and stay usable while
 another attempt holds it.

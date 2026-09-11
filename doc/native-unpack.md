@@ -2,7 +2,7 @@
 
 Roadmap item 10a is a planning slice only. It does not execute an unpack, write a
 journal, mutate an install root, recover an interrupted operation, or release
-cleanup state. Production selection of the native backend remains unavailable
+cleanup state. Production native transaction execution remains unavailable
 before acquisition or mutation.
 
 Item 10b adds a private data-only materialization adapter and an executable

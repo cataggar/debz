@@ -79,7 +79,7 @@ retained as a compatibility alias.
 
 Inputs are explicit: `--source`, `--config`, `--keyring`, `--status-path`,
 `--default-release`,
-`--repository-policy`, `--lock-input`, `--lock-output`, `--offline`,
+`--repository-policy`, `--lock-input`, `--lock-output`, `--transaction-backend`, `--offline`,
 `--proxy`, `--credential-reference`, `--cache-only`, `--recommends`,
 `--allow-downgrade`, `--deadline-ms`,
 `--lock-wait-ms`, `--noninteractive`, `--conffile`, and typed `--force`
@@ -94,6 +94,23 @@ cannot be repeated.
 Every mutating command requires `--assume-yes`. Noninteractive transaction
 commands additionally require `--conffile keep-existing` or
 `--conffile use-package-version`. `plan` and `download` are non-executing.
+
+`--transaction-backend legacy_dpkg|native` selects the core backend; omission
+retains `legacy_dpkg`. Embedders select the same backend with
+`ProductionBackend.transaction_backend`, without changing product API v1
+request or result encoding. Native currently supports non-mutating planning
+and verified download only. Native install/remove/upgrade/reinstall/recovery
+remain `transaction_backend_unavailable` before repository or root access,
+including when a command-shaped executor is injected. There is no fallback.
+
+Native `plan`/`download` resolve and replay exact-lock v2 from authenticated
+repository evidence. They do not convert v1 locks or invent local-artifact
+origins. Native solver policy uses a distinct digest domain, so locks cannot
+cross backend policy boundaries. V1 remains the legacy core format; neither
+backend silently accepts the other's format. Native package downloads bind
+identity, repository/snapshot, SHA-256, and size before cache or transport
+access, including cache-only replay. The separate `package-cache` commands
+and other consumer contracts remain v1-only where documented.
 
 The standalone binary instantiates `ProductionBackend`. A non-mutating `plan`
 or `download` may use `--lock-output` without `--lock-input` to resolve an

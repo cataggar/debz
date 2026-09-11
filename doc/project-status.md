@@ -139,8 +139,10 @@ callback state are now explicitly execution-local rather than thread-local.
 terminal receipts, and acknowledgment with mandatory bundled helper binding.
 It accepts prepared programs and immutable archive bytes rather than fixture
 requests or command-shaped executor inputs, and refuses host or mismatched
-roots. Product/CLI lock/result integration remains incomplete; backend selection
-is still unavailable and legacy remains default. See the
+roots. The core CLI now supports explicit `--transaction-backend native` for
+genuine v2 lock planning/replay and verified download, with backend-bound solver
+policy and no v1 conversion. Product native mutation/recovery and receipt/result
+integration remain unavailable; legacy remains default. See the
 [typed runtime contract](native-recovery.md#experimental-typed-runtime-api).
 Exact-lock v2 permits an empty installed closure for last-package removal/purge,
 without changing existing lock bytes or hashes. Native preparation still binds

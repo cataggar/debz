@@ -63,6 +63,16 @@ The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
 
+The core CLI selects genuine v2 planning and download with
+`--transaction-backend native`; embedders set
+`ProductionBackend.transaction_backend = .native`. Native resolution builds
+the tagged closure directly from authenticated repository snapshots, while
+native replay refuses v1 input. Its solver-policy digest is SHA-256 of
+`debz.product-native-solver-policy-v1\0` followed by the existing 32-byte solver
+policy digest. Legacy core resolution/replay keeps its original v1 format and
+policy bytes. Native product mutation/recovery remains unavailable until the
+native receipt and outer-completion contracts are integrated.
+
 The separate `debz package-cache` interface supports canonical v1 locks only.
 `fingerprint` rejects unsupported schema versions, noncanonical/tampered
 documents, target or solver-policy drift, duplicate object digests, and

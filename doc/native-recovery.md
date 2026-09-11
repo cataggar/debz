@@ -2,7 +2,7 @@
 
 Items 14 and 15b provide durable execution boundaries around the compiled native
 lifecycle, including the experimental caller-owned `debz.native_runtime` API.
-Product/CLI native selection remains unavailable; this does not enable a
+Product/CLI native execution/recovery remains unavailable; this does not enable a
 product cutover or change legacy recovery.
 
 ## Durable execution authority
@@ -217,10 +217,11 @@ operation workflow, the caller passes the exact `digest_sha256` to
 recovery after active cleanup are supported. The caller still owns outer
 completion, provenance, and lock release.
 
-Core product/CLI wiring remains required before experimental backend selection
-can be exposed. Empty v2 closures now represent last-package removal or purge,
+Core native v2 lock planning and download are available, but product/CLI
+execution and recovery still require receipt/result integration.
+Empty v2 closures now represent last-package removal or purge,
 with explicit action authorization and retained configuration modeled separately.
-Genuine product v2 lock/result integration, remaining consumers, and full pinned
+Product native receipt/result integration, remaining consumers, and full pinned
 parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 

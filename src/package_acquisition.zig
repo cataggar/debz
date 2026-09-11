@@ -6,6 +6,7 @@ const packages_index = @import("packages_index.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -132,6 +133,7 @@ pub const Request = struct {
     selected: SelectedPackage,
     policy: Policy,
     exact_lock_package: ?exact_lock.Package = null,
+    exact_lock_v2_package: ?exact_lock_v2.Package = null,
 };
 
 pub const Provenance = struct {
@@ -180,6 +182,7 @@ pub const Error = SelectionError || error{
     CorruptObject,
     LockBusy,
     LockPackageMismatch,
+    MultipleExactLocks,
 };
 
 pub const LockPolicy = union(enum) {
@@ -578,6 +581,23 @@ pub const Cache = struct {
     }
 };
 
+fn verifyLockPackage(
+    locked: anytype,
+    selected: SelectedPackage,
+    origin: exact_lock_v2.AuthenticatedRepositoryOrigin,
+) !void {
+    const record = selected.record;
+    if (!std.mem.eql(u8, locked.name, record.control.package.text) or
+        !std.mem.eql(u8, locked.version, record.control.version.value.original) or
+        !std.mem.eql(u8, locked.architecture, record.control.architecture.text) or
+        !std.mem.eql(u8, &origin.repository_id, selected.repository_id.slice()) or
+        selected.authenticated_snapshot_sha256 == null or
+        !std.mem.eql(u8, &origin.repository_snapshot_sha256, &selected.authenticated_snapshot_sha256.?) or
+        !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
+        locked.declared_size != record.transport.size.value)
+        return error.LockPackageMismatch;
+}
+
 pub fn acquirePackage(
     allocator: std.mem.Allocator,
     cache: *Cache,
@@ -586,16 +606,20 @@ pub fn acquirePackage(
 ) !VerifiedPackage {
     const record = request.selected.record;
     const declared_size = record.transport.size.value;
+    if (request.exact_lock_package != null and request.exact_lock_v2_package != null)
+        return error.MultipleExactLocks;
     if (request.exact_lock_package) |locked| {
-        if (!std.mem.eql(u8, locked.name, record.control.package.text) or
-            !std.mem.eql(u8, locked.version, record.control.version.value.original) or
-            !std.mem.eql(u8, locked.architecture, record.control.architecture.text) or
-            !std.mem.eql(u8, &locked.repository_id, request.selected.repository_id.slice()) or
-            request.selected.authenticated_snapshot_sha256 == null or
-            !std.mem.eql(u8, &locked.repository_snapshot_sha256, &request.selected.authenticated_snapshot_sha256.?) or
-            !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
-            locked.declared_size != declared_size)
-            return error.LockPackageMismatch;
+        try verifyLockPackage(locked, request.selected, .{
+            .repository_id = locked.repository_id,
+            .repository_snapshot_sha256 = locked.repository_snapshot_sha256,
+        });
+    }
+    if (request.exact_lock_v2_package) |locked| {
+        const origin = switch (locked.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => return error.LockPackageMismatch,
+        };
+        try verifyLockPackage(locked, request.selected, origin);
     }
     if (request.policy.maximum_package_bytes == 0 or
         declared_size > request.policy.maximum_package_bytes or
@@ -1061,6 +1085,102 @@ test "package_acquisition.test.exact lock rejects repository and artifact substi
         .{ .selected = selection.selected, .policy = testPolicy(.cache_only), .exact_lock_package = locked },
         transport.dependencies(),
     ));
+}
+
+test "package_acquisition.test.v2 lock binds downloads and cache hits before acquisition" {
+    const payload = "package payload";
+    var selection = try testSelection(std.testing.allocator, payload);
+    defer selection.deinit(std.testing.allocator);
+    selection.selected.authenticated_snapshot_sha256 = @splat(1);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var cache = try testCache(&directory);
+    defer cache.deinit();
+    const locked: exact_lock_v2.Package = .{
+        .name = "demo",
+        .version = "1.2.3-1",
+        .architecture = "amd64",
+        .origin = .{ .authenticated_repository = .{
+            .repository_id = selection.repository.repository_id.bytes,
+            .repository_snapshot_sha256 = @splat(1),
+        } },
+        .sha256 = selection.index.records[0].transport.sha256.bytes,
+        .declared_size = payload.len,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var transport: TestTransport = .{ .responses = &.{.{ .body = payload }} };
+    var request: Request = .{
+        .selected = selection.selected,
+        .policy = testPolicy(.online),
+        .exact_lock_v2_package = locked,
+    };
+    var downloaded = try acquirePackage(std.testing.allocator, &cache, request, transport.dependencies());
+    defer downloaded.deinit();
+    try std.testing.expectEqual(Outcome.downloaded, downloaded.provenance.outcome);
+    request.policy = testPolicy(.cache_only);
+    var cached = try acquirePackage(std.testing.allocator, &cache, request, transport.dependencies());
+    defer cached.deinit();
+    try std.testing.expectEqual(Outcome.cache_hit, cached.provenance.outcome);
+    try std.testing.expectEqualStrings(payload, cached.bytes);
+
+    const Mismatch = enum { name, version, architecture, repository, snapshot, digest, size, local };
+    for (std.enums.values(Mismatch)) |mismatch| {
+        var changed = locked;
+        switch (mismatch) {
+            .name => changed.name = "other",
+            .version => changed.version = "2",
+            .architecture => changed.architecture = "arm64",
+            .repository => changed.origin.authenticated_repository.repository_id = @splat('b'),
+            .snapshot => changed.origin.authenticated_repository.repository_snapshot_sha256 = @splat(2),
+            .digest => changed.sha256 = @splat(2),
+            .size => changed.declared_size += 1,
+            .local => changed.origin = .{ .local_artifact = .{
+                .artifact_id = @import("package_origin.zig").artifactIdFromSha256(locked.sha256),
+                .sha256 = locked.sha256,
+                .size = locked.declared_size,
+                .package = locked.name,
+                .version = locked.version,
+                .architecture = locked.architecture,
+                .acquisition_url = "file:///demo.deb",
+                .trust_mode = .pinned_sha256,
+            } },
+        }
+        request.exact_lock_v2_package = changed;
+        try std.testing.expectError(error.LockPackageMismatch, acquirePackage(
+            std.testing.allocator,
+            &cache,
+            request,
+            transport.dependencies(),
+        ));
+    }
+    request.exact_lock_v2_package = locked;
+    request.selected.authenticated_snapshot_sha256 = null;
+    try std.testing.expectError(error.LockPackageMismatch, acquirePackage(
+        std.testing.allocator,
+        &cache,
+        request,
+        transport.dependencies(),
+    ));
+    request.selected = selection.selected;
+    request.exact_lock_package = .{
+        .name = locked.name,
+        .version = locked.version,
+        .architecture = locked.architecture,
+        .repository_id = locked.origin.authenticated_repository.repository_id,
+        .repository_snapshot_sha256 = locked.origin.authenticated_repository.repository_snapshot_sha256,
+        .sha256 = locked.sha256,
+        .declared_size = locked.declared_size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    try std.testing.expectError(error.MultipleExactLocks, acquirePackage(
+        std.testing.allocator,
+        &cache,
+        request,
+        transport.dependencies(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), transport.count);
 }
 
 test "verified download publishes CAS and cache-only hit performs no network" {

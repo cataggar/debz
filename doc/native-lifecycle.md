@@ -2,7 +2,7 @@
 
 The item-12 lifecycle acceptance boundary composes the native program compiler,
 data/conffile materialization, package database, root-operation coordinator, and
-audited maintainer-script runner. It is private: production native selection
+audited maintainer-script runner. It is private: production native execution
 remains unavailable and the legacy backend remains the default.
 [Trigger execution](native-triggers.md) and
 [durable native recovery](native-recovery.md) extend this private boundary.
@@ -70,7 +70,8 @@ helper bytes, probes namespace capability before package mutation, and records
 the isolated helper binding in a v2 request. Missing targets are refused without
 creating placeholders. `debz.native_runtime` now exposes the trusted-helper-only
 typed execution/recovery/acknowledgment path; fixture controls remain private.
-Product/CLI selection remains pending item-15b integration.
+Product/CLI execution/recovery remains pending item-15b integration;
+non-mutating native v2 planning and download are available separately.
 
 ## Independent reference acceptance
 

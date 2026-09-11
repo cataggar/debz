@@ -29,6 +29,13 @@ Refresh, planning, verified downloads, cache replay, payload validation, policy,
 and reproducibility remain mandatory on every host. No qemu or foreign
 executable is used. Foreign packages contain inert data only.
 
+The core native planning lane resolves a real v2 lock, compares its repository
+and package evidence with the legacy closure, verifies its independent digest
+and backend-bound policy, and exercises cold download and cache-only replay.
+It rejects v1 input, changed policy, and native mutation without creating a
+root-operation record or changing installed state. This does not claim native
+transaction parity or enable product mutation.
+
 ## Support claims
 
 The suite names identify fixture contracts, not downloaded vendor root
