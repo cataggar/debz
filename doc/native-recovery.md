@@ -1,8 +1,9 @@
 # Native recovery and provenance
 
-Items 14 and 15b provide private durable execution boundaries around the compiled
-native lifecycle, including caller-owned operations. Production native selection remains unavailable; this does not
-enable a CLI or product cutover and does not change legacy recovery.
+Items 14 and 15b provide durable execution boundaries around the compiled native
+lifecycle, including the experimental caller-owned `debz.native_runtime` API.
+Product/CLI native selection remains unavailable; this does not enable a
+product cutover or change legacy recovery.
 
 ## Durable execution authority
 
@@ -113,7 +114,7 @@ hash of this new document. No fields or hash domains are added to existing
 intent, program, progress or provenance documents. Private fixture requests
 remain readable but cannot authorize caller-owned recovery.
 
-The private typed adapter persists this mapping before package mutation and
+The typed adapter persists this mapping before package mutation and
 reproduces application models from exact program-bound archive bytes. Supplied
 archives are matched by digest rather than caller ordering. Recovery loads the
 original database and archives, without re-solving or accepting replacement
@@ -142,7 +143,7 @@ target path, byte digest and size. It has a separate v2 digest domain; existing
 v1 requests and receipts keep their original bytes and remain readable.
 
 `debz.native_helper` makes the statically linked native trigger helper available
-as a build-bound embedded payload. The helper-aware private adapter stages
+as a build-bound embedded payload. The helper-aware runtime stages
 verified bytes under the content-addressed
 `var/lib/debz/native-helper-cache-v1/` directory, with read/execute-only
 permissions, and requires a successful namespace setup probe before package
@@ -163,9 +164,63 @@ Plans that remove the target's owning package, omit the target from its
 replacement archive, or replace it with a non-regular entry are also refused.
 Fresh-root target creation is outside this increment.
 
-These adapters are still private. Public product/CLI wiring remains required
-before experimental native selection can be exposed; legacy stays default and
-there is no fallback.
+### Experimental typed runtime API
+
+`debz.native_runtime` exposes `execute`, `recover`, `readCompletion`, and
+`acknowledge` without exposing fixture controls or a command-shaped executor.
+It supports Linux non-host roots. The caller must retain a live, locked native
+`root_operation.Attempt` and its coordinator throughout each call. The runtime
+reopens the canonical named root without following symlinks and matches its
+device/inode against the held root before work; host roots, lost locks,
+legacy attempts, and mismatched root descriptors are refused.
+
+Prepare with `native_runtime.scriptPolicy()` and supply the owned preparation
+plus immutable archive byte slices to `execute`. Inputs are borrowed for the
+call and must not be changed concurrently. Authorization/program integrity,
+caller binding, archive bytes, and locked database state are revalidated.
+The runtime always uses the bundled trusted helper and persists a v2 request.
+It accepts neither caller helper bytes nor helper-free execution.
+
+```zig
+var report = try debz.native_runtime.execute(allocator, .{
+    .attempt = &attempt,
+    .prepared = &prepared,
+    .archives = archive_bytes,
+    .operation = .install,
+});
+defer report.deinit();
+```
+
+Reports distinguish `succeeded`, `failed`, `recovery_required`, and `refused`.
+Success or terminal failure requires an independently owned native provenance
+receipt in `report.receipt`; `report.deinit()` releases that receipt. Diagnostic
+text is static, and results do not invent dpkg argv or command exit reports.
+Unsupported work does not hand off to a legacy backend. Refusals with active
+native evidence or an already-mutated caller operation become recovery
+requirements, not proof that nothing happened. Errors propagate; callers must
+retain the original attempt and evidence rather than infer rollback or clear
+state from a failed call.
+
+`recover(allocator, &attempt)` accepts no new archives, plan, policy, or helper.
+Both unfinished recovery and terminal receipt adoption require the original
+helper binding to match this build's bundled helper. Use the original build
+for outstanding work if the bundled helper changes. Private v1 helper-free
+recovery remains compatible through its private adapters, but cannot be
+adopted through this API.
+
+`readCompletion` returns a separately owned terminal receipt without mutation.
+Terminal recovery and acknowledgment validate retained helper bytes, so they
+do not require the current helper cache or target to exist and do not probe a
+namespace or rerun scripts. After durably accepting the receipt in its own
+operation workflow, the caller passes the exact `digest_sha256` to
+`acknowledge(allocator, &attempt, digest)`. Repeated acknowledgment and terminal
+recovery after active cleanup are supported. The caller still owns outer
+completion, provenance, and lock release.
+
+Core product/CLI wiring remains required before experimental backend selection
+can be exposed. Genuine v2 lock/result integration, empty-removal closure
+support, remaining consumers, and full pinned parity remain roadmap work.
+Legacy stays default, and there is no fallback.
 
 ## Independent acceptance
 

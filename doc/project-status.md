@@ -65,7 +65,9 @@ opt-in script-free conffile staging/configuration and removal/purge phases,
 including both policies, old/dist artifacts, obsolete/remove-on-upgrade state,
 and globally planned batch removal. Scripts, triggers, selection changes,
 package disappearance, shared roots, and unsupported filesystem/database
-features still hand off. No apply, journal, recovery, or release entry point is exported.
+features still hand off in these private adapters. Their fixture apply, journal,
+recovery, and release entry points are not exported; the separate typed runtime
+described below never hands off to legacy execution.
 Native backend selection remains `BackendUnavailable` before mutation. The
 private adapter composes the existing lock, journal, and mutation engine;
 `test-native-materialization` compares real install, upgrade, downgrade,
@@ -128,13 +130,18 @@ program bindings. Private typed recovery restores the original inputs, publishes
 native terminal receipts without completing the outer operation, and retains
 active evidence until the caller acknowledges the exact receipt.
 `debz.native_helper` supplies a build-bound static helper payload and immutable
-root-local deployment. The helper-aware private adapter probes namespace
+root-local deployment. The helper-aware runtime probes namespace
 capability before package mutation and persists the binding in a v2 request.
 Missing helper targets are refused without placeholders; package-owned target
 bytes remain unchanged. Interpreter recovery, action counters, and mutation
 callback state are now explicitly execution-local rather than thread-local.
-Public runtime/CLI integration remains incomplete;
-native selection is still unavailable and legacy remains default.
+`debz.native_runtime` exposes experimental caller-owned execution, recovery,
+terminal receipts, and acknowledgment with mandatory bundled helper binding.
+It accepts prepared programs and immutable archive bytes rather than fixture
+requests or command-shaped executor inputs, and refuses host or mismatched
+roots. Product/CLI lock/result integration remains incomplete; backend selection
+is still unavailable and legacy remains default. See the
+[typed runtime contract](native-recovery.md#experimental-typed-runtime-api).
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an

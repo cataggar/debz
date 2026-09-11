@@ -33,8 +33,8 @@ pub const AuthorizationError = error{
     AuthorizationArtifactMismatch,
 };
 
-/// Backend-neutral transaction entry point. The legacy implementation retains
-/// its current request and report types until native step provenance lands.
+/// Existing command-shaped executor boundary. Native runtime uses a separate
+/// prepared-program/receipt interface rather than fabricating command reports.
 pub const Executor = struct {
     context: *anyopaque,
     executeFn: *const fn (
@@ -98,7 +98,7 @@ fn recoverLegacy(
 
 /// Native preparation returns a typed authorization and program, not a
 /// command-shaped executor. Selection remains unavailable before acquisition
-/// or mutation until the production execution/recovery capability is wired.
+/// or mutation until typed product/CLI lock and result contracts are wired.
 pub fn select(
     kind: Kind,
     legacy_dpkg: Executor,

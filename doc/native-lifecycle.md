@@ -6,7 +6,9 @@ audited maintainer-script runner. It is private: production native selection
 remains unavailable and the legacy backend remains the default.
 [Trigger execution](native-triggers.md) and
 [durable native recovery](native-recovery.md) extend this private boundary.
-Production integration remains a separate milestone.
+The experimental [typed runtime API](native-recovery.md#experimental-typed-runtime-api)
+provides caller-owned execution of prepared programs. Product/CLI integration
+remains a separate milestone.
 
 ## Execution contract
 
@@ -66,8 +68,9 @@ terminal evidence without completing the caller. Cleanup requires explicit
 receipt acknowledgment. The helper-aware variant embeds and stages trusted
 helper bytes, probes namespace capability before package mutation, and records
 the isolated helper binding in a v2 request. Missing targets are refused without
-creating placeholders. Public runtime/CLI selection remains pending item-15b
-integration; these private boundaries do not enable public native execution.
+creating placeholders. `debz.native_runtime` now exposes the trusted-helper-only
+typed execution/recovery/acknowledgment path; fixture controls remain private.
+Product/CLI selection remains pending item-15b integration.
 
 ## Independent reference acceptance
 

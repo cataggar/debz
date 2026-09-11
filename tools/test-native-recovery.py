@@ -156,6 +156,14 @@ def intent_binding(intent: dict) -> dict:
     }
 
 
+def caller_binding(root: Path) -> dict:
+    binding = intent_binding(document(root / INTENT, 16 * 1024 * 1024))
+    caller = document(root / OPERATION)
+    binding.update({field: caller[field] for field in ("request_sha256", "policy_sha256")})
+    binding["operation"] = {caller["surface"]: caller["operation"]}
+    return binding
+
+
 def canonical(value: object) -> bytes:
     # Native digests preserve wire field order, unlike comparison snapshots.
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
@@ -556,11 +564,9 @@ class Scenario(triggers.Scenario):
             caller_owned=caller_owned,
             isolated_helper=isolated_helper,
         )
-        binding = intent_binding(document(self.candidate / INTENT, 16 * 1024 * 1024))
-        if caller_owned:
-            caller = document(self.candidate / OPERATION)
-            binding.update({field: caller[field] for field in ("request_sha256", "policy_sha256")})
-            binding["operation"] = {caller["surface"]: caller["operation"]}
+        binding = caller_binding(self.candidate) if caller_owned else intent_binding(
+            document(self.candidate / INTENT, 16 * 1024 * 1024),
+        )
         if boundary != "after_active_clear" and document(self.candidate / OPERATION)["backend"] != "native":
             raise AssertionError("crashed process lost native operation evidence")
         for archive in archives:
@@ -646,12 +652,13 @@ class Scenario(triggers.Scenario):
             raise AssertionError("repeated recovery replaced terminal provenance")
         print(f"{self.directory.name}: crash/recovery parity and provenance passed", flush=True)
 
-    def blocked(self, binding: dict, *, unknown_script: bool = False) -> None:
+    def blocked(self, binding: dict, *, unknown_script: bool = False,
+                caller_owned: bool = False, isolated_helper: bool = False) -> None:
         before = triggers.snapshot(self.candidate)
         script_bytes = m.oracle._read_bounded(self.candidate / SCRIPT, 1024 * 1024)
         if unknown_script and document(self.candidate / SCRIPT)["outcome"] != "in_flight":
             raise AssertionError("unknown-outcome fixture did not reach the in-flight boundary")
-        report = self.recover()
+        report = self.recover(caller_owned=caller_owned, isolated_helper=isolated_helper)
         if report["outcome"] not in ("recovery_required", "refused"):
             raise AssertionError(f"unresolved evidence permitted recovery: {report}")
         if m.oracle.differences(before, triggers.snapshot(self.candidate)):
@@ -695,6 +702,47 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
             workspace / "packages" / label, environment, architecture, version,
             package=name, scripts=lifecycle.scripts(name, version) if scripts else None,
         )
+
+    current = case("typed-runtime-completed-install")
+    helper_path = current.candidate / triggers.HELPER
+    shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+    original = helper_path.read_bytes()
+    original_inode = helper_path.stat().st_ino
+    archive = package("typed-runtime-completed-install")
+    destination = current.directory / "execute"
+    destination.mkdir()
+    if triggers.reference(current.expected, "install", [archive], [], environment, destination, defer=True) != 0:
+        raise AssertionError("typed runtime reference installation failed")
+    report = native(executable, current.candidate, architecture, "install", [archive],
+                    environment, destination, caller_owned=True, isolated_helper=True)
+    if report is None or report["outcome"] != "applied":
+        raise AssertionError(f"typed runtime installation failed: {report}")
+    binding = caller_binding(current.candidate)
+    provenance(current.candidate, report, binding)
+    intent = document(current.candidate / INTENT, 16 * 1024 * 1024)
+    request_blob = next(blob for blob in intent["blobs"] if blob["kind"] == "request")
+    request = document(current.candidate / request_blob["storage_path"])
+    helper_source = current.candidate / request["helper"]["source_path"]
+    caller_before = document(current.candidate / OPERATION)
+    saved_target = helper_path.with_name("dpkg-trigger.saved")
+    saved_source = helper_source.with_suffix(".saved")
+    helper_path.rename(saved_target)
+    try:
+        helper_source.rename(saved_source)
+        try:
+            terminal = current.recover(
+                caller_owned=True, isolated_helper=True, label="terminal-without-live-helper",
+            )
+            if terminal["outcome"] != "applied" or document(current.candidate / OPERATION) != caller_before:
+                raise AssertionError("terminal receipt recovery required live helper deployment or changed caller state")
+        finally:
+            saved_source.rename(helper_source)
+    finally:
+        saved_target.rename(helper_path)
+    archive.unlink()
+    current.caller_completed(binding, isolated_helper=True)
+    if helper_path.read_bytes() != original or helper_path.stat().st_ino != original_inode:
+        raise AssertionError("typed runtime replaced the package-owned helper target")
 
     for boundary in ("after_execution_intent", "after_script_outcome", "after_provenance"):
         current = case(f"isolated-helper-{boundary}")
@@ -752,11 +800,27 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
         binding = current.crash("install", [archive], boundary, caller_owned=True)
         current.caller_completed(binding)
 
-    current = case("caller-known-failure")
-    archive = package("caller-failure")
-    lifecycle.Scenario.fail(current, f"{m.PACKAGE}@1:preinst:install")
-    binding = current.crash("install", [archive], "after_failure_outcome", failure=True, caller_owned=True)
-    current.caller_completed(binding, failure=True)
+    for isolated_helper in (False, True):
+        label = "typed-runtime-known-failure" if isolated_helper else "caller-known-failure"
+        current = case(label)
+        if isolated_helper:
+            shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+        archive = package(label)
+        lifecycle.Scenario.fail(current, f"{m.PACKAGE}@1:preinst:install")
+        binding = current.crash(
+            "install", [archive], "after_failure_outcome", failure=True,
+            caller_owned=True, isolated_helper=isolated_helper,
+        )
+        current.caller_completed(binding, failure=True, isolated_helper=isolated_helper)
+
+    current = case("typed-runtime-unknown-script")
+    shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
+    archive = package("typed-runtime-unknown-script")
+    binding = current.crash(
+        "install", [archive], "after_script_return_before_outcome",
+        compare_reference=False, caller_owned=True, isolated_helper=True,
+    )
+    current.blocked(binding, unknown_script=True, caller_owned=True, isolated_helper=True)
 
     current = case("caller-changed-request")
     archive = package("caller-changed-request")
