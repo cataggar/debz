@@ -55,12 +55,14 @@ const version_module = @import("debian_version.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-threadlocal var active_native_recovery: ?*native_recovery.Runtime = null;
-threadlocal var active_native_action: ?native_recovery.Action = null;
-threadlocal var active_native_program_step: u32 = 0;
-threadlocal var active_native_phase_ordinal: u16 = 0;
-threadlocal var active_native_script_ordinal: u32 = 0;
-threadlocal var active_native_phase_steps: ?[]const root_mutation.Step = null;
+const ExecutionState = struct {
+    recovery: ?*native_recovery.Runtime = null,
+    action: ?native_recovery.Action = null,
+    program_step: u32 = 0,
+    phase_ordinal: u16 = 0,
+    script_ordinal: u32 = 0,
+    phase_steps: ?[]const root_mutation.Step = null,
+};
 
 fn nativeAction(
     kind: native_recovery.ActionKind,
@@ -76,34 +78,35 @@ fn nativeAction(
     };
 }
 
-fn recoveredActionApplied() !bool {
-    const runtime = active_native_recovery orelse return false;
-    const action = active_native_action orelse return false;
+fn recoveredActionApplied(execution: *ExecutionState) !bool {
+    const runtime = execution.recovery orelse return false;
+    const action = execution.action orelse return false;
     const record = try runtime.latest(action) orelse return false;
     return record.stage == .completed and
         (record.result == .applied or record.result == .succeeded or
             record.result == .recovered);
 }
 
-fn beginNativePhase(kind: native_recovery.ActionKind) ?native_recovery.Action {
-    if (active_native_recovery == null) return null;
+fn beginNativePhase(execution: *ExecutionState, kind: native_recovery.ActionKind) ?native_recovery.Action {
+    if (execution.recovery == null) return null;
     const action = nativeAction(
         kind,
-        active_native_program_step,
-        active_native_phase_ordinal,
+        execution.program_step,
+        execution.phase_ordinal,
         0,
     );
-    active_native_phase_ordinal +%= 1;
-    active_native_action = action;
+    execution.phase_ordinal +%= 1;
+    execution.action = action;
     return action;
 }
 
 fn beginNativeProgramStep(
+    execution: *ExecutionState,
     step: native_program.Step,
 ) native_program.Operation {
-    active_native_program_step = step.sequence;
-    active_native_phase_ordinal = 0;
-    active_native_script_ordinal = 0;
+    execution.program_step = step.sequence;
+    execution.phase_ordinal = 0;
+    execution.script_ordinal = 0;
     return step.operation;
 }
 
@@ -7015,6 +7018,7 @@ const MaterializationRequest = struct {
     locks: root_operation.LockBackend,
     operation: product_api.Operation,
     borrowed_attempt: ?*root_operation.Attempt = null,
+    execution: ?*ExecutionState = null,
     raw_status_verification: bool = false,
     mutation_last_step: ?*u32 = null,
     hooks: root_mutation.Hooks = .{},
@@ -7744,10 +7748,12 @@ fn materialize(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
 ) !MaterializationResult {
-    const previous_action = active_native_action;
-    _ = beginNativePhase(.filesystem);
-    defer active_native_action = previous_action;
-    if (try recoveredActionApplied())
+    var standalone_execution: ExecutionState = .{};
+    const execution = request.execution orelse &standalone_execution;
+    const previous_action = execution.action;
+    _ = beginNativePhase(execution, .filesystem);
+    defer execution.action = previous_action;
+    if (try recoveredActionApplied(execution))
         return .{ .outcome = .applied, .detail = "recovered_phase" };
 
     var planned = switch (try plan(allocator, request.planning)) {
@@ -7929,14 +7935,14 @@ fn materialize(
         else
             @intCast(mutation_plan.steps.len - 1);
 
-    if (active_native_recovery) |runtime| {
-        if (active_native_action) |action|
+    if (execution.recovery) |runtime| {
+        if (execution.action) |action|
             try runtime.append(action, .prepared, .none, null);
     }
     var combined_hooks: CombinedMutationHooks = .{
         .original = request.hooks,
-        .runtime = active_native_recovery,
-        .action = active_native_action,
+        .runtime = execution.recovery,
+        .action = execution.action,
     };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
@@ -7950,7 +7956,7 @@ fn materialize(
                 .context = &combined_hooks,
                 .beforeFn = CombinedMutationHooks.before,
             },
-            .allow_recovery_continuation = active_native_recovery != null,
+            .allow_recovery_continuation = execution.recovery != null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -7974,9 +7980,9 @@ fn materialize(
     defer engine.deinit();
 
     const mutation_report = block: {
-        const previous_steps = active_native_phase_steps;
-        active_native_phase_steps = mutation_plan.steps;
-        defer active_native_phase_steps = previous_steps;
+        const previous_steps = execution.phase_steps;
+        execution.phase_steps = mutation_plan.steps;
+        defer execution.phase_steps = previous_steps;
         break :block root_mutation.apply(
             &engine,
             .fromPlan(&mutation_plan),
@@ -8033,8 +8039,8 @@ fn materialize(
         };
     }
 
-    if (active_native_recovery) |runtime| {
-        if (active_native_action) |action| {
+    if (execution.recovery) |runtime| {
+        if (execution.action) |action| {
             const checkpoint_sha256 = switch (mutation_report.outcome) {
                 .applied => try checkpointManagedPaths(
                     allocator,
@@ -8192,10 +8198,12 @@ fn executePhaseMaterialization(
     artifact_evidence: ?[32]u8,
     require_status_old: bool,
 ) !MaterializationResult {
-    const previous_action = active_native_action;
-    _ = beginNativePhase(.database);
-    defer active_native_action = previous_action;
-    if (try recoveredActionApplied())
+    var standalone_execution: ExecutionState = .{};
+    const execution = request.execution orelse &standalone_execution;
+    const previous_action = execution.action;
+    _ = beginNativePhase(execution, .database);
+    defer execution.action = previous_action;
+    if (try recoveredActionApplied(execution))
         return .{ .outcome = .applied, .detail = "recovered_phase" };
 
     const program_sha256 = parseHex(
@@ -8305,14 +8313,14 @@ fn executePhaseMaterialization(
         else
             artifact_evidence,
     };
-    if (active_native_recovery) |runtime| {
-        if (active_native_action) |action|
+    if (execution.recovery) |runtime| {
+        if (execution.action) |action|
             try runtime.append(action, .prepared, .none, null);
     }
     var combined_hooks: CombinedMutationHooks = .{
         .original = request.hooks,
-        .runtime = active_native_recovery,
-        .action = active_native_action,
+        .runtime = execution.recovery,
+        .action = execution.action,
     };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
@@ -8326,7 +8334,7 @@ fn executePhaseMaterialization(
                 .context = &combined_hooks,
                 .beforeFn = CombinedMutationHooks.before,
             },
-            .allow_recovery_continuation = active_native_recovery != null,
+            .allow_recovery_continuation = execution.recovery != null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -8350,9 +8358,9 @@ fn executePhaseMaterialization(
     var engine_open = true;
     defer if (engine_open) engine.deinit();
     const report = block: {
-        const previous_steps = active_native_phase_steps;
-        active_native_phase_steps = mutation_plan.steps;
-        defer active_native_phase_steps = previous_steps;
+        const previous_steps = execution.phase_steps;
+        execution.phase_steps = mutation_plan.steps;
+        defer execution.phase_steps = previous_steps;
         break :block root_mutation.apply(
             &engine,
             .fromPlan(&mutation_plan),
@@ -8429,8 +8437,8 @@ fn executePhaseMaterialization(
             };
         }
     }
-    if (active_native_recovery) |runtime| {
-        if (active_native_action) |action| {
+    if (execution.recovery) |runtime| {
+        if (execution.action) |action| {
             const checkpoint_sha256 = switch (report.outcome) {
                 .applied => try checkpointManagedPaths(
                     allocator,
@@ -11519,11 +11527,12 @@ fn appendRuntimeTriggerEvent(
 }
 
 fn persistRuntimeTriggerEvents(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     events: []const RuntimeTriggerEvent,
 ) !void {
-    const runtime = active_native_recovery orelse return;
+    const runtime = execution.recovery orelse return;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const owned = arena.allocator();
@@ -11567,11 +11576,12 @@ fn persistRuntimeTriggerEvents(
 }
 
 fn restoreRuntimeTriggerEvents(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     events: *std.ArrayList(RuntimeTriggerEvent),
 ) !void {
-    if (active_native_recovery == null) return;
+    if (execution.recovery == null) return;
     var persisted = try native_recovery.readTriggerEvents(allocator, root);
     defer persisted.deinit();
     for (persisted.document.events) |event| {
@@ -12258,6 +12268,7 @@ fn lifecycleProgramArtifact(
 }
 
 fn lifecyclePhaseRequest(
+    execution: *ExecutionState,
     root: root_fs.Root,
     install_root: []const u8,
     snapshot: package_database.Snapshot,
@@ -12291,10 +12302,12 @@ fn lifecyclePhaseRequest(
         .locks = locks,
         .operation = operation,
         .borrowed_attempt = attempt,
+        .execution = execution,
     };
 }
 
 fn lifecycleDataStep(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12324,6 +12337,7 @@ fn lifecycleDataStep(
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
     var request = lifecyclePhaseRequest(
+        execution,
         root,
         install_root,
         captured.snapshot,
@@ -12342,6 +12356,7 @@ fn lifecycleDataStep(
 }
 
 fn lifecycleConfigurePackage(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12378,6 +12393,7 @@ fn lifecycleConfigurePackage(
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
     return materializeConfigure(allocator, lifecyclePhaseRequest(
+        execution,
         root,
         install_root,
         captured.snapshot,
@@ -12393,6 +12409,7 @@ fn lifecycleConfigurePackage(
 }
 
 fn lifecycleRemovePackage(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12415,6 +12432,7 @@ fn lifecycleRemovePackage(
     return materializeRemoval(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -12433,6 +12451,7 @@ fn lifecycleRemovePackage(
 }
 
 fn lifecycleStateStep(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12478,6 +12497,7 @@ fn lifecycleStateStep(
     return materializeStateRecord(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -12497,6 +12517,7 @@ fn lifecycleStateStep(
 }
 
 fn lifecycleFreshFailure(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12513,6 +12534,7 @@ fn lifecycleFreshFailure(
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
     var request = lifecyclePhaseRequest(
+        execution,
         root,
         install_root,
         captured.snapshot,
@@ -12535,6 +12557,7 @@ fn lifecycleFreshFailure(
 }
 
 fn lifecycleDetailedState(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12556,6 +12579,7 @@ fn lifecycleDetailedState(
     return materializeDetailedState(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -12577,6 +12601,7 @@ fn lifecycleDetailedState(
 }
 
 fn lifecycleRestoredPackageState(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12600,6 +12625,7 @@ fn lifecycleRestoredPackageState(
     return materializeRestoredPackageState(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -12623,6 +12649,7 @@ fn lifecycleRestoredPackageState(
 }
 
 fn lifecycleTriggerDatabase(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12641,6 +12668,7 @@ fn lifecycleTriggerDatabase(
     return materializeTriggerDatabase(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -12659,6 +12687,7 @@ fn lifecycleTriggerDatabase(
 }
 
 fn lifecycleSyncTriggerRegistry(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12712,6 +12741,7 @@ fn lifecycleSyncTriggerRegistry(
         }
     }
     return lifecycleTriggerDatabase(
+        execution,
         allocator,
         root,
         install_root,
@@ -12733,6 +12763,7 @@ fn lifecycleSyncTriggerRegistry(
 }
 
 fn lifecycleApplyTriggerEvents(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -12869,6 +12900,7 @@ fn lifecycleApplyTriggerEvents(
         });
     }
     return lifecycleTriggerDatabase(
+        execution,
         allocator,
         root,
         install_root,
@@ -12887,6 +12919,7 @@ fn lifecycleApplyTriggerEvents(
 }
 
 fn lifecyclePublishDerivedFinalState(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     root: root_fs.Root,
@@ -12943,6 +12976,7 @@ fn lifecyclePublishDerivedFinalState(
         });
     }
     return lifecycleTriggerDatabase(
+        execution,
         allocator,
         root,
         install_root,
@@ -12961,10 +12995,11 @@ fn lifecyclePublishDerivedFinalState(
 }
 
 fn latestAuthenticatedTriggerCaller(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
 ) !?package_database.Identity {
-    if (active_native_recovery == null) return null;
+    if (execution.recovery == null) return null;
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
     var index = progress.document.records.len;
@@ -12994,6 +13029,7 @@ fn latestAuthenticatedTriggerCaller(
 }
 
 fn lifecycleIncorporateTriggerQueue(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -13073,6 +13109,7 @@ fn lifecycleIncorporateTriggerQueue(
     if (activation_log) |log| {
         const destination = activation_allocator orelse return error.InvalidLifecycleProgram;
         const noawait_source = try latestAuthenticatedTriggerCaller(
+            execution,
             destination,
             root,
         );
@@ -13122,12 +13159,14 @@ fn lifecycleIncorporateTriggerQueue(
     }
     if (activation_log) |log|
         try persistRuntimeTriggerEvents(
+            execution,
             activation_allocator orelse return error.InvalidLifecycleProgram,
             root,
             log.items,
         );
     if (apply_events)
         return lifecycleApplyTriggerEvents(
+            execution,
             allocator,
             root,
             install_root,
@@ -13141,6 +13180,7 @@ fn lifecycleIncorporateTriggerQueue(
             true,
         );
     return lifecycleTriggerDatabase(
+        execution,
         allocator,
         root,
         install_root,
@@ -13223,6 +13263,7 @@ fn triggerHandlerBinding(
 }
 
 fn lifecycleCompleteTriggerHandler(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -13295,6 +13336,7 @@ fn lifecycleCompleteTriggerHandler(
         });
     }
     return lifecycleTriggerDatabase(
+        execution,
         allocator,
         root,
         install_root,
@@ -13313,13 +13355,14 @@ fn lifecycleCompleteTriggerHandler(
 }
 
 fn recoveredTriggerOrdinal(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     sequence: u32,
     package: native_program.PackageIdentity,
     arguments: []const []const u8,
 ) !u32 {
-    if (active_native_recovery == null) return active_native_script_ordinal;
+    if (execution.recovery == null) return execution.script_ordinal;
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
     var next: u32 = 0;
@@ -13344,12 +13387,13 @@ fn recoveredTriggerOrdinal(
 }
 
 fn restoreTriggerCycleSignatures(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     sequence: u32,
     produced: *std.AutoHashMapUnmanaged([32]u8, void),
 ) !void {
-    if (active_native_recovery == null) return;
+    if (execution.recovery == null) return;
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
     for (progress.document.records) |record| {
@@ -13398,6 +13442,7 @@ fn persistTriggerCycleSignature(
 }
 
 fn lifecycleProcessTriggers(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     activation_log: *std.ArrayList(RuntimeTriggerEvent),
@@ -13413,6 +13458,7 @@ fn lifecycleProcessTriggers(
     inject_unknown: bool,
 ) !LifecycleResult {
     var incorporated = try lifecycleIncorporateTriggerQueue(
+        execution,
         allocator,
         root,
         install_root,
@@ -13431,6 +13477,7 @@ fn lifecycleProcessTriggers(
     var produced: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer produced.deinit(allocator);
     try restoreTriggerCycleSignatures(
+        execution,
         allocator,
         root,
         sequence,
@@ -13455,15 +13502,16 @@ fn lifecycleProcessTriggers(
             return .{ .outcome = .refused, .detail = "trigger_handler_unbound" };
         const joined = try std.mem.join(scratch, " ", handler.triggers);
         const arguments = [_][]const u8{ "triggered", joined };
-        if (active_native_recovery != null) {
-            active_native_script_ordinal = try recoveredTriggerOrdinal(
+        if (execution.recovery != null) {
+            execution.script_ordinal = try recoveredTriggerOrdinal(
+                execution,
                 allocator,
                 root,
                 sequence,
                 handler.package,
                 &arguments,
             );
-            if (active_native_script_ordinal >= maximum_invocations)
+            if (execution.script_ordinal >= maximum_invocations)
                 return .{
                     .outcome = .trigger_failed,
                     .detail = "trigger_invocation_limit",
@@ -13471,11 +13519,12 @@ fn lifecycleProcessTriggers(
                 };
             invocation_count = @max(
                 invocation_count,
-                active_native_script_ordinal + 1,
+                execution.script_ordinal + 1,
             );
         }
-        const handler_ordinal = active_native_script_ordinal;
+        const handler_ordinal = execution.script_ordinal;
         const outcome = try runLifecycleScript(
+            execution,
             allocator,
             root,
             install_root,
@@ -13506,6 +13555,7 @@ fn lifecycleProcessTriggers(
         };
         if (code != 0) {
             const failed = try lifecycleCompleteTriggerHandler(
+                execution,
                 allocator,
                 root,
                 install_root,
@@ -13526,6 +13576,7 @@ fn lifecycleProcessTriggers(
             };
         }
         const completed = try lifecycleCompleteTriggerHandler(
+            execution,
             allocator,
             root,
             install_root,
@@ -13540,6 +13591,7 @@ fn lifecycleProcessTriggers(
         );
         if (lifecycleMaterializationFailure(completed)) |failure| return failure;
         incorporated = try lifecycleIncorporateTriggerQueue(
+            execution,
             allocator,
             root,
             install_root,
@@ -13572,6 +13624,7 @@ fn lifecycleProcessTriggers(
             ) and std.mem.eql(u8, &next.state_sha256, &handler.state_sha256);
         if (self_cycle or produced.contains(next.state_sha256)) {
             const failed = try lifecycleCompleteTriggerHandler(
+                execution,
                 allocator,
                 root,
                 install_root,
@@ -13594,7 +13647,7 @@ fn lifecycleProcessTriggers(
             };
         }
         try produced.put(allocator, next.state_sha256, {});
-        if (active_native_recovery) |runtime|
+        if (execution.recovery) |runtime|
             try persistTriggerCycleSignature(
                 runtime,
                 sequence,
@@ -13610,6 +13663,7 @@ fn lifecycleProcessTriggers(
 }
 
 fn lifecycleAuxiliary(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -13628,6 +13682,7 @@ fn lifecycleAuxiliary(
     return lifecycleAuxiliaryMutation(
         allocator,
         lifecyclePhaseRequest(
+            execution,
             root,
             install_root,
             captured.snapshot,
@@ -13800,6 +13855,7 @@ fn lifecyclePackageKey(
 }
 
 fn stageLifecycleScripts(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     root: root_fs.Root,
@@ -13824,7 +13880,7 @@ fn stageLifecycleScripts(
     if (directory) |entry| {
         if (entry.kind != .directory)
             return .{ .outcome = .refused, .detail = "tmp_ci_not_directory" };
-        if (active_native_recovery) |runtime|
+        if (execution.recovery) |runtime|
             staging.directory_created =
                 !runtime.staging_directory_initially_present;
     } else {
@@ -13849,7 +13905,7 @@ fn stageLifecycleScripts(
                 .{ lifecycle_tmp_ci, package.name, @tagName(kind) },
             );
             if (try root.entryIfExists(try root_fs.Path.init(path)) != null) {
-                if (active_native_recovery == null)
+                if (execution.recovery == null)
                     return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
                 const staged_sha = rootFileSha256(
                     allocator,
@@ -13909,7 +13965,7 @@ fn stageLifecycleScripts(
                 .{ lifecycle_tmp_ci, package.name, package.architecture, @tagName(kind) },
             );
             if (try root.entryIfExists(try root_fs.Path.init(path)) != null) {
-                if (active_native_recovery == null)
+                if (execution.recovery == null)
                     return .{ .outcome = .refused, .detail = "tmp_ci_collision" };
                 const staged_sha = rootFileSha256(
                     allocator,
@@ -13935,6 +13991,7 @@ fn stageLifecycleScripts(
         }
     }
     const result = try lifecycleAuxiliary(
+        execution,
         allocator,
         root,
         install_root,
@@ -13953,6 +14010,7 @@ fn stageLifecycleScripts(
 }
 
 fn cleanupLifecycleStaging(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -13978,6 +14036,7 @@ fn cleanupLifecycleStaging(
             .removal = .allow_absent,
         } });
     return lifecycleAuxiliary(
+        execution,
         allocator,
         root,
         install_root,
@@ -14502,13 +14561,14 @@ fn nativeFinalClosureDigest(
 }
 
 fn publishNativeRecoveryRequiredProvenance(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     attempt: *root_operation.Attempt,
     program_sha256: [32]u8,
     detail: []const u8,
 ) !void {
-    const runtime = active_native_recovery orelse return;
+    const runtime = execution.recovery orelse return;
     var intent = try native_recovery.readIntent(allocator, root);
     defer intent.deinit();
     var progress = try native_recovery.readProgress(allocator, root);
@@ -14634,6 +14694,7 @@ fn lifecycleScriptOwner(
 }
 
 fn runLifecycleScript(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -14655,12 +14716,12 @@ fn runLifecycleScript(
         if (bound_owner != null) .trigger else .script,
         sequence,
         @intCast(@intFromEnum(kind)),
-        active_native_script_ordinal,
+        execution.script_ordinal,
     );
-    active_native_script_ordinal +%= 1;
-    const previous_action = active_native_action;
-    active_native_action = recovery_action;
-    defer active_native_action = previous_action;
+    execution.script_ordinal +%= 1;
+    const previous_action = execution.action;
+    execution.action = recovery_action;
+    defer execution.action = previous_action;
     const path = try lifecycleScriptPath(
         allocator,
         root,
@@ -14676,7 +14737,7 @@ fn runLifecycleScript(
     if (!std.mem.eql(u8, &expected, &observed))
         return error.InstalledScriptMismatch;
 
-    if (active_native_recovery) |runtime| {
+    if (execution.recovery) |runtime| {
         if (try native_recovery.readScriptOutcome(
             allocator,
             root,
@@ -14708,6 +14769,7 @@ fn runLifecycleScript(
             {
                 try attempt.requireRecovery(allocator, .script);
                 try publishNativeRecoveryRequiredProvenance(
+                    execution,
                     allocator,
                     root,
                     attempt,
@@ -14845,6 +14907,7 @@ fn runLifecycleScript(
             {
                 try attempt.requireRecovery(allocator, .script);
                 try publishNativeRecoveryRequiredProvenance(
+                    execution,
                     allocator,
                     root,
                     attempt,
@@ -14862,7 +14925,7 @@ fn runLifecycleScript(
 
     var helper_mount: ?maintainer_script.HelperMount = null;
     defer if (helper_mount) |*mount| mount.deinit();
-    if (active_native_recovery) |runtime| {
+    if (execution.recovery) |runtime| {
         if (runtime.helper_binding) |helper| {
             helper_mount = native_helper.bind(allocator, root, helper) catch |err| {
                 if (attempt.record().mutation_started)
@@ -14884,7 +14947,7 @@ fn runLifecycleScript(
         null,
     );
     defer allocator.free(in_flight);
-    if (active_native_recovery) |runtime|
+    if (execution.recovery) |runtime|
         try runtime.append(recovery_action, .in_flight, .none, null);
     publishLifecycleScriptRecord(
         root,
@@ -14919,7 +14982,7 @@ fn runLifecycleScript(
     }, .{ .launcher = launcher.interface() });
     defer report.deinit();
 
-    if (active_native_recovery) |runtime| {
+    if (execution.recovery) |runtime| {
         runtime.crash.hit(.after_script_return_before_outcome);
         if (kind == .postrm and source == .installed_package)
             runtime.crash.hit(.after_upgrade_postrm_return_before_outcome);
@@ -14931,7 +14994,7 @@ fn runLifecycleScript(
     }
     var native_outcome: ?native_recovery.ScriptOutcome = null;
     var managed_checkpoint_sha256: ?native_recovery.Digest = null;
-    if (active_native_recovery) |runtime| {
+    if (execution.recovery) |runtime| {
         native_outcome = try persistNativeScriptOutcome(
             allocator,
             runtime,
@@ -14947,8 +15010,8 @@ fn runLifecycleScript(
             allocator,
             runtime,
             recovery_action,
-            active_native_phase_steps orelse &.{},
-            active_native_phase_steps != null,
+            execution.phase_steps orelse &.{},
+            execution.phase_steps != null,
         );
         try runtime.append(
             recovery_action,
@@ -15016,7 +15079,7 @@ fn runLifecycleScript(
         try attempt.requireRecovery(allocator, .script);
         return .recovery_required;
     };
-    if (active_native_recovery) |runtime|
+    if (execution.recovery) |runtime|
         try runtime.append(
             recovery_action,
             .completed,
@@ -15056,6 +15119,7 @@ fn postUnpackScript(
 }
 
 const PostUnpackHook = struct {
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -15081,6 +15145,7 @@ fn postUnpackHook(
         return;
     context.fired = true;
     const primary = runLifecycleScript(
+        context.execution,
         context.allocator,
         context.root,
         context.install_root,
@@ -15111,6 +15176,7 @@ fn postUnpackHook(
     if (code == 0) return;
     if (context.script.call.failure.unwind) |unwind| {
         const unwind_outcome = runLifecycleScript(
+            context.execution,
             context.allocator,
             context.root,
             context.install_root,
@@ -15151,6 +15217,7 @@ fn postUnpackHook(
         0..,
     ) |call, compensation_index| {
         const outcome = runLifecycleScript(
+            context.execution,
             context.allocator,
             context.root,
             context.install_root,
@@ -15203,6 +15270,7 @@ fn lifecycleMaterializationFailure(
 }
 
 fn restoreLifecycleStatusOld(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -15229,6 +15297,7 @@ fn restoreLifecycleStatusOld(
         .expected_sha256 = digest,
     } }};
     return lifecycleAuxiliary(
+        execution,
         allocator,
         root,
         install_root,
@@ -15244,13 +15313,14 @@ fn restoreLifecycleStatusOld(
 }
 
 fn finishLifecycleAttempt(
+    execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     attempt: *root_operation.Attempt,
     program_sha256: [32]u8,
     succeeded: bool,
 ) !void {
-    const runtime = active_native_recovery orelse {
+    const runtime = execution.recovery orelse {
         try attempt.advance(allocator, .{
             .state = .verifying,
             .phase = .verification,
@@ -17776,10 +17846,8 @@ fn executeLifecycleProgramWithRequest(
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
     var recovery_runtime: native_recovery.Runtime = undefined;
-    defer {
-        active_native_recovery = null;
-        active_native_action = null;
-    }
+    var execution_state: ExecutionState = .{};
+    const execution = &execution_state;
     if (recovery_intent) |intent| {
         recovery_runtime = .{
             .allocator = scratch,
@@ -17791,7 +17859,7 @@ fn executeLifecycleProgramWithRequest(
             .caller_owned = production_request != null,
             .helper_binding = helper_binding,
         };
-        active_native_recovery = &recovery_runtime;
+        execution.recovery = &recovery_runtime;
         const script_recovery = classifyActiveScriptBeforeMutationRecovery(
             allocator,
             root,
@@ -17801,6 +17869,7 @@ fn executeLifecycleProgramWithRequest(
         ) catch {
             try attempt.requireRecovery(allocator, .script);
             try publishNativeRecoveryRequiredProvenance(
+                execution,
                 allocator,
                 root,
                 attempt,
@@ -17816,6 +17885,7 @@ fn executeLifecycleProgramWithRequest(
         if (script_recovery == .outcome_unknown) {
             try attempt.requireRecovery(allocator, .script);
             try publishNativeRecoveryRequiredProvenance(
+                execution,
                 allocator,
                 root,
                 attempt,
@@ -17850,6 +17920,7 @@ fn executeLifecycleProgramWithRequest(
             else
                 "mutation_evidence_unresolved";
             try publishNativeRecoveryRequiredProvenance(
+                execution,
                 allocator,
                 root,
                 attempt,
@@ -17875,7 +17946,7 @@ fn executeLifecycleProgramWithRequest(
             production_request,
             helper_binding,
         );
-        active_native_recovery = &recovery_runtime;
+        execution.recovery = &recovery_runtime;
         recovery_runtime.crash.hit(.after_execution_intent);
     }
     if (recovery_intent != null) {
@@ -17894,6 +17965,7 @@ fn executeLifecycleProgramWithRequest(
             const terminal_succeeded = record.result == .succeeded or
                 record.result == .recovered;
             if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
+                execution,
                 allocator,
                 root,
                 attempt,
@@ -17925,7 +17997,7 @@ fn executeLifecycleProgramWithRequest(
     defer consumed_scripts.deinit(allocator);
     var trigger_events: std.ArrayList(RuntimeTriggerEvent) = .empty;
     defer trigger_events.deinit(scratch);
-    try restoreRuntimeTriggerEvents(scratch, root, &trigger_events);
+    try restoreRuntimeTriggerEvents(execution, scratch, root, &trigger_events);
     var fault_used = false;
     var crossed_configure_barrier = false;
     var status_old_baseline = try scratch.dupe(
@@ -17936,7 +18008,7 @@ fn executeLifecycleProgramWithRequest(
             locked_capture.snapshot.status.bytes,
     );
 
-    for (program.steps) |step| switch (beginNativeProgramStep(step)) {
+    for (program.steps) |step| switch (beginNativeProgramStep(execution, step)) {
         .assert_authorization,
         .assert_root_state,
         .assert_database_generation,
@@ -17950,6 +18022,7 @@ fn executeLifecycleProgramWithRequest(
         => {},
         .materialize_bootstrap_payload => |intent| {
             const result = try lifecycleDataStep(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -17984,6 +18057,7 @@ fn executeLifecycleProgramWithRequest(
             var hook_context: PostUnpackHook = undefined;
             const hooks: root_mutation.Hooks = if (post_unpack) |script| block: {
                 hook_context = .{
+                    .execution = execution,
                     .allocator = allocator,
                     .root = root,
                     .install_root = external.root,
@@ -18005,6 +18079,7 @@ fn executeLifecycleProgramWithRequest(
                 };
             } else .{};
             const result = try lifecycleDataStep(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18056,6 +18131,7 @@ fn executeLifecycleProgramWithRequest(
                             compensation_start..,
                         ) |compensation, compensation_index| {
                             const compensation_outcome = try runLifecycleScript(
+                                execution,
                                 allocator,
                                 root,
                                 external.root,
@@ -18114,6 +18190,7 @@ fn executeLifecycleProgramWithRequest(
                             intent.package.architecture,
                         ) orelse return error.InvalidLifecycleProgram;
                         const result_state = try lifecycleRestoredPackageState(
+                            execution,
                             allocator,
                             root,
                             external.root,
@@ -18135,6 +18212,7 @@ fn executeLifecycleProgramWithRequest(
                             return failure;
                     }
                     const cleanup = try cleanupLifecycleStaging(
+                        execution,
                         allocator,
                         root,
                         external.root,
@@ -18149,6 +18227,7 @@ fn executeLifecycleProgramWithRequest(
                     if (lifecycleMaterializationFailure(cleanup)) |failure|
                         return failure;
                     const restored = try restoreLifecycleStatusOld(
+                        execution,
                         allocator,
                         root,
                         external.root,
@@ -18168,6 +18247,7 @@ fn executeLifecycleProgramWithRequest(
                         trigger_authority_bytes,
                     );
                     if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
+                        execution,
                         allocator,
                         root,
                         attempt,
@@ -18184,6 +18264,7 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
             if (program.trigger_authority != null) {
                 const synced = try lifecycleSyncTriggerRegistry(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18221,6 +18302,7 @@ fn executeLifecycleProgramWithRequest(
                     &trigger_events,
                 );
                 try persistRuntimeTriggerEvents(
+                    execution,
                     scratch,
                     root,
                     trigger_events.items,
@@ -18249,6 +18331,7 @@ fn executeLifecycleProgramWithRequest(
             );
             if (!configured.contains(key)) {
                 const result = try lifecycleConfigurePackage(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18282,6 +18365,7 @@ fn executeLifecycleProgramWithRequest(
                 );
                 if (!configured.contains(key)) {
                     const result = try lifecycleConfigurePackage(
+                        execution,
                         allocator,
                         root,
                         external.root,
@@ -18301,6 +18385,7 @@ fn executeLifecycleProgramWithRequest(
                 }
             }
             const result = try lifecycleStateStep(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18331,11 +18416,13 @@ fn executeLifecycleProgramWithRequest(
                 );
             if (program.trigger_authority != null)
                 try persistRuntimeTriggerEvents(
+                    execution,
                     scratch,
                     root,
                     trigger_events.items,
                 );
             const result = try lifecycleRemovePackage(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18351,6 +18438,7 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
             if (program.trigger_authority != null) {
                 const synced = try lifecycleSyncTriggerRegistry(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18367,6 +18455,7 @@ fn executeLifecycleProgramWithRequest(
         },
         .purge_package_files => |intent| {
             const result = try lifecycleRemovePackage(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18382,6 +18471,7 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
             if (program.trigger_authority != null) {
                 const synced = try lifecycleSyncTriggerRegistry(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18399,6 +18489,7 @@ fn executeLifecycleProgramWithRequest(
         .run_maintainer_script => |call| {
             if (consumed_scripts.contains(step.sequence)) continue;
             const staged = try stageLifecycleScripts(
+                execution,
                 allocator,
                 scratch,
                 root,
@@ -18422,6 +18513,7 @@ fn executeLifecycleProgramWithRequest(
                 );
             if (inject_unknown) fault_used = true;
             const outcome = try runLifecycleScript(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18451,6 +18543,7 @@ fn executeLifecycleProgramWithRequest(
             var unwind_succeeded = call.failure.unwind == null;
             if (call.failure.unwind) |unwind| {
                 const unwind_outcome = try runLifecycleScript(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18498,6 +18591,7 @@ fn executeLifecycleProgramWithRequest(
             var failed_compensation: ?native_program.Unwind = null;
             compensations: for (call.failure.compensations) |compensation| {
                 const compensation_outcome = try runLifecycleScript(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18546,6 +18640,7 @@ fn executeLifecycleProgramWithRequest(
                     else
                         .reinst_required;
                 const result = try lifecycleRestoredPackageState(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18572,6 +18667,7 @@ fn executeLifecycleProgramWithRequest(
                 action != null and action.?.prior_version == null)
             {
                 const cleanup = try cleanupLifecycleStaging(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18587,6 +18683,7 @@ fn executeLifecycleProgramWithRequest(
                     return failure;
                 staging_cleaned = true;
                 const result = try lifecycleFreshFailure(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18606,6 +18703,7 @@ fn executeLifecycleProgramWithRequest(
                 !unwind_succeeded)
             {
                 const result = try lifecycleDetailedState(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18627,6 +18725,7 @@ fn executeLifecycleProgramWithRequest(
                 std.mem.eql(u8, call.arguments[0], "remove"))
             {
                 const result = try lifecycleRestoredPackageState(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18650,6 +18749,7 @@ fn executeLifecycleProgramWithRequest(
                 std.mem.eql(u8, call.arguments[0], "purge"))
             {
                 const result = try lifecycleDetailedState(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18681,6 +18781,7 @@ fn executeLifecycleProgramWithRequest(
                     unwind_succeeded)
                     failure_state.state = .installed;
                 const result = try lifecycleStateStep(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18698,6 +18799,7 @@ fn executeLifecycleProgramWithRequest(
             }
             if (!staging_cleaned) {
                 const cleanup = try cleanupLifecycleStaging(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18713,6 +18815,7 @@ fn executeLifecycleProgramWithRequest(
             }
             if (!staging_cleaned) {
                 const restored = try restoreLifecycleStatusOld(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18733,6 +18836,7 @@ fn executeLifecycleProgramWithRequest(
                 trigger_authority_bytes,
             );
             if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
+                execution,
                 allocator,
                 root,
                 attempt,
@@ -18762,6 +18866,7 @@ fn executeLifecycleProgramWithRequest(
                 };
             if (program.trigger_authority.?.defer_triggers) {
                 const incorporated = try lifecycleIncorporateTriggerQueue(
+                    execution,
                     allocator,
                     root,
                     external.root,
@@ -18779,6 +18884,7 @@ fn executeLifecycleProgramWithRequest(
                 if (lifecycleMaterializationFailure(incorporated)) |failure|
                     return failure;
                 const derived = try lifecyclePublishDerivedFinalState(
+                    execution,
                     allocator,
                     scratch,
                     root,
@@ -18797,6 +18903,7 @@ fn executeLifecycleProgramWithRequest(
                 continue;
             }
             const applied_events = try lifecycleApplyTriggerEvents(
+                execution,
                 allocator,
                 root,
                 external.root,
@@ -18812,6 +18919,7 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(applied_events)) |failure|
                 return failure;
             const trigger_result = try lifecycleProcessTriggers(
+                execution,
                 allocator,
                 scratch,
                 &trigger_events,
@@ -18835,6 +18943,7 @@ fn executeLifecycleProgramWithRequest(
                 .recovery_required => return trigger_result,
                 .trigger_failed => {
                     const cleanup = try cleanupLifecycleStaging(
+                        execution,
                         allocator,
                         root,
                         external.root,
@@ -18849,6 +18958,7 @@ fn executeLifecycleProgramWithRequest(
                     if (lifecycleMaterializationFailure(cleanup)) |failure|
                         return failure;
                     const restored = try restoreLifecycleStatusOld(
+                        execution,
                         allocator,
                         root,
                         external.root,
@@ -18868,6 +18978,7 @@ fn executeLifecycleProgramWithRequest(
                         trigger_authority_bytes,
                     );
                     if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
+                        execution,
                         allocator,
                         root,
                         attempt,
@@ -18882,6 +18993,7 @@ fn executeLifecycleProgramWithRequest(
     };
 
     const cleanup = try cleanupLifecycleStaging(
+        execution,
         allocator,
         root,
         external.root,
@@ -18895,6 +19007,7 @@ fn executeLifecycleProgramWithRequest(
     );
     if (lifecycleMaterializationFailure(cleanup)) |failure| return failure;
     const restored = try restoreLifecycleStatusOld(
+        execution,
         allocator,
         root,
         external.root,
@@ -18954,6 +19067,7 @@ fn executeLifecycleProgramWithRequest(
         trigger_authority_bytes,
     );
     if (borrowed_attempt == null or production_request != null) try finishLifecycleAttempt(
+        execution,
         allocator,
         root,
         attempt,
@@ -20246,6 +20360,99 @@ test "native_unpack.test.lifecycle external fixture" {
         external.report,
         result,
     );
+}
+
+test "native_unpack.test.interleaved execution state isolates progress counters and trigger evidence" {
+    var outer_fixture: Fixture = undefined;
+    try outer_fixture.init(empty_status, &.{});
+    defer outer_fixture.deinit();
+    var inner_fixture: Fixture = undefined;
+    try inner_fixture.init(empty_status, &.{});
+    defer inner_fixture.deinit();
+    var outer_runtime: native_recovery.Runtime = .{
+        .allocator = testing.allocator,
+        .root = outer_fixture.root(),
+        .intent_sha256 = @splat('a'),
+    };
+    var inner_runtime: native_recovery.Runtime = .{
+        .allocator = testing.allocator,
+        .root = inner_fixture.root(),
+        .intent_sha256 = @splat('b'),
+    };
+    for ([_]*native_recovery.Runtime{ &outer_runtime, &inner_runtime }) |runtime| {
+        try runtime.root.ensureDirectory(
+            try root_fs.Path.init(root_operation.namespace_path),
+            root_fs.default_directory_permissions,
+        );
+        try native_recovery.initializeProgress(testing.allocator, runtime.root, runtime.intent_sha256);
+        try native_recovery.initializeTriggerEvents(testing.allocator, runtime.root, runtime.intent_sha256);
+    }
+    var outer: ExecutionState = .{ .recovery = &outer_runtime };
+    var inner: ExecutionState = .{ .recovery = &inner_runtime };
+    const step: native_program.Step = .{
+        .sequence = 7,
+        .phase = .preflight,
+        .requires = &.{},
+        .operation = .{ .assert_root_state = .{
+            .install_root = "/fixture",
+            .root_identity_sha256 = @splat('c'),
+            .target_architecture = "amd64",
+            .foreign_architectures = &.{},
+        } },
+    };
+    _ = beginNativeProgramStep(&outer, step);
+    _ = beginNativeProgramStep(&inner, step);
+    const outer_action = beginNativePhase(&outer, .filesystem).?;
+    const inner_action = beginNativePhase(&inner, .filesystem).?;
+    try testing.expectEqual(outer_action, inner_action);
+    try outer_runtime.append(outer_action, .prepared, .none, null);
+    try inner_runtime.append(inner_action, .prepared, .none, null);
+    try inner_runtime.append(inner_action, .completed, .applied, null);
+    try testing.expect(!try recoveredActionApplied(&outer));
+    try testing.expect(try recoveredActionApplied(&inner));
+
+    outer.script_ordinal = 4;
+    outer.phase_steps = &.{};
+    var next_step = step;
+    next_step.sequence = 11;
+    _ = beginNativeProgramStep(&inner, next_step);
+    try testPreparedMixedLifecycle(false, .production);
+    try testPreparedMixedLifecycle(true, .production_resume);
+    try testing.expectEqual(@as(u32, 7), outer.program_step);
+    try testing.expectEqual(@as(u16, 1), outer.phase_ordinal);
+    try testing.expectEqual(@as(u32, 4), outer.script_ordinal);
+    try testing.expectEqual(outer_action, outer.action.?);
+    try testing.expect(outer.phase_steps != null);
+    try testing.expectEqual(@as(u32, 11), inner.program_step);
+    try testing.expectEqual(@as(u16, 0), inner.phase_ordinal);
+    try testing.expectEqual(@as(u32, 0), inner.script_ordinal);
+    try testing.expect(inner.phase_steps == null);
+    try testing.expectEqual(nativeAction(.database, 7, 1, 0), beginNativePhase(&outer, .database).?);
+
+    for ([_]*ExecutionState{ &outer, &inner }, [_][]const u8{ "outer", "inner" }) |execution, name| {
+        try persistRuntimeTriggerEvents(execution, testing.allocator, execution.recovery.?.root, &.{.{
+            .origin = .dynamic,
+            .source = .{ .name = name, .architecture = "amd64" },
+            .trigger = name,
+            .activation_awaits = false,
+            .listeners = &.{},
+        }});
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]*ExecutionState{ &inner, &outer }, [_][]const u8{ "inner", "outer" }) |execution, name| {
+        var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+        try restoreRuntimeTriggerEvents(execution, arena.allocator(), execution.recovery.?.root, &events);
+        try testing.expectEqual(@as(usize, 1), events.items.len);
+        try testing.expectEqualStrings(name, events.items[0].source.name);
+        try testing.expectEqualStrings(name, events.items[0].trigger);
+    }
+    var standalone: ExecutionState = .{};
+    try testing.expect(beginNativePhase(&standalone, .filesystem) == null);
+    try testing.expect(!try recoveredActionApplied(&standalone));
+    try testing.expectEqual(@as(u32, 4), outer.script_ordinal);
+    try testing.expect(outer.recovery == &outer_runtime);
+    try testing.expect(inner.recovery == &inner_runtime);
 }
 
 test "native_unpack.test.production preparation drives a mixed install and removal program" {

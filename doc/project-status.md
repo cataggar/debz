@@ -131,7 +131,9 @@ active evidence until the caller acknowledges the exact receipt.
 root-local deployment. The helper-aware private adapter probes namespace
 capability before package mutation and persists the binding in a v2 request.
 Missing helper targets are refused without placeholders; package-owned target
-bytes remain unchanged. Public runtime/CLI integration remains incomplete;
+bytes remain unchanged. Interpreter recovery, action counters, and mutation
+callback state are now explicitly execution-local rather than thread-local.
+Public runtime/CLI integration remains incomplete;
 native selection is still unavailable and legacy remains default.
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
