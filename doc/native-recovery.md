@@ -34,6 +34,14 @@ alone cannot authorize resuming over externally changed payload.
 Each invocation has a durable identity distinct from every other invocation,
 including repeated identical triggered calls and compensation scripts.
 
+The interpreter passes execution-local recovery state, action identities,
+phase/script counters, and in-progress mutation steps explicitly through
+materialization, script callbacks, trigger work, and completion. There is no
+thread-local ambient execution to inherit or clear when another transaction
+runs on the same thread. Distinct executions still require their own
+caller-owned attempts and root locks; this does not permit concurrent mutation
+of one root or change persisted action identities.
+
 | Boundary | Recovery meaning |
 | --- | --- |
 | `script_prepared` | Launcher entry was not yet authorized; the script may start once. |
