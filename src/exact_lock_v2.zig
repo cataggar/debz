@@ -148,6 +148,7 @@ pub const OwnedLock = struct {
 pub const ValidationError = error{
     UnverifiedOrigin,
     EmptyArchitecture,
+    /// Retained for source compatibility; v2 now accepts an empty closure.
     EmptyClosure,
     InvalidIdentity,
     MissingSigner,
@@ -179,7 +180,6 @@ pub fn create(
 ) (std.mem.Allocator.Error || ValidationError || package_origin.ValidationError)!OwnedLock {
     if (!input.verified_origins) return error.UnverifiedOrigin;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
-    if (input.packages.len == 0) return error.EmptyClosure;
     if (input.repositories.len > maximum_repositories) return error.TooManyRepositories;
     if (input.local_artifacts.len > maximum_local_artifacts) return error.TooManyArtifacts;
     if (input.packages.len > maximum_packages) return error.TooManyPackages;
@@ -927,6 +927,10 @@ test "exact_lock_v2.test.mixed origins canonical roundtrip and tamper rejection"
         .verified_origins = true,
     });
     defer owned.deinit();
+    try std.testing.expectEqual(
+        try parseHex(32, "6e227f80432dcaa4fad8004cc0a9599d469af541f8d6791fba76f08f29697e44"),
+        owned.lock.digest_sha256,
+    );
     const json = try owned.lock.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"local_artifact\"") != null);
@@ -957,6 +961,69 @@ test "exact_lock_v2.test.mixed origins canonical roundtrip and tamper rejection"
         error.NonCanonicalDocument,
         decode(std.testing.allocator, noncanonical, maximum_document_bytes),
     );
+}
+
+test "exact_lock_v2.test.empty closure is canonical bounded and still evidence checked" {
+    var input: Input = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    };
+    var owned = try create(std.testing.allocator, input);
+    defer owned.deinit();
+    try std.testing.expectEqual(
+        try parseHex(32, "cd84da2b85532fb27bbcd53a085a4446bd3c25c9b816808d8ce8c9e3c12b60e6"),
+        owned.lock.digest_sha256,
+    );
+    try std.testing.expect(owned.lock.findIdentity("absent", "amd64") == null);
+    try std.testing.expect(owned.lock.findPackage("absent", "1", "amd64") == null);
+    const json = try owned.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    var decoded = try decode(std.testing.allocator, json, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), decoded.lock.packages.len);
+    const canonical = try decoded.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(json, canonical);
+    try std.testing.expectError(error.DocumentTooLarge, decode(std.testing.allocator, json, json.len - 1));
+    const noncanonical = try std.mem.concat(std.testing.allocator, u8, &.{ json, "\n" });
+    defer std.testing.allocator.free(noncanonical);
+    try std.testing.expectError(error.NonCanonicalDocument, decode(std.testing.allocator, noncanonical, maximum_document_bytes));
+    const tampered = try std.testing.allocator.dupe(u8, json);
+    defer std.testing.allocator.free(tampered);
+    tampered[std.mem.indexOf(u8, tampered, "amd64").?] = 'A';
+    try std.testing.expectError(error.DigestMismatch, decode(std.testing.allocator, tampered, maximum_document_bytes));
+
+    input.verified_origins = false;
+    try std.testing.expectError(error.UnverifiedOrigin, create(std.testing.allocator, input));
+    input.verified_origins = true;
+    input.target_architecture = "";
+    try std.testing.expectError(error.EmptyArchitecture, create(std.testing.allocator, input));
+    input.target_architecture = "amd64";
+    input.repositories = &.{.{
+        .id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    }};
+    try std.testing.expectError(error.UnusedRepository, create(std.testing.allocator, input));
+    input.repositories = &.{};
+    input.local_artifacts = &.{.{
+        .artifact_id = package_origin.artifactIdFromSha256(@splat(5)),
+        .sha256 = @splat(5),
+        .size = 1,
+        .package = "removed",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///removed.deb",
+        .trust_mode = .pinned_sha256,
+    }};
+    try std.testing.expectError(error.UnusedArtifact, create(std.testing.allocator, input));
 }
 
 test "exact_lock_v2.test.rejects origin substitution mismatch and unused evidence" {

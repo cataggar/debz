@@ -128,6 +128,27 @@ class RecoveryOracleTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_empty_exact_lock_v2_schema_preserves_required_bindings(self) -> None:
+        value = {
+            "schema": "https://debz.dev/schema/exact-closure-lock-v2",
+            "version": 2, "target_architecture": "amd64",
+            "request_sha256": "07" * 32, "policy_sha256": "08" * 32,
+            "repositories": [], "local_artifacts": [], "packages": [],
+        }
+        value["digest_sha256"] = acceptance.digest("", value)
+        self.assertEqual(value["digest_sha256"],
+                         "cd84da2b85532fb27bbcd53a085a4446bd3c25c9b816808d8ce8c9e3c12b60e6")
+        validator = acceptance.validator("exact-closure-lock-v2")
+        validator.validate(value)
+        for field in ("target_architecture", "request_sha256", "policy_sha256", "packages", "digest_sha256"):
+            with self.subTest(field=field):
+                invalid = dict(value)
+                del invalid[field]
+                self.assertFalse(validator.is_valid(invalid))
+        legacy = {**value, "schema": "https://debz.dev/schema/exact-closure-lock-v1", "version": 1}
+        del legacy["local_artifacts"]
+        self.assertFalse(acceptance.validator("exact-closure-lock-v1").is_valid(legacy))
+
     def test_isolated_invocation_evidence_cannot_be_omitted(self) -> None:
         request = {
             "execution": {"install_root": "/fixture"},

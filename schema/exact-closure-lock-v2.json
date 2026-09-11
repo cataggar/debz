@@ -21,7 +21,6 @@
     },
     "packages": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/package" }
     },
     "digest_sha256": { "$ref": "#/$defs/sha256" }

@@ -20841,11 +20841,17 @@ test "native_unpack.test.borrowed preflight refusals leave operation cleanup to 
     try testPreparedMixedLifecycle(false, .wrong_architecture);
 }
 
+test "native_unpack.test.empty v2 closure drives last-package removal purge and receipt recovery" {
+    try testPreparedMixedLifecycle(false, .empty_closure);
+    try testPreparedMixedLifecycle(true, .empty_closure);
+}
+
 const MixedLifecycleCase = enum {
     owned,
     borrowed,
     production,
     production_resume,
+    empty_closure,
     helper_target_removed,
     public_missing_helper,
     stale_database,
@@ -20858,6 +20864,7 @@ const MixedLifecycleCase = enum {
 };
 
 fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
+    const empty_closure = case == .empty_closure;
     const status = try std.fmt.allocPrint(
         testing.allocator,
         "Package: old\nStatus: install ok installed\nVersion: 2.0\nArchitecture: amd64\n" ++
@@ -20903,12 +20910,15 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         .repository_id = repository_id,
         .repository_snapshot_sha256 = snapshot,
     } };
-    const archives = try programArchiveEvidence(arena.allocator(), &models, &.{bytes}, &.{origin});
+    const archives: []const native_program.Archive = if (empty_closure)
+        &.{}
+    else
+        try programArchiveEvidence(arena.allocator(), &models, &.{bytes}, &.{origin});
     var lock = try exact_lock_v2.create(testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(7),
         .policy_sha256 = @splat(8),
-        .repositories = &.{.{
+        .repositories = if (empty_closure) &.{} else &.{.{
             .id = repository_id,
             .snapshot_sha256 = snapshot,
             .release_sha256 = @splat(3),
@@ -20916,7 +20926,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .signer_fingerprints = &.{@splat(5)},
         }},
         .local_artifacts = &.{},
-        .packages = &.{.{
+        .packages = if (empty_closure) &.{} else &.{.{
             .name = "app",
             .version = "1.2",
             .architecture = "amd64",
@@ -20961,8 +20971,8 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
                 .architecture = "amd64",
                 .installed_size_kib = null,
             },
-            .requested = false,
-            .reason = .replacement,
+            .requested = empty_closure,
+            .reason = if (empty_closure) .explicit_request else .replacement,
             .selected_origin = null,
         },
     };
@@ -20974,10 +20984,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     const solver_plan: solver.Plan = .{
         .target_architecture = "amd64",
         .mode = .plan_only,
-        .actions = &actions,
-        .ordered_actions = &ordered,
+        .actions = if (empty_closure) actions[1..] else &actions,
+        .ordered_actions = if (empty_closure) ordered[0..1] else &ordered,
         .summary = .{},
-        .download_bytes = bytes.len,
+        .download_bytes = if (empty_closure) 0 else bytes.len,
         .installed_size_delta_bytes = 0,
         .backing_allocator = testing.allocator,
         .arena = undefined,
@@ -21005,6 +21015,11 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             return error.TestUnexpectedResult;
         },
     };
+    if (empty_closure) {
+        try testing.expectEqual(@as(usize, 0), lock.lock.packages.len);
+        try testing.expectEqual(@as(usize, 0), compiled.program.program.artifacts.len);
+        try testing.expectEqual(@as(usize, if (purge) 0 else 1), compiled.authorization.authorization.final_state.len);
+    }
     if (case == .helper_target_removed) {
         try testing.expectError(error.NativeHelperTargetMutationUnsupported, validateNativeHelperTargetPlan(
             compiled.authorization.authorization,
@@ -21090,7 +21105,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         } else try caller.abandonIfPreMutation(testing.allocator);
         return;
     }
-    const production = case == .production or case == .production_resume;
+    const production = case == .production or case == .production_resume or empty_closure;
     if (case == .public_missing_helper) {
         try testing.expectError(error.NativeHelperTargetMissing, Runtime.execute(testing.allocator, .{
             .attempt = &caller,
@@ -21141,10 +21156,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             testing.allocator,
             root,
             &compiled,
-            &.{bytes},
+            if (empty_closure) &.{} else &.{bytes},
             &caller,
             locks.interface(),
-            .install,
+            if (empty_closure) (if (purge) .purge else .remove) else .install,
             null,
         )
     else
@@ -21274,7 +21289,12 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         .diagnostic => return error.TestUnexpectedResult,
     };
     defer imported.deinit();
-    try testing.expectEqual(package_database.Want.install, imported.model.find("app", "amd64").?.status.want);
+    if (empty_closure) {
+        try testing.expectEqual(@as(usize, if (purge) 0 else 1), imported.model.packages.len);
+        try testing.expect(imported.model.find("app", "amd64") == null);
+    } else {
+        try testing.expectEqual(package_database.Want.install, imported.model.find("app", "amd64").?.status.want);
+    }
     if (purge) {
         try testing.expect(imported.model.find("old", "amd64") == null);
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("etc/old.conf")) == null);
@@ -21286,9 +21306,13 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expectEqualStrings("old configuration\n", conffile);
     }
     try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/old")) == null);
-    const payload = try root.readFileAlloc(testing.allocator, try root_fs.Path.init("usr/share/app"), 4096);
-    defer testing.allocator.free(payload);
-    try testing.expectEqualStrings("new payload\n", payload);
+    if (empty_closure) {
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+    } else {
+        const payload = try root.readFileAlloc(testing.allocator, try root_fs.Path.init("usr/share/app"), 4096);
+        defer testing.allocator.free(payload);
+        try testing.expectEqualStrings("new payload\n", payload);
+    }
 }
 
 test "native_unpack.test.materialization adapter applies data-only plan" {

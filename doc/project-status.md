@@ -142,6 +142,10 @@ requests or command-shaped executor inputs, and refuses host or mismatched
 roots. Product/CLI lock/result integration remains incomplete; backend selection
 is still unavailable and legacy remains default. See the
 [typed runtime contract](native-recovery.md#experimental-typed-runtime-api).
+Exact-lock v2 permits an empty installed closure for last-package removal/purge,
+without changing existing lock bytes or hashes. Native preparation still binds
+every removal and preserves required residual configuration; an empty lock is
+not blanket authority to delete installed state.
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
