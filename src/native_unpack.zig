@@ -34,6 +34,7 @@ const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
 const native_preparation = @import("native_preparation.zig");
+const native_operation = @import("native_operation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_trigger = @import("native_trigger.zig");
@@ -7838,6 +7839,10 @@ fn materialize(
         .digest_sha256 = lock_digest,
     };
     const borrowed = request.borrowed_attempt != null;
+    const operation_plan = if (request.borrowed_attempt) |attempt|
+        try native_operation.boundPlan(request.root, attempt, request.planning.program.*)
+    else
+        planned.digest;
     const lifecycle_artifacts = parseHex(
         32,
         &request.planning.program.artifacts_sha256,
@@ -7845,7 +7850,7 @@ fn materialize(
     const operation_evidence: root_operation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = if (borrowed) program_sha256 else planned.digest,
+        .plan_sha256 = operation_plan,
         .exact_lock = exact_lock,
         .database_generation_sha256 = planned.database.base_generation.sha256,
         .artifact_evidence_sha256 = if (borrowed)
@@ -7856,7 +7861,7 @@ fn materialize(
     const mutation_evidence: root_mutation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = if (borrowed) program_sha256 else planned.digest,
+        .plan_sha256 = operation_plan,
         .exact_lock = exact_lock,
         .database_generation_sha256 = if (borrowed)
             null
@@ -8217,6 +8222,10 @@ fn executePhaseMaterialization(
         .digest_sha256 = lock_digest,
     };
     const borrowed = request.borrowed_attempt != null;
+    const operation_plan = if (request.borrowed_attempt) |attempt|
+        try native_operation.boundPlan(request.root, attempt, request.planning.program.*)
+    else
+        null;
     const lifecycle_artifacts = parseHex(
         32,
         &request.planning.program.artifacts_sha256,
@@ -8224,7 +8233,7 @@ fn executePhaseMaterialization(
     const operation_evidence: root_operation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = if (borrowed) program_sha256 else null,
+        .plan_sha256 = operation_plan,
         .exact_lock = exact_lock,
         .database_generation_sha256 = database_evidence.base_generation.sha256,
         .artifact_evidence_sha256 = if (borrowed)
@@ -8282,7 +8291,7 @@ fn executePhaseMaterialization(
     const mutation_evidence: root_mutation.Evidence = .{
         .authorization_sha256 = authorization_sha256,
         .program_sha256 = program_sha256,
-        .plan_sha256 = if (borrowed) program_sha256 else phase_digest,
+        .plan_sha256 = operation_plan orelse phase_digest,
         .exact_lock = exact_lock,
         .database_generation_sha256 = if (borrowed)
             null
@@ -17063,8 +17072,47 @@ fn executeLifecycleProgram(
     recovery_intent: ?native_recovery.Intent,
     raw_request: ?[]const u8,
 ) !LifecycleResult {
+    return executeLifecycleProgramInOperation(
+        allocator,
+        root,
+        external,
+        compiled,
+        models,
+        archive_bytes,
+        initial_snapshot,
+        initial_model,
+        locks,
+        recovery_intent,
+        raw_request,
+        null,
+    );
+}
+
+fn executeLifecycleProgramInOperation(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    compiled: *CompiledLifecycle,
+    models: []archive_application.Model,
+    archive_bytes: []const []u8,
+    initial_snapshot: package_database.Snapshot,
+    initial_model: package_database.Model,
+    locks: root_operation.LockBackend,
+    recovery_intent: ?native_recovery.Intent,
+    raw_request: ?[]const u8,
+    borrowed_attempt: ?*root_operation.Attempt,
+) !LifecycleResult {
+    // The private v1 recovery request cannot describe a caller-owned
+    // operation. Do not persist it as if it were a production request.
+    if (borrowed_attempt != null and
+        (external.recovery or recovery_intent != null or raw_request != null))
+        return error.ProductionRecoveryRequestRequired;
     const program = &compiled.program.program;
     const authorization = &compiled.authorization.authorization;
+    if (!program.matchesAuthorization(authorization.*) or
+        !std.mem.eql(u8, external.root, program.install_root) or
+        !std.mem.eql(u8, external.architecture, program.target_architecture))
+        return error.InvalidLifecycleProgram;
     const program_sha256 = parseHex(32, &program.digest_sha256) orelse
         return error.InvalidLifecycleProgram;
     const request_sha256 = parseHex(32, &program.request_sha256) orelse
@@ -17084,55 +17132,58 @@ fn executeLifecycleProgram(
         .keep_existing => .keep_existing,
         .use_package_version => .use_package_version,
     };
-    var coordinator = try root_operation.Coordinator.open(
-        root.io,
-        root,
-        external.root,
-        locks,
-    );
-    var attempt = coordinator.acquire(allocator, .{
-        .intent = if (recovery_intent != null) .recovery else .mutation,
-        .existing = .reclaim_resolved,
-        .backend = .native,
-        .operation = .{ .package_transaction = operation },
-        .request_sha256 = request_sha256,
-        .policy_sha256 = policy_sha256,
-        .evidence = .{
-            .authorization_sha256 = authorization.digest_sha256,
-            .program_sha256 = program_sha256,
-            .plan_sha256 = program_sha256,
-            .exact_lock = .{
-                .schema = program.exact_lock.schema,
-                .version = program.exact_lock.version,
-                .digest_sha256 = lock_sha256,
+    var owned_attempt: root_operation.Attempt = undefined;
+    if (borrowed_attempt == null) {
+        var coordinator = try root_operation.Coordinator.open(
+            root.io,
+            root,
+            external.root,
+            locks,
+        );
+        owned_attempt = coordinator.acquire(allocator, .{
+            .intent = if (recovery_intent != null) .recovery else .mutation,
+            .existing = .reclaim_resolved,
+            .backend = .native,
+            .operation = .{ .package_transaction = operation },
+            .request_sha256 = request_sha256,
+            .policy_sha256 = policy_sha256,
+            .evidence = .{
+                .authorization_sha256 = authorization.digest_sha256,
+                .program_sha256 = program_sha256,
+                .plan_sha256 = program_sha256,
+                .exact_lock = .{
+                    .schema = program.exact_lock.schema,
+                    .version = program.exact_lock.version,
+                    .digest_sha256 = lock_sha256,
+                },
+                .database_generation_sha256 = initial_database,
+                .artifact_evidence_sha256 = artifact_evidence,
             },
-            .database_generation_sha256 = initial_database,
-            .artifact_evidence_sha256 = artifact_evidence,
-        },
-        .target_architecture = program.target_architecture,
-        .foreign_architectures = program.foreign_architectures,
-        .adopt_settled_for_acknowledgment = recovery_intent != null,
-    }) catch |err| switch (err) {
-        error.RecoveryRequired,
-        error.OperationInProgress,
-        error.ProvenancePending,
-        => return .{
-            .outcome = .recovery_required,
-            .detail = @errorName(err),
-            .program_sha256 = program.digest_sha256,
-        },
-        else => return err,
-    };
-    var attempt_active = true;
-    defer if (attempt_active) attempt.release();
+            .target_architecture = program.target_architecture,
+            .foreign_architectures = program.foreign_architectures,
+            .adopt_settled_for_acknowledgment = recovery_intent != null,
+        }) catch |err| switch (err) {
+            error.RecoveryRequired,
+            error.OperationInProgress,
+            error.ProvenancePending,
+            => return .{
+                .outcome = .recovery_required,
+                .detail = @errorName(err),
+                .program_sha256 = program.digest_sha256,
+            },
+            else => return err,
+        };
+    }
+    const attempt = borrowed_attempt orelse &owned_attempt;
+    defer if (borrowed_attempt == null) attempt.release();
+    if (borrowed_attempt != null)
+        try native_operation.bind(allocator, root, attempt, program.*);
     if (recovery_intent) |intent| {
         if (!std.mem.eql(
             u8,
             &intent.attempt_id,
             &native_recovery.hexDigest(attempt.attemptId()),
         )) {
-            attempt.release();
-            attempt_active = false;
             return .{
                 .outcome = .refused,
                 .detail = "attempt_binding_mismatch",
@@ -17142,7 +17193,7 @@ fn executeLifecycleProgram(
     }
 
     var locked_capture = captureDatabaseSnapshot(allocator, root, .{}) catch |err| {
-        try attempt.abandonIfPreMutation(allocator);
+        if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
         return err;
     };
     defer locked_capture.deinit();
@@ -17160,7 +17211,7 @@ fn executeLifecycleProgram(
     )) {
         .database => |value| value,
         .diagnostic => {
-            try attempt.abandonIfPreMutation(allocator);
+            if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
             return .{
                 .outcome = .refused,
                 .detail = "locked_database_rejected",
@@ -17174,16 +17225,14 @@ fn executeLifecycleProgram(
         locked_database.generation,
         locked_database.model.packages.len,
     )) {
-        try attempt.abandonIfPreMutation(allocator);
-        attempt.release();
-        attempt_active = false;
+        if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
         return .{
             .outcome = .refused,
             .detail = "database_generation_drift",
             .program_sha256 = program.digest_sha256,
         };
     }
-    if (recovery_intent == null) try attempt.advance(allocator, .{
+    if (recovery_intent == null and borrowed_attempt == null) try attempt.advance(allocator, .{
         .state = .preflight,
         .phase = .preflight,
     });
@@ -17219,7 +17268,7 @@ fn executeLifecycleProgram(
             try publishNativeRecoveryRequiredProvenance(
                 allocator,
                 root,
-                &attempt,
+                attempt,
                 program_sha256,
                 "script_evidence_invalid",
             );
@@ -17234,7 +17283,7 @@ fn executeLifecycleProgram(
             try publishNativeRecoveryRequiredProvenance(
                 allocator,
                 root,
-                &attempt,
+                attempt,
                 program_sha256,
                 "script_outcome_unknown",
             );
@@ -17247,7 +17296,7 @@ fn executeLifecycleProgram(
         const mutation_recovered = recoverNativeRootMutation(
             allocator,
             root,
-            &attempt,
+            attempt,
             &recovery_runtime,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
@@ -17268,7 +17317,7 @@ fn executeLifecycleProgram(
             try publishNativeRecoveryRequiredProvenance(
                 allocator,
                 root,
-                &attempt,
+                attempt,
                 program_sha256,
                 detail,
             );
@@ -17287,7 +17336,7 @@ fn executeLifecycleProgram(
             raw_request orelse return error.InvalidLifecycleProgram,
             archive_bytes,
             initial_snapshot,
-            &attempt,
+            attempt,
         );
         active_native_recovery = &recovery_runtime;
         recovery_runtime.crash.hit(.after_execution_intent);
@@ -17307,15 +17356,13 @@ fn executeLifecycleProgram(
                 return error.InvalidRecoveryProgress;
             const terminal_succeeded = record.result == .succeeded or
                 record.result == .recovered;
-            try finishLifecycleAttempt(
+            if (borrowed_attempt == null) try finishLifecycleAttempt(
                 allocator,
                 root,
-                &attempt,
+                attempt,
                 program_sha256,
                 terminal_succeeded,
             );
-            attempt.release();
-            attempt_active = false;
             return .{
                 .outcome = if (terminal_succeeded) .applied else .script_failed,
                 .detail = if (terminal_succeeded)
@@ -17330,7 +17377,7 @@ fn executeLifecycleProgram(
         allocator,
         root,
         program.*,
-        &attempt,
+        attempt,
     );
     defer if (trigger_authority_bytes) |bytes| allocator.free(bytes);
     var staging: LifecycleStaging = .{};
@@ -17374,7 +17421,7 @@ fn executeLifecycleProgram(
                 models,
                 archive_bytes,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 step.sequence,
@@ -17405,7 +17452,7 @@ fn executeLifecycleProgram(
                     .install_root = external.root,
                     .program = program,
                     .authorization = authorization,
-                    .attempt = &attempt,
+                    .attempt = attempt,
                     .target_step = 0,
                     .script = script,
                     .inject_unknown = external.fault != null and
@@ -17429,7 +17476,7 @@ fn executeLifecycleProgram(
                 models,
                 archive_bytes,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 step.sequence,
@@ -17477,7 +17524,7 @@ fn executeLifecycleProgram(
                                 external.root,
                                 program,
                                 authorization,
-                                &attempt,
+                                attempt,
                                 hook_context.script.sequence,
                                 intent.package,
                                 null,
@@ -17536,7 +17583,7 @@ fn executeLifecycleProgram(
                             program,
                             authorization,
                             locks,
-                            &attempt,
+                            attempt,
                             operation,
                             conffile_policy,
                             initial_snapshot,
@@ -17557,7 +17604,7 @@ fn executeLifecycleProgram(
                         program,
                         authorization,
                         locks,
-                        &attempt,
+                        attempt,
                         operation,
                         conffile_policy,
                         &staging,
@@ -17571,7 +17618,7 @@ fn executeLifecycleProgram(
                         program,
                         authorization,
                         locks,
-                        &attempt,
+                        attempt,
                         operation,
                         conffile_policy,
                         status_old_baseline,
@@ -17583,15 +17630,13 @@ fn executeLifecycleProgram(
                         root,
                         trigger_authority_bytes,
                     );
-                    try finishLifecycleAttempt(
+                    if (borrowed_attempt == null) try finishLifecycleAttempt(
                         allocator,
                         root,
-                        &attempt,
+                        attempt,
                         program_sha256,
                         false,
                     );
-                    attempt.release();
-                    attempt_active = false;
                     return .{
                         .outcome = .script_failed,
                         .detail = "postrm",
@@ -17608,7 +17653,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                 );
@@ -17675,7 +17720,7 @@ fn executeLifecycleProgram(
                     models,
                     archive_bytes,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     package,
@@ -17708,7 +17753,7 @@ fn executeLifecycleProgram(
                         models,
                         archive_bytes,
                         locks,
-                        &attempt,
+                        attempt,
                         operation,
                         conffile_policy,
                         state.package.ref(),
@@ -17725,7 +17770,7 @@ fn executeLifecycleProgram(
                 program,
                 authorization,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 state,
@@ -17760,7 +17805,7 @@ fn executeLifecycleProgram(
                 program,
                 authorization,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 intent.package.ref(),
@@ -17775,7 +17820,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                 );
@@ -17791,7 +17836,7 @@ fn executeLifecycleProgram(
                 program,
                 authorization,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 intent.package.ref(),
@@ -17806,7 +17851,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                 );
@@ -17825,7 +17870,7 @@ fn executeLifecycleProgram(
                 authorization,
                 models,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 call.package,
@@ -17845,7 +17890,7 @@ fn executeLifecycleProgram(
                 external.root,
                 program,
                 authorization,
-                &attempt,
+                attempt,
                 step.sequence,
                 call.package,
                 null,
@@ -17874,7 +17919,7 @@ fn executeLifecycleProgram(
                     external.root,
                     program,
                     authorization,
-                    &attempt,
+                    attempt,
                     step.sequence,
                     call.package,
                     null,
@@ -17921,7 +17966,7 @@ fn executeLifecycleProgram(
                     external.root,
                     program,
                     authorization,
-                    &attempt,
+                    attempt,
                     step.sequence,
                     call.package,
                     null,
@@ -17970,7 +18015,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     initial_snapshot,
@@ -17996,7 +18041,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     &staging,
@@ -18011,7 +18056,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     call.package,
@@ -18030,7 +18075,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     call.package,
@@ -18051,7 +18096,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     initial_snapshot,
@@ -18074,7 +18119,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     call.package,
@@ -18105,7 +18150,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     failure_state,
@@ -18122,7 +18167,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     &staging,
@@ -18137,7 +18182,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     status_old_baseline,
@@ -18150,15 +18195,13 @@ fn executeLifecycleProgram(
                 root,
                 trigger_authority_bytes,
             );
-            try finishLifecycleAttempt(
+            if (borrowed_attempt == null) try finishLifecycleAttempt(
                 allocator,
                 root,
-                &attempt,
+                attempt,
                 program_sha256,
                 false,
             );
-            attempt.release();
-            attempt_active = false;
             return .{
                 .outcome = .script_failed,
                 .detail = @tagName(call.kind),
@@ -18188,7 +18231,7 @@ fn executeLifecycleProgram(
                     program,
                     authorization,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     scratch,
@@ -18207,7 +18250,7 @@ fn executeLifecycleProgram(
                     authorization,
                     initial_model,
                     locks,
-                    &attempt,
+                    attempt,
                     operation,
                     conffile_policy,
                     trigger_events.items,
@@ -18223,7 +18266,7 @@ fn executeLifecycleProgram(
                 program,
                 authorization,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 trigger_events.items,
@@ -18240,7 +18283,7 @@ fn executeLifecycleProgram(
                 program,
                 authorization,
                 locks,
-                &attempt,
+                attempt,
                 operation,
                 conffile_policy,
                 step.sequence,
@@ -18261,7 +18304,7 @@ fn executeLifecycleProgram(
                         program,
                         authorization,
                         locks,
-                        &attempt,
+                        attempt,
                         operation,
                         conffile_policy,
                         &staging,
@@ -18275,7 +18318,7 @@ fn executeLifecycleProgram(
                         program,
                         authorization,
                         locks,
-                        &attempt,
+                        attempt,
                         operation,
                         conffile_policy,
                         status_old_baseline,
@@ -18287,15 +18330,13 @@ fn executeLifecycleProgram(
                         root,
                         trigger_authority_bytes,
                     );
-                    try finishLifecycleAttempt(
+                    if (borrowed_attempt == null) try finishLifecycleAttempt(
                         allocator,
                         root,
-                        &attempt,
+                        attempt,
                         program_sha256,
                         false,
                     );
-                    attempt.release();
-                    attempt_active = false;
                     return trigger_result;
                 },
                 .script_failed, .handoff, .refused => return trigger_result,
@@ -18310,7 +18351,7 @@ fn executeLifecycleProgram(
         program,
         authorization,
         locks,
-        &attempt,
+        attempt,
         operation,
         conffile_policy,
         &staging,
@@ -18323,7 +18364,7 @@ fn executeLifecycleProgram(
         program,
         authorization,
         locks,
-        &attempt,
+        attempt,
         operation,
         conffile_policy,
         status_old_baseline,
@@ -18375,15 +18416,13 @@ fn executeLifecycleProgram(
         root,
         trigger_authority_bytes,
     );
-    try finishLifecycleAttempt(
+    if (borrowed_attempt == null) try finishLifecycleAttempt(
         allocator,
         root,
-        &attempt,
+        attempt,
         program_sha256,
         true,
     );
-    attempt.release();
-    attempt_active = false;
     return .{
         .outcome = .applied,
         .detail = "completed",
@@ -19567,14 +19606,41 @@ test "native_unpack.test.lifecycle external fixture" {
 }
 
 test "native_unpack.test.production preparation drives a mixed install and removal program" {
-    try testPreparedMixedLifecycle(false);
+    try testPreparedMixedLifecycle(false, .owned);
 }
 
 test "native_unpack.test.production preparation drives a mixed install and purge program" {
-    try testPreparedMixedLifecycle(true);
+    try testPreparedMixedLifecycle(true, .owned);
 }
 
-fn testPreparedMixedLifecycle(purge: bool) !void {
+test "native_unpack.test.borrowed native interpreter preserves caller hashes lock and completion" {
+    try testPreparedMixedLifecycle(false, .borrowed);
+    try testPreparedMixedLifecycle(true, .borrowed);
+}
+
+test "native_unpack.test.borrowed preflight refusals leave operation cleanup to the caller" {
+    try testPreparedMixedLifecycle(false, .stale_database);
+    try testPreparedMixedLifecycle(false, .wrong_plan);
+    try testPreparedMixedLifecycle(false, .foreign_root);
+    try testPreparedMixedLifecycle(false, .private_recovery);
+    try testPreparedMixedLifecycle(false, .legacy_bridge);
+    try testPreparedMixedLifecycle(false, .legacy_backend);
+    try testPreparedMixedLifecycle(false, .wrong_architecture);
+}
+
+const MixedLifecycleCase = enum {
+    owned,
+    borrowed,
+    stale_database,
+    wrong_plan,
+    foreign_root,
+    private_recovery,
+    legacy_bridge,
+    legacy_backend,
+    wrong_architecture,
+};
+
+fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     const status = try std.fmt.allocPrint(
         testing.allocator,
         "Package: old\nStatus: install ok installed\nVersion: 2.0\nArchitecture: amd64\n" ++
@@ -19719,16 +19785,81 @@ fn testPreparedMixedLifecycle(purge: bool) !void {
     try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
     var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
     defer locks.deinit();
-    const result = try executeLifecycleProgram(
+    var caller: root_operation.Attempt = undefined;
+    if (case != .owned) {
+        var coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
+        caller = try coordinator.acquire(testing.allocator, .{
+            .backend = if (case == .legacy_backend) .legacy_dpkg else .native,
+            .operation = .{ .repository_bootstrap = .add },
+            .request_sha256 = @splat(0x71),
+            .policy_sha256 = @splat(0x72),
+            .target_architecture = if (case == .wrong_architecture) "arm64" else "amd64",
+            .evidence = .{ .plan_sha256 = if (case == .wrong_plan)
+                @splat(0x73)
+            else
+                transaction_executor.planDigest(solver_plan) },
+        });
+        if (case == .legacy_bridge)
+            try caller.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    }
+    defer if (case != .owned) caller.release();
+    const external: ExternalLifecycleRequest = .{
+        .root = install_root,
+        .architecture = "amd64",
+        .archives = &.{},
+        .operation = .install,
+        .report = "",
+        .recovery = case == .private_recovery,
+    };
+    if (case == .stale_database) {
+        const changed_status = try std.mem.concat(testing.allocator, u8, &.{ status, "\n" });
+        defer testing.allocator.free(changed_status);
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), changed_status, .{});
+    }
+    if (case == .wrong_plan or case == .foreign_root or case == .private_recovery or
+        case == .legacy_bridge or case == .legacy_backend or case == .wrong_architecture)
+    {
+        const original_digest = caller.record().digest_sha256;
+        var other = testing.tmpDir(.{});
+        defer other.cleanup();
+        try testing.expectError(
+            switch (case) {
+                .wrong_plan => error.InvalidTransition,
+                .foreign_root => error.OperationRootMismatch,
+                .private_recovery => error.ProductionRecoveryRequestRequired,
+                .legacy_bridge => error.OperationNotMutable,
+                .legacy_backend => error.OperationBackendMismatch,
+                .wrong_architecture => error.OperationArchitectureMismatch,
+                else => unreachable,
+            },
+            executeLifecycleProgramInOperation(
+                testing.allocator,
+                if (case == .foreign_root) root_fs.Root.init(testing.io, other.dir) else root,
+                external,
+                &compiled,
+                &models,
+                &.{bytes},
+                fixture.snapshot(),
+                database.model,
+                locks.interface(),
+                null,
+                null,
+                &caller,
+            ),
+        );
+        try testing.expect(caller.locked());
+        try testing.expectEqual(original_digest, caller.record().digest_sha256);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        if (case == .legacy_bridge) {
+            _ = try caller.witness(testing.allocator, .proved_not_started);
+            try caller.clear();
+        } else try caller.abandonIfPreMutation(testing.allocator);
+        return;
+    }
+    const result = try executeLifecycleProgramInOperation(
         testing.allocator,
         root,
-        .{
-            .root = install_root,
-            .architecture = "amd64",
-            .archives = &.{},
-            .operation = .install,
-            .report = "",
-        },
+        external,
         &compiled,
         &models,
         &.{bytes},
@@ -19737,10 +19868,39 @@ fn testPreparedMixedLifecycle(purge: bool) !void {
         locks.interface(),
         null,
         null,
+        if (case == .owned) null else &caller,
     );
+    if (case == .stale_database) {
+        try testing.expectEqual(LifecycleOutcome.refused, result.outcome);
+        try testing.expectEqualStrings("database_generation_drift", result.detail);
+        try testing.expect(caller.locked());
+        try testing.expectEqual(root_operation.State.preflight, caller.record().state);
+        try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        try caller.abandonIfPreMutation(testing.allocator);
+        return;
+    }
     if (result.outcome != .applied) {
         std.debug.print("mixed native execution failed: {any}\n", .{result});
         return error.TestUnexpectedResult;
+    }
+    if (case == .borrowed) {
+        try testing.expect(caller.locked());
+        try testing.expectEqual(root_operation.State.mutating, caller.record().state);
+        try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
+        try testing.expect(caller.record().operation.eql(.{ .repository_bootstrap = .add }));
+        try testing.expectEqual([_]u8{0x71} ** 32, caller.record().request_sha256);
+        try testing.expectEqual([_]u8{0x72} ** 32, caller.record().policy_sha256);
+        try testing.expectEqual(transaction_executor.planDigest(solver_plan), caller.record().plan_sha256.?);
+        try testing.expectEqual(compiled.authorization.authorization.digest_sha256, caller.record().authorization_sha256.?);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation_completion.document_path)) == null);
+        try caller.advance(testing.allocator, .{ .state = .mutating, .phase = .mutation });
+        try caller.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+        try caller.complete(testing.allocator, .succeeded);
+        try caller.publishProvenance(testing.allocator, @splat(0x74));
+        try caller.clear();
     }
     var final = try captureDatabaseSnapshot(testing.allocator, root, .{});
     defer final.deinit();

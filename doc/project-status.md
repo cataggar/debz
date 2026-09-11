@@ -120,9 +120,12 @@ Item 15b's `debz.native_preparation` foundation binds actual solver plans and
 exact-lock v2 documents to native authorization and compiled programs without
 fixture request hashes or command-shaped reports. It preserves authenticated
 origins and the complete installed/residual closure, and the private interpreter
-accepts its mixed install/remove and install/purge programs. Production
-execution/recovery ownership, helper deployment, and CLI integration remain
-incomplete; native selection is still unavailable and legacy remains default.
+accepts its mixed install/remove and install/purge programs. Its caller-owned
+operation boundary preserves the outer request/policy/plan hashes and leaves
+the caller's lock, mutation state, completion, and cleanup under caller control.
+Production request persistence/recovery, helper deployment, and CLI integration
+remain incomplete; native selection is still unavailable and legacy remains
+default.
 
 `debz.root_fs` is the traversal-safe filesystem layer for the native
 transaction engine. It anchors bounded, typed, root-relative operations to an
