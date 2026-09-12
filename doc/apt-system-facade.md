@@ -321,6 +321,15 @@ released marker is not finalized by verification, and no cleared-root summary is
 returned. Public settled verification still refuses that marker until the owner
 has actually been finalized.
 
+Known failed native transactions have a distinct pending-failure verifier and
+result type. The receipt, root completion, and terminal progress must all record
+failure under the exact pending owner. The current database must match the
+receipt's recorded generation and state digest, but the verifier does not claim
+that the desired package closure was reached. Success and failure result types
+are not interchangeable; unknown/recovery-required outcomes are refused. This
+read-only path neither acknowledges the failed attempt nor enables native
+apt/system execution.
+
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
 schema, version, digest, and bytes in the existing per-attempt
