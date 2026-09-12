@@ -2682,6 +2682,7 @@ pub const AcquireLock = struct {
     path: []const u8,
     wait_ms: u64,
     cancellation: transaction_executor.Cancellation,
+    create_if_missing: bool = true,
 };
 
 /// Injectable lock backend. Tests supply an in-process implementation; the
@@ -2785,16 +2786,19 @@ pub const SystemLockBackend = struct {
                 .follow_symlinks = false,
                 .resolve_beneath = true,
             }) catch |err| switch (err) {
-                error.FileNotFound => parent.dir.createFile(self.io, parent.leaf, .{
-                    .read = true,
-                    .truncate = false,
-                    .exclusive = true,
-                    .permissions = record_permissions,
-                    .resolve_beneath = true,
-                }) catch |create_err| switch (create_err) {
-                    error.PathAlreadyExists => continue,
-                    else => return create_err,
-                },
+                error.FileNotFound => if (!request.create_if_missing)
+                    return error.FileNotFound
+                else
+                    parent.dir.createFile(self.io, parent.leaf, .{
+                        .read = true,
+                        .truncate = false,
+                        .exclusive = true,
+                        .permissions = record_permissions,
+                        .resolve_beneath = true,
+                    }) catch |create_err| switch (create_err) {
+                        error.PathAlreadyExists => continue,
+                        else => return create_err,
+                    },
                 else => return err,
             };
         }
@@ -6645,6 +6649,34 @@ test "root_operation.test.the production lock backend serializes one root" {
 
     const metadata = try second_coordinator.root.metadata(try root_fs.Path.init(lock_path));
     try testing.expect(metadata.isRegularFile());
+}
+
+test "root_operation.test.read-only verification cannot create a missing lock" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var backend: SystemLockBackend = .{ .allocator = testing.allocator, .io = testing.io };
+    const coordinator = try openTestCoordinator(&tmp, backend.interface(), test_root);
+    const locks = backend.interface();
+    const request: AcquireLock = .{
+        .rank = .root_operation,
+        .root = coordinator.root,
+        .identity = coordinator.identity,
+        .path = lock_path,
+        .wait_ms = 0,
+        .cancellation = .never(),
+        .create_if_missing = false,
+    };
+    try testing.expectError(error.LockUnavailable, locks.acquire(request));
+    try testing.expect(try coordinator.root.entryIfExists(try root_fs.Path.init(lock_path)) == null);
+    var writable = request;
+    writable.create_if_missing = true;
+    const first = try locks.acquire(writable);
+    locks.release(first);
+    const second = try locks.acquire(request);
+    defer locks.release(second);
+    try testing.expect(locks.held(second));
+    try testing.expect(try coordinator.store().read(testing.allocator) == null);
 }
 
 test "root_operation.test.allocation failure never leaks or half-publishes" {

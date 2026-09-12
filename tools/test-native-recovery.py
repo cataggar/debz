@@ -1126,7 +1126,10 @@ def workflow(
     return document(report_path, 64 * 1024)
 
 
-def exercise_workflows(executable: Path, workspace: Path, environment: dict, architecture: str) -> None:
+def exercise_workflows(
+    executable: Path, workspace: Path, environment: dict, architecture: str,
+    result_cli: Path | None = None,
+) -> None:
     spec = importlib.util.spec_from_file_location(
         "debz_workflow_repository", ROOT / "tools/generate-integration-repository.py",
     )
@@ -1187,6 +1190,57 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
         assert_final_database(current.candidate, architecture, receipt)
         for path in (OPERATION, INTENT, NAMESPACE / "native-recovery-v1"):
             assert not (current.candidate / path).exists(), path
+        if result_cli is not None:
+            verify_result(
+                current, lock,
+                receipt["outcome"] == "succeeded" and
+                not (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").exists(),
+            )
+
+    def verify_result(
+        current: lifecycle.Scenario, lock: dict, succeeds: bool = True,
+        selected_architecture: str | None = None,
+    ) -> None:
+        assert result_cli is not None
+
+        def inventory() -> list[tuple]:
+            return sorted(
+                (str(path.relative_to(current.candidate)), entry.st_mode, entry.st_size, entry.st_mtime_ns)
+                for path in (current.candidate / NAMESPACE).rglob("*")
+                for entry in [path.lstat()]
+            )
+
+        before = inventory()
+        result = subprocess.run(
+            [
+                str(result_cli), "transaction-result", "verify", "--transaction-backend", "native",
+                "--install-root", str(current.candidate),
+                "--lock-input", str(current.directory / "workflow.lock.json"),
+                "--architecture", selected_architecture or architecture, "--json",
+            ],
+            env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
+        )
+        assert before == inventory(), "native verification changed root-operation evidence"
+        assert result.returncode == (0 if succeeds else 7), result.stderr.decode(errors="replace")
+        if not succeeds:
+            assert result.stdout == b""
+            return
+        assert result.stderr == b""
+        summary = json.loads(result.stdout)
+        validator("transaction-result-summary-v2").validate(summary)
+        assert result.stdout == json.dumps(summary, separators=(",", ":")).encode() + b"\n"
+        assert summary["backend"] == "native"
+        assert summary["lock_sha256"] == lock["digest_sha256"]
+        assert summary["request_sha256"] == lock["request_sha256"]
+        assert summary["solver_policy_sha256"] == lock["policy_sha256"]
+        assert summary["package_count"] == len(lock["packages"])
+        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert summary["transaction_digest_sha256"] == receipt["digest_sha256"]
+        assert summary["completion_digest_sha256"] == completion["digest_sha256"]
+        assert summary["caller_request_sha256"] == completion["request_sha256"]
+        assert summary["caller_policy_sha256"] == completion["policy_sha256"]
+        assert summary["program_sha256"] == receipt["program_sha256"]
 
     names = ["scenario-main", "conffile-pkg"]
     current = scenario("workflow-batch")
@@ -1204,6 +1258,48 @@ def exercise_workflows(executable: Path, workspace: Path, environment: dict, arc
     ) == 0
     compare(current.expected, current.candidate)
     assert_completion(current, lock)
+    if result_cli is not None:
+        capability_result = subprocess.run(
+            [str(result_cli), "transaction-result", "capabilities", "--transaction-backend", "native", "--json"],
+            env=environment, capture_output=True, timeout=30, check=True,
+        )
+        validator("transaction-result-capability-v1").validate(json.loads(capability_result.stdout))
+        verify_result(current, lock, False, "arm64" if architecture == "amd64" else "amd64")
+        lock_path = current.directory / "workflow.lock.json"
+        original_lock = lock_path.read_bytes()
+        different_lock = dict(lock)
+        different_lock.pop("digest_sha256")
+        different_lock["request_sha256"] = "0" * 64
+        different_lock["digest_sha256"] = hashlib.sha256(
+            json.dumps(different_lock, separators=(",", ":")).encode()
+        ).hexdigest()
+        try:
+            lock_path.write_bytes(json.dumps(different_lock, separators=(",", ":")).encode())
+            verify_result(current, different_lock, False)
+        finally:
+            lock_path.write_bytes(original_lock)
+        m.write(current.candidate / OPERATION, b"unsettled operation\n")
+        try:
+            verify_result(current, lock, False)
+        finally:
+            (current.candidate / OPERATION).unlink()
+        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        program_path = current.candidate / next(
+            entry["path"] for entry in receipt["evidence_files"] if entry["kind"] == "program"
+        )
+        for path in (
+            program_path,
+            current.candidate / NAMESPACE / "native-transaction-provenance-v1.json",
+            current.candidate / NAMESPACE / "root-operation-completion-v1.json",
+            current.candidate / "var/lib/dpkg/status",
+        ):
+            original = path.read_bytes()
+            try:
+                path.write_bytes(b"invalid completed evidence\n")
+                verify_result(current, lock, False)
+            finally:
+                path.write_bytes(original)
+        verify_result(current, lock)
     receipt_before = (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
     run(current, "plan-unchanged", request(current, "upgrade_all", "plan_only", []))
     unchanged = run(current, "unchanged", request(current, "upgrade_all", "execute", []))
@@ -1505,6 +1601,7 @@ def main() -> int:
     parser.add_argument("--native-helper", type=Path, required=True)
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--core-only", action="store_true")
+    parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -1513,6 +1610,7 @@ def main() -> int:
             raise RuntimeError(f"missing reference prerequisite: {command}")
     executable = arguments.native_test.resolve(strict=True)
     helper = arguments.native_helper.resolve(strict=True)
+    result_cli = arguments.result_cli.resolve(strict=True) if arguments.result_cli else None
     triggers.validate_native_helper(helper)
     architecture = subprocess.run(
         ["dpkg", "--print-architecture"], check=True, capture_output=True,
@@ -1538,7 +1636,7 @@ def main() -> int:
             if not arguments.core_only:
                 exercise(executable, helper, workspace, environment, architecture)
             exercise_core(executable, helper, workspace, environment, architecture)
-            exercise_workflows(executable, workspace, environment, architecture)
+            exercise_workflows(executable, workspace, environment, architecture, result_cli)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")

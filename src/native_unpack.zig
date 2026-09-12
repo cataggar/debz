@@ -15397,20 +15397,7 @@ fn finishLifecycleAttempt(
         captured.snapshot,
     );
 
-    var script_hash = Sha256.init(.{});
-    script_hash.update("debz-native-script-outcomes-v1\x00");
-    var recovered_phases: u64 = 0;
-    for (progress.document.records) |entry| {
-        if ((entry.action.kind == .script or entry.action.kind == .trigger or
-            entry.action.kind == .compensation) and
-            entry.stage == .outcome)
-        {
-            script_hash.update(&entry.digest_sha256);
-            if (entry.evidence_sha256) |digest| script_hash.update(&digest);
-        }
-        if (entry.result == .recovered) recovered_phases += 1;
-    }
-    const script_outcomes_sha256 = script_hash.finalResult();
+    const progress_summary = native_recovery.summarizeProgress(progress.document);
     var trigger_events = try native_recovery.readTriggerEvents(
         allocator,
         root,
@@ -15474,7 +15461,7 @@ fn finishLifecycleAttempt(
         .progress_head_sha256 = progress.document.head_sha256,
         .progress_record_count = progress.document.records.len,
         .script_outcomes_sha256 = native_provenance.hexDigest(
-            script_outcomes_sha256,
+            progress_summary.script_outcomes_sha256,
         ),
         .trigger_evidence_sha256 = trigger_events.document.digest_sha256,
         .final_database_generation_sha256 = native_provenance.hexDigest(
@@ -15483,7 +15470,7 @@ fn finishLifecycleAttempt(
         .final_state_sha256 = native_provenance.hexDigest(
             nativeFinalClosureDigest(captured.snapshot),
         ),
-        .recovered_phase_count = recovered_phases,
+        .recovered_phase_count = progress_summary.recovered_phase_count,
         .evidence_root = retained.root_path,
         .evidence_files = retained.files,
         .evidence_files_sha256 = retained.digest_sha256,
@@ -17471,6 +17458,33 @@ pub const Runtime = struct {
         const helper = request.helper() orelse return error.NativeHelperBindingRequired;
         try helper.matches(native_helper.bundled());
         return receipt;
+    }
+
+    /// Verifies the current database against retained successful evidence.
+    /// The caller holds the root-operation lock; no recovery work is performed.
+    pub fn verifyCompletedState(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        authorization: native_authorization.Authorization,
+        receipt: native_provenance.Document,
+    ) !void {
+        if (receipt.outcome != .succeeded)
+            return error.TransactionNotSuccessful;
+        var captured = try captureDatabaseSnapshot(allocator, root, .{});
+        defer captured.deinit();
+        normalizeCapturedNativeArchitecture(&captured.snapshot, authorization.target_architecture);
+        var database = switch (try package_database.importSnapshot(allocator, .{
+            .native_architecture = authorization.target_architecture,
+            .snapshot = captured.snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.InvalidExternalDatabase,
+        };
+        defer database.deinit();
+        if (!lifecycleFinalClosureMatches(authorization.final_state, database) or
+            !std.mem.eql(u8, &native_provenance.hexDigest(database.generation.sha256), &receipt.final_database_generation_sha256) or
+            !std.mem.eql(u8, &native_provenance.hexDigest(nativeFinalClosureDigest(captured.snapshot)), &receipt.final_state_sha256))
+            return error.FinalStateMismatch;
     }
 
     /// Clears only native active evidence after an exact receipt acknowledgment.

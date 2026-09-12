@@ -251,6 +251,38 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !OwnedDocument {
     return .{ .document = parsed.value, .parsed = parsed };
 }
 
+fn programBinding(program: native_program.Program) ProgramBinding {
+    return .{
+        .request_sha256 = program.request_sha256,
+        .solver_policy_sha256 = program.solver_policy_sha256,
+        .executor_policy_sha256 = program.executor_policy_sha256,
+        .plan_sha256 = program.plan_sha256,
+        .authorization_sha256 = program.authorization_sha256,
+        .program_sha256 = program.digest_sha256,
+        .exact_lock_sha256 = program.exact_lock.digest_sha256,
+        .artifact_evidence_sha256 = program.artifacts_sha256,
+        .database_generation_sha256 = program.installed_database.generation_sha256,
+        .script_policy_sha256 = program.script_policy_sha256,
+    };
+}
+
+/// Checks persisted program evidence without creating or adopting an attempt.
+pub fn validateProgram(document: Document, program: native_program.Program) !void {
+    try validate(document);
+    try native_program.validateDocument(program);
+    if (!std.meta.eql(document.program, programBinding(program)) or
+        !std.mem.eql(u8, document.install_root, program.install_root) or
+        !std.mem.eql(u8, &document.root_identity_sha256, &program.root_identity_sha256) or
+        !std.mem.eql(u8, document.architecture, program.target_architecture) or
+        document.policy != @as(native_recovery.ConffilePolicy, switch (program.policy.conffile) {
+            .keep_existing => .keep_existing,
+            .use_package_version => .use_package_version,
+        }) or
+        document.triggers != (program.trigger_authority != null) or
+        document.defer_triggers != (if (program.trigger_authority) |authority| authority.defer_triggers else false))
+        return error.RecoveryRequestBindingMismatch;
+}
+
 /// Returned strings borrow the program and attempt. Encode before advancing
 /// the attempt, or decode the canonical bytes to obtain an owned document.
 pub fn create(
@@ -275,18 +307,7 @@ pub fn create(
             .request_sha256 = native_recovery.hexDigest(record.request_sha256),
             .policy_sha256 = native_recovery.hexDigest(record.policy_sha256),
         },
-        .program = .{
-            .request_sha256 = program.request_sha256,
-            .solver_policy_sha256 = program.solver_policy_sha256,
-            .executor_policy_sha256 = program.executor_policy_sha256,
-            .plan_sha256 = program.plan_sha256,
-            .authorization_sha256 = program.authorization_sha256,
-            .program_sha256 = program.digest_sha256,
-            .exact_lock_sha256 = program.exact_lock.digest_sha256,
-            .artifact_evidence_sha256 = program.artifacts_sha256,
-            .database_generation_sha256 = program.installed_database.generation_sha256,
-            .script_policy_sha256 = program.script_policy_sha256,
-        },
+        .program = programBinding(program),
         .operation = operation,
         .policy = switch (program.policy.conffile) {
             .keep_existing => .keep_existing,

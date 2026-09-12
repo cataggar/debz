@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "package-cache", "prepare" }, .usage = "debz package-cache prepare --lock-input PATH" },
         .{ .args = &.{"transaction-result"}, .usage = "debz transaction-result verify --state-path PATH" },
         .{ .args = &.{ "transaction-result", "verify" }, .usage = "debz transaction-result verify --state-path PATH" },
+        .{ .args = &.{ "transaction-result", "capabilities" }, .usage = "debz transaction-result capabilities --transaction-backend native --json" },
         .{ .args = &.{"apt"}, .usage = "debz apt [--profile PATH] [--json] <command>" },
         .{ .args = &.{ "apt", "install" }, .usage = "debz apt [--profile PATH] [--json] install [-y] PACKAGE..." },
         .{ .args = &.{ "recover", "--system-profile", "/profile.json" }, .usage = "debz recover [--json] --system-profile PATH" },
@@ -658,7 +659,10 @@ pub fn build(b: *std.Build) void {
 
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "native_recovery.test.", "native_provenance.test.", "native_execution_request.test.", "native_helper.test." },
+        .filters = &.{
+            "native_recovery.test.", "native_provenance.test.",         "native_execution_request.test.",
+            "native_helper.test.",   "native_transaction_result.test.",
+        },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
     b.step("test-native-recovery-unit", "Run native execution journal and provenance tests")
@@ -671,6 +675,8 @@ pub fn build(b: *std.Build) void {
     native_recovery.addArtifactArg(native_lifecycle_tests);
     native_recovery.addArg("--native-helper");
     native_recovery.addArtifactArg(native_trigger_helper);
+    native_recovery.addArg("--result-cli");
+    native_recovery.addArtifactArg(cli);
     if (b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false)
         native_recovery.addArg("--core-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
@@ -954,6 +960,8 @@ fn installReleaseFiles(
         "transaction-result-v1.json",
         "transaction-result-v2.json",
         "transaction-result-summary-v1.json",
+        "transaction-result-summary-v2.json",
+        "transaction-result-capability-v1.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },

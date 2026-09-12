@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/transaction-result-summary-v2.json",
+  "title": "debz verified native transaction-result summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "api_version", "backend", "transaction_schema", "transaction_schema_version",
+    "completion_schema", "completion_schema_version", "target_architecture", "install_root",
+    "operation", "request_sha256", "solver_policy_sha256", "caller_request_sha256",
+    "caller_policy_sha256", "lock_sha256", "transaction_digest_sha256",
+    "completion_digest_sha256", "program_sha256", "package_count", "outcome",
+    "final_verification_status", "lock_evidence", "receipt_evidence", "root_operation_status"
+  ],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.transaction-result-summary.v2" },
+    "api_version": { "const": 2 },
+    "backend": { "const": "native" },
+    "transaction_schema": { "const": "https://debz.dev/schema/native-transaction-provenance-v1" },
+    "transaction_schema_version": { "const": 1 },
+    "completion_schema": { "const": "https://debz.dev/schema/root-operation-completion-v1" },
+    "completion_schema_version": { "const": 1 },
+    "target_architecture": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "install_root": { "type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^/" },
+    "operation": { "enum": ["install", "remove", "upgrade", "upgrade-all", "reinstall"] },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "caller_request_sha256": { "$ref": "#/$defs/sha256" },
+    "caller_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "lock_sha256": { "$ref": "#/$defs/sha256" },
+    "transaction_digest_sha256": { "$ref": "#/$defs/sha256" },
+    "completion_digest_sha256": { "$ref": "#/$defs/sha256" },
+    "program_sha256": { "$ref": "#/$defs/sha256" },
+    "package_count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+    "outcome": { "const": "succeeded" },
+    "final_verification_status": { "const": "exact_match" },
+    "lock_evidence": { "const": "exact_match" },
+    "receipt_evidence": { "const": "exact_match" },
+    "root_operation_status": { "const": "cleared" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

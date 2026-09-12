@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/transaction-result-capability-v1.json",
+  "title": "debz native transaction-result verification capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "api_version", "backend", "capability", "summary_schema", "summary_api_version",
+    "transaction_schema", "transaction_schema_version", "completion_schema",
+    "completion_schema_version", "lock_schema", "lock_schema_version", "read_only"
+  ],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.transaction-result-capability.v1" },
+    "api_version": { "const": 1 },
+    "backend": { "const": "native" },
+    "capability": { "const": "native-transaction-result-v1" },
+    "summary_schema": { "const": "io.github.cataggar.debz.transaction-result-summary.v2" },
+    "summary_api_version": { "const": 2 },
+    "transaction_schema": { "const": "https://debz.dev/schema/native-transaction-provenance-v1" },
+    "transaction_schema_version": { "const": 1 },
+    "completion_schema": { "const": "https://debz.dev/schema/root-operation-completion-v1" },
+    "completion_schema_version": { "const": 1 },
+    "lock_schema": { "const": "https://debz.dev/schema/exact-closure-lock-v2" },
+    "lock_schema_version": { "const": 2 },
+    "read_only": { "const": true }
+  }
+}

@@ -199,6 +199,42 @@ set -e
 test "$status_code" -eq 7
 grep -q "transaction result verification failed" cli-test-stderr
 
+"$debz" transaction-result capabilities --transaction-backend native --json >cli-test-stdout
+python3 - cli-test-stdout <<'PY'
+import json
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_bytes()
+value = json.loads(source)
+assert source.count(b"\n") == 1 and source.endswith(b"\n")
+assert value["schema"] == "io.github.cataggar.debz.transaction-result-capability.v1"
+assert value["backend"] == "native"
+assert value["capability"] == "native-transaction-result-v1"
+assert value["summary_schema"] == "io.github.cataggar.debz.transaction-result-summary.v2"
+assert value["summary_api_version"] == 2
+assert value["lock_schema_version"] == 2
+assert value["read_only"] is True
+PY
+
+for arguments in \
+    "transaction-result capabilities --json" \
+    "transaction-result capabilities --transaction-backend native --install-root /unused --json" \
+    "transaction-result verify --transaction-backend other --json" \
+    "transaction-result verify --transaction-backend native --transaction-backend native --json" \
+    "transaction-result verify --transaction-backend native --state-path $state --lock-input /missing --architecture amd64 --json" \
+    "transaction-result verify --transaction-backend native --lock-input /missing --architecture amd64 --json" \
+    "transaction-result verify --transaction-backend native --install-root relative --lock-input /missing --architecture amd64 --json" \
+    "transaction-result verify --install-root /unused --lock-input /missing --architecture amd64 --json"
+do
+    set +e
+    "$debz" $arguments >cli-test-stdout 2>cli-test-stderr
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stdout
+done
+
 for arguments in \
     "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64" \
     "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline" \
