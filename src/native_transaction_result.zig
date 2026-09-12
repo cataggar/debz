@@ -7,9 +7,11 @@ const native_program = @import("native_program.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
+const native_trigger = @import("native_trigger.zig");
 const package_origin = @import("package_origin.zig");
 const product_api = @import("product_api.zig");
 const root_fs = @import("root_fs.zig");
+const root_mutation = @import("root_mutation.zig");
 const root_operation = @import("root_operation.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
@@ -99,46 +101,12 @@ pub fn verify(
     expected_architecture: []const u8,
     locks: root_operation.LockBackend,
 ) !Summary {
-    if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
-    var named = try root_fs.openAbsoluteRoot(root.io, install_root);
-    defer named.close();
-    const held = try root.rootEntry();
-    const resolved = try named.root.rootEntry();
-    if (held.inode != resolved.inode or held.device != resolved.device)
-        return error.RootIdentityMismatch;
-    var host = try root_fs.openAbsoluteRoot(root.io, "/");
-    defer host.close();
-    const host_entry = try host.root.rootEntry();
-    if (held.inode == host_entry.inode and held.device == host_entry.device)
-        return error.HostRootNotSupported;
-    const lock_entry = (try root.entryIfExists(try root_fs.Path.init(root_operation.lock_path))) orelse
-        return error.CompletionMissing;
-    if (lock_entry.kind != .file) return error.InvalidCompletion;
-    const token = try locks.acquire(.{
-        .rank = .root_operation,
-        .root = root,
-        .identity = .{
-            .install_root_sha256 = transaction_recovery.rootIdentity(install_root),
-            .inode = held.inode,
-        },
-        .path = root_operation.lock_path,
-        .wait_ms = 0,
-        .cancellation = .never(),
-        .create_if_missing = false,
-    });
-    defer locks.release(token);
-    if (!locks.held(token)) return error.LockLost;
+    var held = try VerificationLock.acquire(root, install_root, locks);
+    defer held.deinit();
     if (try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null or
         try root.entryIfExists(try root_fs.Path.init(root_operation.deferred_ack_path)) != null or
         try native_runtime.hasActiveEvidence(allocator, root))
         return error.OperationNotSettled;
-
-    const lock_bytes = try lock.canonicalJson(allocator);
-    defer allocator.free(lock_bytes);
-    var validated_lock = try exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes);
-    defer validated_lock.deinit();
-    if (!std.mem.eql(u8, lock.target_architecture, expected_architecture))
-        return error.ArchitectureMismatch;
 
     var completion = try root_operation_completion.Store.init(root).read(allocator) orelse
         return error.CompletionMissing;
@@ -147,6 +115,178 @@ pub fn verify(
     defer receipt.deinit();
     const proof = receipt.document;
     const outer = completion.document;
+    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, proof);
+    if (!locks.held(held.token)) return error.LockLost;
+    return .{
+        .target_architecture = expected_architecture,
+        .install_root = install_root,
+        .operation = outer.operation.package_transaction,
+        .request_sha256 = lock.request_sha256,
+        .solver_policy_sha256 = lock.policy_sha256,
+        .caller_request_sha256 = outer.request_sha256,
+        .caller_policy_sha256 = outer.policy_sha256,
+        .lock_sha256 = lock.digest_sha256,
+        .transaction_digest_sha256 = try parseDigest(proof.digest_sha256),
+        .completion_digest_sha256 = outer.digest_sha256,
+        .program_sha256 = try parseDigest(proof.program_sha256),
+        .package_count = lock.packages.len,
+    };
+}
+
+pub const PendingRequest = struct {
+    /// Independently retained caller authority, never discovered from this root.
+    owner: root_operation.DeferredAcknowledgment,
+    operation: product_api.Operation,
+    caller_request_sha256: [32]u8,
+    caller_policy_sha256: [32]u8,
+};
+
+/// Owns verified documents, but does not assert that the root has been cleared.
+pub const PendingSuccess = struct {
+    owner: root_operation.DeferredAcknowledgment,
+    receipt: native_provenance.OwnedDocument,
+    completion: root_operation_completion.OwnedDocument,
+
+    pub fn deinit(self: *PendingSuccess) void {
+        self.receipt.deinit();
+        self.completion.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Verifies a published successful completion before its exact owner acknowledges
+/// it. No attempt is opened/adopted and no recovery or cleanup is performed.
+pub fn verifyPendingSuccess(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: PendingRequest,
+    locks: root_operation.LockBackend,
+) !PendingSuccess {
+    return verifyPendingSuccessInternal(
+        allocator,
+        root,
+        install_root,
+        lock,
+        expected_architecture,
+        expected,
+        locks,
+    ) catch |err| switch (err) {
+        // This read-only path writes only to allocating canonical encoders.
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn verifyPendingSuccessInternal(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: PendingRequest,
+    locks: root_operation.LockBackend,
+) !PendingSuccess {
+    const owner_bytes = try expected.owner.canonicalJson(allocator);
+    defer allocator.free(owner_bytes);
+    if (expected.owner.state != .pending) return error.PendingOwnerRequired;
+    var held = try VerificationLock.acquire(root, install_root, locks);
+    defer held.deinit();
+    const store = root_operation.Store.init(root);
+    if (try store.readRecoveryReviewClaim(allocator) != null)
+        return error.RecoveryReviewClaimPresent;
+    const observed = try store.readDeferredAcknowledgment(allocator) orelse
+        return error.PendingOwnerRequired;
+    if (!root_operation.deferredAcknowledgmentExactEqual(observed, expected.owner))
+        return error.OwnershipMismatch;
+    var record = try store.read(allocator) orelse return error.CompletionMissing;
+    defer record.deinit();
+    if (root_operation.deferredRecordCompatibility(record.record, observed, false) != .pending_published)
+        return error.InvalidCompletion;
+    var completion = try root_operation_completion.Store.init(root).read(allocator) orelse
+        return error.CompletionMissing;
+    errdefer completion.deinit();
+    const outer = completion.document;
+    if (!outer.bindsRecord(record.record) or outer.operation != .package_transaction or
+        outer.operation.package_transaction != expected.operation or
+        !textsEqual(outer.foreign_architectures, record.record.foreign_architectures) or
+        !std.mem.eql(u8, &outer.request_sha256, &expected.caller_request_sha256) or
+        !std.mem.eql(u8, &outer.policy_sha256, &expected.caller_policy_sha256) or
+        !std.mem.eql(u8, &outer.digest_sha256, &observed.completion_sha256.?) or
+        !std.mem.eql(u8, &outer.digest_sha256, &observed.provenance_sha256.?))
+        return error.InvalidCompletion;
+    var receipt = try native_provenance.read(allocator, root) orelse return error.ReceiptMissing;
+    errdefer receipt.deinit();
+    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, receipt.document);
+    try verifyPendingEvidence(allocator, root, receipt.document);
+    if (!locks.held(held.token)) return error.LockLost;
+    return .{ .owner = observed, .receipt = receipt, .completion = completion };
+}
+
+const VerificationLock = struct {
+    named: root_fs.OwnedRoot,
+    backend: root_operation.LockBackend,
+    token: root_operation.LockToken,
+    inode: u64,
+
+    fn acquire(root: root_fs.Root, install_root: []const u8, locks: root_operation.LockBackend) !VerificationLock {
+        if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
+        var named = try root_fs.openAbsoluteRoot(root.io, install_root);
+        errdefer named.close();
+        const held = try root.rootEntry();
+        const resolved = try named.root.rootEntry();
+        if (held.inode != resolved.inode or held.device != resolved.device)
+            return error.RootIdentityMismatch;
+        var host = try root_fs.openAbsoluteRoot(root.io, "/");
+        defer host.close();
+        const host_entry = try host.root.rootEntry();
+        if (held.inode == host_entry.inode and held.device == host_entry.device)
+            return error.HostRootNotSupported;
+        const lock_entry = (try root.entryIfExists(try root_fs.Path.init(root_operation.lock_path))) orelse
+            return error.CompletionMissing;
+        if (lock_entry.kind != .file) return error.InvalidCompletion;
+        const token = try locks.acquire(.{
+            .rank = .root_operation,
+            .root = root,
+            .identity = .{
+                .install_root_sha256 = transaction_recovery.rootIdentity(install_root),
+                .inode = held.inode,
+            },
+            .path = root_operation.lock_path,
+            .wait_ms = 0,
+            .cancellation = .never(),
+            .create_if_missing = false,
+        });
+        errdefer locks.release(token);
+        if (!locks.held(token)) return error.LockLost;
+        return .{ .named = named, .backend = locks, .token = token, .inode = held.inode };
+    }
+
+    fn deinit(self: *VerificationLock) void {
+        self.backend.release(self.token);
+        self.named.close();
+        self.* = undefined;
+    }
+};
+
+fn verifyEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    root_inode: u64,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    outer: root_operation_completion.Document,
+    proof: native_provenance.Document,
+) !void {
+    const lock_bytes = try lock.canonicalJson(allocator);
+    defer allocator.free(lock_bytes);
+    var validated_lock = try exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes);
+    defer validated_lock.deinit();
+    if (!std.mem.eql(u8, lock.target_architecture, expected_architecture))
+        return error.ArchitectureMismatch;
     if (proof.outcome != .succeeded or outer.outcome != .succeeded)
         return error.TransactionNotSuccessful;
     if (outer.backend != .native or !outer.mutation_started or
@@ -155,7 +295,7 @@ pub fn verify(
         !std.mem.eql(u8, outer.transaction_provenance.schema, native_provenance.schema_id) or
         outer.journal.status != .absent or outer.journal.document_sha256 != null or
         !std.mem.eql(u8, outer.install_root, install_root) or
-        !std.mem.eql(u8, proof.install_root, install_root) or proof.root_inode != held.inode or
+        !std.mem.eql(u8, proof.install_root, install_root) or proof.root_inode != root_inode or
         !std.mem.eql(u8, outer.target_architecture, expected_architecture) or
         !outer.operation.eql(proof.operation))
         return error.InvalidCompletion;
@@ -211,7 +351,7 @@ pub fn verify(
     try evidenceDigest(proof, .execution_request, request.documentDigest());
     const execution = request.execution();
     try native_execution_request.validateProgram(execution, program.program);
-    if (execution.root_inode != held.inode or
+    if (execution.root_inode != root_inode or
         !std.mem.eql(u8, execution.install_root, install_root) or
         !execution.caller.operation.eql(outer.operation))
         return error.InvalidCompletion;
@@ -268,21 +408,87 @@ pub fn verify(
     try equalDigest(managed.document.intent_sha256, proof.execution_intent_sha256);
     if (managed.document.transient != null) return error.InvalidManagedState;
     try native_runtime.verifyCompletedState(allocator, root, authorized, proof);
-    if (!locks.held(token)) return error.LockLost;
-    return .{
-        .target_architecture = expected_architecture,
-        .install_root = install_root,
-        .operation = outer.operation.package_transaction,
-        .request_sha256 = lock.request_sha256,
-        .solver_policy_sha256 = lock.policy_sha256,
-        .caller_request_sha256 = outer.request_sha256,
-        .caller_policy_sha256 = outer.policy_sha256,
-        .lock_sha256 = lock.digest_sha256,
-        .transaction_digest_sha256 = try parseDigest(proof.digest_sha256),
-        .completion_digest_sha256 = outer.digest_sha256,
-        .program_sha256 = try parseDigest(proof.program_sha256),
-        .package_count = lock.packages.len,
+}
+
+fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof: native_provenance.Document) !void {
+    for ([_][]const u8{
+        native_trigger.script_record_path, native_trigger.authority_path,
+        root_mutation.journal_path,        root_mutation.progress_path,
+    }) |path| {
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.UnresolvedNativeEvidence;
+    }
+    var namespace = try root.pinDirectory(try root_fs.Path.init(root_operation.namespace_path));
+    defer namespace.close();
+    var observed = try namespace.observeAlloc(allocator, native_recovery.maximum_records, 64 * 1024 * 1024);
+    defer observed.deinit();
+    for (observed.members) |member| {
+        if (std.mem.startsWith(u8, member.name, ".debz-native-"))
+            return error.UnresolvedNativeEvidence;
+        if (!std.mem.startsWith(u8, member.name, native_recovery.script_outcome_prefix)) continue;
+        var matched = false;
+        for (proof.evidence_files) |file| {
+            if (file.kind != .script_outcome) continue;
+            var path_buffer: [128]u8 = undefined;
+            const path = try activeScriptOutcomePath(file, &path_buffer);
+            if (std.mem.eql(u8, member.name, std.fs.path.basename(path))) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return error.UnresolvedNativeEvidence;
+    }
+    inline for (.{
+        .{ .authorization, root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name },
+        .{ .program, root_operation.namespace_path ++ "/" ++ native_recovery.program_name },
+        .{ .intent, native_recovery.intent_path },
+        .{ .progress, native_recovery.progress_path },
+        .{ .managed_state, native_recovery.managed_state_path },
+        .{ .trigger_events, native_recovery.trigger_events_path },
+    }) |entry| {
+        const file = try evidenceFile(proof, entry[0]);
+        try verifyRemainingFile(allocator, root, entry[1], file.sha256, file.size);
+    }
+    for (proof.evidence_files) |file| {
+        if (file.kind != .script_outcome) continue;
+        var path_buffer: [128]u8 = undefined;
+        const path = try activeScriptOutcomePath(file, &path_buffer);
+        try verifyRemainingFile(allocator, root, path, file.sha256, file.size);
+    }
+}
+
+fn activeScriptOutcomePath(file: native_provenance.EvidenceFile, buffer: *[128]u8) ![]const u8 {
+    const action = file.action orelse return error.EvidenceMissing;
+    return native_recovery.scriptOutcomePath(.{
+        .kind = action.kind,
+        .program_step = action.program_step,
+        .substep = action.substep,
+        .ordinal = action.ordinal,
+    }, buffer);
+}
+
+fn verifyRemainingFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    expected_sha256: native_provenance.Digest,
+    expected_size: u64,
+) !void {
+    // Acknowledgment can be interrupted between removals. Missing active copies
+    // are fine; retained evidence remains mandatory and every surviving copy agrees.
+    const bytes = root.readFileAlloc(
+        allocator,
+        try root_fs.Path.init(path),
+        std.math.cast(usize, expected_size) orelse return error.EvidenceTooLarge,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
     };
+    defer allocator.free(bytes);
+    if (bytes.len != expected_size) return error.EvidenceChanged;
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &sha256, .{});
+    try equalDigest(native_recovery.hexDigest(sha256), expected_sha256);
 }
 
 fn verifyLock(authorization: native_authorization.Authorization, program: native_program.Program, lock: exact_lock_v2.Lock) !void {
@@ -482,4 +688,144 @@ test "native_transaction_result.test.empty closures retain only authorized resid
     try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&.{residual}, lock.lock));
     residual.state = .triggers_pending;
     try std.testing.expectError(error.TransactionNotSuccessful, verifyFinalClosure(&.{residual}, lock.lock));
+}
+
+fn testPendingRefusal(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected: PendingRequest,
+    locks: root_operation.LockBackend,
+    expected_error: anyerror,
+) !void {
+    var result = verifyPendingSuccess(allocator, root, path, lock, "amd64", expected, locks) catch |err| {
+        if (err == expected_error) return;
+        return err;
+    };
+    defer result.deinit();
+    return error.TestExpectedError;
+}
+
+test "native_transaction_result.test.pending verification preserves exact owners and never provisions locks" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(testing.io, &path_buffer)];
+    var lock = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const Locks = struct {
+        acquisitions: usize = 0,
+        releases: usize = 0,
+        live: bool = false,
+        lost: bool = false,
+
+        fn acquire(context: *anyopaque, request: root_operation.AcquireLock) root_operation.LockError!root_operation.LockToken {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(!request.create_if_missing and request.rank == .root_operation and !self.live);
+            self.acquisitions += 1;
+            self.live = true;
+            return context;
+        }
+        fn held(context: *anyopaque, _: root_operation.LockToken) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.live and !self.lost;
+        }
+        fn release(context: *anyopaque, _: root_operation.LockToken) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.live = false;
+            self.releases += 1;
+        }
+    };
+    var observer: Locks = .{};
+    const locks: root_operation.LockBackend = .{
+        .context = &observer,
+        .acquireFn = Locks.acquire,
+        .heldFn = Locks.held,
+        .releaseFn = Locks.release,
+    };
+    const base = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(3),
+        .acknowledgment_id = @splat(4),
+        .completion_sha256 = @splat(5),
+        .provenance_sha256 = @splat(5),
+    });
+    var expected: PendingRequest = .{
+        .owner = base,
+        .operation = .install,
+        .caller_request_sha256 = @splat(6),
+        .caller_policy_sha256 = @splat(7),
+    };
+    try testing.expectError(error.HostRootNotSupported, verifyPendingSuccess(allocator, root, "/", lock.lock, "amd64", expected, locks));
+    try testPendingRefusal(allocator, root, path, lock.lock, expected, locks, error.CompletionMissing);
+    try testing.expectEqual(@as(usize, 0), observer.acquisitions);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.namespace_path)) == null);
+    const store = root_operation.Store.init(root);
+    try store.ensureNamespace();
+    try root.publishFile(try root_fs.Path.init(root_operation.lock_path), "", .{});
+    try testing.expectError(error.PendingOwnerRequired, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try store.publishDeferredAcknowledgment(allocator, base);
+    try testing.checkAllAllocationFailures(
+        allocator,
+        testPendingRefusal,
+        .{ root, path, lock.lock, expected, locks, error.CompletionMissing },
+    );
+    var claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = base.acknowledgment_id,
+        .outer_generation = 1,
+        .outer_state_sha256 = @splat(8),
+        .profile_sha256 = @splat(9),
+        .profile_reference_sha256 = @splat(10),
+        .exact_lock_sha256 = lock.lock.digest_sha256,
+        .semantic_request_sha256 = lock.lock.request_sha256,
+        .mutation_status = .changed,
+        .outer_transaction_sha256 = @splat(11),
+        .nonce = @splat(12),
+    });
+    const reviewed = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, claim);
+    const reviewed_bytes = try reviewed.canonicalJson(allocator);
+    defer allocator.free(reviewed_bytes);
+    try root.publishFile(try root_fs.Path.init(root_operation.deferred_ack_path), reviewed_bytes, .{ .overwrite = .replace });
+    try testing.expectError(error.OwnershipMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    expected.owner = reviewed;
+    try testing.checkAllAllocationFailures(
+        allocator,
+        testPendingRefusal,
+        .{ root, path, lock.lock, expected, locks, error.CompletionMissing },
+    );
+    claim.nonce = @splat(13);
+    claim = try root_operation.createRecoveryReviewClaim(claim);
+    expected.owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, claim);
+    try testing.expectEqualSlices(u8, &reviewed.digest_sha256, &expected.owner.digest_sha256);
+    try testing.expectError(error.OwnershipMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    expected.owner = reviewed;
+    expected.owner.exact_identity_sha256 = @splat(14);
+    try testing.expectError(error.ExactIdentityMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    expected.owner = reviewed;
+    observer.lost = true;
+    try testing.expectError(error.LockLost, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    observer.lost = false;
+    const claim_bytes = try claim.canonicalJson(allocator);
+    defer allocator.free(claim_bytes);
+    try root.publishFile(try root_fs.Path.init(root_operation.deferred_ack_path), claim_bytes, .{ .overwrite = .replace });
+    try testing.checkAllAllocationFailures(
+        allocator,
+        testPendingRefusal,
+        .{ root, path, lock.lock, expected, locks, error.RecoveryReviewClaimPresent },
+    );
+    try testing.expectEqual(observer.acquisitions, observer.releases);
+    try testing.expect(!observer.live);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
 }

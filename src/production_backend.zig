@@ -5347,6 +5347,10 @@ test "production workflow external native fixture" {
         owner_evidence: ?[]const u8 = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
+        pending_verification: ?struct {
+            lock_path: []const u8,
+            expected_error: ?[]const u8 = null,
+        } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
@@ -5434,8 +5438,61 @@ test "production workflow external native fixture" {
             },
         };
     } else if (external.acknowledgment != null) return error.InvalidExternalWorkflowRequest;
-    const result = try backend.executeWorkflow(allocator, requested);
-    const output = try result.canonicalJson(allocator);
+    const output = if (external.pending_verification) |check| verified: {
+        if (external.acknowledgment != null or external.completion_crash != null or
+            external.reconciliation_owner_output != null)
+            return error.InvalidExternalWorkflowRequest;
+        const verifier = @import("native_transaction_result.zig");
+        var lock = try exact_lock_v2.decode(
+            allocator,
+            try readFile(allocator, std.testing.io, check.lock_path, exact_lock_v2.maximum_document_bytes),
+            exact_lock_v2.maximum_document_bytes,
+        );
+        defer lock.deinit();
+        var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+        var result = verifier.verifyPendingSuccess(
+            std.testing.allocator,
+            root.root,
+            requested.options.install_root,
+            lock.lock,
+            requested.options.architecture,
+            .{
+                .owner = requested.expected_ownership_marker orelse return error.InvalidExternalWorkflowRequest,
+                .operation = workflowSemanticSurface(requested.operation),
+                .caller_request_sha256 = try workflowProductRequestDigest(
+                    allocator,
+                    requested.operation,
+                    .execute,
+                    requested.selectors,
+                    requested.options,
+                ),
+                .caller_policy_sha256 = planningPolicyDigest(.native, requested.options),
+            },
+            locks.interface(),
+        ) catch |err| {
+            try std.testing.expectEqualStrings(check.expected_error orelse return err, @errorName(err));
+            break :verified "{\"verified\":false}\n";
+        };
+        defer result.deinit();
+        try std.testing.expect(check.expected_error == null);
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+            requested.expected_ownership_marker.?,
+            result.owner,
+        ));
+        try std.testing.expectEqualSlices(
+            u8,
+            &result.owner.completion_sha256.?,
+            &result.completion.document.digest_sha256,
+        );
+        try std.testing.expectEqualStrings(
+            &native_recovery.hexDigest(result.completion.document.transaction_provenance.document_sha256.?),
+            &result.receipt.document.digest_sha256,
+        );
+        break :verified "{\"verified\":true}\n";
+    } else result: {
+        const outcome = try backend.executeWorkflow(allocator, requested);
+        break :result try outcome.canonicalJson(allocator);
+    };
     var report_dir = try openAbsoluteDirectory(std.testing.io, std.fs.path.dirname(external.report).?);
     defer report_dir.close(std.testing.io);
     try report_dir.writeFile(std.testing.io, .{
