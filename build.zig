@@ -661,7 +661,7 @@ pub fn build(b: *std.Build) void {
         .root_module = debz,
         .filters = &.{
             "native_recovery.test.", "native_provenance.test.",         "native_execution_request.test.",
-            "native_helper.test.",   "native_transaction_result.test.",
+            "native_helper.test.",   "native_transaction_result.test.", "native_install_result.test.",
         },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
@@ -962,6 +962,8 @@ fn installReleaseFiles(
         "transaction-result-summary-v1.json",
         "transaction-result-summary-v2.json",
         "transaction-result-capability-v1.json",
+        "native-install-capability-v1.json",
+        "native-install-result-v1.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },

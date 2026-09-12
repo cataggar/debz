@@ -10,9 +10,10 @@ export const testRoot = path.resolve(
 
 export async function createInputEnvironment(
   name: string,
+  root = testRoot,
 ): Promise<{ environment: RuntimeEnvironment; workspace: string; runner: string }> {
-  const workspace = path.join(testRoot, name, 'workspace');
-  const runner = path.join(testRoot, name, 'runner');
+  const workspace = path.join(root, name, 'workspace');
+  const runner = path.join(root, name, 'runner');
   await mkdir(workspace, { recursive: true });
   await mkdir(runner, { recursive: true });
   await writeFile(path.join(workspace, 'lock.json'), '{}');
@@ -76,6 +77,7 @@ export function fixtureInputs(root: string): Inputs {
     workspace: path.join(root, 'workspace'),
     runnerTemp: path.join(root, 'runner'),
     actionPath: path.join(root, 'actions', 'install'),
+    transactionBackend: 'legacy_dpkg',
     package: 'scenario-main',
     lockInput: path.join(root, 'workspace', 'lock.json'),
     architecture: 'amd64',
@@ -145,5 +147,71 @@ export function transactionSummary(lockDigest = 'a'.repeat(64)): string {
     outcome: 'succeeded',
     final_verification_status: 'exact_match',
     lock_evidence: 'exact_match',
+  })}\n`;
+}
+
+export function nativeCapability(): string {
+  return `${JSON.stringify({
+    schema: 'io.github.cataggar.debz.native-install-capability.v1',
+    api_version: 1,
+    backend: 'native',
+    capability: 'native-install-v1',
+    result_schema: 'io.github.cataggar.debz.native-install-result.v1',
+    result_api_version: 1,
+    summary_schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
+    summary_api_version: 2,
+    receipt_binding: true,
+    unchanged_without_receipt: true,
+  })}\n`;
+}
+
+export function nativeInstallResult(inputs: Inputs, changed = true, count = 4): string {
+  return `${JSON.stringify({
+    schema: 'io.github.cataggar.debz.native-install-result.v1',
+    api_version: 1,
+    backend: 'native',
+    command: { ...JSON.parse(commandResult()), changed },
+    evidence: {
+      install_root: inputs.installRoot,
+      target_architecture: inputs.architecture,
+      lock_sha256: 'a'.repeat(64),
+      caller_request_sha256: 'e'.repeat(64),
+      caller_policy_sha256: 'f'.repeat(64),
+      package_count: count,
+      receipt: changed ? {
+        transaction_digest_sha256: 'd'.repeat(64),
+        completion_digest_sha256: '1'.repeat(64),
+        program_sha256: '2'.repeat(64),
+      } : null,
+    },
+  })}\n`;
+}
+
+export function nativeTransactionSummary(inputs: Inputs, count = 4): string {
+  return `${JSON.stringify({
+    schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
+    api_version: 2,
+    backend: 'native',
+    transaction_schema: 'https://debz.dev/schema/native-transaction-provenance-v1',
+    transaction_schema_version: 1,
+    completion_schema: 'https://debz.dev/schema/root-operation-completion-v1',
+    completion_schema_version: 1,
+    target_architecture: inputs.architecture,
+    install_root: inputs.installRoot,
+    operation: 'install',
+    request_sha256: 'b'.repeat(64),
+    solver_policy_sha256: 'c'.repeat(64),
+    caller_request_sha256: 'e'.repeat(64),
+    caller_policy_sha256: 'f'.repeat(64),
+    lock_sha256: 'a'.repeat(64),
+    transaction_digest_sha256: 'd'.repeat(64),
+    completion_digest_sha256: '1'.repeat(64),
+    program_sha256: '2'.repeat(64),
+    package_count: count,
+    outcome: 'succeeded',
+    final_verification_status: 'exact_match',
+    lock_evidence: 'exact_match',
+    receipt_evidence: 'exact_match',
+    root_operation_status: 'cleared',
   })}\n`;
 }

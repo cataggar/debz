@@ -19,6 +19,9 @@ import {
   commandResult,
   fixtureInputs,
   transactionSummary,
+  nativeCapability,
+  nativeInstallResult,
+  nativeTransactionSummary,
 } from './helpers.js';
 
 interface Harness {
@@ -27,15 +30,22 @@ interface Harness {
   calls: { arguments: string[]; sudo?: string }[];
   cleanup: boolean;
   saved: boolean;
+  downloaded: boolean;
   services: Services;
 }
 
-function harness(cacheHit = true): Harness {
+function harness(
+  cacheHit = true,
+  backend: Inputs['transactionBackend'] = 'legacy_dpkg',
+  changed = true,
+): Harness {
   const inputs = fixtureInputs('/work');
+  inputs.transactionBackend = backend;
   const outputs = new Map<string, string>();
   const calls: { arguments: string[]; sudo?: string }[] = [];
   let cleanup = false;
   let saved = false;
+  let downloaded = false;
   const fileIdentity: FileIdentity = {
     path: '/work/runner/debz-tools/0.3.0/bin/debz',
     device: 1n,
@@ -63,6 +73,7 @@ function harness(cacheHit = true): Harness {
       };
     },
     async download() {
+      downloaded = true;
       return {
         cacheHit,
         matchedKey: cacheHit ? `debz-${'a'.repeat(64)}` : '',
@@ -82,8 +93,16 @@ function harness(cacheHit = true): Harness {
   };
   const executions: CommandExecution[] = [
     { code: 0, stdout: '0.3.0\n', stderr: '' },
-    { code: 0, stdout: commandResult(), stderr: '' },
-    { code: 0, stdout: transactionSummary(), stderr: '' },
+    ...(backend === 'native'
+      ? [
+          { code: 0, stdout: nativeCapability(), stderr: '' },
+          { code: 0, stdout: nativeInstallResult(inputs, changed), stderr: '' },
+          ...(changed ? [{ code: 0, stdout: nativeTransactionSummary(inputs), stderr: '' }] : []),
+        ]
+      : [
+          { code: 0, stdout: commandResult(), stderr: '' },
+          { code: 0, stdout: transactionSummary(), stderr: '' },
+        ]),
   ];
   const services: Services = {
     async prepareDirectories() {},
@@ -96,6 +115,7 @@ function harness(cacheHit = true): Harness {
     },
     async verifyDirectory() {},
     async captureOptionalFile() {
+      assert.equal(backend, 'legacy_dpkg', 'private native receipts are read only by the verified CLI');
       return prior;
     },
     async requireFreshResult() {
@@ -137,6 +157,9 @@ function harness(cacheHit = true): Harness {
     },
     get saved() {
       return saved;
+    },
+    get downloaded() {
+      return downloaded;
     },
     services,
   };
@@ -198,4 +221,86 @@ test('uses explicit sudo for version, install, and result verification only', as
   await runAction(value.inputs, ioFor(value), value.services);
   assert.equal(value.calls[0].sudo, undefined);
   assert.equal(value.calls.slice(1).every((call) => call.sudo === '/usr/bin/sudo'), true);
+});
+
+test('native installs probe before preparation and bind the actual receipt under sudo', async () => {
+  const value = harness(true, 'native');
+  value.inputs.useSudo = true;
+  const original = value.services.runDebz;
+  let first = true;
+  value.services.runDebz = async (executable, args, sudo, maximum) => {
+    if (first) {
+      first = false;
+      value.calls.push({ arguments: args, sudo });
+      return { code: 0, stdout: '0.3.0\n', stderr: '' };
+    }
+    if (args[1] === 'capabilities') assert.equal(value.downloaded, false);
+    return await original(executable, args, sudo, maximum);
+  };
+  await runAction(value.inputs, ioFor(value), value.services);
+  assert.equal(value.calls.slice(1).every((call) => call.sudo === '/usr/bin/sudo'), true);
+  const install = value.calls.find((call) => call.arguments[0] === 'install');
+  assert.ok(install?.arguments.includes('--native-result'));
+  assert.ok(install?.arguments.includes('--transaction-backend'));
+  const verify = value.calls.at(-1)?.arguments;
+  assert.ok(verify?.includes('--install-root'));
+  assert.equal(verify?.includes('--state-path'), false);
+  assert.equal(value.outputs.get('changed'), 'true');
+  assert.match(value.outputs.get('transaction-result') ?? '', /root\/var\/lib\/debz\/native-transaction-provenance-v1.json$/u);
+  assert.equal(value.outputs.get('installed-count'), '4');
+});
+
+test('unchanged native installs publish no historical or fabricated receipt', async () => {
+  const value = harness(true, 'native', false);
+  await runAction(value.inputs, ioFor(value), value.services);
+  assert.equal(value.calls.some((call) => call.arguments[1] === 'verify'), false);
+  assert.equal(value.outputs.get('changed'), 'false');
+  assert.equal(value.outputs.get('transaction-result'), '');
+  assert.equal(value.outputs.get('provenance'), '');
+  assert.equal(value.outputs.get('installed-count'), '4');
+});
+
+test('unsupported native capability refuses before package preparation or installation', async () => {
+  for (const capability of [
+    { code: 0, stdout: '{}\n', stderr: '' },
+    { code: 0, stdout: nativeCapability().replace('"receipt_binding":true', '"receipt_binding":false'), stderr: '' },
+    { code: 2, stdout: '', stderr: 'unsupported option\n' },
+    { code: 0, stdout: nativeCapability(), stderr: 'unexpected diagnostic\n' },
+  ]) {
+    const value = harness(true, 'native');
+    const original = value.services.runDebz;
+    value.services.runDebz = async (executable, args, sudo, maximum) => {
+      if (args[1] === 'capabilities') return capability;
+      return await original(executable, args, sudo, maximum);
+    };
+    await assert.rejects(runAction(value.inputs, ioFor(value), value.services));
+    assert.equal(value.downloaded, false);
+    assert.equal(value.calls.some((call) => call.arguments[0] === 'install'), false);
+    assert.equal(value.outputs.size, 0);
+    assert.equal(value.cleanup, true);
+  }
+});
+
+test('native receipt, completion, caller, program, root, and closure mismatches publish no outputs', async () => {
+  for (const field of [
+    'transaction_digest_sha256', 'completion_digest_sha256', 'program_sha256',
+    'caller_request_sha256', 'caller_policy_sha256', 'lock_sha256',
+    'install_root', 'target_architecture', 'package_count',
+  ]) {
+    const value = harness(true, 'native');
+    const original = value.services.runDebz;
+    value.services.runDebz = async (executable, args, sudo, maximum) => {
+      const result = await original(executable, args, sudo, maximum);
+      if (args[1] === 'verify') {
+        const document = JSON.parse(result.stdout);
+        document[field] = field === 'package_count' ? 3 : '9'.repeat(64);
+        return { ...result, stdout: `${JSON.stringify(document)}\n` };
+      }
+      return result;
+    };
+    await assert.rejects(runAction(value.inputs, ioFor(value), value.services), new RegExp(field, 'u'));
+    assert.equal(value.outputs.size, 0);
+    assert.equal(value.saved, false);
+    assert.equal(value.cleanup, true);
+  }
 });

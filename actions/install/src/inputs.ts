@@ -43,6 +43,7 @@ export interface Inputs {
   workspace: string;
   runnerTemp: string;
   actionPath: string;
+  transactionBackend: 'legacy_dpkg' | 'native';
   package: string;
   lockInput: string;
   architecture: 'amd64' | 'arm64';
@@ -100,6 +101,10 @@ export async function readInputs(
     'GITHUB_ACTION_PATH',
   );
   const { architecture, target } = validateRunner(environment, runtime);
+  const transactionBackend = exactScalar(environment, 'TRANSACTION_BACKEND') || 'legacy_dpkg';
+  if (transactionBackend !== 'legacy_dpkg' && transactionBackend !== 'native') {
+    throw new InstallActionError("transaction-backend must be 'legacy_dpkg' or 'native'");
+  }
 
   const packageSelector = exactScalar(environment, 'PACKAGE', true);
   if (
@@ -377,6 +382,7 @@ export async function readInputs(
     workspace,
     runnerTemp,
     actionPath,
+    transactionBackend,
     package: packageSelector,
     lockInput,
     architecture,

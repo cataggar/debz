@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-install-result-v1",
+  "title": "Successful native install command and evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "api_version", "backend", "command", "evidence"],
+  "properties": {
+    "schema": { "const": "io.github.cataggar.debz.native-install-result.v1" },
+    "api_version": { "const": 1 },
+    "backend": { "const": "native" },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "api_version", "operation", "exit_status", "changed", "summary", "items", "diagnostics"],
+      "properties": {
+        "schema": { "const": "io.github.cataggar.debz.command.v1" },
+        "api_version": { "const": 1 },
+        "operation": { "const": "install" },
+        "exit_status": { "const": 0 },
+        "changed": { "type": "boolean" },
+        "summary": { "type": "string", "maxLength": 4096 },
+        "items": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["package", "version", "architecture", "detail"],
+            "properties": {
+              "package": { "type": "string", "maxLength": 255 },
+              "version": { "type": ["string", "null"], "maxLength": 4096 },
+              "architecture": { "type": ["string", "null"], "maxLength": 64 },
+              "detail": { "type": ["string", "null"], "maxLength": 4096 }
+            }
+          }
+        },
+        "diagnostics": { "type": "array", "maxItems": 0 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["install_root", "target_architecture", "lock_sha256", "caller_request_sha256", "caller_policy_sha256", "package_count", "receipt"],
+      "properties": {
+        "install_root": { "type": "string", "pattern": "^/[^\\u0000\\r\\n]+$", "maxLength": 4096 },
+        "target_architecture": { "enum": ["amd64", "arm64"] },
+        "lock_sha256": { "$ref": "#/$defs/sha256" },
+        "caller_request_sha256": { "$ref": "#/$defs/sha256" },
+        "caller_policy_sha256": { "$ref": "#/$defs/sha256" },
+        "package_count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "receipt": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["transaction_digest_sha256", "completion_digest_sha256", "program_sha256"],
+              "properties": {
+                "transaction_digest_sha256": { "$ref": "#/$defs/sha256" },
+                "completion_digest_sha256": { "$ref": "#/$defs/sha256" },
+                "program_sha256": { "$ref": "#/$defs/sha256" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "command": { "properties": { "changed": { "const": true } } } } },
+      "then": { "properties": { "evidence": { "properties": { "receipt": { "type": "object" } } } } },
+      "else": { "properties": { "evidence": { "properties": { "receipt": { "type": "null" } } } } }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

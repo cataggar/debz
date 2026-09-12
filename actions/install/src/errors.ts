@@ -10,6 +10,7 @@ export class DebzInstallExitError extends InstallActionError {
     readonly exitCode: number,
     readonly statePath: string,
     readonly diagnostic?: string,
+    readonly transactionBackend: 'legacy_dpkg' | 'native' = 'legacy_dpkg',
   ) {
     super(`debz install failed with exit code ${exitCode}`);
     this.name = 'DebzInstallExitError';

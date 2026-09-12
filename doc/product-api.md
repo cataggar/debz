@@ -80,8 +80,8 @@ until their own native integration.
 
 Native keys use a separate `debz-package-cas-v2-` prefix and fingerprint
 domain while retaining the shared `packages-v1/objects` layout. The download
-action supports matching explicit native selection; the install action and
-other native consumer integrations remain separately gated.
+and install actions support matching explicit native selection. Other native
+consumer integrations remain separately gated.
 
 `--restored-cache none|partial|exact` is a typed orchestration hint. The
 first-party action computes it from the cache service response; it is not
@@ -282,8 +282,34 @@ Missing, stale, incomplete, failed, or mismatched evidence refuses with exit 7
 and no success summary. Verification never repairs, acknowledges, clears, or
 replays anything and does not invoke a helper or maintainer script. A
 receiptless unchanged closure is not proof that a native transaction occurred.
-This verifier is a prerequisite for native install-action integration; that
-action remains explicitly legacy until its separate handoff is complete.
+
+### Receipt-bound native install handoff
+
+`debz transaction-result capabilities --transaction-backend native --for-install
+--json` advertises `native-install-v1` without root access or mutation, separately
+from the read-only verification capability above.
+
+An explicitly locked `debz install --transaction-backend native --native-result
+--json ...` returns `io.github.cataggar.debz.native-install-result.v1` on success.
+This envelope contains the unchanged command.v1 result and typed native evidence:
+root, architecture, lock digest, original caller request/policy digests, exact
+closure count, and a nullable receipt binding. Changed installs bind the actual
+receipt, root completion, and program digests captured by the completing native
+caller. Consumers compare them to the read-only verifier's v2 summary; human
+summary strings are not a machine interface.
+
+An unchanged result carries no receipt. Native preparation has verified the
+unchanged database closure under the root lock, but no native execution is
+claimed. The install action reports `changed: false` and empty receipt/provenance
+paths rather than relabeling an older receipt or requiring one for an unchanged
+result. This does not change solver behavior: an explicit install selector can
+still select a reinstall on an already-installed root.
+
+The opt-in result mode is rejected for legacy, unlocked, non-install, or non-JSON
+requests before backend execution. Ordinary command.v1 output and structured
+failure output are unchanged. Schemas:
+[`native-install-result-v1.json`](../schema/native-install-result-v1.json) and
+[`native-install-capability-v1.json`](../schema/native-install-capability-v1.json).
 
 ## JSON and compatibility
 

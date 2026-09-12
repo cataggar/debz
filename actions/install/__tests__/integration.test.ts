@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdir, readdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   defaultServices,
@@ -12,7 +14,9 @@ import {
 } from '../src/action.js';
 import { DebzInstallExitError } from '../src/errors.js';
 import { readInputs, type Inputs, type RuntimeEnvironment } from '../src/inputs.js';
-import { BundledActionRunner } from '../src/subprocess.js';
+import { BundledActionRunner, type CommandExecution } from '../src/subprocess.js';
+import { createInputEnvironment } from './helpers.js';
+import { buildTransactionResultArguments } from '../src/runner.js';
 
 const enabled = process.env.DEBZ_INSTALL_INTEGRATION === '1';
 const actionPath = path.resolve(
@@ -155,6 +159,165 @@ test(
   },
 );
 
+test('native installs bind real receipts across cold, warm, offline, same-root, and failed transactions', {
+  skip: !enabled, timeout: 240_000,
+}, async () => {
+  const base = await mkdtemp(path.join(requiredPath('DEBZ_INSTALL_FIXTURE_ROOT'), 'native-action-'));
+  const { environment, workspace, runner } = await createInputEnvironment('fixture', base);
+  const architecture = requiredValue('DEBZ_INSTALL_ARCHITECTURE');
+  const runnerArchitecture = architecture === 'amd64' ? 'X64' : 'ARM64';
+  const sourceCli = requiredPath('DEBZ_INSTALL_CLI');
+  environment.GITHUB_ACTION_PATH = actionPath;
+  environment.RUNNER_ARCH = runnerArchitecture;
+  environment.DEBZ_INSTALL_ARCHITECTURE = architecture;
+  environment.DEBZ_INSTALL_TRANSACTION_BACKEND = 'native';
+  environment.DEBZ_INSTALL_USE_SUDO = process.env.DEBZ_INSTALL_INTEGRATION_SUDO === '1' ? 'true' : 'false';
+  environment.DEBZ_INSTALL_CACHE = 'false';
+  environment.DEBZ_INSTALL_CLI_CACHE = 'false';
+  const temporary = path.resolve(actionPath, '../../.tmp');
+  await mkdir(temporary, { recursive: true });
+  const bootstrap = `
+import importlib.util, os, shutil, subprocess, sys
+from pathlib import Path
+repo, workspace, runner = map(Path, sys.argv[1:4])
+cli, arch, uid, gid = sys.argv[4:]
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, repo / "tools" / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+generator = load("install_repository", "generate-integration-repository.py")
+lifecycle = load("install_lifecycle", "test-native-lifecycle.py")
+repository = workspace / "repository"
+generator.write_repository(repository, "debian-stable", arch)
+keyring = workspace / "keyring.gpg"
+shutil.copyfile(repository / "fixture-keyring.gpg", keyring)
+source = workspace / "repo.sources"
+source.write_text(f"Types: deb\\nURIs: file://{repository}\\nSuites: debian-stable\\nComponents: main\\nArchitectures: {arch}\\nSigned-By: {keyring}\\n")
+for name in ("plan", "cold", "warm-fresh", "offline", "failure", "receiptless", "cross-backend"):
+    root = runner / f"root-{name}"
+    root.mkdir()
+    lifecycle.m.make_root(root, arch)
+    lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+    seeds = ["native-helper-target", "essential-core"]
+    if name == "receiptless":
+        seeds += ["base-dep", "scenario-main"]
+    archives = [repository / f"pool/main/{package}_1.0-1_{arch}.deb" for package in seeds]
+    assert lifecycle.reference_phase(root, archives, "install", dict(os.environ), root, packages=[]) == 0
+for selector, filename, backend in (
+    ("scenario-main", "lock.json", "native"), ("fail-script", "fail.lock.json", "native"),
+    ("scenario-main", "legacy.lock.json", "legacy_dpkg"),
+):
+    result = subprocess.run([cli, "plan", "--transaction-backend", backend,
+        "--install-root", str(runner / "root-plan"), "--cache-path", str(workspace / "plan-cache"),
+        "--state-path", str(workspace / "plan-state"), "--architecture", arch,
+        "--source", str(source), "--keyring", str(keyring),
+        "--lock-output", str(workspace / filename), "--json", selector],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert result.returncode == 0, (result.stdout[-8192:], result.stderr[-8192:])
+    os.chown(workspace / filename, int(uid), int(gid))
+`;
+  const bootstrapArgs = [
+    '/usr/bin/env', 'PYTHONDONTWRITEBYTECODE=1', `TMPDIR=${temporary}`,
+    `XDG_CACHE_HOME=${path.resolve(actionPath, '../../.cache')}`,
+    '/usr/bin/python3', '-c', bootstrap, path.resolve(actionPath, '../..'),
+    workspace, runner, sourceCli, architecture,
+    String(process.getuid?.() ?? 0), String(process.getgid?.() ?? 0),
+  ];
+  const elevated = environment.DEBZ_INSTALL_USE_SUDO === 'true';
+  await promisify(execFile)(
+    elevated ? '/usr/bin/sudo' : bootstrapArgs[0],
+    elevated ? ['-n', '--', ...bootstrapArgs] : bootstrapArgs.slice(1),
+    {
+      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', TMPDIR: temporary },
+      timeout: 180_000, maxBuffer: 1024 * 1024,
+    },
+  );
+  const localCli = path.join(runner, 'debz-tools', '0.3.0', 'bin', 'debz');
+  await mkdir(path.dirname(localCli), { recursive: true });
+  await copyFile(sourceCli, localCli);
+  await chmod(localCli, 0o755);
+  const observed: string[] = [];
+  const runNative = async (inputs: Inputs, outputs = new Map<string, string>()) =>
+    await execute(inputs, localCli, outputs, (args, result) => {
+      if (result.code === 0 && (args[0] === 'install' || args[1] === 'capabilities')) {
+        observed.push(result.stdout);
+      }
+    });
+  const coldInputs = await inputsFor(environment, runnerArchitecture, 'cold', 'keep-existing');
+  const cold = await runNative(coldInputs);
+  assert.equal(cold.get('changed'), 'true');
+  assert.equal(cold.get('installed-count'), '4');
+  assert.ok(Number(cold.get('downloaded-count')) > 0);
+  assert.equal(cold.get('transaction-result'), path.join(coldInputs.installRoot, 'var/lib/debz/native-transaction-provenance-v1.json'));
+  if (process.getuid?.() !== 0) {
+    await assert.rejects(readFile(cold.get('transaction-result')!), /EACCES/u);
+  }
+  const warm = await runNative(await inputsFor(environment, runnerArchitecture, 'warm-fresh', 'use-package-version'));
+  assert.equal(warm.get('downloaded-count'), '0');
+  assert.equal(warm.get('reused-count'), '4');
+  assert.equal(warm.get('changed'), 'true');
+  const offlineEnvironment = { ...environment, DEBZ_INSTALL_OFFLINE: 'true' };
+  const offlineInputs = await inputsFor(offlineEnvironment, runnerArchitecture, 'offline', 'keep-existing');
+  const offline = await runNative(offlineInputs);
+  assert.equal(offline.get('downloaded-count'), '0');
+  assert.equal(offline.get('changed'), 'true');
+  for (const inputs of [
+    offlineInputs,
+    await inputsFor(offlineEnvironment, runnerArchitecture, 'receiptless', 'keep-existing'),
+  ]) {
+    // The current install selector deliberately selects the available candidate
+    // again. Preserve that reinstall rather than imposing no-op semantics here.
+    const repeated = await runNative(inputs);
+    assert.equal(repeated.get('changed'), 'true');
+    assert.ok(repeated.get('transaction-result'));
+    assert.equal(repeated.get('installed-count'), '4');
+  }
+  const failureInputs = await inputsFor({
+    ...environment, DEBZ_INSTALL_PACKAGE: 'fail-script',
+    DEBZ_INSTALL_LOCK_INPUT: path.join(workspace, 'fail.lock.json'),
+  }, runnerArchitecture, 'failure', 'keep-existing');
+  const failureOutputs = new Map<string, string>();
+  await assert.rejects(runNative(failureInputs, failureOutputs), (error: unknown) =>
+    error instanceof DebzInstallExitError && error.exitCode === 7 &&
+    error.statePath === path.join(failureInputs.installRoot, 'var/lib/debz'));
+  assert.equal(failureOutputs.size, 0);
+  const failedVerification = await defaultServices.runDebz(
+    localCli, buildTransactionResultArguments(failureInputs),
+    elevated ? '/usr/bin/sudo' : undefined,
+  );
+  assert.equal(failedVerification.code, 7);
+  assert.equal(failedVerification.stdout, '');
+  assert.match(failedVerification.stderr, /TransactionNotSuccessful/u);
+  const wrongBackend = await inputsFor({
+    ...environment, DEBZ_INSTALL_LOCK_INPUT: path.join(workspace, 'legacy.lock.json'),
+  }, runnerArchitecture, 'cross-backend', 'keep-existing');
+  const statusPath = path.join(wrongBackend.installRoot, 'var/lib/dpkg/status');
+  const before = await readFile(statusPath);
+  const refusedOutputs = new Map<string, string>();
+  await assert.rejects(runNative(wrongBackend, refusedOutputs));
+  assert.equal(refusedOutputs.size, 0);
+  assert.deepEqual(await readFile(statusPath), before);
+  const documents = observed.map((source) => JSON.parse(source));
+  const receipts = documents.filter((document) => document.evidence)
+    .map((document) => document.evidence.receipt.transaction_digest_sha256);
+  assert.equal(receipts.length, 5);
+  assert.equal(new Set(receipts).size, receipts.length);
+  const observations = path.join(workspace, 'observed-native-results.json');
+  await writeFile(observations, JSON.stringify(documents));
+  await promisify(execFile)('/usr/bin/python3', ['-c', `
+import json, pathlib, sys
+import jsonschema
+schemas = pathlib.Path(sys.argv[1]) / "schema"
+for document in json.loads(pathlib.Path(sys.argv[2]).read_text()):
+    name = "native-install-result-v1.json" if "evidence" in document else "native-install-capability-v1.json"
+    jsonschema.Draft202012Validator(json.loads((schemas / name).read_text())).validate(document)
+`, path.resolve(actionPath, '../..'), observations], {
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', TMPDIR: temporary },
+    timeout: 30_000, maxBuffer: 1024 * 1024,
+  });
+});
+
 async function inputsFor(
   common: RuntimeEnvironment,
   runnerArchitecture: string,
@@ -185,6 +348,7 @@ async function execute(
   inputs: Inputs,
   localCli: string,
   outputs = new Map<string, string>(),
+  observe?: (args: string[], result: CommandExecution) => void,
 ): Promise<Map<string, string>> {
   const bundled = new BundledActionRunner(inputs);
   const composition: CompositionRunner = {
@@ -214,6 +378,11 @@ async function execute(
   await runAction(inputs, io, {
     ...defaultServices,
     createComposition: () => composition,
+    async runDebz(executable, args, sudo, maximum) {
+      const result = await defaultServices.runDebz(executable, args, sudo, maximum);
+      observe?.(args, result);
+      return result;
+    },
   });
   return outputs;
 }

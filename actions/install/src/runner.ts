@@ -30,6 +30,27 @@ const summaryKeys = [
 ];
 const itemKeys = ['package', 'version', 'architecture', 'detail'];
 const hex64 = /^[0-9a-f]{64}$/u;
+const nativeSummaryKeys = [
+  'schema', 'api_version', 'backend', 'transaction_schema',
+  'transaction_schema_version', 'completion_schema', 'completion_schema_version',
+  'target_architecture', 'install_root', 'operation', 'request_sha256',
+  'solver_policy_sha256', 'caller_request_sha256', 'caller_policy_sha256',
+  'lock_sha256', 'transaction_digest_sha256', 'completion_digest_sha256',
+  'program_sha256', 'package_count', 'outcome', 'final_verification_status',
+  'lock_evidence', 'receipt_evidence', 'root_operation_status',
+];
+
+export interface NativeInstallResult {
+  changed: boolean;
+  installedCount: number;
+  callerRequestDigest: string;
+  callerPolicyDigest: string;
+  receipt: {
+    transactionDigest: string;
+    completionDigest: string;
+    programDigest: string;
+  } | null;
+}
 
 export interface TransactionSummary {
   lockDigest: string;
@@ -79,6 +100,9 @@ export function buildInstallArguments(inputs: Inputs): string[] {
     arguments_.push('--deadline-ms', String(inputs.deadlineMs));
   }
   for (const force of inputs.forces) arguments_.push('--force', force);
+  if (inputs.transactionBackend === 'native') {
+    arguments_.push('--transaction-backend', 'native', '--native-result');
+  }
   arguments_.push('--json', inputs.package);
   return arguments_;
 }
@@ -87,14 +111,39 @@ export function buildTransactionResultArguments(inputs: Inputs): string[] {
   return [
     'transaction-result',
     'verify',
-    '--state-path',
-    inputs.statePath,
+    ...(inputs.transactionBackend === 'native'
+      ? ['--transaction-backend', 'native', '--install-root', inputs.installRoot]
+      : ['--state-path', inputs.statePath]),
     '--lock-input',
     inputs.lockInput,
     '--architecture',
     inputs.architecture,
     '--json',
   ];
+}
+
+export function buildNativeCapabilityArguments(): string[] {
+  return ['transaction-result', 'capabilities', '--transaction-backend', 'native', '--for-install', '--json'];
+}
+
+export function validateNativeCapability(output: string): void {
+  const document = parseCanonicalLine(output, 64 * 1024, 'native install capability');
+  const expected = {
+    schema: 'io.github.cataggar.debz.native-install-capability.v1',
+    api_version: 1,
+    backend: 'native',
+    capability: 'native-install-v1',
+    result_schema: 'io.github.cataggar.debz.native-install-result.v1',
+    result_api_version: 1,
+    summary_schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
+    summary_api_version: 2,
+    receipt_binding: true,
+    unchanged_without_receipt: true,
+  };
+  exactKeys(document, Object.keys(expected), 'native install capability');
+  for (const [name, value] of Object.entries(expected)) {
+    literal(document[name], value, name);
+  }
 }
 
 export function validateVersionOutput(
@@ -109,12 +158,16 @@ export function validateVersionOutput(
   }
 }
 
-export function validateInstallCommandResult(output: string): void {
+export function validateInstallCommandResult(output: string): boolean {
   const document = parseCanonicalLine(
     output,
     32 * 1024 * 1024,
     'install command result',
   );
+  return validateCommandDocument(document);
+}
+
+function validateCommandDocument(document: Record<string, unknown>): boolean {
   exactKeys(document, commandKeys, 'install command result');
   literal(document.schema, 'io.github.cataggar.debz.command.v1', 'schema');
   literal(document.api_version, 1, 'api_version');
@@ -140,6 +193,47 @@ export function validateInstallCommandResult(output: string): void {
       'successful debz install result contains diagnostics',
     );
   }
+  return document.changed;
+}
+
+export function validateNativeInstallResult(
+  output: string,
+  inputs: Inputs,
+  expectedLockDigest: string,
+): NativeInstallResult {
+  const document = parseCanonicalLine(output, 32 * 1024 * 1024, 'native install result');
+  exactKeys(document, ['schema', 'api_version', 'backend', 'command', 'evidence'], 'native install result');
+  literal(document.schema, 'io.github.cataggar.debz.native-install-result.v1', 'schema');
+  literal(document.api_version, 1, 'api_version');
+  literal(document.backend, 'native', 'backend');
+  const changed = validateCommandDocument(record(document.command, 'native install command'));
+  const evidence = record(document.evidence, 'native install evidence');
+  exactKeys(evidence, [
+    'install_root', 'target_architecture', 'lock_sha256',
+    'caller_request_sha256', 'caller_policy_sha256', 'package_count', 'receipt',
+  ], 'native install evidence');
+  literal(evidence.install_root, inputs.installRoot, 'install_root');
+  literal(evidence.target_architecture, inputs.architecture, 'target_architecture');
+  literal(evidence.lock_sha256, expectedLockDigest, 'lock_sha256');
+  let receipt: NativeInstallResult['receipt'] = null;
+  if (changed) {
+    const value = record(evidence.receipt, 'native install receipt');
+    exactKeys(value, ['transaction_digest_sha256', 'completion_digest_sha256', 'program_sha256'], 'native install receipt');
+    receipt = {
+      transactionDigest: digest(value.transaction_digest_sha256, 'transaction_digest_sha256'),
+      completionDigest: digest(value.completion_digest_sha256, 'completion_digest_sha256'),
+      programDigest: digest(value.program_sha256, 'program_sha256'),
+    };
+  } else if (evidence.receipt !== null) {
+    throw new InstallActionError('unchanged native install must not claim a transaction receipt');
+  }
+  return {
+    changed,
+    installedCount: nativePackageCount(evidence.package_count, inputs),
+    callerRequestDigest: digest(evidence.caller_request_sha256, 'caller_request_sha256'),
+    callerPolicyDigest: digest(evidence.caller_policy_sha256, 'caller_policy_sha256'),
+    receipt,
+  };
 }
 
 export function failureDiagnostic(output: string): string | undefined {
@@ -175,12 +269,51 @@ export function validateTransactionSummary(
   output: string,
   inputs: Inputs,
   expectedLockDigest: string,
+  nativeResult?: NativeInstallResult,
 ): TransactionSummary {
   const document = parseCanonicalLine(
     output,
     64 * 1024,
     'transaction-result summary',
   );
+  if (inputs.transactionBackend === 'native') {
+    if (nativeResult?.receipt === undefined || nativeResult.receipt === null) {
+      throw new InstallActionError('native transaction verification requires this execution receipt');
+    }
+    exactKeys(document, nativeSummaryKeys, 'native transaction-result summary');
+    const expected = {
+      schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
+      api_version: 2,
+      backend: 'native',
+      transaction_schema: 'https://debz.dev/schema/native-transaction-provenance-v1',
+      transaction_schema_version: 1,
+      completion_schema: 'https://debz.dev/schema/root-operation-completion-v1',
+      completion_schema_version: 1,
+      target_architecture: inputs.architecture,
+      install_root: inputs.installRoot,
+      operation: 'install',
+      caller_request_sha256: nativeResult.callerRequestDigest,
+      caller_policy_sha256: nativeResult.callerPolicyDigest,
+      lock_sha256: expectedLockDigest,
+      transaction_digest_sha256: nativeResult.receipt.transactionDigest,
+      completion_digest_sha256: nativeResult.receipt.completionDigest,
+      program_sha256: nativeResult.receipt.programDigest,
+      package_count: nativeResult.installedCount,
+      outcome: 'succeeded',
+      final_verification_status: 'exact_match',
+      lock_evidence: 'exact_match',
+      receipt_evidence: 'exact_match',
+      root_operation_status: 'cleared',
+    };
+    for (const [name, value] of Object.entries(expected)) literal(document[name], value, name);
+    digest(document.request_sha256, 'request_sha256');
+    digest(document.solver_policy_sha256, 'solver_policy_sha256');
+    return {
+      lockDigest: expectedLockDigest,
+      transactionDigest: nativeResult.receipt.transactionDigest,
+      installedCount: nativePackageCount(document.package_count, inputs),
+    };
+  }
   exactKeys(document, summaryKeys, 'transaction-result summary');
   literal(
     document.schema,
@@ -226,9 +359,26 @@ export function validateTransactionSummary(
 }
 
 export function transactionResultPath(inputs: Inputs): string {
+  if (inputs.transactionBackend === 'native') {
+    return path.join(inputs.installRoot, 'var/lib/debz/native-transaction-provenance-v1.json');
+  }
   return path.join(inputs.statePath, 'transaction-result.json');
 }
 
+function digest(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !hex64.test(value)) {
+    throw new InstallActionError(`native result field '${name}' is invalid`);
+  }
+  return value;
+}
+
+function nativePackageCount(value: unknown, inputs: Inputs): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) ||
+      value < 0 || value > Math.min(100_000, inputs.limits.maximumLockPackages)) {
+    throw new InstallActionError("native result field 'package_count' is invalid");
+  }
+  return value;
+}
 function parseCanonicalLine(
   output: string,
   maximumBytes: number,
