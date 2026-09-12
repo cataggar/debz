@@ -343,24 +343,36 @@ pub const BackendError = error{
 };
 
 pub const Backend = struct {
+    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
     context: *anyopaque,
     routeFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        system_profile.TransactionBackend,
         product_api.Request,
     ) BackendError!product_api.Result,
     workflowFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        system_profile.TransactionBackend,
         WorkflowRequest,
     ) BackendError!product_api.Result,
+
+    pub fn forTransactionBackend(
+        self: Backend,
+        backend: system_profile.TransactionBackend,
+    ) Backend {
+        var selected = self;
+        selected.transaction_backend = backend;
+        return selected;
+    }
 
     pub fn route(
         self: Backend,
         allocator: std.mem.Allocator,
         request: product_api.Request,
     ) BackendError!product_api.Result {
-        return self.routeFn(self.context, allocator, request);
+        return self.routeFn(self.context, allocator, self.transaction_backend, request);
     }
 
     pub fn workflow(
@@ -368,12 +380,12 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
-        return self.workflowFn(self.context, allocator, request);
+        return self.workflowFn(self.context, allocator, self.transaction_backend, request);
     }
 };
 
 pub const ProductionBackend = struct {
-    backend: *production_backend.Backend,
+    backend: *const production_backend.Backend,
 
     pub fn interface(self: *ProductionBackend) Backend {
         return .{
@@ -386,20 +398,24 @@ pub const ProductionBackend = struct {
     fn route(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *ProductionBackend = @ptrCast(@alignCast(context));
-        return self.backend.execute(allocator, request) catch |err|
+        var selected = self.configuration(backend);
+        return selected.execute(allocator, request) catch |err|
             return mapBoundaryError(err);
     }
 
     fn workflow(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *ProductionBackend = @ptrCast(@alignCast(context));
-        return self.backend.executeWorkflow(allocator, .{
+        var selected = self.configuration(backend);
+        return selected.executeWorkflow(allocator, .{
             .operation = switch (request.operation) {
                 .install => .install,
                 .remove => .remove,
@@ -424,6 +440,15 @@ pub const ProductionBackend = struct {
             .ownership_acknowledgment = request.ownership_acknowledgment,
             .recovery_acknowledgment = request.recovery_acknowledgment,
         }) catch |err| return mapBoundaryError(err);
+    }
+
+    fn configuration(
+        self: *const ProductionBackend,
+        backend: system_profile.TransactionBackend,
+    ) production_backend.Backend {
+        var selected = self.backend.*;
+        selected.transaction_backend = backend;
+        return selected;
     }
 
     fn mapBoundaryError(err: anyerror) BackendError {
@@ -4721,7 +4746,7 @@ pub const Engine = struct {
                 "trusted profile reference changed immediately before backend routing",
             ),
         };
-        var run = self.runner.route(allocator, self.backend, .{
+        var run = self.runner.route(allocator, self.backend.forTransactionBackend(profile.transaction_backend), .{
             .operation = operation,
             .options = commonOptions(profile, null, null),
         }) catch |err| switch (err) {
@@ -4822,7 +4847,7 @@ pub const Engine = struct {
                 "trusted profile reference changed immediately before planning",
             ) },
         };
-        var planned = self.runner.workflow(allocator, self.backend, .{
+        var planned = self.runner.workflow(allocator, self.backend.forTransactionBackend(profile.transaction_backend), .{
             .operation = workflow_operation,
             .mode = .plan_only,
             .selectors = selectors,
@@ -5059,7 +5084,7 @@ pub const Engine = struct {
         const selectors = try selectorsFor(allocator, prepared.request);
         defer allocator.free(selectors);
         const workflow_operation = semanticOperation(prepared.request.operation);
-        var downloaded = self.runner.workflow(allocator, self.backend, .{
+        var downloaded = self.runner.workflow(allocator, self.backend.forTransactionBackend(loaded.view.transaction_backend), .{
             .operation = workflow_operation,
             .mode = .download_only,
             .selectors = selectors,
@@ -5195,7 +5220,7 @@ pub const Engine = struct {
                 .reservation_outcome_ambiguous,
             ),
         };
-        var reserved = self.runner.workflow(allocator, self.backend, .{
+        var reserved = self.runner.workflow(allocator, self.backend.forTransactionBackend(loaded.view.transaction_backend), .{
             .operation = workflow_operation,
             .mode = .reserve,
             .selectors = selectors,
@@ -5316,7 +5341,7 @@ pub const Engine = struct {
         self.hitCompletionBoundary(.after_mutating_state) catch
             return self.reconcilePreparedError(allocator, prepared);
 
-        var executed = self.runner.workflow(allocator, self.backend, .{
+        var executed = self.runner.workflow(allocator, self.backend.forTransactionBackend(loaded.view.transaction_backend), .{
             .operation = workflow_operation,
             .mode = .execute,
             .selectors = selectors,
@@ -5655,7 +5680,7 @@ pub const Engine = struct {
             };
             var claimed = self.runner.workflow(
                 allocator,
-                self.backend,
+                self.backend.forTransactionBackend(loaded.view.transaction_backend),
                 .{
                     .operation = semanticOperation(prepared.request.operation),
                     .mode = .recover,
@@ -7332,7 +7357,7 @@ pub const Engine = struct {
                 if (retry_unbound_preflight) {
                     var reserved = self.runner.workflow(
                         allocator,
-                        self.backend,
+                        self.backend.forTransactionBackend(loaded.view.transaction_backend),
                         .{
                             .operation = semanticOperation(
                                 recovery.prepared.request.operation,
@@ -7478,7 +7503,7 @@ pub const Engine = struct {
                     );
                 var retried = self.runner.workflow(
                     allocator,
-                    self.backend,
+                    self.backend.forTransactionBackend(loaded.view.transaction_backend),
                     .{
                         .operation = semanticOperation(
                             recovery.prepared.request.operation,
@@ -7691,7 +7716,7 @@ pub const Engine = struct {
                 );
                 var claimed = self.runner.workflow(
                     allocator,
-                    self.backend,
+                    self.backend.forTransactionBackend(loaded.view.transaction_backend),
                     .{
                         .operation = semanticOperation(
                             recovery.prepared.request.operation,
@@ -7933,7 +7958,7 @@ pub const Engine = struct {
             recovery.prepared.request,
         );
         defer allocator.free(selectors);
-        var executed = self.runner.workflow(allocator, self.backend, .{
+        var executed = self.runner.workflow(allocator, self.backend.forTransactionBackend(loaded.view.transaction_backend), .{
             .operation = semanticOperation(
                 recovery.prepared.request.operation,
             ),
@@ -8100,7 +8125,7 @@ pub const Engine = struct {
                 try self.hitCompletionBoundary(.before_ownership_acknowledged);
                 var finalized = self.runner.workflow(
                     allocator,
-                    self.backend,
+                    self.backend.forTransactionBackend(loaded.view.transaction_backend),
                     .{
                         .operation = semanticOperation(
                             prepared.request.operation,
@@ -8145,7 +8170,7 @@ pub const Engine = struct {
             .pending => {
                 var finalized = self.runner.workflow(
                     allocator,
-                    self.backend,
+                    self.backend.forTransactionBackend(loaded.view.transaction_backend),
                     .{
                         .operation = semanticOperation(
                             prepared.request.operation,
@@ -12603,6 +12628,8 @@ test "apt_system_orchestrator.test.native profile authority is refused without l
 const FakeBackend = struct {
     route_calls: usize = 0,
     workflow_calls: usize = 0,
+    last_transaction_backend: ?system_profile.TransactionBackend = null,
+    expected_transaction_backend: ?system_profile.TransactionBackend = null,
     plan_calls: usize = 0,
     download_calls: usize = 0,
     reserve_calls: usize = 0,
@@ -12639,10 +12666,14 @@ const FakeBackend = struct {
     fn route(
         context: *anyopaque,
         _: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *FakeBackend = @ptrCast(@alignCast(context));
         self.route_calls += 1;
+        self.last_transaction_backend = backend;
+        if (self.expected_transaction_backend) |expected|
+            if (backend != expected) return error.ContractViolation;
         self.last_route = request.operation;
         return .{
             .operation = request.operation,
@@ -12663,10 +12694,14 @@ const FakeBackend = struct {
     fn workflow(
         context: *anyopaque,
         _: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *FakeBackend = @ptrCast(@alignCast(context));
         self.workflow_calls += 1;
+        self.last_transaction_backend = backend;
+        if (self.expected_transaction_backend) |expected|
+            if (backend != expected) return error.ContractViolation;
         self.last_selector_count = request.selectors.len;
         self.last_operation = request.operation;
         if (request.recovery_acknowledgment != null) {
@@ -12744,6 +12779,129 @@ const FakeBackend = struct {
     }
 };
 
+test "apt_system_orchestrator.test.bound backend dispatch is isolated and never retries another backend" {
+    var mock: FakeBackend = .{ .expected_transaction_backend = .legacy_dpkg };
+    const legacy = mock.interface();
+    const native = legacy.forTransactionBackend(.native);
+    const options: product_api.CommonOptions = .{
+        .install_root = live_root.logical_root_path,
+        .cache_path = "/cache",
+        .state_path = "/state",
+        .architecture = "amd64",
+    };
+    try std.testing.expectError(
+        error.ContractViolation,
+        native.route(std.testing.allocator, .{ .operation = .list_installed, .options = options }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), mock.route_calls);
+    try std.testing.expectEqual(system_profile.TransactionBackend.native, mock.last_transaction_backend.?);
+    const listed = try legacy.route(std.testing.allocator, .{ .operation = .list_installed, .options = options });
+    try std.testing.expectEqual(product_api.ExitStatus.success, listed.exit_status);
+    try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, mock.last_transaction_backend.?);
+    const request: WorkflowRequest = .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &.{.{ .name = "alpha" }},
+        .options = options,
+    };
+    try std.testing.expectError(error.ContractViolation, native.workflow(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(usize, 1), mock.workflow_calls);
+    try std.testing.expectEqual(system_profile.TransactionBackend.native, mock.last_transaction_backend.?);
+    const planned = try legacy.workflow(std.testing.allocator, request);
+    try std.testing.expectEqual(product_api.ExitStatus.success, planned.exit_status);
+    try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, mock.last_transaction_backend.?);
+    try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, legacy.transaction_backend);
+    try std.testing.expectEqual(system_profile.TransactionBackend.native, native.transaction_backend);
+}
+
+test "apt_system_orchestrator.test.production dispatch snapshots profile backend without mutating shared configuration" {
+    const options: product_api.CommonOptions = .{
+        .install_root = live_root.logical_root_path,
+        .cache_path = "/unread/cache",
+        .state_path = "/unread/state",
+        .architecture = "amd64",
+        .lock_input_path = "/unread/replacement-lock.json",
+        .assume_yes = true,
+        .conffile = .keep_existing,
+    };
+    for ([_]system_profile.TransactionBackend{ .legacy_dpkg, .native }) |configured| {
+        var template: production_backend.Backend = .{
+            .io = undefined,
+            .transaction_backend = configured,
+            .now_unix = 123,
+        };
+        var adapter: ProductionBackend = .{ .backend = &template };
+        const base = adapter.interface();
+        for ([_]system_profile.TransactionBackend{ .native, .legacy_dpkg, .native }) |selected| {
+            const bound = base.forTransactionBackend(selected);
+            const snapshot = adapter.configuration(selected);
+            try std.testing.expectEqual(selected, snapshot.transaction_backend);
+            try std.testing.expectEqual(template.now_unix, snapshot.now_unix);
+            try std.testing.expectEqual(template.executor.context, snapshot.executor.context);
+            const routed = try bound.route(std.testing.allocator, .{
+                .operation = .recover,
+                .options = options,
+            });
+            const workflow = try bound.workflow(std.testing.allocator, .{
+                .operation = .install,
+                .mode = .recover,
+                .selectors = &.{.{ .name = "alpha" }},
+                .options = options,
+            });
+            const expected = if (selected == .native)
+                product_api.ErrorId.invalid_request
+            else
+                product_api.ErrorId.configuration_required;
+            try std.testing.expectEqual(product_api.ExitStatus.usage, routed.exit_status);
+            try std.testing.expectEqual(expected, routed.diagnostics[0].id);
+            try std.testing.expectEqual(product_api.ExitStatus.usage, workflow.exit_status);
+            try std.testing.expectEqual(expected, workflow.diagnostics[0].id);
+            try std.testing.expectEqual(configured, template.transaction_backend);
+            try std.testing.expectEqual(@as(?i64, 123), template.now_unix);
+            try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, base.transaction_backend);
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.reviewed profile controls every backend dispatch and native profiles stay gated" {
+    var harness = Harness.init(std.testing.allocator);
+    defer harness.deinit();
+    harness.rebind();
+    harness.engine.backend = harness.engine.backend.forTransactionBackend(.native);
+    harness.backend.expected_transaction_backend = .legacy_dpkg;
+    var listed = switch (try harness.engine.prepare(std.testing.allocator, .{
+        .operation = .list_installed,
+        .profile_path = "/profile.json",
+    })) {
+        .result => |result| result,
+        .ready => return error.UnexpectedPreparation,
+    };
+    defer listed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, listed.outcome);
+    var prepared = try expectReady(try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{ "alpha", "beta" }),
+    ));
+    defer prepared.deinit();
+    var executed = try harness.engine.execute(std.testing.allocator, prepared, true);
+    defer executed.deinit();
+    try std.testing.expectEqual(api.Outcome.success, executed.outcome);
+    try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, harness.backend.last_transaction_backend.?);
+    try std.testing.expectEqual(system_profile.TransactionBackend.native, harness.engine.backend.transaction_backend);
+    const previous_calls = harness.backend.route_calls + harness.backend.workflow_calls;
+    harness.profile.transaction_backend = .native;
+    var refused = switch (try harness.engine.prepare(
+        std.testing.allocator,
+        mutationRequest(.install, &.{"alpha"}),
+    )) {
+        .result => |result| result,
+        .ready => return error.UnexpectedPreparation,
+    };
+    defer refused.deinit();
+    try std.testing.expectEqual(api.Outcome.configuration, refused.outcome);
+    try std.testing.expectEqual(previous_calls, harness.backend.route_calls + harness.backend.workflow_calls);
+}
+
 const SignalTestBackend = struct {
     ready_fd: ?i32 = null,
 
@@ -12758,6 +12916,7 @@ const SignalTestBackend = struct {
     fn route(
         context: *anyopaque,
         _: std.mem.Allocator,
+        _: system_profile.TransactionBackend,
         _: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *SignalTestBackend = @ptrCast(@alignCast(context));
@@ -12775,6 +12934,7 @@ const SignalTestBackend = struct {
     fn workflow(
         _: *anyopaque,
         _: std.mem.Allocator,
+        _: system_profile.TransactionBackend,
         _: WorkflowRequest,
     ) BackendError!product_api.Result {
         waitForSignal();
@@ -12807,6 +12967,7 @@ const TransportFailureBackend = struct {
     fn route(
         context: *anyopaque,
         _: std.mem.Allocator,
+        _: system_profile.TransactionBackend,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *TransportFailureBackend = @ptrCast(@alignCast(context));
@@ -12824,6 +12985,7 @@ const TransportFailureBackend = struct {
     fn workflow(
         context: *anyopaque,
         _: std.mem.Allocator,
+        _: system_profile.TransactionBackend,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *TransportFailureBackend = @ptrCast(@alignCast(context));
@@ -16112,36 +16274,38 @@ test "apt_system_orchestrator.test.private child failure envelope rejects malfor
 test "apt_system_orchestrator.test.required_privileged.production private runner validates every workflow mode transport operation" {
     try requirePrivilegedProductionTest();
     inline for (std.meta.tags(WorkflowMode)) |mode| {
-        var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
-        var backend: FakeBackend = .{};
-        if (mode == .recover) backend.recover_status = .recovery;
-        var result = runner.interface().workflow(
-            std.testing.allocator,
-            backend.interface(),
-            .{
-                .operation = .install,
-                .mode = mode,
-                .selectors = &.{.{ .name = "alpha" }},
-                .options = .{
-                    .install_root = live_root.logical_root_path,
-                    .cache_path = "/var/cache/apt",
-                    .state_path = "/var/lib/apt",
-                    .architecture = "amd64",
+        inline for (.{ .legacy_dpkg, .native }) |backend_kind| {
+            var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+            var backend: FakeBackend = .{ .expected_transaction_backend = backend_kind };
+            if (mode == .recover) backend.recover_status = .recovery;
+            var result = runner.interface().workflow(
+                std.testing.allocator,
+                backend.interface().forTransactionBackend(backend_kind),
+                .{
+                    .operation = .install,
+                    .mode = mode,
+                    .selectors = &.{.{ .name = "alpha" }},
+                    .options = .{
+                        .install_root = live_root.logical_root_path,
+                        .cache_path = "/var/cache/apt",
+                        .state_path = "/var/lib/apt",
+                        .architecture = "amd64",
+                    },
                 },
-            },
-        ) catch |err| switch (err) {
-            error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
-            else => return err,
-        };
-        defer result.deinit();
-        try std.testing.expectEqual(
-            workflowSurfaceOperation(.install, mode),
-            result.result.operation,
-        );
-        try std.testing.expectEqualStrings(
-            if (mode == .recover) "injected failure" else "ok",
-            result.result.summary,
-        );
+            ) catch |err| switch (err) {
+                error.PrivilegeUnavailable => return privilegedCoverageUnavailable(),
+                else => return err,
+            };
+            defer result.deinit();
+            try std.testing.expectEqual(
+                workflowSurfaceOperation(.install, mode),
+                result.result.operation,
+            );
+            try std.testing.expectEqualStrings(
+                if (mode == .recover) "injected failure" else "ok",
+                result.result.summary,
+            );
+        }
     }
     var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
     var backend: FakeBackend = .{};
