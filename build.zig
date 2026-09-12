@@ -16,8 +16,14 @@ pub fn build(b: *std.Build) void {
         "require-privileged-orchestration-tests",
         "Fail instead of skipping privileged production orchestration tests",
     ) orelse false;
+    const native_helper_debug_info = b.option(
+        bool,
+        "native-helper-debug-info",
+        "Retain debugger metadata in the private native helper",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(bool, "native_helper_debug_info", native_helper_debug_info);
     build_options.addOption(
         bool,
         "require_privileged_orchestration_tests",
@@ -604,6 +610,9 @@ pub fn build(b: *std.Build) void {
                 .abi = .musl,
             }),
             .optimize = optimize,
+            // Helper bytes are repeatedly authenticated and retained. Keep
+            // Debug safety checks without carrying large debugger metadata.
+            .strip = !native_helper_debug_info,
             .link_libc = true,
         }),
         .linkage = .static,

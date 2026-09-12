@@ -142,6 +142,12 @@ pub fn probe(allocator: std.mem.Allocator, root: root_fs.Root, binding: Binding)
     }
 }
 
+test "native_helper.test.bundled helper keeps runtime evidence compact" {
+    if (@import("debz_build_options").native_helper_debug_info)
+        return error.SkipZigTest;
+    try std.testing.expect(@embedFile("debz_native_trigger_helper").len <= 8 * 1024 * 1024);
+}
+
 test "native_helper.test.absent target refuses without creating a placeholder or cache" {
     const testing = std.testing;
     var temporary = testing.tmpDir(.{});

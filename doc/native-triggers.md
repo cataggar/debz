@@ -118,3 +118,11 @@ zig build test-native-triggers -Doptimize=ReleaseSafe -j2
 `native-trigger-helper` builds the private artifact without installing it.
 Both the focused parity target and the default unit target include the
 independent oracle regressions.
+
+The private helper omits debugger metadata by default, including in Debug
+builds; Debug code generation and runtime safety checks remain enabled.
+This keeps repeatedly authenticated and retained helper evidence compact,
+especially on CPUs without accelerated SHA-256. The default bundled artifact
+has an 8 MiB regression budget. `-Dnative-helper-debug-info=true` retains the
+metadata for helper debugging; use that option consistently when building the
+caller and helper because their exact byte/digest binding still applies.
