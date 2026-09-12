@@ -295,9 +295,19 @@ v1 repository evidence.
 Transaction verification is separately gated: the current legacy verifier
 rejects native selection and non-v1 lock bindings before reading evidence.
 Native lock verification alone does not authorize legacy provenance or permit
-native planning/execution. Backend construction, native receipt/completion
-publication and verification, recovery, and live-root authority must still be
-integrated before native profiles can pass the facade boundary.
+native planning/execution. Native receipt/completion publication and
+verification, recovery, and live-root authority must still be integrated before
+native profiles can pass the facade boundary.
+
+Every route and workflow invocation binds a backend descriptor by value to the
+reviewed profile selection, including reservation, recovery, reconciliation,
+and acknowledgment. The descriptor crosses the private live-root runner with
+the request. The production adapter copies its configuration for that invocation
+and sets the selected backend only on that copy; it never toggles shared backend
+configuration or inherits a previous invocation's selection. Existing executor,
+process-runner, clock, and fault-injection configuration is preserved. Backend
+errors propagate directly without retrying through another engine, and this
+internal dispatch contract does not remove the native profile or host-root gates.
 
 Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v2.json`
 for native from the trusted profile backend during preparation, recovery, and
