@@ -16,6 +16,7 @@ const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const live_root = @import("live_root.zig");
 const native_provenance = @import("native_provenance.zig");
+const native_transaction_result = @import("native_transaction_result.zig");
 const product_api = @import("product_api.zig");
 const production_backend = @import("production_backend.zig");
 const root_fs = @import("root_fs.zig");
@@ -526,6 +527,29 @@ pub const LiveRootRunner = struct {
         *anyopaque,
         root_operation.RecoveryReviewClaim,
     ) BoundaryError!RecoveryReviewDisposition,
+    verifyOwnedNativeFn: ?*const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        ResultVerifier,
+        system_profile.TransactionBackend,
+        OwnedNativeRequest,
+    ) VerificationError!OwnedNativeVerification = null,
+
+    pub fn verifyOwnedNative(
+        self: LiveRootRunner,
+        allocator: std.mem.Allocator,
+        verifier: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+    ) VerificationError!OwnedNativeVerification {
+        request.validate(allocator, backend) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+            else => return error.OperationalVerificationFailure,
+        };
+        const verify_fn = self.verifyOwnedNativeFn orelse return error.OperationalVerificationFailure;
+        if (verifier.verifyOwnedNativeFn == null) return error.OperationalVerificationFailure;
+        return verify_fn(self.context, allocator, verifier, backend, request);
+    }
 
     pub fn route(
         self: LiveRootRunner,
@@ -656,6 +680,15 @@ pub const PrivateLiveRootRunner = struct {
         output_fd: i32,
     };
 
+    const NativeVerificationContext = struct {
+        verifier: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+        output_fd: i32,
+    };
+    const maximum_native_verification_bytes = root_operation.maximum_document_bytes + 1 +
+        native_provenance.maximum_document_bytes + root_operation_completion.maximum_document_bytes;
+
     const ReviewOperation = union(enum) {
         prepare: RecoveryReviewInput,
         validate: root_operation.RecoveryReviewClaim,
@@ -706,6 +739,7 @@ pub const PrivateLiveRootRunner = struct {
             .validateRecoveryReviewFn = validateRecoveryReview,
             .releaseRecoveryReviewFn = releaseRecoveryReview,
             .settleRecoveryReviewFn = settleRecoveryReview,
+            .verifyOwnedNativeFn = verifyOwnedNative,
         };
     }
 
@@ -2125,6 +2159,209 @@ pub const PrivateLiveRootRunner = struct {
         defer std.heap.page_allocator.free(source);
         try writeTransport(context.output_fd, source);
         return 0;
+    }
+
+    fn verifyOwnedNative(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        verifier: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+    ) VerificationError!OwnedNativeVerification {
+        return verifyOwnedNativeInternal(context, allocator, verifier, backend, request) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed, error.ChildOutOfMemory => error.OutOfMemory,
+            error.InvariantViolation, error.ChildInvariantViolation => error.InvariantViolation,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyOwnedNativeInternal(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        verifier: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+    ) !OwnedNativeVerification {
+        try request.validate(allocator, backend);
+        if (verifier.verifyOwnedNativeFn == null) return error.OperationalVerificationFailure;
+        var guard = try live_root.blockWatchedSignals();
+        var result = verifyOwnedNativeSignalsBlocked(context, allocator, verifier, backend, request, &guard) catch |err| {
+            try guard.restore();
+            return err;
+        };
+        errdefer result.deinit();
+        try guard.restore();
+        return result;
+    }
+
+    fn verifyOwnedNativeSignalsBlocked(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        verifier: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+        guard: *const live_root.SignalMaskGuard,
+    ) !OwnedNativeVerification {
+        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        const self: *PrivateLiveRootRunner = @ptrCast(@alignCast(context));
+        const linux = std.os.linux;
+        var pipe: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS)
+            return error.PipeFailed;
+        var read_open = true;
+        var write_open = true;
+        defer {
+            if (read_open) _ = linux.close(pipe[0]);
+            if (write_open) _ = linux.close(pipe[1]);
+        }
+        const buffer = try allocator.alloc(u8, maximum_native_verification_bytes);
+        defer allocator.free(buffer);
+        var reader_context: ReaderContext = .{ .fd = pipe[0], .buffer = buffer };
+        const reader = try std.Thread.spawn(.{}, readTransport, .{&reader_context});
+        var joined = false;
+        defer if (!joined) {
+            if (write_open) {
+                _ = linux.close(pipe[1]);
+                write_open = false;
+            }
+            reader.join();
+        };
+        var child_context: NativeVerificationContext = .{
+            .verifier = verifier,
+            .backend = backend,
+            .request = request,
+            .output_fd = pipe[1],
+        };
+        const result = try live_root.runProjectedSignalsBlocked(.{
+            .context = &child_context,
+            .child = verifyOwnedNativeChild,
+            .termination_grace_ms = self.termination_grace_ms,
+        }, guard);
+        _ = linux.close(pipe[1]);
+        write_open = false;
+        reader.join();
+        joined = true;
+        _ = linux.close(pipe[0]);
+        read_open = false;
+        if (reader_context.failure) |failure| return failure;
+        switch (result) {
+            .exited => |code| if (code != 0) return error.LiveRootChildFailed,
+            .signaled => return error.LiveRootChildSignaled,
+            .interrupted => return error.LiveRootInterrupted,
+            .setup_failed => |failure| return mapSetupFailure(failure),
+        }
+        const source = buffer[0..reader_context.length];
+        switch (try decodeFailureEnvelope(source)) {
+            .none => {},
+            .out_of_memory => return error.ChildOutOfMemory,
+            .invariant_violation => return error.ChildInvariantViolation,
+            .operational, .contract_violation => return error.OperationalVerificationFailure,
+        }
+        return decodeOwnedNative(allocator, request, source);
+    }
+
+    fn verifyOwnedNativeChild(raw: ?*anyopaque, projection: *const live_root.Projection) anyerror!u8 {
+        const context: *const NativeVerificationContext = @ptrCast(@alignCast(raw.?));
+        verifyOwnedNativeChildInternal(context.*, projection) catch |err| {
+            try writeFailureEnvelope(context.output_fd, switch (err) {
+                error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+                error.InvariantViolation => error.InvariantViolation,
+                else => error.OperationalBoundaryFailure,
+            });
+        };
+        return 0;
+    }
+
+    fn verifyOwnedNativeChildInternal(context: NativeVerificationContext, projection: *const live_root.Projection) !void {
+        const allocator = std.heap.page_allocator;
+        const verify_fn = context.verifier.verifyOwnedNativeFn orelse return error.OperationalVerificationFailure;
+        var result = try verify_fn(context.verifier.context, allocator, context.backend, context.request, projection);
+        defer result.deinit();
+        switch (result) {
+            inline else => |owned| {
+                if (!root_operation.deferredAcknowledgmentExactEqual(owned.owner, context.request.owner) or
+                    ((@TypeOf(owned).outcome == .succeeded) != (context.request.outcome == .succeeded)))
+                    return error.InvalidNativeVerification;
+                const owner = try owned.owner.canonicalJson(allocator);
+                defer allocator.free(owner);
+                const receipt = try owned.receipt.document.canonicalJson(allocator);
+                defer allocator.free(receipt);
+                const completion = try owned.completion.document.canonicalJson(allocator);
+                defer allocator.free(completion);
+                if (owner.len > root_operation.maximum_document_bytes or
+                    receipt.len > native_provenance.maximum_document_bytes or
+                    completion.len > root_operation_completion.maximum_document_bytes)
+                    return error.DocumentTooLarge;
+                try writeTransport(context.output_fd, owner);
+                try writeTransport(context.output_fd, "\n");
+                try writeTransport(context.output_fd, receipt);
+                try writeTransport(context.output_fd, completion);
+            },
+        }
+    }
+
+    fn decodeOwnedNative(allocator: std.mem.Allocator, request: OwnedNativeRequest, source: []const u8) !OwnedNativeVerification {
+        try request.validate(allocator, .native);
+        if (source.len > maximum_native_verification_bytes)
+            return error.DocumentTooLarge;
+        const owner_end = std.mem.indexOfScalar(u8, source, '\n') orelse return error.InvalidNativeVerification;
+        const owner = try root_operation.decodeDeferredAcknowledgment(allocator, source[0..owner_end]);
+        if (!root_operation.deferredAcknowledgmentExactEqual(owner, request.owner))
+            return error.InvalidNativeVerification;
+        const documents = source[owner_end + 1 ..];
+        const separator = std.mem.indexOfScalar(u8, documents, '\n') orelse return error.InvalidNativeVerification;
+        var receipt = try native_provenance.decode(allocator, documents[0 .. separator + 1]);
+        errdefer receipt.deinit();
+        var completion = try root_operation_completion.decode(allocator, documents[separator + 1 ..], root_operation_completion.maximum_document_bytes);
+        errdefer completion.deinit();
+        try validateOwnedNativeReply(allocator, request, receipt.document, completion.document);
+        return switch (request.outcome) {
+            .succeeded => .{ .succeeded = .{ .owner = owner, .receipt = receipt, .completion = completion } },
+            .failed => .{ .failed = .{ .owner = owner, .receipt = receipt, .completion = completion } },
+        };
+    }
+
+    // The child verified the live root. Decoding binds the canonical returned
+    // documents to the caller's request; it is not offline execution verification.
+    fn validateOwnedNativeReply(
+        allocator: std.mem.Allocator,
+        request: OwnedNativeRequest,
+        receipt: native_provenance.Document,
+        completion: root_operation_completion.Document,
+    ) !void {
+        const expected = try request.authority(allocator, null);
+        const lock = completion.exact_lock orelse return error.InvalidNativeVerification;
+        const receipt_digest = completion.transaction_provenance.document_sha256 orelse return error.InvalidNativeVerification;
+        if (completion.backend != .native or !completion.mutation_started or
+            completion.operation != .package_transaction or completion.operation.package_transaction != expected.operation or
+            !receipt.operation.eql(completion.operation) or
+            !std.mem.eql(u8, &completion.attempt_id, &request.owner.attempt_id) or
+            !std.mem.eql(u8, &receipt.attempt_id, &native_provenance.hexDigest(request.owner.attempt_id)) or
+            !std.mem.eql(u8, &completion.request_sha256, &expected.caller_request_sha256) or
+            !std.mem.eql(u8, &completion.policy_sha256, &expected.caller_policy_sha256) or
+            !std.mem.eql(u8, &receipt.request_sha256, &native_provenance.hexDigest(expected.caller_request_sha256)) or
+            !std.mem.eql(u8, &receipt.policy_sha256, &native_provenance.hexDigest(expected.caller_policy_sha256)) or
+            !std.mem.eql(u8, completion.install_root, request.options.install_root) or
+            !std.mem.eql(u8, receipt.install_root, request.options.install_root) or
+            !std.mem.eql(u8, completion.target_architecture, request.options.architecture) or
+            !std.mem.eql(u8, lock.schema, exact_lock_v2.schema_id) or lock.version != exact_lock_v2.schema_version or
+            !std.mem.eql(u8, &lock.digest_sha256, &request.exact_lock.digest_sha256) or
+            !std.mem.eql(u8, &receipt.exact_lock_sha256, &native_provenance.hexDigest(request.exact_lock.digest_sha256)) or
+            completion.transaction_provenance.status == .unavailable or
+            !std.mem.eql(u8, completion.transaction_provenance.schema, native_provenance.schema_id) or
+            !std.mem.eql(u8, &receipt.digest_sha256, &native_provenance.hexDigest(receipt_digest)) or
+            completion.journal.status != .absent or completion.journal.document_sha256 != null)
+            return error.InvalidNativeVerification;
+        switch (request.outcome) {
+            .succeeded => if (receipt.outcome != .succeeded or completion.outcome != .succeeded)
+                return error.InvalidNativeVerification,
+            .failed => if (receipt.outcome != .failed or completion.outcome != .failed_after_mutation)
+                return error.InvalidNativeVerification,
+        }
+        if (request.owner.state == .pending and
+            (!std.mem.eql(u8, &completion.digest_sha256, &request.owner.completion_sha256.?) or
+                !std.mem.eql(u8, &completion.digest_sha256, &request.owner.provenance_sha256.?)))
+            return error.InvalidNativeVerification;
     }
 
     fn readTransport(context: *ReaderContext) void {
@@ -3973,6 +4210,73 @@ pub const VerifiedTransaction = struct {
     }
 };
 
+pub const OwnedNativeRequest = struct {
+    exact_lock: api.DocumentBinding,
+    owner: root_operation.DeferredAcknowledgment,
+    operation: WorkflowOperation,
+    selectors: []const solver.PackageSelector,
+    options: product_api.CommonOptions,
+    outcome: enum { succeeded, failed },
+
+    fn validate(self: OwnedNativeRequest, allocator: std.mem.Allocator, backend: system_profile.TransactionBackend) !void {
+        if (backend != .native) return error.UnsupportedTransactionBackend;
+        if (!std.mem.eql(u8, self.options.install_root, live_root.logical_root_path))
+            return error.UnsafeInstallRoot;
+        if (!std.mem.eql(u8, self.exact_lock.schema, exact_lock_v2.schema_id) or
+            self.exact_lock.version != exact_lock_v2.schema_version)
+            return error.LockEvidenceMismatch;
+        if ((self.owner.state != .pending and self.owner.state != .released) or
+            (self.outcome == .failed and self.owner.state != .pending))
+            return error.InvalidVerificationOwner;
+        if ((self.operation == .upgrade_all) != (self.selectors.len == 0))
+            return error.InvalidVerificationRequest;
+        const owner_bytes = try self.owner.canonicalJson(allocator);
+        defer allocator.free(owner_bytes);
+    }
+
+    fn semanticOperation(self: OwnedNativeRequest) production_backend.WorkflowSemanticOperation {
+        return switch (self.operation) {
+            .install => .install,
+            .remove => .remove,
+            .upgrade_all => .upgrade_all,
+        };
+    }
+
+    fn authority(
+        self: OwnedNativeRequest,
+        allocator: std.mem.Allocator,
+        projection: ?*const live_root.Projection,
+    ) !native_transaction_result.OwnedRequest {
+        return .{
+            .owner = self.owner,
+            .operation = workflowSurfaceOperation(self.operation, .execute),
+            .caller_request_sha256 = try production_backend.workflowProductRequestDigest(
+                allocator,
+                self.semanticOperation(),
+                .execute,
+                self.selectors,
+                self.options,
+            ),
+            .caller_policy_sha256 = production_backend.planningPolicyDigest(.native, self.options),
+            .projection = projection,
+        };
+    }
+};
+
+/// Live owner-bound evidence, not historical verification or a cleared-root
+/// summary. A known failure cannot be consumed as a successful transaction.
+pub const OwnedNativeVerification = union(enum) {
+    succeeded: native_transaction_result.OwnedSuccess,
+    failed: native_transaction_result.PendingFailure,
+
+    pub fn deinit(self: *OwnedNativeVerification) void {
+        switch (self.*) {
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const VerificationError = error{
     OutOfMemory,
     OperationalVerificationFailure,
@@ -3997,6 +4301,13 @@ pub const ResultVerifier = struct {
         api.DocumentBinding,
         []const u8,
     ) VerificationError!VerifiedTransaction,
+    verifyOwnedNativeFn: ?*const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        system_profile.TransactionBackend,
+        OwnedNativeRequest,
+        *const live_root.Projection,
+    ) VerificationError!OwnedNativeVerification = null,
 };
 
 pub const SystemResultVerifier = struct {
@@ -4007,6 +4318,7 @@ pub const SystemResultVerifier = struct {
             .context = self,
             .verifyLockFn = verifyLock,
             .verifyTransactionFn = verifyTransaction,
+            .verifyOwnedNativeFn = verifyOwnedNative,
         };
     }
 
@@ -4170,6 +4482,67 @@ pub const SystemResultVerifier = struct {
             },
             .allocator = allocator,
         };
+    }
+
+    fn verifyOwnedNative(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+        projection: *const live_root.Projection,
+    ) VerificationError!OwnedNativeVerification {
+        return verifyOwnedNativeInternal(context, allocator, backend, request, projection) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+            error.InvariantViolation => error.InvariantViolation,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyOwnedNativeInternal(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+        projection: *const live_root.Projection,
+    ) !OwnedNativeVerification {
+        try request.validate(allocator, backend);
+        const self: *SystemResultVerifier = @ptrCast(@alignCast(context));
+        const source = try readTrustedOperationFile(self.io, allocator, request.exact_lock.path, exact_lock_v2.maximum_document_bytes);
+        defer allocator.free(source);
+        var lock = try exact_lock_v2.decode(allocator, source, exact_lock_v2.maximum_document_bytes);
+        defer lock.deinit();
+        const semantic = try production_backend.workflowSemanticRequestDigest(allocator, request.semanticOperation(), request.selectors);
+        if (!std.mem.eql(u8, &lock.lock.digest_sha256, &request.exact_lock.digest_sha256) or
+            !std.mem.eql(u8, &lock.lock.request_sha256, &semantic) or
+            !std.mem.eql(u8, lock.lock.target_architecture, request.options.architecture))
+            return error.LockEvidenceMismatch;
+        var root = try root_fs.openAbsoluteRoot(self.io, request.options.install_root);
+        defer root.close();
+        var locks: root_operation.SystemLockBackend = .{ .io = self.io, .allocator = allocator };
+        const expected = try request.authority(allocator, projection);
+        if (request.outcome == .failed)
+            return .{ .failed = try native_transaction_result.verifyPendingFailure(
+                allocator,
+                root.root,
+                request.options.install_root,
+                lock.lock,
+                request.options.architecture,
+                expected,
+                locks.interface(),
+            ) };
+        const verify_success = if (request.owner.state == .pending)
+            &native_transaction_result.verifyPendingSuccess
+        else
+            &native_transaction_result.verifyReleasedSuccess;
+        return .{ .succeeded = try verify_success(
+            allocator,
+            root.root,
+            request.options.install_root,
+            lock.lock,
+            request.options.architecture,
+            expected,
+            locks.interface(),
+        ) };
     }
 };
 
@@ -11843,6 +12216,233 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
     try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{
         system_profile.TransactionBackend.native, source,
     });
+}
+
+fn ownedNativeTransportFixture(
+    allocator: std.mem.Allocator,
+    failed: bool,
+    state: root_operation.DeferredAcknowledgmentState,
+) !struct { request: OwnedNativeRequest, source: []u8 } {
+    var request: OwnedNativeRequest = .{
+        .exact_lock = .{
+            .path = "/unread/native-lock.json",
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = @splat(0x77),
+        },
+        .owner = try root_operation.createDeferredAcknowledgment(.{
+            .state = .released,
+            .attempt_id = @splat(0x11),
+            .acknowledgment_id = @splat(0x22),
+        }),
+        .operation = .install,
+        .selectors = &.{.{ .name = "fixture" }},
+        .options = .{
+            .install_root = live_root.logical_root_path,
+            .cache_path = "/unread/cache",
+            .state_path = "/unread/state",
+            .architecture = "amd64",
+            .conffile = .keep_existing,
+        },
+        .outcome = if (failed) .failed else .succeeded,
+    };
+    const authority = try request.authority(allocator, null);
+    var proof = native_provenance.testDocument();
+    proof.install_root = live_root.logical_root_path;
+    proof.root_identity_sha256 = native_provenance.hexDigest(
+        @import("transaction_recovery.zig").rootIdentity(proof.install_root),
+    );
+    proof.request_sha256 = native_provenance.hexDigest(authority.caller_request_sha256);
+    proof.policy_sha256 = native_provenance.hexDigest(authority.caller_policy_sha256);
+    proof.outcome = if (failed) .failed else .succeeded;
+    native_provenance.seal(&proof);
+    var receipt_digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&receipt_digest, &proof.digest_sha256);
+    var record = try root_operation.create(allocator, .{
+        .attempt_id = request.owner.attempt_id,
+        .generation = 4,
+        .install_root = request.options.install_root,
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .state = .completed,
+        .phase = .provenance,
+        .step = 4,
+        .mutation_started = true,
+        .outcome = if (failed) .failed_after_mutation else .succeeded,
+        .provenance = .pending,
+        .evidence = .{
+            .authorization_sha256 = @splat(0x55),
+            .program_sha256 = @splat(0x66),
+            .exact_lock = .{
+                .schema = exact_lock_v2.schema_id,
+                .version = exact_lock_v2.schema_version,
+                .digest_sha256 = request.exact_lock.digest_sha256,
+            },
+            .database_generation_sha256 = @splat(0x99),
+            .artifact_evidence_sha256 = @splat(0x88),
+        },
+        .request_sha256 = authority.caller_request_sha256,
+        .policy_sha256 = authority.caller_policy_sha256,
+        .target_architecture = request.options.architecture,
+        .reserved_unix = 90,
+        .updated_unix = 100,
+    });
+    defer record.deinit();
+    var completion = try root_operation_completion.create(allocator, .{
+        .record = record.record,
+        .transaction_provenance = .{
+            .status = .already_present,
+            .schema = native_provenance.schema_id,
+            .document_sha256 = receipt_digest,
+            .detail = "transport fixture only",
+        },
+        .journal = .{ .status = .absent, .detail = "no command journal" },
+        .discharge = .{
+            .surface = .package_transaction,
+            .operation = "install",
+            .request_sha256 = authority.caller_request_sha256,
+        },
+    });
+    defer completion.deinit();
+    request.owner = try root_operation.createDeferredAcknowledgment(.{
+        .state = state,
+        .attempt_id = request.owner.attempt_id,
+        .acknowledgment_id = request.owner.acknowledgment_id,
+        .completion_sha256 = if (state == .pending) completion.document.digest_sha256 else null,
+        .provenance_sha256 = if (state == .pending) completion.document.digest_sha256 else null,
+    });
+    const owner = try request.owner.canonicalJson(allocator);
+    defer allocator.free(owner);
+    const receipt = try proof.canonicalJson(allocator);
+    defer allocator.free(receipt);
+    const outer = try completion.document.canonicalJson(allocator);
+    defer allocator.free(outer);
+    return .{ .request = request, .source = try std.mem.concat(allocator, u8, &.{ owner, "\n", receipt, outer }) };
+}
+
+fn testOwnedNativeDecode(allocator: std.mem.Allocator, request: OwnedNativeRequest, source: []const u8) !void {
+    var decoded = PrivateLiveRootRunner.decodeOwnedNative(allocator, request, source) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer decoded.deinit();
+    try std.testing.expect((decoded == .succeeded) == (request.outcome == .succeeded));
+    switch (decoded) {
+        inline else => |owned| try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(request.owner, owned.owner)),
+    }
+}
+
+test "apt_system_orchestrator.test.native owned transport preserves owner outcome and canonical bindings" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |failed| {
+        for ([_]root_operation.DeferredAcknowledgmentState{ .pending, .released }) |state| {
+            if (failed and state == .released) continue;
+            const fixture = try ownedNativeTransportFixture(allocator, failed, state);
+            defer allocator.free(fixture.source);
+            try std.testing.checkAllAllocationFailures(allocator, testOwnedNativeDecode, .{ fixture.request, fixture.source });
+            var changed = fixture.request;
+            changed.owner.acknowledgment_id[0] ^= 1;
+            changed.owner = try root_operation.createDeferredAcknowledgment(changed.owner);
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, changed, fixture.source));
+            changed = fixture.request;
+            changed.options.recommends = !changed.options.recommends;
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, changed, fixture.source));
+            changed = fixture.request;
+            changed.options.architecture = "arm64";
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, changed, fixture.source));
+            changed = fixture.request;
+            changed.selectors = &.{.{ .name = "different" }};
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, changed, fixture.source));
+            changed = fixture.request;
+            changed.exact_lock.digest_sha256[0] ^= 1;
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, changed, fixture.source));
+            changed = fixture.request;
+            changed.outcome = if (failed) .succeeded else .failed;
+            try std.testing.expectError(
+                if (state == .released) error.InvalidVerificationOwner else error.InvalidNativeVerification,
+                testOwnedNativeDecode(allocator, changed, fixture.source),
+            );
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, fixture.request, ""));
+            const owner_end = std.mem.indexOfScalar(u8, fixture.source, '\n').?;
+            try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, fixture.request, fixture.source[0 .. owner_end + 1]));
+            const extra = try std.mem.concat(allocator, u8, &.{ fixture.source, "{}" });
+            defer allocator.free(extra);
+            try std.testing.expectError(error.NonCanonicalDocument, testOwnedNativeDecode(allocator, fixture.request, extra));
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.native owned transport requires exact v2 review owner identity" {
+    const allocator = std.testing.allocator;
+    const fixture = try ownedNativeTransportFixture(allocator, false, .pending);
+    defer allocator.free(fixture.source);
+    const claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = fixture.request.owner.acknowledgment_id,
+        .outer_generation = 2,
+        .outer_state_sha256 = @splat(3),
+        .profile_sha256 = @splat(4),
+        .profile_reference_sha256 = @splat(5),
+        .exact_lock_sha256 = fixture.request.exact_lock.digest_sha256,
+        .semantic_request_sha256 = @splat(6),
+        .mutation_status = .changed,
+        .outer_transaction_sha256 = @splat(7),
+        .nonce = @splat(8),
+    });
+    var request = fixture.request;
+    request.owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(request.owner, claim);
+    const owner = try request.owner.canonicalJson(allocator);
+    defer allocator.free(owner);
+    const owner_end = std.mem.indexOfScalar(u8, fixture.source, '\n').?;
+    const source = try std.mem.concat(allocator, u8, &.{ owner, fixture.source[owner_end..] });
+    defer allocator.free(source);
+    try std.testing.checkAllAllocationFailures(allocator, testOwnedNativeDecode, .{ request, source });
+    var other_claim = claim;
+    other_claim.nonce[0] ^= 1;
+    other_claim = try root_operation.createRecoveryReviewClaim(other_claim);
+    const original = request.owner;
+    request.owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(fixture.request.owner, other_claim);
+    try std.testing.expectEqualSlices(u8, &original.digest_sha256, &request.owner.digest_sha256);
+    try std.testing.expectError(error.InvalidNativeVerification, testOwnedNativeDecode(allocator, request, source));
+}
+
+test "apt_system_orchestrator.test.owned native verification rejects unsupported requests before IO" {
+    const allocator = std.testing.allocator;
+    const fixture = try ownedNativeTransportFixture(allocator, false, .pending);
+    defer allocator.free(fixture.source);
+    var runner: PrivateLiveRootRunner = .{ .io = undefined };
+    var verifier: SystemResultVerifier = .{ .io = undefined };
+    for (0..8) |index| {
+        var request = fixture.request;
+        const backend: system_profile.TransactionBackend = if (index == 0) .legacy_dpkg else .native;
+        switch (index) {
+            0 => {},
+            1 => request.options.install_root = "/",
+            2 => request.exact_lock.schema = exact_lock.schema_id,
+            3 => request.exact_lock.version = exact_lock.schema_version,
+            4 => request.selectors = &.{},
+            5 => request.operation = .upgrade_all,
+            6, 7 => {
+                request.owner = try root_operation.createDeferredAcknowledgment(.{
+                    .state = if (index == 6) .bound else .released,
+                    .attempt_id = request.owner.attempt_id,
+                    .acknowledgment_id = request.owner.acknowledgment_id,
+                });
+                request.outcome = .failed;
+            },
+            else => unreachable,
+        }
+        try std.testing.expectError(error.OperationalVerificationFailure, runner.interface().verifyOwnedNative(allocator, verifier.interface(), backend, request));
+        try std.testing.expectError(error.OperationalVerificationFailure, verifier.interface().verifyOwnedNativeFn.?(verifier.interface().context, allocator, backend, request, undefined));
+    }
+    var unsupported = verifier.interface();
+    unsupported.verifyOwnedNativeFn = null;
+    try std.testing.expectError(error.OperationalVerificationFailure, runner.interface().verifyOwnedNative(allocator, unsupported, .native, fixture.request));
+    var unsupported_runner = runner.interface();
+    unsupported_runner.verifyOwnedNativeFn = null;
+    try std.testing.expectError(error.OperationalVerificationFailure, unsupported_runner.verifyOwnedNative(allocator, verifier.interface(), .native, fixture.request));
+    const oversized = try allocator.alloc(u8, PrivateLiveRootRunner.maximum_native_verification_bytes + 1);
+    defer allocator.free(oversized);
+    try std.testing.expectError(error.DocumentTooLarge, testOwnedNativeDecode(allocator, fixture.request, oversized));
 }
 
 test "apt_system_orchestrator.test.transaction verification refuses native or cross-schema evidence before file access" {

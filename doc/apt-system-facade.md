@@ -316,20 +316,42 @@ recovery, and ownership cleanup pass it through their in-memory coordinator.
 Root acquisition and record publication revalidate it, as do native runtime
 entry points. The capability never enters a program, receipt, owner marker, or
 recovery document: a later recovery needs its own supervised callback. Native
-facade result-verifier/engine and recovery integration remain incomplete, so the
+facade engine and persisted recovery integration remain incomplete, so the
 central native profile gate is unchanged.
 
+`LiveRootRunner.verifyOwnedNative` provides a separate live-owned verification
+gateway. Its request carries an independently retained v2 exact-lock binding,
+the complete expected owner, original operation/selectors and caller options,
+and an explicit success or known-failure expectation. `SystemResultVerifier`
+checks the canonical lock digest, semantic request, and architecture, derives
+the original execution request/policy digests, and invokes the appropriate
+pending-success, released-success, or pending-failure verifier with freshly
+issued projection authority. Missing runner/verifier support, wrong backend,
+cross-schema locks, unsupported owner states, and mismatched evidence fail
+closed; no backend fallback or owner discovery can supply authorization.
+
+The child returns bounded canonical owner, receipt, and completion documents
+through the existing supervised transport. The parent checks exact v1/v2 owner
+identity and the outcome, attempt, caller, lock, and receipt/completion bindings.
+Canonical framing and allocation/operational failures remain fail-closed.
+This transport consistency check relies on the child's live verification; it
+is not an offline verifier for historical receipts. Success and known failure
+remain distinct result types, and neither finalizes ownership or claims a
+cleared root. Existing facade execution/recovery call sites and the legacy
+transaction verifier are not switched by this gateway.
+
 The native result module also exposes a separate read-only pending-success
-verifier for future caller integration. It requires independently retained exact
+verifier used by the owned gateway. It requires independently retained exact
 owner and caller request/policy authority, a published completion bound to the
 original root record, and the same lock, retained receipt, helper, and current
 database evidence as settled verification. Surviving active execution records
 must agree with the receipt; interrupted acknowledgment may already have removed
 some active copies. Verification never creates/adopts an attempt, acknowledges an
 owner, or runs recovery. Its owned receipt/completion result does not claim that
-the root is cleared. The public settled verifier still rejects pending ownership,
-and neither verifier accepts the physical host root. Failed completions and
-unpublished or stale ownership are not successful pending results.
+the root is cleared. The public settled verifier still rejects pending ownership
+and physical host-root aliases. Pending verification accepts the projected root
+only with callback-local authority. Failed completions and unpublished or stale
+ownership are not successful pending results.
 
 Normal native workflows instead leave a released owner after native
 acknowledgment. A separate read-only released-success entry point binds the exact
