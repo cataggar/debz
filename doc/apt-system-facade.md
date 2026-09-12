@@ -299,6 +299,18 @@ native planning/execution. Native receipt/completion publication and
 verification, recovery, and live-root authority must still be integrated before
 native profiles can pass the facade boundary.
 
+The private live-root supervisor can issue an opaque, callback-local projection
+authority to an explicitly projected callback. Owned native verification may
+borrow this authority to read the exact projected root. It binds the callback
+process, PID and mount namespaces, source/runtime/lock/mount identities, stable
+logical root spelling, and the opened root descriptor's mount identity. The
+verifier revalidates the authority under its existing read-only root lock before
+returning. Authority cannot be serialized for recovery, reused by descendants,
+or replaced by a host-root flag. Public settled verification and ordinary native
+callers continue to refuse physical host-root aliases. Native preparation,
+execution, facade dispatch, and persisted recovery do not yet consume this
+authority; the native profile gate remains unchanged.
+
 The native result module also exposes a separate read-only pending-success
 verifier for future caller integration. It requires independently retained exact
 owner and caller request/policy authority, a published completion bound to the

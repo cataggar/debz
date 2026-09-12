@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 import jsonschema
@@ -1768,6 +1769,53 @@ def exercise_workflows(
             print(f"workflow-reconciliation-{pre_mutation}-{claim_boundary}: exact exclusion and finalization passed", flush=True)
 
 
+def projection_inside(root: Path) -> None:
+    root = root.resolve(strict=True)
+    if (
+        os.getpid() != 1 or os.geteuid() != 0
+        or root.name != "root" or root.parent.name != "projection"
+        or root.parent.parent.parent != (ROOT / ".tmp").resolve()
+        or (root / ".debz-native-disposable").read_text() != "debz native projection fixture v1\n"
+    ):
+        raise RuntimeError("projection entry requires a disposable root and private PID namespace")
+    subprocess.run(["mount", "--bind", str(root), str(root)], check=True, timeout=10)
+    subprocess.run(["mount", "-t", "proc", "proc", str(root / "proc")], check=True, timeout=10)
+    os.chroot(root)
+    os.chdir("/")
+    os.execve("/fixture/native-test", ["/fixture/native-test"], {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
+        "TMPDIR": "/tmp", "DEBZ_NATIVE_PROJECTION_FIXTURE": "1",
+    })
+
+
+def exercise_projection(executable: Path, workspace: Path) -> None:
+    root = workspace / "projection" / "root"
+    for directory in ("proc", "run", "tmp", "var/lib/debz"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / ".debz-native-disposable").write_text("debz native projection fixture v1\n")
+    lock = root / NAMESPACE / "root-operation.lock"
+    lock.write_bytes(b"")
+    lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+    result = subprocess.run(
+        [
+            "unshare", "--mount", "--pid", "--fork",
+            sys.executable, str(Path(__file__).resolve()), "--projection-inside", str(root),
+        ],
+        env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
+            "TMPDIR": str(workspace), "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=60, check=False,
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert b"native_transaction_result.test.projected root external fixture...OK" in result.stderr, result.stderr
+    assert lock.read_bytes() == b""
+    assert list((root / NAMESPACE).iterdir()) == [lock], "read-only verification created root evidence"
+    assert not list((root / "run/debz/system-root").iterdir()), "private projection leaked"
+    print("native-projection: exact invocation-bound read-only authority and refusal passed", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
@@ -1778,7 +1826,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
-    for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd"):
+    for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd", "unshare", "mount"):
         if shutil.which(command) is None:
             raise RuntimeError(f"missing reference prerequisite: {command}")
     executable = arguments.native_test.resolve(strict=True)
@@ -1806,6 +1854,7 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
+            exercise_projection(executable, workspace)
             if not arguments.core_only:
                 exercise(executable, helper, workspace, environment, architecture)
             exercise_core(executable, helper, workspace, environment, architecture)
@@ -1817,4 +1866,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) == 3 and sys.argv[1] == "--projection-inside":
+        projection_inside(Path(sys.argv[2]))
+    else:
+        raise SystemExit(main())

@@ -41,6 +41,43 @@ pub const Request = struct {
     termination_grace_ms: u64 = 1_000,
 };
 
+pub const ProjectedChildFn = *const fn (
+    context: ?*anyopaque,
+    projection: *const Projection,
+) anyerror!u8;
+
+pub const ProjectedRequest = struct {
+    context: ?*anyopaque = null,
+    child: ProjectedChildFn,
+    termination_grace_ms: u64 = 1_000,
+};
+
+/// Borrowed authority for this callback's exact private projection, not a
+/// persistent permission or a way to authorize an arbitrary host-root alias.
+pub const Projection = opaque {
+    pub fn validateRoot(self: *const Projection, install_root: []const u8, root_fd: i32) Error!void {
+        const authority: *const ProjectionAuthority = @ptrCast(@alignCast(self));
+        if (!std.mem.eql(u8, install_root, logical_root_path))
+            return error.InvalidProjection;
+        if (linux.getpid() != authority.process_id or
+            !(try namespaceIdentity("/proc/self/ns/pid", linux.CLONE.NEWPID)).eql(authority.pid_namespace) or
+            !(try namespaceIdentity("/proc/self/ns/mnt", linux.CLONE.NEWNS)).eql(authority.mount_namespace))
+            return error.InvalidProjection;
+        try validateProjectedPaths(authority.lock, authority.expected);
+        if (!(try identityOf(root_fd)).eql(authority.expected.mounted_root))
+            return error.RootReplaced;
+    }
+};
+
+const Invocation = struct {
+    context: ?*anyopaque,
+    callback: union(enum) {
+        ordinary: ChildFn,
+        projected: ProjectedChildFn,
+    },
+    termination_grace_ms: u64,
+};
+
 pub const SetupStage = enum(u8) {
     source_validation,
     runtime_validation,
@@ -88,6 +125,7 @@ pub const Error = error{
     SignalSetupFailed,
     WaitFailed,
     SystemCallFailed,
+    InvalidProjection,
 };
 
 pub fn platformSupported(os: std.Target.Os.Tag) bool {
@@ -115,6 +153,42 @@ pub const testing = struct {
         const forked = linux.fork();
         if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
         return @intCast(forked);
+    }
+
+    pub fn replaceMountNamespace() Error!void {
+        if (!builtin.is_test) return error.NamespaceUnavailable;
+        if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS)
+            return error.NamespaceUnavailable;
+    }
+
+    pub fn verifyProjection(projection: *const Projection) !void {
+        if (!builtin.is_test) return error.InvalidProjection;
+        const root_fd = try openDirectoryAbsolute(logical_root_path);
+        defer closeRaw(root_fd);
+        try projection.validateRoot(logical_root_path, root_fd);
+        try std.testing.expectError(error.InvalidProjection, projection.validateRoot("/", root_fd));
+        try std.testing.expectError(error.InvalidProjection, projection.validateRoot(logical_root_path ++ "/.", root_fd));
+        const host_fd = try openDirectoryAbsolute("/");
+        defer closeRaw(host_fd);
+        try std.testing.expectError(error.RootReplaced, projection.validateRoot(logical_root_path, host_fd));
+        const foreign_fd = try openDirectoryAbsolute(runtime_directory_path);
+        defer closeRaw(foreign_fd);
+        try std.testing.expectError(error.RootReplaced, projection.validateRoot(logical_root_path, foreign_fd));
+
+        for ([_]bool{ false, true }) |nested_pid_namespace| {
+            if (nested_pid_namespace and linux.errno(linux.unshare(linux.CLONE.NEWPID)) != .SUCCESS)
+                return error.NamespaceUnavailable;
+            const child = try forkProcess();
+            if (child == 0) {
+                if (nested_pid_namespace and linux.getpid() != 1) linux.exit_group(2);
+                projection.validateRoot(logical_root_path, root_fd) catch |err|
+                    linux.exit_group(if (err == error.InvalidProjection) 0 else 3);
+                linux.exit_group(4);
+            }
+            const result = termination(try reapBlocking(child));
+            if (result != .exited or result.exited != 0) return error.InvalidProjection;
+        }
+        try projection.validateRoot(logical_root_path, root_fd);
     }
 };
 
@@ -150,6 +224,40 @@ pub fn run(request: Request) Error!Result {
 /// signals keep their ordinary disposition there. The caller owns restoration.
 pub fn runSignalsBlocked(
     request: Request,
+    signal_guard: *const SignalMaskGuard,
+) Error!Result {
+    return runInvocation(.{
+        .context = request.context,
+        .callback = .{ .ordinary = request.child },
+        .termination_grace_ms = request.termination_grace_ms,
+    }, signal_guard);
+}
+
+/// Issues projection authority only inside the supervised namespace callback.
+/// The authority must not escape that callback or be serialized for recovery.
+pub fn runProjected(request: ProjectedRequest) Error!Result {
+    var signal_guard = try blockWatchedSignals();
+    const result = runProjectedSignalsBlocked(request, &signal_guard) catch |err| {
+        signal_guard.restore() catch return error.SignalSetupFailed;
+        return err;
+    };
+    try signal_guard.restore();
+    return result;
+}
+
+pub fn runProjectedSignalsBlocked(
+    request: ProjectedRequest,
+    signal_guard: *const SignalMaskGuard,
+) Error!Result {
+    return runInvocation(.{
+        .context = request.context,
+        .callback = .{ .projected = request.child },
+        .termination_grace_ms = request.termination_grace_ms,
+    }, signal_guard);
+}
+
+fn runInvocation(
+    request: Invocation,
     signal_guard: *const SignalMaskGuard,
 ) Error!Result {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
@@ -428,7 +536,7 @@ const FailureWire = extern struct {
 const failure_magic: u32 = 0x445a4c52;
 
 fn supervisorMain(
-    request: Request,
+    request: Invocation,
     pinned: PinnedPaths,
     old_mask: linux.sigset_t,
     parent_signal_fd: i32,
@@ -610,7 +718,7 @@ fn supervisorMain(
     }
     const worker: i32 = @intCast(worker_raw);
     if (worker == 0)
-        workloadMain(request, old_mask, report_pipe[1], control_pipe[0], owned.lock_fd);
+        workloadMain(request, old_mask, report_pipe[1], control_pipe[0], owned.lock_fd, owned.lock, expected);
 
     const supervised = superviseWorkload(
         worker,
@@ -641,20 +749,43 @@ fn supervisorMain(
 }
 
 fn workloadMain(
-    request: Request,
+    request: Invocation,
     old_mask: linux.sigset_t,
     report_fd: i32,
     control_fd: i32,
     lock_fd: i32,
+    lock: Identity,
+    expected: NamespaceIdentity,
 ) noreturn {
     closeRaw(control_fd);
     closeRaw(lock_fd);
     _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
     resetInterruptActions();
-    const code = request.child(request.context, logical_root_path) catch
+    const code = invokeCallback(request, lock, expected) catch |err| {
+        if (builtin.is_test)
+            std.debug.print("live-root callback failed: {s}\n", .{@errorName(err)});
         childFail(report_fd, .callback, 0);
+    };
     closeRaw(report_fd);
     linux.exit_group(code);
+}
+
+fn invokeCallback(request: Invocation, lock: Identity, expected: NamespaceIdentity) !u8 {
+    switch (request.callback) {
+        .ordinary => |child| return child(request.context, logical_root_path),
+        .projected => |child| {
+            if (linux.getpid() != 1) return error.InvalidProjection;
+            try validateProjectedPaths(lock, expected);
+            const authority: ProjectionAuthority = .{
+                .process_id = @intCast(linux.getpid()),
+                .pid_namespace = try namespaceIdentity("/proc/self/ns/pid", linux.CLONE.NEWPID),
+                .mount_namespace = try namespaceIdentity("/proc/self/ns/mnt", linux.CLONE.NEWNS),
+                .lock = lock,
+                .expected = expected,
+            };
+            return child(request.context, @ptrCast(&authority));
+        },
+    }
 }
 
 fn validateOriginalSource(pinned: PinnedPaths) Error!void {
@@ -780,13 +911,36 @@ const NamespaceIdentity = struct {
     mounted_root: Identity,
 };
 
+const ProjectionAuthority = struct {
+    process_id: i32,
+    pid_namespace: Identity,
+    mount_namespace: Identity,
+    lock: Identity,
+    expected: NamespaceIdentity,
+};
+
+fn namespaceIdentity(path: [*:0]const u8, kind: u32) Error!Identity {
+    // These intentional procfs magic-link opens must resolve to actual nsfs
+    // descriptors of the requested type, not files in an untrusted source root.
+    const fd = try fdResult(linux.open(path, .{ .CLOEXEC = true }, 0));
+    defer closeRaw(fd);
+    const ns_get_nstype = 0xb703;
+    if (linux.ioctl(fd, ns_get_nstype, 0) != kind)
+        return error.InvalidProjection;
+    return identityOf(fd);
+}
+
 fn validateCallbackPaths(pinned: PinnedPaths, expected: NamespaceIdentity) Error!void {
+    return validateProjectedPaths(pinned.lock, expected);
+}
+
+fn validateProjectedPaths(expected_lock: Identity, expected: NamespaceIdentity) Error!void {
     const source = try identityAbsolute("/");
     if (!source.eql(expected.source)) return error.RootReplaced;
     const runtime = try identityAbsolute(runtime_directory_path);
     if (!runtime.eql(expected.runtime)) return error.RuntimeReplaced;
     const lock = try identityAbsolute(lock_path);
-    if (!lock.samePinnedEntry(pinned.lock) or
+    if (!lock.samePinnedEntry(expected_lock) or
         lock.link_count != 1 or lock.mount_id != runtime.mount_id)
         return error.LockReplaced;
     const mounted = try identityAbsolute(logical_root_path);
@@ -1651,6 +1805,10 @@ test "live_root.test.watched signal guard is inherited and restores caller mask"
         error.SignalSetupFailed,
         runSignalsBlocked(.{ .child = integrationChild }, &guard),
     );
+    try std.testing.expectError(
+        error.SignalSetupFailed,
+        runProjectedSignalsBlocked(.{ .child = projectedIntegrationChild }, &guard),
+    );
 }
 
 test "live_root.test.parent EOF kills and reaps before mount and lock cleanup" {
@@ -1686,8 +1844,25 @@ test "live_root.test.control pipe EOF detects parent death without a signal race
     try std.testing.expect(!parentAlive(control[0]));
 }
 
+test "live_root.test.projection namespace identities require real namespace descriptors" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    _ = try namespaceIdentity("/proc/self/ns/pid", linux.CLONE.NEWPID);
+    _ = try namespaceIdentity("/proc/self/ns/mnt", linux.CLONE.NEWNS);
+    try std.testing.expectError(error.InvalidProjection, namespaceIdentity("/proc/self/ns/mnt", linux.CLONE.NEWPID));
+    try std.testing.expectError(error.InvalidProjection, namespaceIdentity("/", linux.CLONE.NEWPID));
+}
+
 fn integrationChild(_: ?*anyopaque, install_root: []const u8) anyerror!u8 {
     if (!std.mem.eql(u8, install_root, logical_root_path)) return error.BadRoot;
+    return 0;
+}
+
+fn projectedIntegrationChild(_: ?*anyopaque, projection: *const Projection) anyerror!u8 {
+    try testing.verifyProjection(projection);
+    const root_fd = try openDirectoryAbsolute(logical_root_path);
+    defer closeRaw(root_fd);
+    try testing.replaceMountNamespace();
+    try std.testing.expectError(error.InvalidProjection, projection.validateRoot(logical_root_path, root_fd));
     return 0;
 }
 
@@ -1720,6 +1895,7 @@ fn expectIntegrationAvailable(result: Result) !void {
 test "live_root.test.linux integration when namespace capabilities are available" {
     if (builtin.os.tag != .linux or linux.geteuid() != 0) return error.SkipZigTest;
     try expectIntegrationAvailable(try run(.{ .child = integrationChild }));
+    try expectIntegrationAvailable(try runProjected(.{ .child = projectedIntegrationChild }));
 }
 
 const ParentDeathContext = struct {
