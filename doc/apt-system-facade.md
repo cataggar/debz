@@ -283,6 +283,22 @@ Neither path retries through legacy v1 lock or transaction evidence. Explicit
 v2 `legacy_dpkg` profiles remain usable. Native v2 lock/provenance/recovery and
 live-root integration must be completed before lifting that gate.
 
+The apt/system exact-lock verifier takes the reviewed profile's backend
+explicitly at each planning, execution, reconciliation, recovery, and
+acknowledgment boundary. Legacy selects the canonical v1 decoder; native selects
+the canonical v2 decoder, including empty and mixed-origin closures. Neither
+the filename nor a document header selects a different backend. The verifier
+preserves the actual schema/version and checks the lock digest, requested
+architecture, and semantic request digest without converting v2 origins into
+v1 repository evidence.
+
+Transaction verification is separately gated: the current legacy verifier
+rejects native selection and non-v1 lock bindings before reading evidence.
+Native lock verification alone does not authorize legacy provenance or permit
+native planning/execution. Backend construction, native operation storage,
+receipt/completion verification, recovery, and live-root authority must still
+be integrated before native profiles can pass the facade boundary.
+
 `system_profile.load` takes an injected filesystem interface. The profile and
 every source, config, keyring, and credential file are bounded and must be a
 canonical absolute non-root path. Every ancestor directory is opened without

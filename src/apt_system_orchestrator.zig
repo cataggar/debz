@@ -13,6 +13,7 @@ const operation_state = @import("apt_system_state.zig");
 const lower_ownership_token =
     @import("apt_system_lower_ownership_token.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 const live_root = @import("live_root.zig");
 const product_api = @import("product_api.zig");
 const production_backend = @import("production_backend.zig");
@@ -3881,6 +3882,7 @@ pub const ResultVerifier = struct {
     verifyLockFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        system_profile.TransactionBackend,
         []const u8,
         []const u8,
         [32]u8,
@@ -3888,6 +3890,7 @@ pub const ResultVerifier = struct {
     verifyTransactionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        system_profile.TransactionBackend,
         []const u8,
         api.DocumentBinding,
         []const u8,
@@ -3908,6 +3911,7 @@ pub const SystemResultVerifier = struct {
     fn verifyLock(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         architecture: []const u8,
         expected_request_sha256: [32]u8,
@@ -3915,6 +3919,7 @@ pub const SystemResultVerifier = struct {
         return verifyLockInternal(
             context,
             allocator,
+            backend,
             path,
             architecture,
             expected_request_sha256,
@@ -3927,6 +3932,7 @@ pub const SystemResultVerifier = struct {
     fn verifyLockInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         architecture: []const u8,
         expected_request_sha256: [32]u8,
@@ -3936,39 +3942,60 @@ pub const SystemResultVerifier = struct {
             self.io,
             allocator,
             path,
-            exact_lock.maximum_document_bytes,
+            switch (backend) {
+                .legacy_dpkg => exact_lock.maximum_document_bytes,
+                .native => exact_lock_v2.maximum_document_bytes,
+            },
         );
         defer allocator.free(source);
-        var decoded = try exact_lock.decode(
+        return verifyLockSource(
             allocator,
+            backend,
+            path,
             source,
-            exact_lock.maximum_document_bytes,
-        );
-        defer decoded.deinit();
-        if (!std.mem.eql(
-            u8,
-            decoded.lock.target_architecture,
             architecture,
-        )) return error.ArchitectureMismatch;
-        if (!std.mem.eql(
-            u8,
-            &decoded.lock.request_sha256,
-            &expected_request_sha256,
-        )) return error.RequestDigestMismatch;
-        return .{
-            .binding = .{
-                .path = path,
-                .schema = exact_lock.schema_id,
-                .version = exact_lock.schema_version,
-                .digest_sha256 = decoded.lock.digest_sha256,
+            expected_request_sha256,
+        );
+    }
+
+    fn verifyLockSource(
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        path: []const u8,
+        source: []const u8,
+        architecture: []const u8,
+        expected_request_sha256: [32]u8,
+    ) !VerifiedLock {
+        switch (backend) {
+            inline else => |kind| {
+                const Lock = if (kind == .native) exact_lock_v2 else exact_lock;
+                var decoded = Lock.decode(allocator, source, Lock.maximum_document_bytes) catch |err| switch (err) {
+                    // Canonical re-encoding uses only an allocating writer.
+                    error.WriteFailed => return error.OutOfMemory,
+                    else => return err,
+                };
+                defer decoded.deinit();
+                if (!std.mem.eql(u8, decoded.lock.target_architecture, architecture))
+                    return error.ArchitectureMismatch;
+                if (!std.mem.eql(u8, &decoded.lock.request_sha256, &expected_request_sha256))
+                    return error.RequestDigestMismatch;
+                return .{
+                    .binding = .{
+                        .path = path,
+                        .schema = Lock.schema_id,
+                        .version = Lock.schema_version,
+                        .digest_sha256 = decoded.lock.digest_sha256,
+                    },
+                    .semantic_request_sha256 = decoded.lock.request_sha256,
+                };
             },
-            .semantic_request_sha256 = decoded.lock.request_sha256,
-        };
+        }
     }
 
     fn verifyTransaction(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         lock_binding: api.DocumentBinding,
         architecture: []const u8,
@@ -3976,6 +4003,7 @@ pub const SystemResultVerifier = struct {
         return verifyTransactionInternal(
             context,
             allocator,
+            backend,
             path,
             lock_binding,
             architecture,
@@ -3988,10 +4016,16 @@ pub const SystemResultVerifier = struct {
     fn verifyTransactionInternal(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         lock_binding: api.DocumentBinding,
         architecture: []const u8,
     ) !VerifiedTransaction {
+        // Native receipts require their own retained completion/recovery binding.
+        if (backend != .legacy_dpkg) return error.UnsupportedTransactionBackend;
+        if (!std.mem.eql(u8, lock_binding.schema, exact_lock.schema_id) or
+            lock_binding.version != exact_lock.schema_version)
+            return error.LockEvidenceMismatch;
         const self: *SystemResultVerifier = @ptrCast(@alignCast(context));
         const lock_source = try readTrustedOperationFile(
             self.io,
@@ -4836,6 +4870,7 @@ pub const Engine = struct {
         const verified = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            profile.transaction_backend,
             generated_paths.exact_lock,
             profile.architecture,
             try workflowSemanticDigest(
@@ -4973,6 +5008,7 @@ pub const Engine = struct {
         const before_download = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
@@ -5070,6 +5106,7 @@ pub const Engine = struct {
         const before_execute = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
@@ -5184,6 +5221,7 @@ pub const Engine = struct {
         const after_reserve_lock = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
@@ -5482,6 +5520,7 @@ pub const Engine = struct {
         const verified_lock = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
@@ -5975,6 +6014,7 @@ pub const Engine = struct {
         const verified_lock = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             state_lock.path,
             loaded.view.architecture,
             semantic_request_sha256,
@@ -6074,6 +6114,7 @@ pub const Engine = struct {
             var verified = self.verifier.verifyTransactionFn(
                 self.verifier.context,
                 allocator,
+                loaded.view.transaction_backend,
                 binding.path,
                 verified_lock.binding,
                 loaded.view.architecture,
@@ -6297,6 +6338,7 @@ pub const Engine = struct {
         const verified = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, retained.request),
@@ -6334,6 +6376,7 @@ pub const Engine = struct {
                 verified_outer_transaction = self.verifier.verifyTransactionFn(
                     self.verifier.context,
                     allocator,
+                    loaded.view.transaction_backend,
                     binding.path,
                     verified.binding,
                     loaded.view.architecture,
@@ -6938,6 +6981,7 @@ pub const Engine = struct {
         const recovery_lock = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             recovery.prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(
@@ -7229,6 +7273,7 @@ pub const Engine = struct {
                 const before_retry = self.verifier.verifyLockFn(
                     self.verifier.context,
                     allocator,
+                    loaded.view.transaction_backend,
                     recovery.prepared.paths.exact_lock,
                     loaded.view.architecture,
                     try semanticDigestForRequest(
@@ -7323,6 +7368,7 @@ pub const Engine = struct {
                     const after_reserve = self.verifier.verifyLockFn(
                         self.verifier.context,
                         allocator,
+                        loaded.view.transaction_backend,
                         recovery.prepared.paths.exact_lock,
                         loaded.view.architecture,
                         try semanticDigestForRequest(
@@ -7511,6 +7557,7 @@ pub const Engine = struct {
                     var verified = self.verifier.verifyTransactionFn(
                         self.verifier.context,
                         allocator,
+                        loaded.view.transaction_backend,
                         shared_source,
                         recovery_lock.binding,
                         loaded.view.architecture,
@@ -7832,6 +7879,7 @@ pub const Engine = struct {
         const before_recovery = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             recovery.prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(
@@ -7999,6 +8047,7 @@ pub const Engine = struct {
         const before_ack = self.verifier.verifyLockFn(
             self.verifier.context,
             allocator,
+            loaded.view.transaction_backend,
             prepared.paths.exact_lock,
             loaded.view.architecture,
             try semanticDigestForRequest(allocator, prepared.request),
@@ -8218,6 +8267,7 @@ pub const Engine = struct {
             var verified = self.verifier.verifyTransactionFn(
                 self.verifier.context,
                 allocator,
+                profile.transaction_backend,
                 source_path,
                 prepared.exact_lock,
                 profile.architecture,
@@ -8601,6 +8651,7 @@ pub const Engine = struct {
                 var verified = self.verifier.verifyTransactionFn(
                     self.verifier.context,
                     allocator,
+                    loaded.view.transaction_backend,
                     prepared.paths.transaction_result,
                     verified_lock.binding,
                     loaded.view.architecture,
@@ -11169,6 +11220,264 @@ test "apt_system_orchestrator.test.system result verifier exposes lock and prove
     var verifier: SystemResultVerifier = .{ .io = std.testing.io };
     const interface = verifier.interface();
     try std.testing.expect(interface.context == @as(*anyopaque, @ptrCast(&verifier)));
+}
+
+fn verifyLockAllocationCase(
+    allocator: std.mem.Allocator,
+    backend: system_profile.TransactionBackend,
+    source: []const u8,
+) !void {
+    _ = try SystemResultVerifier.verifyLockSource(
+        allocator,
+        backend,
+        "/state/lock.json",
+        source,
+        "amd64",
+        @splat(7),
+    );
+}
+
+test "apt_system_orchestrator.test.backend-bound locks preserve schema identity request architecture and allocation failures" {
+    inline for (.{ .legacy_dpkg, .native }) |backend| {
+        const Lock = if (backend == .native) exact_lock_v2 else exact_lock;
+        var lock = if (backend == .native)
+            try Lock.create(std.testing.allocator, .{
+                .target_architecture = "amd64",
+                .request_sha256 = @splat(7),
+                .policy_sha256 = @splat(8),
+                .repositories = &.{},
+                .local_artifacts = &.{},
+                .packages = &.{},
+                .verified_origins = true,
+            })
+        else
+            try Lock.create(std.testing.allocator, .{
+                .target_architecture = "amd64",
+                .request_sha256 = @splat(7),
+                .policy_sha256 = @splat(8),
+                .repositories = &.{.{
+                    .id = @splat('a'),
+                    .snapshot_sha256 = @splat(1),
+                    .release_sha256 = @splat(2),
+                    .index_sha256 = @splat(3),
+                    .signer_fingerprints = &.{@splat(4)},
+                }},
+                .packages = &.{},
+                .authenticated_metadata = true,
+            });
+        defer lock.deinit();
+        const source = try lock.lock.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(source);
+        const verified = try SystemResultVerifier.verifyLockSource(
+            std.testing.allocator,
+            backend,
+            "/state/lock.json",
+            source,
+            "amd64",
+            @splat(7),
+        );
+        try std.testing.expectEqualStrings("/state/lock.json", verified.binding.path);
+        try std.testing.expectEqualStrings(Lock.schema_id, verified.binding.schema);
+        try std.testing.expectEqual(Lock.schema_version, verified.binding.version);
+        try std.testing.expectEqualSlices(u8, &lock.lock.digest_sha256, &verified.binding.digest_sha256);
+        try std.testing.expectEqualSlices(u8, &lock.lock.request_sha256, &verified.semantic_request_sha256);
+        try std.testing.expectError(
+            error.UnsupportedSchema,
+            SystemResultVerifier.verifyLockSource(
+                std.testing.allocator,
+                if (backend == .native) .legacy_dpkg else .native,
+                "/state/lock.json",
+                source,
+                "amd64",
+                @splat(7),
+            ),
+        );
+        try std.testing.expectError(
+            error.ArchitectureMismatch,
+            SystemResultVerifier.verifyLockSource(
+                std.testing.allocator,
+                backend,
+                "/state/lock.json",
+                source,
+                "arm64",
+                @splat(7),
+            ),
+        );
+        try std.testing.expectError(
+            error.RequestDigestMismatch,
+            SystemResultVerifier.verifyLockSource(
+                std.testing.allocator,
+                backend,
+                "/state/lock.json",
+                source,
+                "amd64",
+                @splat(9),
+            ),
+        );
+        const noncanonical = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{source});
+        defer std.testing.allocator.free(noncanonical);
+        try std.testing.expectError(
+            error.NonCanonicalDocument,
+            SystemResultVerifier.verifyLockSource(
+                std.testing.allocator,
+                backend,
+                "/state/lock.json",
+                noncanonical,
+                "amd64",
+                @splat(7),
+            ),
+        );
+        const tampered = try std.testing.allocator.dupe(u8, source);
+        defer std.testing.allocator.free(tampered);
+        const digest_offset = std.mem.indexOf(u8, tampered, "\"request_sha256\":\"").? +
+            "\"request_sha256\":\"".len;
+        tampered[digest_offset] = 'f';
+        try std.testing.expectError(
+            error.DigestMismatch,
+            SystemResultVerifier.verifyLockSource(
+                std.testing.allocator,
+                backend,
+                "/state/lock.json",
+                tampered,
+                "amd64",
+                @splat(7),
+            ),
+        );
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{ backend, source });
+    }
+}
+
+test "apt_system_orchestrator.test.native lock verification retains mixed origin authority" {
+    const origin = @import("package_origin.zig");
+    const artifact: origin.LocalArtifactEvidence = .{
+        .artifact_id = origin.artifactIdFromSha256(@splat(0xab)),
+        .sha256 = @splat(0xab),
+        .size = 12,
+        .package = "local",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "https://example.test/local.deb?REDACTED",
+        .trust_mode = .pinned_sha256,
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = @splat('a'),
+            .snapshot_sha256 = @splat(1),
+            .release_sha256 = @splat(2),
+            .index_sha256 = @splat(3),
+            .signer_fingerprints = &.{@splat(4)},
+        }},
+        .local_artifacts = &.{artifact},
+        .packages = &.{
+            .{
+                .name = artifact.package,
+                .version = artifact.version,
+                .architecture = artifact.architecture,
+                .origin = .{ .local_artifact = artifact },
+                .sha256 = artifact.sha256,
+                .declared_size = artifact.size,
+                .retention = .requested,
+                .dpkg_selection_hold = false,
+            },
+            .{
+                .name = "repository",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = .{ .authenticated_repository = .{
+                    .repository_id = @splat('a'),
+                    .repository_snapshot_sha256 = @splat(1),
+                } },
+                .sha256 = @splat(9),
+                .declared_size = 34,
+                .retention = .dependency,
+                .dpkg_selection_hold = false,
+            },
+        },
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const source = try lock.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    const verified = try SystemResultVerifier.verifyLockSource(
+        std.testing.allocator,
+        .native,
+        "/state/lock.json",
+        source,
+        "amd64",
+        @splat(7),
+    );
+    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, verified.binding.schema);
+    try std.testing.expectEqualSlices(u8, &lock.lock.digest_sha256, &verified.binding.digest_sha256);
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        SystemResultVerifier.verifyLockSource(
+            std.testing.allocator,
+            .legacy_dpkg,
+            "/state/lock.json",
+            source,
+            "amd64",
+            @splat(7),
+        ),
+    );
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{
+        system_profile.TransactionBackend.native, source,
+    });
+}
+
+test "apt_system_orchestrator.test.transaction verification refuses native or cross-schema evidence before file access" {
+    var verifier: SystemResultVerifier = .{ .io = undefined };
+    const legacy: api.DocumentBinding = .{
+        .path = "/unread/lock.json",
+        .schema = exact_lock.schema_id,
+        .version = exact_lock.schema_version,
+        .digest_sha256 = @splat(1),
+    };
+    var native = legacy;
+    native.schema = exact_lock_v2.schema_id;
+    native.version = exact_lock_v2.schema_version;
+    for ([_]api.DocumentBinding{ legacy, native }) |binding| {
+        try std.testing.expectError(
+            error.UnsupportedTransactionBackend,
+            SystemResultVerifier.verifyTransactionInternal(
+                &verifier,
+                std.testing.allocator,
+                .native,
+                "/unread/receipt.json",
+                binding,
+                "amd64",
+            ),
+        );
+        try std.testing.expectError(
+            error.OperationalVerificationFailure,
+            verifier.interface().verifyTransactionFn(
+                &verifier,
+                std.testing.allocator,
+                .native,
+                "/unread/receipt.json",
+                binding,
+                "amd64",
+            ),
+        );
+    }
+    var wrong_version = legacy;
+    wrong_version.version = exact_lock_v2.schema_version;
+    var wrong_schema = legacy;
+    wrong_schema.schema = exact_lock_v2.schema_id;
+    for ([_]api.DocumentBinding{ native, wrong_version, wrong_schema }) |binding|
+        try std.testing.expectError(
+            error.LockEvidenceMismatch,
+            SystemResultVerifier.verifyTransactionInternal(
+                &verifier,
+                std.testing.allocator,
+                .legacy_dpkg,
+                "/unread/result.json",
+                binding,
+                "amd64",
+            ),
+        );
 }
 
 test "apt_system_orchestrator.test.system state store exposes durable operation boundary" {
@@ -14047,6 +14356,7 @@ const FakeVerifier = struct {
     fn verifyLock(
         context: *anyopaque,
         _: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         _: []const u8,
         expected_request_sha256: [32]u8,
@@ -14068,8 +14378,8 @@ const FakeVerifier = struct {
         return .{
             .binding = .{
                 .path = path,
-                .schema = exact_lock.schema_id,
-                .version = exact_lock.schema_version,
+                .schema = if (backend == .native) exact_lock_v2.schema_id else exact_lock.schema_id,
+                .version = if (backend == .native) exact_lock_v2.schema_version else exact_lock.schema_version,
                 .digest_sha256 = digest,
             },
             .semantic_request_sha256 = semantic_request_sha256,
@@ -14079,12 +14389,14 @@ const FakeVerifier = struct {
     fn verifyTransaction(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         _: api.DocumentBinding,
         _: []const u8,
     ) VerificationError!VerifiedTransaction {
         const self: *FakeVerifier = @ptrCast(@alignCast(context));
         self.transaction_checks += 1;
+        if (backend != .legacy_dpkg) return error.OperationalVerificationFailure;
         if (self.transaction_failure_on_check) |injected|
             if (injected.check == self.transaction_checks)
                 return injected.failure;
@@ -14122,6 +14434,7 @@ const OneShotOperationalLockVerifier = struct {
     fn verifyLock(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         architecture: []const u8,
         expected_request_sha256: [32]u8,
@@ -14135,6 +14448,7 @@ const OneShotOperationalLockVerifier = struct {
         return self.inner.verifyLockFn(
             self.inner.context,
             allocator,
+            backend,
             path,
             architecture,
             expected_request_sha256,
@@ -14144,6 +14458,7 @@ const OneShotOperationalLockVerifier = struct {
     fn verifyTransaction(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         path: []const u8,
         lock: api.DocumentBinding,
         architecture: []const u8,
@@ -14153,6 +14468,7 @@ const OneShotOperationalLockVerifier = struct {
         return self.inner.verifyTransactionFn(
             self.inner.context,
             allocator,
+            backend,
             path,
             lock,
             architecture,
@@ -20927,6 +21243,7 @@ test "apt_system_orchestrator.test.completed lower protocol states require exact
     const verified_lock = try harness.verifier.interface().verifyLockFn(
         harness.verifier.interface().context,
         std.testing.allocator,
+        loaded.view.transaction_backend,
         prepared.paths.exact_lock,
         loaded.view.architecture,
         try semanticDigestForRequest(
