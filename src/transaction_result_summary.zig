@@ -493,9 +493,16 @@ test "transaction result summary binds successful canonical evidence to the exac
     const summary = try verify(std.testing.allocator, json, lock.lock, "amd64");
     try std.testing.expectEqual(@as(usize, 1), summary.package_count);
     try std.testing.expectEqualSlices(u8, &lock.lock.digest_sha256, &summary.lock_sha256);
+    // Document evidence is checked before the lock's architecture.
+    try std.testing.expectError(
+        error.LockEvidenceMismatch,
+        verify(std.testing.allocator, json, lock.lock, "arm64"),
+    );
+    var wrong_architecture = lock.lock;
+    wrong_architecture.target_architecture = "arm64";
     try std.testing.expectError(
         error.ArchitectureMismatch,
-        verify(std.testing.allocator, json, lock.lock, "arm64"),
+        verify(std.testing.allocator, json, wrong_architecture, "amd64"),
     );
     var wrong_policy = lock.lock;
     wrong_policy.policy_sha256 = @splat(0xff);
