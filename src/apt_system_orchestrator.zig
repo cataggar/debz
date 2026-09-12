@@ -30,6 +30,7 @@ pub const operation_directory_name = "operations";
 pub const request_document_name = "request-v1.json";
 pub const retained_state_name = "state-v1.json";
 pub const exact_lock_name = "exact-lock-v1.json";
+pub const native_exact_lock_name = "exact-lock-v2.json";
 pub const transaction_result_name = "transaction-result.json";
 pub const recovery_completion_name = "root-operation-recovery-completion-v1.json";
 pub const completion_document_name = "execution-completion-v1.json";
@@ -2302,6 +2303,15 @@ pub fn pathsFor(
     state_path: []const u8,
     attempt_id: [32]u8,
 ) !OperationPaths {
+    return pathsForBackend(allocator, state_path, attempt_id, .legacy_dpkg);
+}
+
+pub fn pathsForBackend(
+    allocator: std.mem.Allocator,
+    state_path: []const u8,
+    attempt_id: [32]u8,
+    backend: system_profile.TransactionBackend,
+) !OperationPaths {
     const attempt = std.fmt.bytesToHex(attempt_id, .lower);
     const directory = try std.fmt.allocPrint(
         allocator,
@@ -2315,37 +2325,36 @@ pub fn pathsFor(
         .{ state_path, operation_state.document_name },
     );
     errdefer allocator.free(active);
+    const retained = try join(allocator, directory, retained_state_name);
+    errdefer allocator.free(retained);
+    const request = try join(allocator, directory, request_document_name);
+    errdefer allocator.free(request);
+    const lock = try join(allocator, directory, switch (backend) {
+        .legacy_dpkg => exact_lock_name,
+        .native => native_exact_lock_name,
+    });
+    errdefer allocator.free(lock);
+    const transaction = try join(allocator, directory, transaction_result_name);
+    errdefer allocator.free(transaction);
+    const recovery_completion = try join(allocator, directory, recovery_completion_name);
+    errdefer allocator.free(recovery_completion);
+    const completion = try join(allocator, directory, completion_document_name);
+    errdefer allocator.free(completion);
+    const acknowledgment = try join(allocator, directory, lower_acknowledgment_name);
+    errdefer allocator.free(acknowledgment);
+    const ownership_token = try join(allocator, directory, lower_ownership_token_name);
+    errdefer allocator.free(ownership_token);
     return .{
         .directory = directory,
         .active_state = active,
-        .retained_state = try join(allocator, directory, retained_state_name),
-        .request = try join(allocator, directory, request_document_name),
-        .exact_lock = try join(allocator, directory, exact_lock_name),
-        .transaction_result = try join(
-            allocator,
-            directory,
-            transaction_result_name,
-        ),
-        .recovery_completion = try join(
-            allocator,
-            directory,
-            recovery_completion_name,
-        ),
-        .completion = try join(
-            allocator,
-            directory,
-            completion_document_name,
-        ),
-        .lower_acknowledgment = try join(
-            allocator,
-            directory,
-            lower_acknowledgment_name,
-        ),
-        .lower_ownership_token = try join(
-            allocator,
-            directory,
-            lower_ownership_token_name,
-        ),
+        .retained_state = retained,
+        .request = request,
+        .exact_lock = lock,
+        .transaction_result = transaction,
+        .recovery_completion = recovery_completion,
+        .completion = completion,
+        .lower_acknowledgment = acknowledgment,
+        .lower_ownership_token = ownership_token,
     };
 }
 
@@ -4745,10 +4754,11 @@ pub const Engine = struct {
         defer allocator.free(request_bytes);
         const request_sha256 = try request.digest();
         const attempt_id = try self.ids.nextFn(self.ids.context);
-        var generated_paths = try pathsFor(
+        var generated_paths = try pathsForBackend(
             allocator,
             profile.state_path,
             attempt_id,
+            profile.transaction_backend,
         );
         defer generated_paths.deinit(allocator);
 
@@ -6282,10 +6292,11 @@ pub const Engine = struct {
                 profile_path,
                 "active apt/system state is foreign to the requested profile",
             ) };
-        var paths = try pathsFor(
+        var paths = try pathsForBackend(
             allocator,
             loaded.view.state_path,
             active.state.attempt_id,
+            loaded.view.transaction_backend,
         );
         defer paths.deinit(allocator);
         var retained = self.store.readRequestFn(
@@ -8749,10 +8760,11 @@ pub const Engine = struct {
                 request.profile_path,
                 "active apt/system state is foreign to the trusted profile",
             );
-        var paths = try pathsFor(
+        var paths = try pathsForBackend(
             allocator,
             profile.state_path,
             active.state.attempt_id,
+            profile.transaction_backend,
         );
         defer paths.deinit(allocator);
         if (!active.state.mutation_started) {
@@ -11175,6 +11187,166 @@ test "apt_system_orchestrator.test.operation paths are retained under one filesy
         "/var/lib/debz/apt/active-operation-v1.json",
         paths.active_state,
     );
+}
+
+fn operationPathsAllocationCase(
+    allocator: std.mem.Allocator,
+    backend: system_profile.TransactionBackend,
+) !void {
+    var paths = try pathsForBackend(allocator, "/var/lib/debz", @splat(0xab), backend);
+    defer paths.deinit(allocator);
+}
+
+test "apt_system_orchestrator.test.backend-specific locks preserve shared ownership paths and allocation cleanup" {
+    var legacy = try pathsFor(std.testing.allocator, "/var/lib/debz", @splat(0xab));
+    defer legacy.deinit(std.testing.allocator);
+    inline for (.{ .legacy_dpkg, .native }) |backend| {
+        var selected = try pathsForBackend(std.testing.allocator, "/var/lib/debz", @splat(0xab), backend);
+        defer selected.deinit(std.testing.allocator);
+        inline for (std.meta.fields(OperationPaths)) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "exact_lock"))
+                try std.testing.expectEqualStrings(@field(legacy, field.name), @field(selected, field.name));
+        }
+        try std.testing.expectEqualStrings(
+            if (backend == .native) native_exact_lock_name else exact_lock_name,
+            std.fs.path.basename(selected.exact_lock),
+        );
+        try std.testing.expectEqualStrings(selected.directory, std.fs.path.dirname(selected.exact_lock).?);
+        if (backend == .legacy_dpkg)
+            try std.testing.expectEqualStrings(legacy.exact_lock, selected.exact_lock);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, operationPathsAllocationCase, .{backend});
+    }
+}
+
+test "apt_system_orchestrator.test.native lock storage shares active exclusion and retains immutable profile authority" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var native_paths = try pathsForBackend(std.testing.allocator, "/var/lib/debz", @splat(0xab), .native);
+    defer native_paths.deinit(std.testing.allocator);
+    var legacy_paths = try pathsFor(std.testing.allocator, "/var/lib/debz", @splat(0xcd));
+    defer legacy_paths.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(native_paths.active_state, legacy_paths.active_state);
+    var native_locks: operation_state.SystemLockBackend = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .dir = directory.dir,
+    };
+    var legacy_locks = native_locks;
+    const native_store = try operation_state.Store.init(
+        std.testing.io,
+        directory.dir,
+        std.fs.path.basename(native_paths.active_state),
+        native_locks.interface(),
+    );
+    const legacy_store = try operation_state.Store.init(
+        std.testing.io,
+        directory.dir,
+        std.fs.path.basename(legacy_paths.active_state),
+        legacy_locks.interface(),
+    );
+    var current = try testInitialState(std.testing.allocator, @splat(0xab));
+    defer current.deinit();
+    var other = try testInitialState(std.testing.allocator, @splat(0xcd));
+    defer other.deinit();
+    {
+        const held = try native_locks.interface().acquire(0);
+        defer native_locks.interface().release(held);
+        try std.testing.expectError(
+            error.LockTimeout,
+            legacy_store.initialize(std.testing.allocator, other.state, operation_state.maximum_document_bytes, 0),
+        );
+    }
+    try native_store.initialize(std.testing.allocator, current.state, operation_state.maximum_document_bytes, 0);
+    try std.testing.expectError(
+        error.StateAlreadyExists,
+        legacy_store.initialize(std.testing.allocator, other.state, operation_state.maximum_document_bytes, 0),
+    );
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const lock_bytes = try lock.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(lock_bytes);
+    {
+        var file = try directory.dir.createFile(std.testing.io, std.fs.path.basename(native_paths.exact_lock), .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, lock_bytes);
+        try file.sync(std.testing.io);
+    }
+    const stored_lock = try directory.dir.readFileAlloc(
+        std.testing.io,
+        std.fs.path.basename(native_paths.exact_lock),
+        std.testing.allocator,
+        .limited(exact_lock_v2.maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(stored_lock);
+    const verified = try SystemResultVerifier.verifyLockSource(
+        std.testing.allocator,
+        .native,
+        native_paths.exact_lock,
+        stored_lock,
+        "amd64",
+        @splat(7),
+    );
+    for ([_]operation_state.Phase{ .profile_loaded, .authenticated, .planned }) |phase| {
+        var next = try nextState(std.testing.allocator, current.state, .{
+            .phase = phase,
+            .exact_lock = if (phase == .planned) verified.binding else null,
+            .updated_unix = current.state.updated_unix + 1,
+        });
+        errdefer next.deinit();
+        try native_store.compareAndSet(
+            std.testing.allocator,
+            operation_state.Expected.fromState(current.state),
+            next.state,
+            operation_state.maximum_document_bytes,
+            0,
+        );
+        current.deinit();
+        current = next;
+    }
+    var observed = try legacy_store.read(std.testing.allocator, operation_state.maximum_document_bytes);
+    defer observed.deinit();
+    try std.testing.expect(documentEqual(verified.binding, observed.state.exact_lock.?));
+    try std.testing.expect(profileEqual(current.state.profile, observed.state.profile));
+    try std.testing.expect(!observed.state.mutation_started);
+    for ([_]bool{ false, true }) |replace_profile| {
+        var replacement = current.state;
+        replacement.generation += 1;
+        replacement.phase = .downloaded;
+        replacement.updated_unix += 1;
+        if (replace_profile) {
+            replacement.profile.sha256[0] ^= 0xff;
+        } else {
+            replacement.exact_lock.?.schema = exact_lock.schema_id;
+            replacement.exact_lock.?.version = exact_lock.schema_version;
+        }
+        var invalid = try operation_state.create(std.testing.allocator, replacement);
+        defer invalid.deinit();
+        try std.testing.expectError(
+            if (replace_profile) error.AttemptMismatch else error.EvidenceRollback,
+            legacy_store.compareAndSet(
+                std.testing.allocator,
+                operation_state.Expected.fromState(current.state),
+                invalid.state,
+                operation_state.maximum_document_bytes,
+                0,
+            ),
+        );
+    }
+    var unchanged = try native_store.read(std.testing.allocator, operation_state.maximum_document_bytes);
+    defer unchanged.deinit();
+    try std.testing.expectEqualSlices(u8, &current.state.digest_sha256, &unchanged.state.digest_sha256);
 }
 
 test "apt_system_orchestrator.test.execution boundary propagates only contract classes" {

@@ -295,9 +295,21 @@ v1 repository evidence.
 Transaction verification is separately gated: the current legacy verifier
 rejects native selection and non-v1 lock bindings before reading evidence.
 Native lock verification alone does not authorize legacy provenance or permit
-native planning/execution. Backend construction, native operation storage,
-receipt/completion verification, recovery, and live-root authority must still
-be integrated before native profiles can pass the facade boundary.
+native planning/execution. Backend construction, native receipt/completion
+publication and verification, recovery, and live-root authority must still be
+integrated before native profiles can pass the facade boundary.
+
+Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v2.json`
+for native from the trusted profile backend during preparation, recovery, and
+active-state reconciliation. Within a state path, both backends retain the same
+`apt/active-operation-v1.json` slot and `active-operation-v1.lock`; selecting
+native never creates a second active-operation namespace that could bypass an
+outstanding legacy operation. Request, retained state, acknowledgment, and
+ownership paths likewise remain shared. The existing state schema already
+supports versioned document bindings, so native lock storage needs no new state
+schema or redundant backend field. Exact profile-byte identity remains the
+durable backend authority, and state transitions reject profile replacement or
+lock-version substitution.
 
 `system_profile.load` takes an injected filesystem interface. The profile and
 every source, config, keyring, and credential file are bounded and must be a
