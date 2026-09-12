@@ -1829,7 +1829,11 @@ def exercise_workflows(
                 return None
             value = document(report)
             if "owned_verification" in extra:
-                assert value == {"verified": True, "outcome": "failed" if outcome == "failed" else "succeeded"}, value
+                expected = (
+                    {"verified": False} if extra["owned_verification"].get("expected_error")
+                    else {"verified": True, "outcome": "failed" if outcome == "failed" else "succeeded"}
+                )
+                assert value == expected, value
             elif expected_exit is None:
                 assert value["exit_status"] != 0 and not value["changed"], value
             else:
@@ -1840,6 +1844,7 @@ def exercise_workflows(
             m.write(fixture / "owner.json", (root / owner_path).read_bytes())
 
         projected_run("plan_only")
+        projected_lock = document(fixture / "lock.json")
         initial_status = (root / "var/lib/dpkg/status").read_bytes()
         projected_run("reserve", expected_exit=None, withhold_projection=True)
         assert not (root / OPERATION).exists() and not (root / owner_path).exists()
@@ -1866,12 +1871,46 @@ def exercise_workflows(
             str(path.relative_to(root)): path.read_bytes()
             for path in (root / NAMESPACE).rglob("*") if path.is_file()
         }
+        verification = {
+            "lock_path": "/fixture/lock.json",
+            "lock_sha256": list(bytes.fromhex(projected_lock["digest_sha256"])),
+            "state": "released" if outcome == "success" else "pending",
+            "outcome": "failed" if outcome == "failed" else "succeeded",
+        }
         for _ in range(2):
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification=verification)
+        for invalid in (
+            {"backend": "legacy_dpkg"},
+            {"lock_version": 1},
+            {"lock_schema": "https://debz.dev/schema/exact-closure-lock-v1"},
+            {"lock_sha256": [0] * 32},
+            {"outcome": "succeeded" if outcome == "failed" else "failed"},
+        ):
             projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
-                "lock_path": "/fixture/lock.json",
-                "state": "released" if outcome == "success" else "pending",
-                "outcome": "failed" if outcome == "failed" else "succeeded",
+                **verification, **invalid, "expected_error": "OperationalVerificationFailure",
             })
+        for changed in ("policy", "selectors", "architecture"):
+            changed_request = projected_request("recover")
+            if changed == "policy":
+                changed_request["options"]["recommends"] = True
+            elif changed == "selectors":
+                changed_request["selectors"] = [{"name": "different-package"}]
+            else:
+                changed_request["options"]["architecture"] = "arm64" if architecture == "amd64" else "amd64"
+            projected_run("recover", workflow=changed_request, owner_evidence="/fixture/owner.json",
+                          owned_verification={**verification, "expected_error": "OperationalVerificationFailure"})
+        for damaged in (
+            fixture / "lock.json",
+            root / NAMESPACE / "native-transaction-provenance-v1.json",
+            root / "var/lib/dpkg/status",
+        ):
+            original = damaged.read_bytes()
+            try:
+                damaged.write_bytes(b"{}\n")
+                projected_run("recover", owner_evidence="/fixture/owner.json",
+                              owned_verification={**verification, "expected_error": "OperationalVerificationFailure"})
+            finally:
+                damaged.write_bytes(original)
         assert (root / "var/lib/dpkg/status").read_bytes() == status_before
         assert evidence_before == {
             str(path.relative_to(root)): path.read_bytes()

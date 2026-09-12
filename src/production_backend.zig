@@ -4827,7 +4827,7 @@ const ProductLock = union(transaction_engine.Kind) {
     }
 };
 
-fn planningPolicyDigest(backend: transaction_engine.Kind, options: api.CommonOptions) [32]u8 {
+pub fn planningPolicyDigest(backend: transaction_engine.Kind, options: api.CommonOptions) [32]u8 {
     return switch (backend) {
         inline else => |kind| {
             const digest = if (kind == .native)
@@ -5374,6 +5374,10 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         acknowledgment: ?enum { ownership, recovery } = null,
         owned_verification: ?struct {
             lock_path: []const u8,
+            lock_sha256: ?[32]u8 = null,
+            lock_schema: []const u8 = exact_lock_v2.schema_id,
+            lock_version: u32 = exact_lock_v2.schema_version,
+            backend: transaction_engine.Kind = .native,
             expected_error: ?[]const u8 = null,
             state: enum { pending, released } = .pending,
             outcome: enum { succeeded, failed } = .succeeded,
@@ -5382,7 +5386,15 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
+        !@import("absolute_path.zig").nonRoot(external.report))
+        return error.InvalidExternalWorkflowRequest;
     if (external.projected and projection == null) {
+        if (external.owned_verification != null) {
+            const output = try verifyExternalOwnedNativeWorkflow(allocator, external);
+            try writeExternalNativeWorkflowReport(external.report, output);
+            return;
+        }
         const Callback = struct {
             path: []const u8,
             fn run(raw: ?*anyopaque, authority: *const live_root.Projection) anyerror!u8 {
@@ -5400,9 +5412,6 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         std.debug.print("projected native workflow failed: {any}\n", .{result});
         return error.InvalidExternalWorkflowRequest;
     }
-    if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
-        !@import("absolute_path.zig").nonRoot(external.report))
-        return error.InvalidExternalWorkflowRequest;
     var root = try root_fs.openAbsoluteRoot(std.testing.io, external.workflow.options.install_root);
     defer root.close();
     const marker = try root.root.readFileAlloc(
@@ -5572,12 +5581,58 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         const outcome = try backend.executeWorkflow(allocator, requested);
         break :result try outcome.canonicalJson(allocator);
     };
-    var report_dir = try openAbsoluteDirectory(std.testing.io, std.fs.path.dirname(external.report).?);
+    try writeExternalNativeWorkflowReport(external.report, output);
+}
+
+fn writeExternalNativeWorkflowReport(path: []const u8, output: []const u8) !void {
+    var report_dir = try openAbsoluteDirectory(std.testing.io, std.fs.path.dirname(path).?);
     defer report_dir.close(std.testing.io);
     try report_dir.writeFile(std.testing.io, .{
-        .sub_path = std.fs.path.basename(external.report),
+        .sub_path = std.fs.path.basename(path),
         .data = output,
     });
+}
+
+fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: anytype) ![]const u8 {
+    const facade = @import("apt_system_orchestrator.zig");
+    const check = external.owned_verification.?;
+    const owner = try root_operation.decodeDeferredAcknowledgment(
+        allocator,
+        try readFile(allocator, std.testing.io, external.owner_evidence orelse return error.InvalidExternalWorkflowRequest, root_operation.maximum_document_bytes),
+    );
+    if ((owner.state == .pending) != (check.state == .pending))
+        return error.InvalidExternalWorkflowRequest;
+    var runner: facade.PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var verifier: facade.SystemResultVerifier = .{ .io = std.testing.io };
+    var result = runner.interface().verifyOwnedNative(allocator, verifier.interface(), check.backend, .{
+        .exact_lock = .{
+            .path = check.lock_path,
+            .schema = check.lock_schema,
+            .version = check.lock_version,
+            .digest_sha256 = check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest,
+        },
+        .owner = owner,
+        .operation = switch (external.workflow.operation) {
+            .install => .install,
+            .remove => .remove,
+            .upgrade_all => .upgrade_all,
+        },
+        .selectors = external.workflow.selectors,
+        .options = external.workflow.options,
+        .outcome = if (check.outcome == .failed) .failed else .succeeded,
+    }) catch |err| {
+        try std.testing.expectEqualStrings(check.expected_error orelse return err, @errorName(err));
+        return "{\"verified\":false}\n";
+    };
+    defer result.deinit();
+    try std.testing.expect(check.expected_error == null);
+    switch (result) {
+        inline else => |owned| try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, owned.owner)),
+    }
+    return if (result == .succeeded)
+        "{\"verified\":true,\"outcome\":\"succeeded\"}\n"
+    else
+        "{\"verified\":true,\"outcome\":\"failed\"}\n";
 }
 
 test "production workflow required_security.native acknowledgment preserves exact reviewed ownership" {
