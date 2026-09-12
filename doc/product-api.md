@@ -43,6 +43,9 @@ API v1. They expose `debz.package_cache_workflow` as a lock-oriented,
 non-installing API: fingerprinting performs no repository or package I/O, and
 preparation authenticates and verifies the complete exact-lock v1 closure.
 Exact-lock v2/local-artifact origins are rejected explicitly.
+The lower-level `debz.package_cache_archive` library separately exposes typed
+v2 import/export, including empty closures, using its distinct v2 stream.
+Those native archive APIs are not yet selected by the CLI or action contracts.
 
 ```sh
 debz package-cache fingerprint \
