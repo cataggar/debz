@@ -41,11 +41,13 @@ The nested `debz package-cache fingerprint` and `debz package-cache prepare`
 commands likewise use dedicated versioned schemas rather than changing product
 API v1. They expose `debz.package_cache_workflow` as a lock-oriented,
 non-installing API: fingerprinting performs no repository or package I/O, and
-preparation authenticates and verifies the complete exact-lock v1 closure.
-Exact-lock v2/local-artifact origins are rejected explicitly.
-The lower-level `debz.package_cache_archive` library separately exposes typed
-v2 import/export, including empty closures, using its distinct v2 stream.
-Those native archive APIs are not yet selected by the CLI or action contracts.
+preparation authenticates and verifies the complete lock closure. The default
+`legacy_dpkg` backend retains the v1 lock, fingerprint, result, and archive
+contracts. Explicit `--transaction-backend native` selects genuine v2 locks
+using the core native solver-policy domain, v2 fingerprint/result schemas,
+and the distinct v2 archive stream. Neither mode auto-detects the other.
+The library provides corresponding typed `createNativeFingerprint`,
+`preflightNative`, and `prepareNative` entry points and writer-held variants.
 
 ```sh
 debz package-cache fingerprint \
@@ -56,7 +58,29 @@ debz package-cache prepare \
   --lock-input /work/closure.lock.json \
   --cache-path /work/cache --architecture amd64 \
   --source /work/repository.sources --keyring /work/archive-keyring.gpg --json
+
+debz package-cache prepare --transaction-backend native \
+  --lock-input /work/native-closure.lock.json \
+  --cache-path /work/native-cache --architecture amd64 \
+  --source /work/repository.sources --keyring /work/archive-keyring.gpg \
+  --archive-output /work/native-closure.dbzcache --json
 ```
+
+Native preparation permits empty and mixed-origin closures. Repository
+packages still require matching authenticated metadata, including on cache
+hits. Local artifacts must already be present in the verified CAS or imported
+archive and must pass local payload, digest, size, and identity validation.
+Missing local artifacts require separate explicit acquisition; corrupt local
+artifacts refuse even with online repair enabled. Redacted provenance URLs
+are never treated as acquisition inputs or promoted to repository authority.
+Closures without repository origins require no source or keyring inputs.
+Empty closures produce zero verified objects and a canonical empty v2 archive.
+Repository/bootstrap workflows with other solver-policy scopes remain gated
+until their own native integration.
+
+Native keys use a separate `debz-package-cas-v2-` prefix and fingerprint
+domain while retaining the shared `packages-v1/objects` layout. Existing
+Actions contracts remain v1-only until their separate native integration.
 
 `--restored-cache none|partial|exact` is a typed orchestration hint. The
 first-party action computes it from the cache service response; it is not
@@ -115,7 +139,8 @@ cross backend policy boundaries. V1 remains the legacy core format; neither
 backend silently accepts the other's format. Native package downloads bind
 identity, repository/snapshot, SHA-256, and size before cache or transport
 access, including cache-only replay. The separate `package-cache` commands
-and other consumer contracts remain v1-only where documented.
+also support explicit native selection as described above; other consumer
+contracts remain gated where documented.
 
 Native execution captures the complete database and acquired archive evidence
 under its caller-owned root attempt, derives trigger authority, and revalidates
@@ -241,14 +266,17 @@ There is no promise of APT output, wording, or option-spelling compatibility.
 Package-cache JSON schemas are:
 
 - [`package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
+- [`package-cache-fingerprint-v2.json`](../schema/package-cache-fingerprint-v2.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
+- [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned
 fingerprint, exact/compatible cache keys or verified preparation counts, and
 the exact `packages-v1/objects` path. Fingerprint output also supplies the
 maximum opaque archive byte count for a bounded pre-import download. Error
-documents contain no cache key or success-shaped path.
+documents contain no cache key or success-shaped path. The error v1 envelope
+is backend-neutral and remains shared by both modes.
 
 Credentials must not be placed in diagnostics. `product_api.redact` removes
 URI user information before provenance or output is constructed.

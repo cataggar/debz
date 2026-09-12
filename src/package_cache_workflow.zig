@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const deb_payload = @import("deb_payload.zig");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const package_cache_archive = @import("package_cache_archive.zig");
 const packages_index = @import("packages_index.zig");
@@ -18,6 +19,14 @@ pub const fingerprint_domain = "debz-package-cache-fingerprint-v1";
 pub const abi_identity = "debian-package-archive-v1";
 pub const payload_policy = "deb-payload-default-limits-v1";
 pub const supported_origin_mode = "exact-lock-v1-authenticated-repository";
+pub const native_capability = "package-cache-v2";
+pub const native_fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v2";
+pub const native_result_schema = "io.github.cataggar.debz.package-cache-result.v2";
+pub const native_api_version: u32 = 2;
+pub const native_fingerprint_domain = "debz-package-cache-fingerprint-v2";
+pub const native_origin_mode = "exact-lock-v2-verified-origins";
+
+const Version = enum { v1, v2 };
 
 pub const RepositoryPolicy = enum {
     strict_priority,
@@ -110,6 +119,7 @@ pub const Request = struct {
 };
 
 pub const Fingerprint = struct {
+    version: Version = .v1,
     lock_digest: [64]u8,
     acceptance_policy_digest: [64]u8,
     fingerprint: [64]u8,
@@ -133,16 +143,17 @@ pub const Fingerprint = struct {
     }
 
     pub fn canonicalJson(self: Fingerprint, allocator: std.mem.Allocator) ![]u8 {
+        const native = self.version == .v2;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
         try writer.writeAll("{\"schema\":");
-        try writeJsonString(writer, fingerprint_schema);
-        try writer.print(",\"api_version\":{},\"capability\":", .{api_version});
-        try writeJsonString(writer, capability);
+        try writeJsonString(writer, if (native) native_fingerprint_schema else fingerprint_schema);
+        try writer.print(",\"api_version\":{},\"capability\":", .{if (native) native_api_version else api_version});
+        try writeJsonString(writer, if (native) native_capability else capability);
         try writer.writeAll(",\"lock_schema\":");
-        try writeJsonString(writer, exact_lock.schema_id);
-        try writer.print(",\"lock_schema_version\":{},\"lock_digest\":", .{exact_lock.schema_version});
+        try writeJsonString(writer, if (native) exact_lock_v2.schema_id else exact_lock.schema_id);
+        try writer.print(",\"lock_schema_version\":{},\"lock_digest\":", .{if (native) exact_lock_v2.schema_version else exact_lock.schema_version});
         try writeJsonString(writer, &self.lock_digest);
         try writer.writeAll(",\"target_architecture\":");
         try writeJsonString(writer, self.target_architecture);
@@ -153,11 +164,11 @@ pub const Fingerprint = struct {
         try writer.writeAll(",\"cas_layout\":");
         try writeJsonString(writer, package_acquisition.namespace);
         try writer.writeAll(",\"archive_format\":");
-        try writeJsonString(writer, package_cache_archive.format_id);
+        try writeJsonString(writer, if (native) package_cache_archive.native_format_id else package_cache_archive.format_id);
         try writer.writeAll(",\"payload_policy\":");
         try writeJsonString(writer, payload_policy);
         try writer.writeAll(",\"origin_mode\":");
-        try writeJsonString(writer, supported_origin_mode);
+        try writeJsonString(writer, if (native) native_origin_mode else supported_origin_mode);
         try writer.writeAll(",\"acceptance_policy_digest\":");
         try writeJsonString(writer, &self.acceptance_policy_digest);
         try writer.writeAll(",\"fingerprint\":");
@@ -184,18 +195,27 @@ pub const RepositoryView = struct {
     signer_fingerprint: ?[20]u8,
 };
 
-pub const PrepareRequest = struct {
-    lock: *const exact_lock.Lock,
-    cache: *package_acquisition.Cache,
-    repositories: []const RepositoryView,
-    architecture: []const u8,
-    debz_version: []const u8,
-    cache_root: []const u8,
-    policy: Policy,
-    proxy: repository_acquisition.ProxyPolicy = .direct,
-    credentials: repository_acquisition.CredentialsProvider = .none,
-    acquisition: repository_acquisition.Dependencies,
-};
+pub const PrepareRequest = PrepareRequestVersion(.v1);
+pub const NativePrepareRequest = PrepareRequestVersion(.v2);
+
+fn PrepareRequestVersion(comptime version: Version) type {
+    return struct {
+        lock: *const LockType(version),
+        cache: *package_acquisition.Cache,
+        repositories: []const RepositoryView,
+        architecture: []const u8,
+        debz_version: []const u8,
+        cache_root: []const u8,
+        policy: Policy,
+        proxy: repository_acquisition.ProxyPolicy = .direct,
+        credentials: repository_acquisition.CredentialsProvider = .none,
+        acquisition: repository_acquisition.Dependencies,
+    };
+}
+
+fn LockType(comptime version: Version) type {
+    return if (version == .v1) exact_lock.Lock else exact_lock_v2.Lock;
+}
 
 pub const PreflightResult = struct {
     present: usize,
@@ -204,6 +224,7 @@ pub const PreflightResult = struct {
 };
 
 pub const PrepareResult = struct {
+    version: Version = .v1,
     lock_digest: [64]u8,
     fingerprint: [64]u8,
     target_architecture: []u8,
@@ -226,13 +247,14 @@ pub const PrepareResult = struct {
     }
 
     pub fn canonicalJson(self: PrepareResult, allocator: std.mem.Allocator) ![]u8 {
+        const native = self.version == .v2;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
         try writer.writeAll("{\"schema\":");
-        try writeJsonString(writer, result_schema);
-        try writer.print(",\"api_version\":{},\"capability\":", .{api_version});
-        try writeJsonString(writer, capability);
+        try writeJsonString(writer, if (native) native_result_schema else result_schema);
+        try writer.print(",\"api_version\":{},\"capability\":", .{if (native) native_api_version else api_version});
+        try writeJsonString(writer, if (native) native_capability else capability);
         try writer.writeAll(",\"lock_digest\":");
         try writeJsonString(writer, &self.lock_digest);
         try writer.writeAll(",\"fingerprint\":");
@@ -279,6 +301,7 @@ pub const Error = error{
     AmbiguousPackage,
     PackageEvidenceMismatch,
     InvalidPackagePayload,
+    LocalArtifactAcquisitionRequired,
     CleanupIncomplete,
     GarbageCollectionIncomplete,
 };
@@ -321,13 +344,35 @@ pub fn createFingerprint(
     cache_root: []const u8,
     policy: Policy,
 ) !Fingerprint {
-    try validateLock(allocator, lock, architecture, policy);
+    return createFingerprintVersion(.v1, allocator, lock, architecture, debz_version, cache_root, policy);
+}
+
+pub fn createNativeFingerprint(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    architecture: []const u8,
+    debz_version: []const u8,
+    cache_root: []const u8,
+    policy: Policy,
+) !Fingerprint {
+    return createFingerprintVersion(.v2, allocator, lock, architecture, debz_version, cache_root, policy);
+}
+
+fn createFingerprintVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    lock: LockType(version),
+    architecture: []const u8,
+    debz_version: []const u8,
+    cache_root: []const u8,
+    policy: Policy,
+) !Fingerprint {
+    try validateLock(version, allocator, lock, architecture, policy);
     _ = std.SemanticVersion.parse(debz_version) catch return error.InvalidRequest;
     if (!validAbsolutePath(cache_root)) return error.InvalidRequest;
 
-    const policy_digest = acceptancePolicyDigest(allocator, architecture, debz_version, policy) catch |err|
-        return err;
-    const fingerprint_digest = fullFingerprint(lock.digest_sha256, policy_digest);
+    const policy_digest = try acceptancePolicyDigest(version, allocator, architecture, debz_version, policy);
+    const fingerprint_digest = fullFingerprint(version, lock.digest_sha256, policy_digest);
     var lock_hex: [64]u8 = undefined;
     var policy_hex: [64]u8 = undefined;
     var fingerprint_hex: [64]u8 = undefined;
@@ -336,14 +381,14 @@ pub fn createFingerprint(
     formatHex(fingerprint_digest, &fingerprint_hex);
     const primary_key = try std.fmt.allocPrint(
         allocator,
-        "debz-package-cas-v1-{s}-{s}-{s}",
-        .{ architecture, &policy_hex, &lock_hex },
+        "debz-package-cas-v{d}-{s}-{s}-{s}",
+        .{ if (version == .v1) api_version else native_api_version, architecture, &policy_hex, &lock_hex },
     );
     errdefer allocator.free(primary_key);
     const restore_prefix = try std.fmt.allocPrint(
         allocator,
-        "debz-package-cas-v1-{s}-{s}-",
-        .{ architecture, &policy_hex },
+        "debz-package-cas-v{d}-{s}-{s}-",
+        .{ if (version == .v1) api_version else native_api_version, architecture, &policy_hex },
     );
     errdefer allocator.free(restore_prefix);
     const cache_path = try std.fmt.allocPrint(
@@ -354,20 +399,26 @@ pub fn createFingerprint(
     errdefer allocator.free(cache_path);
     const target = try allocator.dupe(u8, architecture);
     errdefer allocator.free(target);
-    const version = try allocator.dupe(u8, debz_version);
-    errdefer allocator.free(version);
+    const owned_version = try allocator.dupe(u8, debz_version);
+    errdefer allocator.free(owned_version);
     const owned_root = try allocator.dupe(u8, cache_root);
-    const maximum_archive_bytes = try package_cache_archive.maximumArchiveBytes(.{
+    errdefer allocator.free(owned_root);
+    const maximumArchiveBytes = if (version == .v1)
+        package_cache_archive.maximumArchiveBytes
+    else
+        package_cache_archive.maximumNativeArchiveBytes;
+    const maximum_archive_bytes = try maximumArchiveBytes(.{
         .maximum_objects = policy.limits.maximum_lock_packages,
         .maximum_object_bytes = policy.limits.maximum_package_bytes,
         .maximum_total_object_bytes = policy.limits.maximum_total_package_bytes,
     });
     return .{
+        .version = version,
         .lock_digest = lock_hex,
         .acceptance_policy_digest = policy_hex,
         .fingerprint = fingerprint_hex,
         .target_architecture = target,
-        .debz_version = version,
+        .debz_version = owned_version,
         .primary_key = primary_key,
         .restore_prefix = restore_prefix,
         .cache_root = owned_root,
@@ -381,9 +432,25 @@ pub fn prepare(
     allocator: std.mem.Allocator,
     request: PrepareRequest,
 ) !PrepareResult {
+    return prepareVersion(.v1, allocator, request);
+}
+
+pub fn prepareNative(
+    allocator: std.mem.Allocator,
+    request: NativePrepareRequest,
+) !PrepareResult {
+    return prepareVersion(.v2, allocator, request);
+}
+
+fn prepareVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    request: PrepareRequestVersion(version),
+) !PrepareResult {
     if (request.cache.limits.maximum_object_bytes != request.policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
-    var validated = try createFingerprint(
+    var validated = try createFingerprintVersion(
+        version,
         allocator,
         request.lock.*,
         request.architecture,
@@ -400,8 +467,9 @@ pub fn prepare(
         request.policy,
         &writer_lock,
     );
-    _ = try preflight(allocator, request.lock.*, request.cache, request.policy, &writer_lock);
-    return prepareWithWriterLockAfterCleanup(
+    _ = try preflightVersion(version, allocator, request.lock.*, request.cache, request.policy, &writer_lock);
+    return prepareAfterCleanupVersion(
+        version,
         allocator,
         request,
         &writer_lock,
@@ -416,10 +484,31 @@ pub fn preflight(
     policy: Policy,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !PreflightResult {
+    return preflightVersion(.v1, allocator, lock, cache, policy, writer_lock);
+}
+
+pub fn preflightNative(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    cache: *package_acquisition.Cache,
+    policy: Policy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PreflightResult {
+    return preflightVersion(.v2, allocator, lock, cache, policy, writer_lock);
+}
+
+fn preflightVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    lock: LockType(version),
+    cache: *package_acquisition.Cache,
+    policy: Policy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PreflightResult {
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
-    try validateLock(allocator, lock, lock.target_architecture, policy);
+    try validateLock(version, allocator, lock, lock.target_architecture, policy);
     var result: PreflightResult = .{
         .present = 0,
         .missing = 0,
@@ -441,11 +530,19 @@ pub fn preflight(
                     policy.corrupt_cache == .fail)
                     return error.CorruptObject;
                 if (policy.offline) return error.CacheMiss;
+                if (version == .v2) {
+                    if (package.origin == .local_artifact)
+                        return error.LocalArtifactAcquisitionRequired;
+                }
                 result.missing += 1;
             },
             error.CorruptObject => {
                 if (policy.offline or policy.corrupt_cache == .fail)
                     return error.CorruptObject;
+                if (version == .v2) {
+                    if (package.origin == .local_artifact)
+                        return error.CorruptObject;
+                }
                 result.corrupt_for_repair += 1;
             },
             else => |other| return other,
@@ -459,13 +556,31 @@ pub fn prepareWithWriterLock(
     request: PrepareRequest,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !PrepareResult {
+    return prepareWithWriterVersion(.v1, allocator, request, writer_lock);
+}
+
+pub fn prepareNativeWithWriterLock(
+    allocator: std.mem.Allocator,
+    request: NativePrepareRequest,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PrepareResult {
+    return prepareWithWriterVersion(.v2, allocator, request, writer_lock);
+}
+
+fn prepareWithWriterVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    request: PrepareRequestVersion(version),
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PrepareResult {
     const initial_cleanup = try cleanupStagingForPrepare(
         allocator,
         request.cache,
         request.policy,
         writer_lock,
     );
-    return prepareWithWriterLockAfterCleanup(
+    return prepareAfterCleanupVersion(
+        version,
         allocator,
         request,
         writer_lock,
@@ -496,11 +611,31 @@ pub fn prepareWithWriterLockAfterCleanup(
     writer_lock: *const package_acquisition.Cache.WriterLock,
     initial_cleanup: package_acquisition.CleanupResult,
 ) !PrepareResult {
+    return prepareAfterCleanupVersion(.v1, allocator, request, writer_lock, initial_cleanup);
+}
+
+pub fn prepareNativeWithWriterLockAfterCleanup(
+    allocator: std.mem.Allocator,
+    request: NativePrepareRequest,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    initial_cleanup: package_acquisition.CleanupResult,
+) !PrepareResult {
+    return prepareAfterCleanupVersion(.v2, allocator, request, writer_lock, initial_cleanup);
+}
+
+fn prepareAfterCleanupVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    request: PrepareRequestVersion(version),
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    initial_cleanup: package_acquisition.CleanupResult,
+) !PrepareResult {
     if (writer_lock.cache != request.cache or writer_lock.file == null or
         request.cache.limits.maximum_object_bytes != request.policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
     if (!initial_cleanup.complete) return error.CleanupIncomplete;
-    var fingerprint = try createFingerprint(
+    var fingerprint = try createFingerprintVersion(
+        version,
         allocator,
         request.lock.*,
         request.architecture,
@@ -509,8 +644,11 @@ pub fn prepareWithWriterLockAfterCleanup(
         request.policy,
     );
     defer fingerprint.deinit();
-    try validateRepositoryEvidence(allocator, request.lock.*, request.repositories);
+    if (version == .v2)
+        _ = try preflightNative(allocator, request.lock.*, request.cache, request.policy, writer_lock);
+    try validateRepositoryEvidence(version, allocator, request.lock.*, request.repositories);
     const matches = try matchPackages(
+        version,
         allocator,
         request.lock.*,
         request.repositories,
@@ -527,7 +665,35 @@ pub fn prepareWithWriterLockAfterCleanup(
     var downloaded_count: usize = 0;
     var reused_count: usize = 0;
     var transport_bytes: u64 = 0;
-    for (request.lock.packages, matches) |locked, match| {
+    for (request.lock.packages, matches) |locked, maybe_match| {
+        if (version == .v2) {
+            if (locked.origin == .local_artifact) {
+                const bytes = try request.cache.lookup(
+                    allocator,
+                    .{ .bytes = locked.sha256 },
+                    locked.declared_size,
+                    .verify_sha256,
+                );
+                defer allocator.free(bytes);
+                var validation = deb_payload.inspectLocal(allocator, bytes, .{
+                    .source = locked.origin.local_artifact.acquisition_url,
+                    .size = locked.declared_size,
+                    .sha256 = locked.sha256,
+                    .identity = .{
+                        .package = locked.name,
+                        .version = locked.version,
+                        .architecture = locked.architecture,
+                    },
+                }, .{});
+                switch (validation) {
+                    .diagnostic => return error.InvalidPackagePayload,
+                    .validation => |*value| value.deinit(),
+                }
+                reused_count += 1;
+                continue;
+            }
+        }
+        const match = maybe_match orelse return error.MissingPackage;
         const view = request.repositories[match.repository_index];
         const record = &view.input.packages.records[match.record_index];
         const origin: solver.PackageOrigin = .{
@@ -564,7 +730,8 @@ pub fn prepareWithWriterLockAfterCleanup(
                     .credentials = request.credentials,
                     .cache_lock = .{ .held = writer_lock },
                 },
-                .exact_lock_package = locked,
+                .exact_lock_package = if (version == .v1) locked else null,
+                .exact_lock_v2_package = if (version == .v2) locked else null,
             },
             request.acquisition,
         );
@@ -613,6 +780,7 @@ pub fn prepareWithWriterLockAfterCleanup(
     errdefer allocator.free(owned_root);
     const owned_path = try allocator.dupe(u8, fingerprint.cache_path);
     return .{
+        .version = version,
         .lock_digest = fingerprint.lock_digest,
         .fingerprint = fingerprint.fingerprint,
         .target_architecture = target,
@@ -639,6 +807,18 @@ pub fn solverPolicyDigest(
     hash.update(if (recommends) "recommends\x00" else "no-recommends\x00");
     hash.update(if (allow_downgrade) "allow-downgrade\x00" else "no-downgrade\x00");
     hash.update(@tagName(repository_policy));
+    return hash.finalResult();
+}
+
+pub fn nativeSolverPolicyDigest(
+    recommends: bool,
+    allow_downgrade: bool,
+    repository_policy: RepositoryPolicy,
+) [32]u8 {
+    const legacy = solverPolicyDigest(recommends, allow_downgrade, repository_policy);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz.product-native-solver-policy-v1\x00");
+    hash.update(&legacy);
     return hash.finalResult();
 }
 
@@ -682,16 +862,18 @@ fn validatePolicy(architecture: []const u8, policy: Policy) Error!void {
 }
 
 fn validateLock(
+    comptime version: Version,
     allocator: std.mem.Allocator,
-    lock: exact_lock.Lock,
+    lock: LockType(version),
     architecture: []const u8,
     policy: Policy,
 ) !void {
     try validatePolicy(architecture, policy);
     if (!std.mem.eql(u8, lock.target_architecture, architecture)) return error.ArchitectureMismatch;
-    if (lock.packages.len == 0 or lock.packages.len > policy.limits.maximum_lock_packages)
+    if ((version == .v1 and lock.packages.len == 0) or lock.packages.len > policy.limits.maximum_lock_packages)
         return error.TooManyPackages;
-    const expected_policy = solverPolicyDigest(
+    const policyDigest = if (version == .v1) solverPolicyDigest else nativeSolverPolicyDigest;
+    const expected_policy = policyDigest(
         policy.recommends,
         policy.allow_downgrade,
         policy.repository_policy,
@@ -712,13 +894,14 @@ fn validateLock(
         digests[index] = package.sha256;
     }
     std.mem.sort([32]u8, digests, {}, lessBytes32);
-    for (digests[1..], digests[0 .. digests.len - 1]) |current, prior|
+    if (digests.len > 1) for (digests[1..], digests[0 .. digests.len - 1]) |current, prior|
         if (std.mem.eql(u8, &current, &prior)) return error.DuplicatePackageDigest;
 }
 
 fn validateRepositoryEvidence(
+    comptime version: Version,
     allocator: std.mem.Allocator,
-    lock: exact_lock.Lock,
+    lock: LockType(version),
     repositories: []const RepositoryView,
 ) !void {
     var by_id = std.AutoHashMap([64]u8, usize).init(allocator);
@@ -749,14 +932,20 @@ const PackageMatch = struct {
 };
 
 fn matchPackages(
+    comptime version: Version,
     allocator: std.mem.Allocator,
-    lock: exact_lock.Lock,
+    lock: LockType(version),
     repositories: []const RepositoryView,
     maximum_records: usize,
-) ![]PackageMatch {
+) ![]?PackageMatch {
     var by_digest = std.AutoHashMap([32]u8, usize).init(allocator);
     defer by_digest.deinit();
-    for (lock.packages, 0..) |package, index| try by_digest.put(package.sha256, index);
+    for (lock.packages, 0..) |package, index| {
+        if (version == .v2) {
+            if (package.origin == .local_artifact) continue;
+        }
+        try by_digest.put(package.sha256, index);
+    }
 
     const matches = try allocator.alloc(?PackageMatch, lock.packages.len);
     defer allocator.free(matches);
@@ -772,7 +961,11 @@ fn matchPackages(
             scanned += 1;
             const lock_index = by_digest.get(record.transport.sha256.bytes) orelse continue;
             const locked = lock.packages[lock_index];
-            if (!std.mem.eql(u8, repository.input.repository_id.slice(), &locked.repository_id) or
+            const repository_id = if (version == .v1) locked.repository_id else switch (locked.origin) {
+                .authenticated_repository => |origin| origin.repository_id,
+                .local_artifact => return error.PackageEvidenceMismatch,
+            };
+            if (!std.mem.eql(u8, repository.input.repository_id.slice(), &repository_id) or
                 !std.mem.eql(u8, record.control.package.text, locked.name) or
                 !std.mem.eql(u8, record.control.version.value.original, locked.version) or
                 !std.mem.eql(u8, record.control.architecture.text, locked.architecture) or
@@ -789,9 +982,15 @@ fn matchPackages(
         }
     }
 
-    const result = try allocator.alloc(PackageMatch, lock.packages.len);
+    const result = try allocator.alloc(?PackageMatch, lock.packages.len);
     errdefer allocator.free(result);
     for (matches, 0..) |match, index| {
+        if (version == .v2) {
+            if (lock.packages[index].origin == .local_artifact) {
+                result[index] = null;
+                continue;
+            }
+        }
         result[index] = match orelse if (mismatched[index])
             return error.PackageEvidenceMismatch
         else
@@ -806,6 +1005,7 @@ fn containsSigner(signers: []const [20]u8, wanted: [20]u8) bool {
 }
 
 fn acceptancePolicyDigest(
+    comptime version: Version,
     allocator: std.mem.Allocator,
     architecture: []const u8,
     debz_version: []const u8,
@@ -815,27 +1015,27 @@ fn acceptancePolicyDigest(
     defer allocator.free(foreign);
     std.mem.sort([]const u8, foreign, {}, lessString);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hash, fingerprint_domain);
-    hashField(&hash, exact_lock.schema_id);
-    hashInt(&hash, exact_lock.schema_version);
+    hashField(&hash, if (version == .v1) fingerprint_domain else native_fingerprint_domain);
+    hashField(&hash, if (version == .v1) exact_lock.schema_id else exact_lock_v2.schema_id);
+    hashInt(&hash, if (version == .v1) exact_lock.schema_version else exact_lock_v2.schema_version);
     hashField(&hash, architecture);
     hashInt(&hash, foreign.len);
     for (foreign) |value| hashField(&hash, value);
     hashField(&hash, debz_version);
     hashField(&hash, package_acquisition.namespace);
-    hashField(&hash, package_cache_archive.format_id);
+    hashField(&hash, if (version == .v1) package_cache_archive.format_id else package_cache_archive.native_format_id);
     hashField(&hash, abi_identity);
     hashField(&hash, payload_policy);
-    hashField(&hash, supported_origin_mode);
+    hashField(&hash, if (version == .v1) supported_origin_mode else native_origin_mode);
     hashField(&hash, policy.corrupt_cache.spelling());
     hashInt(&hash, policy.limits.maximum_package_bytes);
     hashInt(&hash, policy.limits.maximum_total_package_bytes);
     return hash.finalResult();
 }
 
-fn fullFingerprint(lock_digest: [32]u8, policy_digest: [32]u8) [32]u8 {
+fn fullFingerprint(comptime version: Version, lock_digest: [32]u8, policy_digest: [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(fingerprint_domain);
+    hash.update(if (version == .v1) fingerprint_domain else native_fingerprint_domain);
     hash.update("\x00full\x00");
     hash.update(&policy_digest);
     hash.update(&lock_digest);
@@ -1334,6 +1534,321 @@ fn testRepository(allocator: std.mem.Allocator, payload: []const u8) !TestReposi
             .signer_fingerprint = @splat(5),
         },
     };
+}
+
+const NativeTestClosure = enum { empty, repository, local, mixed };
+
+fn testNativePayload(allocator: std.mem.Allocator) ![]u8 {
+    const appendAr = @import("fixtures/archive.zig").appendAr;
+    var ar: std.ArrayList(u8) = .empty;
+    errdefer ar.deinit(allocator);
+    try ar.appendSlice(allocator, "!<arch>\n");
+    try appendAr(allocator, &ar, "debian-binary/", "2.0\n");
+    try appendAr(allocator, &ar, "control.tar.gz/", @embedFile("fixtures/deb-payload/control.tar.gz"));
+    try appendAr(allocator, &ar, "data.tar.gz/", @embedFile("fixtures/deb-payload/data.tar.gz"));
+    return ar.toOwnedSlice(allocator);
+}
+
+fn testNativeLock(
+    allocator: std.mem.Allocator,
+    repository: *const TestRepository,
+    local_payload: []const u8,
+    closure: NativeTestClosure,
+) !exact_lock_v2.OwnedLock {
+    const package_origin = @import("package_origin.zig");
+    const has_repository = closure == .repository or closure == .mixed;
+    const has_local = closure == .local or closure == .mixed;
+    const digest = package_acquisition.Digest.of(local_payload).bytes;
+    const local: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = local_payload.len,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .acquisition_url = "https://artifacts.example.test/demo.deb?REDACTED",
+        .trust_mode = .verified_https,
+    };
+    const original = repository.lock.lock.packages[0];
+    var packages: [2]exact_lock_v2.Package = undefined;
+    var count: usize = 0;
+    if (has_repository) {
+        packages[count] = .{
+            .name = original.name,
+            .version = original.version,
+            .architecture = original.architecture,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository.view.input.repository_id.bytes,
+                .repository_snapshot_sha256 = repository.view.input.authenticated_snapshot_sha256.?,
+            } },
+            .sha256 = original.sha256,
+            .declared_size = original.declared_size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        };
+        count += 1;
+    }
+    if (has_local) {
+        packages[count] = .{
+            .name = local.package,
+            .version = local.version,
+            .architecture = local.architecture,
+            .origin = .{ .local_artifact = local },
+            .sha256 = digest,
+            .declared_size = local.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        };
+        count += 1;
+    }
+    return exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(2),
+        .policy_sha256 = nativeSolverPolicyDigest(false, false, .strict_priority),
+        .repositories = if (has_repository) &.{.{
+            .id = repository.view.input.repository_id.bytes,
+            .snapshot_sha256 = repository.view.input.authenticated_snapshot_sha256.?,
+            .release_sha256 = repository.view.release_sha256,
+            .index_sha256 = repository.view.index_sha256,
+            .signer_fingerprints = &.{repository.view.signer_fingerprint.?},
+        }} else &.{},
+        .local_artifacts = if (has_local) &.{local} else &.{},
+        .packages = packages[0..count],
+        .verified_origins = true,
+    });
+}
+
+test "package_cache_workflow.test.native policy and fingerprints preserve version boundaries" {
+    var legacy_hex: [64]u8 = undefined;
+    var native_hex: [64]u8 = undefined;
+    formatHex(solverPolicyDigest(false, false, .strict_priority), &legacy_hex);
+    formatHex(nativeSolverPolicyDigest(false, false, .strict_priority), &native_hex);
+    try std.testing.expectEqualStrings("a810f5c8e3ee5c3c6c389a0e2859d9d3b23c39091bbf83a59006d93d49172fea", &legacy_hex);
+    try std.testing.expectEqualStrings("2f5d0d954dfe682bcc36acd6d636f4bc3d52a819156b6623b6a1d2339ed38d57", &native_hex);
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepository(std.testing.allocator, payload);
+    defer repository.deinit(std.testing.allocator);
+    const local = try testNativePayload(std.testing.allocator);
+    defer std.testing.allocator.free(local);
+    var legacy = try createFingerprint(
+        std.testing.allocator,
+        repository.lock.lock,
+        "amd64",
+        "0.3.0",
+        "/runner/cache",
+        .{},
+    );
+    defer legacy.deinit();
+    for ([_]NativeTestClosure{ .empty, .repository, .local, .mixed }) |closure| {
+        var lock = try testNativeLock(std.testing.allocator, &repository, local, closure);
+        defer lock.deinit();
+        var first = try createNativeFingerprint(
+            std.testing.allocator,
+            lock.lock,
+            "amd64",
+            "0.3.0",
+            "/runner/cache",
+            .{},
+        );
+        defer first.deinit();
+        var relocated = try createNativeFingerprint(
+            std.testing.allocator,
+            lock.lock,
+            "amd64",
+            "0.3.0",
+            "/another/cache",
+            .{ .restored_cache = .exact },
+        );
+        defer relocated.deinit();
+        try std.testing.expectEqualStrings(first.primary_key, relocated.primary_key);
+        try std.testing.expectEqualStrings(first.restore_prefix, relocated.restore_prefix);
+        try std.testing.expect(std.mem.startsWith(u8, first.primary_key, "debz-package-cas-v2-amd64-"));
+        try std.testing.expect(!std.mem.eql(u8, first.restore_prefix, legacy.restore_prefix));
+        try std.testing.expect(!std.mem.eql(u8, &first.acceptance_policy_digest, &legacy.acceptance_policy_digest));
+        var repair = try createNativeFingerprint(
+            std.testing.allocator,
+            lock.lock,
+            "amd64",
+            "0.3.0",
+            "/runner/cache",
+            .{ .corrupt_cache = .repair_online },
+        );
+        defer repair.deinit();
+        try std.testing.expect(!std.mem.eql(u8, first.restore_prefix, repair.restore_prefix));
+        const json = try first.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-fingerprint.v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"api_version\":2,\"capability\":\"package-cache-v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"archive_format\":\"debz-package-cache-archive-v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "artifacts.example.test") == null);
+        try std.testing.expectError(error.ArchitectureMismatch, createNativeFingerprint(
+            std.testing.allocator,
+            lock.lock,
+            "arm64",
+            "0.3.0",
+            "/runner/cache",
+            .{},
+        ));
+        var wrong_policy = lock.lock;
+        wrong_policy.policy_sha256 = solverPolicyDigest(false, false, .strict_priority);
+        try std.testing.expectError(error.LockPolicyMismatch, createNativeFingerprint(
+            std.testing.allocator,
+            wrong_policy,
+            "amd64",
+            "0.3.0",
+            "/runner/cache",
+            .{},
+        ));
+    }
+}
+
+test "package_cache_workflow.test.native preparation handles repository cached local mixed and empty closures" {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepository(std.testing.allocator, payload);
+    defer repository.deinit(std.testing.allocator);
+    repository.view.input.packages = &repository.index;
+    const local = try testNativePayload(std.testing.allocator);
+    defer std.testing.allocator.free(local);
+    const policy: Policy = .{ .limits = .{
+        .maximum_package_bytes = 1024 * 1024,
+        .maximum_total_package_bytes = 2 * 1024 * 1024,
+    } };
+    for ([_]NativeTestClosure{ .empty, .repository, .local, .mixed }) |closure| {
+        const has_repository = closure == .repository or closure == .mixed;
+        const has_local = closure == .local or closure == .mixed;
+        var lock = try testNativeLock(std.testing.allocator, &repository, local, closure);
+        defer lock.deinit();
+        const original_digest = lock.lock.digest_sha256;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+            .maximum_object_bytes = policy.limits.maximum_package_bytes,
+        });
+        defer cache.deinit();
+        var transport: TestTransport = .{ .payloads = if (has_repository) &.{payload} else &.{} };
+        const request: NativePrepareRequest = .{
+            .lock = &lock.lock,
+            .cache = &cache,
+            .repositories = if (has_repository) &.{repository.view} else &.{},
+            .architecture = "amd64",
+            .debz_version = "0.3.0",
+            .cache_root = "/runner/cache",
+            .policy = policy,
+            .acquisition = transport.dependencies(),
+        };
+        if (has_local) {
+            try std.testing.expectError(error.LocalArtifactAcquisitionRequired, prepareNative(std.testing.allocator, request));
+            try std.testing.expectEqual(@as(usize, 0), transport.calls);
+            try cache.publish(
+                std.testing.allocator,
+                package_acquisition.Digest.of(local),
+                local.len,
+                local,
+                .fail_fast,
+                .{},
+            );
+        }
+        try cache.publish(
+            std.testing.allocator,
+            package_acquisition.Digest.of("unrelated"),
+            "unrelated".len,
+            "unrelated",
+            .fail_fast,
+            .{},
+        );
+        var cold = try prepareNative(std.testing.allocator, request);
+        defer cold.deinit();
+        try std.testing.expectEqual(@intFromBool(has_repository), cold.downloaded_count);
+        try std.testing.expectEqual(@intFromBool(has_local), cold.reused_count);
+        try std.testing.expectEqual(@as(usize, 1), cold.gc_deleted);
+        try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
+        const json = try cold.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-result.v2\"") != null);
+        if (closure == .empty)
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"verified_count\":0") != null);
+        var warm_request = request;
+        warm_request.policy.offline = true;
+        var warm = try prepareNative(std.testing.allocator, warm_request);
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 0), warm.downloaded_count);
+        try std.testing.expectEqual(lock.lock.packages.len, warm.reused_count);
+        try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
+        try std.testing.expectEqual(original_digest, lock.lock.digest_sha256);
+        for (lock.lock.packages) |package| {
+            const cached = try cache.lookup(std.testing.allocator, .{ .bytes = package.sha256 }, package.declared_size, .verify_sha256);
+            defer std.testing.allocator.free(cached);
+            try std.testing.expectEqual(@as(usize, @intCast(package.declared_size)), cached.len);
+        }
+        if (has_repository) {
+            var changed = repository.view;
+            changed.index_sha256 = @splat(99);
+            warm_request.repositories = &.{changed};
+            try std.testing.expectError(error.RepositoryEvidenceMismatch, prepareNative(std.testing.allocator, warm_request));
+            try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
+        }
+        if (has_local) {
+            var held = try cache.acquireWriter(10);
+            defer held.release();
+            var invalid_writer = held;
+            invalid_writer.file = null;
+            try std.testing.expectError(error.InvalidRequest, preflightNative(
+                std.testing.allocator,
+                lock.lock,
+                &cache,
+                policy,
+                &invalid_writer,
+            ));
+            const digest = package_acquisition.Digest.of(local);
+            var hex: [64]u8 = undefined;
+            digest.formatHex(&hex);
+            try cache.objects.writeFile(std.testing.io, .{ .sub_path = &hex, .data = "corrupt" });
+            var repair_policy = policy;
+            repair_policy.corrupt_cache = .repair_online;
+            try std.testing.expectError(error.CorruptObject, preflightNative(
+                std.testing.allocator,
+                lock.lock,
+                &cache,
+                repair_policy,
+                &held,
+            ));
+            try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
+        }
+    }
+}
+
+test "package_cache_workflow.test.native cached local payload must match the locked identity" {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepository(std.testing.allocator, payload);
+    defer repository.deinit(std.testing.allocator);
+    var lock = try testNativeLock(std.testing.allocator, &repository, payload, .local);
+    defer lock.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = 1024 * 1024,
+    });
+    defer cache.deinit();
+    try cache.publish(
+        std.testing.allocator,
+        package_acquisition.Digest.of(payload),
+        payload.len,
+        payload,
+        .fail_fast,
+        .{},
+    );
+    var no_network: TestTransport = .{};
+    try std.testing.expectError(error.InvalidPackagePayload, prepareNative(std.testing.allocator, .{
+        .lock = &lock.lock,
+        .cache = &cache,
+        .repositories = &.{},
+        .architecture = "amd64",
+        .debz_version = "0.3.0",
+        .cache_root = "/runner/cache",
+        .policy = .{ .limits = .{ .maximum_package_bytes = 1024 * 1024 } },
+        .acquisition = no_network.dependencies(),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), no_network.calls);
 }
 
 test "package_cache_workflow.test.prepare covers cold exact corrupt repair and bounded GC" {

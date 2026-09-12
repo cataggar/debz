@@ -186,6 +186,7 @@ const package_cache_fingerprint_help =
     \\  debz package-cache fingerprint --lock-input PATH --cache-path PATH --architecture ARCH [options]
     \\
     \\Policy options:
+    \\  --transaction-backend legacy_dpkg|native
     \\  --foreign-architecture ARCH --repository-policy strict-priority|best-version
     \\  --recommends --allow-downgrade --repair-corrupt-cache
     \\
@@ -212,6 +213,7 @@ const package_cache_prepare_help =
     \\  --proxy URI --credential-reference PATH
     \\
     \\Policy options:
+    \\  --transaction-backend legacy_dpkg|native
     \\  --recommends --allow-downgrade --repair-corrupt-cache
     \\  --restored-cache none|partial|exact
     \\  --archive-input PATH --archive-output PATH
@@ -230,6 +232,8 @@ const package_cache_prepare_help =
     \\
     \\Repository metadata is authenticated normally but is not part of the
     \\externally cacheable object path. Offline mode never falls back online.
+    \\Native selects v2 locks and archives; legacy_dpkg remains the default.
+    \\Native local artifacts must already be in the verified CAS or archive.
     \\
 ;
 
@@ -785,6 +789,7 @@ fn validCliArchitecture(value: []const u8) bool {
 const PackageCacheOperation = enum { fingerprint, prepare };
 
 const PackageCacheSingleOption = enum {
+    transaction_backend,
     lock_input,
     cache_path,
     architecture,
@@ -832,7 +837,7 @@ fn runPackageCache(
     };
 
     var requested_json = false;
-    const request = parsePackageCache(
+    const invocation = parsePackageCache(
         init.arena.allocator(),
         operation,
         args,
@@ -853,7 +858,11 @@ fn runPackageCache(
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
 
-    var backend: debz.ProductionBackend = .{ .io = init.io };
+    const request = invocation.request;
+    var backend: debz.ProductionBackend = .{
+        .io = init.io,
+        .transaction_backend = invocation.transaction_backend,
+    };
     switch (operation) {
         .fingerprint => {
             var result = backend.packageCacheFingerprint(
@@ -922,17 +931,23 @@ fn runPackageCache(
     }
 }
 
+const PackageCacheInvocation = struct {
+    request: debz.package_cache_workflow.Request,
+    transaction_backend: debz.transaction_engine.Kind,
+};
+
 fn parsePackageCache(
     allocator: std.mem.Allocator,
     operation: PackageCacheOperation,
     args: *std.process.Args.Iterator,
     requested_json: *bool,
-) CliError!debz.package_cache_workflow.Request {
+) CliError!PackageCacheInvocation {
     var sources: std.ArrayList([]const u8) = .empty;
     var configs: std.ArrayList([]const u8) = .empty;
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var seen: std.EnumSet(PackageCacheSingleOption) = .initEmpty();
+    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
     var request: debz.package_cache_workflow.Request = .{
         .lock_input_path = "",
         .cache_root = "",
@@ -943,6 +958,10 @@ fn parsePackageCache(
         if (!std.mem.startsWith(u8, argument, "--")) return error.InvalidArguments;
         if (std.mem.eql(u8, argument, "--json")) {
             requested_json.* = true;
+        } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
+            try setPackageCacheOnce(&seen, .transaction_backend);
+            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
+                return error.InvalidArguments;
         } else if (std.mem.eql(u8, argument, "--lock-input")) {
             try setPackageCacheOnce(&seen, .lock_input);
             request.lock_input_path = try next(args);
@@ -1063,7 +1082,7 @@ fn parsePackageCache(
             request.archive_output_path != null or
             request.restored_cache != .none))
         return error.InvalidArguments;
-    return request;
+    return .{ .request = request, .transaction_backend = transaction_backend };
 }
 
 fn setPackageCacheOnce(
@@ -1143,6 +1162,10 @@ fn packageCacheFailure(err: anyerror) PackageCacheFailure {
         error.CorruptObject => .{
             .status = @intFromEnum(api.ExitStatus.download),
             .id = "corrupt_cache_object",
+        },
+        error.LocalArtifactAcquisitionRequired => .{
+            .status = @intFromEnum(api.ExitStatus.download),
+            .id = "local_artifact_acquisition_required",
         },
         error.InvalidArchive,
         error.InvalidArchiveFile,

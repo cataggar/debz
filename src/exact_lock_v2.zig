@@ -395,15 +395,23 @@ pub fn decode(
 ) !OwnedLock {
     if (source.len > maximum_bytes or source.len > maximum_document_bytes)
         return error.DocumentTooLarge;
+    const Header = struct {
+        schema: []const u8,
+        version: u32,
+    };
+    var header = try std.json.parseFromSlice(Header, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer header.deinit();
+    if (!std.mem.eql(u8, header.value.schema, schema_id) or
+        header.value.version != schema_version)
+        return error.UnsupportedSchema;
     var parsed = try std.json.parseFromSlice(WireLock, allocator, source, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     });
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, schema_id) or
-        parsed.value.version != schema_version)
-        return error.UnsupportedSchema;
-
     const repositories = try allocator.alloc(Repository, parsed.value.repositories.len);
     var repositories_initialized: usize = 0;
     defer {
@@ -869,6 +877,25 @@ fn safeLeaf(name: []const u8) bool {
         !std.mem.eql(u8, name, "..") and
         std.mem.indexOfScalar(u8, name, '/') == null and
         std.mem.indexOfScalar(u8, name, '\\') == null;
+}
+
+test "exact_lock_v2.test.schema refusal precedes version-specific field decoding" {
+    const legacy_shape =
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,"packages":[{"repository_id":"legacy-only-field"}]}
+    ;
+    try std.testing.expectError(error.UnsupportedSchema, decode(
+        std.testing.allocator,
+        legacy_shape,
+        maximum_document_bytes,
+    ));
+    const unknown_v2_field =
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v2","version":2,"unknown":true}
+    ;
+    try std.testing.expectError(error.UnknownField, decode(
+        std.testing.allocator,
+        unknown_v2_field,
+        maximum_document_bytes,
+    ));
 }
 
 test "exact_lock_v2.test.mixed origins canonical roundtrip and tamper rejection" {
