@@ -15,6 +15,7 @@ const lower_ownership_token =
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const live_root = @import("live_root.zig");
+const native_provenance = @import("native_provenance.zig");
 const product_api = @import("product_api.zig");
 const production_backend = @import("production_backend.zig");
 const root_fs = @import("root_fs.zig");
@@ -2582,6 +2583,7 @@ pub const StateStore = struct {
     retainTransactionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        system_profile.TransactionBackend,
         OperationPaths,
         []const u8,
         [32]u8,
@@ -3589,19 +3591,19 @@ pub const SystemStateStore = struct {
     fn retainTransaction(
         context: *anyopaque,
         allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         paths: OperationPaths,
         source: []const u8,
         digest: [32]u8,
     ) !api.DocumentBinding {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
-        var validated = try transaction_provenance.validateDocument(
+        const binding = try retainedTransactionBinding(
             allocator,
+            backend,
+            paths.transaction_result,
             source,
-            transaction_provenance.maximum_document_bytes,
+            digest,
         );
-        defer validated.deinit();
-        if (!std.mem.eql(u8, &validated.digest_sha256, &digest))
-            return error.DigestMismatch;
         var dir = try openSecureAbsoluteDirectory(
             self,
             allocator,
@@ -3616,12 +3618,7 @@ pub const SystemStateStore = struct {
             transaction_result_name,
             source,
         );
-        return .{
-            .path = paths.transaction_result,
-            .schema = transaction_provenance.schema_id,
-            .version = transaction_provenance.schema_version,
-            .digest_sha256 = digest,
-        };
+        return binding;
     }
 
     fn retainRecoveryCompletion(
@@ -3888,6 +3885,40 @@ pub const SystemStateStore = struct {
             try crash.hit(.after_directory_sync);
     }
 };
+
+fn retainedTransactionBinding(
+    allocator: std.mem.Allocator,
+    backend: system_profile.TransactionBackend,
+    path: []const u8,
+    source: []const u8,
+    expected_digest: [32]u8,
+) !api.DocumentBinding {
+    const actual_digest = switch (backend) {
+        .legacy_dpkg => legacy: {
+            var document = try transaction_provenance.validateDocument(
+                allocator,
+                source,
+                transaction_provenance.maximum_document_bytes,
+            );
+            defer document.deinit();
+            break :legacy document.digest_sha256;
+        },
+        .native => native: {
+            var document = try native_provenance.decode(allocator, source);
+            defer document.deinit();
+            var digest: [32]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&digest, &document.document.digest_sha256);
+            break :native digest;
+        },
+    };
+    if (!std.mem.eql(u8, &actual_digest, &expected_digest)) return error.DigestMismatch;
+    return .{
+        .path = path,
+        .schema = if (backend == .native) native_provenance.schema_id else transaction_provenance.schema_id,
+        .version = if (backend == .native) native_provenance.schema_version else transaction_provenance.schema_version,
+        .digest_sha256 = actual_digest,
+    };
+}
 
 pub const VerifiedLock = struct {
     binding: api.DocumentBinding,
@@ -8348,6 +8379,7 @@ pub const Engine = struct {
                 self.store.retainTransactionFn(
                     self.store.context,
                     allocator,
+                    profile.transaction_backend,
                     prepared.paths,
                     verified.bytes,
                     verified.binding.digest_sha256,
@@ -11372,6 +11404,158 @@ test "apt_system_orchestrator.test.native lock storage shares active exclusion a
     var unchanged = try native_store.read(std.testing.allocator, operation_state.maximum_document_bytes);
     defer unchanged.deinit();
     try std.testing.expectEqualSlices(u8, &current.state.digest_sha256, &unchanged.state.digest_sha256);
+}
+
+fn retainedTransactionAllocationCase(
+    allocator: std.mem.Allocator,
+    backend: system_profile.TransactionBackend,
+    source: []const u8,
+    digest: [32]u8,
+) !void {
+    const binding = try retainedTransactionBinding(allocator, backend, "/state/transaction-result.json", source, digest);
+    try std.testing.expectEqualSlices(u8, &digest, &binding.digest_sha256);
+}
+
+test "apt_system_orchestrator.test.receipt retention is backend-bound before filesystem access" {
+    const allocator = std.testing.allocator;
+    var paths = try pathsForBackend(allocator, "/does-not-exist", @splat(1), .native);
+    defer paths.deinit(allocator);
+    var store: SystemStateStore = .{ .allocator = allocator, .io = std.testing.io };
+    var legacy = try transaction_provenance.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .solver_policy_sha256 = @splat(2),
+        .executor_policy_sha256 = @splat(3),
+        .plan_sha256 = @splat(4),
+        .lock_sha256 = @splat(5),
+        .repositories = &.{},
+        .packages = &.{},
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(6),
+            .package_origins_sha256 = @splat(7),
+            .detail = "verified",
+        },
+        .outcome = .succeeded,
+    });
+    defer legacy.deinit();
+    const legacy_bytes = try legacy.result.canonicalJson(allocator);
+    defer allocator.free(legacy_bytes);
+    const legacy_binding = try retainedTransactionBinding(
+        allocator,
+        .legacy_dpkg,
+        paths.transaction_result,
+        legacy_bytes,
+        legacy.result.digest_sha256,
+    );
+    try std.testing.expectEqualStrings(transaction_provenance.schema_id, legacy_binding.schema);
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        retainedTransactionAllocationCase,
+        .{ .legacy_dpkg, legacy_bytes, legacy.result.digest_sha256 },
+    );
+    try std.testing.expectError(error.UnknownField, store.interface().retainTransactionFn(
+        &store,
+        allocator,
+        .native,
+        paths,
+        legacy_bytes,
+        legacy.result.digest_sha256,
+    ));
+    for ([_]native_provenance.Outcome{ .succeeded, .failed, .recovery_required }) |outcome| {
+        var receipt = native_provenance.testDocument();
+        receipt.outcome = outcome;
+        native_provenance.seal(&receipt);
+        const source = try receipt.canonicalJson(allocator);
+        defer allocator.free(source);
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, &receipt.digest_sha256);
+        const binding = try retainedTransactionBinding(allocator, .native, paths.transaction_result, source, digest);
+        try std.testing.expectEqualStrings(native_provenance.schema_id, binding.schema);
+        try std.testing.expectEqual(native_provenance.schema_version, binding.version);
+        try std.testing.expectEqualStrings(paths.transaction_result, binding.path);
+        try std.testing.checkAllAllocationFailures(
+            allocator,
+            retainedTransactionAllocationCase,
+            .{ .native, source, digest },
+        );
+        try std.testing.expectError(error.NonCanonicalDocument, store.interface().retainTransactionFn(
+            &store,
+            allocator,
+            .legacy_dpkg,
+            paths,
+            source,
+            digest,
+        ));
+        try std.testing.expectError(error.DigestMismatch, store.interface().retainTransactionFn(
+            &store,
+            allocator,
+            .native,
+            paths,
+            source,
+            @splat(0),
+        ));
+    }
+}
+
+test "apt_system_orchestrator.test.native receipt bytes and state bindings survive retained publication" {
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var paths = try pathsForBackend(allocator, "/var/lib/debz", @splat(1), .native);
+    defer paths.deinit(allocator);
+    const receipt = native_provenance.testDocument();
+    const source = try receipt.canonicalJson(allocator);
+    defer allocator.free(source);
+    var digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&digest, &receipt.digest_sha256);
+    const binding = try retainedTransactionBinding(allocator, .native, paths.transaction_result, source, digest);
+    var store: SystemStateStore = .{ .allocator = allocator, .io = std.testing.io };
+    var durable_dir = try openSyncCapableDirectory(std.testing.io, directory.dir, ".", false);
+    defer durable_dir.close(std.testing.io);
+    try SystemStateStore.publishAtomic(&store, allocator, durable_dir, transaction_result_name, source);
+    const retained = try directory.dir.readFileAlloc(
+        std.testing.io,
+        transaction_result_name,
+        allocator,
+        .limited(native_provenance.maximum_document_bytes),
+    );
+    defer allocator.free(retained);
+    try std.testing.expectEqualStrings(source, retained);
+    try std.testing.expect(documentEqual(
+        binding,
+        try retainedTransactionBinding(allocator, .native, paths.transaction_result, retained, digest),
+    ));
+    var initial = try testInitialState(allocator, @splat(1));
+    defer initial.deinit();
+    var input = initial.state;
+    input.phase = .verifying;
+    input.mutation_started = true;
+    input.exact_lock = .{
+        .path = paths.exact_lock,
+        .schema = exact_lock_v2.schema_id,
+        .version = exact_lock_v2.schema_version,
+        .digest_sha256 = @splat(7),
+    };
+    input.transaction_result = binding;
+    var state = try operation_state.create(allocator, input);
+    defer state.deinit();
+    const bytes = try state.state.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    var decoded = try operation_state.decode(allocator, bytes, operation_state.maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expect(documentEqual(binding, decoded.state.transaction_result.?));
+    input = decoded.state;
+    input.generation += 1;
+    input.phase = .recovery_required;
+    input.diagnostic = "retained receipt changed";
+    input.transaction_result.?.schema = transaction_provenance.schema_id;
+    input.transaction_result.?.version = transaction_provenance.schema_version;
+    var substituted = try operation_state.create(allocator, input);
+    defer substituted.deinit();
+    try std.testing.expectError(error.EvidenceRollback, operation_state.validateTransition(decoded.state, substituted.state));
 }
 
 test "apt_system_orchestrator.test.execution boundary propagates only contract classes" {
@@ -14555,6 +14739,7 @@ const FakeStateStore = struct {
     fn retainTransaction(
         context: *anyopaque,
         _: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
         paths: OperationPaths,
         _: []const u8,
         digest: [32]u8,
@@ -14563,8 +14748,8 @@ const FakeStateStore = struct {
         self.retained_transaction = true;
         return .{
             .path = paths.transaction_result,
-            .schema = transaction_provenance.schema_id,
-            .version = transaction_provenance.schema_version,
+            .schema = if (backend == .native) native_provenance.schema_id else transaction_provenance.schema_id,
+            .version = if (backend == .native) native_provenance.schema_version else transaction_provenance.schema_version,
             .digest_sha256 = digest,
         };
     }

@@ -142,6 +142,14 @@ pub const Document = struct {
     outcome: Outcome,
     detail: []const u8,
     digest_sha256: Digest,
+
+    pub fn canonicalJson(self: Document, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        std.json.Stringify.value(self, .{ .whitespace = .minified }, &output.writer) catch return error.OutOfMemory;
+        output.writer.writeByte('\n') catch return error.OutOfMemory;
+        return output.toOwnedSlice();
+    }
 };
 
 pub const OwnedDocument = struct {
@@ -407,7 +415,7 @@ pub fn publish(
     document: Document,
 ) !void {
     try validate(document);
-    const bytes = try canonicalJson(allocator, document);
+    const bytes = try document.canonicalJson(allocator);
     defer allocator.free(bytes);
     if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
     const path = try root_fs.Path.init(document_path);
@@ -455,17 +463,23 @@ pub fn read(
         else => return err,
     };
     defer allocator.free(bytes);
+    return try decode(allocator, bytes);
+}
+
+/// Checks the canonical receipt document, not its retained files or current root.
+pub fn decode(allocator: std.mem.Allocator, source: []const u8) !OwnedDocument {
+    if (source.len > maximum_document_bytes) return error.DocumentTooLarge;
     var parsed = try std.json.parseFromSlice(
         Document,
         allocator,
-        bytes,
+        source,
         .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
     );
     errdefer parsed.deinit();
     try validate(parsed.value);
-    const canonical = try canonicalJson(allocator, parsed.value);
+    const canonical = try parsed.value.canonicalJson(allocator);
     defer allocator.free(canonical);
-    if (!std.mem.eql(u8, canonical, bytes))
+    if (!std.mem.eql(u8, canonical, source))
         return error.NonCanonicalDocument;
     return .{ .document = parsed.value, .parsed = parsed };
 }
@@ -507,18 +521,6 @@ pub fn verifyEvidence(
     }
 }
 
-fn canonicalJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try std.json.Stringify.value(
-        value,
-        .{ .whitespace = .minified },
-        &output.writer,
-    );
-    try output.writer.writeByte('\n');
-    return output.toOwnedSlice();
-}
-
 fn digest(document: Document) Digest {
     var buffer: [4096]u8 = undefined;
     var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
@@ -533,12 +535,12 @@ fn digest(document: Document) Digest {
     return hexDigest(sink.hasher.finalResult());
 }
 
-pub fn testContract() !void {
+pub fn testDocument() Document {
     const attempt_id: Digest = @splat('1');
     const evidence_root =
         receipts_directory ++
         "/1111111111111111111111111111111111111111111111111111111111111111";
-    const evidence_files = [_]EvidenceFile{
+    const evidence_files = comptime &[_]EvidenceFile{
         .{
             .kind = .authorization,
             .path = evidence_root ++ "/authorization.json",
@@ -606,14 +608,19 @@ pub fn testContract() !void {
         .final_state_sha256 = @splat('f'),
         .recovered_phase_count = 1,
         .evidence_root = evidence_root,
-        .evidence_files = &evidence_files,
-        .evidence_files_sha256 = evidenceDigest(&evidence_files),
+        .evidence_files = evidence_files,
+        .evidence_files_sha256 = evidenceDigest(evidence_files),
         .final_state_kind = .package_database_closure_v1,
         .outcome = .succeeded,
         .detail = "recovered",
         .digest_sha256 = @splat('0'),
     };
     seal(&document);
+    return document;
+}
+
+pub fn testContract() !void {
+    var document = testDocument();
     try validate(document);
     document.progress_record_count += 1;
     try std.testing.expectError(error.DigestMismatch, validate(document));
@@ -621,4 +628,37 @@ pub fn testContract() !void {
 
 test "native_provenance.test.digest binds terminal evidence" {
     try testContract();
+}
+
+fn testDecodeAllocation(allocator: std.mem.Allocator, source: []const u8) !void {
+    var document = try decode(allocator, source);
+    defer document.deinit();
+    const canonical = try document.document.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings(source, canonical);
+}
+
+test "native_provenance.test.canonical byte decoding preserves outcomes and allocation failures" {
+    const allocator = std.testing.allocator;
+    const oversized = try allocator.alloc(u8, maximum_document_bytes + 1);
+    defer allocator.free(oversized);
+    try std.testing.expectError(error.DocumentTooLarge, decode(allocator, oversized));
+    for ([_]Outcome{ .succeeded, .failed, .recovery_required }) |outcome| {
+        var document = testDocument();
+        document.outcome = outcome;
+        seal(&document);
+        const source = try document.canonicalJson(allocator);
+        defer allocator.free(source);
+        try std.testing.checkAllAllocationFailures(allocator, testDecodeAllocation, .{source});
+        var decoded = try decode(allocator, source);
+        defer decoded.deinit();
+        try std.testing.expectEqual(outcome, decoded.document.outcome);
+        const noncanonical = try std.fmt.allocPrint(allocator, "{s}\n", .{source});
+        defer allocator.free(noncanonical);
+        try std.testing.expectError(error.NonCanonicalDocument, decode(allocator, noncanonical));
+        document.detail = "changed without resealing";
+        const changed = try document.canonicalJson(allocator);
+        defer allocator.free(changed);
+        try std.testing.expectError(error.DigestMismatch, decode(allocator, changed));
+    }
 }
