@@ -17545,6 +17545,11 @@ pub const Runtime = struct {
         const resolved = try named.root.rootEntry();
         if (held.inode != resolved.inode or held.device != resolved.device)
             return error.OperationRootMismatch;
+        if (attempt.coordinator.root_projection) |projection| {
+            try projection.validateRoot(record.install_root, root.dir.handle);
+            try projection.validateRoot(record.install_root, named.root.dir.handle);
+            return root;
+        }
         var host = try root_fs.openAbsoluteRoot(root.io, "/");
         defer host.close();
         const host_entry = try host.root.rootEntry();

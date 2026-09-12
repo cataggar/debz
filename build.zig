@@ -584,6 +584,7 @@ pub fn build(b: *std.Build) void {
             "native_unpack.test.lifecycle external fixture",
             "production workflow external native fixture",
             "native_transaction_result.test.projected root external fixture",
+            "apt_system_orchestrator.test.projected native dispatch external fixture",
         },
     });
     const native_lifecycle = b.addSystemCommand(&.{

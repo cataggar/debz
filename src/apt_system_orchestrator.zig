@@ -345,17 +345,20 @@ pub const BackendError = error{
 
 pub const Backend = struct {
     transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
+    root_projection: ?*const live_root.Projection = null,
     context: *anyopaque,
     routeFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         system_profile.TransactionBackend,
+        ?*const live_root.Projection,
         product_api.Request,
     ) BackendError!product_api.Result,
     workflowFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         system_profile.TransactionBackend,
+        ?*const live_root.Projection,
         WorkflowRequest,
     ) BackendError!product_api.Result,
 
@@ -365,6 +368,8 @@ pub const Backend = struct {
     ) Backend {
         var selected = self;
         selected.transaction_backend = backend;
+        // Root authority comes from this invocation's runner, not its profile.
+        selected.root_projection = null;
         return selected;
     }
 
@@ -373,7 +378,9 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: product_api.Request,
     ) BackendError!product_api.Result {
-        return self.routeFn(self.context, allocator, self.transaction_backend, request);
+        if (self.root_projection != null and self.transaction_backend != .native)
+            return error.ContractViolation;
+        return self.routeFn(self.context, allocator, self.transaction_backend, self.root_projection, request);
     }
 
     pub fn workflow(
@@ -381,7 +388,9 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
-        return self.workflowFn(self.context, allocator, self.transaction_backend, request);
+        if (self.root_projection != null and self.transaction_backend != .native)
+            return error.ContractViolation;
+        return self.workflowFn(self.context, allocator, self.transaction_backend, self.root_projection, request);
     }
 };
 
@@ -400,10 +409,11 @@ pub const ProductionBackend = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         backend: system_profile.TransactionBackend,
+        projection: ?*const live_root.Projection,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *ProductionBackend = @ptrCast(@alignCast(context));
-        var selected = self.configuration(backend);
+        var selected = self.configuration(backend, projection);
         return selected.execute(allocator, request) catch |err|
             return mapBoundaryError(err);
     }
@@ -412,10 +422,11 @@ pub const ProductionBackend = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         backend: system_profile.TransactionBackend,
+        projection: ?*const live_root.Projection,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *ProductionBackend = @ptrCast(@alignCast(context));
-        var selected = self.configuration(backend);
+        var selected = self.configuration(backend, projection);
         return selected.executeWorkflow(allocator, .{
             .operation = switch (request.operation) {
                 .install => .install,
@@ -446,9 +457,11 @@ pub const ProductionBackend = struct {
     fn configuration(
         self: *const ProductionBackend,
         backend: system_profile.TransactionBackend,
+        projection: ?*const live_root.Projection,
     ) production_backend.Backend {
         var selected = self.backend.*;
         selected.transaction_backend = backend;
+        selected.root_projection = if (backend == .native) projection else null;
         return selected;
     }
 
@@ -617,6 +630,12 @@ pub const PrivateLiveRootRunner = struct {
             backend: Backend,
             request: WorkflowRequest,
         },
+
+        fn native(self: Invocation) bool {
+            return switch (self) {
+                inline else => |value| value.backend.transaction_backend == .native,
+            };
+        }
     };
 
     const ChildContext = struct {
@@ -1194,11 +1213,19 @@ pub const PrivateLiveRootRunner = struct {
             .invocation = invocation,
             .output_fd = pipe[1],
         };
-        const result = live_root.runSignalsBlocked(.{
-            .context = &child_context,
-            .child = transportChild,
-            .termination_grace_ms = self.termination_grace_ms,
-        }, signal_guard) catch |err| {
+        const execution = if (invocation.native())
+            live_root.runProjectedSignalsBlocked(.{
+                .context = &child_context,
+                .child = transportProjectedChild,
+                .termination_grace_ms = self.termination_grace_ms,
+            }, signal_guard)
+        else
+            live_root.runSignalsBlocked(.{
+                .context = &child_context,
+                .child = transportChild,
+                .termination_grace_ms = self.termination_grace_ms,
+            }, signal_guard);
+        const result = execution catch |err| {
             _ = linux.close(pipe[1]);
             write_open = false;
             reader.join();
@@ -1358,6 +1385,16 @@ pub const PrivateLiveRootRunner = struct {
             .recovery_acknowledgment = recovery_acknowledgment,
             .ownership_acknowledgment = ownership_acknowledgment,
         };
+    }
+
+    fn transportProjectedChild(raw: ?*anyopaque, projection: *const live_root.Projection) anyerror!u8 {
+        const context: *const ChildContext = @ptrCast(@alignCast(raw.?));
+        if (!context.invocation.native()) return error.ContractViolation;
+        var scoped = context.*;
+        switch (scoped.invocation) {
+            inline else => |*invocation| invocation.backend.root_projection = projection,
+        }
+        return transportChild(&scoped, live_root.logical_root_path);
     }
 
     fn transportChild(
@@ -12851,6 +12888,7 @@ const FakeBackend = struct {
         context: *anyopaque,
         _: std.mem.Allocator,
         backend: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *FakeBackend = @ptrCast(@alignCast(context));
@@ -12879,6 +12917,7 @@ const FakeBackend = struct {
         context: *anyopaque,
         _: std.mem.Allocator,
         backend: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *FakeBackend = @ptrCast(@alignCast(context));
@@ -13018,7 +13057,7 @@ test "apt_system_orchestrator.test.production dispatch snapshots profile backend
         const base = adapter.interface();
         for ([_]system_profile.TransactionBackend{ .native, .legacy_dpkg, .native }) |selected| {
             const bound = base.forTransactionBackend(selected);
-            const snapshot = adapter.configuration(selected);
+            const snapshot = adapter.configuration(selected, null);
             try std.testing.expectEqual(selected, snapshot.transaction_backend);
             try std.testing.expectEqual(template.now_unix, snapshot.now_unix);
             try std.testing.expectEqual(template.executor.context, snapshot.executor.context);
@@ -13044,6 +13083,107 @@ test "apt_system_orchestrator.test.production dispatch snapshots profile backend
             try std.testing.expectEqual(@as(?i64, 123), template.now_unix);
             try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, base.transaction_backend);
         }
+    }
+}
+
+test "apt_system_orchestrator.test.projected native dispatch external fixture" {
+    const enabled = std.c.getenv("DEBZ_NATIVE_PROJECTION_FIXTURE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.InvalidProjectionFixture;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer root.close();
+    const marker = try root.root.readFileAlloc(
+        std.testing.allocator,
+        try root_fs.Path.init(".debz-native-projection"),
+        128,
+    );
+    defer std.testing.allocator.free(marker);
+    try std.testing.expectEqualStrings("debz native projection fixture v1\n", marker);
+    const Probe = struct {
+        fn check(kind: system_profile.TransactionBackend, projection: ?*const live_root.Projection, path: []const u8) !void {
+            var template: production_backend.Backend = .{ .io = std.testing.io };
+            var adapter: ProductionBackend = .{ .backend = &template };
+            const selected = adapter.configuration(kind, projection);
+            try std.testing.expectEqual(kind, selected.transaction_backend);
+            try std.testing.expect(template.root_projection == null);
+            if (kind == .native) {
+                const authority = projection orelse return error.ProjectionMissing;
+                try std.testing.expect(selected.root_projection == authority);
+                var named = try root_fs.openAbsoluteRoot(std.testing.io, path);
+                defer named.close();
+                try authority.validateRoot(path, named.root.dir.handle);
+                var scoped = adapter.interface().forTransactionBackend(.native);
+                scoped.root_projection = authority;
+                try std.testing.expect(scoped.forTransactionBackend(.native).root_projection == null);
+                try std.testing.expect(scoped.forTransactionBackend(.legacy_dpkg).root_projection == null);
+                try std.testing.expect(adapter.configuration(.legacy_dpkg, projection).root_projection == null);
+                var configured = template;
+                configured.root_projection = authority;
+                const configured_adapter: ProductionBackend = .{ .backend = &configured };
+                try std.testing.expect(configured_adapter.configuration(.native, null).root_projection == null);
+                try std.testing.expect(configured.root_projection == authority);
+                var locks: root_operation.SystemLockBackend = .{
+                    .allocator = std.testing.allocator,
+                    .io = std.testing.io,
+                };
+                var coordinator = try root_operation.Coordinator.open(std.testing.io, named.root, path, locks.interface());
+                coordinator.root_projection = authority;
+                const Observer = struct {
+                    fn hit(_: *anyopaque, point: root_operation.AcquisitionPoint) !void {
+                        if (point != .after_lock_acquired) return error.UnexpectedAcquisition;
+                        try live_root.testing.replaceMountNamespace();
+                    }
+                };
+                var observer: u8 = 0;
+                try std.testing.expectError(error.InvalidRoot, coordinator.acquire(std.testing.allocator, .{
+                    .backend = .native,
+                    .operation = .{ .package_transaction = .install },
+                    .request_sha256 = @splat(1),
+                    .policy_sha256 = @splat(2),
+                    .target_architecture = "amd64",
+                    .acquisition_observer = .{ .context = &observer, .hitFn = Observer.hit },
+                }));
+                try std.testing.expect(try named.root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+            } else {
+                try std.testing.expect(projection == null and selected.root_projection == null);
+            }
+        }
+
+        fn route(_: *anyopaque, _: std.mem.Allocator, kind: system_profile.TransactionBackend, projection: ?*const live_root.Projection, request: product_api.Request) BackendError!product_api.Result {
+            check(kind, projection, request.options.install_root) catch return error.ContractViolation;
+            return .{ .operation = request.operation, .exit_status = .success, .summary = "projection dispatch verified" };
+        }
+
+        fn workflow(_: *anyopaque, _: std.mem.Allocator, kind: system_profile.TransactionBackend, projection: ?*const live_root.Projection, request: WorkflowRequest) BackendError!product_api.Result {
+            check(kind, projection, request.options.install_root) catch return error.ContractViolation;
+            return .{ .operation = workflowSurfaceOperation(request.operation, request.mode), .exit_status = .success, .summary = "projection dispatch verified" };
+        }
+    };
+    var context: u8 = 0;
+    const backend: Backend = .{ .context = &context, .routeFn = Probe.route, .workflowFn = Probe.workflow };
+    var runner: PrivateLiveRootRunner = .{ .io = std.testing.io };
+    const options: product_api.CommonOptions = .{
+        .install_root = live_root.logical_root_path,
+        .cache_path = "/unread/cache",
+        .state_path = "/unread/state",
+        .architecture = "amd64",
+    };
+    for ([_]system_profile.TransactionBackend{ .native, .legacy_dpkg, .native }) |kind| {
+        const selected = backend.forTransactionBackend(kind);
+        var routed = try runner.interface().route(std.testing.allocator, selected, .{
+            .operation = .list_installed,
+            .options = options,
+        });
+        defer routed.deinit();
+        var planned = try runner.interface().workflow(std.testing.allocator, selected, .{
+            .operation = .upgrade_all,
+            .mode = .plan_only,
+            .selectors = &.{},
+            .options = options,
+        });
+        defer planned.deinit();
+        try std.testing.expectEqual(product_api.ExitStatus.success, routed.result.exit_status);
+        try std.testing.expectEqual(product_api.ExitStatus.success, planned.result.exit_status);
+        try std.testing.expect(selected.root_projection == null and backend.root_projection == null);
     }
 }
 
@@ -13101,6 +13241,7 @@ const SignalTestBackend = struct {
         context: *anyopaque,
         _: std.mem.Allocator,
         _: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         _: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *SignalTestBackend = @ptrCast(@alignCast(context));
@@ -13119,6 +13260,7 @@ const SignalTestBackend = struct {
         _: *anyopaque,
         _: std.mem.Allocator,
         _: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         _: WorkflowRequest,
     ) BackendError!product_api.Result {
         waitForSignal();
@@ -13152,6 +13294,7 @@ const TransportFailureBackend = struct {
         context: *anyopaque,
         _: std.mem.Allocator,
         _: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         request: product_api.Request,
     ) BackendError!product_api.Result {
         const self: *TransportFailureBackend = @ptrCast(@alignCast(context));
@@ -13170,6 +13313,7 @@ const TransportFailureBackend = struct {
         context: *anyopaque,
         _: std.mem.Allocator,
         _: system_profile.TransactionBackend,
+        _: ?*const live_root.Projection,
         request: WorkflowRequest,
     ) BackendError!product_api.Result {
         const self: *TransportFailureBackend = @ptrCast(@alignCast(context));

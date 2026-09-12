@@ -307,9 +307,17 @@ logical root spelling, and the opened root descriptor's mount identity. The
 verifier revalidates the authority under its existing read-only root lock before
 returning. Authority cannot be serialized for recovery, reused by descendants,
 or replaced by a host-root flag. Public settled verification and ordinary native
-callers continue to refuse physical host-root aliases. Native preparation,
-execution, facade dispatch, and persisted recovery do not yet consume this
-authority; the native profile gate remains unchanged.
+callers continue to refuse physical host-root aliases.
+
+Explicit native dispatch now borrows freshly issued authority inside the private
+runner, without mutating shared backend configuration or carrying a previous
+invocation's permission. Native preparation, execution, persisted backend
+recovery, and ownership cleanup pass it through their in-memory coordinator.
+Root acquisition and record publication revalidate it, as do native runtime
+entry points. The capability never enters a program, receipt, owner marker, or
+recovery document: a later recovery needs its own supervised callback. Native
+facade result-verifier/engine and recovery integration remain incomplete, so the
+central native profile gate is unchanged.
 
 The native result module also exposes a separate read-only pending-success
 verifier for future caller integration. It requires independently retained exact
