@@ -257,6 +257,7 @@ pub const native_runtime = native_unpack.Runtime;
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
 pub const transaction_result_summary = @import("transaction_result_summary.zig");
+pub const native_transaction_result = @import("native_transaction_result.zig");
 pub const MaintainerScriptKind = maintainer_script.Kind;
 pub const MaintainerScriptIdentity = maintainer_script.Identity;
 pub const MaintainerScriptPolicy = maintainer_script.Policy;
@@ -621,6 +622,8 @@ test {
     _ = transaction_engine;
     _ = transaction_provenance;
     _ = transaction_provenance_v2;
+    _ = transaction_result_summary;
+    _ = native_transaction_result;
     _ = package_family_backend;
     _ = repository_api;
     _ = repository_state;

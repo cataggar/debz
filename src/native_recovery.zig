@@ -360,6 +360,28 @@ pub const ProgressDocument = struct {
     digest_sha256: Digest,
 };
 
+pub fn summarizeProgress(progress: ProgressDocument) struct {
+    script_outcomes_sha256: [32]u8,
+    recovered_phase_count: u64,
+} {
+    var script_hash = Sha256.init(.{});
+    script_hash.update("debz-native-script-outcomes-v1\x00");
+    var recovered_phases: u64 = 0;
+    for (progress.records) |entry| {
+        if ((entry.action.kind == .script or entry.action.kind == .trigger or
+            entry.action.kind == .compensation) and entry.stage == .outcome)
+        {
+            script_hash.update(&entry.digest_sha256);
+            if (entry.evidence_sha256) |value| script_hash.update(&value);
+        }
+        if (entry.result == .recovered) recovered_phases += 1;
+    }
+    return .{
+        .script_outcomes_sha256 = script_hash.finalResult(),
+        .recovered_phase_count = recovered_phases,
+    };
+}
+
 pub const OwnedProgress = struct {
     document: ProgressDocument,
     parsed: std.json.Parsed(ProgressDocument),
@@ -775,6 +797,11 @@ pub fn readTriggerEvents(
         maximum_progress_bytes,
     );
     defer allocator.free(bytes);
+    return decodeTriggerEvents(allocator, bytes);
+}
+
+pub fn decodeTriggerEvents(allocator: std.mem.Allocator, bytes: []const u8) !OwnedTriggerEvents {
+    if (bytes.len > maximum_progress_bytes) return error.LimitExceeded;
     var parsed = try std.json.parseFromSlice(
         TriggerEventsDocument,
         allocator,
@@ -1239,6 +1266,11 @@ pub fn readManagedState(
         maximum_managed_state_bytes,
     );
     defer allocator.free(bytes);
+    return decodeManagedState(allocator, bytes);
+}
+
+pub fn decodeManagedState(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManagedState {
+    if (bytes.len > maximum_managed_state_bytes) return error.LimitExceeded;
     var parsed = try std.json.parseFromSlice(
         ManagedStateDocument,
         allocator,

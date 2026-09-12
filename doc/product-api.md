@@ -250,6 +250,41 @@ the canonical lock, and emits the bounded
 unprivileged action process to verify a result written by an explicitly
 elevated `debz` process without granting a second program sudo access.
 
+Native callers explicitly select a separate receipt-backed handoff:
+
+```sh
+debz transaction-result capabilities --transaction-backend native --json
+debz transaction-result verify --transaction-backend native \
+  --install-root /explicit/root --lock-input /explicit/closure.v2.json \
+  --architecture amd64 --json
+```
+
+The capability response declares `native-transaction-result-v1` and the exact
+native summary/receipt/completion/lock contracts before a caller attempts a
+mutation. It requires no root access. Native verification accepts no
+`--state-path`, never autodetects a legacy result, and emits
+[`transaction-result-summary.v2`](../schema/transaction-result-summary-v2.json).
+The underlying native receipt and root-operation completion remain their
+existing v1 schemas; they are not converted into command-oriented provenance.
+
+Verification acquires the existing root-operation lock without creating a
+namespace, lock file, or attempt. It requires a physically bound alternate
+root with no active native evidence, root attempt, or outstanding owner
+marker. It checks canonical completion and receipt digests, retained evidence
+bytes, original caller/program/authorization bindings, the exact v2 closure
+and origin evidence, terminal success, and the current package-database
+generation and final state. The summary preserves the lock's request/solver
+policy domains separately from the original caller's request/policy domains.
+Empty installed closures may retain only their authorized residual
+configuration records.
+
+Missing, stale, incomplete, failed, or mismatched evidence refuses with exit 7
+and no success summary. Verification never repairs, acknowledges, clears, or
+replays anything and does not invoke a helper or maintainer script. A
+receiptless unchanged closure is not proof that a native transaction occurred.
+This verifier is a prerequisite for native install-action integration; that
+action remains explicitly legacy until its separate handoff is complete.
+
 ## JSON and compatibility
 
 `--json` writes exactly one canonical result object to stdout. Diagnostics and

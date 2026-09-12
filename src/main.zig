@@ -242,10 +242,14 @@ const transaction_result_help =
     \\
     \\Usage:
     \\  debz transaction-result verify --state-path PATH --lock-input PATH --architecture ARCH --json
+    \\  debz transaction-result verify --transaction-backend native --install-root PATH --lock-input PATH --architecture ARCH --json
+    \\  debz transaction-result capabilities --transaction-backend native --json
     \\
     \\The verifier opens the canonical result without following symbolic links,
     \\checks its digest and complete exact-lock evidence, and emits a bounded
     \\machine-readable success summary. It never mutates transaction state.
+    \\Legacy is the default. Native verification requires settled receipt-backed
+    \\completion and the matching current database; it never performs recovery.
     \\
 ;
 
@@ -427,7 +431,8 @@ fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpT
             if (isHelpFlag(argument)) has_help = true;
         }
         if (!has_help) return null;
-        if (isHelpFlag(subcommand) or std.mem.eql(u8, subcommand, "verify"))
+        if (isHelpFlag(subcommand) or std.mem.eql(u8, subcommand, "verify") or
+            std.mem.eql(u8, subcommand, "capabilities"))
             return .transaction_result;
         return null;
     }
@@ -625,6 +630,8 @@ fn isSystemRecovery(init: std.process.Init) bool {
 }
 
 const TransactionResultSingleOption = enum {
+    transaction_backend,
+    install_root,
     state_path,
     lock_input,
     architecture,
@@ -642,13 +649,16 @@ fn runTransactionResult(
         try stderr.flush();
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
-    if (!std.mem.eql(u8, subcommand, "verify")) {
+    const capabilities = std.mem.eql(u8, subcommand, "capabilities");
+    if (!std.mem.eql(u8, subcommand, "verify") and !capabilities) {
         try stderr.print("debz: unknown transaction-result command '{s}'\n", .{subcommand});
         try stderr.writeAll(transaction_result_help);
         try stderr.flush();
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     }
 
+    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
+    var install_root: ?[]const u8 = null;
     var state_path: ?[]const u8 = null;
     var lock_input: ?[]const u8 = null;
     var architecture: ?[]const u8 = null;
@@ -657,6 +667,18 @@ fn runTransactionResult(
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--json")) {
             requested_json = true;
+        } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
+            setOnceTransactionResult(&seen, .transaction_backend) catch
+                return transactionResultUsage(stderr, "duplicate --transaction-backend");
+            const value = args.next() orelse
+                return transactionResultUsage(stderr, "missing --transaction-backend value");
+            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, value) orelse
+                return transactionResultUsage(stderr, "invalid --transaction-backend");
+        } else if (std.mem.eql(u8, argument, "--install-root")) {
+            setOnceTransactionResult(&seen, .install_root) catch
+                return transactionResultUsage(stderr, "duplicate --install-root");
+            install_root = args.next() orelse
+                return transactionResultUsage(stderr, "missing --install-root value");
         } else if (std.mem.eql(u8, argument, "--state-path")) {
             setOnceTransactionResult(&seen, .state_path) catch
                 return transactionResultUsage(stderr, "duplicate --state-path");
@@ -676,14 +698,38 @@ fn runTransactionResult(
             return transactionResultUsage(stderr, "invalid transaction-result argument");
         }
     }
-    const state = state_path orelse
-        return transactionResultUsage(stderr, "--state-path is required");
+    if (!requested_json)
+        return transactionResultUsage(stderr, "--json is required");
+    if (capabilities) {
+        if (transaction_backend != .native or state_path != null or install_root != null or
+            lock_input != null or architecture != null)
+            return transactionResultUsage(stderr, "capabilities requires only --transaction-backend native --json");
+        try stdout.writeAll(try debz.native_transaction_result.capabilitiesJson(init.arena.allocator()));
+        return;
+    }
     const lock_path = lock_input orelse
         return transactionResultUsage(stderr, "--lock-input is required");
     const target = architecture orelse
         return transactionResultUsage(stderr, "--architecture is required");
-    if (!requested_json)
-        return transactionResultUsage(stderr, "--json is required");
+    if (transaction_backend == .native) {
+        if (state_path != null)
+            return transactionResultUsage(stderr, "native verification does not use --state-path");
+        const root = install_root orelse
+            return transactionResultUsage(stderr, "native verification requires --install-root");
+        if (!validCliAbsolutePath(root) or !validCliAbsolutePath(lock_path) or !validCliArchitecture(target))
+            return transactionResultUsage(stderr, "invalid explicit path or architecture");
+        const result = verifyNativeTransactionResult(init.arena.allocator(), init.io, root, lock_path, target) catch |err| {
+            try stderr.print("debz: transaction result verification failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(@intFromEnum(api.ExitStatus.transaction));
+        };
+        try stdout.writeAll(try result.canonicalJson(init.arena.allocator()));
+        return;
+    }
+    if (install_root != null)
+        return transactionResultUsage(stderr, "--install-root requires native verification");
+    const state = state_path orelse
+        return transactionResultUsage(stderr, "--state-path is required");
     if (!validCliAbsolutePath(state) or !validCliAbsolutePath(lock_path) or
         !validCliArchitecture(target))
         return transactionResultUsage(stderr, "invalid explicit path or architecture");
@@ -752,6 +798,25 @@ fn verifyTransactionResult(
         lock.lock,
         architecture,
     );
+}
+
+fn verifyNativeTransactionResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    install_root: []const u8,
+    lock_path: []const u8,
+    architecture: []const u8,
+) !debz.native_transaction_result.Summary {
+    const lock_parent = std.fs.path.dirname(lock_path) orelse return error.InvalidAbsolutePath;
+    var lock_dir = try openAbsoluteDirectoryNoFollow(io, lock_parent);
+    defer lock_dir.close(io);
+    const lock_store = try debz.ExactClosureLockV2Store.init(io, lock_dir, std.fs.path.basename(lock_path));
+    var lock = try lock_store.read(allocator, debz.exact_lock_v2.maximum_document_bytes);
+    defer lock.deinit();
+    var root = try debz.openAbsoluteRootFilesystem(io, install_root);
+    defer root.close();
+    var locks: debz.root_operation.SystemLockBackend = .{ .allocator = allocator, .io = io };
+    return debz.native_transaction_result.verify(allocator, root.root, install_root, lock.lock, architecture, locks.interface());
 }
 
 fn openAbsoluteDirectoryNoFollow(io: std.Io, path: []const u8) !std.Io.Dir {
