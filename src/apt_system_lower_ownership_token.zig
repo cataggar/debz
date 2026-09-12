@@ -604,6 +604,7 @@ test "apt_system_lower_ownership_token.test.clean reconciliation transition bind
         .exact_lock_sha256 = @splat(0x27),
         .semantic_request_sha256 = @splat(0x28),
         .mutation_status = .changed,
+        .outer_transaction_sha256 = @splat(0x2b),
         .nonce = @splat(0x20),
     });
     const review_marker =

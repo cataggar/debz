@@ -43,7 +43,7 @@ class RecoveryOracleTests(unittest.TestCase):
     def test_projection_requires_private_disposable_root_before_mounting(self) -> None:
         projected = self.workspace / "projection/root"
         projected.mkdir(parents=True)
-        marker = projected / ".debz-native-disposable"
+        marker = projected / ".debz-native-projection"
         for root, pid, uid, contents in (
             (Path("/"), 1, 0, "debz native projection fixture v1\n"),
             (self.root, 1, 0, "debz native projection fixture v1\n"),

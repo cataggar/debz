@@ -214,6 +214,7 @@ const RepositoryOptions = struct {
 pub const Backend = struct {
     io: std.Io,
     transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    root_projection: ?*const live_root.Projection = null,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
@@ -1942,7 +1943,7 @@ pub const Backend = struct {
         );
         defer owned_root.close();
         if (self.transaction_backend == .native)
-            validateNativeRoot(self.io, owned_root.root) catch |err|
+            validateNativeRoot(self.io, owned_root.root, request.options.install_root, self.root_projection) catch |err|
                 return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
@@ -1955,6 +1956,7 @@ pub const Backend = struct {
             request.options.install_root,
             lock_backend,
         ) catch |err| return mapRootOperationError(request.operation, err);
+        coordinator.root_projection = if (self.transaction_backend == .native) self.root_projection else null;
         const token = lock_backend.acquire(.{
             .rank = .root_operation,
             .root = owned_root.root,
@@ -1964,6 +1966,8 @@ pub const Backend = struct {
             .cancellation = transaction_executor.Cancellation.never(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
+        coordinator.validateProjection() catch |err|
+            return mapRootOperationError(request.operation, err);
         const store = coordinator.store();
         var marker = store.readDeferredAcknowledgment(allocator) catch |err|
             switch (err) {
@@ -2254,7 +2258,7 @@ pub const Backend = struct {
         );
         defer owned_root.close();
         if (self.transaction_backend == .native)
-            validateNativeRoot(self.io, owned_root.root) catch |err|
+            validateNativeRoot(self.io, owned_root.root, request.options.install_root, self.root_projection) catch |err|
                 return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
@@ -2267,6 +2271,7 @@ pub const Backend = struct {
             request.options.install_root,
             lock_backend,
         ) catch |err| return mapRootOperationError(request.operation, err);
+        coordinator.root_projection = if (self.transaction_backend == .native) self.root_projection else null;
         const token = lock_backend.acquire(.{
             .rank = .root_operation,
             .root = owned_root.root,
@@ -2276,6 +2281,8 @@ pub const Backend = struct {
             .cancellation = transaction_executor.Cancellation.never(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
+        coordinator.validateProjection() catch |err|
+            return mapRootOperationError(request.operation, err);
         const store = coordinator.store();
         var marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
@@ -2678,19 +2685,20 @@ pub const Backend = struct {
         );
         defer owned_root.close();
         if (self.transaction_backend == .native)
-            validateNativeRoot(self.io, owned_root.root) catch |err|
+            validateNativeRoot(self.io, owned_root.root, request.options.install_root, self.root_projection) catch |err|
                 return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
             .io = self.io,
         };
         const lock_backend = locks.interface();
-        const coordinator = root_operation.Coordinator.open(
+        var coordinator = root_operation.Coordinator.open(
             self.io,
             owned_root.root,
             request.options.install_root,
             lock_backend,
         ) catch |err| return mapRootOperationError(request.operation, err);
+        coordinator.root_projection = if (self.transaction_backend == .native) self.root_projection else null;
         const token = lock_backend.acquire(.{
             .rank = .root_operation,
             .root = owned_root.root,
@@ -2700,6 +2708,8 @@ pub const Backend = struct {
             .cancellation = transaction_executor.Cancellation.never(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
+        coordinator.validateProjection() catch |err|
+            return mapRootOperationError(request.operation, err);
         if (self.transaction_backend == .native) {
             const active = native_runtime.hasActiveEvidence(allocator, owned_root.root) catch |err| switch (err) {
                 error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
@@ -3240,7 +3250,15 @@ fn workflowReconciliationMarker(
     });
 }
 
-fn validateNativeRoot(io: std.Io, root: root_fs.Root) !void {
+fn validateNativeRoot(
+    io: std.Io,
+    root: root_fs.Root,
+    install_root: []const u8,
+    projection: ?*const live_root.Projection,
+) !void {
+    if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
+    if (projection) |authority|
+        return authority.validateRoot(install_root, root.dir.handle);
     var host = root_fs.openAbsoluteRoot(io, "/") catch return error.HostRootNotSupported;
     defer host.close();
     const held = try root.rootEntry();
@@ -3536,7 +3554,7 @@ const RootOperationGuard = struct {
             "install root is unsafe or unavailable",
         );
         if (self.native_owned)
-            validateNativeRoot(self.backend.io, self.owned_root.?.root) catch |err|
+            validateNativeRoot(self.backend.io, self.owned_root.?.root, request.options.install_root, self.backend.root_projection) catch |err|
                 return nativeFailure(request.operation, err, false);
         self.locks = .{ .allocator = allocator, .io = self.backend.io };
         self.coordinator = root_operation.Coordinator.open(
@@ -3546,6 +3564,7 @@ const RootOperationGuard = struct {
             self.locks.interface(),
         ) catch |err| return mapRootOperationError(request.operation, err);
         self.coordinator.now_unix = self.backend.now_unix;
+        self.coordinator.root_projection = if (self.native_owned) self.backend.root_projection else null;
         self.attempt = self.coordinator.acquire(allocator, .{
             .intent = if (request.operation == .recover)
                 .recovery
@@ -5336,13 +5355,19 @@ test "production workflow native execution requires a reviewed lock before repos
 
 test "production workflow external native fixture" {
     const raw_path = std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") orelse return error.SkipZigTest;
+    try runExternalNativeWorkflow(std.mem.span(raw_path), null);
+}
+
+fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_root.Projection) anyerror!void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const bytes = try readFile(allocator, std.testing.io, std.mem.span(raw_path), 1024 * 1024);
+    const bytes = try readFile(allocator, std.testing.io, request_path, 1024 * 1024);
     const External = struct {
         workflow: WorkflowRequest,
         report: []const u8,
+        projected: bool = false,
+        withhold_projection: bool = false,
         completion_crash: ?CompletionPoint = null,
         owner_evidence: ?[]const u8 = null,
         reconciliation_owner_output: ?[]const u8 = null,
@@ -5357,6 +5382,24 @@ test "production workflow external native fixture" {
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.projected and projection == null) {
+        const Callback = struct {
+            path: []const u8,
+            fn run(raw: ?*anyopaque, authority: *const live_root.Projection) anyerror!u8 {
+                const self: *const @This() = @ptrCast(@alignCast(raw.?));
+                try runExternalNativeWorkflow(self.path, authority);
+                return 0;
+            }
+        };
+        var callback: Callback = .{ .path = request_path };
+        const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+        if (result == .exited) {
+            if (result.exited != 0) std.process.exit(result.exited);
+            return;
+        }
+        std.debug.print("projected native workflow failed: {any}\n", .{result});
+        return error.InvalidExternalWorkflowRequest;
+    }
     if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
@@ -5383,6 +5426,7 @@ test "production workflow external native fixture" {
     var backend: Backend = .{
         .io = std.testing.io,
         .transaction_backend = .native,
+        .root_projection = if (external.withhold_projection) null else projection,
         .now_unix = 1_788_796_860,
         .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
@@ -5463,6 +5507,7 @@ test "production workflow external native fixture" {
                 requested.options,
             ),
             .caller_policy_sha256 = planningPolicyDigest(.native, requested.options),
+            .projection = if (external.withhold_projection) null else projection,
         };
         const Check = struct {
             fn documents(result: anytype, owner: root_operation.DeferredAcknowledgment) !void {

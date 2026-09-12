@@ -34,6 +34,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
+const live_root = @import("live_root.zig");
 const product_api = @import("product_api.zig");
 const repository_api = @import("repository_api.zig");
 const root_fs = @import("root_fs.zig");
@@ -3057,6 +3058,8 @@ pub const Coordinator = struct {
     identity: Identity,
     locks: LockBackend,
     now_unix: ?i64 = null,
+    /// Borrowed from the current private-root callback; never persisted.
+    root_projection: ?*const live_root.Projection = null,
 
     /// Validates the selected root, binds its identity, and provisions the
     /// shared namespace. Nothing else in this module touches the filesystem
@@ -3089,6 +3092,12 @@ pub const Coordinator = struct {
         return .init(self.root);
     }
 
+    pub fn validateProjection(self: Coordinator) Error!void {
+        if (self.root_projection) |projection|
+            projection.validateRoot(self.install_root, self.root.dir.handle) catch
+                return error.InvalidRoot;
+    }
+
     /// Read-only view of the active record. It takes no lock, so it is only
     /// for diagnostics and must never gate a mutation.
     pub fn inspect(self: Coordinator, allocator: std.mem.Allocator) !?OwnedRecord {
@@ -3109,6 +3118,7 @@ pub const Coordinator = struct {
         allocator: std.mem.Allocator,
         request: Request,
     ) Error!Attempt {
+        try self.validateProjection();
         const token = try self.locks.acquire(.{
             .rank = .root_operation,
             .root = self.root,
@@ -3120,6 +3130,7 @@ pub const Coordinator = struct {
         errdefer self.locks.release(token);
         if (request.acquisition_observer) |observer|
             observer.hit(.after_lock_acquired) catch return error.StoreFailed;
+        try self.validateProjection();
 
         const store_handle = self.store();
         var recovery_review = store_handle.readRecoveryReviewClaim(
@@ -3736,6 +3747,7 @@ pub const Attempt = struct {
     ) Error!void {
         const current = self.owned.record;
         if (!self.locked()) return error.LockLost;
+        try self.coordinator.validateProjection();
 
         const step = transition.step orelse (std.math.add(u64, current.step, 1) catch
             return error.InvalidTransition);
@@ -3926,6 +3938,7 @@ pub const Attempt = struct {
     pub fn clear(self: *Attempt) Error!void {
         const current = self.owned.record;
         if (!self.locked()) return error.LockLost;
+        try self.coordinator.validateProjection();
         if (current.state != .completed) return error.InvalidTransition;
         if (current.provenance == .pending) return error.ProvenanceRequired;
         self.coordinator.store().clear() catch return error.StoreFailed;

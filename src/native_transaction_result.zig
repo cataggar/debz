@@ -793,13 +793,14 @@ fn testSummaries(allocator: std.mem.Allocator) !void {
 }
 
 test "native_transaction_result.test.projected root external fixture" {
+    std.testing.refAllDecls(@import("apt_system_orchestrator.zig"));
     const enabled = std.c.getenv("DEBZ_NATIVE_PROJECTION_FIXTURE") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.InvalidProjectionFixture;
     var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
     defer root.close();
     const marker = try root.root.readFileAlloc(
         std.testing.allocator,
-        try root_fs.Path.init(".debz-native-disposable"),
+        try root_fs.Path.init(".debz-native-projection"),
         128,
     );
     defer std.testing.allocator.free(marker);

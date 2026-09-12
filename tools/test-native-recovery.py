@@ -1768,48 +1768,177 @@ def exercise_workflows(
             assert not (current.directory / "unused-state").exists()
             print(f"workflow-reconciliation-{pre_mutation}-{claim_boundary}: exact exclusion and finalization passed", flush=True)
 
+    for outcome in ("success", "recovered", "failed"):
+        current = scenario(f"workflow-projected-{outcome}")
+        root = current.candidate
+        fixture = root / "fixture"
+        fixture.mkdir()
+        (root / "proc").mkdir(exist_ok=True)
+        (root / "run").mkdir(exist_ok=True)
+        (root / "tmp").mkdir(exist_ok=True)
+        (root / "dev").mkdir(exist_ok=True)
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        m.write(root / ".debz-native-projection", b"debz native projection fixture v1\n")
+        lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+        shutil.copytree(repository, fixture / "repository")
+        m.write(fixture / "workflow.sources", (
+            "Types: deb\nURIs: file:///fixture/repository\nSuites: debian-stable\n"
+            f"Components: main\nArchitectures: {architecture}\n"
+            "Signed-By: /fixture/repository/fixture-keyring.gpg\n"
+        ).encode())
+        selected = ["fail-script"] if outcome == "failed" else ["scenario-main", "conffile-pkg"]
 
-def projection_inside(root: Path) -> None:
+        def projected_request(mode: str) -> dict:
+            options = {
+                "install_root": "/run/debz/system-root",
+                "cache_path": "/fixture/unused-cache" if mode == "recover" else "/fixture/cache",
+                "state_path": "/fixture/unused-state" if mode == "recover" else "/fixture/state",
+                "architecture": architecture, "assume_yes": True,
+                "conffile": "keep_existing", "noninteractive": True,
+            }
+            if mode != "recover":
+                options.update(
+                    source_paths=["/fixture/workflow.sources"],
+                    keyring_paths=["/fixture/repository/fixture-keyring.gpg"],
+                )
+                options["lock_output_path" if mode == "plan_only" else "lock_input_path"] = "/fixture/lock.json"
+            value = {
+                "operation": "install", "mode": mode,
+                "selectors": [{"name": name} for name in selected], "options": options,
+            }
+            if mode not in ("plan_only", "download_only"):
+                value["orchestration_id"] = [23] * 32
+            if mode == "recover" and outcome != "success":
+                value["defer_recovery_clear"] = True
+            return value
+
+        def projected_run(mode: str, *, expected_exit: int | None = 0, **extra) -> dict | None:
+            report = fixture / "report.json"
+            report.unlink(missing_ok=True)
+            m.write(fixture / "request.json", json.dumps({
+                "workflow": projected_request(mode), "projected": True,
+                "report": "/fixture/report.json", **extra,
+            }).encode())
+            result = projected_process(root, workflow=True)
+            assert result.returncode == (CRASH_EXIT if "completion_crash" in extra else 0), (
+                result.returncode, result.stderr,
+            )
+            assert not list((root / "run/debz/system-root").iterdir()), "projected workflow mount leaked"
+            if "completion_crash" in extra:
+                assert not report.exists()
+                return None
+            value = document(report)
+            if "owned_verification" in extra:
+                assert value == {"verified": True, "outcome": "failed" if outcome == "failed" else "succeeded"}, value
+            elif expected_exit is None:
+                assert value["exit_status"] != 0 and not value["changed"], value
+            else:
+                assert value["exit_status"] == expected_exit, value
+            return value
+
+        def projected_owner() -> None:
+            m.write(fixture / "owner.json", (root / owner_path).read_bytes())
+
+        projected_run("plan_only")
+        initial_status = (root / "var/lib/dpkg/status").read_bytes()
+        projected_run("reserve", expected_exit=None, withhold_projection=True)
+        assert not (root / OPERATION).exists() and not (root / owner_path).exists()
+        assert (root / "var/lib/dpkg/status").read_bytes() == initial_status
+        projected_run("reserve")
+        projected_owner()
+        execution = {"owner_evidence": "/fixture/owner.json"}
+        if outcome != "success":
+            execution["completion_crash"] = (
+                "after_owed_provenance_document" if outcome == "failed" else "after_native_receipt"
+            )
+        projected_run("execute", **execution)
+        projected_owner()
+        if outcome != "success":
+            projected_run("recover", owner_evidence="/fixture/owner.json", expected_exit=7 if outcome == "failed" else 0)
+            projected_owner()
+        proof = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        assert proof["install_root"] == "/run/debz/system-root"
+        assert proof["outcome"] == ("failed" if outcome == "failed" else "succeeded")
+        retained_documents(root, proof)
+        assert_final_database(root, architecture, proof)
+        status_before = (root / "var/lib/dpkg/status").read_bytes()
+        evidence_before = {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in (root / NAMESPACE).rglob("*") if path.is_file()
+        }
+        for _ in range(2):
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                "lock_path": "/fixture/lock.json",
+                "state": "released" if outcome == "success" else "pending",
+                "outcome": "failed" if outcome == "failed" else "succeeded",
+            })
+        assert (root / "var/lib/dpkg/status").read_bytes() == status_before
+        assert evidence_before == {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in (root / NAMESPACE).rglob("*") if path.is_file()
+        }, "projected verification changed retained evidence"
+        for _ in range(2):
+            projected_run("recover", owner_evidence="/fixture/owner.json",
+                          acknowledgment="ownership" if outcome == "success" else "recovery")
+        for path in (OPERATION, INTENT, owner_path):
+            assert not (root / path).exists(), path
+        assert not (fixture / "unused-cache").exists()
+        assert not (fixture / "unused-state").exists()
+        print(f"workflow-projected-{outcome}: scoped execution, fresh-owner verification, and acknowledgment passed", flush=True)
+
+
+def projection_inside(root: Path, workflow: bool = False) -> None:
     root = root.resolve(strict=True)
     if (
         os.getpid() != 1 or os.geteuid() != 0
-        or root.name != "root" or root.parent.name != "projection"
+        or root.name not in ("root", "native")
         or root.parent.parent.parent != (ROOT / ".tmp").resolve()
-        or (root / ".debz-native-disposable").read_text() != "debz native projection fixture v1\n"
+        or (root / ".debz-native-projection").read_text() != "debz native projection fixture v1\n"
     ):
         raise RuntimeError("projection entry requires a disposable root and private PID namespace")
     subprocess.run(["mount", "--bind", str(root), str(root)], check=True, timeout=10)
     subprocess.run(["mount", "-t", "proc", "proc", str(root / "proc")], check=True, timeout=10)
     os.chroot(root)
     os.chdir("/")
-    os.execve("/fixture/native-test", ["/fixture/native-test"], {
+    environment = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
-        "TMPDIR": "/tmp", "DEBZ_NATIVE_PROJECTION_FIXTURE": "1",
-    })
+        "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp/.cache",
+    }
+    environment.update(
+        {"DEBZ_NATIVE_WORKFLOW_REQUEST": "/fixture/request.json"} if workflow
+        else {"DEBZ_NATIVE_PROJECTION_FIXTURE": "1"}
+    )
+    os.execve("/fixture/native-test", ["/fixture/native-test"], environment)
+
+
+def projected_process(root: Path, workflow: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            "unshare", "--mount", "--pid", "--fork",
+            sys.executable, str(Path(__file__).resolve()),
+            "--projected-workflow-inside" if workflow else "--projection-inside", str(root),
+        ],
+        env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
+            "TMPDIR": str(root.parent), "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=120, check=False,
+    )
 
 
 def exercise_projection(executable: Path, workspace: Path) -> None:
     root = workspace / "projection" / "root"
     for directory in ("proc", "run", "tmp", "var/lib/debz"):
         (root / directory).mkdir(parents=True, exist_ok=True)
-    (root / ".debz-native-disposable").write_text("debz native projection fixture v1\n")
+    (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
     lock = root / NAMESPACE / "root-operation.lock"
     lock.write_bytes(b"")
     lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
-    result = subprocess.run(
-        [
-            "unshare", "--mount", "--pid", "--fork",
-            sys.executable, str(Path(__file__).resolve()), "--projection-inside", str(root),
-        ],
-        env={
-            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
-            "TMPDIR": str(workspace), "PYTHONDONTWRITEBYTECODE": "1",
-        },
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=60, check=False,
-    )
+    result = projected_process(root)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
     assert b"native_transaction_result.test.projected root external fixture...OK" in result.stderr, result.stderr
+    assert b"apt_system_orchestrator.test.projected native dispatch external fixture...OK" in result.stderr, result.stderr
     assert lock.read_bytes() == b""
     assert list((root / NAMESPACE).iterdir()) == [lock], "read-only verification created root evidence"
     assert not list((root / "run/debz/system-root").iterdir()), "private projection leaked"
@@ -1866,7 +1995,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--projection-inside":
-        projection_inside(Path(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] in ("--projection-inside", "--projected-workflow-inside"):
+        projection_inside(Path(sys.argv[2]), workflow=sys.argv[1] == "--projected-workflow-inside")
     else:
         raise SystemExit(main())
