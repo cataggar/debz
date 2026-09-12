@@ -1,4 +1,4 @@
-//! Strict system profile version 1.
+//! Strict, versioned system profiles.
 //!
 //! A profile is the only system-facade source of repository, trust, network,
 //! architecture, cache, state, and conffile policy. Loading never consults
@@ -7,12 +7,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
+const transaction_engine = @import("transaction_engine.zig");
 
 const Io = std.Io;
 const File = Io.File;
 
 pub const schema_id = "https://debz.dev/schema/system-profile-v1";
 pub const schema_version: u32 = 1;
+pub const backend_schema_id = "https://debz.dev/schema/system-profile-v2";
+pub const backend_schema_version: u32 = 2;
+pub const TransactionBackend = transaction_engine.Kind;
 pub const default_profile_path = "/etc/debz/default.json";
 pub const default_cache_path = "/var/cache/debz";
 pub const default_state_path = "/var/lib/debz";
@@ -50,6 +54,7 @@ pub const NetworkPolicy = struct {
 };
 
 pub const Profile = struct {
+    transaction_backend: TransactionBackend = .legacy_dpkg,
     repositories: []const Repository,
     keyring_paths: []const []const u8,
     architecture: []const u8,
@@ -195,6 +200,59 @@ const WireProfile = struct {
     network: NetworkPolicy = .{},
 };
 
+const WireBackendProfile = struct {
+    schema: []const u8,
+    version: u32,
+    transaction_backend: TransactionBackend,
+    repositories: []const Repository,
+    keyring_paths: []const []const u8,
+    architecture: []const u8,
+    foreign_architectures: []const []const u8 = &.{},
+    repository_policy: RepositoryPolicy = .strict_priority,
+    cache_path: []const u8 = default_cache_path,
+    state_path: []const u8 = default_state_path,
+    default_conffile: ConffilePolicy = .keep_existing,
+    network: NetworkPolicy = .{},
+};
+
+fn profileFromWire(wire: anytype) Profile {
+    return .{
+        .transaction_backend = if (@hasField(@TypeOf(wire), "transaction_backend"))
+            wire.transaction_backend
+        else
+            .legacy_dpkg,
+        .repositories = wire.repositories,
+        .keyring_paths = wire.keyring_paths,
+        .architecture = wire.architecture,
+        .foreign_architectures = wire.foreign_architectures,
+        .repository_policy = wire.repository_policy,
+        .cache_path = wire.cache_path,
+        .state_path = wire.state_path,
+        .default_conffile = wire.default_conffile,
+        .network = wire.network,
+    };
+}
+
+fn parseWire(comptime T: type, allocator: std.mem.Allocator, source: []const u8, ignore_unknown: bool) !T {
+    return std.json.parseFromSliceLeaky(T, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = ignore_unknown,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidDocument,
+    };
+}
+
+fn parseProfile(allocator: std.mem.Allocator, source: []const u8) !Profile {
+    const header = try parseWire(struct { schema: []const u8, version: u32 }, allocator, source, true);
+    if (std.mem.eql(u8, header.schema, schema_id) and header.version == schema_version)
+        return profileFromWire(try parseWire(WireProfile, allocator, source, false));
+    if (std.mem.eql(u8, header.schema, backend_schema_id) and header.version == backend_schema_version)
+        return profileFromWire(try parseWire(WireBackendProfile, allocator, source, false));
+    return error.UnsupportedSchema;
+}
+
 pub const LoadError = error{
     InvalidLimits,
     InvalidProfilePath,
@@ -248,27 +306,9 @@ pub fn load(
     );
     defer allocator.free(profile_capture.bytes);
 
-    var parsed = std.json.parseFromSlice(WireProfile, allocator, profile_capture.bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = false,
-    }) catch return error.InvalidDocument;
-    defer parsed.deinit();
-    const wire = parsed.value;
-    if (!std.mem.eql(u8, wire.schema, schema_id) or
-        wire.version != schema_version)
-        return error.UnsupportedSchema;
-
-    const profile: Profile = .{
-        .repositories = wire.repositories,
-        .keyring_paths = wire.keyring_paths,
-        .architecture = wire.architecture,
-        .foreign_architectures = wire.foreign_architectures,
-        .repository_policy = wire.repository_policy,
-        .cache_path = wire.cache_path,
-        .state_path = wire.state_path,
-        .default_conffile = wire.default_conffile,
-        .network = wire.network,
-    };
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const profile = try parseProfile(scratch.allocator(), profile_capture.bytes);
     try validateProfile(profile, limits);
 
     var trusted_file_count: usize = 1 + profile.keyring_paths.len;
@@ -349,6 +389,7 @@ pub fn load(
         evidence[index].path = try owned.dupe(u8, item.path);
     }
     const owned_profile: Profile = .{
+        .transaction_backend = profile.transaction_backend,
         .repositories = repositories,
         .keyring_paths = keyrings,
         .architecture = try owned.dupe(u8, profile.architecture),
@@ -939,6 +980,84 @@ const defaulted_profile_json =
     \\"architecture":"amd64"}
 ;
 
+fn versionedTestProfile(comptime header: []const u8) []const u8 {
+    return "{" ++ header ++
+        ",\"repositories\":[{\"source_path\":\"/etc/debz/debian.sources\"}]," ++
+        "\"keyring_paths\":[\"/usr/share/keyrings/debian-archive-keyring.gpg\"]," ++
+        "\"architecture\":\"amd64\"}";
+}
+
+const native_profile_json = versionedTestProfile(
+    "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"native\"",
+);
+const legacy_backend_profile_json = versionedTestProfile(
+    "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"legacy_dpkg\"",
+);
+
+test "system_profile.test.versioned backend authority preserves reference trust and changes profile binding" {
+    var fake: FakeFileSystem = .{ .profile_source = defaulted_profile_json };
+    var original = try load(std.testing.allocator, fake.interface(), default_profile_path, .{});
+    defer original.deinit();
+    fake.profile_source = native_profile_json;
+    var native = try load(std.testing.allocator, fake.interface(), default_profile_path, .{});
+    defer native.deinit();
+    fake.profile_source = legacy_backend_profile_json;
+    var legacy = try load(std.testing.allocator, fake.interface(), default_profile_path, .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(TransactionBackend.legacy_dpkg, original.profile.transaction_backend);
+    try std.testing.expectEqual(TransactionBackend.legacy_dpkg, legacy.profile.transaction_backend);
+    try std.testing.expectEqual(TransactionBackend.native, native.profile.transaction_backend);
+    try std.testing.expectEqualStrings(default_cache_path, native.profile.cache_path);
+    try std.testing.expectEqualStrings(default_state_path, native.profile.state_path);
+    try std.testing.expectEqual(original.trusted_file_count, native.trusted_file_count);
+    try std.testing.expectEqualSlices(u8, &original.reference_evidence_sha256, &native.reference_evidence_sha256);
+    try std.testing.expectEqualSlices(u8, &legacy.reference_evidence_sha256, &native.reference_evidence_sha256);
+    try std.testing.expect(!std.mem.eql(u8, &original.profile_sha256, &native.profile_sha256));
+    try std.testing.expect(!std.mem.eql(u8, &legacy.profile_sha256, &native.profile_sha256));
+    const source_path = "/etc/debz/debian.sources";
+    const verified = try native.readTrustedFile(std.testing.allocator, fake.interface(), source_path, .{});
+    defer std.testing.allocator.free(verified);
+    fake.override_path = source_path;
+    fake.override_metadata.uid = 1000;
+    try std.testing.expectError(error.NotRootOwned, load(std.testing.allocator, fake.interface(), default_profile_path, .{}));
+    try std.testing.expectError(error.NotRootOwned, native.readTrustedFile(std.testing.allocator, fake.interface(), source_path, .{}));
+}
+
+test "system_profile.test.backend selection requires v2 and one explicit recognized backend" {
+    inline for (.{
+        "\"schema\":\"https://debz.dev/schema/system-profile-v1\",\"version\":1,\"transaction_backend\":\"native\"",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v1\",\"version\":1,\"transaction_backend\":null",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":null",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"auto\"",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"NATIVE\"",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"native\",\"transaction_backend\":\"legacy_dpkg\"",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"native\",\"install_root\":\"/\"",
+    }) |header| {
+        var fake: FakeFileSystem = .{ .profile_source = versionedTestProfile(header) };
+        try std.testing.expectError(error.InvalidDocument, load(std.testing.allocator, fake.interface(), default_profile_path, .{}));
+    }
+    inline for (.{
+        "\"schema\":\"https://debz.dev/schema/system-profile-v1\",\"version\":2",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":1,\"transaction_backend\":\"native\"",
+        "\"schema\":\"https://debz.dev/schema/system-profile-v3\",\"version\":3,\"transaction_backend\":\"native\"",
+    }) |header| {
+        var fake: FakeFileSystem = .{ .profile_source = versionedTestProfile(header) };
+        try std.testing.expectError(error.UnsupportedSchema, load(std.testing.allocator, fake.interface(), default_profile_path, .{}));
+    }
+}
+
+fn allocationProfileCase(allocator: std.mem.Allocator, source: []const u8) !void {
+    var fake: FakeFileSystem = .{ .profile_source = source };
+    var loaded = try load(allocator, fake.interface(), default_profile_path, .{});
+    defer loaded.deinit();
+}
+
+test "system_profile.test.versioned parsing and trust capture preserve allocation failures" {
+    for ([_][]const u8{ valid_profile_json, native_profile_json, legacy_backend_profile_json }) |source|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProfileCase, .{source});
+}
+
 test "system_profile.test.strict profile loads only explicit trusted inputs" {
     var fake: FakeFileSystem = .{ .profile_source = valid_profile_json };
     var loaded = try load(
@@ -948,6 +1067,7 @@ test "system_profile.test.strict profile loads only explicit trusted inputs" {
         .{},
     );
     defer loaded.deinit();
+    try std.testing.expectEqual(TransactionBackend.legacy_dpkg, loaded.profile.transaction_backend);
     try std.testing.expectEqualStrings("amd64", loaded.profile.architecture);
     try std.testing.expectEqualStrings(default_cache_path, loaded.profile.cache_path);
     try std.testing.expectEqualStrings(default_state_path, loaded.profile.state_path);

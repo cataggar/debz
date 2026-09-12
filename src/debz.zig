@@ -44,6 +44,7 @@ pub const ProductExitStatus = product_api.ExitStatus;
 pub const ProductBackend = product_api.Backend;
 pub const executeProductRequest = product_api.execute;
 pub const SystemProfile = system_profile.Profile;
+pub const SystemProfileTransactionBackend = system_profile.TransactionBackend;
 pub const OwnedSystemProfile = system_profile.LoadedProfile;
 pub const SystemProfileRepository = system_profile.Repository;
 pub const SystemProfileNetworkPolicy = system_profile.NetworkPolicy;

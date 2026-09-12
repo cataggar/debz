@@ -954,6 +954,7 @@ fn installReleaseFiles(
         "root-operation-completion-v1.json",
         "root-operation-record-v1.json",
         "system-profile-v1.json",
+        "system-profile-v2.json",
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",

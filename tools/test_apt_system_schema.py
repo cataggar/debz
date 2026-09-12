@@ -55,6 +55,68 @@ class RequiredSecurityTestManifestTests(unittest.TestCase):
         self.assertEqual(selected, 6)
 
 
+class SystemProfileSchemaTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.v1 = json.loads((ROOT / "schema/system-profile-v1.json").read_text())
+        cls.v2 = json.loads((ROOT / "schema/system-profile-v2.json").read_text())
+        cls.v1_validator = jsonschema.Draft202012Validator(cls.v1)
+        if Registry is not None and Resource is not None:
+            registry = Registry().with_resource(
+                cls.v1["$id"], Resource.from_contents(cls.v1),
+            )
+            cls.v2_validator = jsonschema.Draft202012Validator(cls.v2, registry=registry)
+        else:
+            cls.v2_validator = jsonschema.Draft202012Validator(
+                cls.v2,
+                resolver=jsonschema.RefResolver.from_schema(
+                    cls.v2, store={cls.v1["$id"]: cls.v1},
+                ),
+            )
+
+    @staticmethod
+    def profile() -> dict:
+        return {
+            "schema": "https://debz.dev/schema/system-profile-v2",
+            "version": 2,
+            "transaction_backend": "native",
+            "repositories": [{"source_path": "/etc/debz/repository.sources"}],
+            "keyring_paths": ["/etc/debz/keyring.gpg"],
+            "architecture": "amd64",
+        }
+
+    def test_v2_requires_explicit_backend_and_preserves_v1_rejection(self) -> None:
+        for backend in ("legacy_dpkg", "native"):
+            document = self.profile()
+            document["transaction_backend"] = backend
+            self.v2_validator.validate(document)
+            document["schema"] = self.v1["$id"]
+            document["version"] = 1
+            with self.assertRaises(jsonschema.ValidationError):
+                self.v1_validator.validate(document)
+            del document["transaction_backend"]
+            self.v1_validator.validate(document)
+        document = self.profile()
+        del document["transaction_backend"]
+        with self.assertRaises(jsonschema.ValidationError):
+            self.v2_validator.validate(document)
+
+    def test_v2_retains_strict_backend_path_and_field_constraints(self) -> None:
+        for backend in ("auto", "NATIVE", "", None):
+            document = self.profile()
+            document["transaction_backend"] = backend
+            with self.assertRaises(jsonschema.ValidationError):
+                self.v2_validator.validate(document)
+        for name, value in (
+            ("install_root", "/"), ("cache_path", "/"), ("state_path", "/a/../b"),
+            ("keyring_paths", ["/a//b"]), ("version", 1),
+        ):
+            document = self.profile()
+            document[name] = value
+            with self.assertRaises(jsonschema.ValidationError):
+                self.v2_validator.validate(document)
+
+
 class AptSystemResultSchemaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

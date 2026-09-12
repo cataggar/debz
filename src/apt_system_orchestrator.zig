@@ -39,6 +39,7 @@ pub const completion_schema_id =
 pub const completion_schema_version: u32 = 1;
 
 pub const ProfileView = struct {
+    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
     binding: api.ProfileBinding,
     source_paths: []const []const u8,
     config_paths: []const []const u8,
@@ -97,7 +98,12 @@ pub const ProfileLoader = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
     ) BoundaryError!LoadedProfile {
-        return self.loadFn(self.context, allocator, path);
+        var loaded = try self.loadFn(self.context, allocator, path);
+        errdefer loaded.deinit();
+        // Native profile authority must not enter the legacy lock/recovery path.
+        if (loaded.view.transaction_backend != .legacy_dpkg)
+            return error.OperationalBoundaryFailure;
+        return loaded;
     }
 };
 
@@ -174,6 +180,7 @@ pub const SystemProfileLoader = struct {
         return .{
             .context = lease,
             .view = .{
+                .transaction_backend = lease.loaded.profile.transaction_backend,
                 .binding = .{
                     .path = lease.loaded.profile_path,
                     .sha256 = lease.loaded.profile_sha256,
@@ -12000,6 +12007,8 @@ fn testBoundaryError(err: anyerror) BoundaryError {
 
 const FakeProfileLoader = struct {
     load_count: usize = 0,
+    deinit_count: usize = 0,
+    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
     revalidate_count: usize = 0,
     load_boundary_error: ?BoundaryError = null,
     fail_revalidate: bool = false,
@@ -12040,6 +12049,7 @@ const FakeProfileLoader = struct {
         return .{
             .context = self,
             .view = .{
+                .transaction_backend = self.transaction_backend,
                 .binding = .{
                     .path = "/profile.json",
                     .sha256 = @splat(
@@ -12088,8 +12098,26 @@ const FakeProfileLoader = struct {
             return error.TrustedFileContentChanged;
     }
 
-    fn deinit(_: ?*anyopaque) void {}
+    fn deinit(context: ?*anyopaque) void {
+        const self: *FakeProfileLoader = @ptrCast(@alignCast(context.?));
+        self.deinit_count += 1;
+    }
 };
+
+test "apt_system_orchestrator.test.native profile authority is refused without legacy fallback" {
+    var profiles: FakeProfileLoader = .{ .transaction_backend = .native };
+    try std.testing.expectError(
+        error.OperationalBoundaryFailure,
+        profiles.interface().load(std.testing.allocator, "/profile.json"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), profiles.load_count);
+    try std.testing.expectEqual(@as(usize, 1), profiles.deinit_count);
+    try std.testing.expectEqual(@as(usize, 0), profiles.revalidate_count);
+    profiles.transaction_backend = .legacy_dpkg;
+    var loaded = try profiles.interface().load(std.testing.allocator, "/profile.json");
+    defer loaded.deinit();
+    try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, loaded.view.transaction_backend);
+}
 
 const FakeBackend = struct {
     route_calls: usize = 0,
