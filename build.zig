@@ -433,7 +433,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (require_privileged_orchestration_tests)
             &.{"apt_system_orchestrator.test.required_privileged."}
         else
-            &.{"apt_system_orchestrator.test."},
+            &.{ "apt_system_orchestrator.test.", "apt_system_lower_ownership_token.test." },
     });
     const run_apt_system_orchestrator_tests = b.addRunArtifact(
         apt_system_orchestrator_tests,
