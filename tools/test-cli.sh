@@ -203,6 +203,9 @@ for arguments in \
     "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64" \
     "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline" \
     "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --archive-input /archive" \
+    "package-cache fingerprint --json --transaction-backend other --lock-input /missing --cache-path $cache --architecture amd64" \
+    "package-cache fingerprint --json --transaction-backend native --transaction-backend native --lock-input /missing --cache-path $cache --architecture amd64" \
+    "package-cache prepare --json --transaction-backend native --transaction-backend legacy_dpkg --lock-input /missing --cache-path $cache --architecture amd64" \
     "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --repair-corrupt-cache --offline" \
     "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --restored-cache exact" \
     "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64"

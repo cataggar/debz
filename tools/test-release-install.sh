@@ -54,7 +54,9 @@ for schema in \
   native-execution-request-v2.json \
   package-cache-error-v1.json \
   package-cache-fingerprint-v1.json \
+  package-cache-fingerprint-v2.json \
   package-cache-result-v1.json \
+  package-cache-result-v2.json \
   repository-add-state-v1.json \
   repository-operation-result-v1.json \
   root-operation-completion-v1.json \

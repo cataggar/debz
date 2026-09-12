@@ -138,6 +138,216 @@ for package, previous in zip(native["packages"], legacy["packages"]):
 expected = native.pop("digest_sha256")
 assert hashlib.sha256(json.dumps(native, separators=(",", ":")).encode()).hexdigest() == expected
 PY
+
+native_package_cache="$workspace/native-package-cache"
+native_package_archive="$workspace/native-package-cache.dbzcache"
+native_package_common="--transaction-backend native --lock-input $native_lock --cache-path $native_package_cache --architecture $architecture --json"
+native_fingerprint=$(run_json package-cache fingerprint $native_package_common)
+native_prepared=$(run_json package-cache prepare $native_package_common \
+  --source "$source_file" --keyring "$keyring" --archive-output "$native_package_archive")
+native_warm=$(run_json package-cache prepare $native_package_common \
+  --source "$source_file" --keyring "$keyring" --offline)
+python3 - "$native_fingerprint" "$native_prepared" "$native_warm" "$native_lock" "$native_package_archive" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import struct
+import sys
+
+import jsonschema
+
+fingerprint, prepared, warm = map(json.loads, sys.argv[1:4])
+lock = json.loads(Path(sys.argv[4]).read_bytes())
+for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (warm, "result")):
+    schema = json.loads(Path(f"schema/package-cache-{name}-v2.json").read_bytes())
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.validate(value, schema)
+    legacy = json.loads(Path(f"schema/package-cache-{name}-v1.json").read_bytes())
+    assert not jsonschema.Draft202012Validator(legacy).is_valid(value)
+    assert value["lock_digest"] == lock["digest_sha256"]
+assert prepared["fingerprint"] == warm["fingerprint"] == fingerprint["fingerprint"]
+assert prepared["downloaded_count"] == prepared["verified_count"] == len(lock["packages"])
+assert prepared["reused_count"] == warm["downloaded_count"] == 0
+assert warm["reused_count"] == prepared["verified_count"]
+archive = Path(sys.argv[5]).read_bytes()
+magic = b"debz-package-cache-archive-v2\n"
+assert archive.startswith(magic)
+assert struct.unpack(">I", archive[len(magic):len(magic) + 4])[0] == len(lock["packages"])
+assert hashlib.sha256(archive[:-32]).digest() == archive[-32:]
+PY
+
+native_scenario_lock="$workspace/scenario.native.lock.json"
+run_json plan $native_common --lock-output "$native_scenario_lock" scenario-main | grep -q '"exit_status":0'
+native_partial=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_scenario_lock" \
+  --cache-path "$workspace/native-package-cache-partial" --architecture "$architecture" \
+  --source "$source_file" --keyring "$keyring" \
+  --archive-input "$native_package_archive" --restored-cache partial \
+  --archive-output "$workspace/native-scenario.dbzcache" --json)
+native_exact=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_scenario_lock" \
+  --cache-path "$workspace/native-package-cache-exact" --architecture "$architecture" \
+  --source "$source_file" --keyring "$keyring" \
+  --archive-input "$workspace/native-scenario.dbzcache" --restored-cache exact --json)
+python3 - "$native_partial" "$native_exact" <<'PY'
+import json
+import sys
+partial, exact = map(json.loads, sys.argv[1:])
+assert partial["downloaded_count"] > 0 and partial["reused_count"] > 0
+assert exact["downloaded_count"] == 0
+assert exact["reused_count"] == exact["verified_count"]
+assert partial["fingerprint"] == exact["fingerprint"]
+PY
+
+native_empty_lock="$workspace/empty.native.lock.json"
+native_mixed_lock="$workspace/mixed.native.lock.json"
+native_local_lock="$workspace/local.native.lock.json"
+python3 - "$native_lock" "$native_empty_lock" "$native_mixed_lock" "$native_local_lock" <<'PY'
+import copy
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+original = json.loads(Path(sys.argv[1]).read_bytes())
+assert original["version"] == 2
+
+def write_cache_fixture(value, path, name):
+    # These v2 cache fixtures are not used as transaction authorization.
+    value.pop("digest_sha256")
+    value["request_sha256"] = hashlib.sha256(name.encode()).hexdigest()
+    encoded = json.dumps(value, separators=(",", ":")).encode()
+    value["digest_sha256"] = hashlib.sha256(encoded).hexdigest()
+    Path(path).write_bytes(json.dumps(value, separators=(",", ":")).encode())
+
+empty = copy.deepcopy(original)
+empty["repositories"] = []
+empty["local_artifacts"] = []
+empty["packages"] = []
+write_cache_fixture(empty, sys.argv[2], "native-cache-empty")
+
+mixed = copy.deepcopy(original)
+package = next(value for value in mixed["packages"] if value["name"] == "base-dep")
+artifact = {
+    "artifact_id": package["sha256"],
+    "sha256": package["sha256"],
+    "size": package["declared_size"],
+    "package": {field: package[field] for field in ("name", "version", "architecture")},
+    "acquisition_url": "file:/unused-native-cache-artifact.deb?REDACTED",
+    "trust_mode": "pinned_sha256",
+}
+package["origin"] = {"type": "local_artifact", **artifact}
+mixed["local_artifacts"] = [artifact]
+local = copy.deepcopy(mixed)
+local["repositories"] = []
+local["packages"] = [copy.deepcopy(package)]
+write_cache_fixture(mixed, sys.argv[3], "native-cache-mixed")
+write_cache_fixture(local, sys.argv[4], "native-cache-local")
+PY
+native_empty_fingerprint=$(run_json package-cache fingerprint \
+  --transaction-backend native --lock-input "$native_empty_lock" \
+  --cache-path "$workspace/native-package-cache-empty" --architecture "$architecture" --json)
+native_empty_prepared=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_empty_lock" \
+  --cache-path "$workspace/native-package-cache-empty" --architecture "$architecture" \
+  --archive-output "$workspace/native-empty.dbzcache" --offline --json)
+native_empty_restored=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_empty_lock" \
+  --cache-path "$workspace/native-package-cache-empty-restored" --architecture "$architecture" \
+  --archive-input "$workspace/native-empty.dbzcache" --restored-cache exact --offline --json)
+python3 - "$native_empty_fingerprint" "$native_empty_prepared" "$native_empty_restored" "$native_empty_lock" "$workspace/native-empty.dbzcache" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+import jsonschema
+
+fingerprint, prepared, restored = map(json.loads, sys.argv[1:4])
+lock = json.loads(Path(sys.argv[4]).read_bytes())
+assert lock["packages"] == lock["repositories"] == lock["local_artifacts"] == []
+for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (restored, "result")):
+    jsonschema.validate(value, json.loads(Path(f"schema/package-cache-{name}-v2.json").read_bytes()))
+    assert value["lock_digest"] == lock["digest_sha256"]
+assert prepared["verified_count"] == restored["verified_count"] == 0
+assert prepared["fingerprint"] == restored["fingerprint"] == fingerprint["fingerprint"]
+body = b"debz-package-cache-archive-v2\n" + bytes(4)
+assert Path(sys.argv[5]).read_bytes() == body + hashlib.sha256(body).digest()
+PY
+
+native_mixed_prepared=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_mixed_lock" \
+  --cache-path "$workspace/native-package-cache-mixed" --architecture "$architecture" \
+  --source "$source_file" --keyring "$keyring" \
+  --archive-input "$native_package_archive" --restored-cache exact --json)
+native_local_prepared=$(run_json package-cache prepare \
+  --transaction-backend native --lock-input "$native_local_lock" \
+  --cache-path "$workspace/native-package-cache-local" --architecture "$architecture" \
+  --archive-input "$native_package_archive" --restored-cache partial --offline --json)
+python3 - "$native_mixed_prepared" "$native_local_prepared" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+import jsonschema
+
+mixed, local = map(json.loads, sys.argv[1:])
+schema = json.loads(Path("schema/package-cache-result-v2.json").read_bytes())
+for value in (mixed, local):
+    jsonschema.validate(value, schema)
+    assert value["downloaded_count"] == 0
+    assert value["reused_count"] == value["verified_count"]
+assert mixed["verified_count"] == 2
+assert local["verified_count"] == 1
+PY
+set +e
+missing_local=$("$debz" package-cache prepare \
+  --transaction-backend native --lock-input "$native_local_lock" \
+  --cache-path "$workspace/native-package-cache-local-missing" --architecture "$architecture" \
+  --json 2>"$stderr_file")
+missing_local_status=$?
+set -e
+test "$missing_local_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$missing_local" | grep -q '"id":"local_artifact_acquisition_required"'
+
+run_json package-cache prepare --lock-input "$resolved_lock" \
+  --cache-path "$cache" --architecture "$architecture" \
+  --source "$source_file" --keyring "$keyring" \
+  --archive-output "$workspace/legacy-package-cache.dbzcache" --json >/dev/null
+for backend in native legacy_dpkg; do
+  if [ "$backend" = native ]; then
+    selected_lock="$native_lock"
+    wrong_archive="$workspace/legacy-package-cache.dbzcache"
+  else
+    selected_lock="$resolved_lock"
+    wrong_archive="$native_package_archive"
+  fi
+  refused_cache="$workspace/native-cache-version-refusal-$backend"
+  set +e
+  refused=$("$debz" package-cache prepare --transaction-backend "$backend" \
+    --lock-input "$selected_lock" --cache-path "$refused_cache" \
+    --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+    --archive-input "$wrong_archive" --restored-cache exact --json 2>"$stderr_file")
+  refused_status=$?
+  set -e
+  test "$refused_status" -eq 6
+  test ! -s "$stderr_file"
+  printf '%s' "$refused" | grep -q '"id":"corrupt_cache_archive"'
+  test -z "$(find "$refused_cache/packages-v1/objects" -mindepth 1 -print -quit)"
+done
+set +e
+native_cache_wrong_lock=$("$debz" package-cache fingerprint \
+  --transaction-backend native --lock-input "$resolved_lock" \
+  --cache-path "$native_package_cache" --architecture "$architecture" --json 2>"$stderr_file")
+native_cache_wrong_lock_status=$?
+set -e
+test "$native_cache_wrong_lock_status" -eq 5
+test ! -s "$stderr_file"
+printf '%s' "$native_cache_wrong_lock" | grep -q '"id":"unsupported_lock_schema"'
+test ! -s "$root/var/lib/dpkg/status"
+test ! -e "$root/var/lib/debz/root-operation-v1.json"
+
 set +e
 native_wrong_version=$("$debz" plan $native_common --lock-input "$resolved_lock" base-dep 2>"$stderr_file")
 native_wrong_version_status=$?

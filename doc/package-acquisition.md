@@ -137,8 +137,20 @@ native lock. Partial restores publish only matching objects; unrelated objects
 are verified but skipped. Imported objects are reread and rehashed before
 publication, and the existing CAS layout remains unchanged.
 
-Native fingerprint/preparation CLI and Actions integration are separate work;
-current commands and action contracts still select only the v1 format.
+`package-cache fingerprint` and `package-cache prepare` select these native
+contracts only with explicit `--transaction-backend native`; the default
+remains `legacy_dpkg` and v1. Native fingerprints/results use separate v2
+schemas, fingerprint domains, and restore-key prefixes. Empty closures need
+no repository inputs and produce zero verified objects.
+
+Native preparation authenticates repository evidence and validates each
+repository payload normally. Local-artifact entries must already be in the
+verified CAS or imported archive and pass `deb_payload.inspectLocal` against
+the lock's exact identity, size, and digest. Missing local artifacts require
+separate explicit acquisition; corrupt local artifacts refuse even under
+online repair. Preparation never fetches a lock's redacted provenance URL.
+The core native solver-policy domain remains required; other consumer policy
+scopes and native Actions integration are separate work.
 
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the

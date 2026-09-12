@@ -416,20 +416,28 @@ pub const Backend = struct {
         debz_version: []const u8,
     ) !package_cache_workflow.Fingerprint {
         try package_cache_workflow.validateRequest(request, false);
-        var lock = readLock(allocator, self.io, request.lock_input_path) catch |err| switch (err) {
+        var lock = readProductLock(allocator, self.io, request.lock_input_path, self.transaction_backend) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSchema => return error.UnsupportedLockSchema,
             else => return error.InvalidExactLock,
         };
         defer lock.deinit();
-        return package_cache_workflow.createFingerprint(
-            allocator,
-            lock.lock,
-            request.architecture,
-            debz_version,
-            request.cache_root,
-            request.policy(),
-        );
+        return switch (lock) {
+            inline else => |owned, kind| {
+                const createFingerprint = if (kind == .native)
+                    package_cache_workflow.createNativeFingerprint
+                else
+                    package_cache_workflow.createFingerprint;
+                return createFingerprint(
+                    allocator,
+                    owned.lock,
+                    request.architecture,
+                    debz_version,
+                    request.cache_root,
+                    request.policy(),
+                );
+            },
+        };
     }
 
     pub fn packageCachePrepare(
@@ -438,16 +446,51 @@ pub const Backend = struct {
         request: package_cache_workflow.Request,
         debz_version: []const u8,
     ) !package_cache_workflow.PrepareResult {
-        try package_cache_workflow.validateRequest(request, true);
-        var lock = readLock(allocator, self.io, request.lock_input_path) catch |err| switch (err) {
+        return switch (self.transaction_backend) {
+            inline else => |kind| self.packageCachePrepareVersion(kind, allocator, request, debz_version),
+        };
+    }
+
+    fn packageCachePrepareVersion(
+        self: *Backend,
+        comptime kind: transaction_engine.Kind,
+        allocator: std.mem.Allocator,
+        request: package_cache_workflow.Request,
+        debz_version: []const u8,
+    ) !package_cache_workflow.PrepareResult {
+        try package_cache_workflow.validateRequest(request, kind == .legacy_dpkg);
+        var owned_lock = readProductLock(allocator, self.io, request.lock_input_path, kind) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSchema => return error.UnsupportedLockSchema,
             else => return error.InvalidExactLock,
         };
-        defer lock.deinit();
-        var validated_fingerprint = try package_cache_workflow.createFingerprint(
+        defer owned_lock.deinit();
+        const lock = if (kind == .native) owned_lock.native.lock else owned_lock.legacy_dpkg.lock;
+        if (kind == .native and lock.repositories.len != 0)
+            try package_cache_workflow.validateRequest(request, true);
+        const createFingerprint = if (kind == .native)
+            package_cache_workflow.createNativeFingerprint
+        else
+            package_cache_workflow.createFingerprint;
+        const importArchive = if (kind == .native)
+            package_cache_archive.importNativeFile
+        else
+            package_cache_archive.importFile;
+        const exportArchive = if (kind == .native)
+            package_cache_archive.exportNativeFile
+        else
+            package_cache_archive.exportFile;
+        const preflight = if (kind == .native)
+            package_cache_workflow.preflightNative
+        else
+            package_cache_workflow.preflight;
+        const prepareAfterCleanup = if (kind == .native)
+            package_cache_workflow.prepareNativeWithWriterLockAfterCleanup
+        else
+            package_cache_workflow.prepareWithWriterLockAfterCleanup;
+        var validated_fingerprint = try createFingerprint(
             allocator,
-            lock.lock,
+            lock,
             request.architecture,
             debz_version,
             request.cache_root,
@@ -504,12 +547,12 @@ pub const Backend = struct {
         if (request.archive_input_path) |path| {
             var archive = try openRegularFileAbsoluteNoFollow(self.io, path);
             defer archive.close(self.io);
-            _ = try package_cache_archive.importFile(
+            _ = try importArchive(
                 allocator,
                 self.io,
                 archive,
                 &package_cache,
-                lock.lock,
+                lock,
                 .{
                     .maximum_objects = request.limits.maximum_lock_packages,
                     .maximum_object_bytes = request.limits.maximum_package_bytes,
@@ -522,9 +565,9 @@ pub const Backend = struct {
                 &package_writer,
             );
         }
-        _ = try package_cache_workflow.preflight(
+        _ = try preflight(
             allocator,
-            lock.lock,
+            lock,
             &package_cache,
             request.policy(),
             &package_writer,
@@ -598,8 +641,8 @@ pub const Backend = struct {
             };
         }
 
-        var result = try package_cache_workflow.prepareWithWriterLockAfterCleanup(allocator, .{
-            .lock = &lock.lock,
+        var result = try prepareAfterCleanup(allocator, .{
+            .lock = &lock,
             .cache = &package_cache,
             .repositories = views,
             .architecture = request.architecture,
@@ -626,12 +669,12 @@ pub const Backend = struct {
             });
             errdefer output_dir.deleteFile(self.io, leaf) catch {};
             defer output.close(self.io);
-            _ = try package_cache_archive.exportFile(
+            _ = try exportArchive(
                 allocator,
                 self.io,
                 output,
                 &package_cache,
-                lock.lock,
+                lock,
                 .{
                     .maximum_objects = request.limits.maximum_lock_packages,
                     .maximum_object_bytes = request.limits.maximum_package_bytes,
@@ -4744,19 +4787,22 @@ const ProductLock = union(transaction_engine.Kind) {
 };
 
 fn planningPolicyDigest(backend: transaction_engine.Kind, options: api.CommonOptions) [32]u8 {
-    const legacy = package_cache_workflow.solverPolicyDigest(
-        options.recommends,
-        options.allow_downgrade,
-        switch (options.repository_policy) {
-            .strict_priority => .strict_priority,
-            .best_version => .best_version,
+    return switch (backend) {
+        inline else => |kind| {
+            const digest = if (kind == .native)
+                package_cache_workflow.nativeSolverPolicyDigest
+            else
+                package_cache_workflow.solverPolicyDigest;
+            return digest(
+                options.recommends,
+                options.allow_downgrade,
+                switch (options.repository_policy) {
+                    .strict_priority => .strict_priority,
+                    .best_version => .best_version,
+                },
+            );
         },
-    );
-    if (backend == .legacy_dpkg) return legacy;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz.product-native-solver-policy-v1\x00");
-    hash.update(&legacy);
-    return hash.finalResult();
+    };
 }
 
 fn readProductLock(
