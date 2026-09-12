@@ -133,7 +133,7 @@ pub fn verify(
     };
 }
 
-pub const PendingRequest = struct {
+pub const OwnedRequest = struct {
     /// Independently retained caller authority, never discovered from this root.
     owner: root_operation.DeferredAcknowledgment,
     operation: product_api.Operation,
@@ -142,17 +142,21 @@ pub const PendingRequest = struct {
 };
 
 /// Owns verified documents, but does not assert that the root has been cleared.
-pub const PendingSuccess = struct {
+pub const OwnedSuccess = struct {
     owner: root_operation.DeferredAcknowledgment,
     receipt: native_provenance.OwnedDocument,
     completion: root_operation_completion.OwnedDocument,
 
-    pub fn deinit(self: *PendingSuccess) void {
+    pub fn deinit(self: *OwnedSuccess) void {
         self.receipt.deinit();
         self.completion.deinit();
         self.* = undefined;
     }
 };
+
+pub const PendingRequest = OwnedRequest;
+pub const PendingSuccess = OwnedSuccess;
+const OwnershipState = enum { pending, released };
 
 /// Verifies a published successful completion before its exact owner acknowledges
 /// it. No attempt is opened/adopted and no recovery or cleanup is performed.
@@ -165,7 +169,34 @@ pub fn verifyPendingSuccess(
     expected: PendingRequest,
     locks: root_operation.LockBackend,
 ) !PendingSuccess {
-    return verifyPendingSuccessInternal(
+    return verifyOwnedSuccess(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending);
+}
+
+/// Native execution has acknowledged its evidence, but the caller still owns the
+/// released marker. Verification does not finalize that owner or clear its record.
+pub fn verifyReleasedSuccess(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: OwnedRequest,
+    locks: root_operation.LockBackend,
+) !OwnedSuccess {
+    return verifyOwnedSuccess(allocator, root, install_root, lock, expected_architecture, expected, locks, .released);
+}
+
+fn verifyOwnedSuccess(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: OwnedRequest,
+    locks: root_operation.LockBackend,
+    state: OwnershipState,
+) !OwnedSuccess {
+    return verifyOwnedSuccessInternal(
         allocator,
         root,
         install_root,
@@ -173,6 +204,7 @@ pub fn verifyPendingSuccess(
         expected_architecture,
         expected,
         locks,
+        state,
     ) catch |err| switch (err) {
         // This read-only path writes only to allocating canonical encoders.
         error.WriteFailed => error.OutOfMemory,
@@ -180,47 +212,74 @@ pub fn verifyPendingSuccess(
     };
 }
 
-fn verifyPendingSuccessInternal(
+fn verifyOwnedSuccessInternal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
     lock: exact_lock_v2.Lock,
     expected_architecture: []const u8,
-    expected: PendingRequest,
+    expected: OwnedRequest,
     locks: root_operation.LockBackend,
-) !PendingSuccess {
+    state: OwnershipState,
+) !OwnedSuccess {
     const owner_bytes = try expected.owner.canonicalJson(allocator);
     defer allocator.free(owner_bytes);
-    if (expected.owner.state != .pending) return error.PendingOwnerRequired;
+    const required_state: root_operation.DeferredAcknowledgmentState = switch (state) {
+        .pending => .pending,
+        .released => .released,
+    };
+    const missing_owner = if (state == .pending) error.PendingOwnerRequired else error.ReleasedOwnerRequired;
+    if (expected.owner.state != required_state) return missing_owner;
     var held = try VerificationLock.acquire(root, install_root, locks);
     defer held.deinit();
     const store = root_operation.Store.init(root);
     if (try store.readRecoveryReviewClaim(allocator) != null)
         return error.RecoveryReviewClaimPresent;
     const observed = try store.readDeferredAcknowledgment(allocator) orelse
-        return error.PendingOwnerRequired;
+        return missing_owner;
     if (!root_operation.deferredAcknowledgmentExactEqual(observed, expected.owner))
         return error.OwnershipMismatch;
-    var record = try store.read(allocator) orelse return error.CompletionMissing;
-    defer record.deinit();
-    if (root_operation.deferredRecordCompatibility(record.record, observed, false) != .pending_published)
+    var record = try store.read(allocator);
+    defer if (record) |*owned| owned.deinit();
+    if (state == .pending and record == null) return error.CompletionMissing;
+    const compatibility = root_operation.deferredRecordCompatibility(
+        if (record) |owned| owned.record else null,
+        observed,
+        false,
+    );
+    const compatible = switch (state) {
+        .pending => compatibility == .pending_published,
+        .released => compatibility == .released_without_record or compatibility == .released_completed,
+    };
+    if (!compatible)
         return error.InvalidCompletion;
     var completion = try root_operation_completion.Store.init(root).read(allocator) orelse
         return error.CompletionMissing;
     errdefer completion.deinit();
     const outer = completion.document;
-    if (!outer.bindsRecord(record.record) or outer.operation != .package_transaction or
+    if (record) |owned| {
+        if (!outer.bindsRecord(owned.record) or
+            !textsEqual(outer.foreign_architectures, owned.record.foreign_architectures) or
+            !std.mem.eql(u8, &outer.digest_sha256, &owned.record.provenance_sha256.?))
+            return error.InvalidCompletion;
+    }
+    if (outer.operation != .package_transaction or
         outer.operation.package_transaction != expected.operation or
-        !textsEqual(outer.foreign_architectures, record.record.foreign_architectures) or
+        !std.mem.eql(u8, &outer.attempt_id, &observed.attempt_id) or
         !std.mem.eql(u8, &outer.request_sha256, &expected.caller_request_sha256) or
-        !std.mem.eql(u8, &outer.policy_sha256, &expected.caller_policy_sha256) or
-        !std.mem.eql(u8, &outer.digest_sha256, &observed.completion_sha256.?) or
-        !std.mem.eql(u8, &outer.digest_sha256, &observed.provenance_sha256.?))
+        !std.mem.eql(u8, &outer.policy_sha256, &expected.caller_policy_sha256))
         return error.InvalidCompletion;
+    if (state == .pending and
+        (!std.mem.eql(u8, &outer.digest_sha256, &observed.completion_sha256.?) or
+            !std.mem.eql(u8, &outer.digest_sha256, &observed.provenance_sha256.?)))
+        return error.InvalidCompletion;
+    if (state == .released and try native_runtime.hasActiveEvidence(allocator, root))
+        return error.OperationNotSettled;
     var receipt = try native_provenance.read(allocator, root) orelse return error.ReceiptMissing;
     errdefer receipt.deinit();
     try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, receipt.document);
-    try verifyPendingEvidence(allocator, root, receipt.document);
+    if (state == .pending)
+        try verifyPendingEvidence(allocator, root, receipt.document);
     if (!locks.held(held.token)) return error.LockLost;
     return .{ .owner = observed, .receipt = receipt, .completion = completion };
 }
@@ -690,7 +749,7 @@ test "native_transaction_result.test.empty closures retain only authorized resid
     try std.testing.expectError(error.TransactionNotSuccessful, verifyFinalClosure(&.{residual}, lock.lock));
 }
 
-fn testPendingRefusal(
+fn testOwnedRefusal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     path: []const u8,
@@ -698,8 +757,9 @@ fn testPendingRefusal(
     expected: PendingRequest,
     locks: root_operation.LockBackend,
     expected_error: anyerror,
+    state: OwnershipState,
 ) !void {
-    var result = verifyPendingSuccess(allocator, root, path, lock, "amd64", expected, locks) catch |err| {
+    var result = verifyOwnedSuccess(allocator, root, path, lock, "amd64", expected, locks, state) catch |err| {
         if (err == expected_error) return;
         return err;
     };
@@ -707,9 +767,16 @@ fn testPendingRefusal(
     return error.TestExpectedError;
 }
 
-test "native_transaction_result.test.pending verification preserves exact owners and never provisions locks" {
+test "native_transaction_result.test.owned verification preserves exact owners and never provisions locks" {
+    try testOwnedBoundaries(.pending);
+    try testOwnedBoundaries(.released);
+}
+
+fn testOwnedBoundaries(comptime state: OwnershipState) !void {
     const testing = std.testing;
     const allocator = testing.allocator;
+    const verify_success = if (state == .pending) verifyPendingSuccess else verifyReleasedSuccess;
+    const missing_owner = if (state == .pending) error.PendingOwnerRequired else error.ReleasedOwnerRequired;
     var temporary = testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = root_fs.Root.init(testing.io, temporary.dir);
@@ -756,11 +823,11 @@ test "native_transaction_result.test.pending verification preserves exact owners
         .releaseFn = Locks.release,
     };
     const base = try root_operation.createDeferredAcknowledgment(.{
-        .state = .pending,
+        .state = if (state == .pending) .pending else .released,
         .attempt_id = @splat(3),
         .acknowledgment_id = @splat(4),
-        .completion_sha256 = @splat(5),
-        .provenance_sha256 = @splat(5),
+        .completion_sha256 = if (state == .pending) @splat(5) else null,
+        .provenance_sha256 = if (state == .pending) @splat(5) else null,
     });
     var expected: PendingRequest = .{
         .owner = base,
@@ -768,19 +835,19 @@ test "native_transaction_result.test.pending verification preserves exact owners
         .caller_request_sha256 = @splat(6),
         .caller_policy_sha256 = @splat(7),
     };
-    try testing.expectError(error.HostRootNotSupported, verifyPendingSuccess(allocator, root, "/", lock.lock, "amd64", expected, locks));
-    try testPendingRefusal(allocator, root, path, lock.lock, expected, locks, error.CompletionMissing);
+    try testing.expectError(error.HostRootNotSupported, verify_success(allocator, root, "/", lock.lock, "amd64", expected, locks));
+    try testOwnedRefusal(allocator, root, path, lock.lock, expected, locks, error.CompletionMissing, state);
     try testing.expectEqual(@as(usize, 0), observer.acquisitions);
     try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.namespace_path)) == null);
     const store = root_operation.Store.init(root);
     try store.ensureNamespace();
     try root.publishFile(try root_fs.Path.init(root_operation.lock_path), "", .{});
-    try testing.expectError(error.PendingOwnerRequired, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectError(missing_owner, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
     try store.publishDeferredAcknowledgment(allocator, base);
     try testing.checkAllAllocationFailures(
         allocator,
-        testPendingRefusal,
-        .{ root, path, lock.lock, expected, locks, error.CompletionMissing },
+        testOwnedRefusal,
+        .{ root, path, lock.lock, expected, locks, error.CompletionMissing, state },
     );
     var claim = try root_operation.createRecoveryReviewClaim(.{
         .outer_attempt_id = base.acknowledgment_id,
@@ -798,32 +865,32 @@ test "native_transaction_result.test.pending verification preserves exact owners
     const reviewed_bytes = try reviewed.canonicalJson(allocator);
     defer allocator.free(reviewed_bytes);
     try root.publishFile(try root_fs.Path.init(root_operation.deferred_ack_path), reviewed_bytes, .{ .overwrite = .replace });
-    try testing.expectError(error.OwnershipMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectError(error.OwnershipMismatch, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
     expected.owner = reviewed;
     try testing.checkAllAllocationFailures(
         allocator,
-        testPendingRefusal,
-        .{ root, path, lock.lock, expected, locks, error.CompletionMissing },
+        testOwnedRefusal,
+        .{ root, path, lock.lock, expected, locks, error.CompletionMissing, state },
     );
     claim.nonce = @splat(13);
     claim = try root_operation.createRecoveryReviewClaim(claim);
     expected.owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, claim);
     try testing.expectEqualSlices(u8, &reviewed.digest_sha256, &expected.owner.digest_sha256);
-    try testing.expectError(error.OwnershipMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectError(error.OwnershipMismatch, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
     expected.owner = reviewed;
     expected.owner.exact_identity_sha256 = @splat(14);
-    try testing.expectError(error.ExactIdentityMismatch, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectError(error.ExactIdentityMismatch, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
     expected.owner = reviewed;
     observer.lost = true;
-    try testing.expectError(error.LockLost, verifyPendingSuccess(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectError(error.LockLost, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
     observer.lost = false;
     const claim_bytes = try claim.canonicalJson(allocator);
     defer allocator.free(claim_bytes);
     try root.publishFile(try root_fs.Path.init(root_operation.deferred_ack_path), claim_bytes, .{ .overwrite = .replace });
     try testing.checkAllAllocationFailures(
         allocator,
-        testPendingRefusal,
-        .{ root, path, lock.lock, expected, locks, error.RecoveryReviewClaimPresent },
+        testOwnedRefusal,
+        .{ root, path, lock.lock, expected, locks, error.RecoveryReviewClaimPresent, state },
     );
     try testing.expectEqual(observer.acquisitions, observer.releases);
     try testing.expect(!observer.live);

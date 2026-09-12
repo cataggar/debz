@@ -1094,7 +1094,7 @@ def workflow(
     executable: Path, request: dict, destination: Path, environment: dict,
     *, completion_crash: str | None = None, owner_evidence: Path | None = None,
     acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
-    pending_verification: dict | None = None,
+    owned_verification: dict | None = None,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1106,7 +1106,7 @@ def workflow(
         "owner_evidence": str(owner_evidence) if owner_evidence else None,
         "reconciliation_owner_output": str(reconciliation_owner_output) if reconciliation_owner_output else None,
         "acknowledgment": acknowledgment,
-        "pending_verification": pending_verification,
+        "owned_verification": owned_verification,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
         result = subprocess.run(
@@ -1391,7 +1391,7 @@ def exercise_workflows(
         m.write(path, m.oracle._read_bounded(current.candidate / owner_path, 1024 * 1024))
         return path
 
-    def verify_pending(current, label, owner, *, expected_error=None, change=None):
+    def verify_owned(current, label, owner, *, state, expected_error=None, change=None):
         before = triggers.snapshot(current.candidate)
         before_evidence = sorted(
             (str(path.relative_to(current.candidate)), stat.st_mode, stat.st_size, stat.st_mtime_ns)
@@ -1403,9 +1403,10 @@ def exercise_workflows(
             verification.update(change)
         result = workflow(
             executable, verification, current.directory / label, environment, owner_evidence=owner,
-            pending_verification={
+            owned_verification={
                 "lock_path": str(current.directory / "workflow.lock.json"),
                 "expected_error": expected_error,
+                "state": state,
             },
         )
         assert result == {"verified": expected_error is None}
@@ -1415,7 +1416,13 @@ def exercise_workflows(
             for path in (current.candidate / NAMESPACE).rglob("*")
             for stat in [path.lstat()]
         )
-        assert before_evidence == after_evidence, "pending verification changed durable evidence"
+        assert before_evidence == after_evidence, "owned verification changed durable evidence"
+
+    def verify_pending(current, label, owner, **options):
+        verify_owned(current, label, owner, state="pending", **options)
+
+    def verify_released(current, label, owner, **options):
+        verify_owned(current, label, owner, state="released", **options)
 
     current = scenario("workflow-owned-success")
     run(current, "plan", request(current, "install", "plan_only", names))
@@ -1436,11 +1443,51 @@ def exercise_workflows(
     assert_completion(current, lock)
     released = retain_owner(current, "released")
     assert document(released)["state"] == "released"
+    verify_released(current, "verify-released", released)
+    verify_released(current, "verify-released-again", released)
+    verify_pending(current, "verify-released-as-pending", released, expected_error="PendingOwnerRequired")
+    verify_released(current, "verify-bound-as-released", bound, expected_error="ReleasedOwnerRequired")
+    verify_released(current, "verify-released-wrong-operation", released,
+                    expected_error="InvalidCompletion", change={"operation": "remove"})
+    verify_released(current, "verify-released-wrong-request", released,
+                    expected_error="InvalidCompletion", change={"selectors": [{"name": "different"}]})
+    original_options = owned_request(current, "install", "recover", names)["options"]
+    verify_released(current, "verify-released-wrong-policy", released,
+                    expected_error="InvalidCompletion",
+                    change={"options": {**original_options, "recommends": True}})
+    m.write(current.candidate / OPERATION, reserved)
+    verify_released(current, "verify-released-unfinished-record", released, expected_error="InvalidCompletion")
+    (current.candidate / OPERATION).unlink()
+    for name, relative in (
+        ("intent", INTENT),
+        ("script", NAMESPACE / "native-lifecycle-script-v1.json"),
+        ("progress", PROGRESS),
+        ("staging", NAMESPACE / ".debz-native-foreign"),
+    ):
+        active = current.candidate / relative
+        assert not active.exists()
+        m.write(active, b"{}\n")
+        verify_released(current, f"verify-released-active-{name}", released, expected_error="OperationNotSettled")
+        active.unlink()
+    completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+    original_completion = completion_path.read_bytes()
+    m.write(completion_path, b"{}\n")
+    verify_released(current, "verify-released-damaged-completion", released, expected_error="NonCanonicalDocument")
+    m.write(completion_path, original_completion)
+    receipt_path = current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"
+    original_receipt = receipt_path.read_bytes()
+    m.write(receipt_path, b"{}\n")
+    verify_released(current, "verify-released-damaged-receipt", released, expected_error="MissingField")
+    m.write(receipt_path, original_receipt)
     finalization = owned_request(current, "install", "recover", names)
     run(current, "finalize", finalization, owner_evidence=released, acknowledgment="ownership")
     run(current, "finalize-again", finalization, owner_evidence=released, acknowledgment="ownership")
     assert not (current.candidate / owner_path).exists()
+    verify_released(current, "verify-finalized-as-released", released, expected_error="ReleasedOwnerRequired")
+    if result_cli is not None:
+        verify_result(current, lock)
     print("workflow-owned-success: reservation, native receipt, and exact owner finalization passed", flush=True)
+    first_released = released
 
     for boundary in ("after_provenance_published", "after_ownership_terminal_publish", "after_ownership_record_clear"):
         current = scenario(f"workflow-finalize-{boundary}")
@@ -1465,6 +1512,15 @@ def exercise_workflows(
                      completion_crash="after_native_acknowledged", owner_evidence=retained,
                      acknowledgment="ownership")
         else:
+            verify_released(current, "verify-terminal-owner", retained)
+            if result_cli is not None:
+                verify_result(current, lock, False)
+            if boundary == "after_ownership_record_clear":
+                assert document(first_released)["attempt_id"] != document(retained)["attempt_id"]
+                m.write(current.candidate / owner_path, first_released.read_bytes())
+                verify_released(current, "verify-terminal-foreign-attempt", first_released,
+                                expected_error="InvalidCompletion")
+                m.write(current.candidate / owner_path, retained.read_bytes())
             run(current, "recover", {**finalization, "defer_recovery_clear": True},
                 owner_evidence=retained, exit_status=8 if boundary == "after_ownership_record_clear" else 0)
         run(current, "finalize", finalization, owner_evidence=retained, acknowledgment="ownership")
@@ -1534,6 +1590,7 @@ def exercise_workflows(
         assert (current.candidate / OPERATION).read_bytes() == published
         assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
         verify_pending(current, "verify-pending", pending)
+        verify_released(current, "verify-pending-as-released", pending, expected_error="ReleasedOwnerRequired")
         if result_cli is not None:
             verify_result(current, lock, False)
         run(current, "foreign-acknowledgment", {**recovery, "orchestration_id": [18] * 32},
