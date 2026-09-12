@@ -297,11 +297,34 @@ jobs:
             --lock-output "$workspace/base.lock.json" base-dep >/dev/null
           zig-out/bin/debz plan "${common[@]}" \
             --lock-output "$workspace/scenario.lock.json" scenario-main >/dev/null
+          zig-out/bin/debz plan "${common[@]}" --transaction-backend native \
+            --lock-output "$workspace/base.native.lock.json" base-dep >/dev/null
+          zig-out/bin/debz plan "${common[@]}" --transaction-backend native \
+            --lock-output "$workspace/scenario.native.lock.json" scenario-main >/dev/null
+          python3 - "$workspace/base.native.lock.json" "$workspace/empty.native.lock.json" <<'PY'
+          from hashlib import sha256
+          import json
+          from pathlib import Path
+          import sys
+
+          value = json.loads(Path(sys.argv[1]).read_bytes())
+          assert value["version"] == 2
+          value.pop("digest_sha256")
+          value["request_sha256"] = sha256(b"native-action-empty-cache").hexdigest()
+          value["repositories"] = []
+          value["local_artifacts"] = []
+          value["packages"] = []
+          value["digest_sha256"] = sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+          Path(sys.argv[2]).write_bytes(json.dumps(value, separators=(",", ":")).encode())
+          PY
           printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\n' \
             "$workspace" "$workspace/fixture.sources" \
             "$workspace/repository/fixture-keyring.gpg" \
             "$workspace/base.lock.json" "$workspace/scenario.lock.json" \
             >>"$GITHUB_OUTPUT"
+          printf 'native_base_lock=%s\nnative_scenario_lock=%s\nnative_empty_lock=%s\n' \
+            "$workspace/base.native.lock.json" "$workspace/scenario.native.lock.json" \
+            "$workspace/empty.native.lock.json" >>"$GITHUB_OUTPUT"
           printf '%s\n' "$PWD/zig-out/bin" >>"$GITHUB_PATH"
       - name: Populate cold exact-lock cache
         id: cold
@@ -407,6 +430,128 @@ jobs:
         run: |
           test "$OUTCOME" = failure
           test -z "$CACHE_PATH"
+      - name: Populate native cold cache
+        id: native-cold
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.native_base_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-cold
+      - name: Restore native partial cache
+        id: native-partial
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.native_scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-partial
+      - name: Restore native exact cache
+        id: native-exact
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.native_scenario_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-exact
+      - name: Validate native cache lifecycle
+        env:
+          COLD_HIT: ${{ steps.native-cold.outputs.cache-hit }}
+          COLD_DOWNLOADED: ${{ steps.native-cold.outputs.downloaded-count }}
+          COLD_REUSED: ${{ steps.native-cold.outputs.reused-count }}
+          PARTIAL_HIT: ${{ steps.native-partial.outputs.cache-hit }}
+          PARTIAL_KEY: ${{ steps.native-partial.outputs.cache-matched-key }}
+          PARTIAL_DOWNLOADED: ${{ steps.native-partial.outputs.downloaded-count }}
+          PARTIAL_REUSED: ${{ steps.native-partial.outputs.reused-count }}
+          EXACT_HIT: ${{ steps.native-exact.outputs.cache-hit }}
+          EXACT_KEY: ${{ steps.native-exact.outputs.cache-matched-key }}
+          EXACT_DOWNLOADED: ${{ steps.native-exact.outputs.downloaded-count }}
+          EXACT_REUSED: ${{ steps.native-exact.outputs.reused-count }}
+        run: |
+          test "$COLD_HIT" = false
+          test "$COLD_DOWNLOADED" -gt 0
+          test "$COLD_REUSED" -eq 0
+          test "$PARTIAL_HIT" = false
+          test "$PARTIAL_DOWNLOADED" -gt 0
+          test "$PARTIAL_REUSED" -gt 0
+          test "$EXACT_HIT" = true
+          test "$EXACT_DOWNLOADED" -eq 0
+          test "$EXACT_REUSED" -gt 0
+          case "$PARTIAL_KEY:$EXACT_KEY" in
+            debz-package-cas-v2-*:debz-package-cas-v2-*) ;;
+            *) exit 1 ;;
+          esac
+      - name: Populate native empty cache
+        id: native-empty
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.native_empty_lock }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-empty
+          offline: 'true'
+      - name: Restore native empty cache
+        id: native-empty-exact
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.native_empty_lock }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-empty-exact
+          offline: 'true'
+      - name: Validate native empty closure
+        env:
+          COLD_HIT: ${{ steps.native-empty.outputs.cache-hit }}
+          COLD_DOWNLOADED: ${{ steps.native-empty.outputs.downloaded-count }}
+          COLD_REUSED: ${{ steps.native-empty.outputs.reused-count }}
+          EXACT_HIT: ${{ steps.native-empty-exact.outputs.cache-hit }}
+          EXACT_DOWNLOADED: ${{ steps.native-empty-exact.outputs.downloaded-count }}
+          EXACT_REUSED: ${{ steps.native-empty-exact.outputs.reused-count }}
+        run: |
+          test "$COLD_HIT" = false
+          test "$COLD_DOWNLOADED" -eq 0
+          test "$COLD_REUSED" -eq 0
+          test "$EXACT_HIT" = true
+          test "$EXACT_DOWNLOADED" -eq 0
+          test "$EXACT_REUSED" -eq 0
+      - name: Refuse legacy lock in native action
+        id: native-foreign-lock
+        continue-on-error: true
+        uses: ./actions/download
+        with:
+          transaction-backend: native
+          lock-input: ${{ steps.fixture.outputs.base_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-native-foreign-lock
+      - name: Refuse native lock in default legacy action
+        id: legacy-foreign-lock
+        continue-on-error: true
+        uses: ./actions/download
+        with:
+          lock-input: ${{ steps.fixture.outputs.native_base_lock }}
+          source: ${{ steps.fixture.outputs.source }}
+          keyring: ${{ steps.fixture.outputs.keyring }}
+          architecture: amd64
+          cache-root: ${{ runner.temp }}/debz-download-legacy-foreign-lock
+      - name: Validate explicit backend refusal
+        env:
+          NATIVE_OUTCOME: ${{ steps.native-foreign-lock.outcome }}
+          NATIVE_PATH: ${{ steps.native-foreign-lock.outputs.cache-path }}
+          LEGACY_OUTCOME: ${{ steps.legacy-foreign-lock.outcome }}
+          LEGACY_PATH: ${{ steps.legacy-foreign-lock.outputs.cache-path }}
+        run: |
+          test "$NATIVE_OUTCOME" = failure
+          test -z "$NATIVE_PATH"
+          test "$LEGACY_OUTCOME" = failure
+          test -z "$LEGACY_PATH"
 
   download-action-container-fixture:
     name: Build download action container fixture

@@ -79,8 +79,9 @@ Repository/bootstrap workflows with other solver-policy scopes remain gated
 until their own native integration.
 
 Native keys use a separate `debz-package-cas-v2-` prefix and fingerprint
-domain while retaining the shared `packages-v1/objects` layout. Existing
-Actions contracts remain v1-only until their separate native integration.
+domain while retaining the shared `packages-v1/objects` layout. The download
+action supports matching explicit native selection; the install action and
+other native consumer integrations remain separately gated.
 
 `--restored-cache none|partial|exact` is a typed orchestration hint. The
 first-party action computes it from the cache service response; it is not

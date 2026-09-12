@@ -41,18 +41,27 @@ test('isolates nested actions from install inputs and Node injection', () => {
     DEBZ_INSTALL_TOKEN: process.env.DEBZ_INSTALL_TOKEN,
     DEBZ_DOWNLOAD_TOKEN: process.env.DEBZ_DOWNLOAD_TOKEN,
     INPUT_TOKEN: process.env.INPUT_TOKEN,
+    DEBZ_DOWNLOAD_TRANSACTION_BACKEND: process.env.DEBZ_DOWNLOAD_TRANSACTION_BACKEND,
+    'INPUT_TRANSACTION-BACKEND': process.env['INPUT_TRANSACTION-BACKEND'],
     NODE_OPTIONS: process.env.NODE_OPTIONS,
   };
   try {
     process.env.DEBZ_INSTALL_TOKEN = 'install-secret';
     process.env.DEBZ_DOWNLOAD_TOKEN = 'download-secret';
     process.env.INPUT_TOKEN = 'ambient-secret';
+    process.env.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'native';
+    process.env['INPUT_TRANSACTION-BACKEND'] = 'native';
     process.env.NODE_OPTIONS = '--require=/tmp/injected.js';
-    const environment = childEnvironment({ INPUT_TOKEN: 'intended-secret' });
+    const environment = childEnvironment({
+      INPUT_TOKEN: 'intended-secret',
+      DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg',
+    });
     assert.equal(environment.DEBZ_INSTALL_TOKEN, undefined);
     assert.equal(environment.DEBZ_DOWNLOAD_TOKEN, undefined);
     assert.equal(environment.NODE_OPTIONS, undefined);
     assert.equal(environment.INPUT_TOKEN, 'intended-secret');
+    assert.equal(environment.DEBZ_DOWNLOAD_TRANSACTION_BACKEND, 'legacy_dpkg');
+    assert.equal(environment['INPUT_TRANSACTION-BACKEND'], undefined);
   } finally {
     for (const [name, value] of Object.entries(original)) {
       if (value === undefined) delete process.env[name];

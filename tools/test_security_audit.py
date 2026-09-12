@@ -243,6 +243,45 @@ class SecurityAuditTests(unittest.TestCase):
             archive_source,
         )
 
+    def test_native_download_negative_cases_require_bound_outcome_assertions(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertEqual(
+            [],
+            security_audit.workflow_failure_handling_failures(workflow, "ci.yml"),
+        )
+        for prefix, step_id in (
+            ("NATIVE", "native-foreign-lock"),
+            ("LEGACY", "legacy-foreign-lock"),
+        ):
+            for token in (
+                f"id: {step_id}",
+                f"{prefix}_OUTCOME: ${{{{ steps.{step_id}.outcome }}}}",
+                f"{prefix}_PATH: ${{{{ steps.{step_id}.outputs.cache-path }}}}",
+                f'test "${prefix}_OUTCOME" = failure',
+                f'test -z "${prefix}_PATH"',
+            ):
+                with self.subTest(token=token):
+                    self.assertIn(token, workflow)
+                    self.assertIn(
+                        "ci.yml: native backend refusal coverage lacks bound outcome assertions",
+                        security_audit.workflow_failure_handling_failures(
+                            workflow.replace(token, ""), "ci.yml"
+                        ),
+                    )
+        self.assertIn(
+            "ci.yml: workflow hides a failing command",
+            security_audit.workflow_failure_handling_failures(
+                workflow.replace("Refuse legacy lock in native action", "Ignore arbitrary failure"),
+                "ci.yml",
+            ),
+        )
+        self.assertIn(
+            "ci.yml: expected-failure action coverage lacks outcome assertions",
+            security_audit.workflow_failure_handling_failures(
+                workflow.replace('test "$OUTCOME" = failure', ""), "ci.yml"
+            ),
+        )
+
     def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
         package = json.loads((ROOT / "actions/install/package.json").read_text())
         self.assertEqual(package["dependencies"], {"@actions/core": "3.0.1"})

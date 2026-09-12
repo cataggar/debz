@@ -149,8 +149,9 @@ verified CAS or imported archive and pass `deb_payload.inspectLocal` against
 the lock's exact identity, size, and digest. Missing local artifacts require
 separate explicit acquisition; corrupt local artifacts refuse even under
 online repair. Preparation never fetches a lock's redacted provenance URL.
-The core native solver-policy domain remains required; other consumer policy
-scopes and native Actions integration are separate work.
+The core native solver-policy domain remains required. The download action
+supports explicit native selection with these v2 contracts; other consumer
+policy scopes and native install-action integration are separate work.
 
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the

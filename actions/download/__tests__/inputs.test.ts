@@ -29,12 +29,34 @@ test('resolves explicit files and creates only the package object cache path', a
   values.DEBZ_DOWNLOAD_CACHE = 'false';
   const inputs = await readInputs(values);
   assert.equal(inputs.lockInput, path.join(workspace, 'lock.json'));
+  assert.equal(inputs.transactionBackend, 'legacy_dpkg');
   assert.deepEqual(inputs.foreignArchitectures, ['arm64']);
   assert.equal(inputs.cacheEnabled, false);
   assert.equal(
     inputs.cachePath,
     path.join(runnerTemp, 'debz-package-cache', 'packages-v1', 'objects'),
   );
+});
+
+test('native selection is explicit and permits repository-free closures without weakening legacy inputs', async () => {
+  const values = environment(workspace, runnerTemp);
+  delete values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND;
+  assert.equal((await readInputs(values)).transactionBackend, 'legacy_dpkg');
+  values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'native';
+  values.DEBZ_DOWNLOAD_SOURCE = '';
+  values.DEBZ_DOWNLOAD_KEYRING = '';
+  const native = await readInputs(values);
+  assert.equal(native.transactionBackend, 'native');
+  assert.deepEqual(native.sources, []);
+  assert.deepEqual(native.keyrings, []);
+  values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'legacy_dpkg';
+  await assert.rejects(readInputs(values), /explicit 'source' or 'config'/);
+  values.DEBZ_DOWNLOAD_SOURCE = 'repo.sources';
+  await assert.rejects(readInputs(values), /keyring/);
+  for (const value of ['other', 'Native', 'native\nlegacy_dpkg']) {
+    values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = value;
+    await assert.rejects(readInputs(values), /transaction-backend|TRANSACTION_BACKEND|one line|multiline/);
+  }
 });
 
 test('reads standard JavaScript-action INPUT_* environment names', async () => {
@@ -49,6 +71,10 @@ test('reads standard JavaScript-action INPUT_* environment names', async () => {
   assert.equal(inputs.lockInput, path.join(workspace, 'lock.json'));
   assert.equal(inputs.cacheEnabled, true);
   assert.equal(inputs.architecture, 'amd64');
+  values['INPUT_TRANSACTION-BACKEND'] = 'native';
+  values.INPUT_SOURCE = '';
+  values.INPUT_KEYRING = '';
+  assert.equal((await readInputs(values)).transactionBackend, 'native');
 });
 
 test('rejects traversal, symlinked inputs, cache overlap, and credential-bearing proxy', async () => {

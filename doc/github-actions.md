@@ -12,6 +12,11 @@ from `PATH`, asks that CLI to produce the deterministic cache fingerprint,
 downloads one opaque cache blob into a private `RUNNER_TEMP` staging directory,
 imports only verified package objects through debz, authenticates the explicit
 repository configuration and keyrings, and prepares every package in the lock.
+It defaults to legacy v1 contracts. Explicit `transaction-backend: native`
+selects native v2 locks, fingerprints, preparation results, and archive keys,
+with no version autodetection or fallback. Native empty and local-only
+closures may omit repository inputs; local bytes must already be acquired or
+imported, never fetched from redacted provenance URLs.
 
 [`actions/install`](../actions/install/README.md) composes those exact
 boundaries and then performs the mutation. It validates all typed inputs before
@@ -19,10 +24,13 @@ setup or cache activity, hands the exact setup executable directly to the
 download runtime, and always invokes one normal `debz install --cache-only`
 transaction with the same lock, repository/keyring inputs, architecture,
 solver policy, cache root, and explicit alternate root.
+The install action still explicitly selects the legacy backend, including
+its private download handoff. Native download support alone does not enable
+native installation.
 
 An exact or partial cache hit supplies only untrusted candidate bytes. Every
 current-lock object is reopened and checked for regular-file shape, declared
-size, SHA-256, authenticated repository/snapshot identity, and Debian payload
+size, SHA-256, the lock's repository or local-artifact evidence, and Debian payload
 identity before it is counted as reused. The CLI performs bounded staging
 cleanup and retained-closure garbage collection before the action saves an
 exact cache key.
