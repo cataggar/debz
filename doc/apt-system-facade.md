@@ -311,6 +311,17 @@ the root is cleared. The public settled verifier still rejects pending ownership
 and neither verifier accepts the physical host root. Failed completions and
 unpublished or stale ownership are not successful pending results.
 
+Receipt retention also takes the reviewed profile backend explicitly. Native
+receipts are decoded as canonical native provenance and retain their actual
+schema, version, digest, and bytes in the existing per-attempt
+`transaction-result.json`; legacy receipts keep their original format. A
+cross-backend document or mismatched digest is refused before the operation
+directory is opened. Existing state bindings preserve native receipt identity
+without a second active-operation namespace or a new state schema. This is
+format/digest validation for storage, not proof of successful execution:
+failed and recovery-required receipt outcomes are preserved, and their presence
+does not authorize completion, acknowledgment, or native apt/system execution.
+
 Every route and workflow invocation binds a backend descriptor by value to the
 reviewed profile selection, including reservation, recovery, reconciliation,
 and acknowledgment. The descriptor crosses the private live-root runner with
