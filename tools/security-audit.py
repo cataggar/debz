@@ -441,6 +441,57 @@ def audit_release_targets() -> None:
                 fail(f"{workflow}: release matrix retains dynamic GNU target {target}")
 
 
+def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
+    failures = []
+    native_negative_steps = {
+        "Refuse legacy lock in native action": ("native-foreign-lock", "NATIVE"),
+        "Refuse native lock in default legacy action": ("legacy-foreign-lock", "LEGACY"),
+    }
+    allowed_negative_steps = {
+        "Reject corrupt package object",
+        "Reject package-only offline restore",
+        *native_negative_steps,
+    }
+    allowed_continue = 0
+    for match in re.finditer(
+        r"(?ms)^\s*-\s+name:\s*(?P<name>[^\n]+)\n(?P<body>(?:\s{8,}[^\n]*\n)*)",
+        text,
+    ):
+        body = match.group("body")
+        if not re.search(r"(?m)^\s+continue-on-error:\s*true\s*$", body):
+            continue
+        name = match.group("name").strip()
+        if name not in allowed_negative_steps:
+            failures.append(f"{label}: workflow hides a failing command")
+        if name in native_negative_steps:
+            step_id, prefix = native_negative_steps[name]
+            required = (
+                "Validate explicit backend refusal",
+                f"{prefix}_OUTCOME: ${{{{ steps.{step_id}.outcome }}}}",
+                f"{prefix}_PATH: ${{{{ steps.{step_id}.outputs.cache-path }}}}",
+                f'test "${prefix}_OUTCOME" = failure',
+                f'test -z "${prefix}_PATH"',
+            )
+            if (
+                f"id: {step_id}" not in body
+                or "uses: ./actions/download" not in body
+                or any(token not in text for token in required)
+            ):
+                failures.append(
+                    f"{label}: native backend refusal coverage lacks bound outcome assertions"
+                )
+        allowed_continue += 1
+    if text.count("continue-on-error: true") != allowed_continue:
+        failures.append(f"{label}: workflow has an unaudited continue-on-error")
+    if allowed_continue and (
+        "Validate corrupt-object failure" not in text
+        or "Validate offline metadata failure" not in text
+        or 'test "$OUTCOME" = failure' not in text
+    ):
+        failures.append(f"{label}: expected-failure action coverage lacks outcome assertions")
+    return failures
+
+
 def audit_ci_pins() -> None:
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
@@ -450,28 +501,8 @@ def audit_ci_pins() -> None:
             fail(f"{relative}: pull_request_target executes untrusted changes with base privileges")
         if re.search(r"\$\{\{\s*secrets\.", text):
             fail(f"{relative}: workflow exposes repository secrets")
-        allowed_negative_steps = {
-            "Reject corrupt package object",
-            "Reject package-only offline restore",
-        }
-        allowed_continue = 0
-        for match in re.finditer(
-            r"(?ms)^\s*-\s+name:\s*(?P<name>[^\n]+)\n(?P<body>(?:\s{8,}[^\n]*\n)*)",
-            text,
-        ):
-            if not re.search(r"(?m)^\s+continue-on-error:\s*true\s*$", match.group("body")):
-                continue
-            if match.group("name").strip() not in allowed_negative_steps:
-                fail(f"{relative}: workflow hides a failing command")
-            allowed_continue += 1
-        if text.count("continue-on-error: true") != allowed_continue:
-            fail(f"{relative}: workflow has an unaudited continue-on-error")
-        if allowed_continue and (
-            "Validate corrupt-object failure" not in text
-            or "Validate offline metadata failure" not in text
-            or 'test "$OUTCOME" = failure' not in text
-        ):
-            fail(f"{relative}: expected-failure action coverage lacks outcome assertions")
+        for failure in workflow_failure_handling_failures(text, str(relative)):
+            fail(failure)
         if not re.search(r"(?m)^permissions:\s*\n\s{2}contents:\s*read\s*$", text):
             fail(f"{relative}: top-level permissions must be contents: read")
         checkout_blocks = re.findall(
