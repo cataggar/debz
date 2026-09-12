@@ -1,13 +1,18 @@
 const std = @import("std");
 const exact_lock = @import("exact_lock.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 const package_acquisition = @import("package_acquisition.zig");
 
 const File = std.Io.File;
 
 pub const format_id = "debz-package-cache-archive-v1";
 pub const magic = format_id ++ "\n";
+pub const native_format_id = "debz-package-cache-archive-v2";
+pub const native_magic = native_format_id ++ "\n";
 pub const entry_header_bytes: u64 = 32 + 8;
 pub const trailer_bytes: u64 = 32;
+
+const Version = enum { v1, v2 };
 
 pub const Limits = struct {
     maximum_objects: usize,
@@ -53,6 +58,15 @@ pub const Error = error{
 };
 
 pub fn maximumArchiveBytes(limits: Limits) Error!u64 {
+    return maximumBytes(.v1, limits);
+}
+
+pub fn maximumNativeArchiveBytes(limits: Limits) Error!u64 {
+    return maximumBytes(.v2, limits);
+}
+
+fn maximumBytes(comptime version: Version, limits: Limits) Error!u64 {
+    const header = if (version == .v1) magic else native_magic;
     if (limits.maximum_objects == 0 or
         limits.maximum_object_bytes == 0 or
         limits.maximum_total_object_bytes == 0)
@@ -64,7 +78,7 @@ pub fn maximumArchiveBytes(limits: Limits) Error!u64 {
     ) catch return error.ArchiveTooLarge;
     var total = std.math.add(
         u64,
-        @intCast(magic.len + @sizeOf(u32)),
+        @intCast(header.len + @sizeOf(u32)),
         headers,
     ) catch return error.ArchiveTooLarge;
     total = std.math.add(u64, total, limits.maximum_total_object_bytes) catch
@@ -82,25 +96,54 @@ pub fn importFile(
     policy: ImportPolicy,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !ImportResult {
+    return importVersion(.v1, allocator, io, archive, cache, lock, limits, policy, writer_lock);
+}
+
+pub fn importNativeFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v2.Lock,
+    limits: Limits,
+    policy: ImportPolicy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ImportResult {
+    return importVersion(.v2, allocator, io, archive, cache, lock, limits, policy, writer_lock);
+}
+
+fn importVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive: File,
+    cache: *package_acquisition.Cache,
+    lock: if (version == .v1) exact_lock.Lock else exact_lock_v2.Lock,
+    limits: Limits,
+    policy: ImportPolicy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ImportResult {
+    const header = if (version == .v1) magic else native_magic;
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != limits.maximum_object_bytes)
         return error.InvalidConfiguration;
     const stat = archive.stat(io) catch return error.InvalidArchiveFile;
     if (stat.kind != .file) return error.InvalidArchiveFile;
-    const maximum = try maximumArchiveBytes(limits);
-    const minimum: u64 = magic.len + @sizeOf(u32) + trailer_bytes;
+    const maximum = try maximumBytes(version, limits);
+    const minimum: u64 = header.len + @sizeOf(u32) + trailer_bytes;
     if (stat.size < minimum) return error.TruncatedArchive;
     if (stat.size > maximum) return error.ArchiveTooLarge;
 
     var offset: u64 = 0;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var magic_buffer: [magic.len]u8 = undefined;
+    var magic_buffer: [header.len]u8 = undefined;
     try readHashed(archive, io, &magic_buffer, &offset, &hasher);
-    if (!std.mem.eql(u8, &magic_buffer, magic)) return error.InvalidArchive;
+    if (!std.mem.eql(u8, &magic_buffer, header)) return error.InvalidArchive;
     var count_buffer: [4]u8 = undefined;
     try readHashed(archive, io, &count_buffer, &offset, &hasher);
     const count = std.mem.readInt(u32, &count_buffer, .big);
-    if (count == 0 or count > limits.maximum_objects) return error.TooManyObjects;
+    if ((version == .v1 and count == 0) or count > limits.maximum_objects)
+        return error.TooManyObjects;
 
     var lock_by_digest = std.AutoHashMap([32]u8, usize).init(allocator);
     defer lock_by_digest.deinit();
@@ -224,9 +267,35 @@ pub fn exportFile(
     limits: Limits,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !ExportResult {
+    return exportVersion(.v1, allocator, io, output, cache, lock, limits, writer_lock);
+}
+
+pub fn exportNativeFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v2.Lock,
+    limits: Limits,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ExportResult {
+    return exportVersion(.v2, allocator, io, output, cache, lock, limits, writer_lock);
+}
+
+fn exportVersion(
+    comptime version: Version,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: File,
+    cache: *package_acquisition.Cache,
+    lock: if (version == .v1) exact_lock.Lock else exact_lock_v2.Lock,
+    limits: Limits,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ExportResult {
+    const header = if (version == .v1) magic else native_magic;
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != limits.maximum_object_bytes or
-        lock.packages.len == 0 or lock.packages.len > limits.maximum_objects)
+        (version == .v1 and lock.packages.len == 0) or lock.packages.len > limits.maximum_objects)
         return error.InvalidConfiguration;
     const output_stat = output.stat(io) catch return error.InvalidArchiveFile;
     if (output_stat.kind != .file or output_stat.size != 0)
@@ -235,15 +304,19 @@ pub fn exportFile(
     const order = try allocator.alloc(usize, lock.packages.len);
     defer allocator.free(order);
     for (order, 0..) |*value, index| value.* = index;
-    std.mem.sort(usize, order, lock, lessPackageDigest);
-    for (order[1..], order[0 .. order.len - 1]) |current, previous|
+    std.mem.sort(usize, order, lock, struct {
+        fn less(context: @TypeOf(lock), left: usize, right: usize) bool {
+            return std.mem.order(u8, &context.packages[left].sha256, &context.packages[right].sha256) == .lt;
+        }
+    }.less);
+    if (order.len > 1) for (order[1..], order[0 .. order.len - 1]) |current, previous|
         if (std.mem.eql(
             u8,
             &lock.packages[current].sha256,
             &lock.packages[previous].sha256,
         )) return error.DuplicateObject;
 
-    var expected_size: u64 = magic.len + @sizeOf(u32) + trailer_bytes;
+    var expected_size: u64 = header.len + @sizeOf(u32) + trailer_bytes;
     var total_bytes: u64 = 0;
     for (lock.packages) |package| {
         if (package.declared_size == 0 or package.declared_size > limits.maximum_object_bytes)
@@ -258,11 +331,11 @@ pub fn exportFile(
             entry_header_bytes + package.declared_size,
         ) catch return error.ArchiveTooLarge;
     }
-    if (expected_size > try maximumArchiveBytes(limits)) return error.ArchiveTooLarge;
+    if (expected_size > try maximumBytes(version, limits)) return error.ArchiveTooLarge;
 
     var offset: u64 = 0;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    try writeHashed(output, io, magic, &offset, &hasher);
+    try writeHashed(output, io, header, &offset, &hasher);
     var count_buffer: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buffer, @intCast(lock.packages.len), .big);
     try writeHashed(output, io, &count_buffer, &offset, &hasher);
@@ -328,14 +401,6 @@ fn writeHashed(
     hasher.update(bytes);
 }
 
-fn lessPackageDigest(lock: exact_lock.Lock, left: usize, right: usize) bool {
-    return std.mem.order(
-        u8,
-        &lock.packages[left].sha256,
-        &lock.packages[right].sha256,
-    ) == .lt;
-}
-
 fn testLock(
     allocator: std.mem.Allocator,
     objects: []const []const u8,
@@ -372,6 +437,374 @@ fn testLock(
         .packages = packages,
         .authenticated_metadata = true,
     });
+}
+
+fn testNativeLock(
+    allocator: std.mem.Allocator,
+    objects: []const []const u8,
+) !exact_lock_v2.OwnedLock {
+    const package_origin = @import("package_origin.zig");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(1);
+    const packages = try temporary.alloc(exact_lock_v2.Package, objects.len);
+    var artifacts: std.ArrayList(package_origin.LocalArtifactEvidence) = .empty;
+    for (objects, 0..) |bytes, index| {
+        const name = try std.fmt.allocPrint(temporary, "package-{d}", .{index});
+        const digest = package_acquisition.Digest.of(bytes).bytes;
+        const origin: exact_lock_v2.PackageOrigin = if (index % 2 == 0)
+            .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } }
+        else local: {
+            const artifact: package_origin.LocalArtifactEvidence = .{
+                .artifact_id = package_origin.artifactIdFromSha256(digest),
+                .sha256 = digest,
+                .size = bytes.len,
+                .package = name,
+                .version = "1",
+                .architecture = "amd64",
+                .acquisition_url = "https://example.test/artifact.deb",
+                .trust_mode = .verified_https,
+            };
+            try artifacts.append(temporary, artifact);
+            break :local .{ .local_artifact = artifact };
+        };
+        packages[index] = .{
+            .name = name,
+            .version = "1",
+            .architecture = "amd64",
+            .origin = origin,
+            .sha256 = digest,
+            .declared_size = bytes.len,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        };
+    }
+    return exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(2),
+        .policy_sha256 = @splat(3),
+        .repositories = if (objects.len == 0) &.{} else &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(4),
+            .index_sha256 = @splat(5),
+            .signer_fingerprints = &.{@splat(6)},
+        }},
+        .local_artifacts = artifacts.items,
+        .packages = packages,
+        .verified_origins = true,
+    });
+}
+
+test "package_cache_archive.test.native roundtrip preserves mixed and empty v2 closures" {
+    const objects = [_][]const u8{ "first object", "second object" };
+    const limits: Limits = .{
+        .maximum_objects = 10,
+        .maximum_object_bytes = 1024,
+        .maximum_total_object_bytes = 4096,
+    };
+    var legacy = try testLock(std.testing.allocator, &objects);
+    defer legacy.deinit();
+    for (0..objects.len + 1) |count| {
+        var lock = try testNativeLock(std.testing.allocator, objects[0..count]);
+        defer lock.deinit();
+        const lock_digest = lock.lock.digest_sha256;
+        var source_tmp = std.testing.tmpDir(.{});
+        defer source_tmp.cleanup();
+        var source_cache = try package_acquisition.Cache.initFromDir(
+            std.testing.io,
+            source_tmp.dir,
+            .{ .maximum_object_bytes = limits.maximum_object_bytes },
+        );
+        defer source_cache.deinit();
+        for (objects[0..count]) |bytes| try source_cache.publish(
+            std.testing.allocator,
+            package_acquisition.Digest.of(bytes),
+            bytes.len,
+            bytes,
+            .fail_fast,
+            .{},
+        );
+        var source_writer = try source_cache.acquireWriter(10);
+        defer source_writer.release();
+        var archive = try source_tmp.dir.createFile(std.testing.io, "native.archive", .{
+            .exclusive = true,
+            .read = true,
+        });
+        defer archive.close(std.testing.io);
+        const exported = try exportNativeFile(
+            std.testing.allocator,
+            std.testing.io,
+            archive,
+            &source_cache,
+            lock.lock,
+            limits,
+            &source_writer,
+        );
+        try std.testing.expectEqual(count, exported.objects);
+        const encoded = try source_tmp.dir.readFileAlloc(
+            std.testing.io,
+            "native.archive",
+            std.testing.allocator,
+            .limited(4096),
+        );
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expect(std.mem.startsWith(u8, encoded, "debz-package-cache-archive-v2\n"));
+        try std.testing.expectEqual(@as(u32, @intCast(count)), std.mem.readInt(u32, encoded[native_magic.len..][0..4], .big));
+        try std.testing.expectEqual(exported.archive_bytes, encoded.len);
+        const digest = package_acquisition.Digest.of(encoded[0 .. encoded.len - trailer_bytes]);
+        try std.testing.expectEqualSlices(u8, &digest.bytes, &exported.content_sha256);
+        try std.testing.expectEqualSlices(u8, &digest.bytes, encoded[encoded.len - trailer_bytes ..]);
+        try std.testing.expect(exported.archive_bytes <= try maximumNativeArchiveBytes(limits));
+        if (count == 0) {
+            try std.testing.expectEqual(@as(u64, native_magic.len + 4 + trailer_bytes), exported.archive_bytes);
+            try std.testing.expectEqual(@as(u64, 0), exported.bytes);
+        }
+        var target_tmp = std.testing.tmpDir(.{});
+        defer target_tmp.cleanup();
+        var target_cache = try package_acquisition.Cache.initFromDir(
+            std.testing.io,
+            target_tmp.dir,
+            .{ .maximum_object_bytes = limits.maximum_object_bytes },
+        );
+        defer target_cache.deinit();
+        var target_writer = try target_cache.acquireWriter(10);
+        defer target_writer.release();
+        try std.testing.expectError(error.InvalidArchive, importFile(
+            std.testing.allocator,
+            std.testing.io,
+            archive,
+            &target_cache,
+            legacy.lock,
+            limits,
+            .{},
+            &target_writer,
+        ));
+        if (count != 0) {
+            var empty_lock = try testNativeLock(std.testing.allocator, &.{});
+            defer empty_lock.deinit();
+            try std.testing.expectError(error.LockObjectMismatch, importNativeFile(
+                std.testing.allocator,
+                std.testing.io,
+                archive,
+                &target_cache,
+                empty_lock.lock,
+                limits,
+                .{ .require_exact_closure = true },
+                &target_writer,
+            ));
+        }
+        const imported = try importNativeFile(
+            std.testing.allocator,
+            std.testing.io,
+            archive,
+            &target_cache,
+            lock.lock,
+            limits,
+            .{ .require_exact_closure = true },
+            &target_writer,
+        );
+        try std.testing.expectEqual(count, imported.imported);
+        try std.testing.expectEqual(@as(usize, 0), imported.skipped);
+        const repeated = try importNativeFile(
+            std.testing.allocator,
+            std.testing.io,
+            archive,
+            &target_cache,
+            lock.lock,
+            limits,
+            .{ .require_exact_closure = true },
+            &target_writer,
+        );
+        try std.testing.expectEqual(@as(usize, 0), repeated.imported);
+        try std.testing.expectEqual(count, repeated.reused);
+        for (objects[0..count]) |expected| {
+            const actual = try target_cache.lookup(
+                std.testing.allocator,
+                package_acquisition.Digest.of(expected),
+                expected.len,
+                .verify_sha256,
+            );
+            defer std.testing.allocator.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+        try std.testing.expectEqual(lock_digest, lock.lock.digest_sha256);
+        if (count == 2) {
+            try std.testing.expect(lock.lock.packages[0].origin == .authenticated_repository);
+            try std.testing.expect(lock.lock.packages[1].origin == .local_artifact);
+            var subset = try testNativeLock(std.testing.allocator, objects[0..1]);
+            defer subset.deinit();
+            var partial_tmp = std.testing.tmpDir(.{});
+            defer partial_tmp.cleanup();
+            var partial_cache = try package_acquisition.Cache.initFromDir(
+                std.testing.io,
+                partial_tmp.dir,
+                .{ .maximum_object_bytes = limits.maximum_object_bytes },
+            );
+            defer partial_cache.deinit();
+            var partial_writer = try partial_cache.acquireWriter(10);
+            defer partial_writer.release();
+            const partial = try importNativeFile(
+                std.testing.allocator,
+                std.testing.io,
+                archive,
+                &partial_cache,
+                subset.lock,
+                limits,
+                .{},
+                &partial_writer,
+            );
+            try std.testing.expectEqual(@as(usize, 1), partial.imported);
+            try std.testing.expectEqual(@as(usize, 1), partial.skipped);
+            try std.testing.expectEqual(@as(?u64, null), try partial_cache.objectSize(package_acquisition.Digest.of(objects[1])));
+        }
+    }
+}
+
+test "package_cache_archive.test.native import does not autodetect legacy archives" {
+    var native_lock = try testNativeLock(std.testing.allocator, &.{"object"});
+    defer native_lock.deinit();
+    var legacy_lock = try testLock(std.testing.allocator, &.{"object"});
+    defer legacy_lock.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{ .maximum_object_bytes = 1024 });
+    defer cache.deinit();
+    var writer = try cache.acquireWriter(10);
+    defer writer.release();
+    var archive = try tmp.dir.createFile(std.testing.io, "legacy.archive", .{ .exclusive = true, .read = true });
+    defer archive.close(std.testing.io);
+    const digest = package_acquisition.Digest.of("object");
+    try writeTestArchive(archive, &.{.{ .digest = digest.bytes, .bytes = "object" }});
+    const limits: Limits = .{ .maximum_objects = 10, .maximum_object_bytes = 1024, .maximum_total_object_bytes = 4096 };
+    try std.testing.expectError(error.InvalidArchive, importNativeFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &cache,
+        native_lock.lock,
+        limits,
+        .{},
+        &writer,
+    ));
+    try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(digest));
+    const imported = try importFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &cache,
+        legacy_lock.lock,
+        limits,
+        .{},
+        &writer,
+    );
+    try std.testing.expectEqual(@as(usize, 1), imported.imported);
+    var empty_lock = try testLock(std.testing.allocator, &.{});
+    defer empty_lock.deinit();
+    var empty_archive = try tmp.dir.createFile(std.testing.io, "empty.archive", .{ .exclusive = true, .read = true });
+    defer empty_archive.close(std.testing.io);
+    try std.testing.expectError(error.InvalidConfiguration, exportFile(
+        std.testing.allocator,
+        std.testing.io,
+        empty_archive,
+        &cache,
+        empty_lock.lock,
+        limits,
+        &writer,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), (try empty_archive.stat(std.testing.io)).size);
+    try writeTestArchive(empty_archive, &.{});
+    try std.testing.expectError(error.TooManyObjects, importFile(
+        std.testing.allocator,
+        std.testing.io,
+        empty_archive,
+        &cache,
+        empty_lock.lock,
+        limits,
+        .{},
+        &writer,
+    ));
+}
+
+test "package_cache_archive.test.native invalid closures publish no objects" {
+    const objects = [_][]const u8{ "first object", "second object" };
+    var lock = try testNativeLock(std.testing.allocator, &objects);
+    defer lock.deinit();
+    const limits: Limits = .{ .maximum_objects = 10, .maximum_object_bytes = 1024, .maximum_total_object_bytes = 4096 };
+    const Fault = enum { empty, missing, extra, duplicate, reversed, trailer, trailing, count, size, released_writer };
+    for ([_]Fault{ .empty, .missing, .extra, .duplicate, .reversed, .trailer, .trailing, .count, .size, .released_writer }) |fault| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{ .maximum_object_bytes = 1024 });
+        defer cache.deinit();
+        var writer = try cache.acquireWriter(10);
+        defer writer.release();
+        var archive = try tmp.dir.createFile(std.testing.io, "native.archive", .{ .exclusive = true, .read = true });
+        defer archive.close(std.testing.io);
+        var entries = [_]TestArchiveEntry{
+            .{ .digest = package_acquisition.Digest.of(objects[0]).bytes, .bytes = objects[0] },
+            .{ .digest = package_acquisition.Digest.of(objects[1]).bytes, .bytes = objects[1] },
+            .{ .digest = package_acquisition.Digest.of("extra").bytes, .bytes = "extra" },
+        };
+        const length: usize = switch (fault) {
+            .empty => 0,
+            .missing => 1,
+            .extra => 3,
+            else => 2,
+        };
+        std.mem.sort(TestArchiveEntry, entries[0..length], {}, struct {
+            fn less(_: void, left: TestArchiveEntry, right: TestArchiveEntry) bool {
+                return std.mem.order(u8, &left.digest, &right.digest) == .lt;
+            }
+        }.less);
+        if (fault == .duplicate) entries[1] = entries[0];
+        if (fault == .reversed) std.mem.swap(TestArchiveEntry, &entries[0], &entries[1]);
+        try writeTestArchiveVersion(.v2, archive, entries[0..length]);
+        if (fault == .trailer) {
+            const end = (try archive.stat(std.testing.io)).size;
+            var last: [1]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 1), try archive.readPositionalAll(std.testing.io, &last, end - 1));
+            last[0] ^= 1;
+            try archive.writePositionalAll(std.testing.io, &last, end - 1);
+        }
+        if (fault == .trailing)
+            try archive.writePositionalAll(std.testing.io, "x", (try archive.stat(std.testing.io)).size);
+        var actual_limits = limits;
+        if (fault == .count) actual_limits.maximum_objects = 1;
+        var packages = [_]exact_lock_v2.Package{ lock.lock.packages[0], lock.lock.packages[1] };
+        var actual_lock = lock.lock;
+        if (fault == .size) {
+            packages[0].declared_size += 1;
+            actual_lock.packages = &packages;
+        }
+        if (fault == .released_writer) writer.release();
+        const expected = switch (fault) {
+            .empty, .missing, .extra, .size => error.LockObjectMismatch,
+            .duplicate => error.DuplicateObject,
+            .reversed => error.NonCanonicalOrder,
+            .trailer => error.ArchiveDigestMismatch,
+            .trailing => error.TrailingArchiveData,
+            .count => error.TooManyObjects,
+            .released_writer => error.InvalidConfiguration,
+        };
+        try std.testing.expectError(expected, importNativeFile(
+            std.testing.allocator,
+            std.testing.io,
+            archive,
+            &cache,
+            actual_lock,
+            actual_limits,
+            .{ .require_exact_closure = true },
+            &writer,
+        ));
+        for (objects) |object|
+            try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(package_acquisition.Digest.of(object)));
+    }
 }
 
 test "package_cache_archive.test.roundtrip relocates verified objects between cache roots" {
@@ -773,9 +1206,18 @@ fn writeTestArchive(
     file: File,
     entries: []const TestArchiveEntry,
 ) !void {
+    return writeTestArchiveVersion(.v1, file, entries);
+}
+
+fn writeTestArchiveVersion(
+    comptime version: Version,
+    file: File,
+    entries: []const TestArchiveEntry,
+) !void {
+    const header = if (version == .v1) magic else native_magic;
     var offset: u64 = 0;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    try writeHashed(file, std.testing.io, magic, &offset, &hasher);
+    try writeHashed(file, std.testing.io, header, &offset, &hasher);
     var count_buffer: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buffer, @intCast(entries.len), .big);
     try writeHashed(file, std.testing.io, &count_buffer, &offset, &hasher);

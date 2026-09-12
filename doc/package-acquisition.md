@@ -114,6 +114,32 @@ count, then strictly digest-sorted records of 32 raw SHA-256 bytes, an unsigned
 preceding bytes, and trailing data is rejected. The format intentionally has
 no pathname, ownership, mode, link, or special-file fields.
 
+### Native archive contract
+
+The lower-level archive API additionally provides `importNativeFile`,
+`exportNativeFile`, and `maximumNativeArchiveBytes` for typed exact-lock v2
+closures. These use `debz-package-cache-archive-v2\n` with the same sorted
+digest/size records and final checksum. Unlike v1, v2 permits a canonical
+zero-object stream for an empty closure. Existing `importFile`, `exportFile`,
+and `maximumArchiveBytes` retain their v1 behavior, including rejecting empty
+streams; neither reader auto-detects or accepts the other version.
+
+The v2 transport binds object digests and sizes directly from the genuine v2
+lock without converting it to v1 or inventing repository origins. Repository
+and local-artifact origin evidence stays in the caller's authenticated lock,
+not the path-free archive. Transport does not grant origin authority or
+validate package installation policy.
+
+Both formats validate the complete envelope and every object before any
+matching object is published under the CAS writer lock. Exact restores require
+the entire lock closure, including an actually empty archive for an empty
+native lock. Partial restores publish only matching objects; unrelated objects
+are verified but skipped. Imported objects are reread and rehashed before
+publication, and the existing CAS layout remains unchanged.
+
+Native fingerprint/preparation CLI and Actions integration are separate work;
+current commands and action contracts still select only the v1 format.
+
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the
 authenticated repository identity and expected SHA-256.
