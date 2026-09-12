@@ -1861,6 +1861,8 @@ def exercise_workflows(
         if outcome != "success":
             projected_run("recover", owner_evidence="/fixture/owner.json", expected_exit=7 if outcome == "failed" else 0)
             projected_owner()
+            projected_run("recover", facade_recover=True, owner_evidence="/fixture/owner.json",
+                          expected_exit=7 if outcome == "failed" else 0)
         proof = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
         assert proof["install_root"] == "/run/debz/system-root"
         assert proof["outcome"] == ("failed" if outcome == "failed" else "succeeded")

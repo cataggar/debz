@@ -1347,14 +1347,23 @@ pub const PrivateLiveRootRunner = struct {
                                 completion.document,
                             ))
                             return error.InvalidRecoveryAcknowledgment;
-                        recovery_acknowledgment = .{
-                            .attempt_id = record.attempt_id,
-                            .completion_sha256 = completion.document.digest_sha256,
-                            .provenance_sha256 = record.provenance_sha256.?,
-                            .acknowledgment_id = workflow_invocation.request
-                                .orchestration_id orelse
-                                return error.MissingRecoveryAcknowledgment,
-                        };
+                        recovery_acknowledgment = if (workflow_invocation.backend.transaction_backend == .native)
+                            try nativeRecoveryAcknowledgment(
+                                allocator,
+                                workflow_invocation.request,
+                                record,
+                                completion.document,
+                                inspection.deferred_acknowledgment orelse return error.MissingRecoveryAcknowledgment,
+                            )
+                        else
+                            .{
+                                .attempt_id = record.attempt_id,
+                                .completion_sha256 = completion.document.digest_sha256,
+                                .provenance_sha256 = record.provenance_sha256.?,
+                                .acknowledgment_id = workflow_invocation.request
+                                    .orchestration_id orelse
+                                    return error.MissingRecoveryAcknowledgment,
+                            };
                     }
                     if ((workflow_invocation.request.mode == .reserve or
                         workflow_invocation.request.mode == .execute or
@@ -8631,6 +8640,7 @@ pub const Engine = struct {
                             .provenance_sha256 = acknowledgment.provenance_sha256.?,
                             .acknowledgment_id = acknowledgment.acknowledgment_id,
                         },
+                        .expected_ownership_marker = if (loaded.view.transaction_backend == .native) acknowledgment else null,
                     },
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -10403,7 +10413,31 @@ fn recoveryCompletionMatches(
         .package_transaction => |operation| operation == expected_operation,
         .repository_bootstrap => false,
     };
+    const backend: root_operation.Backend = switch (profile.transaction_backend) {
+        .legacy_dpkg => .legacy_dpkg,
+        .native => .native,
+    };
+    const recovery_discharge = std.mem.eql(u8, document.discharge.operation, "recover") and
+        std.mem.eql(u8, &document.discharge.request_sha256, &recovery_request_sha256);
+    const discharge_matches = switch (profile.transaction_backend) {
+        .legacy_dpkg => recovery_discharge,
+        .native => recovery_discharge or
+            (std.mem.eql(u8, document.discharge.operation, expected_operation.spelling()) and
+                std.mem.eql(u8, &document.discharge.request_sha256, &original_request_sha256)),
+    };
+    if (backend == .native and
+        (document.outcome != .succeeded or
+            !std.mem.eql(u8, lock.schema, exact_lock_v2.schema_id) or
+            lock.version != exact_lock_v2.schema_version or
+            !std.mem.eql(u8, &document.policy_sha256, &production_backend.planningPolicyDigest(.native, options)) or
+            document.transaction_provenance.status == .unavailable or
+            !std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id) or
+            document.transaction_provenance.document_sha256 == null or
+            document.journal.status != .absent or document.journal.document_sha256 != null))
+        return false;
     return operation_matches and
+        document.backend == backend and
+        documentEqual(verified_lock.binding, prepared.exact_lock) and
         document.mutation_started and
         (document.outcome == .succeeded or document.outcome == .recovered) and
         std.mem.eql(
@@ -10416,11 +10450,6 @@ fn recoveryCompletionMatches(
             &document.request_sha256,
             &original_request_sha256,
         ) and
-        std.mem.eql(
-            u8,
-            &document.discharge.request_sha256,
-            &recovery_request_sha256,
-        ) and
         std.mem.eql(u8, document.install_root, live_root.logical_root_path) and
         std.mem.eql(u8, document.target_architecture, profile.architecture) and
         std.mem.eql(u8, lock.schema, prepared.exact_lock.schema) and
@@ -10431,7 +10460,7 @@ fn recoveryCompletionMatches(
             &prepared.exact_lock.digest_sha256,
         ) and
         document.discharge.surface == .package_transaction and
-        std.mem.eql(u8, document.discharge.operation, "recover");
+        discharge_matches;
 }
 
 fn preMutationReconciliationClaimMatches(
@@ -10578,6 +10607,11 @@ fn lowerRecordBindingMatches(
     profile: ProfileView,
     verified_lock: VerifiedLock,
 ) !bool {
+    const backend: root_operation.Backend = switch (profile.transaction_backend) {
+        .legacy_dpkg => .legacy_dpkg,
+        .native => .native,
+    };
+    if (record.backend != backend) return false;
     if (!std.mem.eql(
         u8,
         &marker.acknowledgment_id,
@@ -10890,6 +10924,10 @@ fn settledRecoveryProvenanceMatches(
     const provenance_sha256 = record.provenance_sha256 orelse return false;
     if (!std.mem.eql(u8, &record.attempt_id, &document.attempt_id))
         return false;
+    if (record.backend != document.backend) return false;
+    if (record.backend == .native)
+        return document.bindsRecord(record) and
+            std.mem.eql(u8, &provenance_sha256, &document.digest_sha256);
     const expected = root_operation.provenanceDigest(record, .{
         .outcome = record.outcome,
         .document_sha256 = document.digest_sha256,
@@ -10908,6 +10946,81 @@ fn acknowledgmentForSettledRecovery(
         .completion_sha256 = document.digest_sha256,
         .provenance_sha256 = record.provenance_sha256.?,
         .acknowledgment_id = acknowledgment_id,
+    };
+}
+
+fn nativeRecoveryAcknowledgment(
+    allocator: std.mem.Allocator,
+    request: WorkflowRequest,
+    record: root_operation.Record,
+    completion: root_operation_completion.Document,
+    observed: root_operation.DeferredAcknowledgment,
+) !RecoveryAcknowledgment {
+    const acknowledgment_id = request.orchestration_id orelse return error.MissingRecoveryAcknowledgment;
+    const expected = request.expected_ownership_marker orelse
+        if (request.recovery_review_claim) |claim| claim.prior_marker else null;
+    if (expected == null and request.recovery_review_claim == null)
+        return error.MissingRecoveryAcknowledgment;
+    if (request.recovery_review_claim) |claim|
+        if (!std.mem.eql(u8, &claim.outer_attempt_id, &acknowledgment_id))
+            return error.InvalidRecoveryAcknowledgment;
+    if (request.root_attempt_id) |attempt_id|
+        if (!std.mem.eql(u8, &record.attempt_id, &attempt_id))
+            return error.InvalidRecoveryAcknowledgment;
+    if (expected) |owner| {
+        if ((owner.state != .bound and owner.state != .pending) or
+            !std.mem.eql(u8, &owner.attempt_id, &record.attempt_id) or
+            !std.mem.eql(u8, &owner.acknowledgment_id, &acknowledgment_id))
+            return error.InvalidRecoveryAcknowledgment;
+        if (owner.state == .pending and
+            (!optionalDigestEqual(owner.completion_sha256, completion.digest_sha256) or
+                !optionalDigestEqual(owner.provenance_sha256, completion.digest_sha256)))
+            return error.InvalidRecoveryAcknowledgment;
+    }
+    const semantic: production_backend.WorkflowSemanticOperation = switch (request.operation) {
+        .install => .install,
+        .remove => .remove,
+        .upgrade_all => .upgrade_all,
+    };
+    const caller = try production_backend.workflowProductRequestDigest(
+        allocator,
+        semantic,
+        .execute,
+        request.selectors,
+        request.options,
+    );
+    if (record.backend != .native or completion.backend != .native or
+        record.state != .completed or record.provenance != .published or
+        record.operation != .package_transaction or
+        record.operation.package_transaction != workflowSurfaceOperation(request.operation, .execute) or
+        completion.outcome != .succeeded or !record.mutation_started or
+        !std.mem.eql(u8, &record.request_sha256, &caller) or
+        !std.mem.eql(u8, &record.policy_sha256, &production_backend.planningPolicyDigest(.native, request.options)) or
+        !std.mem.eql(u8, record.install_root, request.options.install_root) or
+        !std.mem.eql(u8, record.target_architecture, request.options.architecture) or
+        !settledRecoveryProvenanceMatches(record, completion))
+        return error.InvalidRecoveryAcknowledgment;
+    var marker = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = record.attempt_id,
+        .completion_sha256 = completion.digest_sha256,
+        .provenance_sha256 = completion.digest_sha256,
+        .acknowledgment_id = acknowledgment_id,
+    });
+    if (request.recovery_review_claim) |claim| {
+        marker = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(marker, claim);
+    } else if (expected) |owner| {
+        if (owner.recovery_review_claim_sha256 != null)
+            marker = try root_operation.carryDeferredAcknowledgmentReviewOwner(marker, owner);
+    }
+    if (!root_operation.deferredAcknowledgmentExactEqual(marker, observed))
+        return error.InvalidRecoveryAcknowledgment;
+    return .{
+        .attempt_id = marker.attempt_id,
+        .completion_sha256 = marker.completion_sha256.?,
+        .provenance_sha256 = marker.provenance_sha256.?,
+        .acknowledgment_id = marker.acknowledgment_id,
+        .marker = marker,
     };
 }
 
@@ -10951,14 +11064,27 @@ fn durableLowerAcknowledgment(
         )) return error.LowerAcknowledgmentMismatch;
         return marker;
     }
-    if (recovery) |acknowledgment|
-        return try root_operation.createDeferredAcknowledgment(.{
+    if (recovery) |acknowledgment| {
+        const legacy = try root_operation.createDeferredAcknowledgment(.{
             .state = .pending,
             .attempt_id = acknowledgment.attempt_id,
             .completion_sha256 = acknowledgment.completion_sha256,
             .provenance_sha256 = acknowledgment.provenance_sha256,
             .acknowledgment_id = acknowledgment.acknowledgment_id,
         });
+        const marker = acknowledgment.marker orelse return legacy;
+        if (marker.state != .pending or
+            !std.mem.eql(u8, &marker.attempt_id, &legacy.attempt_id) or
+            !std.mem.eql(u8, &marker.acknowledgment_id, &legacy.acknowledgment_id) or
+            !optionalDigestEqual(marker.completion_sha256, legacy.completion_sha256) or
+            !optionalDigestEqual(marker.provenance_sha256, legacy.provenance_sha256) or
+            !root_operation.deferredAcknowledgmentExactEqual(
+                marker,
+                try root_operation.createDeferredAcknowledgment(marker),
+            ))
+            return error.LowerAcknowledgmentMismatch;
+        return marker;
+    }
     return null;
 }
 
@@ -10979,16 +11105,23 @@ fn lowerAcknowledgmentMatches(
                 durable,
                 observed,
             ),
-        .pending => (observed.state == .pending or
-            observed.state == .acknowledged) and
-            optionalDigestEqual(
-                durable.completion_sha256,
-                observed.completion_sha256,
-            ) and
-            optionalDigestEqual(
-                durable.provenance_sha256,
-                observed.provenance_sha256,
-            ),
+        .pending => if (durable.document_version == root_operation.deferred_ack_v2_schema_version)
+            (observed.state == .pending or observed.state == .acknowledged) and
+                root_operation.deferredAcknowledgmentExactEqual(
+                    root_operation.transitionDeferredAcknowledgment(durable, observed.state) catch return false,
+                    observed,
+                )
+        else
+            (observed.state == .pending or
+                observed.state == .acknowledged) and
+                optionalDigestEqual(
+                    durable.completion_sha256,
+                    observed.completion_sha256,
+                ) and
+                optionalDigestEqual(
+                    durable.provenance_sha256,
+                    observed.provenance_sha256,
+                ),
         else => false,
     };
 }
@@ -12222,6 +12355,7 @@ fn ownedNativeTransportFixture(
     allocator: std.mem.Allocator,
     failed: bool,
     state: root_operation.DeferredAcknowledgmentState,
+    options: ?product_api.CommonOptions,
 ) !struct { request: OwnedNativeRequest, source: []u8 } {
     var request: OwnedNativeRequest = .{
         .exact_lock = .{
@@ -12237,7 +12371,7 @@ fn ownedNativeTransportFixture(
         }),
         .operation = .install,
         .selectors = &.{.{ .name = "fixture" }},
-        .options = .{
+        .options = options orelse .{
             .install_root = live_root.logical_root_path,
             .cache_path = "/unread/cache",
             .state_path = "/unread/state",
@@ -12337,7 +12471,7 @@ test "apt_system_orchestrator.test.native owned transport preserves owner outcom
     for ([_]bool{ false, true }) |failed| {
         for ([_]root_operation.DeferredAcknowledgmentState{ .pending, .released }) |state| {
             if (failed and state == .released) continue;
-            const fixture = try ownedNativeTransportFixture(allocator, failed, state);
+            const fixture = try ownedNativeTransportFixture(allocator, failed, state, null);
             defer allocator.free(fixture.source);
             try std.testing.checkAllAllocationFailures(allocator, testOwnedNativeDecode, .{ fixture.request, fixture.source });
             var changed = fixture.request;
@@ -12374,7 +12508,7 @@ test "apt_system_orchestrator.test.native owned transport preserves owner outcom
 
 test "apt_system_orchestrator.test.native owned transport requires exact v2 review owner identity" {
     const allocator = std.testing.allocator;
-    const fixture = try ownedNativeTransportFixture(allocator, false, .pending);
+    const fixture = try ownedNativeTransportFixture(allocator, false, .pending, null);
     defer allocator.free(fixture.source);
     const claim = try root_operation.createRecoveryReviewClaim(.{
         .outer_attempt_id = fixture.request.owner.acknowledgment_id,
@@ -12407,7 +12541,7 @@ test "apt_system_orchestrator.test.native owned transport requires exact v2 revi
 
 test "apt_system_orchestrator.test.owned native verification rejects unsupported requests before IO" {
     const allocator = std.testing.allocator;
-    const fixture = try ownedNativeTransportFixture(allocator, false, .pending);
+    const fixture = try ownedNativeTransportFixture(allocator, false, .pending, null);
     defer allocator.free(fixture.source);
     var runner: PrivateLiveRootRunner = .{ .io = undefined };
     var verifier: SystemResultVerifier = .{ .io = undefined };
@@ -12443,6 +12577,214 @@ test "apt_system_orchestrator.test.owned native verification rejects unsupported
     const oversized = try allocator.alloc(u8, PrivateLiveRootRunner.maximum_native_verification_bytes + 1);
     defer allocator.free(oversized);
     try std.testing.expectError(error.DocumentTooLarge, testOwnedNativeDecode(allocator, fixture.request, oversized));
+}
+
+test "apt_system_orchestrator.test.native recovery completion keeps original discharge and direct provenance binding" {
+    const allocator = std.testing.allocator;
+    var harness = Harness.init(allocator);
+    defer harness.deinit();
+    harness.verifier.lock_digest = @splat(0x77);
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(allocator, mutationRequest(.install, &.{"fixture"})));
+    defer prepared.deinit();
+    prepared.exact_lock.schema = exact_lock_v2.schema_id;
+    prepared.exact_lock.version = exact_lock_v2.schema_version;
+    var loaded = try harness.profile.interface().load(allocator, prepared.request.profile_path);
+    defer loaded.deinit();
+    loaded.view.transaction_backend = .native;
+    const lock: VerifiedLock = .{
+        .binding = prepared.exact_lock,
+        .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+    };
+    const options = executeOptions(loaded.view, prepared.paths.exact_lock);
+    for ([_]bool{ false, true }) |failed| {
+        const fixture = try ownedNativeTransportFixture(allocator, failed, .pending, options);
+        defer allocator.free(fixture.source);
+        var verified = try PrivateLiveRootRunner.decodeOwnedNative(allocator, fixture.request, fixture.source);
+        defer verified.deinit();
+        const document = switch (verified) {
+            inline else => |owned| owned.completion.document,
+        };
+        try std.testing.expectEqual(!failed, try recoveryCompletionMatches(
+            allocator,
+            document,
+            prepared,
+            loaded.view,
+            lock,
+            document.attempt_id,
+        ));
+        var published = try reconstructPublishedRecoveryRecord(allocator, document);
+        defer published.deinit();
+        try std.testing.expectEqualSlices(u8, &document.digest_sha256, &published.record.provenance_sha256.?);
+        try std.testing.expect(settledRecoveryProvenanceMatches(published.record, document));
+        const owner = try root_operation.createDeferredAcknowledgment(.{
+            .state = .pending,
+            .attempt_id = document.attempt_id,
+            .acknowledgment_id = prepared.attempt_id,
+            .completion_sha256 = document.digest_sha256,
+            .provenance_sha256 = document.digest_sha256,
+        });
+        try std.testing.expectEqual(!failed, try lowerMutationMatches(
+            allocator,
+            published.record,
+            owner,
+            prepared,
+            loaded.view,
+            lock,
+            document,
+        ));
+        published.record.provenance_sha256 = root_operation.provenanceDigest(published.record, .{
+            .outcome = published.record.outcome,
+            .document_sha256 = document.digest_sha256,
+        });
+        try std.testing.expect(!settledRecoveryProvenanceMatches(published.record, document));
+        if (failed) continue;
+        var recovery = document;
+        recovery.discharge.operation = "recover";
+        recovery.discharge.request_sha256 = try production_backend.workflowProductRequestDigest(
+            allocator,
+            .install,
+            .recover,
+            fixture.request.selectors,
+            options,
+        );
+        try std.testing.expect(try recoveryCompletionMatches(
+            allocator,
+            recovery,
+            prepared,
+            loaded.view,
+            lock,
+            document.attempt_id,
+        ));
+        for (0..10) |index| {
+            var changed = document;
+            switch (index) {
+                0 => changed.backend = .legacy_dpkg,
+                1 => changed.policy_sha256[0] ^= 1,
+                2 => changed.transaction_provenance.schema = transaction_provenance.schema_id,
+                3 => changed.transaction_provenance.document_sha256 = null,
+                4 => changed.journal.status = .archived,
+                5 => changed.discharge.request_sha256 = recovery.discharge.request_sha256,
+                6 => changed.discharge.operation = "recover",
+                7 => changed.outcome = .recovered,
+                8 => changed.request_sha256[0] ^= 1,
+                9 => changed.attempt_id[0] ^= 1,
+                else => unreachable,
+            }
+            try std.testing.expect(!try recoveryCompletionMatches(
+                allocator,
+                changed,
+                prepared,
+                loaded.view,
+                lock,
+                document.attempt_id,
+            ));
+        }
+        var legacy_profile = loaded.view;
+        legacy_profile.transaction_backend = .legacy_dpkg;
+        try std.testing.expect(!try lowerRecordBindingMatches(
+            allocator,
+            published.record,
+            owner,
+            prepared,
+            legacy_profile,
+            lock,
+        ));
+    }
+}
+
+test "apt_system_orchestrator.test.native recovery handoff preserves exact reviewed pending ownership" {
+    const allocator = std.testing.allocator;
+    const fixture = try ownedNativeTransportFixture(allocator, false, .pending, null);
+    defer allocator.free(fixture.source);
+    var verified = try PrivateLiveRootRunner.decodeOwnedNative(allocator, fixture.request, fixture.source);
+    defer verified.deinit();
+    const completion = verified.succeeded.completion.document;
+    var record = try reconstructPublishedRecoveryRecord(allocator, completion);
+    defer record.deinit();
+    const bound = try root_operation.createDeferredAcknowledgment(.{
+        .document_version = root_operation.deferred_ack_v2_schema_version,
+        .state = .bound,
+        .attempt_id = fixture.request.owner.attempt_id,
+        .acknowledgment_id = fixture.request.owner.acknowledgment_id,
+    });
+    var request: WorkflowRequest = .{
+        .operation = .install,
+        .mode = .recover,
+        .selectors = fixture.request.selectors,
+        .options = fixture.request.options,
+        .defer_recovery_clear = true,
+        .orchestration_id = bound.acknowledgment_id,
+        .expected_ownership_marker = bound,
+        .root_attempt_id = bound.attempt_id,
+    };
+    const original = try nativeRecoveryAcknowledgment(allocator, request, record.record, completion, fixture.request.owner);
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(
+        fixture.request.owner,
+        (try durableLowerAcknowledgment(null, original)).?,
+    ));
+    const claim = try root_operation.createRecoveryReviewClaim(.{
+        .outer_attempt_id = bound.acknowledgment_id,
+        .outer_generation = 2,
+        .outer_state_sha256 = @splat(3),
+        .profile_sha256 = @splat(4),
+        .profile_reference_sha256 = @splat(5),
+        .exact_lock_sha256 = fixture.request.exact_lock.digest_sha256,
+        .semantic_request_sha256 = @splat(6),
+        .mutation_status = .changed,
+        .outer_transaction_sha256 = @splat(7),
+        .nonce = @splat(8),
+    });
+    request.recovery_review_claim = claim;
+    const reviewed = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(fixture.request.owner, claim);
+    const acknowledgment = try nativeRecoveryAcknowledgment(allocator, request, record.record, completion, reviewed);
+    const retained = (try durableLowerAcknowledgment(null, acknowledgment)).?;
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(retained, reviewed));
+    try std.testing.expect(lowerAcknowledgmentMatches(retained, reviewed));
+    const acknowledged = try root_operation.transitionDeferredAcknowledgment(reviewed, .acknowledged);
+    try std.testing.expect(lowerAcknowledgmentMatches(retained, acknowledged));
+    request.expected_ownership_marker = reviewed;
+    request.recovery_review_claim = null;
+    const restarted = try nativeRecoveryAcknowledgment(allocator, request, record.record, completion, reviewed);
+    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(restarted.marker.?, reviewed));
+    var other_claim = claim;
+    other_claim.nonce[0] ^= 1;
+    other_claim = try root_operation.createRecoveryReviewClaim(other_claim);
+    const foreign = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(fixture.request.owner, other_claim);
+    try std.testing.expectEqualSlices(u8, &reviewed.digest_sha256, &foreign.digest_sha256);
+    try std.testing.expect(!lowerAcknowledgmentMatches(retained, foreign));
+    try std.testing.expectError(error.InvalidRecoveryAcknowledgment, nativeRecoveryAcknowledgment(
+        allocator,
+        request,
+        record.record,
+        completion,
+        foreign,
+    ));
+    var changed = acknowledgment;
+    changed.completion_sha256[0] ^= 1;
+    try std.testing.expectError(error.LowerAcknowledgmentMismatch, durableLowerAcknowledgment(null, changed));
+    changed = acknowledgment;
+    changed.marker.?.digest_sha256[0] ^= 1;
+    try std.testing.expectError(error.LowerAcknowledgmentMismatch, durableLowerAcknowledgment(null, changed));
+    request.expected_ownership_marker = null;
+    try std.testing.expectError(error.MissingRecoveryAcknowledgment, nativeRecoveryAcknowledgment(
+        allocator,
+        request,
+        record.record,
+        completion,
+        reviewed,
+    ));
+    var stale = fixture.request.owner;
+    stale.completion_sha256 = @splat(0xaa);
+    stale = try root_operation.createDeferredAcknowledgment(stale);
+    request.expected_ownership_marker = stale;
+    try std.testing.expectError(error.InvalidRecoveryAcknowledgment, nativeRecoveryAcknowledgment(
+        allocator,
+        request,
+        record.record,
+        completion,
+        fixture.request.owner,
+    ));
 }
 
 test "apt_system_orchestrator.test.transaction verification refuses native or cross-schema evidence before file access" {
@@ -14898,14 +15240,17 @@ fn reconstructPublishedRecoveryRecord(
         .updated_unix = document.updated_unix,
     });
     defer pending.deinit();
-    const provenance_sha256 = root_operation.provenanceDigest(
-        pending.record,
-        .{
-            .outcome = document.outcome,
-            .document_sha256 = document.digest_sha256,
-            .journal_archived = document.journal.status == .archived,
-        },
-    );
+    const provenance_sha256 = if (document.backend == .native)
+        document.digest_sha256
+    else
+        root_operation.provenanceDigest(
+            pending.record,
+            .{
+                .outcome = document.outcome,
+                .document_sha256 = document.digest_sha256,
+                .journal_archived = document.journal.status == .archived,
+            },
+        );
     return root_operation.create(allocator, .{
         .attempt_id = document.attempt_id,
         .generation = document.record_generation + 1,
