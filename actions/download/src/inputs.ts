@@ -28,6 +28,7 @@ export interface Limits {
 }
 
 export interface Inputs {
+  transactionBackend: 'legacy_dpkg' | 'native';
   runnerTemp: string;
   lockInput: string;
   architecture: string;
@@ -65,6 +66,13 @@ export async function readInputs(
   validateRunner(environment, runtime);
   const workspace = requiredEnvironmentPath(environment, 'GITHUB_WORKSPACE');
   const runnerTemp = requiredEnvironmentPath(environment, 'RUNNER_TEMP');
+  const transactionBackend =
+    optionalScalar(environment, 'TRANSACTION_BACKEND') ?? 'legacy_dpkg';
+  if (transactionBackend !== 'legacy_dpkg' && transactionBackend !== 'native') {
+    throw new DownloadActionError(
+      "transaction-backend must be 'legacy_dpkg' or 'native'",
+    );
+  }
   const lockInput = await resolveRegularFile(
     scalar(environment, 'LOCK_INPUT', true),
     workspace,
@@ -80,17 +88,17 @@ export async function readInputs(
     workspace,
     'config',
   );
-  if (sources.length === 0 && configs.length === 0) {
+  if (transactionBackend === 'legacy_dpkg' && sources.length === 0 && configs.length === 0) {
     throw new DownloadActionError(
       "one or more explicit 'source' or 'config' paths are required",
     );
   }
   const keyrings = await resolveFileList(
-    multiline(environment, 'KEYRING', true),
+    multiline(environment, 'KEYRING', transactionBackend === 'legacy_dpkg'),
     workspace,
     'keyring',
   );
-  if (keyrings.length === 0) {
+  if (transactionBackend === 'legacy_dpkg' && keyrings.length === 0) {
     throw new DownloadActionError("one or more explicit 'keyring' paths are required");
   }
 
@@ -239,6 +247,7 @@ export async function readInputs(
   }
 
   return {
+    transactionBackend,
     runnerTemp,
     lockInput,
     architecture,

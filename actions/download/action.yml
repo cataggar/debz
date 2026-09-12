@@ -7,8 +7,12 @@ branding:
   color: blue
 
 inputs:
+  transaction-backend:
+    description: Explicit package-cache backend (legacy_dpkg uses v1; native requires v2 CLI contracts)
+    required: false
+    default: legacy_dpkg
   lock-input:
-    description: Workspace-relative or absolute path to a canonical exact-lock v1 document
+    description: Workspace-relative or absolute path to a canonical exact lock matching the selected backend
     required: true
   architecture:
     description: Target Debian architecture (amd64 or arm64)
@@ -22,8 +26,9 @@ inputs:
     required: false
     default: ''
   keyring:
-    description: Newline-delimited explicit repository keyring files
-    required: true
+    description: Newline-delimited explicit repository keyring files; required for repository-backed locks
+    required: false
+    default: ''
   foreign-architecture:
     description: Newline-delimited allowed foreign Debian architectures
     required: false

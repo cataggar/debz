@@ -10,8 +10,46 @@ import { validateDebzVersion } from './inputs.js';
 
 const execFile = promisify(execFileCallback);
 const hex64 = /^[0-9a-f]{64}$/;
-const cacheKey = /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/;
-const restorePrefix = /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-$/;
+const contracts = {
+  legacy_dpkg: {
+    fingerprint: {
+      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v1',
+      api_version: 1,
+      capability: 'package-cache-v1',
+      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
+      lock_schema_version: 1,
+      archive_format: 'debz-package-cache-archive-v1',
+      origin_mode: 'exact-lock-v1-authenticated-repository',
+    },
+    prepare: {
+      schema: 'io.github.cataggar.debz.package-cache-result.v1',
+      api_version: 1,
+      capability: 'package-cache-v1',
+    },
+    cacheKey: /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
+    restorePrefix: /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
+  },
+  native: {
+    fingerprint: {
+      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v2',
+      api_version: 2,
+      capability: 'package-cache-v2',
+      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v2',
+      lock_schema_version: 2,
+      archive_format: 'debz-package-cache-archive-v2',
+      origin_mode: 'exact-lock-v2-verified-origins',
+    },
+    prepare: {
+      schema: 'io.github.cataggar.debz.package-cache-result.v2',
+      api_version: 2,
+      capability: 'package-cache-v2',
+    },
+    cacheKey: /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
+    restorePrefix: /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
+  },
+} as const;
+
+type CacheContract = (typeof contracts)[Inputs['transactionBackend']];
 
 export interface CommandRunner {
   run(executable: string, arguments_: string[], timeoutMs: number): Promise<string>;
@@ -58,20 +96,13 @@ export const systemRunner: CommandRunner = {
   },
 };
 
-export interface FingerprintDocument {
-  schema: 'io.github.cataggar.debz.package-cache-fingerprint.v1';
-  api_version: 1;
-  capability: 'package-cache-v1';
-  lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1';
-  lock_schema_version: 1;
+export type FingerprintDocument = CacheContract['fingerprint'] & {
   lock_digest: string;
   target_architecture: string;
   abi: 'debian-package-archive-v1';
   debz_version: string;
   cas_layout: 'packages-v1';
-  archive_format: 'debz-package-cache-archive-v1';
   payload_policy: 'deb-payload-default-limits-v1';
-  origin_mode: 'exact-lock-v1-authenticated-repository';
   acceptance_policy_digest: string;
   fingerprint: string;
   primary_key: string;
@@ -79,12 +110,9 @@ export interface FingerprintDocument {
   cache_root: string;
   cache_path: string;
   maximum_archive_bytes: number;
-}
+};
 
-export interface PrepareDocument {
-  schema: 'io.github.cataggar.debz.package-cache-result.v1';
-  api_version: 1;
-  capability: 'package-cache-v1';
+export type PrepareDocument = CacheContract['prepare'] & {
   lock_digest: string;
   fingerprint: string;
   target_architecture: string;
@@ -96,7 +124,7 @@ export interface PrepareDocument {
   verified_count: number;
   staging: CleanupDocument;
   gc: CleanupDocument & { bytes_deleted: number };
-}
+};
 
 export interface RestoredCacheState {
   cacheHit: boolean;
@@ -133,7 +161,7 @@ export async function readDebzVersion(
     output = await runner.run(executable, ['version'], 30_000);
   } catch (error) {
     throw new DownloadActionError(
-      'installed debz does not provide the required package-cache-v1 version contract',
+      'installed debz does not provide the required package-cache version contract',
       { cause: error },
     );
   }
@@ -163,7 +191,7 @@ export async function fingerprintCache(
   } catch (error) {
     if (error instanceof CliDiagnosticError) throw error;
     throw new DownloadActionError(
-      'installed debz does not provide the required package-cache-v1 fingerprint contract',
+      `installed debz does not provide the required ${contracts[inputs.transactionBackend].fingerprint.capability} fingerprint contract`,
       { cause: error },
     );
   }
@@ -180,6 +208,10 @@ export async function prepareCache(
   archives: CacheArchivePaths,
   runner: CommandRunner = systemRunner,
 ): Promise<PrepareDocument> {
+  if (version !== expected.debz_version) {
+    throw new DownloadActionError('debz executable changed between action phases');
+  }
+  validateFingerprint(expected, inputs, version);
   const arguments_ = [
     'package-cache',
     'prepare',
@@ -232,9 +264,6 @@ export async function prepareCache(
     inputs,
     expected,
   );
-  if (version !== expected.debz_version) {
-    throw new DownloadActionError('debz executable changed between action phases');
-  }
   return document;
 }
 
@@ -310,6 +339,9 @@ export function fingerprintArguments(inputs: Inputs): string[] {
     '--maximum-lock-packages',
     String(inputs.limits.maximumLockPackages),
   ];
+  if (inputs.transactionBackend === 'native') {
+    arguments_.push('--transaction-backend', 'native');
+  }
   for (const value of inputs.foreignArchitectures) {
     arguments_.push('--foreign-architecture', value);
   }
@@ -324,6 +356,7 @@ export function validateFingerprint(
   inputs: Inputs,
   version: string,
 ): FingerprintDocument {
+  const contract = contracts[inputs.transactionBackend];
   const document = record(value, 'fingerprint');
   exactKeys(document, [
     'schema',
@@ -347,25 +380,20 @@ export function validateFingerprint(
     'cache_path',
     'maximum_archive_bytes',
   ]);
-  literal(document.schema, 'io.github.cataggar.debz.package-cache-fingerprint.v1', 'schema');
-  literal(document.api_version, 1, 'api_version');
-  literal(document.capability, 'package-cache-v1', 'capability');
-  literal(document.lock_schema, 'https://debz.dev/schema/exact-closure-lock-v1', 'lock_schema');
-  literal(document.lock_schema_version, 1, 'lock_schema_version');
+  for (const [name, expected] of Object.entries(contract.fingerprint)) {
+    literal(document[name], expected, name);
+  }
   literal(document.target_architecture, inputs.architecture, 'target_architecture');
   literal(document.abi, 'debian-package-archive-v1', 'abi');
   literal(document.debz_version, version, 'debz_version');
   literal(document.cas_layout, 'packages-v1', 'cas_layout');
-  literal(document.archive_format, 'debz-package-cache-archive-v1', 'archive_format');
   literal(document.payload_policy, 'deb-payload-default-limits-v1', 'payload_policy');
-  literal(document.origin_mode, 'exact-lock-v1-authenticated-repository', 'origin_mode');
   literal(document.cache_root, inputs.cacheRoot, 'cache_root');
   literal(document.cache_path, inputs.cachePath, 'cache_path');
-  count(document.maximum_archive_bytes, 'maximum_archive_bytes');
+  const maximumArchiveBytes = count(document.maximum_archive_bytes, 'maximum_archive_bytes');
   if (
-    (document.maximum_archive_bytes as number) <=
-      inputs.limits.maximumTotalPackageBytes ||
-    (document.maximum_archive_bytes as number) > 10 * 1024 ** 3
+    maximumArchiveBytes <= inputs.limits.maximumTotalPackageBytes ||
+    maximumArchiveBytes > 10 * 1024 ** 3
   ) {
     throw new DownloadActionError(
       "debz JSON field 'maximum_archive_bytes' is outside the cache-service bound",
@@ -374,12 +402,27 @@ export function validateFingerprint(
   stringPattern(document.lock_digest, hex64, 'lock_digest');
   stringPattern(document.acceptance_policy_digest, hex64, 'acceptance_policy_digest');
   stringPattern(document.fingerprint, hex64, 'fingerprint');
-  stringPattern(document.primary_key, cacheKey, 'primary_key');
-  stringPattern(document.restore_prefix, restorePrefix, 'restore_prefix');
+  stringPattern(document.primary_key, contract.cacheKey, 'primary_key');
+  stringPattern(document.restore_prefix, contract.restorePrefix, 'restore_prefix');
   if (!document.primary_key.startsWith(document.restore_prefix)) {
     throw new DownloadActionError('debz primary key is outside its restore prefix');
   }
-  return document as unknown as FingerprintDocument;
+  return {
+    ...contract.fingerprint,
+    lock_digest: document.lock_digest,
+    target_architecture: document.target_architecture,
+    abi: document.abi,
+    debz_version: document.debz_version,
+    cas_layout: document.cas_layout,
+    payload_policy: document.payload_policy,
+    acceptance_policy_digest: document.acceptance_policy_digest,
+    fingerprint: document.fingerprint,
+    primary_key: document.primary_key,
+    restore_prefix: document.restore_prefix,
+    cache_root: document.cache_root,
+    cache_path: document.cache_path,
+    maximum_archive_bytes: maximumArchiveBytes,
+  };
 }
 
 export function validatePrepare(
@@ -387,6 +430,8 @@ export function validatePrepare(
   inputs: Inputs,
   expected: FingerprintDocument,
 ): PrepareDocument {
+  validateFingerprint(expected, inputs, expected.debz_version);
+  const contract = contracts[inputs.transactionBackend];
   const document = record(value, 'prepare result');
   exactKeys(document, [
     'schema',
@@ -404,9 +449,9 @@ export function validatePrepare(
     'staging',
     'gc',
   ]);
-  literal(document.schema, 'io.github.cataggar.debz.package-cache-result.v1', 'schema');
-  literal(document.api_version, 1, 'api_version');
-  literal(document.capability, 'package-cache-v1', 'capability');
+  for (const [name, value] of Object.entries(contract.prepare)) {
+    literal(document[name], value, name);
+  }
   literal(document.lock_digest, expected.lock_digest, 'lock_digest');
   literal(document.fingerprint, expected.fingerprint, 'fingerprint');
   literal(document.target_architecture, inputs.architecture, 'target_architecture');
@@ -416,12 +461,29 @@ export function validatePrepare(
   const downloaded = count(document.downloaded_count, 'downloaded_count');
   const reused = count(document.reused_count, 'reused_count');
   const verified = count(document.verified_count, 'verified_count');
-  if (verified !== downloaded + reused || verified === 0) {
+  if (
+    verified !== downloaded + reused ||
+    (inputs.transactionBackend === 'legacy_dpkg' && verified === 0) ||
+    verified > inputs.limits.maximumLockPackages
+  ) {
     throw new DownloadActionError('debz prepare result contains inconsistent counts');
   }
-  validateCleanup(document.staging, 'staging', false);
-  validateCleanup(document.gc, 'gc', true);
-  return document as unknown as PrepareDocument;
+  const staging = validateCleanup(document.staging, 'staging', false);
+  const gc = validateCleanup(document.gc, 'gc', true);
+  return {
+    ...contract.prepare,
+    lock_digest: document.lock_digest,
+    fingerprint: document.fingerprint,
+    target_architecture: document.target_architecture,
+    cas_layout: document.cas_layout,
+    cache_root: document.cache_root,
+    cache_path: document.cache_path,
+    downloaded_count: downloaded,
+    reused_count: reused,
+    verified_count: verified,
+    staging,
+    gc,
+  };
 }
 
 export function restoredCacheState(
@@ -429,6 +491,8 @@ export function restoredCacheState(
   inputs: Inputs,
   fingerprint: FingerprintDocument,
 ): RestoredCacheState {
+  validateFingerprint(fingerprint, inputs, fingerprint.debz_version);
+  const contract = contracts[inputs.transactionBackend];
   if (!inputs.cacheEnabled) {
     return { cacheHit: false, matchedKey: '', kind: 'none' };
   }
@@ -438,7 +502,7 @@ export function restoredCacheState(
   }
   if (
     matchedKey.length !== 0 &&
-    (!cacheKey.test(matchedKey) ||
+    (!contract.cacheKey.test(matchedKey) ||
       (matchedKey !== fingerprint.primary_key &&
         !matchedKey.startsWith(fingerprint.restore_prefix)))
   ) {
@@ -539,7 +603,13 @@ function count(value: unknown, name: string): number {
   return value as number;
 }
 
-function validateCleanup(value: unknown, name: string, includesBytes: boolean): void {
+function validateCleanup(value: unknown, name: string, includesBytes: true): CleanupDocument & { bytes_deleted: number };
+function validateCleanup(value: unknown, name: string, includesBytes: false): CleanupDocument;
+function validateCleanup(
+  value: unknown,
+  name: string,
+  includesBytes: boolean,
+): CleanupDocument | (CleanupDocument & { bytes_deleted: number }) {
   const document = record(value, name);
   exactKeys(
     document,
@@ -547,8 +617,11 @@ function validateCleanup(value: unknown, name: string, includesBytes: boolean): 
       ? ['scanned', 'deleted', 'bytes_deleted', 'complete']
       : ['scanned', 'deleted', 'complete'],
   );
-  count(document.scanned, `${name}.scanned`);
-  count(document.deleted, `${name}.deleted`);
-  if (includesBytes) count(document.bytes_deleted, `${name}.bytes_deleted`);
+  const scanned = count(document.scanned, `${name}.scanned`);
+  const deleted = count(document.deleted, `${name}.deleted`);
   literal(document.complete, true, `${name}.complete`);
+  const cleanup = { scanned, deleted, complete: document.complete };
+  return includesBytes
+    ? { ...cleanup, bytes_deleted: count(document.bytes_deleted, `${name}.bytes_deleted`) }
+    : cleanup;
 }

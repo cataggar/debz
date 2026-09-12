@@ -119,6 +119,7 @@ export class BundledActionRunner {
       GITHUB_STATE: files.state,
       PATH: path.dirname(debzPath),
       DEBZ_DOWNLOAD_EXECUTABLE: debzPath,
+      DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg',
       DEBZ_DOWNLOAD_LOCK_INPUT: this.inputs.lockInput,
       DEBZ_DOWNLOAD_ARCHITECTURE: this.inputs.architecture,
       DEBZ_DOWNLOAD_SOURCE: this.inputs.sources.join('\n'),
