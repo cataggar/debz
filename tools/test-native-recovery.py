@@ -1094,6 +1094,7 @@ def workflow(
     executable: Path, request: dict, destination: Path, environment: dict,
     *, completion_crash: str | None = None, owner_evidence: Path | None = None,
     acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
+    pending_verification: dict | None = None,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1105,6 +1106,7 @@ def workflow(
         "owner_evidence": str(owner_evidence) if owner_evidence else None,
         "reconciliation_owner_output": str(reconciliation_owner_output) if reconciliation_owner_output else None,
         "acknowledgment": acknowledgment,
+        "pending_verification": pending_verification,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
         result = subprocess.run(
@@ -1389,6 +1391,32 @@ def exercise_workflows(
         m.write(path, m.oracle._read_bounded(current.candidate / owner_path, 1024 * 1024))
         return path
 
+    def verify_pending(current, label, owner, *, expected_error=None, change=None):
+        before = triggers.snapshot(current.candidate)
+        before_evidence = sorted(
+            (str(path.relative_to(current.candidate)), stat.st_mode, stat.st_size, stat.st_mtime_ns)
+            for path in (current.candidate / NAMESPACE).rglob("*")
+            for stat in [path.lstat()]
+        )
+        verification = owned_request(current, "install", "recover", names)
+        if change:
+            verification.update(change)
+        result = workflow(
+            executable, verification, current.directory / label, environment, owner_evidence=owner,
+            pending_verification={
+                "lock_path": str(current.directory / "workflow.lock.json"),
+                "expected_error": expected_error,
+            },
+        )
+        assert result == {"verified": expected_error is None}
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        after_evidence = sorted(
+            (str(path.relative_to(current.candidate)), stat.st_mode, stat.st_size, stat.st_mtime_ns)
+            for path in (current.candidate / NAMESPACE).rglob("*")
+            for stat in [path.lstat()]
+        )
+        assert before_evidence == after_evidence, "pending verification changed durable evidence"
+
     current = scenario("workflow-owned-success")
     run(current, "plan", request(current, "install", "plan_only", names))
     lock = document(current.directory / "workflow.lock.json")
@@ -1497,6 +1525,7 @@ def exercise_workflows(
             recovery_owner = retain_owner(current, "pending-prepublication")
             assert document(recovery_owner)["state"] == "pending"
             assert document(current.candidate / OPERATION)["provenance"] == "pending"
+            verify_pending(current, "verify-unpublished", recovery_owner, expected_error="InvalidCompletion")
         run(current, "recover", recovery, owner_evidence=recovery_owner)
         pending = retain_owner(current, "pending")
         assert document(pending)["state"] == "pending"
@@ -1504,15 +1533,63 @@ def exercise_workflows(
         run(current, "recover-again", recovery, owner_evidence=pending)
         assert (current.candidate / OPERATION).read_bytes() == published
         assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        verify_pending(current, "verify-pending", pending)
+        if result_cli is not None:
+            verify_result(current, lock, False)
         run(current, "foreign-acknowledgment", {**recovery, "orchestration_id": [18] * 32},
             owner_evidence=pending, acknowledgment="recovery", exit_status=2)
         assert (current.candidate / OPERATION).read_bytes() == published
         if execution_boundary == "after_native_receipt":
+            verify_pending(current, "verify-bound-owner", bound, expected_error="PendingOwnerRequired")
+            verify_pending(current, "verify-wrong-operation", pending,
+                           expected_error="InvalidCompletion", change={"operation": "remove"})
+            verify_pending(current, "verify-wrong-request", pending,
+                           expected_error="InvalidCompletion",
+                           change={"selectors": [{"name": "different"}]})
+            verify_pending(current, "verify-wrong-policy", pending,
+                           expected_error="InvalidCompletion",
+                           change={"options": {**recovery["options"], "recommends": True}})
+            for name, relative, failure in (
+                ("intent", INTENT, "EvidenceChanged"),
+                ("progress", PROGRESS, "EvidenceChanged"),
+                ("authorization", NAMESPACE / "native-transaction-authorization-v1.json", "EvidenceChanged"),
+                ("program", NAMESPACE / "native-transaction-program-v1.json", "EvidenceChanged"),
+                ("triggers", NAMESPACE / "native-trigger-events-v1.json", "EvidenceChanged"),
+                ("managed", NAMESPACE / "native-managed-state-v1.json", "EvidenceChanged"),
+            ):
+                active = current.candidate / relative
+                original_active = active.read_bytes()
+                m.write(active, b"{}\n")
+                verify_pending(current, f"verify-damaged-{name}", pending, expected_error=failure)
+                m.write(active, original_active)
+            active_progress = current.candidate / PROGRESS
+            original_progress = active_progress.read_bytes()
+            active_progress.unlink()
+            verify_pending(current, "verify-partial-acknowledgment", pending)
+            m.write(active_progress, original_progress)
+            completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+            original_completion = completion_path.read_bytes()
+            m.write(completion_path, b"{}\n")
+            verify_pending(current, "verify-damaged-completion", pending, expected_error="NonCanonicalDocument")
+            m.write(completion_path, original_completion)
+            for name, relative in (
+                ("script", "native-lifecycle-script-v1.json"),
+                ("trigger-authority", "native-trigger-authority-v1.json"),
+                ("foreign-outcome", "native-script-outcome-v1-foreign.json"),
+                ("staging", ".debz-native-foreign"),
+            ):
+                active = current.candidate / NAMESPACE / relative
+                assert not active.exists()
+                m.write(active, b"{}\n")
+                verify_pending(current, f"verify-unresolved-{name}", pending,
+                               expected_error="UnresolvedNativeEvidence")
+                active.unlink()
             run(current, "wrong-operation-acknowledgment", {**recovery, "operation": "remove"},
                 owner_evidence=pending, acknowledgment="recovery", exit_status=8)
             receipt_path = current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"
             original_receipt = receipt_path.read_bytes()
             m.write(receipt_path, b"{}\n")
+            verify_pending(current, "verify-damaged-receipt", pending, expected_error="MissingField")
             run(current, "damaged-receipt", recovery, owner_evidence=pending,
                 acknowledgment="recovery", exit_status=8)
             assert (current.candidate / OPERATION).read_bytes() == published
@@ -1522,6 +1599,10 @@ def exercise_workflows(
         workflow(executable, recovery, current.directory / "acknowledgment-crash", environment,
                  completion_crash=acknowledgment_boundary, owner_evidence=pending,
                  acknowledgment="recovery")
+        if acknowledgment_boundary == "after_native_acknowledged":
+            verify_pending(current, "verify-native-acknowledged", pending)
+            if result_cli is not None:
+                verify_result(current, lock, False)
         run(current, "acknowledge", recovery, owner_evidence=pending, acknowledgment="recovery")
         run(current, "acknowledge-again", recovery, owner_evidence=pending, acknowledgment="recovery")
         assert_completion(current, lock)
@@ -1544,6 +1625,8 @@ def exercise_workflows(
     assert document(current.candidate / OPERATION)["provenance"] == "pending"
     recovery = {**owned_request(current, "install", "recover", failed_names), "defer_recovery_clear": True}
     run(current, "recover", recovery, owner_evidence=pending, exit_status=7)
+    verify_pending(current, "verify-known-failure", pending, expected_error="TransactionNotSuccessful",
+                   change={"selectors": recovery["selectors"]})
     run(current, "acknowledge", recovery, owner_evidence=pending, acknowledgment="recovery")
     assert_completion(current, lock)
     assert not (current.candidate / owner_path).exists()

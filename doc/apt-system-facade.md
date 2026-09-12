@@ -299,6 +299,18 @@ native planning/execution. Native receipt/completion publication and
 verification, recovery, and live-root authority must still be integrated before
 native profiles can pass the facade boundary.
 
+The native result module also exposes a separate read-only pending-success
+verifier for future caller integration. It requires independently retained exact
+owner and caller request/policy authority, a published completion bound to the
+original root record, and the same lock, retained receipt, helper, and current
+database evidence as settled verification. Surviving active execution records
+must agree with the receipt; interrupted acknowledgment may already have removed
+some active copies. Verification never creates/adopts an attempt, acknowledges an
+owner, or runs recovery. Its owned receipt/completion result does not claim that
+the root is cleared. The public settled verifier still rejects pending ownership,
+and neither verifier accepts the physical host root. Failed completions and
+unpublished or stale ownership are not successful pending results.
+
 Every route and workflow invocation binds a backend descriptor by value to the
 reviewed profile selection, including reservation, recovery, reconciliation,
 and acknowledgment. The descriptor crosses the private live-root runner with

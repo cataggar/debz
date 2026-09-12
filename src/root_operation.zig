@@ -1041,7 +1041,10 @@ pub fn decodeDeferredAcknowledgment(
         allocator,
         source,
         .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
-    ) catch return error.NonCanonicalDocument;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NonCanonicalDocument,
+    };
     defer parsed.deinit();
     const wire = parsed.value;
     const document_version: u32 =
@@ -1113,7 +1116,10 @@ pub fn decodeRecoveryReviewClaim(
         allocator,
         source,
         .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
-    ) catch return error.NonCanonicalDocument;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NonCanonicalDocument,
+    };
     defer parsed.deinit();
     const wire = parsed.value;
     const document_version: u32 =
