@@ -119,7 +119,7 @@ export class BundledActionRunner {
       GITHUB_STATE: files.state,
       PATH: path.dirname(debzPath),
       DEBZ_DOWNLOAD_EXECUTABLE: debzPath,
-      DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg',
+      DEBZ_DOWNLOAD_TRANSACTION_BACKEND: this.inputs.transactionBackend,
       DEBZ_DOWNLOAD_LOCK_INPUT: this.inputs.lockInput,
       DEBZ_DOWNLOAD_ARCHITECTURE: this.inputs.architecture,
       DEBZ_DOWNLOAD_SOURCE: this.inputs.sources.join('\n'),
@@ -480,7 +480,7 @@ function validateSetupOutputs(
   return { debzPath, debzVersion, target, cacheHit };
 }
 
-function validateDownloadOutputs(
+export function validateDownloadOutputs(
   outputs: Map<string, string>,
   inputs: Inputs,
 ): DownloadOutputs {
@@ -503,9 +503,10 @@ function validateDownloadOutputs(
   if (
     matchedKey.includes('\n') ||
     (matchedKey.length !== 0 &&
-      !/^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u.test(
-        matchedKey,
-      )) ||
+      !(inputs.transactionBackend === 'native'
+        ? /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
+        : /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
+      ).test(matchedKey)) ||
     (cacheHit && matchedKey.length === 0) ||
     (!cacheHit && matchedKey.length > 512)
   ) {

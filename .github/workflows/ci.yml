@@ -203,6 +203,8 @@ jobs:
           node-version: 24.20.0
       - name: Build CLI and action test runtime
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
           zig build -Doptimize=ReleaseSafe
           npm --prefix actions/install ci
           npm --prefix actions/install run build

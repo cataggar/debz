@@ -3,11 +3,12 @@ import { access, mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
-import { testRoot } from './helpers.js';
+import { testRoot, fixtureInputs } from './helpers.js';
 import {
   childEnvironment,
   parseCommandFile,
   runDebz,
+  validateDownloadOutputs,
 } from '../src/subprocess.js';
 
 test('parses one-line file-command outputs and rejects output injection', () => {
@@ -34,6 +35,21 @@ test('parses one-line file-command outputs and rejects output injection', () => 
       ),
     /duplicate/u,
   );
+});
+
+test('nested download handoff accepts only the explicitly selected cache key domain', () => {
+  const inputs = fixtureInputs('/work');
+  const outputs = new Map([
+    ['cache-hit', 'true'],
+    ['cache-matched-key', `debz-package-cas-v2-linux-x64-${'a'.repeat(64)}-${'b'.repeat(64)}`],
+    ['cache-path', inputs.cachePath], ['cache-root', inputs.cacheRoot],
+    ['lock-digest', 'a'.repeat(64)], ['downloaded-count', '0'], ['reused-count', '4'],
+  ]);
+  assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
+  inputs.transactionBackend = 'native';
+  assert.equal(validateDownloadOutputs(outputs, inputs).reusedCount, 4);
+  outputs.set('cache-matched-key', outputs.get('cache-matched-key')!.replace('-v2-', '-v1-'));
+  assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
 });
 
 test('isolates nested actions from install inputs and Node injection', () => {

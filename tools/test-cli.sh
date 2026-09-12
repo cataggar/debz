@@ -217,8 +217,27 @@ assert value["lock_schema_version"] == 2
 assert value["read_only"] is True
 PY
 
+"$debz" transaction-result capabilities --transaction-backend native --for-install --json >cli-test-stdout
+python3 - cli-test-stdout <<'PY'
+import json
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_bytes()
+value = json.loads(source)
+assert source == (json.dumps(value, separators=(",", ":")) + "\n").encode()
+assert value["schema"] == "io.github.cataggar.debz.native-install-capability.v1"
+assert value["capability"] == "native-install-v1"
+assert value["result_schema"] == "io.github.cataggar.debz.native-install-result.v1"
+assert value["receipt_binding"] is True
+assert value["unchanged_without_receipt"] is True
+PY
+
 for arguments in \
     "transaction-result capabilities --json" \
+    "transaction-result capabilities --for-install --json" \
+    "transaction-result capabilities --transaction-backend native --for-install --for-install --json" \
+    "transaction-result verify --transaction-backend native --for-install --json" \
     "transaction-result capabilities --transaction-backend native --install-root /unused --json" \
     "transaction-result verify --transaction-backend other --json" \
     "transaction-result verify --transaction-backend native --transaction-backend native --json" \
@@ -233,6 +252,21 @@ do
     set -e
     test "$status_code" -eq 2
     test ! -s cli-test-stdout
+done
+
+for arguments in \
+    "install --json --native-result" \
+    "install --json --transaction-backend native --native-result" \
+    "install --json --transaction-backend native --native-result --native-result --lock-input /missing" \
+    "plan --json --transaction-backend native --native-result --lock-input /missing" \
+    "install --json --transaction-backend legacy_dpkg --native-result --lock-input /missing"
+do
+    set +e
+    "$debz" $arguments >cli-test-stdout 2>cli-test-stderr
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    grep -q '"id":"invalid_request"' cli-test-stdout
 done
 
 for arguments in \

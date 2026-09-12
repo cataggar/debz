@@ -68,7 +68,9 @@ for schema in \
   transaction-result-v1.json \
   transaction-result-v2.json \
   transaction-result-summary-v2.json \
-  transaction-result-capability-v1.json
+  transaction-result-capability-v1.json \
+  native-install-capability-v1.json \
+  native-install-result-v1.json
 do
   test -f "$release_prefix/share/debz/schema/$schema"
   test -f "$release_prefix/share/doc/debz/schema/$schema"

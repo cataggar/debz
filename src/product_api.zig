@@ -133,6 +133,18 @@ pub const Item = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const NativeInstallEvidence = struct {
+    lock_sha256: [32]u8,
+    caller_request_sha256: [32]u8,
+    caller_policy_sha256: [32]u8,
+    package_count: usize,
+    receipt: ?struct {
+        transaction_digest_sha256: [32]u8,
+        completion_digest_sha256: [32]u8,
+        program_sha256: [32]u8,
+    } = null,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -142,6 +154,8 @@ pub const Result = struct {
     items: []const Item = &.{},
     diagnostics: [1]Diagnostic = undefined,
     diagnostic_count: usize = 0,
+    // Explicit native install output carries this evidence; command.v1 does not.
+    native_install: ?NativeInstallEvidence = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);

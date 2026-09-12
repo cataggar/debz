@@ -7,9 +7,13 @@ then **always** executes a normal alternate-root installation with
 `--cache-only`.
 
 A package cache hit saves transfer only. It never means that a root is
-installed and never skips planning, archive revalidation, dpkg
-unpack/configure, maintainer scripts, triggers, transaction journaling, or the
-final exact-state audit.
+installed and never skips the install request or any work required by the
+selected engine. Legacy remains the default. Explicit `transaction-backend:
+native` uses native execution and genuine v2 locks, without fallback.
+When the native planner produces no work, the action accepts an honest unchanged
+result rather than inventing a transaction. An explicit install selector may
+still select a reinstall on an already-installed root; the action preserves
+that engine behavior rather than skipping it.
 
 ## Usage
 
@@ -59,7 +63,7 @@ version. Version 0.3.0 is the minimum supported contract.
 | --- | --- |
 | `debz-version` | Exact SemVer release, with or without `v`; no ranges or `latest`. |
 | `package` | One selector in the current `name[:architecture][=version]` grammar. It is one argv element, never split or interpreted by a shell. |
-| `lock-input` | Reviewed canonical exact-closure lock v1. The action never creates or replaces it. |
+| `lock-input` | Reviewed canonical exact-closure lock: v1 for `legacy_dpkg`, v2 for `native`. The action never creates or replaces it. |
 | `architecture` | Native `amd64` on Linux X64 or native `arm64` on Linux ARM64. |
 | `install-root` | Explicit alternate root. `/`, ambiguous spellings, symbolic-link components, and overlap with cache/state/input files are rejected. |
 | `assume-yes` | Must be exactly `'true'`; this is the mutation authorization. |
@@ -74,6 +78,17 @@ traverse symbolic links. `install-root` may be created by the action. The
 package cache remains an absolute child of `RUNNER_TEMP`.
 
 ## Policy, cache, and setup inputs
+
+`transaction-backend` is `legacy_dpkg` by default or explicitly `native`.
+Native selection is forwarded to both download and install, and accepts only
+v2 cache keys and lock evidence. Before package preparation or mutation, the
+verified CLI must advertise `native-install-v1` through
+`transaction-result capabilities --transaction-backend native --for-install
+--json`. A compatible version number alone is insufficient.
+
+Native installation also requires the engine's supported alternate-root and
+package-owned helper-target prerequisites. This action does not create helper
+placeholders, bootstrap an unsupported root, or fall back to legacy execution.
 
 The repository and solver inputs are passed unchanged to package preparation
 and final installation:
@@ -126,6 +141,8 @@ again.
 Install root, transaction state, and package cache must be pairwise
 non-overlapping. Existing recovery state is preserved and is never
 automatically deleted or recovered.
+For native, this remains an explicit CLI state input, but transaction receipts,
+completion records, and recovery evidence live in `INSTALL_ROOT/var/lib/debz`.
 
 `use-sudo` defaults to `'false'`:
 
@@ -142,10 +159,13 @@ authentication `4`, planning `5`, package/cache `6`, transaction `7`, recovery
 does not publish transaction-shaped outputs. Recovery is an explicit later
 `debz recover` operation using the same exact CLI, root, state, lock,
 repository, architecture, and policy inputs.
+Native recovery instead selects `--transaction-backend native` and the original
+root, using the persisted native request and program; replacement lock,
+repository, and force inputs are not accepted.
 
 ## Verification and outputs
 
-After `debz install` exits successfully, the same executable reopens
+For legacy, after `debz install` exits successfully, the same executable reopens
 `STATE/transaction-result.json` without following symbolic links. It validates
 the canonical transaction-result v1 digest and checks:
 
@@ -162,6 +182,25 @@ command-result JSON, empty success diagnostics/stderr, unchanged input file
 identities, and unchanged root/cache/state directory identities. Only then are
 outputs written.
 
+Native installs request the separate `--native-result --json` contract; ordinary
+CLI `--json` remains command.v1. A changed install returns typed receipt,
+completion, program, caller, lock, and closure identities. The action invokes
+the read-only native verifier through the same verified CLI and privilege
+boundary, then matches its v2 summary to this invocation's exact identities.
+It does not parse human summary text or try to read private root-owned evidence
+with unprivileged Node. An older or concurrently replaced receipt cannot
+satisfy this binding.
+
+For `changed: false`, native preparation has already verified the unchanged
+package-database closure under the root lock. No native execution occurred.
+The action reports the verified closure count but emits empty
+`transaction-result` and `provenance` paths, even if an older receipt exists.
+This result variant also accepts a verified unchanged root with no native receipt.
+It does not
+claim a fresh execution receipt or a new audit of every installed payload file.
+Both native outcomes still require matching preparation counts, empty success
+diagnostics/stderr, and all protected input/executable/directory identity guards.
+
 | Output | Meaning |
 | --- | --- |
 | `debz-path`, `debz-version`, `target` | Exact verified setup identity. |
@@ -171,9 +210,10 @@ outputs written.
 | `package-cache-root` | Parent passed unchanged to final `--cache-path`. |
 | `lock-digest` | Canonical exact-lock digest verified by download and transaction-result validation. |
 | `downloaded-count`, `reused-count` | Package preparation counts, not installed-state claims. |
-| `transaction-result` | Absolute canonical `STATE/transaction-result.json` path. |
-| `provenance` | Alias of `transaction-result`; v1 is one combined result/provenance document. |
+| `transaction-result` | Legacy `STATE/transaction-result.json` or native `INSTALL_ROOT/var/lib/debz/native-transaction-provenance-v1.json`; empty for unchanged native installs. Native evidence may require privilege to read. |
+| `provenance` | Alias of `transaction-result`; unchanged native installs claim no receipt. |
 | `installed-count` | Package count in the final exact closure, not the number newly changed. |
+| `changed` | The CLI's changed flag; false for a verified unchanged native closure. |
 
 No output contains credentials, authorization headers, keyring contents, or
 repository URLs.

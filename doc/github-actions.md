@@ -24,9 +24,13 @@ setup or cache activity, hands the exact setup executable directly to the
 download runtime, and always invokes one normal `debz install --cache-only`
 transaction with the same lock, repository/keyring inputs, architecture,
 solver policy, cache root, and explicit alternate root.
-The install action still explicitly selects the legacy backend, including
-its private download handoff. Native download support alone does not enable
-native installation.
+The install action defaults to legacy. Explicit `transaction-backend: native`
+selects v2 download contracts and receipt-bound native installation, with a
+dedicated CLI capability probe before preparation or mutation. Changed installs
+must match the completing caller's typed receipt/completion identities to a
+read-only native verification summary. Verified unchanged native closures emit
+`changed: false` and no transaction/provenance path; an old receipt is not
+presented as a new execution.
 
 An exact or partial cache hit supplies only untrusted candidate bytes. Every
 current-lock object is reopened and checked for regular-file shape, declared
@@ -46,7 +50,7 @@ absolute runner paths.
 The setup and download actions do not install packages. In particular, a
 download `cache-hit: 'true'` does not represent an installed root. The install
 action treats it only as a transfer optimization and still performs normal
-lock, repository, payload, dpkg, journal, and post-state checks. Repository
+lock, repository, payload, selected-engine, journal, and post-state checks. Repository
 metadata, credentials, keyrings, roots, dpkg state, and journals are never
 included in the package object cache.
 
@@ -62,5 +66,5 @@ The action README is the normative reference for:
 
 The install action additionally documents alternate-root confinement,
 explicit `sudo -n`, conffile/force policy, recovery-state preservation,
-fail-closed offline behavior, and validation of the combined canonical
-transaction-result/provenance document before success outputs are published.
+fail-closed offline behavior, legacy canonical transaction-result validation,
+and native receipt versus unchanged-closure evidence before success outputs.

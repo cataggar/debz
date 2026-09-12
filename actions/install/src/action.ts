@@ -25,10 +25,13 @@ import {
 } from './inputs.js';
 import {
   buildInstallArguments,
+  buildNativeCapabilityArguments,
   buildTransactionResultArguments,
   failureDiagnostic,
   transactionResultPath,
   validateInstallCommandResult,
+  validateNativeCapability,
+  validateNativeInstallResult,
   validateTransactionSummary,
   validateVersionOutput,
 } from './runner.js';
@@ -124,6 +127,7 @@ export async function runAction(
         download: DownloadOutputs;
         resultPath: string;
         installedCount: number;
+        changed: boolean;
       }
     | undefined;
   try {
@@ -171,6 +175,16 @@ export async function runAction(
       executable,
       services,
     );
+    if (inputs.transactionBackend === 'native') {
+      const capability = await services.runDebz(
+        executable.path, buildNativeCapabilityArguments(), sudoPath, 64 * 1024,
+      );
+      if (capability.code !== 0 || capability.stderr.length !== 0) {
+        throw new InstallActionError('the verified CLI does not support the native install-action contract');
+      }
+      validateNativeCapability(capability.stdout);
+      await verifyIdentities(protectedFiles, mutableDirectories, executable, services);
+    }
     const download = await composition.download(executable.path);
     await verifyIdentities(
       protectedFiles,
@@ -179,8 +193,10 @@ export async function runAction(
       services,
     );
 
-    const resultPath = transactionResultPath(inputs);
-    const priorResult = await services.captureOptionalFile(resultPath);
+    let resultPath = transactionResultPath(inputs);
+    const priorResult = inputs.transactionBackend === 'legacy_dpkg'
+      ? await services.captureOptionalFile(resultPath)
+      : undefined;
     const execution = await services.runDebz(
       executable.path,
       buildInstallArguments(inputs),
@@ -190,47 +206,60 @@ export async function runAction(
     if (execution.code !== 0) {
       throw new DebzInstallExitError(
         execution.code,
-        inputs.statePath,
+        inputs.transactionBackend === 'native'
+          ? path.join(inputs.installRoot, 'var/lib/debz')
+          : inputs.statePath,
         failureDiagnostic(execution.stdout),
+        inputs.transactionBackend,
       );
     }
     if (execution.stderr.length !== 0) {
       throw new InstallActionError('debz wrote unexpected stderr on success');
     }
-    validateInstallCommandResult(execution.stdout);
+    const nativeResult = inputs.transactionBackend === 'native'
+      ? validateNativeInstallResult(execution.stdout, inputs, download.lockDigest)
+      : undefined;
+    const changed = nativeResult === undefined
+      ? validateInstallCommandResult(execution.stdout)
+      : nativeResult.changed;
     await verifyIdentities(
       protectedFiles,
       mutableDirectories,
       executable,
       services,
     );
-    const freshResult = await services.requireFreshResult(priorResult);
-
-    const summaryExecution = await services.runDebz(
-      executable.path,
-      buildTransactionResultArguments(inputs),
-      sudoPath,
-      64 * 1024,
-    );
-    if (summaryExecution.code !== 0 || summaryExecution.stderr.length !== 0) {
-      throw new InstallActionError(
-        'the canonical transaction result could not be verified',
+    const freshResult = priorResult === undefined
+      ? undefined
+      : await services.requireFreshResult(priorResult);
+    let installedCount: number;
+    if (nativeResult !== undefined && !nativeResult.changed) {
+      installedCount = nativeResult.installedCount;
+      resultPath = '';
+    } else {
+      const summaryExecution = await services.runDebz(
+        executable.path,
+        buildTransactionResultArguments(inputs),
+        sudoPath,
+        64 * 1024,
       );
+      if (summaryExecution.code !== 0 || summaryExecution.stderr.length !== 0) {
+        throw new InstallActionError(
+          'the canonical transaction result could not be verified',
+        );
+      }
+      installedCount = validateTransactionSummary(
+        summaryExecution.stdout, inputs, download.lockDigest, nativeResult,
+      ).installedCount;
     }
-    const summary = validateTransactionSummary(
-      summaryExecution.stdout,
-      inputs,
-      download.lockDigest,
-    );
     if (
-      summary.installedCount !==
+      installedCount !==
       download.downloadedCount + download.reusedCount
     ) {
       throw new InstallActionError(
         'package preparation and final transaction disagree on closure size',
       );
     }
-    await services.verifyOptionalFile(freshResult);
+    if (freshResult !== undefined) await services.verifyOptionalFile(freshResult);
     await verifyIdentities(
       protectedFiles,
       mutableDirectories,
@@ -244,7 +273,8 @@ export async function runAction(
       setup,
       download,
       resultPath,
-      installedCount: summary.installedCount,
+      installedCount,
+      changed,
     };
   } catch (error) {
     failure = error;
@@ -277,6 +307,7 @@ export async function runAction(
   io.setOutput('transaction-result', outputs.resultPath);
   io.setOutput('provenance', outputs.resultPath);
   io.setOutput('installed-count', String(outputs.installedCount));
+  io.setOutput('changed', outputs.changed ? 'true' : 'false');
 }
 
 async function verifyIdentities(
@@ -334,7 +365,9 @@ export async function runMain(): Promise<void> {
         core.error(error.message);
       }
       core.info(
-        `Transaction state was preserved at ${error.statePath}; recovery is explicit and must use the same verified CLI, root, state, lock, repository, architecture, and policy inputs.`,
+        error.transactionBackend === 'native'
+          ? `Native transaction evidence was preserved at ${error.statePath}; explicit native recovery must use the same verified CLI and original root with persisted inputs, not replacement locks, repositories, or force policies.`
+          : `Transaction state was preserved at ${error.statePath}; recovery is explicit and must use the same verified CLI, root, state, lock, repository, architecture, and policy inputs.`,
       );
       process.exitCode = error.exitCode;
       return;

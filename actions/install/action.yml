@@ -7,11 +7,15 @@ branding:
   color: blue
 
 inputs:
+  transaction-backend:
+    description: Explicit transaction engine (legacy_dpkg or native); no format detection or fallback
+    required: false
+    default: legacy_dpkg
   package:
     description: One explicit debz install selector (name[:architecture][=version])
     required: true
   lock-input:
-    description: Workspace-relative or absolute path to a reviewed canonical exact-lock v1 document
+    description: Reviewed canonical exact-lock document (v1 for legacy_dpkg, v2 for native)
     required: true
   architecture:
     description: Native Debian architecture (amd64 on Linux X64 or arm64 on Linux ARM64)
@@ -33,7 +37,7 @@ inputs:
     required: false
     default: ''
   state-path:
-    description: Optional absolute or workspace-relative recovery state directory
+    description: Optional CLI state directory; native transaction recovery evidence lives beneath install-root
     required: false
     default: ''
   use-sudo:
@@ -181,11 +185,13 @@ outputs:
   reused-count:
     description: Package objects fully reverified from the CAS
   transaction-result:
-    description: Absolute path to the canonical transaction-result.json
+    description: Absolute legacy result or native receipt path; empty for a verified unchanged native install
   provenance:
-    description: Alias of transaction-result for the current combined result/provenance schema
+    description: Alias of transaction-result; unchanged native installs do not claim an execution receipt
   installed-count:
-    description: Exact final closure package count from the verified transaction result
+    description: Exact final closure package count from verified transaction or unchanged native closure evidence
+  changed:
+    description: Whether this invocation executed a package transaction; false for verified unchanged native installs
 
 runs:
   using: node24

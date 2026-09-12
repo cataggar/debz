@@ -244,6 +244,7 @@ const transaction_result_help =
     \\  debz transaction-result verify --state-path PATH --lock-input PATH --architecture ARCH --json
     \\  debz transaction-result verify --transaction-backend native --install-root PATH --lock-input PATH --architecture ARCH --json
     \\  debz transaction-result capabilities --transaction-backend native --json
+    \\  debz transaction-result capabilities --transaction-backend native --for-install --json
     \\
     \\The verifier opens the canonical result without following symbolic links,
     \\checks its digest and complete exact-lock evidence, and emits a bounded
@@ -388,7 +389,11 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         std.process.exit(@intFromEnum(internal.exit_status));
     };
-    try render(init.arena.allocator(), stdout, stderr, request.options.output, result);
+    if (parsed.native_result and result.exit_status == .success) {
+        try stdout.writeAll(try debz.native_install_result.canonicalJson(init.arena.allocator(), request, result));
+    } else {
+        try render(init.arena.allocator(), stdout, stderr, request.options.output, result);
+    }
     if (result.exit_status != .success) {
         try stdout.flush();
         try stderr.flush();
@@ -663,10 +668,14 @@ fn runTransactionResult(
     var lock_input: ?[]const u8 = null;
     var architecture: ?[]const u8 = null;
     var requested_json = false;
+    var for_install = false;
     var seen: std.EnumSet(TransactionResultSingleOption) = .initEmpty();
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--json")) {
             requested_json = true;
+        } else if (std.mem.eql(u8, argument, "--for-install")) {
+            if (for_install) return transactionResultUsage(stderr, "duplicate --for-install");
+            for_install = true;
         } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
             setOnceTransactionResult(&seen, .transaction_backend) catch
                 return transactionResultUsage(stderr, "duplicate --transaction-backend");
@@ -704,9 +713,14 @@ fn runTransactionResult(
         if (transaction_backend != .native or state_path != null or install_root != null or
             lock_input != null or architecture != null)
             return transactionResultUsage(stderr, "capabilities requires only --transaction-backend native --json");
-        try stdout.writeAll(try debz.native_transaction_result.capabilitiesJson(init.arena.allocator()));
+        try stdout.writeAll(if (for_install)
+            try debz.native_install_result.capabilitiesJson(init.arena.allocator())
+        else
+            try debz.native_transaction_result.capabilitiesJson(init.arena.allocator()));
         return;
     }
+    if (for_install)
+        return transactionResultUsage(stderr, "--for-install requires capabilities");
     const lock_path = lock_input orelse
         return transactionResultUsage(stderr, "--lock-input is required");
     const target = architecture orelse
@@ -1460,6 +1474,8 @@ fn printOperationHelp(stdout: *std.Io.Writer, operation: api.Operation) !void {
     if (usesResolution(operation)) try stdout.writeAll(resolution_options_help);
     if (operation.mutates()) try stdout.writeAll(mutation_options_help);
     if (usesTransactions(operation)) try stdout.writeAll(transaction_options_help);
+    if (operation == .install)
+        try stdout.writeAll("Native install result:\n  --native-result --json         Return receipt-bound or verified unchanged native evidence\n\n");
     try stdout.writeAll(common_options_help);
 }
 
@@ -1522,6 +1538,7 @@ fn usesTransactions(operation: api.Operation) bool {
 const ParsedProductCommand = struct {
     request: api.Request,
     transaction_backend: debz.transaction_engine.Kind,
+    native_result: bool,
 };
 
 fn parse(
@@ -1538,6 +1555,7 @@ fn parse(
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
     var seen: std.EnumSet(SingleOption) = .initEmpty();
     var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
+    var native_result = false;
     var options: api.CommonOptions = .{
         .install_root = "",
         .cache_path = "",
@@ -1553,6 +1571,9 @@ fn parse(
         if (std.mem.eql(u8, argument, "--json")) {
             options.output = .json;
             requested_output.* = .json;
+        } else if (std.mem.eql(u8, argument, "--native-result")) {
+            if (native_result) return error.InvalidArguments;
+            native_result = true;
         } else if (std.mem.eql(u8, argument, "--offline")) options.offline = true else if (std.mem.eql(u8, argument, "--cache-only")) {
             options.cache_only = true;
             options.offline = true;
@@ -1624,6 +1645,9 @@ fn parse(
         } else return error.InvalidArguments;
     }
 
+    if (native_result and (operation != .install or transaction_backend != .native or
+        options.output != .json or options.lock_input_path == null))
+        return error.InvalidArguments;
     options.source_paths = try sources.toOwnedSlice(allocator);
     options.config_paths = try configs.toOwnedSlice(allocator);
     options.keyring_paths = try keyrings.toOwnedSlice(allocator);
@@ -1636,6 +1660,7 @@ fn parse(
             .options = options,
         },
         .transaction_backend = transaction_backend,
+        .native_result = native_result,
     };
 }
 

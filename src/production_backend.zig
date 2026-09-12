@@ -759,7 +759,7 @@ pub const Backend = struct {
         var report = native_runtime.recover(allocator, attempt) catch |err|
             return nativeFailure(.recover, err, attempt.record().mutation_started);
         defer report.deinit();
-        return self.finishNative(allocator, request, &guard, report) catch |err|
+        return self.finishNative(allocator, request, &guard, report, null) catch |err|
             nativeFailure(.recover, err, attempt.record().mutation_started);
     }
 
@@ -769,6 +769,7 @@ pub const Backend = struct {
         request: api.Request,
         guard: *RootOperationGuard,
         report: native_runtime.Report,
+        install_evidence: ?api.NativeInstallEvidence,
     ) !api.Result {
         _ = self;
         const attempt = guard.active().?;
@@ -878,8 +879,19 @@ pub const Backend = struct {
                 guard.preserve_settled = true;
             }
         }
-        if (receipt.outcome == .succeeded)
-            return success(request.operation, true, summary, &.{});
+        if (receipt.outcome == .succeeded) {
+            var result = success(request.operation, true, summary, &.{});
+            if (install_evidence) |evidence| {
+                result.native_install = evidence;
+                result.native_install.?.receipt = .{
+                    .transaction_digest_sha256 = receipt_digest,
+                    .completion_digest_sha256 = document.digest_sha256,
+                    .program_sha256 = native_recovery.parseDigest(receipt.program_sha256) orelse
+                        return error.InvalidNativeReceipt,
+                };
+            }
+            return result;
+        }
         var failed = api.failure(request.operation, .transaction, .transaction_failed, summary);
         failed.changed = true;
         return failed;
@@ -1441,6 +1453,12 @@ pub const Backend = struct {
 
         const executor_policy = try executionPolicy(allocator, effective_request);
         if (self.transaction_backend == .native) {
+            const install_evidence: ?api.NativeInstallEvidence = if (request.operation == .install) .{
+                .lock_sha256 = (native_lock orelse return error.NativeExactLockRequired).digest_sha256,
+                .caller_request_sha256 = guard.active().?.record().request_sha256,
+                .caller_policy_sha256 = guard.active().?.record().policy_sha256,
+                .package_count = native_lock.?.packages.len,
+            } else null;
             const archives = try allocator.alloc([]const u8, verified.items.len);
             defer allocator.free(archives);
             for (verified.items, archives) |package, *bytes| bytes.* = package.bytes;
@@ -1453,7 +1471,11 @@ pub const Backend = struct {
             });
             defer preparation.deinit();
             const prepared = switch (preparation) {
-                .unchanged => return planResultChanged(allocator, request.operation, plan.*, false, "native transaction has no package changes"),
+                .unchanged => {
+                    var result = try planResultChanged(allocator, request.operation, plan.*, false, "native transaction has no package changes");
+                    result.native_install = install_evidence;
+                    return result;
+                },
                 .prepared => |*value| value,
                 .diagnostic => |value| return api.failure(
                     request.operation,
@@ -1472,7 +1494,7 @@ pub const Backend = struct {
                 .operation = if (plan.actions.len == 0) .process_triggers else nativeOperation(request.operation),
             });
             defer report.deinit();
-            var result = try self.finishNative(allocator, request, guard, report);
+            var result = try self.finishNative(allocator, request, guard, report, install_evidence);
             if (result.exit_status == .success) {
                 result.items = planned.items;
             }
