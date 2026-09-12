@@ -5347,9 +5347,10 @@ test "production workflow external native fixture" {
         owner_evidence: ?[]const u8 = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
-        pending_verification: ?struct {
+        owned_verification: ?struct {
             lock_path: []const u8,
             expected_error: ?[]const u8 = null,
+            state: enum { pending, released } = .pending,
         } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
@@ -5438,7 +5439,7 @@ test "production workflow external native fixture" {
             },
         };
     } else if (external.acknowledgment != null) return error.InvalidExternalWorkflowRequest;
-    const output = if (external.pending_verification) |check| verified: {
+    const output = if (external.owned_verification) |check| verified: {
         if (external.acknowledgment != null or external.completion_crash != null or
             external.reconciliation_owner_output != null)
             return error.InvalidExternalWorkflowRequest;
@@ -5450,7 +5451,8 @@ test "production workflow external native fixture" {
         );
         defer lock.deinit();
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
-        var result = verifier.verifyPendingSuccess(
+        const verify_success = if (check.state == .pending) &verifier.verifyPendingSuccess else &verifier.verifyReleasedSuccess;
+        var result = verify_success(
             std.testing.allocator,
             root.root,
             requested.options.install_root,
@@ -5479,11 +5481,13 @@ test "production workflow external native fixture" {
             requested.expected_ownership_marker.?,
             result.owner,
         ));
-        try std.testing.expectEqualSlices(
-            u8,
-            &result.owner.completion_sha256.?,
-            &result.completion.document.digest_sha256,
-        );
+        try std.testing.expectEqualSlices(u8, &result.owner.attempt_id, &result.completion.document.attempt_id);
+        if (check.state == .pending)
+            try std.testing.expectEqualSlices(
+                u8,
+                &result.owner.completion_sha256.?,
+                &result.completion.document.digest_sha256,
+            );
         try std.testing.expectEqualStrings(
             &native_recovery.hexDigest(result.completion.document.transaction_provenance.document_sha256.?),
             &result.receipt.document.digest_sha256,

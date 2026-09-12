@@ -311,6 +311,16 @@ the root is cleared. The public settled verifier still rejects pending ownership
 and neither verifier accepts the physical host root. Failed completions and
 unpublished or stale ownership are not successful pending results.
 
+Normal native workflows instead leave a released owner after native
+acknowledgment. A separate read-only released-success entry point binds the exact
+retained owner, original attempt, caller authority, lock, completion, receipt,
+and current database. Native active/orphan evidence must be absent. An original
+completed/published root record may remain during interrupted terminal cleanup,
+but it must bind the same completion; any other record is refused. The caller's
+released marker is not finalized by verification, and no cleared-root summary is
+returned. Public settled verification still refuses that marker until the owner
+has actually been finalized.
+
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
 schema, version, digest, and bytes in the existing per-attempt
