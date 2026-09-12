@@ -258,17 +258,13 @@ pub const Backend = struct {
         if (!count_valid)
             return api.failure(operation, .usage, .invalid_request, "invalid workflow selector count");
         if (self.transaction_backend == .native) {
-            if (workflow.reconciliation_claim != null or
-                (workflow.expected_ownership_marker != null and
-                    workflow.expected_ownership_marker.?.state == .pre_mutation_reconciliation_claim) or
-                (workflow.ownership_acknowledgment != null and
-                    workflow.ownership_acknowledgment.?.marker.state == .pre_mutation_reconciliation_claim))
-                return api.failure(operation, .unavailable, .transaction_backend_unavailable, "native clean reconciliation is not available");
             if (workflow.orchestration_id == null and
                 (workflow.mode == .reserve or workflow.defer_recovery_clear or
                     workflow.recovery_review_claim != null or workflow.expected_ownership_marker != null or
-                    workflow.root_attempt_id != null))
+                    workflow.root_attempt_id != null or workflow.reconciliation_claim != null))
                 return api.failure(operation, .usage, .invalid_request, "native ownership requests require an outer attempt identity");
+            if (workflow.reconciliation_claim != null and workflow.expected_ownership_marker == null)
+                return api.failure(operation, .usage, .invalid_request, "native reconciliation requires independently retained exact ownership");
             if (workflow.orchestration_id != null and
                 (workflow.mode == .plan_only or workflow.mode == .download_only))
                 return api.failure(operation, .usage, .invalid_request, "non-mutating native workflows cannot acquire ownership");
@@ -1925,7 +1921,7 @@ pub const Backend = struct {
         };
         defer if (record) |*owned| owned.deinit();
         if (self.transaction_backend == .native and record == null and
-            try owned_root.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null)
+            try native_runtime.hasActiveEvidence(allocator, owned_root.root))
             return blockedRecovery(request.operation, "native acknowledgment lost its original active record");
         if (marker == null) {
             if (record != null) return blockedRecovery(
@@ -2227,7 +2223,7 @@ pub const Backend = struct {
         );
         defer if (record) |*owned| owned.deinit();
         if (self.transaction_backend == .native and record == null and
-            try owned_root.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null)
+            try native_runtime.hasActiveEvidence(allocator, owned_root.root))
             return blockedRecovery(request.operation, "native ownership lost its original active record");
         if (marker == null) {
             if (record != null) return blockedRecovery(
@@ -2329,8 +2325,6 @@ pub const Backend = struct {
         else
             acknowledgment.marker;
         if (observed.state == .pre_mutation_reconciliation_claim) {
-            if (self.transaction_backend == .native)
-                return blockedRecovery(request.operation, "native clean reconciliation is not available");
             const claim = observed.pre_mutation_claim orelse
                 return blockedRecovery(
                     request.operation,
@@ -2618,6 +2612,9 @@ pub const Backend = struct {
             "the live root is unavailable while claiming reconciliation",
         );
         defer owned_root.close();
+        if (self.transaction_backend == .native)
+            validateNativeRoot(self.io, owned_root.root) catch |err|
+                return nativeFailure(request.operation, err, false);
         var locks: root_operation.SystemLockBackend = .{
             .allocator = allocator,
             .io = self.io,
@@ -2638,6 +2635,14 @@ pub const Backend = struct {
             .cancellation = transaction_executor.Cancellation.never(),
         }) catch |err| return mapRootOperationError(request.operation, err);
         defer lock_backend.release(token);
+        if (self.transaction_backend == .native) {
+            const active = native_runtime.hasActiveEvidence(allocator, owned_root.root) catch |err| switch (err) {
+                error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+                else => return blockedRecovery(request.operation, "native reconciliation evidence is unreadable"),
+            };
+            if (active)
+                return blockedRecovery(request.operation, "native root has unresolved execution evidence");
+        }
         const store = coordinator.store();
         const marker = store.readDeferredAcknowledgment(allocator) catch
             return blockedRecovery(
@@ -2654,56 +2659,13 @@ pub const Backend = struct {
                 request.operation,
                 "lower root is not clean for reconciliation",
             );
-        const execute_request_sha256 = try workflowProductRequestDigest(
+        const reconciliation = try workflowReconciliationMarker(
             allocator,
             semantic_operation,
-            .execute,
             selectors,
             request.options,
-        );
-        const semantic_request_sha256 = try workflowSemanticRequestDigest(
-            allocator,
-            semantic_operation,
-            selectors,
-        );
-        const attempt_id = switch (claim) {
-            .pre_mutation => |binding| root_operation.preMutationReconciliationClaimId(.{
-                .outer_attempt_id = orchestration_id,
-                .outer_generation = binding.outer_generation,
-                .outer_state_sha256 = binding.outer_state_sha256,
-                .profile_sha256 = binding.profile_sha256,
-                .profile_reference_sha256 = binding.profile_reference_sha256,
-                .exact_lock_sha256 = binding.exact_lock_sha256,
-                .semantic_request_sha256 = semantic_request_sha256,
-            }),
-            .post_mutation => |binding| reconciliationAttemptId(
-                orchestration_id,
-                execute_request_sha256,
-                binding.exact_lock_sha256,
-                binding.evidence_sha256,
-            ),
-        };
-        const reconciliation = try root_operation.createDeferredAcknowledgment(
-            .{
-                .state = switch (claim) {
-                    .pre_mutation => .pre_mutation_reconciliation_claim,
-                    .post_mutation => .released,
-                },
-                .attempt_id = attempt_id,
-                .pre_mutation_claim = switch (claim) {
-                    .pre_mutation => |binding| .{
-                        .outer_attempt_id = orchestration_id,
-                        .outer_generation = binding.outer_generation,
-                        .outer_state_sha256 = binding.outer_state_sha256,
-                        .profile_sha256 = binding.profile_sha256,
-                        .profile_reference_sha256 = binding.profile_reference_sha256,
-                        .exact_lock_sha256 = binding.exact_lock_sha256,
-                        .semantic_request_sha256 = semantic_request_sha256,
-                    },
-                    .post_mutation => null,
-                },
-                .acknowledgment_id = orchestration_id,
-            },
+            orchestration_id,
+            claim,
         );
         const expected_reconciliation =
             if (recovery_review_claim) |review|
@@ -3175,6 +3137,42 @@ fn productRequestDigest(request: api.Request) [32]u8 {
         hash.update("\x00");
     }
     return hash.finalResult();
+}
+
+fn workflowReconciliationMarker(
+    allocator: std.mem.Allocator,
+    operation: WorkflowSemanticOperation,
+    selectors: []const solver.PackageSelector,
+    options: api.CommonOptions,
+    owner: [32]u8,
+    claim: WorkflowReconciliationClaim,
+) !root_operation.DeferredAcknowledgment {
+    const pre_mutation: ?root_operation.PreMutationReconciliationClaimBinding = switch (claim) {
+        .pre_mutation => |binding| .{
+            .outer_attempt_id = owner,
+            .outer_generation = binding.outer_generation,
+            .outer_state_sha256 = binding.outer_state_sha256,
+            .profile_sha256 = binding.profile_sha256,
+            .profile_reference_sha256 = binding.profile_reference_sha256,
+            .exact_lock_sha256 = binding.exact_lock_sha256,
+            .semantic_request_sha256 = try workflowSemanticRequestDigest(allocator, operation, selectors),
+        },
+        .post_mutation => null,
+    };
+    return root_operation.createDeferredAcknowledgment(.{
+        .state = if (pre_mutation != null) .pre_mutation_reconciliation_claim else .released,
+        .attempt_id = switch (claim) {
+            .pre_mutation => root_operation.preMutationReconciliationClaimId(pre_mutation.?),
+            .post_mutation => |binding| Backend.reconciliationAttemptId(
+                owner,
+                try workflowProductRequestDigest(allocator, operation, .execute, selectors, options),
+                binding.exact_lock_sha256,
+                binding.evidence_sha256,
+            ),
+        },
+        .pre_mutation_claim = pre_mutation,
+        .acknowledgment_id = owner,
+    });
 }
 
 fn validateNativeRoot(io: std.Io, root: root_fs.Root) !void {
@@ -5279,6 +5277,7 @@ test "production workflow external native fixture" {
         report: []const u8,
         completion_crash: ?CompletionPoint = null,
         owner_evidence: ?[]const u8 = null,
+        reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
@@ -5315,7 +5314,31 @@ test "production workflow external native fixture" {
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
     };
     var requested = external.workflow;
-    if (external.owner_evidence) |path| {
+    if (external.reconciliation_owner_output) |path| {
+        if (external.owner_evidence != null or external.acknowledgment != null or
+            !@import("absolute_path.zig").nonRoot(path) or
+            !std.mem.eql(u8, std.fs.path.dirname(path).?, std.fs.path.dirname(requested.options.install_root).?) or
+            std.mem.eql(u8, path, requested.options.install_root))
+            return error.InvalidExternalWorkflowRequest;
+        var owner = try workflowReconciliationMarker(
+            allocator,
+            requested.operation,
+            requested.selectors,
+            requested.options,
+            requested.orchestration_id orelse return error.InvalidExternalWorkflowRequest,
+            requested.reconciliation_claim orelse return error.InvalidExternalWorkflowRequest,
+        );
+        if (requested.recovery_review_claim) |review|
+            owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(owner, review);
+        var owner_root = try root_fs.openAbsoluteRoot(std.testing.io, std.fs.path.dirname(path).?);
+        defer owner_root.close();
+        try owner_root.root.publishFile(
+            try root_fs.Path.init(std.fs.path.basename(path)),
+            try owner.canonicalJson(allocator),
+            .{ .durable = true, .overwrite = .fail_if_exists },
+        );
+    }
+    if (external.owner_evidence orelse external.reconciliation_owner_output) |path| {
         const owner = try root_operation.decodeDeferredAcknowledgment(
             allocator,
             try readFile(allocator, std.testing.io, path, root_operation.maximum_document_bytes),
@@ -5896,6 +5919,11 @@ fn backendDeferredMarker(
 }
 
 test "production workflow reconciliation claims are distinct durable exclusive and crash convergent" {
+    try testWorkflowReconciliation(.legacy_dpkg);
+    try testWorkflowReconciliation(.native);
+}
+
+fn testWorkflowReconciliation(kind: transaction_engine.Kind) !void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5938,6 +5966,7 @@ test "production workflow reconciliation claims are distinct durable exclusive a
         var crash: TestCompletionCrash = .{ .point = point };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = kind,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = crash.interface(),
@@ -5950,6 +5979,12 @@ test "production workflow reconciliation claims are distinct durable exclusive a
         claim_options.lock_input_path = fixture.lock_path;
         claim_options.assume_yes = true;
         claim_options.conffile = .keep_existing;
+        const reserve_options = claim_options;
+        if (kind == .native) {
+            claim_options.lock_input_path = null;
+            claim_options.source_paths = &.{};
+            claim_options.keyring_paths = &.{};
+        }
         const pre_mutation_binding: root_operation.PreMutationReconciliationClaimBinding = .{
             .outer_attempt_id = outer_id,
             .outer_generation = 9,
@@ -5963,7 +5998,7 @@ test "production workflow reconciliation claims are distinct durable exclusive a
                 &selectors,
             ),
         };
-        const request: WorkflowRequest = .{
+        var request: WorkflowRequest = .{
             .operation = .remove,
             .mode = .recover,
             .selectors = &selectors,
@@ -5983,12 +6018,22 @@ test "production workflow reconciliation claims are distinct durable exclusive a
                     .evidence_sha256 = @splat(0xc3),
                 } },
         };
+        if (kind == .native)
+            request.expected_ownership_marker = try workflowReconciliationMarker(
+                allocator,
+                request.operation,
+                request.selectors,
+                request.options,
+                outer_id,
+                request.reconciliation_claim.?,
+            );
         try std.testing.expectError(
             error.InjectedCompletionCrash,
             backend.executeWorkflow(allocator, request),
         );
         var reopened_backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = kind,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -6039,7 +6084,7 @@ test "production workflow reconciliation claims are distinct durable exclusive a
             .operation = .remove,
             .mode = .reserve,
             .selectors = &selectors,
-            .options = claim_options,
+            .options = reserve_options,
             .orchestration_id = @splat(0xd4),
         });
         try std.testing.expectEqual(api.ExitStatus.recovery, foreign.exit_status);
@@ -6079,10 +6124,190 @@ test "production workflow reconciliation claims are distinct durable exclusive a
             .operation = .remove,
             .mode = .reserve,
             .selectors = &selectors,
-            .options = claim_options,
+            .options = reserve_options,
             .orchestration_id = @splat(0xe5),
         });
         try std.testing.expectEqual(api.ExitStatus.success, next.exit_status);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+    }
+}
+
+test "production workflow required_security.native reconciliation refuses orphan execution evidence" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
+    defer fixture.deinit();
+    var options = fixture.options();
+    options.source_paths = &.{};
+    options.keyring_paths = &.{};
+    options.assume_yes = true;
+    options.conffile = .keep_existing;
+    var request: WorkflowRequest = .{
+        .operation = .upgrade_all,
+        .mode = .recover,
+        .options = options,
+        .orchestration_id = @splat(1),
+        .reconciliation_claim = .{ .post_mutation = .{
+            .exact_lock_sha256 = @splat(2),
+            .evidence_sha256 = @splat(3),
+        } },
+    };
+    const owner = try workflowReconciliationMarker(
+        allocator,
+        request.operation,
+        request.selectors,
+        options,
+        request.orchestration_id.?,
+        request.reconciliation_claim.?,
+    );
+    request.expected_ownership_marker = owner;
+    var finalization = request;
+    finalization.reconciliation_claim = null;
+    finalization.finalize_ownership = true;
+    finalization.ownership_acknowledgment = .{
+        .attempt_id = owner.attempt_id,
+        .marker_sha256 = owner.digest_sha256,
+        .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(owner),
+        .acknowledgment_id = owner.acknowledgment_id,
+        .marker = owner,
+    };
+    var acknowledgment = request;
+    acknowledgment.reconciliation_claim = null;
+    acknowledgment.defer_recovery_clear = true;
+    acknowledgment.recovery_acknowledgment = .{
+        .attempt_id = owner.attempt_id,
+        .completion_sha256 = @splat(4),
+        .provenance_sha256 = @splat(5),
+        .acknowledgment_id = owner.acknowledgment_id,
+    };
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer root.close();
+    const store = root_operation.Store.init(root.root);
+    try store.ensureNamespace();
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
+    for ([_][]const u8{
+        native_recovery.intent_path,
+        native_recovery.workspace_directory,
+        root_operation.namespace_path ++ "/" ++ native_recovery.program_name,
+        root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name,
+        native_recovery.progress_path,
+        native_recovery.managed_state_path,
+        root_operation.namespace_path ++ "/.debz-native-unresolved",
+    }) |name| {
+        const path = try root_fs.Path.init(name);
+        try root.root.publishFile(path, "unresolved", .{ .overwrite = .fail_if_exists });
+        for ([_]WorkflowRequest{ request, finalization, acknowledgment }) |callback| {
+            const result = try backend.executeWorkflow(allocator, callback);
+            try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+            try std.testing.expect(!result.changed);
+        }
+        const retained = try root.root.readFileAlloc(allocator, path, 32);
+        try std.testing.expectEqualStrings("unresolved", retained);
+        try std.testing.expect((try store.readDeferredAcknowledgment(allocator)) == null);
+        try std.testing.expect((try store.read(allocator)) == null);
+        try root.root.removeFile(path);
+    }
+}
+
+test "production workflow required_security.native reconciliation retains exact reviewed ownership" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]bool{ true, false }) |pre_mutation| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
+        defer fixture.deinit();
+        var options = fixture.options();
+        options.source_paths = &.{};
+        options.keyring_paths = &.{};
+        options.assume_yes = true;
+        options.conffile = .keep_existing;
+        const review = try root_operation.createRecoveryReviewClaim(.{
+            .outer_attempt_id = @splat(1),
+            .outer_generation = 1,
+            .outer_state_sha256 = @splat(2),
+            .profile_sha256 = @splat(3),
+            .profile_reference_sha256 = @splat(4),
+            .exact_lock_sha256 = @splat(5),
+            .semantic_request_sha256 = try workflowSemanticRequestDigest(allocator, .upgrade_all, &.{}),
+            .mutation_status = if (pre_mutation) .unchanged else .changed,
+            .outer_transaction_sha256 = if (pre_mutation) null else @splat(6),
+            .nonce = @splat(7),
+        });
+        var request: WorkflowRequest = .{
+            .operation = .upgrade_all,
+            .mode = .recover,
+            .options = options,
+            .orchestration_id = review.outer_attempt_id,
+            .recovery_review_claim = review,
+            .reconciliation_claim = if (pre_mutation) .{ .pre_mutation = .{
+                .outer_generation = review.outer_generation,
+                .outer_state_sha256 = review.outer_state_sha256,
+                .profile_sha256 = review.profile_sha256,
+                .profile_reference_sha256 = review.profile_reference_sha256,
+                .exact_lock_sha256 = review.exact_lock_sha256,
+            } } else .{ .post_mutation = .{
+                .exact_lock_sha256 = review.exact_lock_sha256,
+                .evidence_sha256 = review.outer_transaction_sha256.?,
+            } },
+        };
+        const base = try workflowReconciliationMarker(
+            allocator,
+            request.operation,
+            request.selectors,
+            options,
+            review.outer_attempt_id,
+            request.reconciliation_claim.?,
+        );
+        const expected = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, review);
+        var foreign_review = review;
+        foreign_review.nonce = @splat(8);
+        foreign_review = try root_operation.createRecoveryReviewClaim(foreign_review);
+        const foreign = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(base, foreign_review);
+        try std.testing.expectEqualSlices(u8, &expected.digest_sha256, &foreign.digest_sha256);
+        var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+        defer root.close();
+        const store = root_operation.Store.init(root.root);
+        try store.ensureNamespace();
+        try store.publishRecoveryReviewClaim(allocator, review);
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
+        request.expected_ownership_marker = foreign;
+        const refused = try backend.executeWorkflow(allocator, request);
+        try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
+        try std.testing.expect((try store.readDeferredAcknowledgment(allocator)) == null);
+        try std.testing.expect(root_operation.recoveryReviewClaimExactEqual(review, (try store.readRecoveryReviewClaim(allocator)).?));
+        request.expected_ownership_marker = expected;
+        const claimed = try backend.executeWorkflow(allocator, request);
+        try std.testing.expectEqual(api.ExitStatus.success, claimed.exit_status);
+        try std.testing.expect(!claimed.changed);
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(expected, (try store.readDeferredAcknowledgment(allocator)).?));
+        try std.testing.expect((try store.readRecoveryReviewClaim(allocator)) == null);
+        request.reconciliation_claim = null;
+        request.recovery_review_claim = null;
+        request.finalize_ownership = true;
+        for ([_]root_operation.DeferredAcknowledgment{ foreign, expected }) |owner| {
+            request.ownership_acknowledgment = .{
+                .attempt_id = owner.attempt_id,
+                .marker_sha256 = owner.digest_sha256,
+                .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(owner),
+                .acknowledgment_id = owner.acknowledgment_id,
+                .marker = owner,
+            };
+            const finalized = try backend.executeWorkflow(allocator, request);
+            try std.testing.expectEqual(
+                if (root_operation.deferredAcknowledgmentExactEqual(owner, expected))
+                    api.ExitStatus.success
+                else
+                    api.ExitStatus.recovery,
+                finalized.exit_status,
+            );
+        }
+        try std.testing.expect((try store.readDeferredAcknowledgment(allocator)) == null);
+        try std.testing.expect((try store.read(allocator)) == null);
     }
 }
 
@@ -6197,7 +6422,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     try std.testing.expectEqual(@as(usize, 0), process.calls);
 }
 
-test "production workflow native empty removal locks replay without enabling clean reconciliation" {
+test "production workflow native empty removal locks do not grant reconciliation ownership" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -6250,7 +6475,7 @@ test "production workflow native empty removal locks replay without enabling cle
         .evidence_sha256 = @splat(0x44),
     } };
     const blocked = try backend.executeWorkflow(allocator, request);
-    try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, blocked.diagnostics[0].id);
+    try std.testing.expectEqual(api.ErrorId.invalid_request, blocked.diagnostics[0].id);
     try std.testing.expectEqual(@as(usize, 0), process.calls);
     const unchanged = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(4096));
     defer allocator.free(unchanged);
