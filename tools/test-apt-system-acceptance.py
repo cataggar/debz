@@ -172,6 +172,28 @@ def inside(root: Path) -> None:
         assert not list((root / "var/cache/debz").iterdir())
         assert not (root / "run/debz").exists()
 
+    native_profile = json.loads((root / "etc/debz/default.json").read_text())
+    native_profile.update(
+        schema="https://debz.dev/schema/system-profile-v2",
+        version=2, transaction_backend="native",
+    )
+    (root / "etc/debz/native-v2.json").write_text(json.dumps(native_profile))
+    for args in (
+        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "update"),
+        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "install", "-y", "base-dep"),
+        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "list", "--installed"),
+        ("recover", "--system-profile", "/etc/debz/native-v2.json", "--json"),
+    ):
+        rejected = cli(*args, expected=8 if args[0] == "recover" else 3)
+        assert rejected["changed"] is False
+        if args[0] == "recover":
+            assert rejected["mutation_status"] == "unknown"
+            assert rejected["diagnostics"][0]["id"] == "recovery_required"
+        assert status_path.read_bytes() == initial_status
+        assert not list(state_path.iterdir())
+        assert not list((root / "var/cache/debz").iterdir())
+        assert not (root / "run/debz").exists()
+
     apt("update")
     reviewed = apt("install", "base-dep", "alt-a", expected=2)
     assert reviewed["diagnostics"][0]["id"] == "confirmation_required"
@@ -215,6 +237,13 @@ def inside(root: Path) -> None:
     installed = apt("list", "--installed")
     assert installed["version"] == 2
     assert {item["package"] for item in installed["items"]} == closure, installed
+    legacy_profile = {**native_profile, "transaction_backend": "legacy_dpkg"}
+    (root / "etc/debz/legacy-v2.json").write_text(json.dumps(legacy_profile))
+    explicit_legacy = cli(
+        "apt", "--profile", "/etc/debz/legacy-v2.json", "--json", "list", "--installed",
+    )
+    assert explicit_legacy["items"] == installed["items"]
+    assert explicit_legacy["profile"]["sha256"] != installed["profile"]["sha256"]
 
     apt("install", "-y", "fixture-upgrade=1.0-1")
     upgraded = apt("upgrade", "-y")

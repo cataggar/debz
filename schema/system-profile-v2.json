@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-profile-v2",
+  "title": "debz trusted system profile with explicit transaction backend",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "transaction_backend", "repositories", "keyring_paths", "architecture"],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/system-profile-v2" },
+    "version": { "const": 2 },
+    "transaction_backend": { "enum": ["legacy_dpkg", "native"] },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "system-profile-v1#/$defs/repository" }
+    },
+    "keyring_paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "system-profile-v1#/$defs/absolutePath" }
+    },
+    "architecture": { "$ref": "system-profile-v1#/$defs/architecture" },
+    "foreign_architectures": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "system-profile-v1#/$defs/architecture" },
+      "default": []
+    },
+    "repository_policy": { "enum": ["strict_priority", "best_version"], "default": "strict_priority" },
+    "cache_path": {
+      "allOf": [{ "$ref": "system-profile-v1#/$defs/absolutePath" }],
+      "default": "/var/cache/debz"
+    },
+    "state_path": {
+      "allOf": [{ "$ref": "system-profile-v1#/$defs/absolutePath" }],
+      "default": "/var/lib/debz"
+    },
+    "default_conffile": { "enum": ["keep_existing", "use_package_version"], "default": "keep_existing" },
+    "network": {
+      "$ref": "system-profile-v1#/$defs/network",
+      "default": { "proxy_url": null, "credential_reference": null }
+    }
+  }
+}

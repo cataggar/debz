@@ -258,6 +258,31 @@ omitted proxy and credential fields mean disabled. They never mean
 Likewise, the loader never consults `/etc/apt`, ambient keyrings, GnuPG
 configuration, dpkg configuration, or process environment settings.
 
+Version 1 always selects `legacy_dpkg`; a backend field is not accepted in a
+v1 document. [`system-profile-v2.json`](../schema/system-profile-v2.json)
+preserves the same repository, trust, network, architecture, cache, state, and
+conffile fields but requires an explicit `transaction_backend`, either
+`legacy_dpkg` or `native`. Its schema ID and version must both identify v2.
+Missing, null, unknown, duplicate, or version-mismatched backend selections
+are rejected rather than defaulted or inferred.
+
+The typed profile loader preserves this backend authority and hashes the
+complete reviewed profile bytes. Changing the backend therefore changes the
+profile binding even when every referenced repository/keyring file is identical.
+Existing operation/recovery evidence cannot be rebound by changing only the
+profile's backend.
+
+**Native apt/system execution remains gated.** This profile contract is
+groundwork for native integration, not an execution switch. The current
+apt/system profile boundary rejects native profiles before operation-state,
+live-root, or backend activity, including update, installed listing, and
+recovery. Normal apt commands report a configuration failure (exit 3).
+Recovery preserves its fail-closed recovery failure (exit 8) with unknown
+mutation status because the profile cannot authorize inspecting prior state.
+Neither path retries through legacy v1 lock or transaction evidence. Explicit
+v2 `legacy_dpkg` profiles remain usable. Native v2 lock/provenance/recovery and
+live-root integration must be completed before lifting that gate.
+
 `system_profile.load` takes an injected filesystem interface. The profile and
 every source, config, keyring, and credential file are bounded and must be a
 canonical absolute non-root path. Every ancestor directory is opened without
