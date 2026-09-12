@@ -583,6 +583,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "native_unpack.test.lifecycle external fixture",
             "production workflow external native fixture",
+            "native_transaction_result.test.projected root external fixture",
         },
     });
     const native_lifecycle = b.addSystemCommand(&.{

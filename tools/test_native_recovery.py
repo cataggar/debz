@@ -40,6 +40,32 @@ class RecoveryOracleTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_projection_requires_private_disposable_root_before_mounting(self) -> None:
+        projected = self.workspace / "projection/root"
+        projected.mkdir(parents=True)
+        marker = projected / ".debz-native-disposable"
+        for root, pid, uid, contents in (
+            (Path("/"), 1, 0, "debz native projection fixture v1\n"),
+            (self.root, 1, 0, "debz native projection fixture v1\n"),
+            (projected, 123, 0, "debz native projection fixture v1\n"),
+            (projected, 1, 1000, "debz native projection fixture v1\n"),
+            (projected, 1, 0, "not a projection fixture\n"),
+        ):
+            with self.subTest(root=root, pid=pid, uid=uid, contents=contents):
+                marker.write_text(contents)
+                with (
+                    mock.patch.object(acceptance.os, "getpid", return_value=pid),
+                    mock.patch.object(acceptance.os, "geteuid", return_value=uid),
+                    mock.patch.object(acceptance.subprocess, "run") as run,
+                    mock.patch.object(acceptance.os, "chroot") as chroot,
+                    mock.patch.object(acceptance.os, "execve") as execute,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "disposable root and private PID namespace"):
+                        acceptance.projection_inside(root)
+                    run.assert_not_called()
+                    chroot.assert_not_called()
+                    execute.assert_not_called()
+
     def test_recovery_has_no_caller_work_or_fault(self) -> None:
         for arguments in (
             {"archives": [self.workspace / "replacement.deb"]},

@@ -1,5 +1,6 @@
 const std = @import("std");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const live_root = @import("live_root.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_execution_request = @import("native_execution_request.zig");
 const native_operation = @import("native_operation.zig");
@@ -101,7 +102,7 @@ pub fn verify(
     expected_architecture: []const u8,
     locks: root_operation.LockBackend,
 ) !Summary {
-    var held = try VerificationLock.acquire(root, install_root, locks);
+    var held = try VerificationLock.acquire(root, install_root, locks, null);
     defer held.deinit();
     if (try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null or
         try root.entryIfExists(try root_fs.Path.init(root_operation.deferred_ack_path)) != null or
@@ -116,7 +117,7 @@ pub fn verify(
     const proof = receipt.document;
     const outer = completion.document;
     try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, proof, .succeeded);
-    if (!locks.held(held.token)) return error.LockLost;
+    try held.validate();
     return .{
         .target_architecture = expected_architecture,
         .install_root = install_root,
@@ -139,6 +140,7 @@ pub const OwnedRequest = struct {
     operation: product_api.Operation,
     caller_request_sha256: [32]u8,
     caller_policy_sha256: [32]u8,
+    projection: ?*const live_root.Projection = null,
 };
 
 const TerminalOutcome = enum { succeeded, failed };
@@ -256,7 +258,7 @@ fn verifyOwnedInternal(
     };
     const missing_owner = if (state == .pending) error.PendingOwnerRequired else error.ReleasedOwnerRequired;
     if (expected.owner.state != required_state) return missing_owner;
-    var held = try VerificationLock.acquire(root, install_root, locks);
+    var held = try VerificationLock.acquire(root, install_root, locks, expected.projection);
     defer held.deinit();
     const store = root_operation.Store.init(root);
     if (try store.readRecoveryReviewClaim(allocator) != null)
@@ -306,7 +308,7 @@ fn verifyOwnedInternal(
     try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, receipt.document, expected_outcome);
     if (state == .pending)
         try verifyPendingEvidence(allocator, root, receipt.document);
-    if (!locks.held(held.token)) return error.LockLost;
+    try held.validate();
     return .{ .owner = observed, .receipt = receipt, .completion = completion };
 }
 
@@ -315,9 +317,18 @@ const VerificationLock = struct {
     backend: root_operation.LockBackend,
     token: root_operation.LockToken,
     inode: u64,
+    root_fd: i32,
+    projection: ?*const live_root.Projection,
 
-    fn acquire(root: root_fs.Root, install_root: []const u8, locks: root_operation.LockBackend) !VerificationLock {
+    fn acquire(
+        root: root_fs.Root,
+        install_root: []const u8,
+        locks: root_operation.LockBackend,
+        projection: ?*const live_root.Projection,
+    ) !VerificationLock {
         if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
+        if (projection) |authority|
+            try authority.validateRoot(install_root, root.dir.handle);
         var named = try root_fs.openAbsoluteRoot(root.io, install_root);
         errdefer named.close();
         const held = try root.rootEntry();
@@ -327,7 +338,7 @@ const VerificationLock = struct {
         var host = try root_fs.openAbsoluteRoot(root.io, "/");
         defer host.close();
         const host_entry = try host.root.rootEntry();
-        if (held.inode == host_entry.inode and held.device == host_entry.device)
+        if (projection == null and held.inode == host_entry.inode and held.device == host_entry.device)
             return error.HostRootNotSupported;
         const lock_entry = (try root.entryIfExists(try root_fs.Path.init(root_operation.lock_path))) orelse
             return error.CompletionMissing;
@@ -345,8 +356,24 @@ const VerificationLock = struct {
             .create_if_missing = false,
         });
         errdefer locks.release(token);
-        if (!locks.held(token)) return error.LockLost;
-        return .{ .named = named, .backend = locks, .token = token, .inode = held.inode };
+        const result: VerificationLock = .{
+            .named = named,
+            .backend = locks,
+            .token = token,
+            .inode = held.inode,
+            .root_fd = root.dir.handle,
+            .projection = projection,
+        };
+        try result.validate();
+        return result;
+    }
+
+    fn validate(self: VerificationLock) !void {
+        if (!self.backend.held(self.token)) return error.LockLost;
+        if (self.projection) |authority| {
+            try authority.validateRoot(live_root.logical_root_path, self.root_fd);
+            try authority.validateRoot(live_root.logical_root_path, self.named.root.dir.handle);
+        }
     }
 
     fn deinit(self: *VerificationLock) void {
@@ -763,6 +790,89 @@ fn testSummaries(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings(schema_id, supported.value.object.get("summary_schema").?.string);
     try std.testing.expectEqualStrings(exact_lock_v2.schema_id, supported.value.object.get("lock_schema").?.string);
     try std.testing.expect(supported.value.object.get("read_only").?.bool);
+}
+
+test "native_transaction_result.test.projected root external fixture" {
+    const enabled = std.c.getenv("DEBZ_NATIVE_PROJECTION_FIXTURE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.InvalidProjectionFixture;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer root.close();
+    const marker = try root.root.readFileAlloc(
+        std.testing.allocator,
+        try root_fs.Path.init(".debz-native-disposable"),
+        128,
+    );
+    defer std.testing.allocator.free(marker);
+    if (!std.mem.eql(u8, marker, "debz native projection fixture v1\n"))
+        return error.InvalidProjectionFixture;
+    const Callback = struct {
+        fn run(_: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+            try live_root.testing.verifyProjection(projection);
+            const io = std.testing.io;
+            const allocator = std.testing.allocator;
+            var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+            defer named.close();
+            const projected = named.root;
+            var system_locks: root_operation.SystemLockBackend = .{ .io = io, .allocator = allocator };
+            const locks = system_locks.interface();
+            try std.testing.expectError(
+                error.HostRootNotSupported,
+                VerificationLock.acquire(projected, live_root.logical_root_path, locks, null),
+            );
+            try std.testing.expectError(
+                error.HostRootNotSupported,
+                VerificationLock.acquire(projected, "/", locks, projection),
+            );
+            var lock = try exact_lock_v2.create(allocator, .{
+                .target_architecture = "amd64",
+                .request_sha256 = @splat(1),
+                .policy_sha256 = @splat(2),
+                .repositories = &.{},
+                .local_artifacts = &.{},
+                .packages = &.{},
+                .verified_origins = true,
+            });
+            defer lock.deinit();
+            try std.testing.expectError(
+                error.HostRootNotSupported,
+                verify(allocator, projected, live_root.logical_root_path, lock.lock, "amd64", locks),
+            );
+            for ([_]OwnershipState{ .pending, .released }) |state| {
+                const owner = try root_operation.createDeferredAcknowledgment(.{
+                    .state = if (state == .pending) .pending else .released,
+                    .attempt_id = @splat(3),
+                    .acknowledgment_id = @splat(4),
+                    .completion_sha256 = if (state == .pending) @splat(5) else null,
+                    .provenance_sha256 = if (state == .pending) @splat(5) else null,
+                });
+                const expected: OwnedRequest = .{
+                    .owner = owner,
+                    .operation = .install,
+                    .caller_request_sha256 = @splat(6),
+                    .caller_policy_sha256 = @splat(7),
+                    .projection = projection,
+                };
+                const missing_owner = if (state == .pending) error.PendingOwnerRequired else error.ReleasedOwnerRequired;
+                try testOwnedRefusal(allocator, projected, live_root.logical_root_path, lock.lock, expected, locks, missing_owner, state);
+                if (state == .pending)
+                    try std.testing.expectError(
+                        error.PendingOwnerRequired,
+                        verifyPendingFailure(allocator, projected, live_root.logical_root_path, lock.lock, "amd64", expected, locks),
+                    );
+            }
+            var held = try VerificationLock.acquire(projected, live_root.logical_root_path, locks, projection);
+            defer held.deinit();
+            try held.validate();
+            try live_root.testing.replaceMountNamespace();
+            try std.testing.expectError(error.InvalidProjection, held.validate());
+            return 0;
+        }
+    };
+    const result = try live_root.runProjected(.{ .child = Callback.run });
+    if (result != .exited or result.exited != 0) {
+        std.debug.print("native projection fixture failed: {any}\n", .{result});
+        return error.InvalidProjectionFixture;
+    }
 }
 
 test "native_transaction_result.test.summary preserves distinct request domains and native empty counts" {
