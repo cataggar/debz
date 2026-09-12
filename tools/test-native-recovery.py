@@ -1391,7 +1391,7 @@ def exercise_workflows(
         m.write(path, m.oracle._read_bounded(current.candidate / owner_path, 1024 * 1024))
         return path
 
-    def verify_owned(current, label, owner, *, state, expected_error=None, change=None):
+    def verify_owned(current, label, owner, *, state, outcome="succeeded", expected_error=None, change=None):
         before = triggers.snapshot(current.candidate)
         before_evidence = sorted(
             (str(path.relative_to(current.candidate)), stat.st_mode, stat.st_size, stat.st_mtime_ns)
@@ -1407,9 +1407,10 @@ def exercise_workflows(
                 "lock_path": str(current.directory / "workflow.lock.json"),
                 "expected_error": expected_error,
                 "state": state,
+                "outcome": outcome,
             },
         )
-        assert result == {"verified": expected_error is None}
+        assert result == ({"verified": False} if expected_error else {"verified": True, "outcome": outcome})
         assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
         after_evidence = sorted(
             (str(path.relative_to(current.candidate)), stat.st_mode, stat.st_size, stat.st_mtime_ns)
@@ -1423,6 +1424,9 @@ def exercise_workflows(
 
     def verify_released(current, label, owner, **options):
         verify_owned(current, label, owner, state="released", **options)
+
+    def verify_failed(current, label, owner, **options):
+        verify_owned(current, label, owner, state="pending", outcome="failed", **options)
 
     current = scenario("workflow-owned-success")
     run(current, "plan", request(current, "install", "plan_only", names))
@@ -1590,6 +1594,7 @@ def exercise_workflows(
         assert (current.candidate / OPERATION).read_bytes() == published
         assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
         verify_pending(current, "verify-pending", pending)
+        verify_failed(current, "verify-success-as-failure", pending, expected_error="TransactionNotFailed")
         verify_released(current, "verify-pending-as-released", pending, expected_error="ReleasedOwnerRequired")
         if result_cli is not None:
             verify_result(current, lock, False)
@@ -1681,9 +1686,37 @@ def exercise_workflows(
     assert document(current.candidate / OPERATION)["outcome"] == "failed_after_mutation"
     assert document(current.candidate / OPERATION)["provenance"] == "pending"
     recovery = {**owned_request(current, "install", "recover", failed_names), "defer_recovery_clear": True}
+    verify_failed(current, "verify-failed-unpublished", pending, expected_error="InvalidCompletion",
+                  change={"selectors": recovery["selectors"]})
     run(current, "recover", recovery, owner_evidence=pending, exit_status=7)
     verify_pending(current, "verify-known-failure", pending, expected_error="TransactionNotSuccessful",
                    change={"selectors": recovery["selectors"]})
+    failed_request = {"selectors": recovery["selectors"]}
+    verify_failed(current, "verify-failed", pending, change=failed_request)
+    verify_failed(current, "verify-failed-again", pending, change=failed_request)
+    status_path = current.candidate / "var/lib/dpkg/status"
+    original_status = status_path.read_bytes()
+    assert b"Status: install ok half-configured" in original_status
+    changed_status = original_status.replace(b"Version: 1.0-1", b"Version: 1.0-2", 1)
+    assert changed_status != original_status
+    m.write(status_path, changed_status)
+    verify_failed(current, "verify-failed-changed-database", pending,
+                  expected_error="FinalStateMismatch", change=failed_request)
+    m.write(status_path, original_status)
+    verify_failed(current, "verify-failed-wrong-request", pending,
+                  expected_error="InvalidCompletion", change={"selectors": [{"name": "different"}]})
+    active = current.candidate / INTENT
+    original_intent = active.read_bytes()
+    m.write(active, b"{}\n")
+    verify_failed(current, "verify-failed-changed-intent", pending,
+                  expected_error="EvidenceChanged", change=failed_request)
+    m.write(active, original_intent)
+    if result_cli is not None:
+        verify_result(current, lock, False)
+    workflow(executable, recovery, current.directory / "failed-acknowledgment-crash", environment,
+             completion_crash="after_native_acknowledged", owner_evidence=pending,
+             acknowledgment="recovery")
+    verify_failed(current, "verify-failed-after-native-acknowledgment", pending, change=failed_request)
     run(current, "acknowledge", recovery, owner_evidence=pending, acknowledgment="recovery")
     assert_completion(current, lock)
     assert not (current.candidate / owner_path).exists()

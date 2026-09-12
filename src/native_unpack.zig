@@ -17470,6 +17470,30 @@ pub const Runtime = struct {
     ) !void {
         if (receipt.outcome != .succeeded)
             return error.TransactionNotSuccessful;
+        try verifyTerminalDatabase(allocator, root, authorization, receipt);
+    }
+
+    /// Matches a known failure's recorded database without asserting that the
+    /// desired package closure was reached. The caller holds the root lock.
+    pub fn verifyFailedState(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        authorization: native_authorization.Authorization,
+        receipt: native_provenance.Document,
+    ) !void {
+        if (receipt.outcome != .failed)
+            return error.TransactionNotFailed;
+        try verifyTerminalDatabase(allocator, root, authorization, receipt);
+    }
+
+    fn verifyTerminalDatabase(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        authorization: native_authorization.Authorization,
+        receipt: native_provenance.Document,
+    ) !void {
+        if (receipt.outcome == .recovery_required)
+            return error.TransactionNotTerminal;
         var captured = try captureDatabaseSnapshot(allocator, root, .{});
         defer captured.deinit();
         normalizeCapturedNativeArchitecture(&captured.snapshot, authorization.target_architecture);
@@ -17481,7 +17505,7 @@ pub const Runtime = struct {
             .diagnostic => return error.InvalidExternalDatabase,
         };
         defer database.deinit();
-        if (!lifecycleFinalClosureMatches(authorization.final_state, database) or
+        if ((receipt.outcome == .succeeded and !lifecycleFinalClosureMatches(authorization.final_state, database)) or
             !std.mem.eql(u8, &native_provenance.hexDigest(database.generation.sha256), &receipt.final_database_generation_sha256) or
             !std.mem.eql(u8, &native_provenance.hexDigest(nativeFinalClosureDigest(captured.snapshot)), &receipt.final_state_sha256))
             return error.FinalStateMismatch;

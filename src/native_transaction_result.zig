@@ -115,7 +115,7 @@ pub fn verify(
     defer receipt.deinit();
     const proof = receipt.document;
     const outer = completion.document;
-    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, proof);
+    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, proof, .succeeded);
     if (!locks.held(held.token)) return error.LockLost;
     return .{
         .target_architecture = expected_architecture,
@@ -141,19 +141,26 @@ pub const OwnedRequest = struct {
     caller_policy_sha256: [32]u8,
 };
 
+const TerminalOutcome = enum { succeeded, failed };
+
+fn OwnedResult(comptime expected_outcome: TerminalOutcome) type {
+    return struct {
+        pub const outcome = expected_outcome;
+        owner: root_operation.DeferredAcknowledgment,
+        receipt: native_provenance.OwnedDocument,
+        completion: root_operation_completion.OwnedDocument,
+
+        pub fn deinit(self: *@This()) void {
+            self.receipt.deinit();
+            self.completion.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
 /// Owns verified documents, but does not assert that the root has been cleared.
-pub const OwnedSuccess = struct {
-    owner: root_operation.DeferredAcknowledgment,
-    receipt: native_provenance.OwnedDocument,
-    completion: root_operation_completion.OwnedDocument,
-
-    pub fn deinit(self: *OwnedSuccess) void {
-        self.receipt.deinit();
-        self.completion.deinit();
-        self.* = undefined;
-    }
-};
-
+pub const OwnedSuccess = OwnedResult(.succeeded);
+pub const PendingFailure = OwnedResult(.failed);
 pub const PendingRequest = OwnedRequest;
 pub const PendingSuccess = OwnedSuccess;
 const OwnershipState = enum { pending, released };
@@ -169,7 +176,21 @@ pub fn verifyPendingSuccess(
     expected: PendingRequest,
     locks: root_operation.LockBackend,
 ) !PendingSuccess {
-    return verifyOwnedSuccess(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending);
+    return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending, .succeeded);
+}
+
+/// Confirms a known terminal failure and its recorded database, not the desired
+/// final closure. Unknown outcomes are not failures that this entry point accepts.
+pub fn verifyPendingFailure(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: OwnedRequest,
+    locks: root_operation.LockBackend,
+) !PendingFailure {
+    return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending, .failed);
 }
 
 /// Native execution has acknowledged its evidence, but the caller still owns the
@@ -183,10 +204,10 @@ pub fn verifyReleasedSuccess(
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
 ) !OwnedSuccess {
-    return verifyOwnedSuccess(allocator, root, install_root, lock, expected_architecture, expected, locks, .released);
+    return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .released, .succeeded);
 }
 
-fn verifyOwnedSuccess(
+fn verifyOwned(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -195,8 +216,9 @@ fn verifyOwnedSuccess(
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
     state: OwnershipState,
-) !OwnedSuccess {
-    return verifyOwnedSuccessInternal(
+    comptime expected_outcome: TerminalOutcome,
+) !OwnedResult(expected_outcome) {
+    return verifyOwnedInternal(
         allocator,
         root,
         install_root,
@@ -205,6 +227,7 @@ fn verifyOwnedSuccess(
         expected,
         locks,
         state,
+        expected_outcome,
     ) catch |err| switch (err) {
         // This read-only path writes only to allocating canonical encoders.
         error.WriteFailed => error.OutOfMemory,
@@ -212,7 +235,7 @@ fn verifyOwnedSuccess(
     };
 }
 
-fn verifyOwnedSuccessInternal(
+fn verifyOwnedInternal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
@@ -221,7 +244,10 @@ fn verifyOwnedSuccessInternal(
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
     state: OwnershipState,
-) !OwnedSuccess {
+    comptime expected_outcome: TerminalOutcome,
+) !OwnedResult(expected_outcome) {
+    if (expected_outcome == .failed and state != .pending)
+        return error.PendingOwnerRequired;
     const owner_bytes = try expected.owner.canonicalJson(allocator);
     defer allocator.free(owner_bytes);
     const required_state: root_operation.DeferredAcknowledgmentState = switch (state) {
@@ -277,7 +303,7 @@ fn verifyOwnedSuccessInternal(
         return error.OperationNotSettled;
     var receipt = try native_provenance.read(allocator, root) orelse return error.ReceiptMissing;
     errdefer receipt.deinit();
-    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, receipt.document);
+    try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, receipt.document, expected_outcome);
     if (state == .pending)
         try verifyPendingEvidence(allocator, root, receipt.document);
     if (!locks.held(held.token)) return error.LockLost;
@@ -339,6 +365,7 @@ fn verifyEvidence(
     expected_architecture: []const u8,
     outer: root_operation_completion.Document,
     proof: native_provenance.Document,
+    expected_outcome: TerminalOutcome,
 ) !void {
     const lock_bytes = try lock.canonicalJson(allocator);
     defer allocator.free(lock_bytes);
@@ -346,8 +373,7 @@ fn verifyEvidence(
     defer validated_lock.deinit();
     if (!std.mem.eql(u8, lock.target_architecture, expected_architecture))
         return error.ArchitectureMismatch;
-    if (proof.outcome != .succeeded or outer.outcome != .succeeded)
-        return error.TransactionNotSuccessful;
+    try verifyTerminalOutcome(expected_outcome, proof.outcome, outer.outcome);
     if (outer.backend != .native or !outer.mutation_started or
         outer.operation != .package_transaction or
         outer.transaction_provenance.status == .unavailable or
@@ -446,8 +472,12 @@ fn verifyEvidence(
         .substep = 0,
         .ordinal = 0,
     }) orelse return error.InvalidRecoveryProgress;
-    if (terminal.stage != .terminal or (terminal.result != .succeeded and terminal.result != .recovered))
-        return error.TransactionNotSuccessful;
+    const terminal_matches = terminal.stage == .terminal and switch (expected_outcome) {
+        .succeeded => terminal.result == .succeeded or terminal.result == .recovered,
+        .failed => terminal.result == .failed,
+    };
+    if (!terminal_matches)
+        return if (expected_outcome == .succeeded) error.TransactionNotSuccessful else error.TransactionNotFailed;
     const progress_summary = native_recovery.summarizeProgress(progress.document);
     try equalDigest(native_recovery.hexDigest(progress_summary.script_outcomes_sha256), proof.script_outcomes_sha256);
     if (progress_summary.recovered_phase_count != proof.recovered_phase_count)
@@ -466,7 +496,23 @@ fn verifyEvidence(
     try evidenceDigest(proof, .managed_state, managed.document.digest_sha256);
     try equalDigest(managed.document.intent_sha256, proof.execution_intent_sha256);
     if (managed.document.transient != null) return error.InvalidManagedState;
-    try native_runtime.verifyCompletedState(allocator, root, authorized, proof);
+    switch (expected_outcome) {
+        .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
+        .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
+    }
+}
+
+fn verifyTerminalOutcome(
+    expected: TerminalOutcome,
+    receipt: native_provenance.Outcome,
+    completion: root_operation.Outcome,
+) !void {
+    switch (expected) {
+        .succeeded => if (receipt != .succeeded or completion != .succeeded)
+            return error.TransactionNotSuccessful,
+        .failed => if (receipt != .failed or completion != .failed_after_mutation)
+            return error.TransactionNotFailed,
+    }
 }
 
 fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof: native_provenance.Document) !void {
@@ -759,7 +805,7 @@ fn testOwnedRefusal(
     expected_error: anyerror,
     state: OwnershipState,
 ) !void {
-    var result = verifyOwnedSuccess(allocator, root, path, lock, "amd64", expected, locks, state) catch |err| {
+    var result = verifyOwned(allocator, root, path, lock, "amd64", expected, locks, state, .succeeded) catch |err| {
         if (err == expected_error) return;
         return err;
     };
@@ -770,6 +816,20 @@ fn testOwnedRefusal(
 test "native_transaction_result.test.owned verification preserves exact owners and never provisions locks" {
     try testOwnedBoundaries(.pending);
     try testOwnedBoundaries(.released);
+}
+
+test "native_transaction_result.test.known failure cannot become success or accept unknown outcomes" {
+    try std.testing.expect(OwnedSuccess != PendingFailure);
+    try verifyTerminalOutcome(.succeeded, .succeeded, .succeeded);
+    try verifyTerminalOutcome(.failed, .failed, .failed_after_mutation);
+    for ([_]native_provenance.Outcome{ .succeeded, .failed, .recovery_required }) |receipt| {
+        for (std.meta.tags(root_operation.Outcome)) |completion| {
+            if (receipt != .succeeded or completion != .succeeded)
+                try std.testing.expectError(error.TransactionNotSuccessful, verifyTerminalOutcome(.succeeded, receipt, completion));
+            if (receipt != .failed or completion != .failed_after_mutation)
+                try std.testing.expectError(error.TransactionNotFailed, verifyTerminalOutcome(.failed, receipt, completion));
+        }
+    }
 }
 
 fn testOwnedBoundaries(comptime state: OwnershipState) !void {
