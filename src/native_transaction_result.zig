@@ -140,8 +140,37 @@ pub const OwnedRequest = struct {
     operation: product_api.Operation,
     caller_request_sha256: [32]u8,
     caller_policy_sha256: [32]u8,
+    review_owner: ?root_operation.DeferredAcknowledgment = null,
     projection: ?*const live_root.Projection = null,
 };
+
+pub fn validateReviewOwner(
+    allocator: std.mem.Allocator,
+    owner: root_operation.DeferredAcknowledgment,
+    review_owner: ?root_operation.DeferredAcknowledgment,
+) !void {
+    const expected = review_owner orelse return;
+    const source = try expected.canonicalJson(allocator);
+    defer allocator.free(source);
+    if (expected.document_version != root_operation.deferred_ack_v2_schema_version or
+        expected.recovery_review_claim_sha256 == null or
+        !std.mem.eql(u8, &expected.digest_sha256, &owner.digest_sha256))
+        return error.RecoveryReviewOwnershipMismatch;
+}
+
+pub fn verifyReviewOwner(
+    expected: OwnedRequest,
+    claim: root_operation.RecoveryReviewClaim,
+) !void {
+    const owner = expected.review_owner orelse return error.RecoveryReviewClaimPresent;
+    if (claim.prior_marker == null or claim.mutation_status != .changed or
+        !root_operation.deferredAcknowledgmentExactEqual(claim.prior_marker.?, expected.owner) or
+        !root_operation.deferredAcknowledgmentExactEqual(
+            try root_operation.bindDeferredAcknowledgmentToRecoveryReview(expected.owner, claim),
+            owner,
+        ))
+        return error.RecoveryReviewOwnershipMismatch;
+}
 
 const TerminalOutcome = enum { succeeded, failed };
 
@@ -252,6 +281,7 @@ fn verifyOwnedInternal(
         return error.PendingOwnerRequired;
     const owner_bytes = try expected.owner.canonicalJson(allocator);
     defer allocator.free(owner_bytes);
+    try validateReviewOwner(allocator, expected.owner, expected.review_owner);
     const required_state: root_operation.DeferredAcknowledgmentState = switch (state) {
         .pending => .pending,
         .released => .released,
@@ -261,8 +291,8 @@ fn verifyOwnedInternal(
     var held = try VerificationLock.acquire(root, install_root, locks, expected.projection);
     defer held.deinit();
     const store = root_operation.Store.init(root);
-    if (try store.readRecoveryReviewClaim(allocator) != null)
-        return error.RecoveryReviewClaimPresent;
+    const review = try store.readRecoveryReviewClaim(allocator);
+    if (review) |claim| try verifyReviewOwner(expected, claim);
     const observed = try store.readDeferredAcknowledgment(allocator) orelse
         return missing_owner;
     if (!root_operation.deferredAcknowledgmentExactEqual(observed, expected.owner))
@@ -285,6 +315,18 @@ fn verifyOwnedInternal(
         return error.CompletionMissing;
     errdefer completion.deinit();
     const outer = completion.document;
+    if (review) |claim| {
+        if ((claim.record_sha256 == null) != (record == null) or
+            (record != null and !std.mem.eql(u8, &claim.record_sha256.?, &record.?.record.digest_sha256)) or
+            claim.completion_sha256 == null or
+            !std.mem.eql(u8, &claim.completion_sha256.?, &outer.digest_sha256) or
+            !std.mem.eql(u8, &claim.exact_lock_sha256, &lock.digest_sha256) or
+            !std.mem.eql(u8, &claim.semantic_request_sha256, &lock.request_sha256) or
+            (claim.outer_transaction_sha256 != null and
+                (outer.transaction_provenance.document_sha256 == null or
+                    !std.mem.eql(u8, &claim.outer_transaction_sha256.?, &outer.transaction_provenance.document_sha256.?))))
+            return error.RecoveryReviewEvidenceMismatch;
+    }
     if (record) |owned| {
         if (!outer.bindsRecord(owned.record) or
             !textsEqual(outer.foreign_architectures, owned.record.foreign_architectures) or
@@ -1063,6 +1105,30 @@ fn testOwnedBoundaries(comptime state: OwnershipState) !void {
         testOwnedRefusal,
         .{ root, path, lock.lock, expected, locks, error.RecoveryReviewClaimPresent, state },
     );
+    claim.prior_marker = reviewed;
+    claim.marker_sha256 = reviewed.digest_sha256;
+    claim.marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(reviewed);
+    claim = try root_operation.createRecoveryReviewClaim(claim);
+    const authorized_claim = try claim.canonicalJson(allocator);
+    defer allocator.free(authorized_claim);
+    try root.publishFile(try root_fs.Path.init(root_operation.deferred_ack_path), authorized_claim, .{ .overwrite = .replace });
+    expected.review_owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(reviewed, claim);
+    try testing.checkAllAllocationFailures(
+        allocator,
+        testOwnedRefusal,
+        .{ root, path, lock.lock, expected, locks, error.CompletionMissing, state },
+    );
+    var foreign_claim = claim;
+    foreign_claim.nonce[0] ^= 1;
+    foreign_claim = try root_operation.createRecoveryReviewClaim(foreign_claim);
+    const authorized_owner = expected.review_owner.?;
+    expected.review_owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(reviewed, foreign_claim);
+    try testing.expectEqualSlices(u8, &authorized_owner.digest_sha256, &expected.review_owner.?.digest_sha256);
+    try testing.expectError(error.RecoveryReviewOwnershipMismatch, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
+    expected.review_owner = base;
+    const acquisitions = observer.acquisitions;
+    try testing.expectError(error.RecoveryReviewOwnershipMismatch, verify_success(allocator, root, path, lock.lock, "amd64", expected, locks));
+    try testing.expectEqual(acquisitions, observer.acquisitions);
     try testing.expectEqual(observer.acquisitions, observer.releases);
     try testing.expect(!observer.live);
     try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);

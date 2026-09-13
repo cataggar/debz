@@ -330,6 +330,22 @@ issued projection authority. Missing runner/verifier support, wrong backend,
 cross-schema locks, unsupported owner states, and mismatched evidence fail
 closed; no backend fallback or owner discovery can supply authorization.
 
+An active recovery review still blocks owned verification by default. A caller
+may supply its independently retained exact v2 review-owner binding to authorize
+only the matching claim. The verifier checks the claim's full identity and prior
+owner, then its record, completion, lock, semantic request and optional receipt
+digest against live evidence under the read-only root lock. A same-base-digest
+owner with a different review identity does not authorize the claim. This also
+supports the distinct pending-failure verifier without treating failure as
+success.
+
+The facade carries this authority from the durable recovery-review token, or
+from an already authorized review during confirmed completion. A token published
+before the lower claim does not require that claim to exist; ordinary exact-owner
+verification remains valid when no review is present. The verifier never creates,
+consumes or clears a review claim. Committed historical proof does not accept
+live review authority and remains independent of current root state.
+
 The child returns bounded canonical owner, receipt, and completion documents
 through the existing supervised transport. The parent checks exact v1/v2 owner
 identity and the outcome, attempt, caller, lock, and receipt/completion bindings.

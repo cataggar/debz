@@ -5385,11 +5385,15 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             expected_error: ?[]const u8 = null,
             state: enum { pending, released } = .pending,
             outcome: enum { succeeded, failed } = .succeeded,
+            review: ?enum { publish, publish_stale, authorized, foreign, clear } = null,
         } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.owned_verification) |check|
+        if (check.review != null and !external.projected)
+            return error.InvalidExternalWorkflowRequest;
     if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
@@ -5611,6 +5615,25 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
     );
     if ((owner.state == .pending) != (check.state == .pending))
         return error.InvalidExternalWorkflowRequest;
+    const claim_path = try std.fmt.allocPrint(allocator, "{s}.review-claim", .{external.owner_evidence.?});
+    const review_owner_path = try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?});
+    if (check.review) |mode|
+        if (mode == .publish or mode == .publish_stale or mode == .clear)
+            try prepareExternalNativeReviewFixture(owner, check.lock_path, check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest, claim_path, review_owner_path, mode == .clear, mode == .publish_stale);
+    const review_owner: ?root_operation.DeferredAcknowledgment = if (check.review == .authorized)
+        try root_operation.decodeDeferredAcknowledgment(
+            allocator,
+            try readFile(allocator, std.testing.io, review_owner_path, root_operation.maximum_document_bytes),
+        )
+    else if (check.review == .foreign) foreign: {
+        var claim = try root_operation.decodeRecoveryReviewClaim(
+            allocator,
+            try readFile(allocator, std.testing.io, claim_path, root_operation.maximum_document_bytes),
+        );
+        claim.nonce[0] ^= 1;
+        claim = try root_operation.createRecoveryReviewClaim(claim);
+        break :foreign try root_operation.bindDeferredAcknowledgmentToRecoveryReview(owner, claim);
+    } else null;
     var runner: facade.PrivateLiveRootRunner = .{ .io = std.testing.io };
     var verifier: facade.SystemResultVerifier = .{ .io = std.testing.io };
     var result = runner.interface().verifyOwnedNative(allocator, verifier.interface(), check.backend, .{
@@ -5621,6 +5644,7 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
             .digest_sha256 = check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest,
         },
         .owner = owner,
+        .review_owner = review_owner,
         .operation = switch (external.workflow.operation) {
             .install => .install,
             .remove => .remove,
@@ -5642,6 +5666,95 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
         "{\"verified\":true,\"outcome\":\"succeeded\"}\n"
     else
         "{\"verified\":true,\"outcome\":\"failed\"}\n";
+}
+
+fn prepareExternalNativeReviewFixture(
+    owner: root_operation.DeferredAcknowledgment,
+    lock_path: []const u8,
+    lock_digest: [32]u8,
+    claim_path: []const u8,
+    owner_path: []const u8,
+    clear: bool,
+    stale: bool,
+) !void {
+    const Callback = struct {
+        owner: root_operation.DeferredAcknowledgment,
+        lock_path: []const u8,
+        lock_digest: [32]u8,
+        claim_path: []const u8,
+        owner_path: []const u8,
+        clear: bool,
+        stale: bool,
+
+        fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            const allocator = std.heap.page_allocator;
+            var root = try root_fs.openAbsoluteRoot(std.testing.io, live_root.logical_root_path);
+            defer root.close();
+            try projection.validateRoot(live_root.logical_root_path, root.root.dir.handle);
+            const marker = try root.root.readFileAlloc(allocator, try root_fs.Path.init(".debz-native-disposable"), 128);
+            defer allocator.free(marker);
+            if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
+                return error.InvalidExternalWorkflowRequest;
+            const store = root_operation.Store.init(root.root);
+            if (self.clear) {
+                const claim_source = try readFile(allocator, std.testing.io, self.claim_path, root_operation.maximum_document_bytes);
+                defer allocator.free(claim_source);
+                try store.clearRecoveryReviewClaim(allocator, try root_operation.decodeRecoveryReviewClaim(allocator, claim_source));
+                return 0;
+            }
+            const lock_source = try readFile(allocator, std.testing.io, self.lock_path, 8 * 1024 * 1024);
+            defer allocator.free(lock_source);
+            var lock = try exact_lock_v2.decode(allocator, lock_source, 8 * 1024 * 1024);
+            defer lock.deinit();
+            if (!std.mem.eql(u8, &lock.lock.digest_sha256, &self.lock_digest))
+                return error.InvalidExternalWorkflowRequest;
+            var record = try store.read(allocator);
+            defer if (record) |*owned| owned.deinit();
+            var completion = (try root_operation_completion.Store.init(root.root).read(allocator)) orelse
+                return error.InvalidExternalWorkflowRequest;
+            defer completion.deinit();
+            var completion_digest = completion.document.digest_sha256;
+            if (self.stale) completion_digest[0] ^= 1;
+            const claim = try root_operation.createRecoveryReviewClaim(.{
+                .outer_attempt_id = self.owner.acknowledgment_id,
+                .outer_generation = 1,
+                .outer_state_sha256 = @splat(32),
+                .profile_sha256 = @splat(33),
+                .profile_reference_sha256 = @splat(34),
+                .exact_lock_sha256 = self.lock_digest,
+                .semantic_request_sha256 = lock.lock.request_sha256,
+                .outer_transaction_sha256 = completion.document.transaction_provenance.document_sha256,
+                .mutation_status = .changed,
+                .nonce = @splat(35),
+                .prior_marker = self.owner,
+                .marker_sha256 = self.owner.digest_sha256,
+                .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(self.owner),
+                .record_sha256 = if (record) |owned| owned.record.digest_sha256 else null,
+                .completion_sha256 = completion_digest,
+            });
+            const claim_bytes = try claim.canonicalJson(allocator);
+            defer allocator.free(claim_bytes);
+            const review_owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(self.owner, claim);
+            const owner_bytes = try review_owner.canonicalJson(allocator);
+            defer allocator.free(owner_bytes);
+            try writeExternalNativeWorkflowReport(self.claim_path, claim_bytes);
+            try writeExternalNativeWorkflowReport(self.owner_path, owner_bytes);
+            try store.publishRecoveryReviewClaim(allocator, claim);
+            return 0;
+        }
+    };
+    var callback: Callback = .{
+        .owner = owner,
+        .lock_path = lock_path,
+        .lock_digest = lock_digest,
+        .claim_path = claim_path,
+        .owner_path = owner_path,
+        .clear = clear,
+        .stale = stale,
+    };
+    const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+    if (result != .exited or result.exited != 0) return error.InvalidExternalWorkflowRequest;
 }
 
 fn recoverExternalNativeWorkflow(allocator: std.mem.Allocator, external: anytype) ![]const u8 {
