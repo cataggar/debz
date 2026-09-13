@@ -2000,6 +2000,11 @@ pub const Backend = struct {
                 request.operation,
                 "deferred lower recovery marker is missing for an active record",
             );
+            if (self.transaction_backend == .native) {
+                if (recovery_review_claim) |claim|
+                    if (claim.mutation_status == .changed and claim.prior_marker == null)
+                        return self.finalizeClearedNativeReview(allocator, store, request.operation, acknowledgment.acknowledgment_id, claim, .recovery);
+            }
             if (recovery_review_claim) |claim| {
                 const review = store.readRecoveryReviewClaim(
                     allocator,
@@ -2223,6 +2228,44 @@ pub const Backend = struct {
         );
     }
 
+    fn finalizeClearedNativeReview(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        store: root_operation.Store,
+        operation: api.Operation,
+        acknowledgment_id: [32]u8,
+        expected: root_operation.RecoveryReviewClaim,
+        kind: enum { recovery, ownership },
+    ) !api.Result {
+        if (expected.prior_marker != null or expected.record_sha256 != null or
+            expected.outer_transaction_sha256 == null or expected.mutation_status != .changed or
+            !std.mem.eql(u8, &expected.outer_attempt_id, &acknowledgment_id))
+            return blockedRecovery(operation, "cleared native recovery review has no exact historical caller binding");
+        const observed = (store.readRecoveryReviewClaim(allocator) catch |err| switch (err) {
+            error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+            else => return blockedRecovery(operation, "cleared native recovery review is unreadable"),
+        }) orelse return blockedRecovery(operation, "cleared native recovery requires a fresh review");
+        if (!root_operation.recoveryReviewClaimExactEqual(expected, observed))
+            return blockedRecovery(operation, "cleared native recovery review is stale or foreign");
+        var completion = root_operation_completion.Store.init(store.root).read(allocator) catch |err| switch (err) {
+            error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+            else => return blockedRecovery(operation, "cleared native recovery snapshot is unreadable"),
+        };
+        defer if (completion) |*owned| owned.deinit();
+        if ((completion == null) != (expected.completion_sha256 == null) or
+            (completion != null and !std.mem.eql(u8, &completion.?.document.digest_sha256, &expected.completion_sha256.?)))
+            return blockedRecovery(operation, "cleared native recovery snapshot changed after review");
+        if (self.completion_crash) |crash|
+            try crash.hit(if (kind == .recovery) .before_deferred_marker_cleared else .before_ownership_marker_clear);
+        store.clearRecoveryReviewClaim(allocator, expected) catch |err| switch (err) {
+            error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+            else => return blockedRecovery(operation, "cleared native recovery review could not be finalized"),
+        };
+        if (self.completion_crash) |crash|
+            try crash.hit(if (kind == .recovery) .after_deferred_marker_cleared else .after_ownership_marker_clear);
+        return success(operation, false, "cleared native ownership finalized from confirmed historical review", &.{});
+    }
+
     fn deferredCleanupObserver(
         self: *Backend,
     ) root_operation.OwnershipCleanupObserver {
@@ -2306,6 +2349,11 @@ pub const Backend = struct {
                 request.operation,
                 "lower ownership marker is missing for an active record",
             );
+            if (self.transaction_backend == .native) {
+                if (recovery_review_claim) |claim|
+                    if (claim.mutation_status == .changed and claim.prior_marker == null)
+                        return self.finalizeClearedNativeReview(allocator, store, request.operation, acknowledgment.acknowledgment_id, claim, .ownership);
+            }
             if (recovery_review_claim) |claim| {
                 const review = store.readRecoveryReviewClaim(
                     allocator,
@@ -2388,7 +2436,8 @@ pub const Backend = struct {
                 "lower ownership acknowledgment is internally inconsistent",
             );
         const expected_observed = if (recovery_review_claim) |review|
-            if (observed.recovery_review_claim_sha256 != null)
+            if (observed.recovery_review_claim_sha256 != null and
+                !(self.transaction_backend == .native and observed.state == .released))
                 root_operation.bindDeferredAcknowledgmentToRecoveryReview(
                     acknowledgment.marker,
                     review,
@@ -5370,6 +5419,12 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             lock_sha256: [32]u8,
             generation: u64,
         } = null,
+        prepare_cleared_review: ?struct {
+            lock_path: []const u8,
+            lock_sha256: [32]u8,
+            receipt_sha256: [32]u8,
+            generation: u64,
+        } = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
@@ -5382,7 +5437,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             expected_error: ?[]const u8 = null,
             state: enum { pending, released } = .pending,
             outcome: enum { succeeded, failed } = .succeeded,
-            review: ?enum { publish, publish_stale, authorized, foreign, clear } = null,
+            review: ?enum { publish, publish_stale, authorized, foreign, clear, transfer } = null,
             review_generation: u64 = 1,
         } = null,
     };
@@ -5400,6 +5455,12 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             external.review_evidence == null or external.owner_evidence == null or
             external.facade_recover or external.owned_verification != null))
         return error.InvalidExternalWorkflowRequest;
+    if (external.prepare_cleared_review != null and
+        (!external.projected or external.acknowledgment == null or
+            external.review_evidence == null or external.owner_evidence == null or
+            external.facade_recover or external.owned_verification != null or
+            external.prepare_acknowledged_review != null))
+        return error.InvalidExternalWorkflowRequest;
     if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
@@ -5416,11 +5477,21 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
                 review.lock_sha256,
                 external.review_evidence.?,
                 try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?}),
-                false,
-                false,
-                review.generation,
+                .{ .generation = review.generation },
             );
         }
+        if (external.prepare_cleared_review) |review|
+            try prepareExternalNativeReviewFixture(
+                try root_operation.decodeDeferredAcknowledgment(
+                    allocator,
+                    try readFile(allocator, std.testing.io, external.owner_evidence.?, root_operation.maximum_document_bytes),
+                ),
+                review.lock_path,
+                review.lock_sha256,
+                external.review_evidence.?,
+                try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?}),
+                .{ .generation = review.generation, .cleared_receipt = review.receipt_sha256 },
+            );
         if (external.facade_recover) {
             const output = try recoverExternalNativeWorkflow(allocator, external);
             try writeExternalNativeWorkflowReport(external.report, output);
@@ -5646,8 +5717,13 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
     const claim_path = try std.fmt.allocPrint(allocator, "{s}.review-claim", .{external.owner_evidence.?});
     const review_owner_path = try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?});
     if (check.review) |mode|
-        if (mode == .publish or mode == .publish_stale or mode == .clear)
-            try prepareExternalNativeReviewFixture(owner, check.lock_path, check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest, claim_path, review_owner_path, mode == .clear, mode == .publish_stale, check.review_generation);
+        if (mode == .publish or mode == .publish_stale or mode == .clear or mode == .transfer)
+            try prepareExternalNativeReviewFixture(owner, check.lock_path, check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest, claim_path, review_owner_path, .{
+                .clear = mode == .clear,
+                .stale = mode == .publish_stale,
+                .transfer = mode == .transfer,
+                .generation = check.review_generation,
+            });
     const review_owner: ?root_operation.DeferredAcknowledgment = if (check.review == .authorized)
         try root_operation.decodeDeferredAcknowledgment(
             allocator,
@@ -5702,9 +5778,13 @@ fn prepareExternalNativeReviewFixture(
     lock_digest: [32]u8,
     claim_path: []const u8,
     owner_path: []const u8,
-    clear: bool,
-    stale: bool,
-    generation: u64,
+    options: struct {
+        clear: bool = false,
+        stale: bool = false,
+        transfer: bool = false,
+        generation: u64 = 1,
+        cleared_receipt: ?[32]u8 = null,
+    },
 ) !void {
     const Callback = struct {
         owner: root_operation.DeferredAcknowledgment,
@@ -5712,9 +5792,7 @@ fn prepareExternalNativeReviewFixture(
         lock_digest: [32]u8,
         claim_path: []const u8,
         owner_path: []const u8,
-        clear: bool,
-        stale: bool,
-        generation: u64,
+        options: @TypeOf(options),
 
         fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
@@ -5727,7 +5805,7 @@ fn prepareExternalNativeReviewFixture(
             if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
                 return error.InvalidExternalWorkflowRequest;
             const store = root_operation.Store.init(root.root);
-            if (self.clear) {
+            if (self.options.clear) {
                 const claim_source = try readFile(allocator, std.testing.io, self.claim_path, root_operation.maximum_document_bytes);
                 defer allocator.free(claim_source);
                 try store.clearRecoveryReviewClaim(allocator, try root_operation.decodeRecoveryReviewClaim(allocator, claim_source));
@@ -5741,25 +5819,31 @@ fn prepareExternalNativeReviewFixture(
                 return error.InvalidExternalWorkflowRequest;
             var record = try store.read(allocator);
             defer if (record) |*owned| owned.deinit();
-            var completion = (try root_operation_completion.Store.init(root.root).read(allocator)) orelse
+            const cleared = self.options.cleared_receipt != null;
+            if (cleared and (record != null or try store.readDeferredAcknowledgment(allocator) != null))
                 return error.InvalidExternalWorkflowRequest;
-            defer completion.deinit();
-            var completion_digest = completion.document.digest_sha256;
-            if (self.stale) completion_digest[0] ^= 1;
+            var completion = try root_operation_completion.Store.init(root.root).read(allocator);
+            defer if (completion) |*owned| owned.deinit();
+            if (completion == null and !cleared) return error.InvalidExternalWorkflowRequest;
+            var completion_digest: ?[32]u8 = if (completion) |owned| owned.document.digest_sha256 else null;
+            if (self.options.stale) {
+                if (completion_digest == null) return error.InvalidExternalWorkflowRequest;
+                completion_digest.?[0] ^= 1;
+            }
             const claim = try root_operation.createRecoveryReviewClaim(.{
                 .outer_attempt_id = self.owner.acknowledgment_id,
-                .outer_generation = self.generation,
+                .outer_generation = self.options.generation,
                 .outer_state_sha256 = @splat(32),
                 .profile_sha256 = @splat(33),
                 .profile_reference_sha256 = @splat(34),
                 .exact_lock_sha256 = self.lock_digest,
                 .semantic_request_sha256 = lock.lock.request_sha256,
-                .outer_transaction_sha256 = completion.document.transaction_provenance.document_sha256,
+                .outer_transaction_sha256 = self.options.cleared_receipt orelse completion.?.document.transaction_provenance.document_sha256,
                 .mutation_status = .changed,
                 .nonce = @splat(35),
-                .prior_marker = self.owner,
-                .marker_sha256 = self.owner.digest_sha256,
-                .marker_exact_identity_sha256 = root_operation.deferredAcknowledgmentExactIdentity(self.owner),
+                .prior_marker = if (cleared) null else self.owner,
+                .marker_sha256 = if (cleared) null else self.owner.digest_sha256,
+                .marker_exact_identity_sha256 = if (cleared) null else root_operation.deferredAcknowledgmentExactIdentity(self.owner),
                 .record_sha256 = if (record) |owned| owned.record.digest_sha256 else null,
                 .completion_sha256 = completion_digest,
             });
@@ -5771,6 +5855,13 @@ fn prepareExternalNativeReviewFixture(
             try writeExternalNativeWorkflowReport(self.claim_path, claim_bytes);
             try writeExternalNativeWorkflowReport(self.owner_path, owner_bytes);
             try store.publishRecoveryReviewClaim(allocator, claim);
+            if (self.options.transfer)
+                try store.exchangeRecoveryReviewClaimForOwnership(allocator, .{
+                    .expected_claim = claim,
+                    .expected_marker = self.owner,
+                    .expected_record_sha256 = if (record) |owned| owned.record.digest_sha256 else null,
+                    .replacement_marker = self.owner,
+                });
             return 0;
         }
     };
@@ -5780,9 +5871,7 @@ fn prepareExternalNativeReviewFixture(
         .lock_digest = lock_digest,
         .claim_path = claim_path,
         .owner_path = owner_path,
-        .clear = clear,
-        .stale = stale,
-        .generation = generation,
+        .options = options,
     };
     const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
     if (result != .exited or result.exited != 0) return error.InvalidExternalWorkflowRequest;

@@ -493,6 +493,24 @@ without live database verification or package replay. The immutable pending
 acknowledgment is not replaced by the observed terminal marker. Native cleanup
 still checks active evidence and refuses foreign or orphaned state.
 
+When both original lower ownership and the root record are already absent,
+completed native history can reconcile the remaining outer active slot.
+Current shared completion is only a review snapshot: missing or foreign
+completion does not replace the original retained receipt as proof. The native
+shared receipt and live database are not consulted. Missing historical anchors,
+foreign ownership tokens and surviving foreign owners still prevent review.
+Repeated preparation preserves the exact no-owner review token.
+
+Confirmed cleanup consumes only that exact, still-present review under the
+projected root lock, after checking the empty ownership/record slot, absence of
+native active evidence and unchanged completion snapshot. It never reconstructs
+the original pending/released owner or creates replacement reconciliation
+ownership. A crash leaves either the review or no owner; a supplied review
+that has already disappeared cannot be treated as consumed authority. The
+operation-local acknowledgment and native receipt remain immutable. Released
+native owners that still exist likewise retain their original review identity
+through finalization rather than being rebound to a later cleanup review.
+
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
 owner and caller request/policy authority, a published completion bound to the
