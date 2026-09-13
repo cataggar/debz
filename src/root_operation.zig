@@ -2276,6 +2276,8 @@ pub const Store = struct {
         expected_marker: ?DeferredAcknowledgment,
         expected_record_sha256: ?[32]u8,
         replacement_marker: ?DeferredAcknowledgment = null,
+        // Terminal acknowledgment must not re-key an already retained owner.
+        preserve_prior_owner: bool = false,
         owner_publish_observer: ?root_fs.PublishObserver = null,
         observer: ?RecoveryReviewExchangeObserver = null,
     };
@@ -2295,6 +2297,7 @@ pub const Store = struct {
         exchange: RecoveryReviewExchange,
     ) !void {
         const claim = try self.readRecoveryReviewClaim(allocator) orelse {
+            if (exchange.preserve_prior_owner) return error.RecoveryReviewClaimMissing;
             const transferred = try self.readDeferredAcknowledgment(
                 allocator,
             ) orelse return error.RecoveryReviewClaimMissing;
@@ -2341,10 +2344,10 @@ pub const Store = struct {
             &replacement.acknowledgment_id,
             &claim.outer_attempt_id,
         )) return error.InvalidDocument;
-        replacement = try bindDeferredAcknowledgmentToRecoveryReview(
-            replacement,
-            claim,
-        );
+        replacement = if (exchange.preserve_prior_owner)
+            try preservedReviewOwner(replacement, claim)
+        else
+            try bindDeferredAcknowledgmentToRecoveryReview(replacement, claim);
         if (exchange.observer) |observer|
             try observer.hit(.before_owner_publish);
         const bytes = try replacement.canonicalJson(allocator);
@@ -2365,6 +2368,17 @@ pub const Store = struct {
             try observer.hit(.before_claim_clear);
         if (exchange.observer) |observer|
             try observer.hit(.after_claim_clear);
+    }
+
+    fn preservedReviewOwner(
+        marker: DeferredAcknowledgment,
+        claim: RecoveryReviewClaim,
+    ) !DeferredAcknowledgment {
+        const prior = claim.prior_marker orelse return error.NoDeferredAcknowledgment;
+        if ((prior.state != .pending and prior.state != .acknowledged and prior.state != .released) or
+            !deferredAcknowledgmentExactEqual(prior, marker))
+            return error.DeferredAcknowledgmentMismatch;
+        return prior;
     }
 
     pub fn publishDeferredAcknowledgment(
@@ -4950,6 +4964,84 @@ test "root_operation.test.recovery review exchange survives every durable public
             transferred,
             (try reopened.readDeferredAcknowledgment(testing.allocator)).?,
         );
+    }
+}
+
+test "root_operation.test.terminal review consumption preserves owner identity across publication failures" {
+    for ([_]u32{ deferred_ack_schema_version, deferred_ack_v2_schema_version }) |version| {
+        for ([_]DeferredAcknowledgmentState{ .pending, .acknowledged, .released }) |state| {
+            inline for (std.enums.values(root_fs.PublishPoint)) |fail_at| {
+                var tmp = testing.tmpDir(.{ .iterate = true });
+                defer tmp.cleanup();
+                const store = Store.init(.init(testing.io, tmp.dir));
+                try store.ensureNamespace();
+                const owner = try createDeferredAcknowledgment(.{
+                    .document_version = version,
+                    .state = state,
+                    .attempt_id = @splat(0x11),
+                    .acknowledgment_id = @splat(0x22),
+                    .completion_sha256 = if (state == .released) null else @splat(0x33),
+                    .provenance_sha256 = if (state == .released) null else @splat(0x44),
+                });
+                try store.publishDeferredAcknowledgment(testing.allocator, owner);
+                var claim = try createRecoveryReviewClaim(.{
+                    .outer_attempt_id = owner.acknowledgment_id,
+                    .outer_generation = 1,
+                    .outer_state_sha256 = @splat(0x55),
+                    .profile_sha256 = @splat(0x66),
+                    .profile_reference_sha256 = @splat(0x77),
+                    .exact_lock_sha256 = @splat(0x88),
+                    .semantic_request_sha256 = @splat(0x99),
+                    .mutation_status = .changed,
+                    .outer_transaction_sha256 = @splat(0xbb),
+                    .nonce = @splat(0xaa),
+                    .prior_marker = owner,
+                    .marker_sha256 = owner.digest_sha256,
+                    .marker_exact_identity_sha256 = deferredAcknowledgmentExactIdentity(owner),
+                });
+                try store.publishRecoveryReviewClaim(testing.allocator, claim);
+                const foreign = try bindDeferredAcknowledgmentToRecoveryReview(owner, claim);
+                try testing.expectError(error.DeferredAcknowledgmentMismatch, store.exchangeRecoveryReviewClaimForOwnership(testing.allocator, .{
+                    .expected_claim = claim,
+                    .expected_marker = owner,
+                    .expected_record_sha256 = null,
+                    .replacement_marker = foreign,
+                    .preserve_prior_owner = true,
+                }));
+                var observer: FailingPublishObserver = .{ .fail_at = fail_at };
+                try testing.expectError(error.InjectedCrash, store.exchangeRecoveryReviewClaimForOwnership(testing.allocator, .{
+                    .expected_claim = claim,
+                    .expected_marker = owner,
+                    .expected_record_sha256 = null,
+                    .preserve_prior_owner = true,
+                    .owner_publish_observer = observer.interface(),
+                }));
+                try testing.expect(deferredAcknowledgmentExactEqual(owner, (try store.readDeferredAcknowledgment(testing.allocator)).?));
+                const retry: Store.RecoveryReviewExchange = .{
+                    .expected_claim = claim,
+                    .expected_marker = owner,
+                    .expected_record_sha256 = null,
+                    .preserve_prior_owner = true,
+                };
+                if (try store.readRecoveryReviewClaim(testing.allocator) != null) {
+                    try store.exchangeRecoveryReviewClaimForOwnership(testing.allocator, retry);
+                } else {
+                    try testing.expectError(error.RecoveryReviewClaimMissing, store.exchangeRecoveryReviewClaimForOwnership(testing.allocator, retry));
+                }
+                try testing.expect((try store.readRecoveryReviewClaim(testing.allocator)) == null);
+                claim.outer_generation += 1;
+                claim.nonce[0] ^= 1;
+                claim = try createRecoveryReviewClaim(claim);
+                try store.publishRecoveryReviewClaim(testing.allocator, claim);
+                try store.exchangeRecoveryReviewClaimForOwnership(testing.allocator, .{
+                    .expected_claim = claim,
+                    .expected_marker = owner,
+                    .expected_record_sha256 = null,
+                    .preserve_prior_owner = true,
+                });
+                try testing.expect(deferredAcknowledgmentExactEqual(owner, (try store.readDeferredAcknowledgment(testing.allocator)).?));
+            }
+        }
     }
 }
 
