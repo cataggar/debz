@@ -1913,6 +1913,36 @@ def exercise_workflows(
                               owned_verification={**verification, "expected_error": "OperationalVerificationFailure"})
             finally:
                 damaged.write_bytes(original)
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "publish", "expected_error": "OperationalVerificationFailure",
+        })
+        reviewed_evidence = {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in (root / NAMESPACE).rglob("*") if path.is_file()
+        }
+        for _ in range(2):
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                **verification, "review": "authorized",
+            })
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "foreign", "expected_error": "OperationalVerificationFailure",
+        })
+        assert reviewed_evidence == {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in (root / NAMESPACE).rglob("*") if path.is_file()
+        }, "review-bound verification changed lower evidence"
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "clear",
+        })
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "publish_stale", "expected_error": "OperationalVerificationFailure",
+        })
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "authorized", "expected_error": "OperationalVerificationFailure",
+        })
+        projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+            **verification, "review": "clear",
+        })
         assert (root / "var/lib/dpkg/status").read_bytes() == status_before
         assert evidence_before == {
             str(path.relative_to(root)): path.read_bytes()

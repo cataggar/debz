@@ -4284,6 +4284,7 @@ pub const VerifiedTransaction = struct {
 pub const OwnedNativeRequest = struct {
     exact_lock: api.DocumentBinding,
     owner: root_operation.DeferredAcknowledgment,
+    review_owner: ?root_operation.DeferredAcknowledgment = null,
     operation: WorkflowOperation,
     selectors: []const solver.PackageSelector,
     options: product_api.CommonOptions,
@@ -4303,6 +4304,7 @@ pub const OwnedNativeRequest = struct {
             return error.InvalidVerificationRequest;
         const owner_bytes = try self.owner.canonicalJson(allocator);
         defer allocator.free(owner_bytes);
+        try native_transaction_result.validateReviewOwner(allocator, self.owner, self.review_owner);
     }
 
     fn semanticOperation(self: OwnedNativeRequest) production_backend.WorkflowSemanticOperation {
@@ -4320,6 +4322,7 @@ pub const OwnedNativeRequest = struct {
     ) !native_transaction_result.OwnedRequest {
         return .{
             .owner = self.owner,
+            .review_owner = self.review_owner,
             .operation = workflowSurfaceOperation(self.operation, .execute),
             .caller_request_sha256 = try production_backend.workflowProductRequestDigest(
                 allocator,
@@ -4358,7 +4361,7 @@ pub const CommittedNativeRequest = struct {
     fn validate(self: CommittedNativeRequest, allocator: std.mem.Allocator, backend: system_profile.TransactionBackend) !void {
         try self.owned.validate(allocator, backend);
         try operation_state.validate(self.retained);
-        if (self.owned.outcome != .succeeded or
+        if (self.owned.outcome != .succeeded or self.owned.review_owner != null or
             self.retained.phase != .completed or !self.retained.mutation_started or
             (self.retained.outcome != .succeeded and self.retained.outcome != .recovered) or
             !std.mem.eql(u8, &self.owned.owner.acknowledgment_id, &self.retained.attempt_id))
@@ -9082,6 +9085,7 @@ pub const Engine = struct {
         recovery_document: ?root_operation_completion.Document,
         recovery_lock: ?VerifiedLock,
         expected_attempt: ?[32]u8,
+        review_owner: ?root_operation.DeferredAcknowledgment,
     ) !native_transaction_result.OwnedSuccess {
         if (profile.transaction_backend != .native or
             !std.mem.eql(u8, &owner.acknowledgment_id, &prepared.attempt_id))
@@ -9099,6 +9103,7 @@ pub const Engine = struct {
         const request: OwnedNativeRequest = .{
             .exact_lock = prepared.exact_lock,
             .owner = owner,
+            .review_owner = review_owner,
             .operation = semanticOperation(prepared.request.operation),
             .selectors = selectors,
             .options = executeOptions(profile, prepared.paths.exact_lock),
@@ -9204,8 +9209,8 @@ pub const Engine = struct {
         }
         if (state.phase == .completed) return error.InvalidRetainedEvidence;
 
-        const owner = try self.nativeRecoveryLiveOwner(allocator, prepared, state, verified_lock, retained_owner);
-        var live = try self.verifyNativeCompletion(allocator, prepared, profile, owner, null, verified_lock, null);
+        const authority = try self.nativeRecoveryLiveAuthority(allocator, prepared, state, verified_lock, retained_owner);
+        var live = try self.verifyNativeCompletion(allocator, prepared, profile, authority.owner, null, verified_lock, null, authority.review_owner);
         defer live.deinit();
         var receipt_digest: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&receipt_digest, &live.receipt.document.digest_sha256) catch
@@ -9222,26 +9227,39 @@ pub const Engine = struct {
         };
     }
 
-    fn nativeRecoveryLiveOwner(
+    const NativeRecoveryAuthority = struct {
+        owner: root_operation.DeferredAcknowledgment,
+        review_owner: ?root_operation.DeferredAcknowledgment = null,
+    };
+
+    fn nativeRecoveryLiveAuthority(
         self: *Engine,
         allocator: std.mem.Allocator,
         prepared: Preparation,
         state: operation_state.State,
         verified_lock: VerifiedLock,
         retained_owner: ?root_operation.DeferredAcknowledgment,
-    ) !root_operation.DeferredAcknowledgment {
+    ) !NativeRecoveryAuthority {
         // A local owner is authority; current root ownership is only evidence to compare.
-        if (retained_owner) |owner| return owner;
-        const token = (try self.store.readOwnershipToken(allocator, prepared.paths)) orelse
+        const token = try self.store.readOwnershipToken(allocator, prepared.paths);
+        if (token) |value|
+            if (!ownershipTokenMatchesPreparation(value, prepared, state, verified_lock))
+                return error.InvalidRetainedEvidence;
+        const owner = retained_owner orelse owner: {
+            const value = token orelse return error.InvalidRetainedEvidence;
+            if (value.purpose == .execution and value.marker.state == .released)
+                break :owner value.marker;
+            if (value.purpose == .recovery_review)
+                if (value.prior_marker) |prior|
+                    if (prior.state == .released) break :owner prior;
             return error.InvalidRetainedEvidence;
-        if (!ownershipTokenMatchesPreparation(token, prepared, state, verified_lock))
-            return error.InvalidRetainedEvidence;
-        if (token.purpose == .execution and token.marker.state == .released)
-            return token.marker;
-        if (token.purpose == .recovery_review)
-            if (token.prior_marker) |prior|
-                if (prior.state == .released) return prior;
-        return error.InvalidRetainedEvidence;
+        };
+        if (token) |value| {
+            if (value.purpose == .recovery_review and value.prior_marker != null and
+                root_operation.deferredAcknowledgmentExactEqual(value.prior_marker.?, owner))
+                return .{ .owner = owner, .review_owner = value.marker };
+        }
+        return .{ .owner = owner };
     }
 
     fn verifyUnretainedNativeCompletion(
@@ -9262,9 +9280,9 @@ pub const Engine = struct {
         defer if (final) |*owned| owned.deinit();
         if (final != null) return error.InvalidRetainedEvidence;
         const retained_owner = try self.store.readAcknowledgmentFn(self.store.context, allocator, prepared.paths);
-        const owner = try self.nativeRecoveryLiveOwner(allocator, prepared, state, verified_lock, retained_owner);
-        if (owner.state != .released) return error.InvalidRetainedEvidence;
-        var live = try self.verifyNativeCompletion(allocator, prepared, profile, owner, null, verified_lock, null);
+        const authority = try self.nativeRecoveryLiveAuthority(allocator, prepared, state, verified_lock, retained_owner);
+        if (authority.owner.state != .released) return error.InvalidRetainedEvidence;
+        var live = try self.verifyNativeCompletion(allocator, prepared, profile, authority.owner, null, verified_lock, null, authority.review_owner);
         defer live.deinit();
         return .{
             .owner = live.owner,
@@ -9321,6 +9339,10 @@ pub const Engine = struct {
                 recovery_document,
                 recovery_lock,
                 expected_recovery_attempt,
+                if (recovery_review_claim) |claim|
+                    root_operation.bindDeferredAcknowledgmentToRecoveryReview(owner, claim) catch return error.InvariantViolation
+                else
+                    null,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvariantViolation => return error.InvariantViolation,
@@ -15173,6 +15195,14 @@ const FakeRunner = struct {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         if (backend != .native) return error.InvariantViolation;
         self.native_verification_calls += 1;
+        if (self.recovery_review_claim) |claim| {
+            const expected = request.authority(allocator, null) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.OperationalVerificationFailure,
+            };
+            native_transaction_result.verifyReviewOwner(expected, claim) catch
+                return error.OperationalVerificationFailure;
+        }
         return PrivateLiveRootRunner.decodeOwnedNative(
             allocator,
             request,
@@ -24367,6 +24397,7 @@ fn testNativeEngineCompletion(
                     null,
                     null,
                     null,
+                    null,
                 );
                 defer verified.deinit();
             }
@@ -24641,6 +24672,7 @@ fn testUnretainedNativeRecovery(
         },
         .cleanup_required => return error.TestUnexpectedResult,
     }
+    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ &harness.engine, recovery.prepared, loaded.view, state, lock });
     const input: RecoveryReviewInput = .{
         .prepared = &recovery.prepared,
         .outer_state = state,
@@ -25049,6 +25081,16 @@ fn testNativeCommittedHistory(
         },
     };
     var system: SystemResultVerifier = .{ .io = undefined };
+    if (owner.recovery_review_claim_sha256 != null) {
+        var reviewed = request;
+        reviewed.owned.review_owner = owner;
+        try std.testing.expectError(error.OperationalVerificationFailure, system.interface().verifyCommittedNativeFn.?(
+            system.interface().context,
+            allocator,
+            .native,
+            reviewed,
+        ));
+    }
     for (0..6) |index| {
         var changed = request;
         switch (index) {
