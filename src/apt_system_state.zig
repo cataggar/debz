@@ -159,7 +159,10 @@ pub fn decode(
     var parsed = std.json.parseFromSlice(WireState, allocator, source, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return error.InvalidDocument;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidDocument,
+    };
     defer parsed.deinit();
     const wire = parsed.value;
     if (!std.mem.eql(u8, wire.schema, schema_id) or
@@ -1082,6 +1085,23 @@ test "apt_system_state.test.completed state round-trips canonically" {
     try std.testing.expectEqual(Phase.completed, decoded.state.phase);
     try std.testing.expectEqual(Outcome.succeeded, decoded.state.outcome);
     try std.testing.expect(decoded.state.root_operation_completion != null);
+}
+
+test "apt_system_state.test.completed state decoding preserves allocation failures" {
+    var state = try testCompletedState(std.testing.allocator);
+    defer state.deinit();
+    const source = try state.state.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var decoded = decode(allocator, bytes, maximum_document_bytes) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            defer decoded.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{source});
 }
 
 test "apt_system_state.test.success cannot omit root completion evidence" {

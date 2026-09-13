@@ -358,7 +358,7 @@ survives outer acknowledgment retention and pending-to-acknowledged comparison.
 Native cleanup receives that exact expected marker, while legacy callers retain
 their existing identifier-based upgrade behavior. This ownership handoff is not
 receipt verification or permission to finalize before durable outer completion.
-Native retained-final/restart and known-failure integration still need completion
+Native recovery entry-point and known-failure integration still need completion
 before the profile gate can be removed.
 
 The engine's live completion path now consumes owner-bound native success for
@@ -378,9 +378,31 @@ shared file. The storage retention check is only a format/binding check, never
 standalone execution or historical verification. The engine retains the exact
 owner and publishes and commits outer completion before native ownership cleanup
 and active-state clearing. Missing authority, mismatched outcomes, retention
-failures, and interrupted publication leave cleanup unperformed. Historical
-reconciliation still requires separate native integration; the profile gate
-continues to prevent public native facade execution.
+failures, and interrupted publication leave cleanup unperformed. The profile
+gate continues to prevent public native facade execution until the remaining
+recovery entry points are integrated.
+
+Committed native history has a separate verifier. Its request carries the
+expected durable final-state snapshot and complete operation-local owner.
+All evidence paths must be derived from the same state directory and outer
+attempt. The verifier reads the canonical retained final state, outer execution
+completion, retained acknowledgment, v2 exact lock, and native receipt through
+the trusted-file boundary. It binds the final generation/digest, profile and
+request, completion and receipt identity, exact v1/v2 owner, original native
+caller/policy, lock, architecture, and successful outcome. An outer completion
+file without the matching retained final state is insufficient.
+
+This path does not inspect the current root, database, shared receipt, or current
+owner, and does not require projection authority. A later transaction therefore
+cannot invalidate a previously committed transaction's historical proof merely
+by replacing shared root evidence. Missing or corrupt operation-local evidence,
+foreign review ownership, and failed or recovery-required receipts are refused;
+allocation failures remain distinct from invalid evidence. Retained-final
+reconciliation uses this proof to resume outer commit after final-state
+publication, then performs only the exact caller-owned cleanup. Recovery
+preparation, interrupted-live reconciliation, and known-failure integration
+remain separate work; neither the native profile gate nor the legacy
+transaction verifier is relaxed.
 
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
