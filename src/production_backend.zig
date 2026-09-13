@@ -3285,19 +3285,8 @@ fn nativeAcknowledgmentMatchesOwner(
 ) bool {
     if (observed.document_version != root_operation.deferred_ack_v2_schema_version) return true;
     var owner = expected orelse return false;
-    if (owner.state == .pending and observed.state == .acknowledged) {
-        const acknowledged = root_operation.createDeferredAcknowledgment(.{
-            .state = .acknowledged,
-            .attempt_id = owner.attempt_id,
-            .completion_sha256 = owner.completion_sha256,
-            .provenance_sha256 = owner.provenance_sha256,
-            .acknowledgment_id = owner.acknowledgment_id,
-        }) catch return false;
-        owner = if (owner.document_version == root_operation.deferred_ack_v2_schema_version)
-            root_operation.carryDeferredAcknowledgmentReviewOwner(acknowledged, owner) catch return false
-        else
-            acknowledged;
-    }
+    if (owner.state == .pending and observed.state == .acknowledged)
+        owner = root_operation.transitionDeferredAcknowledgment(owner, .acknowledged) catch return false;
     if (review) |claim| {
         if (observed.recovery_review_claim_sha256 != null and
             std.mem.eql(u8, &observed.recovery_review_claim_sha256.?, &claim.digest_sha256))
@@ -5376,6 +5365,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         completion_crash: ?CompletionPoint = null,
         owner_evidence: ?[]const u8 = null,
         review_evidence: ?[]const u8 = null,
+        prepare_acknowledged_review: ?struct {
+            lock_path: []const u8,
+            lock_sha256: [32]u8,
+            generation: u64,
+        } = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
@@ -5401,10 +5395,32 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     if (external.review_evidence != null and
         (!external.projected or external.acknowledgment == null))
         return error.InvalidExternalWorkflowRequest;
+    if (external.prepare_acknowledged_review != null and
+        (!external.projected or external.acknowledgment != .recovery or
+            external.review_evidence == null or external.owner_evidence == null or
+            external.facade_recover or external.owned_verification != null))
+        return error.InvalidExternalWorkflowRequest;
     if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
     if (external.projected and projection == null) {
+        if (external.prepare_acknowledged_review) |review| {
+            const pending = try root_operation.decodeDeferredAcknowledgment(
+                allocator,
+                try readFile(allocator, std.testing.io, external.owner_evidence.?, root_operation.maximum_document_bytes),
+            );
+            if (pending.state != .pending) return error.InvalidExternalWorkflowRequest;
+            try prepareExternalNativeReviewFixture(
+                try root_operation.transitionDeferredAcknowledgment(pending, .acknowledged),
+                review.lock_path,
+                review.lock_sha256,
+                external.review_evidence.?,
+                try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?}),
+                false,
+                false,
+                review.generation,
+            );
+        }
         if (external.facade_recover) {
             const output = try recoverExternalNativeWorkflow(allocator, external);
             try writeExternalNativeWorkflowReport(external.report, output);
@@ -5869,6 +5885,14 @@ test "production workflow required_security.native acknowledgment preserves exac
         try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, foreign, null));
         try std.testing.expect(!nativeAcknowledgmentMatchesOwner(observed, foreign, other_claim));
     }
+    var unreviewed = base;
+    unreviewed.document_version = root_operation.deferred_ack_v2_schema_version;
+    unreviewed = try root_operation.createDeferredAcknowledgment(unreviewed);
+    const unreviewed_acknowledged = try root_operation.transitionDeferredAcknowledgment(unreviewed, .acknowledged);
+    try std.testing.expect(nativeAcknowledgmentMatchesOwner(unreviewed_acknowledged, unreviewed, null));
+    try std.testing.expect(!nativeAcknowledgmentMatchesOwner(unreviewed_acknowledged, pending, null));
+    try std.testing.expect(!nativeAcknowledgmentMatchesOwner(unreviewed_acknowledged, base, null));
+    try std.testing.expect(!nativeAcknowledgmentMatchesOwner(acknowledged, unreviewed, null));
 }
 
 test "production workflow required_security.native callbacks refuse host roots and orphan intents" {

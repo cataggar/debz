@@ -475,6 +475,24 @@ retained acknowledgment. Execution/recovery ownership exchanges and legacy
 cleanup retain their existing review-binding behavior. Further clean-root
 reconciliation and known-failure facade integration remain separate work.
 
+Acknowledged native cleanup uses committed historical proof, not live pending
+verification. A completed outer state, its matching retained final snapshot,
+outer completion, canonical native receipt and immutable pending acknowledgment
+must agree. Recovery derives the acknowledged owner by changing only that
+retained owner's state; the exact v1/v2 version and review identity are
+preserved. Missing history, nonfinal outer state, foreign ownership and altered
+review identity cannot be authorized from observed root metadata.
+
+The lower completion must still match the retained owner and native receipt.
+An original published root record, if present, must bind that same completion;
+its absence after acknowledged record cleanup is permitted. Review-token
+rotation accepts only the exact pending-to-acknowledged transition, and repeated
+review retains the same authority. Confirmed recovery revalidates committed
+proof and completes only the remaining caller-owned acknowledgment/cleanup,
+without live database verification or package replay. The immutable pending
+acknowledgment is not replaced by the observed terminal marker. Native cleanup
+still checks active evidence and refuses foreign or orphaned state.
+
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
 owner and caller request/policy authority, a published completion bound to the

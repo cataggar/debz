@@ -1974,6 +1974,36 @@ def exercise_workflows(
                 **verification, "review": "publish", "review_generation": 4,
                 "expected_error": "OperationalVerificationFailure",
             })
+        if outcome == "recovered":
+            projected_run(
+                "recover", owner_evidence="/fixture/owner.json", **review_arguments,
+                acknowledgment="recovery", completion_crash="after_deferred_acknowledged",
+            )
+            acknowledged_owner = (root / owner_path).read_bytes()
+            assert document(root / owner_path)["state"] == "acknowledged"
+            assert document(fixture / "owner.json")["state"] == "pending"
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                **verification, "expected_error": "OperationalVerificationFailure",
+            })
+            terminal_review = {
+                "lock_path": "/fixture/lock.json",
+                "lock_sha256": verification["lock_sha256"], "generation": 5,
+            }
+            projected_run(
+                "recover", owner_evidence="/fixture/owner.json", **review_arguments,
+                acknowledgment="recovery", prepare_acknowledged_review=terminal_review,
+                completion_crash="after_deferred_record_cleared",
+            )
+            assert not (root / OPERATION).exists()
+            assert (root / owner_path).read_bytes() == acknowledged_owner
+            assert (fixture / "owner.json").read_bytes() == original_owner
+            assert (root / "var/lib/dpkg/status").read_bytes() == status_before
+            terminal_review["generation"] = 6
+            projected_run(
+                "recover", owner_evidence="/fixture/owner.json", **review_arguments,
+                acknowledgment="recovery", prepare_acknowledged_review=terminal_review,
+            )
+            review_arguments = {}
         for _ in range(2):
             projected_run("recover", owner_evidence="/fixture/owner.json",
                           acknowledgment="ownership" if outcome == "success" else "recovery",
