@@ -7406,8 +7406,34 @@ pub const Engine = struct {
             };
         var authenticated_prior =
             lower.deferred_acknowledgment;
+        if (loaded.view.transaction_backend == .native and
+            lower.deferred_acknowledgment == null and lower.record == null and
+            retained_ownership_token != null and
+            !ownershipTokenMatchesPreparation(retained_ownership_token.?, preparation, active.state, verified))
+        {
+            return_preparation = true;
+            return .{ .ready = .{
+                .prepared = preparation,
+                .action = action,
+                .mutation_status = .unknown,
+            } };
+        }
         if (lower.deferred_acknowledgment) |observed| {
-            if (loaded.view.transaction_backend == .native and observed.state == .acknowledged) {
+            if (loaded.view.transaction_backend == .native and active.state.phase == .completed and observed.state == .released) {
+                if (verified_outer_transaction == null or retained_acknowledgment == null or
+                    !root_operation.deferredAcknowledgmentExactEqual(retained_acknowledgment.?, observed) or
+                    (retained_ownership_token != null and
+                        !ownershipTokenMatchesPreparation(retained_ownership_token.?, preparation, active.state, verified)))
+                {
+                    return_preparation = true;
+                    return .{ .ready = .{
+                        .prepared = preparation,
+                        .action = action,
+                        .mutation_status = .unknown,
+                    } };
+                }
+                authenticated_prior = retained_acknowledgment;
+            } else if (loaded.view.transaction_backend == .native and observed.state == .acknowledged) {
                 const owner = if (active.state.phase == .completed and verified_outer_transaction != null)
                     acknowledgedNativeOwner(retained_acknowledgment, observed)
                 else
@@ -7611,6 +7637,13 @@ pub const Engine = struct {
             ) catch return error.InvariantViolation;
         const token = token: {
             if (retained_ownership_token) |retained_token| {
+                if (loaded.view.transaction_backend == .native and authenticated_prior == null and
+                    retained_token.purpose == .recovery_review and
+                    retained_token.outer_generation == active.state.generation and
+                    std.mem.eql(u8, &retained_token.outer_state_sha256, &active.state.digest_sha256) and
+                    ownershipTokenMatchesPreparation(retained_token, preparation, active.state, verified) and
+                    root_operation.deferredAcknowledgmentExactEqual(retained_token.marker, expected_owner))
+                    break :token retained_token;
                 if (retained_token.purpose == .clean_reconciliation) {
                     if (!ownershipTokenMatchesPreparation(
                         retained_token,
@@ -11657,6 +11690,15 @@ fn classifyRecoveryMutationStatus(
     }
     const lower_marker = marker orelse {
         if (record != null) return .unknown;
+        if (profile.transaction_backend == .native and outer_state.mutation_started)
+            return if (outer_state.phase == .completed and
+                (outer_state.outcome == .succeeded or outer_state.outcome == .recovered) and
+                outerTransactionProvesMutation(outer_state, outer_transaction_verified) and
+                std.mem.eql(u8, outer_state.transaction_result.?.schema, native_provenance.schema_id) and
+                outer_state.transaction_result.?.version == native_provenance.schema_version)
+                .changed
+            else
+                .unknown;
         if (completion) |document| {
             const binding = outer_state.transaction_result orelse
                 return .unknown;
@@ -15496,6 +15538,19 @@ const FakeRunner = struct {
                     claim,
                 ))
                 return error.OperationalBoundaryFailure;
+            if (backend.transaction_backend == .native and claim.prior_marker == null and
+                (request.finalize_ownership or request.recovery_acknowledgment != null))
+            {
+                if (self.inspect_deferred_acknowledgment != null or self.inspect_record_source != null)
+                    return error.OperationalBoundaryFailure;
+                var completion = readRecoveryCompletion(context, allocator) catch |err|
+                    return testBoundaryError(err);
+                defer if (completion) |*owned| owned.deinit();
+                if (!optionalDigestEqual(
+                    claim.completion_sha256,
+                    if (completion) |owned| owned.document.digest_sha256 else null,
+                )) return error.OperationalBoundaryFailure;
+            }
             self.recovery_review_claim = null;
             self.recovery_review_transferred = true;
         } else if (request.recovery_review_claim != null) {
@@ -24798,6 +24853,7 @@ fn testNativeEngineCompletion(
         } else try std.testing.expectEqual(@as(usize, 1), harness.runner.ownership_finalize_calls);
         try std.testing.expectEqual(@as(usize, if (scenario == .retained) 1 else 0), harness.store.native_retention_checks);
         if (scenario == .fresh or scenario == .reviewed) {
+            try testClearedNativeReconciliation(allocator, &harness, prepared, &loaded, owner, document);
             if (owner.state == .pending)
                 try testAcknowledgedNativeCleanup(allocator, &harness, prepared, &loaded, owner, document);
             try testNativeRecoveryEvidenceRouting(allocator, &harness, prepared, &loaded, owner);
@@ -24812,6 +24868,180 @@ fn testNativeEngineCompletion(
         if (scenario == .corrupt_retained)
             try std.testing.expectEqualStrings("{}\n", harness.store.native_transaction_bytes.?);
     }
+}
+
+fn testClearedNativeReconciliation(
+    allocator: std.mem.Allocator,
+    harness: *Harness,
+    prepared: Preparation,
+    loaded: *LoadedProfile,
+    owner: root_operation.DeferredAcknowledgment,
+    completion: root_operation_completion.Document,
+) !void {
+    var final = try operation_state.decode(allocator, harness.store.retained_bytes.?, operation_state.maximum_document_bytes);
+    defer final.deinit();
+    const native_source = harness.runner.native_verification_source;
+    const initial_token = harness.store.lower_ownership;
+    const committed_store = harness.verifier.committed_store;
+    defer {
+        harness.runner.native_verification_source = native_source;
+        harness.store.lower_ownership = initial_token;
+        harness.verifier.committed_store = committed_store;
+    }
+    harness.runner.native_verification_source = null;
+    harness.verifier.committed_store = &harness.store;
+    const live_calls = harness.runner.native_verification_calls;
+    var bound = try root_operation.createDeferredAcknowledgment(.{
+        .document_version = root_operation.deferred_ack_v2_schema_version,
+        .state = .bound,
+        .attempt_id = owner.attempt_id,
+        .acknowledgment_id = owner.acknowledgment_id,
+    });
+    if (owner.recovery_review_claim_sha256 != null)
+        bound = try root_operation.carryDeferredAcknowledgmentReviewOwner(bound, owner);
+    const token = try lower_ownership_token.create(allocator, .{
+        .purpose = .execution,
+        .outer_attempt_id = prepared.attempt_id,
+        .outer_generation = final.state.generation,
+        .outer_state_sha256 = final.state.digest_sha256,
+        .request_sha256 = prepared.request_sha256,
+        .profile_sha256 = prepared.profile.sha256,
+        .profile_reference_sha256 = prepared.profile.reference_evidence_sha256,
+        .exact_lock_sha256 = prepared.exact_lock.digest_sha256,
+        .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+        .prior_marker = bound,
+        .marker = try root_operation.transitionDeferredAcknowledgment(bound, .released),
+    });
+    var foreign = try fakeRecoveryCompletion(allocator, .{
+        .operation = .install,
+        .mode = .recover,
+        .selectors = &.{.{ .name = "other-package" }},
+        .options = executeOptions(loaded.view, prepared.paths.exact_lock),
+    }, .successful_outcome, @splat(0xdd));
+    defer foreign.deinit();
+    for (0..3) |snapshot| {
+        harness.store.lower_ownership = token;
+        harness.store.active_bytes = try allocator.dupe(u8, harness.store.retained_bytes.?);
+        const previous_completion = harness.runner.recovery_completion_source;
+        harness.runner.recovery_completion_source = switch (snapshot) {
+            0 => null,
+            1 => try completion.canonicalJson(allocator),
+            2 => try foreign.document.canonicalJson(allocator),
+            else => unreachable,
+        };
+        defer {
+            if (harness.runner.recovery_completion_source) |source| allocator.free(source);
+            harness.runner.recovery_completion_source = previous_completion;
+            if (harness.store.active_bytes) |source| allocator.free(source);
+            harness.store.active_bytes = null;
+        }
+        for (0..6) |invalid| {
+            const retained = harness.store.retained_bytes;
+            const acknowledgment = harness.store.lower_acknowledgment;
+            const original_completion = harness.store.native_completion_bytes;
+            defer {
+                harness.store.retained_bytes = retained;
+                harness.store.lower_acknowledgment = acknowledgment;
+                harness.store.native_completion_bytes = original_completion;
+                harness.store.lower_ownership = token;
+                harness.runner.inspect_deferred_acknowledgment = null;
+            }
+            switch (invalid) {
+                0 => harness.store.retained_bytes = null,
+                1 => harness.store.lower_acknowledgment = null,
+                2 => harness.store.native_completion_bytes = null,
+                3 => harness.store.lower_ownership.?.profile_sha256[0] ^= 1,
+                4 => harness.runner.inspect_deferred_acknowledgment = try root_operation.createDeferredAcknowledgment(.{
+                    .state = .bound,
+                    .attempt_id = @splat(0xdd),
+                    .acknowledgment_id = @splat(0xee),
+                }),
+                5 => harness.runner.inspect_deferred_acknowledgment = try root_operation.createDeferredAcknowledgment(.{
+                    .state = .released,
+                    .attempt_id = @splat(0xdd),
+                    .acknowledgment_id = prepared.attempt_id,
+                }),
+                else => unreachable,
+            }
+            var refused = try harness.engine.prepareRecoveryWithProfile(allocator, prepared.request.profile_path, loaded);
+            switch (refused) {
+                .result => |*result| {
+                    defer result.deinit();
+                    try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
+                    try std.testing.expect(!result.changed);
+                },
+                .ready => |*ready| {
+                    defer ready.deinit();
+                    try std.testing.expect(invalid >= 3);
+                    try std.testing.expectEqual(VerifiedMutationStatus.unknown, ready.mutation_status);
+                    try std.testing.expect(ready.review_claim == null);
+                },
+                .cleanup_required => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(harness.runner.recovery_review_claim == null);
+            if (invalid != 3)
+                try std.testing.expect(lower_ownership_token.exactEqual(token, harness.store.lower_ownership.?));
+        }
+        var outcome = try harness.engine.prepareRecoveryWithProfile(allocator, prepared.request.profile_path, loaded);
+        var recovery = switch (outcome) {
+            .ready => |ready| ready,
+            .result => |*result| {
+                result.deinit();
+                return error.TestUnexpectedResult;
+            },
+            .cleanup_required => return error.TestUnexpectedResult,
+        };
+        defer recovery.deinit();
+        try std.testing.expectEqual(VerifiedMutationStatus.changed, recovery.mutation_status);
+        const claim = recovery.review_claim orelse return error.TestUnexpectedResult;
+        try std.testing.expect(claim.prior_marker == null);
+        try std.testing.expect(claim.record_sha256 == null);
+        try std.testing.expect(optionalDigestEqual(final.state.transaction_result.?.digest_sha256, claim.outer_transaction_sha256));
+        for (0..2) |_| {
+            var repeated = try harness.engine.prepareRecoveryWithProfile(allocator, prepared.request.profile_path, loaded);
+            switch (repeated) {
+                .ready => |*ready| {
+                    defer ready.deinit();
+                    try std.testing.expectEqual(VerifiedMutationStatus.changed, ready.mutation_status);
+                    try std.testing.expect(root_operation.recoveryReviewClaimExactEqual(claim, ready.review_claim.?));
+                    try std.testing.expect(lower_ownership_token.exactEqual(recovery.ownership_token.?, ready.ownership_token.?));
+                },
+                .result => |*result| {
+                    result.deinit();
+                    return error.TestUnexpectedResult;
+                },
+                .cleanup_required => return error.TestUnexpectedResult,
+            }
+        }
+        {
+            const changed_completion = try (if (snapshot == 2) completion else foreign.document).canonicalJson(allocator);
+            defer allocator.free(changed_completion);
+            const reviewed_completion = harness.runner.recovery_completion_source;
+            harness.runner.recovery_completion_source = changed_completion;
+            defer harness.runner.recovery_completion_source = reviewed_completion;
+            var refused_transfer = false;
+            var refused = try harness.engine.executeValidatedRecoveryWithProfile(allocator, recovery, claim, &refused_transfer, loaded);
+            defer refused.deinit();
+            try std.testing.expectEqual(api.Outcome.recovery, refused.outcome);
+            try std.testing.expect(!refused_transfer);
+            try std.testing.expect(harness.store.active_bytes != null);
+            try std.testing.expect(root_operation.recoveryReviewClaimExactEqual(claim, harness.runner.recovery_review_claim.?));
+        }
+        var transferred = false;
+        var result = try harness.engine.executeValidatedRecoveryWithProfile(allocator, recovery, claim, &transferred, loaded);
+        defer result.deinit();
+        try std.testing.expectEqual(api.Outcome.success, result.outcome);
+        try std.testing.expect(result.changed);
+        try std.testing.expect(transferred);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(harness.runner.recovery_review_claim == null);
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment == null);
+        try std.testing.expect(harness.runner.inspect_record_source == null);
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, harness.store.lower_acknowledgment.?));
+    }
+    try std.testing.expectEqual(live_calls, harness.runner.native_verification_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls + harness.backend.recover_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.verifier.transaction_checks);
 }
 
 fn testAcknowledgedNativeCleanup(

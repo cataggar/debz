@@ -1879,6 +1879,16 @@ def exercise_workflows(
             "state": "released" if outcome == "success" else "pending",
             "outcome": "failed" if outcome == "failed" else "succeeded",
         }
+        if outcome == "success":
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                **verification, "review": "transfer", "expected_error": "OperationalVerificationFailure",
+            })
+            m.write(fixture / "owner.json", (fixture / "owner.json.review-owner").read_bytes())
+            assert document(fixture / "owner.json")["version"] == 2
+            evidence_before = {
+                str(path.relative_to(root)): path.read_bytes()
+                for path in (root / NAMESPACE).rglob("*") if path.is_file()
+            }
         for _ in range(2):
             projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification=verification)
         for invalid in (
@@ -2010,6 +2020,50 @@ def exercise_workflows(
                           **review_arguments)
         for path in (OPERATION, INTENT, owner_path):
             assert not (root / path).exists(), path
+        if outcome != "failed":
+            shared_receipt = root / NAMESPACE / "native-transaction-provenance-v1.json"
+            shared_receipt.write_bytes(b"{}\n")
+            completion_path = root / NAMESPACE / "root-operation-completion-v1.json"
+            completion_bytes = completion_path.read_bytes()
+            if outcome == "recovered":
+                completion_path.unlink()
+            cleared_arguments = {
+                "owner_evidence": "/fixture/owner.json",
+                "review_evidence": "/fixture/owner.json.review-claim",
+                "acknowledgment": "ownership" if outcome == "success" else "recovery",
+            }
+            cleared_review = {
+                "lock_path": "/fixture/lock.json", "lock_sha256": verification["lock_sha256"],
+                "receipt_sha256": list(bytes.fromhex(proof["digest_sha256"])), "generation": 7,
+            }
+            for index, boundary in enumerate(
+                ("before_ownership_marker_clear", "after_ownership_marker_clear")
+                if outcome == "success" else
+                ("before_deferred_marker_cleared", "after_deferred_marker_cleared")
+            ):
+                setup = {"prepare_cleared_review": cleared_review} if index == 0 else {}
+                projected_run("recover", **cleared_arguments, **setup,
+                              completion_crash=boundary)
+                assert not (root / OPERATION).exists()
+                if index == 0:
+                    reviewed_bytes = (root / owner_path).read_bytes()
+                    if outcome == "success":
+                        completion_path.unlink()
+                    else:
+                        completion_path.write_bytes(completion_bytes)
+                    projected_run("recover", **cleared_arguments, expected_exit=8)
+                    assert (root / owner_path).read_bytes() == reviewed_bytes
+                    if outcome == "success":
+                        completion_path.write_bytes(completion_bytes)
+                    else:
+                        completion_path.unlink()
+            cleared_review["generation"] += 1
+            assert not (root / owner_path).exists(), "cleared review fabricated replacement ownership"
+            projected_run("recover", **cleared_arguments, expected_exit=8)
+            projected_run("recover", **cleared_arguments, prepare_cleared_review=cleared_review)
+            assert not (root / owner_path).exists()
+            assert shared_receipt.read_bytes() == b"{}\n"
+            assert (root / "var/lib/dpkg/status").read_bytes() == status_before
         assert not (fixture / "unused-cache").exists()
         assert not (fixture / "unused-state").exists()
         print(f"workflow-projected-{outcome}: scoped execution, fresh-owner verification, and acknowledgment passed", flush=True)
