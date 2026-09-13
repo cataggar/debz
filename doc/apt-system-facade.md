@@ -472,8 +472,8 @@ bind that already-retained owner to a new review identity. Atomic publication
 leaves either the review with its original prior owner or that same owner;
 interrupted cleanup and subsequent reviews therefore cannot invalidate the
 retained acknowledgment. Execution/recovery ownership exchanges and legacy
-cleanup retain their existing review-binding behavior. Further clean-root
-reconciliation and known-failure facade integration remain separate work.
+cleanup retain their existing review-binding behavior. Known-failure completion
+and cleanup remain separate work.
 
 Acknowledged native cleanup uses committed historical proof, not live pending
 verification. A completed outer state, its matching retained final snapshot,
@@ -542,6 +542,23 @@ that the desired package closure was reached. Success and failure result types
 are not interchangeable; unknown/recovery-required outcomes are refused. This
 read-only path neither acknowledges the failed attempt nor enables native
 apt/system execution.
+
+The facade's interrupted-completion diagnostics and recovery preparation now
+use that typed pending-failure verifier for nonfinal native attempts without a
+retained receipt or outer completion binding. The published failed completion
+must bind the original caller, policy, lock and record, and pending ownership
+must be reconstructed from an independent execution/review token or exact
+operation-local acknowledgment. A foreign saved acknowledgment is not bypassed.
+An active lower review additionally requires independently retained exact
+review authority.
+
+Fresh verified failure returns `recovery` with `changed: true` and a
+`transaction_failed` diagnostic. It does not report success, invent retained
+receipt/completion evidence, publish or consume a review, write outer state,
+acknowledge ownership, or replay package work. Missing or foreign authority,
+stale completion, invalid receipt, and unknown outcomes remain unknown/refused.
+Failure receipt retention, durable failed-result history, confirmed recovery
+and cleanup are not yet integrated; the native profile gate remains unchanged.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
