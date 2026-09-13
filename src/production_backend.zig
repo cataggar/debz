@@ -45,6 +45,9 @@ pub const WorkflowRecoveryAcknowledgment = struct {
     completion_sha256: [32]u8,
     provenance_sha256: [32]u8,
     acknowledgment_id: [32]u8,
+    /// Complete owner returned to the outer caller; identifiers alone cannot
+    /// retain or discharge a review-bound v2 marker.
+    marker: ?root_operation.DeferredAcknowledgment = null,
 };
 
 pub const WorkflowOwnershipAcknowledgment = struct {
@@ -5372,6 +5375,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         owner_evidence: ?[]const u8 = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
+        facade_recover: bool = false,
         owned_verification: ?struct {
             lock_path: []const u8,
             lock_sha256: ?[32]u8 = null,
@@ -5390,6 +5394,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
     if (external.projected and projection == null) {
+        if (external.facade_recover) {
+            const output = try recoverExternalNativeWorkflow(allocator, external);
+            try writeExternalNativeWorkflowReport(external.report, output);
+            return;
+        }
         if (external.owned_verification != null) {
             const output = try verifyExternalOwnedNativeWorkflow(allocator, external);
             try writeExternalNativeWorkflowReport(external.report, output);
@@ -5633,6 +5642,59 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
         "{\"verified\":true,\"outcome\":\"succeeded\"}\n"
     else
         "{\"verified\":true,\"outcome\":\"failed\"}\n";
+}
+
+fn recoverExternalNativeWorkflow(allocator: std.mem.Allocator, external: anytype) ![]const u8 {
+    if (external.workflow.mode != .recover or !external.workflow.defer_recovery_clear or
+        external.owned_verification != null or external.acknowledgment != null or external.completion_crash != null)
+        return error.InvalidExternalWorkflowRequest;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer root.close();
+    const marker = try root.root.readFileAlloc(allocator, try root_fs.Path.init(".debz-native-disposable"), 128);
+    if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
+        return error.InvalidExternalWorkflowRequest;
+    const owner = try root_operation.decodeDeferredAcknowledgment(
+        allocator,
+        try readFile(allocator, std.testing.io, external.owner_evidence orelse return error.InvalidExternalWorkflowRequest, root_operation.maximum_document_bytes),
+    );
+    const facade = @import("apt_system_orchestrator.zig");
+    const RejectLegacy = struct {
+        fn run(_: *anyopaque, _: transaction_executor.Invocation) anyerror!transaction_executor.ProcessResult {
+            return error.UnexpectedLegacyProcess;
+        }
+    };
+    var context: u8 = 0;
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .now_unix = 1_788_796_860,
+        .process_runner = .{ .context = &context, .runFn = RejectLegacy.run },
+    };
+    var adapter: facade.ProductionBackend = .{ .backend = &backend };
+    var runner: facade.PrivateLiveRootRunner = .{ .io = std.testing.io };
+    var result = try runner.interface().workflow(allocator, adapter.interface().forTransactionBackend(.native), .{
+        .operation = switch (external.workflow.operation) {
+            .install => .install,
+            .remove => .remove,
+            .upgrade_all => .upgrade_all,
+        },
+        .mode = .recover,
+        .selectors = external.workflow.selectors,
+        .options = external.workflow.options,
+        .defer_recovery_clear = true,
+        .orchestration_id = external.workflow.orchestration_id,
+        .expected_ownership_marker = owner,
+        .root_attempt_id = owner.attempt_id,
+    });
+    defer result.deinit();
+    if (result.result.exit_status == .success) {
+        try std.testing.expectEqual(facade.RootStatus.completed, result.root_status);
+        const acknowledgment = result.recovery_acknowledgment orelse return error.MissingRecoveryAcknowledgment;
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, acknowledgment.marker.?));
+    } else {
+        try std.testing.expectEqual(facade.RootStatus.recovery_required, result.root_status);
+        try std.testing.expect(result.recovery_acknowledgment == null);
+    }
+    return result.result.canonicalJson(allocator);
 }
 
 test "production workflow required_security.native acknowledgment preserves exact reviewed ownership" {

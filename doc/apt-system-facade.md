@@ -340,6 +340,27 @@ remain distinct result types, and neither finalizes ownership or claims a
 cleared root. Existing facade execution/recovery call sites and the legacy
 transaction verifier are not switched by this gateway.
 
+Native recovery completion matching now uses native publication semantics
+rather than the legacy journal-derived provenance hash: the published record
+binds the completion document digest directly. A native completion can retain
+the exact original operation discharge when recovery resumes after publication,
+or an exact recovery discharge when recovery first creates the completion.
+The classifier binds both to the original caller, native policy, architecture,
+v2 lock, and available native receipt. Cross-backend evidence, mixed discharge
+name/digest pairs, legacy journals, and non-success outcomes cannot prove
+successful recovery.
+
+The private runner returns the complete pending native owner with its recovery
+acknowledgment. It reconstructs that owner from the invocation's retained owner
+or reviewed claim and compares exact identity against observed evidence; it
+never adopts the observed marker as authorization. Review-bound v2 identity
+survives outer acknowledgment retention and pending-to-acknowledged comparison.
+Native cleanup receives that exact expected marker, while legacy callers retain
+their existing identifier-based upgrade behavior. This ownership handoff is not
+receipt verification or permission to finalize before durable outer completion.
+Native facade engine retention, restart, and known-failure integration still
+need completion before the profile gate can be removed.
+
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
 owner and caller request/policy authority, a published completion bound to the
