@@ -1948,9 +1948,36 @@ def exercise_workflows(
             str(path.relative_to(root)): path.read_bytes()
             for path in (root / NAMESPACE).rglob("*") if path.is_file()
         }, "projected verification changed retained evidence"
+        review_arguments = {}
+        if outcome != "failed":
+            original_owner = (fixture / "owner.json").read_bytes()
+            for generation in (2, 3):
+                projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                    **verification, "review": "publish", "review_generation": generation,
+                    "expected_error": "OperationalVerificationFailure",
+                })
+                review_arguments = {"review_evidence": "/fixture/owner.json.review-claim"}
+                projected_run(
+                    "recover", owner_evidence="/fixture/owner.json", **review_arguments,
+                    acknowledgment="ownership" if outcome == "success" else "recovery",
+                    completion_crash=(
+                        "before_ownership_marker_clear" if outcome == "success"
+                        else "before_deferred_acknowledged"
+                    ),
+                )
+                assert (root / owner_path).read_bytes() == original_owner, (
+                    "interrupted reviewed acknowledgment changed the retained native owner"
+                )
+                projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification=verification)
+                assert (root / "var/lib/dpkg/status").read_bytes() == status_before
+            projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
+                **verification, "review": "publish", "review_generation": 4,
+                "expected_error": "OperationalVerificationFailure",
+            })
         for _ in range(2):
             projected_run("recover", owner_evidence="/fixture/owner.json",
-                          acknowledgment="ownership" if outcome == "success" else "recovery")
+                          acknowledgment="ownership" if outcome == "success" else "recovery",
+                          **review_arguments)
         for path in (OPERATION, INTENT, owner_path):
             assert not (root / path).exists(), path
         assert not (fixture / "unused-cache").exists()

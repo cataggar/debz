@@ -2146,6 +2146,7 @@ pub const Backend = struct {
                     else
                         null,
                     .replacement_marker = observed_marker,
+                    .preserve_prior_owner = self.transaction_backend == .native,
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2156,8 +2157,8 @@ pub const Backend = struct {
                     "confirmed recovery review could not be exchanged for the verified lower recovery owner",
                 ),
             };
-            observed_marker =
-                try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            if (self.transaction_backend != .native)
+                observed_marker = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
                     observed_marker,
                     expected_review,
                 );
@@ -2589,6 +2590,7 @@ pub const Backend = struct {
                     else
                         null,
                     .replacement_marker = observed,
+                    .preserve_prior_owner = self.transaction_backend == .native and observed.state == .released,
                 },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2597,8 +2599,8 @@ pub const Backend = struct {
                     "confirmed recovery review could not be exchanged for the verified lower owner",
                 ),
             };
-            observed =
-                try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
+            if (self.transaction_backend != .native or observed.state != .released)
+                observed = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(
                     observed,
                     expected_review,
                 );
@@ -5373,6 +5375,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         withhold_projection: bool = false,
         completion_crash: ?CompletionPoint = null,
         owner_evidence: ?[]const u8 = null,
+        review_evidence: ?[]const u8 = null,
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
@@ -5386,6 +5389,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             state: enum { pending, released } = .pending,
             outcome: enum { succeeded, failed } = .succeeded,
             review: ?enum { publish, publish_stale, authorized, foreign, clear } = null,
+            review_generation: u64 = 1,
         } = null,
     };
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
@@ -5394,6 +5398,9 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     if (external.owned_verification) |check|
         if (check.review != null and !external.projected)
             return error.InvalidExternalWorkflowRequest;
+    if (external.review_evidence != null and
+        (!external.projected or external.acknowledgment == null))
+        return error.InvalidExternalWorkflowRequest;
     if (!@import("absolute_path.zig").nonRoot(external.workflow.options.install_root) or
         !@import("absolute_path.zig").nonRoot(external.report))
         return error.InvalidExternalWorkflowRequest;
@@ -5454,6 +5461,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
     };
     var requested = external.workflow;
+    if (external.review_evidence) |path|
+        requested.recovery_review_claim = try root_operation.decodeRecoveryReviewClaim(
+            allocator,
+            try readFile(allocator, std.testing.io, path, root_operation.maximum_document_bytes),
+        );
     if (external.reconciliation_owner_output) |path| {
         if (external.owner_evidence != null or external.acknowledgment != null or
             !@import("absolute_path.zig").nonRoot(path) or
@@ -5619,7 +5631,7 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
     const review_owner_path = try std.fmt.allocPrint(allocator, "{s}.review-owner", .{external.owner_evidence.?});
     if (check.review) |mode|
         if (mode == .publish or mode == .publish_stale or mode == .clear)
-            try prepareExternalNativeReviewFixture(owner, check.lock_path, check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest, claim_path, review_owner_path, mode == .clear, mode == .publish_stale);
+            try prepareExternalNativeReviewFixture(owner, check.lock_path, check.lock_sha256 orelse return error.InvalidExternalWorkflowRequest, claim_path, review_owner_path, mode == .clear, mode == .publish_stale, check.review_generation);
     const review_owner: ?root_operation.DeferredAcknowledgment = if (check.review == .authorized)
         try root_operation.decodeDeferredAcknowledgment(
             allocator,
@@ -5676,6 +5688,7 @@ fn prepareExternalNativeReviewFixture(
     owner_path: []const u8,
     clear: bool,
     stale: bool,
+    generation: u64,
 ) !void {
     const Callback = struct {
         owner: root_operation.DeferredAcknowledgment,
@@ -5685,6 +5698,7 @@ fn prepareExternalNativeReviewFixture(
         owner_path: []const u8,
         clear: bool,
         stale: bool,
+        generation: u64,
 
         fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
@@ -5718,7 +5732,7 @@ fn prepareExternalNativeReviewFixture(
             if (self.stale) completion_digest[0] ^= 1;
             const claim = try root_operation.createRecoveryReviewClaim(.{
                 .outer_attempt_id = self.owner.acknowledgment_id,
-                .outer_generation = 1,
+                .outer_generation = self.generation,
                 .outer_state_sha256 = @splat(32),
                 .profile_sha256 = @splat(33),
                 .profile_reference_sha256 = @splat(34),
@@ -5752,6 +5766,7 @@ fn prepareExternalNativeReviewFixture(
         .owner_path = owner_path,
         .clear = clear,
         .stale = stale,
+        .generation = generation,
     };
     const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
     if (result != .exited or result.exited != 0) return error.InvalidExternalWorkflowRequest;

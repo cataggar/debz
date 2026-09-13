@@ -445,9 +445,35 @@ completion, finalize ownership or replay package work. After confirmation,
 completion obtains fresh owned success again, retains the receipt, commits
 outer evidence and only then finalizes the exact owner. Missing or foreign
 authority, stale completion and unavailable live evidence remain unknown.
-Remaining settled/clean-root recovery and known-failure integration are separate
-work. Neither the native profile gate nor the legacy transaction verifier is
-relaxed.
+Neither the native profile gate nor the legacy transaction verifier is relaxed.
+
+Settled native pending success requires a complete pending acknowledgment
+authenticated from the operation-local acknowledgment or independently retained
+execution/review token. The successful native completion must bind the original
+caller, policy, attempt and published record. Unreviewed v2 reservations may
+produce legitimate v1 pending owners; recovery does not rewrite them as v2 or
+adopt observed ownership as authority. A foreign saved acknowledgment cannot be
+bypassed by falling back to another token.
+
+Before publishing a pending-success review, fresh owned verification permits
+retaining the exact pending owner if it was not already retained. This durable
+handoff authorizes subsequent review-token publication without retaining a
+receipt, committing outer completion or acknowledging native evidence.
+Repeated preparation preserves that owner and exact review. Confirmation
+normalizes interrupted mutating/verifying phases through recovery-required,
+then verifies and retains the native receipt, commits outer completion, and
+acknowledges the complete owner without replaying package work. Completed native
+records still carrying bound ownership instead go through native backend
+recovery, never the legacy clean-root finalization shortcut.
+
+Native pending acknowledgment and released-owner finalization consume a
+confirmed review while preserving its exact prior terminal owner. They do not
+bind that already-retained owner to a new review identity. Atomic publication
+leaves either the review with its original prior owner or that same owner;
+interrupted cleanup and subsequent reviews therefore cannot invalidate the
+retained acknowledgment. Execution/recovery ownership exchanges and legacy
+cleanup retain their existing review-binding behavior. Further clean-root
+reconciliation and known-failure facade integration remain separate work.
 
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
