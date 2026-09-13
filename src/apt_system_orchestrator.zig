@@ -2871,6 +2871,14 @@ pub const StateStore = struct {
         []const u8,
         [32]u8,
     ) anyerror!api.DocumentBinding,
+    /// Canonical operation-local retention check, not execution verification.
+    verifyRetainedTransactionFn: ?*const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        system_profile.TransactionBackend,
+        OperationPaths,
+        api.DocumentBinding,
+    ) anyerror!void = null,
     retainRecoveryCompletionFn: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -3103,6 +3111,7 @@ pub const SystemStateStore = struct {
             .compareAndReplaceOwnershipTokenFn = compareAndReplaceOwnershipToken,
             .readOwnershipTokenFn = readOwnershipToken,
             .retainTransactionFn = retainTransaction,
+            .verifyRetainedTransactionFn = verifyRetainedTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
             .readRecoveryCompletionFn = readRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
@@ -3902,6 +3911,27 @@ pub const SystemStateStore = struct {
             source,
         );
         return binding;
+    }
+
+    fn verifyRetainedTransaction(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        paths: OperationPaths,
+        expected: api.DocumentBinding,
+    ) !void {
+        const self: *SystemStateStore = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, expected.path, paths.transaction_result) or
+            !std.mem.eql(u8, expected.schema, if (backend == .native) native_provenance.schema_id else transaction_provenance.schema_id) or
+            expected.version != (if (backend == .native) native_provenance.schema_version else transaction_provenance.schema_version))
+            return error.TransactionEvidenceMismatch;
+        const source = try readTrustedOperationFile(self.io, allocator, expected.path, switch (backend) {
+            .native => native_provenance.maximum_document_bytes,
+            .legacy_dpkg => transaction_provenance.maximum_document_bytes,
+        });
+        defer allocator.free(source);
+        const actual = try retainedTransactionBinding(allocator, backend, expected.path, source, expected.digest_sha256);
+        if (!documentEqual(actual, expected)) return error.TransactionEvidenceMismatch;
     }
 
     fn retainRecoveryCompletion(
@@ -5833,6 +5863,21 @@ pub const Engine = struct {
             );
         self.hitCompletionBoundary(.after_backend_success) catch
             return self.reconcilePreparedError(allocator, prepared);
+        const acknowledgment = executed.ownership_acknowledgment orelse
+            return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                &current,
+                "successful lower transaction did not retain its exact ownership token",
+            );
+        if (loaded.view.transaction_backend == .native and
+            !root_operation.deferredAcknowledgmentExactEqual(acknowledgment.marker, execution_token.marker))
+            return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                &current,
+                "native completion ownership differs from the retained execution token",
+            );
         return self.verifyAndComplete(
             allocator,
             prepared,
@@ -5843,13 +5888,7 @@ pub const Engine = struct {
             null,
             null,
             null,
-            executed.ownership_acknowledgment orelse
-                return self.markRecoveryRequired(
-                    allocator,
-                    prepared,
-                    &current,
-                    "successful lower transaction did not retain its exact ownership token",
-                ),
+            acknowledgment,
             null,
             null,
         );
@@ -8664,6 +8703,63 @@ pub const Engine = struct {
         }
     }
 
+    fn verifyNativeCompletion(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        prepared: Preparation,
+        profile: ProfileView,
+        owner: root_operation.DeferredAcknowledgment,
+        recovery_document: ?root_operation_completion.Document,
+        recovery_lock: ?VerifiedLock,
+        expected_attempt: ?[32]u8,
+    ) !native_transaction_result.OwnedSuccess {
+        if (profile.transaction_backend != .native or
+            !std.mem.eql(u8, &owner.acknowledgment_id, &prepared.attempt_id))
+            return error.InvalidNativeCompletion;
+        if (expected_attempt) |attempt_id|
+            if (!std.mem.eql(u8, &owner.attempt_id, &attempt_id))
+                return error.InvalidNativeCompletion;
+        if (recovery_lock) |lock| {
+            if (!documentEqual(lock.binding, prepared.exact_lock) or
+                !std.mem.eql(u8, &lock.semantic_request_sha256, &(try semanticDigestForRequest(allocator, prepared.request))))
+                return error.InvalidNativeCompletion;
+        }
+        const selectors = try selectorsFor(allocator, prepared.request);
+        defer allocator.free(selectors);
+        const request: OwnedNativeRequest = .{
+            .exact_lock = prepared.exact_lock,
+            .owner = owner,
+            .operation = semanticOperation(prepared.request.operation),
+            .selectors = selectors,
+            .options = executeOptions(profile, prepared.paths.exact_lock),
+            .outcome = .succeeded,
+        };
+        var result = try self.runner.verifyOwnedNative(allocator, self.verifier, profile.transaction_backend, request);
+        errdefer result.deinit();
+        if (result != .succeeded or
+            !root_operation.deferredAcknowledgmentExactEqual(result.succeeded.owner, owner))
+            return error.InvalidNativeCompletion;
+        try PrivateLiveRootRunner.validateOwnedNativeReply(
+            allocator,
+            request,
+            result.succeeded.receipt.document,
+            result.succeeded.completion.document,
+        );
+        if (recovery_document) |document| {
+            if (!std.mem.eql(u8, &document.digest_sha256, &result.succeeded.completion.document.digest_sha256) or
+                !try recoveryCompletionMatches(
+                    allocator,
+                    document,
+                    prepared,
+                    profile,
+                    recovery_lock orelse return error.MissingRecoveryLockVerification,
+                    owner.attempt_id,
+                ))
+                return error.InvalidNativeCompletion;
+        }
+        return result.succeeded;
+    }
+
     fn verifyAndComplete(
         self: *Engine,
         allocator: std.mem.Allocator,
@@ -8680,8 +8776,124 @@ pub const Engine = struct {
         claim_transferred: ?*bool,
     ) InternalExecutionError!api.Result {
         const profile = loaded.view;
+        const native_owner: ?root_operation.DeferredAcknowledgment = if (profile.transaction_backend == .native) owner: {
+            if (recovery_acknowledgment) |acknowledgment|
+                if (acknowledgment.marker == null)
+                    return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "native recovery completion requires the complete retained owner",
+                    );
+            break :owner (durableLowerAcknowledgment(ownership_acknowledgment, recovery_acknowledgment) catch
+                return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "native completion ownership is invalid or ambiguous",
+                )) orelse return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                current,
+                "native completion has no independent owner authority",
+            );
+        } else null;
         var retained: api.DocumentBinding = undefined;
-        if (recovered and recovery_document != null) {
+        if (native_owner) |owner| {
+            var verified = self.verifyNativeCompletion(
+                allocator,
+                prepared,
+                profile,
+                owner,
+                recovery_document,
+                recovery_lock,
+                expected_recovery_attempt,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvariantViolation => return error.InvariantViolation,
+                else => return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "native completion does not verify against the exact owner and caller",
+                ),
+            };
+            defer verified.deinit();
+            const source = try verified.receipt.document.canonicalJson(allocator);
+            defer allocator.free(source);
+            var receipt_digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&receipt_digest, &verified.receipt.document.digest_sha256) catch
+                return error.InvariantViolation;
+            const expected: api.DocumentBinding = .{
+                .path = prepared.paths.transaction_result,
+                .schema = native_provenance.schema_id,
+                .version = native_provenance.schema_version,
+                .digest_sha256 = receipt_digest,
+            };
+            if (current.state.transaction_result) |existing| {
+                if (!documentEqual(existing, expected))
+                    return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "retained native receipt identity differs from the verified completion",
+                    );
+                const verify_retained = self.store.verifyRetainedTransactionFn orelse
+                    return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "retained native receipt validation is unavailable",
+                    );
+                verify_retained(self.store.context, allocator, profile.transaction_backend, prepared.paths, existing) catch |err| switch (err) {
+                    error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    else => return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "retained native receipt bytes are missing or invalid",
+                    ),
+                };
+            }
+            self.hitCompletionBoundary(.after_transaction_verified) catch
+                return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "native completion verification was interrupted",
+                );
+            const stored = if (current.state.transaction_result != null)
+                expected
+            else
+                (self.store.retainTransactionFn(
+                    self.store.context,
+                    allocator,
+                    profile.transaction_backend,
+                    prepared.paths,
+                    source,
+                    receipt_digest,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                    error.InvariantViolation => return error.InvariantViolation,
+                    error.ContractViolation => return error.ContractViolation,
+                    else => return self.markRecoveryRequired(
+                        allocator,
+                        prepared,
+                        current,
+                        "verified native receipt could not be retained",
+                    ),
+                });
+            if (!documentEqual(stored, expected))
+                return self.markRecoveryRequired(
+                    allocator,
+                    prepared,
+                    current,
+                    "retained native receipt binding is inconsistent",
+                );
+            retained = expected;
+        } else if (recovered and recovery_document != null) {
             const document = recovery_document.?;
             if (!try recoveryCompletionMatches(
                 allocator,
@@ -8845,7 +9057,7 @@ pub const Engine = struct {
         };
         self.hitCompletionBoundary(.after_verifying_state) catch
             return self.reconcilePreparedError(allocator, prepared);
-        const durable_acknowledgment = durableLowerAcknowledgment(
+        const durable_acknowledgment = native_owner orelse durableLowerAcknowledgment(
             ownership_acknowledgment,
             recovery_acknowledgment,
         ) catch return self.markRecoveryRequired(
@@ -14363,6 +14575,9 @@ const FakeRunner = struct {
     force_release_review_stale: bool = false,
     review_failure_after_publish: ?BoundaryError = null,
     review_snapshot_marker_override: ?root_operation.DeferredAcknowledgment = null,
+    native_verification_source: ?[]const u8 = null,
+    native_verification_calls: usize = 0,
+    native_cleanup_owner: ?root_operation.DeferredAcknowledgment = null,
 
     const RecoveryCompletionMismatch = enum {
         none,
@@ -14399,6 +14614,27 @@ const FakeRunner = struct {
             .validateRecoveryReviewFn = validateRecoveryReviewBoundary,
             .releaseRecoveryReviewFn = releaseRecoveryReviewBoundary,
             .settleRecoveryReviewFn = settleRecoveryReviewBoundary,
+            .verifyOwnedNativeFn = verifyOwnedNative,
+        };
+    }
+
+    fn verifyOwnedNative(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ResultVerifier,
+        backend: system_profile.TransactionBackend,
+        request: OwnedNativeRequest,
+    ) VerificationError!OwnedNativeVerification {
+        const self: *FakeRunner = @ptrCast(@alignCast(context));
+        if (backend != .native) return error.InvariantViolation;
+        self.native_verification_calls += 1;
+        return PrivateLiveRootRunner.decodeOwnedNative(
+            allocator,
+            request,
+            self.native_verification_source orelse return error.OperationalVerificationFailure,
+        ) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+            else => error.OperationalVerificationFailure,
         };
     }
 
@@ -14900,6 +15136,13 @@ const FakeRunner = struct {
             result.result.exit_status == .success)
         {
             if (request.recovery_acknowledgment) |_| {
+                if (backend.transaction_backend == .native) {
+                    const expected = request.expected_ownership_marker orelse return error.MissingRecoveryAcknowledgment;
+                    if (self.inspect_deferred_acknowledgment) |observed|
+                        if (!root_operation.deferredAcknowledgmentExactEqual(expected, observed))
+                            return error.InvalidRecoveryAcknowledgment;
+                    self.native_cleanup_owner = expected;
+                }
                 if (self.inspect_deferred_acknowledgment == null and
                     self.inspect_record_source != null)
                     return error.MissingRecoveryAcknowledgment;
@@ -15474,6 +15717,9 @@ const FakeStateStore = struct {
     retained_bytes: ?[]u8 = null,
     request_bytes: ?[]u8 = null,
     recovery_completion_bytes: ?[]u8 = null,
+    native_transaction_bytes: ?[]u8 = null,
+    native_retention_checks: usize = 0,
+    fail_native_retention: bool = false,
     lower_acknowledgment: ?root_operation.DeferredAcknowledgment = null,
     lower_ownership: ?lower_ownership_token.Document = null,
     reserve_calls: usize = 0,
@@ -15500,6 +15746,8 @@ const FakeStateStore = struct {
         if (self.request_bytes) |bytes| self.allocator.free(bytes);
         if (self.recovery_completion_bytes) |bytes|
             self.allocator.free(bytes);
+        if (self.native_transaction_bytes) |bytes|
+            self.allocator.free(bytes);
         self.* = undefined;
     }
 
@@ -15521,6 +15769,7 @@ const FakeStateStore = struct {
             .compareAndReplaceOwnershipTokenFn = compareAndReplaceOwnershipToken,
             .readOwnershipTokenFn = readOwnershipToken,
             .retainTransactionFn = retainTransaction,
+            .verifyRetainedTransactionFn = verifyRetainedTransaction,
             .retainRecoveryCompletionFn = retainRecoveryCompletion,
             .readRecoveryCompletionFn = readRecoveryCompletion,
             .publishCompletionFn = publishCompletion,
@@ -15830,10 +16079,17 @@ const FakeStateStore = struct {
         _: std.mem.Allocator,
         backend: system_profile.TransactionBackend,
         paths: OperationPaths,
-        _: []const u8,
+        source: []const u8,
         digest: [32]u8,
     ) !api.DocumentBinding {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        if (backend == .native) {
+            if (self.fail_native_retention) return error.InjectedNativeRetentionFailure;
+            const bytes = try self.allocator.dupe(u8, source);
+            if (self.native_transaction_bytes) |previous|
+                self.allocator.free(previous);
+            self.native_transaction_bytes = bytes;
+        }
         self.retained_transaction = true;
         return .{
             .path = paths.transaction_result,
@@ -15841,6 +16097,20 @@ const FakeStateStore = struct {
             .version = if (backend == .native) native_provenance.schema_version else transaction_provenance.schema_version,
             .digest_sha256 = digest,
         };
+    }
+
+    fn verifyRetainedTransaction(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        paths: OperationPaths,
+        expected: api.DocumentBinding,
+    ) !void {
+        const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        self.native_retention_checks += 1;
+        const source = self.native_transaction_bytes orelse return error.FileNotFound;
+        const actual = try retainedTransactionBinding(allocator, backend, paths.transaction_result, source, expected.digest_sha256);
+        if (!documentEqual(actual, expected)) return error.TransactionEvidenceMismatch;
     }
 
     fn readRecoveryCompletion(
@@ -23340,6 +23610,284 @@ test "apt_system_orchestrator.test.remove-to-empty review retains every planned 
     try std.testing.expectEqual(@as(usize, 2), prepared.review.len);
     try std.testing.expectEqualStrings("remove", prepared.review[0].detail.?);
     try std.testing.expectEqual(WorkflowOperation.remove, harness.backend.last_operation.?);
+}
+
+const NativeCompletionScenario = enum {
+    fresh,
+    reviewed,
+    retained,
+    corrupt_retained,
+    changed_binding,
+    failed_receipt,
+    missing_owner,
+    missing_full_owner,
+    wrong_outer,
+    wrong_completion,
+    retention_failure,
+    commit_failure,
+    verify_allocations,
+};
+
+fn testNativeEngineCompletion(
+    allocator: std.mem.Allocator,
+    owner_state: root_operation.DeferredAcknowledgmentState,
+    scenario: NativeCompletionScenario,
+) !void {
+    var harness = Harness.init(allocator);
+    defer harness.deinit();
+    harness.sources.next_id = @splat(0x22);
+    harness.verifier.lock_digest = @splat(0x77);
+    harness.rebind();
+    var prepared = try expectReady(try harness.engine.prepare(allocator, mutationRequest(.install, &.{"fixture"})));
+    defer prepared.deinit();
+    prepared.paths.exact_lock = try std.fmt.allocPrint(
+        prepared.arena.allocator(),
+        "{s}/{s}",
+        .{ prepared.paths.directory, native_exact_lock_name },
+    );
+    prepared.exact_lock = .{
+        .path = prepared.paths.exact_lock,
+        .schema = exact_lock_v2.schema_id,
+        .version = exact_lock_v2.schema_version,
+        .digest_sha256 = @splat(0x77),
+    };
+    var loaded = try harness.profile.interface().load(allocator, prepared.request.profile_path);
+    defer loaded.deinit();
+    loaded.view.transaction_backend = .native;
+    harness.profile.transaction_backend = .native;
+    harness.backend.expected_transaction_backend = .native;
+    var initial = (try harness.store.interface().readActive(allocator, prepared.profile_state_path)).?;
+    defer initial.deinit();
+    var input = initial.state;
+    input.generation += 1;
+    input.phase = if (owner_state == .pending) .recovering else .mutating;
+    input.mutation_started = true;
+    input.exact_lock = prepared.exact_lock;
+    var current = try operation_state.create(allocator, input);
+    defer current.deinit();
+    const active = try current.state.canonicalJson(allocator);
+    allocator.free(harness.store.active_bytes.?);
+    harness.store.active_bytes = active;
+    var fixture = try ownedNativeTransportFixture(
+        allocator,
+        scenario == .failed_receipt,
+        owner_state,
+        executeOptions(loaded.view, prepared.paths.exact_lock),
+    );
+    defer allocator.free(fixture.source);
+    if (scenario == .reviewed) {
+        const claim = try root_operation.createRecoveryReviewClaim(.{
+            .outer_attempt_id = prepared.attempt_id,
+            .outer_generation = current.state.generation,
+            .outer_state_sha256 = current.state.digest_sha256,
+            .profile_sha256 = prepared.profile.sha256,
+            .profile_reference_sha256 = prepared.profile.reference_evidence_sha256,
+            .exact_lock_sha256 = prepared.exact_lock.digest_sha256,
+            .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+            .mutation_status = .changed,
+            .outer_transaction_sha256 = @splat(7),
+            .nonce = @splat(8),
+        });
+        fixture.request.owner = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(fixture.request.owner, claim);
+        const owner_bytes = try fixture.request.owner.canonicalJson(allocator);
+        defer allocator.free(owner_bytes);
+        const owner_end = std.mem.indexOfScalar(u8, fixture.source, '\n').?;
+        const updated = try std.mem.concat(allocator, u8, &.{ owner_bytes, fixture.source[owner_end..] });
+        allocator.free(fixture.source);
+        fixture.source = updated;
+    }
+    harness.runner.native_verification_source = fixture.source;
+    harness.runner.inspect_deferred_acknowledgment = fixture.request.owner;
+    const Child = struct {
+        fn reject(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: system_profile.TransactionBackend,
+            _: OwnedNativeRequest,
+            _: *const live_root.Projection,
+        ) VerificationError!OwnedNativeVerification {
+            return error.InvariantViolation;
+        }
+    };
+    harness.engine.verifier.verifyOwnedNativeFn = Child.reject;
+    var documents = try PrivateLiveRootRunner.decodeOwnedNative(allocator, fixture.request, fixture.source);
+    defer documents.deinit();
+    const document = switch (documents) {
+        inline else => |owned| owned.completion.document,
+    };
+    const source = try switch (documents) {
+        inline else => |owned| owned.receipt.document.canonicalJson(allocator),
+    };
+    defer allocator.free(source);
+    const receipt_digest = document.transaction_provenance.document_sha256.?;
+    const binding: api.DocumentBinding = .{
+        .path = prepared.paths.transaction_result,
+        .schema = native_provenance.schema_id,
+        .version = native_provenance.schema_version,
+        .digest_sha256 = receipt_digest,
+    };
+    if (scenario == .verify_allocations) {
+        const Case = struct {
+            fn run(
+                failing_allocator: std.mem.Allocator,
+                engine: *Engine,
+                preparation: Preparation,
+                profile: ProfileView,
+                owner: root_operation.DeferredAcknowledgment,
+            ) !void {
+                var verified = try engine.verifyNativeCompletion(
+                    failing_allocator,
+                    preparation,
+                    profile,
+                    owner,
+                    null,
+                    null,
+                    null,
+                );
+                defer verified.deinit();
+            }
+        };
+        try std.testing.checkAllAllocationFailures(
+            allocator,
+            Case.run,
+            .{ &harness.engine, prepared, loaded.view, fixture.request.owner },
+        );
+        return;
+    }
+    if (scenario == .retained or scenario == .corrupt_retained or scenario == .changed_binding) {
+        harness.store.native_transaction_bytes = try allocator.dupe(
+            u8,
+            if (scenario == .corrupt_retained) "{}\n" else source,
+        );
+        var next_input = current.state;
+        next_input.phase = if (owner_state == .pending) .recovering else .verifying;
+        next_input.transaction_result = binding;
+        if (scenario == .changed_binding)
+            next_input.transaction_result.?.digest_sha256[0] ^= 1;
+        var next = try operation_state.create(allocator, next_input);
+        const next_source = next.state.canonicalJson(allocator) catch |err| {
+            next.deinit();
+            return err;
+        };
+        current.deinit();
+        current = next;
+        allocator.free(harness.store.active_bytes.?);
+        harness.store.active_bytes = next_source;
+    }
+    harness.store.fail_native_retention = scenario == .retention_failure;
+    harness.store.fail_finish = scenario == .commit_failure;
+    var owner = fixture.request.owner;
+    if (scenario == .wrong_outer) {
+        owner.acknowledgment_id[0] ^= 1;
+        owner = try root_operation.createDeferredAcknowledgment(owner);
+    }
+    const ownership = if (owner_state == .released and scenario != .missing_owner)
+        ownershipAcknowledgment(owner, owner.acknowledgment_id)
+    else
+        null;
+    const recovery: ?RecoveryAcknowledgment = if (owner_state == .pending and scenario != .missing_owner) .{
+        .attempt_id = owner.attempt_id,
+        .acknowledgment_id = owner.acknowledgment_id,
+        .completion_sha256 = owner.completion_sha256.?,
+        .provenance_sha256 = owner.provenance_sha256.?,
+        .marker = if (scenario == .missing_full_owner) null else owner,
+    } else null;
+    var recovery_document = document;
+    if (scenario == .wrong_completion) recovery_document.digest_sha256[0] ^= 1;
+    var result = try harness.engine.verifyAndComplete(
+        allocator,
+        prepared,
+        &loaded,
+        &current,
+        owner_state == .pending,
+        if (owner_state == .pending) recovery_document else null,
+        if (owner_state == .pending) .{
+            .binding = prepared.exact_lock,
+            .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+        } else null,
+        if (owner_state == .pending) owner.attempt_id else null,
+        recovery,
+        ownership,
+        null,
+        null,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), harness.verifier.transaction_checks);
+    if (scenario == .fresh or scenario == .retained or scenario == .reviewed) {
+        if (result.outcome != .success)
+            std.debug.print("native completion {s}/{s}: verified={d}, retained={}, completion={}, cleanup={d}, phase={s}, diagnostic={s}\n", .{
+                @tagName(owner_state),              @tagName(scenario),                 harness.runner.native_verification_calls,
+                harness.store.retained_transaction, harness.store.completion_published, harness.runner.recovery_ack_calls + harness.runner.ownership_finalize_calls,
+                @tagName(current.state.phase),      current.state.diagnostic,
+            });
+        try std.testing.expectEqual(api.Outcome.success, result.outcome);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(harness.store.retained_bytes != null);
+        try std.testing.expect(harness.store.completion_published);
+        try std.testing.expect(harness.store.recovery_completion_bytes == null);
+        try std.testing.expectEqualStrings(source, harness.store.native_transaction_bytes.?);
+        try std.testing.expect(documentEqual(binding, result.evidence.transaction_result.?));
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, harness.store.lower_acknowledgment.?));
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment == null);
+        if (owner_state == .pending) {
+            try std.testing.expectEqual(@as(usize, 1), harness.runner.recovery_ack_calls);
+            try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, harness.runner.native_cleanup_owner.?));
+        } else try std.testing.expectEqual(@as(usize, 1), harness.runner.ownership_finalize_calls);
+        try std.testing.expectEqual(@as(usize, if (scenario == .retained) 1 else 0), harness.store.native_retention_checks);
+    } else {
+        try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
+        try std.testing.expect(harness.store.active_bytes != null);
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment != null);
+        try std.testing.expectEqual(@as(usize, 0), harness.runner.recovery_ack_calls + harness.runner.ownership_finalize_calls);
+        if (scenario != .commit_failure) try std.testing.expect(!harness.store.completion_published);
+        if (scenario == .corrupt_retained)
+            try std.testing.expectEqualStrings("{}\n", harness.store.native_transaction_bytes.?);
+    }
+}
+
+test "apt_system_orchestrator.test.native engine completion retains receipts before exact owner cleanup" {
+    for ([_]root_operation.DeferredAcknowledgmentState{ .released, .pending }) |state| {
+        for (std.enums.values(NativeCompletionScenario)) |scenario| {
+            if (scenario == .verify_allocations) continue;
+            if (state == .released and (scenario == .failed_receipt or scenario == .missing_full_owner or scenario == .wrong_completion)) continue;
+            try testNativeEngineCompletion(std.testing.allocator, state, scenario);
+        }
+    }
+}
+
+test "apt_system_orchestrator.test.native engine live verification preserves allocation failures" {
+    for ([_]root_operation.DeferredAcknowledgmentState{ .released, .pending }) |state|
+        try testNativeEngineCompletion(std.testing.allocator, state, .verify_allocations);
+}
+
+test "apt_system_orchestrator.test.retained native receipt guards reject wrong bindings before IO" {
+    const allocator = std.testing.allocator;
+    var paths = try pathsFor(allocator, "/unread/state", @splat(1));
+    defer paths.deinit(allocator);
+    var store: SystemStateStore = .{ .io = undefined, .allocator = allocator };
+    const expected: api.DocumentBinding = .{
+        .path = paths.transaction_result,
+        .schema = native_provenance.schema_id,
+        .version = native_provenance.schema_version,
+        .digest_sha256 = @splat(2),
+    };
+    for (0..4) |index| {
+        var binding = expected;
+        switch (index) {
+            0 => binding.path = "/unread/foreign.json",
+            1 => binding.schema = transaction_provenance.schema_id,
+            2 => binding.version = 0,
+            3 => {},
+            else => unreachable,
+        }
+        try std.testing.expectError(error.TransactionEvidenceMismatch, store.interface().verifyRetainedTransactionFn.?(
+            store.interface().context,
+            allocator,
+            if (index == 3) .legacy_dpkg else .native,
+            paths,
+            binding,
+        ));
+    }
 }
 
 test "apt_system_orchestrator.test.confirmed execution uses exact lock and verifies completion" {

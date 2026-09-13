@@ -337,8 +337,8 @@ Canonical framing and allocation/operational failures remain fail-closed.
 This transport consistency check relies on the child's live verification; it
 is not an offline verifier for historical receipts. Success and known failure
 remain distinct result types, and neither finalizes ownership or claims a
-cleared root. Existing facade execution/recovery call sites and the legacy
-transaction verifier are not switched by this gateway.
+cleared root. The legacy transaction verifier remains separate and still refuses
+native selection.
 
 Native recovery completion matching now uses native publication semantics
 rather than the legacy journal-derived provenance hash: the published record
@@ -358,8 +358,29 @@ survives outer acknowledgment retention and pending-to-acknowledged comparison.
 Native cleanup receives that exact expected marker, while legacy callers retain
 their existing identifier-based upgrade behavior. This ownership handoff is not
 receipt verification or permission to finalize before durable outer completion.
-Native facade engine retention, restart, and known-failure integration still
-need completion before the profile gate can be removed.
+Native retained-final/restart and known-failure integration still need completion
+before the profile gate can be removed.
+
+The engine's live completion path now consumes owner-bound native success for
+ordinary completion and recovered pending completion. Normal execution compares
+the returned owner with its independently retained execution token; recovery
+requires the complete returned owner rather than reconstructing v2 authority
+from identifiers. Verification binds that owner to the outer attempt, original
+caller, exact lock, and any supplied recovery completion. A known failure is not
+a successful completion and cannot enter this path.
+
+Native completion retains the verified canonical native receipt at the existing
+per-attempt `transaction-result.json`, including after recovery; it does not
+substitute a legacy recovery-discharge document. An already bound receipt must
+match both the fresh live proof and the trusted operation-local canonical bytes.
+Missing, corrupt, or replaced retained evidence is refused, not repaired from a
+shared file. The storage retention check is only a format/binding check, never
+standalone execution or historical verification. The engine retains the exact
+owner and publishes and commits outer completion before native ownership cleanup
+and active-state clearing. Missing authority, mismatched outcomes, retention
+failures, and interrupted publication leave cleanup unperformed. Historical
+reconciliation still requires separate native integration; the profile gate
+continues to prevent public native facade execution.
 
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
