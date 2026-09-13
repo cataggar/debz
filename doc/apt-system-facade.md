@@ -399,10 +399,23 @@ by replacing shared root evidence. Missing or corrupt operation-local evidence,
 foreign review ownership, and failed or recovery-required receipts are refused;
 allocation failures remain distinct from invalid evidence. Retained-final
 reconciliation uses this proof to resume outer commit after final-state
-publication, then performs only the exact caller-owned cleanup. Recovery
-preparation, interrupted-live reconciliation, and known-failure integration
-remain separate work; neither the native profile gate nor the legacy
-transaction verifier is relaxed.
+publication, then performs only the exact caller-owned cleanup.
+
+Recovery preparation and interrupted-completion diagnostics route retained
+native receipts through the same authority split. A matching durable final
+snapshot selects committed proof without consulting live root evidence.
+Otherwise, a nonfinal attempt requires fresh owned live success, using its
+operation-local acknowledgment or exact released execution token as authority,
+and validates its retained receipt against that proof. Observed root ownership
+is never adopted as authorization. Missing or corrupt final evidence does not
+fall back to live verification for a completed attempt. An outer completion
+published before final-state commit is passed separately from the unchanged
+active state; it cannot turn interrupted live evidence into committed history.
+
+Recovery review still checks current lower ownership before claiming exclusion.
+Attempts without retained receipt bindings, remaining clean-root recovery and
+known-failure integration remain separate work. Neither the native profile gate
+nor the legacy transaction verifier is relaxed.
 
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact

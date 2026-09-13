@@ -53,7 +53,7 @@ pub const State = struct {
             return error.DigestMismatch;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try writeDocument(self, &output.writer);
+        writeDocument(self, &output.writer) catch return error.OutOfMemory;
         const bytes = try output.toOwnedSlice();
         if (bytes.len > maximum_document_bytes) {
             allocator.free(bytes);
@@ -1094,10 +1094,7 @@ test "apt_system_state.test.completed state decoding preserves allocation failur
     defer std.testing.allocator.free(source);
     const Case = struct {
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
-            var decoded = decode(allocator, bytes, maximum_document_bytes) catch |err| switch (err) {
-                error.WriteFailed => return error.OutOfMemory,
-                else => return err,
-            };
+            var decoded = try decode(allocator, bytes, maximum_document_bytes);
             defer decoded.deinit();
         }
     };
