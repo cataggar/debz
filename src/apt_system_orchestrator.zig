@@ -2704,7 +2704,7 @@ pub const ExecutionCompletion = struct {
 
 /// Creates ordinary-success or recovered apt/system completion evidence. This
 /// schema is intentionally distinct from
-/// `root-operation-completion-v1.json`, which is a recovery-only discharge
+/// `root-operation-completion-v1.json`, the lower operation's discharge
 /// statement owned by the root-operation protocol.
 pub fn createExecutionCompletion(input: CompletionInput) !ExecutionCompletion {
     try api.validateProfileBinding(input.profile);
@@ -2742,7 +2742,10 @@ fn verifyExistingCompletion(
         allocator,
         source,
         .{},
-    ) catch return error.InvalidCompletion;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCompletion,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCompletion;
     const completed_unix = parsed.value.object.get("completed_unix") orelse
@@ -4316,6 +4319,59 @@ pub const OwnedNativeVerification = union(enum) {
     }
 };
 
+/// Historical proof requires the durable final state, outer completion and
+/// exact owner retained for this operation. It never inspects the current root.
+pub const CommittedNativeRequest = struct {
+    paths: OperationPaths,
+    retained: operation_state.State,
+    owned: OwnedNativeRequest,
+
+    fn validate(self: CommittedNativeRequest, allocator: std.mem.Allocator, backend: system_profile.TransactionBackend) !void {
+        try self.owned.validate(allocator, backend);
+        try operation_state.validate(self.retained);
+        if (self.owned.outcome != .succeeded or
+            self.retained.phase != .completed or !self.retained.mutation_started or
+            (self.retained.outcome != .succeeded and self.retained.outcome != .recovered) or
+            !std.mem.eql(u8, &self.owned.owner.acknowledgment_id, &self.retained.attempt_id))
+            return error.InvalidCommittedNativeEvidence;
+        const operation: WorkflowOperation = switch (self.retained.operation) {
+            .install => .install,
+            .remove => .remove,
+            .upgrade => .upgrade_all,
+            else => return error.InvalidCommittedNativeEvidence,
+        };
+        if (operation != self.owned.operation) return error.InvalidCommittedNativeEvidence;
+        const lock = self.retained.exact_lock orelse return error.InvalidCommittedNativeEvidence;
+        const receipt = self.retained.transaction_result orelse return error.InvalidCommittedNativeEvidence;
+        const completion = self.retained.root_operation_completion orelse return error.InvalidCommittedNativeEvidence;
+        var expected_paths = try pathsForBackend(allocator, self.owned.options.state_path, self.retained.attempt_id, .native);
+        defer expected_paths.deinit(allocator);
+        inline for (std.meta.fields(OperationPaths)) |field|
+            if (!std.mem.eql(u8, @field(self.paths, field.name), @field(expected_paths, field.name)))
+                return error.InvalidCommittedNativeEvidence;
+        if (!documentEqual(lock, self.owned.exact_lock) or
+            !std.mem.eql(u8, lock.path, self.paths.exact_lock) or
+            !std.mem.eql(u8, receipt.path, self.paths.transaction_result) or
+            !std.mem.eql(u8, receipt.schema, native_provenance.schema_id) or receipt.version != native_provenance.schema_version or
+            !std.mem.eql(u8, completion.document.path, self.paths.completion) or
+            !std.mem.eql(u8, completion.document.schema, completion_schema_id) or completion.document.version != completion_schema_version or
+            !std.mem.eql(u8, &completion.completed_attempt_id, &self.retained.attempt_id))
+            return error.InvalidCommittedNativeEvidence;
+    }
+
+    fn completionInput(self: CommittedNativeRequest) CompletionInput {
+        return .{
+            .attempt_id = self.retained.attempt_id,
+            .request_sha256 = self.retained.request_sha256,
+            .profile = self.retained.profile,
+            .exact_lock = self.retained.exact_lock.?,
+            .transaction_result = self.retained.transaction_result.?,
+            .recovered = self.retained.outcome == .recovered,
+            .completed_unix = self.retained.updated_unix,
+        };
+    }
+};
+
 pub const VerificationError = error{
     OutOfMemory,
     OperationalVerificationFailure,
@@ -4347,6 +4403,12 @@ pub const ResultVerifier = struct {
         OwnedNativeRequest,
         *const live_root.Projection,
     ) VerificationError!OwnedNativeVerification = null,
+    verifyCommittedNativeFn: ?*const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        system_profile.TransactionBackend,
+        CommittedNativeRequest,
+    ) VerificationError!VerifiedTransaction = null,
 };
 
 pub const SystemResultVerifier = struct {
@@ -4358,6 +4420,7 @@ pub const SystemResultVerifier = struct {
             .verifyLockFn = verifyLock,
             .verifyTransactionFn = verifyTransaction,
             .verifyOwnedNativeFn = verifyOwnedNative,
+            .verifyCommittedNativeFn = verifyCommittedNative,
         };
     }
 
@@ -4521,6 +4584,127 @@ pub const SystemResultVerifier = struct {
             },
             .allocator = allocator,
         };
+    }
+
+    fn verifyCommittedNative(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: CommittedNativeRequest,
+    ) VerificationError!VerifiedTransaction {
+        return verifyCommittedNativeInternal(context, allocator, backend, request) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+            error.InvariantViolation => error.InvariantViolation,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyCommittedNativeInternal(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: CommittedNativeRequest,
+    ) !VerifiedTransaction {
+        try request.validate(allocator, backend);
+        const self: *SystemResultVerifier = @ptrCast(@alignCast(context));
+        const final_source = try readTrustedOperationFile(
+            self.io,
+            allocator,
+            request.paths.retained_state,
+            operation_state.maximum_document_bytes,
+        );
+        defer allocator.free(final_source);
+        const completion_source = try readTrustedOperationFile(
+            self.io,
+            allocator,
+            request.paths.completion,
+            transaction_provenance.maximum_document_bytes,
+        );
+        defer allocator.free(completion_source);
+        const owner_source = try readTrustedOperationFile(
+            self.io,
+            allocator,
+            request.paths.lower_acknowledgment,
+            root_operation.maximum_document_bytes,
+        );
+        defer allocator.free(owner_source);
+        try verifyCommittedNativeAnchors(allocator, request, final_source, completion_source, owner_source);
+        const semantic = try production_backend.workflowSemanticRequestDigest(
+            allocator,
+            request.owned.semanticOperation(),
+            request.owned.selectors,
+        );
+        const lock = try verifyLockInternal(
+            context,
+            allocator,
+            backend,
+            request.paths.exact_lock,
+            request.owned.options.architecture,
+            semantic,
+        );
+        if (!documentEqual(lock.binding, request.owned.exact_lock))
+            return error.InvalidCommittedNativeEvidence;
+        const source = try readTrustedOperationFile(
+            self.io,
+            allocator,
+            request.paths.transaction_result,
+            native_provenance.maximum_document_bytes,
+        );
+        errdefer allocator.free(source);
+        try verifyCommittedNativeReceipt(allocator, request, source);
+        return .{
+            .bytes = source,
+            .binding = .{
+                .path = request.paths.transaction_result,
+                .schema = native_provenance.schema_id,
+                .version = native_provenance.schema_version,
+                .digest_sha256 = request.retained.transaction_result.?.digest_sha256,
+            },
+            .allocator = allocator,
+        };
+    }
+
+    fn verifyCommittedNativeAnchors(
+        allocator: std.mem.Allocator,
+        request: CommittedNativeRequest,
+        final_source: []const u8,
+        completion_source: []const u8,
+        owner_source: []const u8,
+    ) !void {
+        var retained = try operation_state.decode(allocator, final_source, operation_state.maximum_document_bytes);
+        defer retained.deinit();
+        if (!finalStateEquivalent(retained.state, request.retained) or
+            retained.state.generation != request.retained.generation or
+            !std.mem.eql(u8, &retained.state.digest_sha256, &request.retained.digest_sha256))
+            return error.InvalidCommittedNativeEvidence;
+        const completion = try verifyExistingCompletion(allocator, completion_source, request.completionInput());
+        if (!completionEqual(
+            completionBinding(request.paths, request.completionInput(), completion),
+            request.retained.root_operation_completion.?,
+        )) return error.InvalidCommittedNativeEvidence;
+        const owner = try root_operation.decodeDeferredAcknowledgment(allocator, owner_source);
+        if (!root_operation.deferredAcknowledgmentExactEqual(owner, request.owned.owner))
+            return error.InvalidCommittedNativeEvidence;
+    }
+
+    fn verifyCommittedNativeReceipt(
+        allocator: std.mem.Allocator,
+        request: CommittedNativeRequest,
+        source: []const u8,
+    ) !void {
+        var receipt = try native_provenance.decode(allocator, source);
+        defer receipt.deinit();
+        const proof = receipt.document;
+        const expected = try request.owned.authority(allocator, null);
+        if (proof.outcome != .succeeded or
+            !proof.operation.eql(.{ .package_transaction = expected.operation }) or
+            !std.mem.eql(u8, &proof.digest_sha256, &native_provenance.hexDigest(request.retained.transaction_result.?.digest_sha256)) or
+            !std.mem.eql(u8, &proof.attempt_id, &native_provenance.hexDigest(expected.owner.attempt_id)) or
+            !std.mem.eql(u8, &proof.request_sha256, &native_provenance.hexDigest(expected.caller_request_sha256)) or
+            !std.mem.eql(u8, &proof.policy_sha256, &native_provenance.hexDigest(expected.caller_policy_sha256)) or
+            !std.mem.eql(u8, &proof.exact_lock_sha256, &native_provenance.hexDigest(request.owned.exact_lock.digest_sha256)) or
+            !std.mem.eql(u8, proof.install_root, request.owned.options.install_root))
+            return error.InvalidCommittedNativeEvidence;
     }
 
     fn verifyOwnedNative(
@@ -9333,6 +9517,32 @@ pub const Engine = struct {
 
         const binding = retained.transaction_result orelse
             return error.InvalidRetainedEvidence;
+        if (loaded.view.transaction_backend == .native) {
+            if (!std.mem.eql(u8, &retained.attempt_id, &prepared.attempt_id) or
+                !std.mem.eql(u8, &retained.request_sha256, &prepared.request_sha256) or
+                retained.operation != prepared.request.operation or
+                !profileEqual(retained.profile, prepared.profile) or
+                !profileEqual(retained.profile, loaded.view.binding))
+                return error.InvalidRetainedEvidence;
+            const verify = self.verifier.verifyCommittedNativeFn orelse return error.InvalidRetainedEvidence;
+            const selectors = try selectorsFor(allocator, prepared.request);
+            defer allocator.free(selectors);
+            var verified = try verify(self.verifier.context, allocator, loaded.view.transaction_backend, .{
+                .paths = prepared.paths,
+                .retained = retained,
+                .owned = .{
+                    .exact_lock = verified_lock.binding,
+                    .owner = acknowledgment,
+                    .operation = semanticOperation(prepared.request.operation),
+                    .selectors = selectors,
+                    .options = executeOptions(loaded.view, prepared.paths.exact_lock),
+                    .outcome = .succeeded,
+                },
+            });
+            defer verified.deinit();
+            if (!documentEqual(verified.binding, binding)) return error.InvalidRetainedEvidence;
+            return;
+        }
         switch (retained.outcome) {
             .succeeded => {
                 if (acknowledgment.state != .released or
@@ -15718,6 +15928,7 @@ const FakeStateStore = struct {
     request_bytes: ?[]u8 = null,
     recovery_completion_bytes: ?[]u8 = null,
     native_transaction_bytes: ?[]u8 = null,
+    native_completion_bytes: ?[]u8 = null,
     native_retention_checks: usize = 0,
     fail_native_retention: bool = false,
     lower_acknowledgment: ?root_operation.DeferredAcknowledgment = null,
@@ -15747,6 +15958,8 @@ const FakeStateStore = struct {
         if (self.recovery_completion_bytes) |bytes|
             self.allocator.free(bytes);
         if (self.native_transaction_bytes) |bytes|
+            self.allocator.free(bytes);
+        if (self.native_completion_bytes) |bytes|
             self.allocator.free(bytes);
         self.* = undefined;
     }
@@ -16172,6 +16385,15 @@ const FakeStateStore = struct {
         input: CompletionInput,
     ) !api.CompletionBinding {
         const self: *FakeStateStore = @ptrCast(@alignCast(context));
+        if (std.mem.eql(u8, input.transaction_result.schema, native_provenance.schema_id)) {
+            const completion = try createExecutionCompletion(input);
+            const source = try completion.canonicalJson(self.allocator);
+            if (self.native_completion_bytes) |previous|
+                self.allocator.free(previous);
+            self.native_completion_bytes = source;
+            self.completion_published = true;
+            return completionBinding(paths, input, completion);
+        }
         self.completion_published = true;
         return .{
             .document = .{
@@ -16186,8 +16408,8 @@ const FakeStateStore = struct {
 
     fn verifyCompletion(
         context: *anyopaque,
-        _: std.mem.Allocator,
-        _: OperationPaths,
+        allocator: std.mem.Allocator,
+        paths: OperationPaths,
         input: CompletionInput,
         expected: api.CompletionBinding,
     ) !void {
@@ -16199,6 +16421,12 @@ const FakeStateStore = struct {
                 &input.attempt_id,
             ))
             return error.CompletionMismatch;
+        if (std.mem.eql(u8, input.transaction_result.schema, native_provenance.schema_id)) {
+            const source = self.native_completion_bytes orelse return error.CompletionMismatch;
+            const completion = try verifyExistingCompletion(allocator, source, input);
+            if (!completionEqual(completionBinding(paths, input, completion), expected))
+                return error.CompletionMismatch;
+        }
     }
 };
 
@@ -16222,12 +16450,56 @@ const FakeVerifier = struct {
     different_lock_check: ?usize = null,
     different_semantic_check: ?usize = null,
     transaction_checks: usize = 0,
+    committed_store: ?*FakeStateStore = null,
+    committed_checks: usize = 0,
 
     fn interface(self: *FakeVerifier) ResultVerifier {
         return .{
             .context = self,
             .verifyLockFn = verifyLock,
             .verifyTransactionFn = verifyTransaction,
+            .verifyCommittedNativeFn = verifyCommittedNative,
+        };
+    }
+
+    fn verifyCommittedNative(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: CommittedNativeRequest,
+    ) VerificationError!VerifiedTransaction {
+        const self: *FakeVerifier = @ptrCast(@alignCast(context));
+        self.committed_checks += 1;
+        return self.verifyCommittedNativeInternal(allocator, backend, request) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+            else => error.OperationalVerificationFailure,
+        };
+    }
+
+    fn verifyCommittedNativeInternal(
+        self: *FakeVerifier,
+        allocator: std.mem.Allocator,
+        backend: system_profile.TransactionBackend,
+        request: CommittedNativeRequest,
+    ) !VerifiedTransaction {
+        try request.validate(allocator, backend);
+        const store = self.committed_store orelse return error.InvalidCommittedNativeEvidence;
+        const owner = store.lower_acknowledgment orelse return error.InvalidCommittedNativeEvidence;
+        const owner_source = try owner.canonicalJson(allocator);
+        defer allocator.free(owner_source);
+        try SystemResultVerifier.verifyCommittedNativeAnchors(
+            allocator,
+            request,
+            store.retained_bytes orelse return error.InvalidCommittedNativeEvidence,
+            store.native_completion_bytes orelse return error.InvalidCommittedNativeEvidence,
+            owner_source,
+        );
+        const source = store.native_transaction_bytes orelse return error.InvalidCommittedNativeEvidence;
+        try SystemResultVerifier.verifyCommittedNativeReceipt(allocator, request, source);
+        return .{
+            .bytes = try allocator.dupe(u8, source),
+            .binding = request.retained.transaction_result.?,
+            .allocator = allocator,
         };
     }
 
@@ -23625,6 +23897,7 @@ const NativeCompletionScenario = enum {
     wrong_completion,
     retention_failure,
     commit_failure,
+    retained_publication_crash,
     verify_allocations,
 };
 
@@ -23776,6 +24049,7 @@ fn testNativeEngineCompletion(
     }
     harness.store.fail_native_retention = scenario == .retention_failure;
     harness.store.fail_finish = scenario == .commit_failure;
+    harness.store.fail_after_retain_once = scenario == .retained_publication_crash;
     var owner = fixture.request.owner;
     if (scenario == .wrong_outer) {
         owner.acknowledgment_id[0] ^= 1;
@@ -23813,6 +24087,36 @@ fn testNativeEngineCompletion(
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), harness.verifier.transaction_checks);
+    if (scenario == .retained_publication_crash) {
+        try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
+        try std.testing.expect(harness.store.active_bytes != null);
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment != null);
+        var final = try operation_state.decode(allocator, harness.store.retained_bytes.?, operation_state.maximum_document_bytes);
+        defer final.deinit();
+        harness.verifier.committed_store = &harness.store;
+        harness.runner.native_verification_source = null;
+        const live_verifications = harness.runner.native_verification_calls;
+        var resumed = try harness.engine.reconcileRetainedFinal(
+            allocator,
+            prepared,
+            &loaded,
+            &current,
+            final.state,
+            .{
+                .binding = prepared.exact_lock,
+                .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+            },
+            null,
+            null,
+        );
+        defer resumed.deinit();
+        try std.testing.expectEqual(api.Outcome.success, resumed.outcome);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment == null);
+        try std.testing.expectEqual(live_verifications, harness.runner.native_verification_calls);
+        try std.testing.expectEqual(@as(usize, 1), harness.verifier.committed_checks);
+        return;
+    }
     if (scenario == .fresh or scenario == .retained or scenario == .reviewed) {
         if (result.outcome != .success)
             std.debug.print("native completion {s}/{s}: verified={d}, retained={}, completion={}, cleanup={d}, phase={s}, diagnostic={s}\n", .{
@@ -23834,6 +24138,8 @@ fn testNativeEngineCompletion(
             try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, harness.runner.native_cleanup_owner.?));
         } else try std.testing.expectEqual(@as(usize, 1), harness.runner.ownership_finalize_calls);
         try std.testing.expectEqual(@as(usize, if (scenario == .retained) 1 else 0), harness.store.native_retention_checks);
+        if (scenario == .fresh or scenario == .reviewed)
+            try testNativeCommittedHistory(allocator, &harness, prepared, &loaded, owner);
     } else {
         try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
         try std.testing.expect(harness.store.active_bytes != null);
@@ -23843,6 +24149,186 @@ fn testNativeEngineCompletion(
         if (scenario == .corrupt_retained)
             try std.testing.expectEqualStrings("{}\n", harness.store.native_transaction_bytes.?);
     }
+}
+
+fn testNativeCommittedHistory(
+    allocator: std.mem.Allocator,
+    harness: *Harness,
+    prepared: Preparation,
+    loaded: *LoadedProfile,
+    owner: root_operation.DeferredAcknowledgment,
+) !void {
+    var retained = try operation_state.decode(allocator, harness.store.retained_bytes.?, operation_state.maximum_document_bytes);
+    defer retained.deinit();
+    const lock: VerifiedLock = .{
+        .binding = prepared.exact_lock,
+        .semantic_request_sha256 = try semanticDigestForRequest(allocator, prepared.request),
+    };
+    harness.verifier.committed_store = &harness.store;
+    harness.runner.native_verification_source = null;
+    harness.runner.boundary_failure_point = .inspect;
+    harness.runner.inspect_deferred_acknowledgment = try root_operation.createDeferredAcknowledgment(.{
+        .state = .bound,
+        .attempt_id = @splat(0xee),
+        .acknowledgment_id = @splat(0xff),
+    });
+    const calls = harness.runner.calls;
+    const inspections = harness.runner.inspect_calls;
+    const live_verifications = harness.runner.native_verification_calls;
+    try harness.engine.verifyRetainedFinalEvidence(allocator, prepared, loaded, retained.state, lock, owner);
+    const Case = struct {
+        fn run(
+            failing_allocator: std.mem.Allocator,
+            engine: *Engine,
+            preparation: Preparation,
+            profile: *LoadedProfile,
+            state: operation_state.State,
+            verified_lock: VerifiedLock,
+            acknowledgment: root_operation.DeferredAcknowledgment,
+        ) !void {
+            try engine.verifyRetainedFinalEvidence(failing_allocator, preparation, profile, state, verified_lock, acknowledgment);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        Case.run,
+        .{ &harness.engine, prepared, loaded, retained.state, lock, owner },
+    );
+    for (0..5) |index| {
+        const final_bytes = harness.store.retained_bytes;
+        const completion_bytes = harness.store.native_completion_bytes;
+        const receipt_bytes = harness.store.native_transaction_bytes;
+        const acknowledgment = harness.store.lower_acknowledgment;
+        const corrupt = try allocator.dupe(u8, "{}\n");
+        defer allocator.free(corrupt);
+        defer {
+            harness.store.retained_bytes = final_bytes;
+            harness.store.native_completion_bytes = completion_bytes;
+            harness.store.native_transaction_bytes = receipt_bytes;
+            harness.store.lower_acknowledgment = acknowledgment;
+        }
+        switch (index) {
+            0 => harness.store.retained_bytes = null,
+            1 => harness.store.native_completion_bytes = null,
+            2 => harness.store.lower_acknowledgment = null,
+            3 => harness.store.native_transaction_bytes = corrupt,
+            4 => {
+                var other_id = owner.acknowledgment_id;
+                other_id[0] ^= 1;
+                harness.store.lower_acknowledgment = try root_operation.createDeferredAcknowledgment(.{
+                    .state = owner.state,
+                    .attempt_id = owner.attempt_id,
+                    .acknowledgment_id = other_id,
+                    .completion_sha256 = owner.completion_sha256,
+                    .provenance_sha256 = owner.provenance_sha256,
+                });
+            },
+            else => unreachable,
+        }
+        try std.testing.expectError(error.OperationalVerificationFailure, harness.engine.verifyRetainedFinalEvidence(
+            allocator,
+            prepared,
+            loaded,
+            retained.state,
+            lock,
+            owner,
+        ));
+    }
+    if (owner.document_version == root_operation.deferred_ack_v2_schema_version) {
+        const claim = try root_operation.createRecoveryReviewClaim(.{
+            .outer_attempt_id = owner.acknowledgment_id,
+            .outer_generation = retained.state.generation,
+            .outer_state_sha256 = retained.state.digest_sha256,
+            .profile_sha256 = prepared.profile.sha256,
+            .profile_reference_sha256 = prepared.profile.reference_evidence_sha256,
+            .exact_lock_sha256 = prepared.exact_lock.digest_sha256,
+            .semantic_request_sha256 = lock.semantic_request_sha256,
+            .mutation_status = .changed,
+            .outer_transaction_sha256 = retained.state.transaction_result.?.digest_sha256,
+            .nonce = @splat(0xbb),
+        });
+        const foreign = try root_operation.bindDeferredAcknowledgmentToRecoveryReview(owner, claim);
+        try std.testing.expectEqualSlices(u8, &owner.digest_sha256, &foreign.digest_sha256);
+        const previous = harness.store.lower_acknowledgment;
+        harness.store.lower_acknowledgment = foreign;
+        defer harness.store.lower_acknowledgment = previous;
+        try std.testing.expectError(error.OperationalVerificationFailure, harness.engine.verifyRetainedFinalEvidence(
+            allocator,
+            prepared,
+            loaded,
+            retained.state,
+            lock,
+            owner,
+        ));
+    }
+    const selectors = try selectorsFor(allocator, prepared.request);
+    defer allocator.free(selectors);
+    const request: CommittedNativeRequest = .{
+        .paths = prepared.paths,
+        .retained = retained.state,
+        .owned = .{
+            .exact_lock = prepared.exact_lock,
+            .owner = owner,
+            .operation = semanticOperation(prepared.request.operation),
+            .selectors = selectors,
+            .options = executeOptions(loaded.view, prepared.paths.exact_lock),
+            .outcome = .succeeded,
+        },
+    };
+    var system: SystemResultVerifier = .{ .io = undefined };
+    for (0..6) |index| {
+        var changed = request;
+        switch (index) {
+            0 => changed.retained.phase = .verifying,
+            1 => changed.owned.options.state_path = "/different-state",
+            2 => changed.owned.exact_lock.version = 1,
+            3 => changed.owned.outcome = .failed,
+            4 => changed.retained.root_operation_completion = null,
+            5 => {},
+            else => unreachable,
+        }
+        try std.testing.expectError(error.OperationalVerificationFailure, system.interface().verifyCommittedNativeFn.?(
+            system.interface().context,
+            allocator,
+            if (index == 5) .legacy_dpkg else .native,
+            changed,
+        ));
+    }
+    for (0..3) |index| {
+        var changed = request;
+        switch (index) {
+            0 => changed.owned.options.architecture = "arm64",
+            1 => changed.owned.selectors = &.{.{ .name = "different" }},
+            2 => changed.owned.options.recommends = !changed.owned.options.recommends,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.InvalidCommittedNativeEvidence, SystemResultVerifier.verifyCommittedNativeReceipt(
+            allocator,
+            changed,
+            harness.store.native_transaction_bytes.?,
+        ));
+    }
+    var receipt = try native_provenance.decode(allocator, harness.store.native_transaction_bytes.?);
+    defer receipt.deinit();
+    for ([_]native_provenance.Outcome{ .failed, .recovery_required }) |outcome| {
+        var changed = request;
+        var proof = receipt.document;
+        proof.outcome = outcome;
+        native_provenance.seal(&proof);
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, &proof.digest_sha256);
+        changed.retained.transaction_result.?.digest_sha256 = digest;
+        const source = try proof.canonicalJson(allocator);
+        defer allocator.free(source);
+        try std.testing.expectError(error.InvalidCommittedNativeEvidence, SystemResultVerifier.verifyCommittedNativeReceipt(
+            allocator,
+            changed,
+            source,
+        ));
+    }
+    try std.testing.expectEqual(calls, harness.runner.calls);
+    try std.testing.expectEqual(inspections, harness.runner.inspect_calls);
+    try std.testing.expectEqual(live_verifications, harness.runner.native_verification_calls);
 }
 
 test "apt_system_orchestrator.test.native engine completion retains receipts before exact owner cleanup" {
