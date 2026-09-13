@@ -406,16 +406,32 @@ native receipts through the same authority split. A matching durable final
 snapshot selects committed proof without consulting live root evidence.
 Otherwise, a nonfinal attempt requires fresh owned live success, using its
 operation-local acknowledgment or exact released execution token as authority,
-and validates its retained receipt against that proof. Observed root ownership
-is never adopted as authorization. Missing or corrupt final evidence does not
-fall back to live verification for a completed attempt. An outer completion
+and validates its retained receipt against that proof. A recovery-review token
+can preserve the independently authenticated prior released owner for retries.
+Observed root ownership is never adopted as authorization. Missing or corrupt
+final evidence does not fall back to live verification for a completed attempt.
+An outer completion
 published before final-state commit is passed separately from the unchanged
 active state; it cannot turn interrupted live evidence into committed history.
 
-Recovery review still checks current lower ownership before claiming exclusion.
-Attempts without retained receipt bindings, remaining clean-root recovery and
-known-failure integration remain separate work. Neither the native profile gate
-nor the legacy transaction verifier is relaxed.
+Released native success interrupted before the outer receipt binding is retained
+has a separate live-evidence path. It requires independently retained ownership
+and fresh owned success; an observed released marker alone is insufficient.
+Diagnostics can report known mutation without inventing a retained receipt or
+outer completion binding. Recovery preparation carries a transient witness of
+the exact owner, native receipt digest and lower completion digest. Review
+publication rechecks that owner, absence of a root record, and the matching
+completion under the lower lock. The review claim's `outer_transaction_sha256`
+then binds the verified live native receipt, not an invented outer state field.
+
+Preparing or repeating that review does not retain a receipt, publish outer
+completion, finalize ownership or replay package work. After confirmation,
+completion obtains fresh owned success again, retains the receipt, commits
+outer evidence and only then finalizes the exact owner. Missing or foreign
+authority, stale completion and unavailable live evidence remain unknown.
+Remaining settled/clean-root recovery and known-failure integration are separate
+work. Neither the native profile gate nor the legacy transaction verifier is
+relaxed.
 
 The native result module also exposes a separate read-only pending-success
 verifier used by the owned gateway. It requires independently retained exact
