@@ -582,7 +582,7 @@ pending owner and its native receipt binding. After another fresh failure
 verification, the engine transitions through verifying and durably commits
 `completed` / `failed_after_mutation` outer state. That final state has no
 successful outer completion binding. Lower ownership remains pending and the
-outer active slot is not cleared.
+outer active slot remains occupied at this durable history boundary.
 
 Committed failure has its own request and historical result type. Verification
 requires the exact durable final generation/digest, retained pending owner,
@@ -594,13 +594,29 @@ success or unknown outcomes, and cross-attempt evidence are refused. No current
 root, database, shared receipt/completion or live review authority is consulted.
 The document-binding decoder alone is not historical proof.
 
+Normal already-confirmed execution then freshly verifies that failure history,
+the exact committed active slot, profile and lock before acknowledging the
+original pending owner. A native acknowledgment without the exact active review
+claim is refused under the root-operation lock before native evidence cleanup.
+The immutable retained owner, receipt and original lower completion are never
+rebound or replaced. Only successful exact lower acknowledgment permits clearing
+the matching committed outer active slot.
+
+Completed cleanup returns `transaction` (exit 7), `changed: true` and
+`transaction_failed`, with retained failure evidence and no successful outer
+completion. Cleanup success is not transaction success. Interruption before
+acknowledgment, after lower cleanup or during outer clearing leaves durable
+failed history for read-only diagnostics; it does not transition a completed
+failure back to pending or replay packages. An interruption after active-slot
+clearing still produces the same completed failure result.
+
 Read-only diagnostics and recovery preparation distinguish this committed
 failure from live pending failure, including a final snapshot published before
 the active-state commit. Retained-final reconciliation can finish only that
 outer commit using historical proof, without touching lower ownership or
 replaying package work. It still reports transaction failure and unresolved
-cleanup, never success. Failure review/confirmation and exact cleanup remain
-separate work, and native profiles remain gated.
+cleanup, never success. Confirmed failure review/recovery and interrupted-cleanup
+convergence remain separate work, and native profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual

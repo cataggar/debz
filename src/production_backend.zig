@@ -1972,6 +1972,14 @@ pub const Backend = struct {
         coordinator.validateProjection() catch |err|
             return mapRootOperationError(request.operation, err);
         const store = coordinator.store();
+        if (self.transaction_backend == .native and recovery_review_claim == null) {
+            const review = store.readRecoveryReviewClaim(allocator) catch |err| switch (err) {
+                error.OutOfMemory, error.ContractViolation, error.InvariantViolation => return err,
+                else => return blockedRecovery(request.operation, "native acknowledgment review ownership is unreadable"),
+            };
+            if (review != null)
+                return blockedRecovery(request.operation, "native acknowledgment requires the exact active recovery review");
+        }
         var marker = store.readDeferredAcknowledgment(allocator) catch |err|
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
