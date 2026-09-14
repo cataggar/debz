@@ -423,7 +423,7 @@ fn validate(
         ))
             return error.InvalidDocument;
         break :source prior.canonicalJson(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
             else => return error.InvalidDocument,
         };
     } else null;
@@ -431,7 +431,7 @@ fn validate(
     const marker_source = document.marker.canonicalJson(
         allocator,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
         else => return error.InvalidDocument,
     };
     defer allocator.free(marker_source);
@@ -586,6 +586,33 @@ test "apt_system_lower_ownership_token.test.canonical exact marker token rejects
         error.DigestMismatch,
         decode(std.testing.allocator, tampered),
     );
+}
+
+test "apt_system_lower_ownership_token.test.validation preserves allocation failures" {
+    const marker = try root_operation.createDeferredAcknowledgment(.{
+        .document_version = root_operation.deferred_ack_v2_schema_version,
+        .attempt_id = @splat(0x11),
+        .acknowledgment_id = @splat(0x12),
+    });
+    const document = try create(std.testing.allocator, .{
+        .purpose = .execution,
+        .outer_attempt_id = marker.acknowledgment_id,
+        .outer_generation = 3,
+        .outer_state_sha256 = @splat(0x13),
+        .request_sha256 = @splat(0x14),
+        .profile_sha256 = @splat(0x15),
+        .profile_reference_sha256 = @splat(0x16),
+        .exact_lock_sha256 = @splat(0x17),
+        .semantic_request_sha256 = @splat(0x18),
+        .prior_marker = marker,
+        .marker = marker,
+    });
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, input: Document) !void {
+            try validate(input, allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{document});
 }
 
 test "apt_system_lower_ownership_token.test.clean reconciliation transition binds exact prior token" {

@@ -610,13 +610,33 @@ failed history for read-only diagnostics; it does not transition a completed
 failure back to pending or replay packages. An interruption after active-slot
 clearing still produces the same completed failure result.
 
-Read-only diagnostics and recovery preparation distinguish this committed
-failure from live pending failure, including a final snapshot published before
-the active-state commit. Retained-final reconciliation can finish only that
-outer commit using historical proof, without touching lower ownership or
-replaying package work. It still reports transaction failure and unresolved
-cleanup, never success. Confirmed failure review/recovery and interrupted-cleanup
-convergence remain separate work, and native profiles remain gated.
+Read-only diagnostics distinguish committed failure from live pending failure,
+including a final snapshot published before the active-state commit. Without a
+confirmed review, retained-final reconciliation can finish only that outer
+commit using historical proof, without touching lower ownership or replaying
+package work. It still reports transaction failure and unresolved cleanup.
+
+Recovery preparation for an already committed native failure can now bind a
+confirmable cleanup review while the exact original pending owner and published
+lower record/completion remain. It verifies distinct failure history first,
+then independently authenticates the live pending owner and review snapshot.
+The review binds the final generation/digest, profile, lock, failed receipt and
+original lower owner/completion. Review publication retains an exact review
+token without rebinding the immutable pending owner or changing failed outer
+state. Repeated preparation preserves the same review; cancellation releases
+only that review, not transaction evidence or ownership.
+
+Confirmation freshly revalidates the active state, token, profile, lock, failed
+history and exact live review before acknowledging its original pending owner.
+Only the supplied exact claim can be consumed, and the final response remains
+an exit-7 transaction failure. Missing history cannot fall through to nonfinal
+recovery or package execution. Changed/foreign review or active state and
+missing/corrupt anchors refuse cleanup. Unavailable lower evidence still permits
+historical failure diagnostics, but not a confirmable cleanup action.
+
+Nonfinal failure recovery, acknowledged/fully cleared lower ownership and
+recovery-produced failure convergence remain separate work. Native profiles
+remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
