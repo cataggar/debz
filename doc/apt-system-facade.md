@@ -617,14 +617,23 @@ commit using historical proof, without touching lower ownership or replaying
 package work. It still reports transaction failure and unresolved cleanup.
 
 Recovery preparation for an already committed native failure can now bind a
-confirmable cleanup review while the exact original pending owner and published
-lower record/completion remain. It verifies distinct failure history first,
-then independently authenticates the live pending owner and review snapshot.
+confirmable cleanup review while the original owner remains pending or exactly
+acknowledged. The published lower completion remains required; acknowledged
+ownership may already have cleared the lower record. Preparation verifies
+distinct failure history first, then independently authenticates the live owner
+and review snapshot.
 The review binds the final generation/digest, profile, lock, failed receipt and
 original lower owner/completion. Review publication retains an exact review
 token without rebinding the immutable pending owner or changing failed outer
 state. Repeated preparation preserves the same review; cancellation releases
 only that review, not transaction evidence or ownership.
+
+An acknowledged review binds the actual acknowledged marker, including its
+original review identity, and any surviving published record. It must be the
+exact acknowledged transition of the immutable retained pending owner.
+Missing/corrupt completion, foreign same-base review identity and contradictory
+record evidence refuse review. Cleanup still dispatches the original pending
+owner, never a marker rebound to the newly confirmed review.
 
 Confirmation freshly revalidates the active state, token, profile, lock, failed
 history and exact live review before acknowledging its original pending owner.
@@ -634,9 +643,9 @@ recovery or package execution. Changed/foreign review or active state and
 missing/corrupt anchors refuse cleanup. Unavailable lower evidence still permits
 historical failure diagnostics, but not a confirmable cleanup action.
 
-Nonfinal failure recovery, acknowledged/fully cleared lower ownership and
-recovery-produced failure convergence remain separate work. Native profiles
-remain gated.
+Nonfinal failure recovery, fully cleared lower ownership with no remaining
+marker, and recovery-produced failure convergence remain separate work. Native
+profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
