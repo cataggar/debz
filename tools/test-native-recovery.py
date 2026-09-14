@@ -1930,6 +1930,16 @@ def exercise_workflows(
             str(path.relative_to(root)): path.read_bytes()
             for path in (root / NAMESPACE).rglob("*") if path.is_file()
         }
+        if verification["state"] == "pending":
+            refused = projected_run(
+                "recover", owner_evidence="/fixture/owner.json",
+                acknowledgment="recovery", expected_exit=8,
+            )
+            assert not refused["changed"]
+            assert reviewed_evidence == {
+                str(path.relative_to(root)): path.read_bytes()
+                for path in (root / NAMESPACE).rglob("*") if path.is_file()
+            }, "unconfirmed acknowledgment changed native evidence beneath an active review"
         for _ in range(2):
             projected_run("recover", owner_evidence="/fixture/owner.json", owned_verification={
                 **verification, "review": "authorized",
