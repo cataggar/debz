@@ -646,6 +646,20 @@ new ownership, records or active/orphan native evidence before consuming the
 exact review. No replacement lower ownership or successful completion is
 fabricated.
 
+For a nonfinal native failure with an already retained receipt, the original
+pending owner and its published failed lower record/completion can authorize a
+confirmed completion review. Preparation freshly verifies the distinct live
+failure, retained receipt bytes, independent owner authority and exact review
+snapshot without committing final state. Confirmation revalidates that source
+state and live proof, retains the original failed completion, and commits the
+failed final state before freshly verifying historical evidence and performing
+cleanup. Only this uninterrupted commit carries its source-state review into
+cleanup. If interrupted after final publication or commit, restarting with the
+older source review cannot clear ownership; retained-final reconciliation and a
+fresh final-state cleanup review remain required. Packages are never retried,
+the immutable original owner is never rebound, and completed cleanup still
+returns transaction failure.
+
 Confirmation freshly revalidates the active state, token, profile, lock, failed
 history and exact live review before acknowledging its original pending owner.
 Only the supplied exact claim can be consumed, and the final response remains
@@ -654,8 +668,8 @@ recovery or package execution. Changed/foreign review or active state and
 missing/corrupt anchors refuse cleanup. Unreadable lower evidence still permits
 historical failure diagnostics, but not a confirmable cleanup action.
 
-Nonfinal failure recovery and recovery-produced failure convergence remain
-separate work. Native profiles remain gated.
+Failure recovery before receipt retention and recovery-produced failure
+convergence remain separate work. Native profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
