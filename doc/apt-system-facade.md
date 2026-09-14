@@ -573,9 +573,34 @@ typed pending-failure verification and exact canonical operation-local binding
 validation. Missing, corrupt or replaced bound receipts are refused rather than
 repaired from live evidence. A final snapshot or published outer completion
 cannot fall back to this nonfinal failure path, and success-only completion and
-historical verification remain unchanged. Durable failed-result history,
-confirmed recovery and cleanup are not yet integrated; native profiles remain
-gated.
+historical verification remain unchanged.
+
+Normal failed execution now additionally retains the original canonical native
+lower completion at the existing operation-local
+`root-operation-recovery-completion-v1.json`. Its digest must match the immutable
+pending owner and its native receipt binding. After another fresh failure
+verification, the engine transitions through verifying and durably commits
+`completed` / `failed_after_mutation` outer state. That final state has no
+successful outer completion binding. Lower ownership remains pending and the
+outer active slot is not cleared.
+
+Committed failure has its own request and historical result type. Verification
+requires the exact durable final generation/digest, retained pending owner,
+genuine v2 lock, canonical failed native receipt and original failed lower
+completion in the same operation directory. It binds the original caller,
+policy, architecture, lock, attempt, owner review identity and matching original
+or recovery discharge pair. Missing/corrupt anchors, foreign review ownership,
+success or unknown outcomes, and cross-attempt evidence are refused. No current
+root, database, shared receipt/completion or live review authority is consulted.
+The document-binding decoder alone is not historical proof.
+
+Read-only diagnostics and recovery preparation distinguish this committed
+failure from live pending failure, including a final snapshot published before
+the active-state commit. Retained-final reconciliation can finish only that
+outer commit using historical proof, without touching lower ownership or
+replaying package work. It still reports transaction failure and unresolved
+cleanup, never success. Failure review/confirmation and exact cleanup remain
+separate work, and native profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
