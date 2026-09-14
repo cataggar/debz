@@ -616,6 +616,22 @@ confirmed review, retained-final reconciliation can finish only that outer
 commit using historical proof, without touching lower ownership or replaying
 package work. It still reports transaction failure and unresolved cleanup.
 
+If failure history was published before the active-state commit, recovery
+preparation can now offer a source-state-bound commit review. It verifies the
+retained failed final state against the nonfinal active state, immutable failed
+receipt/completion and original pending owner without requiring live execution
+verification or committing during preparation. The preparation retains the
+exact final attempt, generation and digest for confirmation; missing or changed
+history cannot fall through to live failure retention or package recovery.
+
+Confirmation freshly validates that historical snapshot and the source review,
+then completes only the outer final-state commit. It leaves lower ownership
+pending and returns recovery-required failure, not transaction success or
+completed cleanup. The source review is released, and a fresh review bound to
+the now-committed final state is required for acknowledgment and clearing.
+Neither interruption nor an older source review can bypass that final-state
+cleanup boundary.
+
 Recovery preparation for an already committed native failure can now bind a
 confirmable cleanup review while the original owner remains pending or exactly
 acknowledged. The published lower completion remains required; acknowledged
