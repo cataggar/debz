@@ -1992,7 +1992,7 @@ def exercise_workflows(
             **verification, "review": "publish", "review_generation": 4,
             "expected_error": "OperationalVerificationFailure",
         })
-        if outcome == "recovered":
+        if outcome in ("recovered", "failed"):
             projected_run(
                 "recover", owner_evidence="/fixture/owner.json", **review_arguments,
                 acknowledgment="recovery", completion_crash="after_deferred_acknowledged",
