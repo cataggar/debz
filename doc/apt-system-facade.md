@@ -635,17 +635,27 @@ Missing/corrupt completion, foreign same-base review identity and contradictory
 record evidence refuse review. Cleanup still dispatches the original pending
 owner, never a marker rebound to the newly confirmed review.
 
+When both the lower marker and record have already been cleared, verified
+committed failure history can instead authorize a changed review with no prior
+marker or record. The original retained pending owner and failed lower
+completion remain mandatory historical anchors. A missing or valid foreign
+shared completion is allowed only as an exact current snapshot, never as
+failure proof; an unreadable snapshot refuses review. Confirmation requires
+that snapshot to remain unchanged and, under the root-operation lock, refuses
+new ownership, records or active/orphan native evidence before consuming the
+exact review. No replacement lower ownership or successful completion is
+fabricated.
+
 Confirmation freshly revalidates the active state, token, profile, lock, failed
 history and exact live review before acknowledging its original pending owner.
 Only the supplied exact claim can be consumed, and the final response remains
 an exit-7 transaction failure. Missing history cannot fall through to nonfinal
 recovery or package execution. Changed/foreign review or active state and
-missing/corrupt anchors refuse cleanup. Unavailable lower evidence still permits
+missing/corrupt anchors refuse cleanup. Unreadable lower evidence still permits
 historical failure diagnostics, but not a confirmable cleanup action.
 
-Nonfinal failure recovery, fully cleared lower ownership with no remaining
-marker, and recovery-produced failure convergence remain separate work. Native
-profiles remain gated.
+Nonfinal failure recovery and recovery-produced failure convergence remain
+separate work. Native profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
