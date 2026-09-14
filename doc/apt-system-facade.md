@@ -552,7 +552,7 @@ operation-local acknowledgment. A foreign saved acknowledgment is not bypassed.
 An active lower review additionally requires independently retained exact
 review authority.
 
-Fresh verified failure returns `recovery` with `changed: true` and a
+A read-only verified failure diagnostic returns `recovery` with `changed: true` and a
 `transaction_failed` diagnostic. It does not report success, invent retained
 receipt/completion evidence, publish or consume a review, write outer state,
 acknowledge ownership, or replay package work. Missing or foreign authority,
@@ -660,6 +660,18 @@ fresh final-state cleanup review remain required. Packages are never retried,
 the immutable original owner is never rebound, and completed cleanup still
 returns transaction failure.
 
+Before receipt retention, a separate transient pending-failure snapshot binds
+the prospective receipt digest, original pending owner and failed completion.
+It is neither successful completion nor durable historical proof. Preparation
+freshly verifies that failure and retains its exact original owner before
+replacing execution authority with a review token, including original v2 review
+identity. It does not publish receipt, completion or final state. Cancellation
+releases the review while preserving that verified original ownership evidence.
+Confirmation freshly verifies the live failure again, derives the receipt
+binding from that proof, and uses the same retention, failed-history commit and
+source-review cleanup path. An unretained snapshot cannot authorize historical
+cleanup after restart or replace missing committed anchors.
+
 Confirmation freshly revalidates the active state, token, profile, lock, failed
 history and exact live review before acknowledging its original pending owner.
 Only the supplied exact claim can be consumed, and the final response remains
@@ -668,8 +680,8 @@ recovery or package execution. Changed/foreign review or active state and
 missing/corrupt anchors refuse cleanup. Unreadable lower evidence still permits
 historical failure diagnostics, but not a confirmable cleanup action.
 
-Failure recovery before receipt retention and recovery-produced failure
-convergence remain separate work. Native profiles remain gated.
+Recovery-produced failure convergence remains separate work. Native profiles
+remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
