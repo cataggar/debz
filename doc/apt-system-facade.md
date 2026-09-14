@@ -680,8 +680,30 @@ recovery or package execution. Changed/foreign review or active state and
 missing/corrupt anchors refuse cleanup. Unreadable lower evidence still permits
 historical failure diagnostics, but not a confirmable cleanup action.
 
-Recovery-produced failure convergence remains separate work. Native profiles
-remain gated.
+Confirmed backend recovery can itself produce a terminal native failure from an
+interrupted bound attempt. The private runner transports the published failed
+lower completion and exact pending ownership while preserving transaction exit
+7. That pending owner carries the consumed recovery review's full identity.
+An exit code alone is only a candidate: the completed native record, explicit
+failed outcome, original caller and attempt, and exact ownership handoff must
+agree before terminal metadata is returned.
+
+The engine then revalidates the profile and freshly verifies the distinct live
+native failure against its independent operation-local authority. The returned
+completion and pending acknowledgment must match that proof and the confirmed
+review's transferred identity. Only then does it retain the original owner,
+failed receipt and lower completion, commit failed history, and acknowledge
+ownership before clearing the outer slot. A recovery-produced completion keeps
+the original caller identity and its actual `recover` discharge/request pair;
+it is not rewritten as an execution completion or passed through success-only
+verification.
+
+Interruption during owner/receipt retention, failed-history commit or cleanup
+leaves evidence for a fresh confirmed completion or final-state cleanup review.
+Restart does not invoke package recovery again. Unknown outcomes and unavailable
+or mismatched live proof cannot commit failure history or acknowledge ownership.
+Completed cleanup still reports transaction failure with no successful outer
+completion. Native profiles remain gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual

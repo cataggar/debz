@@ -5927,10 +5927,26 @@ fn recoverExternalNativeWorkflow(allocator: std.mem.Allocator, external: anytype
         .root_attempt_id = owner.attempt_id,
     });
     defer result.deinit();
-    if (result.result.exit_status == .success) {
+    if (result.result.exit_status == .success or result.result.exit_status == .transaction) {
         try std.testing.expectEqual(facade.RootStatus.completed, result.root_status);
         const acknowledgment = result.recovery_acknowledgment orelse return error.MissingRecoveryAcknowledgment;
-        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, acknowledgment.marker.?));
+        var expected = owner;
+        if (owner.state == .bound) {
+            expected = try root_operation.createDeferredAcknowledgment(.{
+                .state = .pending,
+                .attempt_id = owner.attempt_id,
+                .acknowledgment_id = owner.acknowledgment_id,
+                .completion_sha256 = result.recovery_completion.?.document.digest_sha256,
+                .provenance_sha256 = result.recovery_completion.?.document.digest_sha256,
+            });
+            if (owner.recovery_review_claim_sha256 != null)
+                expected = try root_operation.carryDeferredAcknowledgmentReviewOwner(expected, owner);
+        }
+        try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(expected, acknowledgment.marker.?));
+        try std.testing.expectEqual(
+            if (result.result.exit_status == .success) root_operation.Outcome.succeeded else .failed_after_mutation,
+            result.recovery_completion.?.document.outcome,
+        );
     } else {
         try std.testing.expectEqual(facade.RootStatus.recovery_required, result.root_status);
         try std.testing.expect(result.recovery_acknowledgment == null);
