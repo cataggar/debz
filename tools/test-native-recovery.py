@@ -1853,14 +1853,15 @@ def exercise_workflows(
         projected_owner()
         execution = {"owner_evidence": "/fixture/owner.json"}
         if outcome != "success":
-            execution["completion_crash"] = (
-                "after_owed_provenance_document" if outcome == "failed" else "after_native_receipt"
-            )
+            execution["completion_crash"] = "after_native_receipt"
         projected_run("execute", **execution)
         projected_owner()
         if outcome != "success":
-            projected_run("recover", owner_evidence="/fixture/owner.json", expected_exit=7 if outcome == "failed" else 0)
+            projected_run("recover", facade_recover=True, owner_evidence="/fixture/owner.json",
+                          expected_exit=7 if outcome == "failed" else 0)
             projected_owner()
+            completion = document(root / NAMESPACE / "root-operation-completion-v1.json")
+            assert completion["discharge"]["operation"] == "recover", completion
             projected_run("recover", facade_recover=True, owner_evidence="/fixture/owner.json",
                           expected_exit=7 if outcome == "failed" else 0)
         proof = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
