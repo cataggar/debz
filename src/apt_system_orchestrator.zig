@@ -292,11 +292,19 @@ pub const RecoveryReviewInput = struct {
     verified_lock: VerifiedLock,
     outer_transaction_sha256: ?[32]u8,
     unretained_native_completion: ?UnretainedNativeCompletion = null,
+    unretained_native_failure: ?UnretainedNativeFailure = null,
     expected_claim: root_operation.RecoveryReviewClaim,
 };
 
 /// A transient live proof, not a retained transaction or cleanup authority.
 pub const UnretainedNativeCompletion = struct {
+    owner: root_operation.DeferredAcknowledgment,
+    receipt_sha256: [32]u8,
+    completion_sha256: [32]u8,
+};
+
+/// A transient pending-failure proof, never successful or committed evidence.
+pub const UnretainedNativeFailure = struct {
     owner: root_operation.DeferredAcknowledgment,
     receipt_sha256: [32]u8,
     completion_sha256: [32]u8,
@@ -622,7 +630,7 @@ pub const LiveRootRunner = struct {
         input: RecoveryReviewInput,
     ) BoundaryError!RecoveryReview {
         if (input.unretained_native_completion) |proof| {
-            if (input.profile.transaction_backend != .native or
+            if (input.unretained_native_failure != null or input.profile.transaction_backend != .native or
                 !unretainedNativePhase(input.outer_state) or
                 proof.owner.state != .released or
                 !std.mem.eql(u8, &proof.owner.acknowledgment_id, &input.prepared.attempt_id) or
@@ -632,6 +640,19 @@ pub const LiveRootRunner = struct {
                 !optionalDigestEqual(input.expected_claim.outer_transaction_sha256, proof.receipt_sha256) or
                 !optionalDigestEqual(input.expected_claim.completion_sha256, proof.completion_sha256) or
                 input.expected_claim.record_sha256 != null)
+                return error.OperationalBoundaryFailure;
+        }
+        if (input.unretained_native_failure) |proof| {
+            if (input.profile.transaction_backend != .native or
+                !unretainedNativePhase(input.outer_state) or !pendingNativeFailurePhase(input.outer_state) or
+                proof.owner.state != .pending or
+                !std.mem.eql(u8, &proof.owner.acknowledgment_id, &input.prepared.attempt_id) or
+                input.expected_claim.prior_marker == null or
+                !root_operation.deferredAcknowledgmentExactEqual(proof.owner, input.expected_claim.prior_marker.?) or
+                !optionalDigestEqual(input.outer_transaction_sha256, proof.receipt_sha256) or
+                !optionalDigestEqual(input.expected_claim.outer_transaction_sha256, proof.receipt_sha256) or
+                !optionalDigestEqual(input.expected_claim.completion_sha256, proof.completion_sha256) or
+                input.expected_claim.record_sha256 == null)
                 return error.OperationalBoundaryFailure;
         }
         return self.prepareRecoveryReviewFn(self.context, allocator, input);
@@ -1862,6 +1883,7 @@ pub const PrivateLiveRootRunner = struct {
             input.verified_lock,
             input.outer_transaction_sha256 != null,
             input.unretained_native_completion,
+            input.unretained_native_failure,
         );
         if (status == .unknown) return 20;
         const claim = try root_operation.createRecoveryReviewClaim(.{
@@ -7510,7 +7532,7 @@ pub const Engine = struct {
                 },
             };
         }
-        const action = try std.fmt.allocPrint(
+        var action = try std.fmt.allocPrint(
             owned,
             "debz recover --system-profile {s}{s}",
             .{
@@ -7563,6 +7585,35 @@ pub const Engine = struct {
             },
         };
         defer if (lower_completion) |*completion| completion.deinit();
+        var unretained_native_failure: ?UnretainedNativeFailure = null;
+        if (loaded.view.transaction_backend == .native and active.state.transaction_result == null and
+            lower.deferred_acknowledgment != null and lower.deferred_acknowledgment.?.state == .pending and
+            lower.record != null and lower_completion != null and lower_completion.?.document.outcome == .failed_after_mutation)
+        {
+            verified_pending_failure = self.verifyNativePendingFailure(
+                allocator,
+                preparation,
+                loaded.view,
+                active.state,
+                verified,
+                lower.record.?.record,
+                lower_completion.?.document,
+                lower.deferred_acknowledgment.?,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvariantViolation => return error.InvariantViolation,
+                error.ContractViolation => return error.ContractViolation,
+                else => return .{ .result = try unknownMutationDiagnostic(allocator, null, profile_path, "unretained native failure could not be verified against independent pending ownership") },
+            };
+            const failure = verified_pending_failure.?;
+            const receipt = try nativeReceiptBinding(preparation.paths.transaction_result, failure.receipt.document);
+            unretained_native_failure = .{
+                .owner = failure.owner,
+                .receipt_sha256 = receipt.digest_sha256,
+                .completion_sha256 = failure.completion.document.digest_sha256,
+            };
+            action = try std.fmt.allocPrint(owned, "debz recover --system-profile {s} (retain, commit and clean up the failed native transaction; do not retry packages or report success)", .{profile_path});
+        }
         if (verified_pending_failure) |failure| {
             if (lower.deferred_acknowledgment == null or lower.record == null or lower_completion == null or
                 !root_operation.deferredAcknowledgmentExactEqual(lower.deferred_acknowledgment.?, failure.owner) or
@@ -7646,6 +7697,13 @@ pub const Engine = struct {
                 };
                 if (!root_operation.deferredAcknowledgmentExactEqual(authenticated_prior.?, failure.owner))
                     return .{ .result = try nativeFailureResult(allocator, preparation, loaded.view, active.state, verified) };
+                if (retained_acknowledgment == null)
+                    self.store.retainAcknowledgmentFn(self.store.context, allocator, preparation.paths, failure.owner) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.InvariantViolation => return error.InvariantViolation,
+                        error.ContractViolation => return error.ContractViolation,
+                        else => return .{ .result = try unknownMutationDiagnostic(allocator, null, profile_path, "verified native failure ownership could not be retained for recovery review") },
+                    };
             } else if (verified_native_failure) |failure| {
                 if (observed.state == .acknowledged) {
                     authenticated_prior = acknowledgedNativeOwner(failure.owner, observed);
@@ -7843,6 +7901,7 @@ pub const Engine = struct {
             verified,
             verified_outer_transaction != null or verified_native_failure != null or verified_pending_failure != null,
             unretained_native_completion,
+            unretained_native_failure,
         );
         if (mutation_status == .unknown) {
             return_preparation = true;
@@ -7856,6 +7915,8 @@ pub const Engine = struct {
             transaction.binding.digest_sha256
         else if (verified_native_failure) |failure|
             failure.binding.digest_sha256
+        else if (unretained_native_failure) |failure|
+            failure.receipt_sha256
         else if (verified_pending_failure != null)
             active.state.transaction_result.?.digest_sha256
         else if (unretained_native_completion) |proof|
@@ -7987,6 +8048,7 @@ pub const Engine = struct {
             .verified_lock = verified,
             .outer_transaction_sha256 = outer_transaction_sha256,
             .unretained_native_completion = unretained_native_completion,
+            .unretained_native_failure = unretained_native_failure,
             .expected_claim = expected_claim,
         };
         var review_guard: RecoveryReviewGuard = .{
@@ -9736,7 +9798,7 @@ pub const Engine = struct {
         claim: root_operation.RecoveryReviewClaim,
         claim_transferred: *bool,
     ) !api.Result {
-        if (!pendingNativeFailurePhase(current.state) or current.state.transaction_result == null)
+        if (!pendingNativeFailurePhase(current.state))
             return error.InvalidNativeFailure;
         var source = (try self.store.inspectActiveLocked(allocator, prepared.profile_state_path)) orelse return error.InvalidRetainedEvidence;
         defer source.deinit();
@@ -9745,7 +9807,8 @@ pub const Engine = struct {
             return error.InvalidRetainedEvidence;
         var failure = try self.verifyNativeFailureFromActive(allocator, prepared, loaded.view, source.state, lock);
         defer failure.deinit();
-        try self.validateNativeFailureReview(allocator, prepared, loaded.view, source.state, lock, source.state.transaction_result.?, failure.owner, failure.completion.document.digest_sha256, claim);
+        const receipt = try nativeReceiptBinding(prepared.paths.transaction_result, failure.receipt.document);
+        try self.validateNativeFailureReview(allocator, prepared, loaded.view, source.state, lock, receipt, failure.owner, failure.completion.document.digest_sha256, claim);
         var committed = try self.commitNativeExecutionFailure(allocator, prepared, loaded, current);
         if (!committed.changed or current.state.phase != .completed or current.state.outcome != .failed_after_mutation)
             return committed;
@@ -9767,9 +9830,14 @@ pub const Engine = struct {
         claim: root_operation.RecoveryReviewClaim,
     ) !void {
         if (reviewed.phase != .completed and
-            (!pendingNativeFailurePhase(reviewed) or reviewed.transaction_result == null or
+            (!pendingNativeFailurePhase(reviewed) or
                 claim.prior_marker == null or claim.prior_marker.?.state != .pending))
             return error.InvalidRetainedEvidence;
+        if (reviewed.transaction_result) |retained| {
+            if (!documentEqual(retained, receipt)) return error.InvalidRetainedEvidence;
+        } else if (!unretainedNativePhase(reviewed)) {
+            return error.InvalidRetainedEvidence;
+        }
         if (claim.prior_marker) |owner| {
             if ((!root_operation.deferredAcknowledgmentExactEqual(owner, retained_owner) and
                 acknowledgedNativeOwner(retained_owner, owner) == null) or
@@ -9782,7 +9850,6 @@ pub const Engine = struct {
         if (reviewed.generation != prepared.active_generation or
             !std.mem.eql(u8, &reviewed.digest_sha256, &prepared.active_digest_sha256) or
             !stateMatchesPreparation(reviewed, prepared) or
-            !documentEqual(reviewed.transaction_result orelse return error.InvalidRetainedEvidence, receipt) or
             claim.mutation_status != .changed or
             !PrivateLiveRootRunner.recoveryReviewBaseMatches(claim, .{
                 .prepared = &prepared,
@@ -9809,8 +9876,8 @@ pub const Engine = struct {
             return error.InvalidRetainedEvidence;
         if (reviewed.phase != .completed and
             (recovery_review_claim == null or !pendingNativeFailurePhase(reviewed) or
-                reviewed.generation >= committed.generation or reviewed.transaction_result == null or
-                !documentEqual(reviewed.transaction_result.?, committed.transaction_result orelse return error.InvalidRetainedEvidence)))
+                reviewed.generation >= committed.generation or
+                !optionalDigestEqual(recovery_review_claim.?.outer_transaction_sha256, (committed.transaction_result orelse return error.InvalidRetainedEvidence).digest_sha256)))
             return error.InvalidRetainedEvidence;
         var active = (try self.store.inspectActiveLocked(allocator, prepared.profile_state_path)) orelse return error.InvalidRetainedEvidence;
         defer active.deinit();
@@ -12546,7 +12613,24 @@ fn classifyRecoveryMutationStatus(
     verified_lock: VerifiedLock,
     outer_transaction_verified: bool,
     unretained_native_completion: ?UnretainedNativeCompletion,
+    unretained_native_failure: ?UnretainedNativeFailure,
 ) !VerifiedMutationStatus {
+    if (unretained_native_failure) |failure| {
+        if (unretained_native_completion != null or profile.transaction_backend != .native or
+            !unretainedNativePhase(outer_state) or !pendingNativeFailurePhase(outer_state) or
+            !stateMatchesPreparation(outer_state, prepared) or !profileEqual(profile.binding, prepared.profile) or
+            !lockMatchesPreparation(verified_lock.binding, prepared, outer_state) or
+            marker == null or record == null or completion == null or
+            !root_operation.deferredAcknowledgmentExactEqual(failure.owner, marker.?) or
+            !std.mem.eql(u8, &failure.completion_sha256, &completion.?.digest_sha256) or
+            !optionalDigestEqual(completion.?.transaction_provenance.document_sha256, failure.receipt_sha256))
+            return .unknown;
+        _ = nativePendingOwner(allocator, prepared, profile, outer_state, verified_lock, record.?, completion.?, marker.?, null, failure.owner, .failed) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .unknown,
+        };
+        return .changed;
+    }
     // The parent verifies failure evidence; this binds only the live review snapshot.
     if (profile.transaction_backend == .native and
         ((outer_state.phase == .completed and outer_state.outcome == .failed_after_mutation) or
@@ -16644,6 +16728,7 @@ const FakeRunner = struct {
             input.verified_lock,
             input.outer_transaction_sha256 != null,
             input.unretained_native_completion,
+            input.unretained_native_failure,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvariantViolation,
@@ -25174,6 +25259,7 @@ test "apt_system_orchestrator.test.completed lower protocol states require exact
                 verified_lock,
                 false,
                 null,
+                null,
             ),
         );
     }
@@ -25204,6 +25290,7 @@ test "apt_system_orchestrator.test.completed lower protocol states require exact
             loaded.view,
             verified_lock,
             false,
+            null,
             null,
         ),
     );
@@ -26062,19 +26149,84 @@ fn testNativePendingFailureDiagnostic(
         try std.testing.expectEqual(api.DiagnosticId.transaction_failed, diagnostic.diagnostics[0].id);
         try std.testing.expect(diagnostic.evidence.transaction_result == null);
         try std.testing.expect(diagnostic.evidence.root_operation_completion == null);
+        const prepares = harness.runner.recovery_review_prepares;
+        const releases = harness.runner.recovery_review_releases;
+        const prior_acknowledgment = harness.store.lower_acknowledgment;
         var preparation = try harness.engine.prepareRecoveryWithProfile(allocator, prepared.request.profile_path, loaded);
         switch (preparation) {
             .result => |*result| {
-                defer result.deinit();
-                try std.testing.expectEqual(api.Outcome.recovery, result.outcome);
-                try std.testing.expect(result.changed);
-                try std.testing.expectEqual(api.DiagnosticId.transaction_failed, result.diagnostics[0].id);
-                try std.testing.expect(result.evidence.transaction_result == null);
-                try std.testing.expect(result.evidence.root_operation_completion == null);
+                result.deinit();
+                return error.TestUnexpectedResult;
             },
             .ready => |*ready| {
-                ready.deinit();
-                return error.TestUnexpectedResult;
+                defer ready.deinit();
+                try std.testing.expectEqual(VerifiedMutationStatus.changed, ready.mutation_status);
+                const claim = ready.review_claim.?;
+                const receipt = try nativeReceiptBinding(prepared.paths.transaction_result, failure.receipt.document);
+                const proof: UnretainedNativeFailure = .{
+                    .owner = failure.owner,
+                    .receipt_sha256 = receipt.digest_sha256,
+                    .completion_sha256 = failure.completion.document.digest_sha256,
+                };
+                try std.testing.expect(optionalDigestEqual(receipt.digest_sha256, claim.outer_transaction_sha256));
+                var confirmation = try ready.confirmationResult();
+                defer confirmation.deinit();
+                try std.testing.expect(confirmation.changed);
+                try std.testing.expect(confirmation.evidence.transaction_result == null);
+                try std.testing.expect(std.mem.indexOf(u8, confirmation.summary, "failed native transaction") != null);
+                const input: RecoveryReviewInput = .{
+                    .prepared = &ready.prepared,
+                    .outer_state = state,
+                    .profile = loaded.view,
+                    .verified_lock = lock,
+                    .outer_transaction_sha256 = proof.receipt_sha256,
+                    .unretained_native_failure = proof,
+                    .expected_claim = claim,
+                };
+                for (0..8) |invalid| {
+                    var snapshot = proof;
+                    var observed: ?root_operation.DeferredAcknowledgment = failure.owner;
+                    var published: ?root_operation.Record = record.record;
+                    var completion: ?root_operation_completion.Document = failure.completion.document;
+                    var outer = state;
+                    switch (invalid) {
+                        0 => {},
+                        1 => snapshot.receipt_sha256[0] ^= 1,
+                        2 => snapshot.completion_sha256[0] ^= 1,
+                        3 => observed = null,
+                        4 => published = null,
+                        5 => completion = null,
+                        6 => outer.transaction_result = receipt,
+                        7 => outer.phase = .completed,
+                        else => unreachable,
+                    }
+                    try std.testing.expectEqual(
+                        if (invalid == 0) VerifiedMutationStatus.changed else .unknown,
+                        try classifyRecoveryMutationStatus(allocator, observed, published, completion, ready.prepared, outer, loaded.view, lock, false, null, snapshot),
+                    );
+                }
+                for (0..7) |invalid| {
+                    var changed = input;
+                    switch (invalid) {
+                        0 => changed.unretained_native_failure.?.receipt_sha256[0] ^= 1,
+                        1 => changed.unretained_native_failure.?.completion_sha256[0] ^= 1,
+                        2 => changed.profile.transaction_backend = .legacy_dpkg,
+                        3 => changed.expected_claim.prior_marker = null,
+                        4 => changed.expected_claim.record_sha256 = null,
+                        5 => changed.outer_state.phase = .completed,
+                        6 => changed.unretained_native_failure.?.owner.acknowledgment_id[0] ^= 1,
+                        else => unreachable,
+                    }
+                    try std.testing.expectError(error.OperationalBoundaryFailure, harness.engine.runner.prepareRecoveryReview(allocator, changed));
+                }
+                try std.testing.expectEqual(prepares + 1, harness.runner.recovery_review_prepares);
+                try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(failure.owner, harness.store.lower_acknowledgment.?));
+                try std.testing.expect(try harness.engine.runner.releaseRecoveryReview(allocator, claim));
+                try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(failure.owner, harness.store.lower_acknowledgment.?));
+                harness.store.lower_acknowledgment = prior_acknowledgment;
+                harness.store.lower_ownership = token;
+                harness.runner.recovery_review_prepares = prepares;
+                harness.runner.recovery_review_releases = releases;
             },
             .cleanup_required => return error.TestUnexpectedResult,
         }
@@ -26324,7 +26476,7 @@ fn testNativeFailureCleanup(
                 defer committed.deinit();
                 try std.testing.expect(committed.changed);
                 if (scenario == .reviewed_recovery) {
-                    try testCommittedNativeFailureReview(failing_allocator, test_harness, preparation, profile, current.state, proof);
+                    try testCommittedNativeFailureReview(failing_allocator, test_harness, preparation, profile, initial, current.state, proof);
                     return;
                 }
                 const final_bytes = store.retained_bytes;
@@ -26465,10 +26617,12 @@ fn testCommittedNativeFailureReview(
     harness: *Harness,
     prepared: Preparation,
     loaded: *LoadedProfile,
+    initial: operation_state.State,
     final: operation_state.State,
     failure: native_transaction_result.PendingFailure,
 ) !void {
     const OwnerState = enum { pending, acknowledged, cleared };
+    const SourceKind = enum { committed, retained, unretained };
     const Scenario = enum {
         fresh,
         repeated,
@@ -26508,13 +26662,16 @@ fn testCommittedNativeFailureReview(
             test_harness: *Harness,
             preparation: Preparation,
             profile: *LoadedProfile,
+            original: operation_state.State,
             committed: operation_state.State,
             proof: native_transaction_result.PendingFailure,
             scenario: Scenario,
             owner_state: OwnerState,
             with_record: bool,
-            nonfinal: bool,
+            source_kind: SourceKind,
         ) !void {
+            const nonfinal = source_kind != .committed;
+            const unretained = source_kind == .unretained;
             const store = &test_harness.store;
             const runner = &test_harness.runner;
             const cleared = owner_state == .cleared;
@@ -26535,6 +26692,7 @@ fn testCommittedNativeFailureReview(
                 input.phase = .recovery_required;
                 input.outcome = .pending;
                 input.diagnostic = "retained native failure awaiting confirmed completion";
+                if (unretained) input = original;
                 pending = try operation_state.create(failing_allocator, input);
             }
             const reviewed_state = if (pending) |owned| owned.state else committed;
@@ -26563,6 +26721,8 @@ fn testCommittedNativeFailureReview(
                     if (store.retained_bytes) |bytes| store.allocator.free(bytes);
                     if (store.recovery_completion_bytes) |bytes| store.allocator.free(bytes);
                 }
+                if (unretained)
+                    if (store.native_transaction_bytes) |bytes| store.allocator.free(bytes);
                 store.retained_bytes = final_source;
                 store.native_transaction_bytes = receipt_source;
                 store.recovery_completion_bytes = retained_completion;
@@ -26587,6 +26747,10 @@ fn testCommittedNativeFailureReview(
             if (nonfinal) {
                 store.retained_bytes = null;
                 store.recovery_completion_bytes = null;
+            }
+            if (unretained) {
+                store.native_transaction_bytes = null;
+                store.lower_acknowledgment = null;
             }
             const observed_owner: ?root_operation.DeferredAcknowledgment = switch (owner_state) {
                 .cleared => null,
@@ -26695,6 +26859,7 @@ fn testCommittedNativeFailureReview(
             var recovery = switch (outcome) {
                 .ready => |ready| ready,
                 .result => |*result| {
+                    std.debug.print("native failure review {s}/{s}: {s}\n", .{ @tagName(source_kind), @tagName(scenario), result.diagnostics[0].message });
                     result.deinit();
                     return error.TestUnexpectedResult;
                 },
@@ -26714,6 +26879,9 @@ fn testCommittedNativeFailureReview(
                 try std.testing.expectEqual(root_operation.DeferredAcknowledgmentState.bound, store.lower_ownership.?.marker.state);
             }
             try std.testing.expect((claim.record_sha256 != null) == with_record);
+            if (unretained) {
+                try std.testing.expect(store.native_transaction_bytes == null);
+            }
             try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, store.lower_acknowledgment.?));
             try std.testing.expectEqualStrings(active_source, store.active_bytes.?);
             var confirmation = try recovery.confirmationResult();
@@ -26885,25 +27053,30 @@ fn testCommittedNativeFailureReview(
                 if (owner_state != .cleared and
                     (scenario == .changed_shared_completion or scenario == .new_lower_owner or scenario == .new_lower_record))
                     continue;
-                try Case.run(allocator, harness, prepared, loaded, final, failure, scenario, owner_state, with_record, false);
+                try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, owner_state, with_record, .committed);
             }
             if (failure.owner.document_version == 2)
-                try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, final, failure, Scenario.fresh, owner_state, with_record, false });
+                try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, owner_state, with_record, SourceKind.committed });
         }
     }
-    for ([_]Scenario{
-        .fresh,                    .repeated,                    .cancelled,
-        .stale_review,             .foreign_review,              .foreign_generation,
-        .foreign_active,           .changed_lock,                .corrupt_receipt,
-        .before_acknowledgment,    .after_acknowledgment,        .after_clear,
-        .after_reviewed_commit,    .refuse_corrupt_receipt,      .refuse_foreign_owner,
-        .shared_completion_absent, .shared_completion_foreign,   .refuse_corrupt_completion,
-        .refuse_corrupt_record,    .refuse_record_without_owner, .missing_token,
-        .foreign_token,            .unavailable_live_proof,
-    }) |scenario|
-        try Case.run(allocator, harness, prepared, loaded, final, failure, scenario, .pending, true, true);
-    if (failure.owner.document_version == 2)
-        try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, final, failure, Scenario.fresh, OwnerState.pending, true, true });
+    for ([_]SourceKind{ .retained, .unretained }) |source_kind| {
+        for ([_]Scenario{
+            .fresh,                    .repeated,                    .cancelled,
+            .stale_review,             .foreign_review,              .foreign_generation,
+            .foreign_active,           .changed_lock,                .corrupt_receipt,
+            .before_acknowledgment,    .after_acknowledgment,        .after_clear,
+            .after_reviewed_commit,    .refuse_corrupt_receipt,      .refuse_foreign_owner,
+            .shared_completion_absent, .shared_completion_foreign,   .refuse_corrupt_completion,
+            .refuse_corrupt_record,    .refuse_record_without_owner, .missing_token,
+            .foreign_token,            .unavailable_live_proof,
+        }) |scenario| {
+            if (source_kind == .unretained and (scenario == .corrupt_receipt or scenario == .refuse_corrupt_receipt))
+                continue;
+            try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, .pending, true, source_kind);
+        }
+        if (failure.owner.document_version == 2)
+            try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, OwnerState.pending, true, source_kind });
+    }
 }
 
 fn testNativeFailureHistory(
@@ -27410,7 +27583,8 @@ fn testNativeFailureRetention(
                 .ready => |*ready| {
                     defer ready.deinit();
                     try std.testing.expectEqual(VerifiedMutationStatus.changed, ready.mutation_status);
-                    try std.testing.expect(newly_bound);
+                    try std.testing.expect(newly_bound or persisted.state.transaction_result == null);
+                    try std.testing.expect(optionalDigestEqual(binding.digest_sha256, ready.review_claim.?.outer_transaction_sha256));
                     try std.testing.expect(ready.review_claim != null);
                     try std.testing.expect(try test_harness.engine.runner.releaseRecoveryReview(failing_allocator, ready.review_claim.?));
                     store.lower_ownership = readonly_token;
@@ -28135,7 +28309,7 @@ fn testUnretainedNativeRecovery(
         }
         try std.testing.expectEqual(
             if (index == 0) VerifiedMutationStatus.changed else .unknown,
-            try classifyRecoveryMutationStatus(allocator, marker, null, completion, prepared, outer, profile, lock, false, changed),
+            try classifyRecoveryMutationStatus(allocator, marker, null, completion, prepared, outer, profile, lock, false, changed, null),
         );
     }
     const native_source = harness.runner.native_verification_source;
