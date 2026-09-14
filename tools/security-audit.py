@@ -492,6 +492,46 @@ def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
     return failures
 
 
+def native_recovery_ci_failures(text: str) -> list[str]:
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        text,
+    ))
+    failures = []
+    for name in ("build-and-test-workload", "native-recovery"):
+        body = jobs.get(name, "")
+        lines = body.splitlines()
+        if any(line not in lines for line in (
+            "    timeout-minutes: 60",
+            "      fail-fast: false",
+            "          - os: ubuntu-24.04",
+            "            name: linux-x64",
+            "          - os: ubuntu-24.04-arm",
+            "            name: linux-arm64",
+        )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
+            failures.append(f"ci.yml: {name} must require both architectures within the existing job limit")
+    recovery = jobs.get("native-recovery", "")
+    if any(line not in recovery.splitlines() for line in (
+        "          zig build test-native-recovery -j2 --summary all",
+        "          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all",
+    )) or re.search(r"(?m)^        if:", recovery):
+        failures.append("ci.yml: native recovery must run the full Debug and ReleaseSafe targets")
+    gate = jobs.get("build-and-test", "")
+    if any(line not in gate.splitlines() for line in (
+        "    name: Build and test (${{ matrix.name }})",
+        "    needs: [build-and-test-workload, native-recovery]",
+        "    if: ${{ always() }}",
+        "      fail-fast: false",
+        "        name: [linux-x64, linux-arm64]",
+        "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+        "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
+        '          test "$BUILD_RESULT" = success',
+        '          test "$RECOVERY_RESULT" = success',
+    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate):
+        failures.append("ci.yml: existing required build checks must reject any incomplete workload")
+    return failures
+
+
 def audit_ci_pins() -> None:
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
@@ -503,6 +543,9 @@ def audit_ci_pins() -> None:
             fail(f"{relative}: workflow exposes repository secrets")
         for failure in workflow_failure_handling_failures(text, str(relative)):
             fail(failure)
+        if workflow.name == "ci.yml":
+            for failure in native_recovery_ci_failures(text):
+                fail(failure)
         if not re.search(r"(?m)^permissions:\s*\n\s{2}contents:\s*read\s*$", text):
             fail(f"{relative}: top-level permissions must be contents: read")
         checkout_blocks = re.findall(

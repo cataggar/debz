@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
+import os
 import pathlib
 import re
+import subprocess
+import textwrap
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -281,6 +285,42 @@ class SecurityAuditTests(unittest.TestCase):
                 workflow.replace('test "$OUTCOME" = failure', ""), "ci.yml"
             ),
         )
+
+    def test_native_recovery_keeps_existing_required_checks_fail_closed(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
+        for token in (
+            "    needs: [build-and-test-workload, native-recovery]",
+            "    if: ${{ always() }}",
+            "        name: [linux-x64, linux-arm64]",
+            "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+            "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
+            '          test "$BUILD_RESULT" = success',
+            '          test "$RECOVERY_RESULT" = success',
+            "          zig build test-native-recovery -j2 --summary all",
+            "          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all",
+            "          - os: ubuntu-24.04-arm",
+        ):
+            with self.subTest(token=token):
+                self.assertTrue(security_audit.native_recovery_ci_failures(
+                    workflow.replace(token, ""),
+                ))
+        gate = re.search(
+            r"(?ms)^  build-and-test:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            workflow,
+        )
+        self.assertIsNotNone(gate)
+        script = gate[1].split("        run: |\n", 1)[1]
+        for build, recovery in itertools.product(
+            ("success", "failure", "cancelled", "skipped", "unknown"), repeat=2,
+        ):
+            with self.subTest(build=build, recovery=recovery):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", textwrap.dedent(script)],
+                    env={**os.environ, "BUILD_RESULT": build, "RECOVERY_RESULT": recovery},
+                    stdin=subprocess.DEVNULL, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode == 0, build == recovery == "success")
 
     def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
         package = json.loads((ROOT / "actions/install/package.json").read_text())
