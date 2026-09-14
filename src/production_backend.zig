@@ -835,7 +835,7 @@ pub const Backend = struct {
                 .journal = .{ .status = .absent, .detail = "native receipt binds native phase journals; no command journal" },
                 .discharge = .{
                     .surface = .package_transaction,
-                    .operation = request.operation.spelling(),
+                    .operation = @tagName(request.operation),
                     .request_sha256 = productRequestDigest(request),
                 },
             });
@@ -3515,6 +3515,7 @@ const RootOperationGuard = struct {
         if (owner.state != .bound and owner.state != .pending)
             return error.InvalidNativeCompletion;
         const base = try root_operation.createDeferredAcknowledgment(.{
+            .document_version = owner.document_version,
             .state = .pending,
             .attempt_id = self.active().?.record().attempt_id,
             .completion_sha256 = document.digest_sha256,

@@ -556,9 +556,12 @@ pub fn validateResult(result: Result) !void {
             result.diagnostic_count != 0)
             return error.PartialSuccess;
         if (result.operation.mutatesRoot()) {
-            if (result.evidence.exact_lock == null or
-                result.evidence.transaction_result == null or
-                result.evidence.root_operation_completion == null)
+            if (result.evidence.exact_lock == null)
+                return error.MissingCompletionEvidence;
+            if (result.changed or result.evidence.transaction_result != null or result.evidence.root_operation_completion != null) {
+                if (result.evidence.transaction_result == null or result.evidence.root_operation_completion == null)
+                    return error.MissingCompletionEvidence;
+            } else if (result.evidence.active_operation_state == null)
                 return error.MissingCompletionEvidence;
         }
     } else {
@@ -890,7 +893,9 @@ const ResultWireVersion = enum {
 fn resultWireVersion(result: Result) ResultWireVersion {
     if (result.mutation_status != null or
         result.recovery_context != null or
-        result.operation == .recover)
+        result.operation == .recover or
+        (result.operation.mutatesRoot() and result.outcome == .success and !result.changed and
+            result.evidence.transaction_result == null and result.evidence.root_operation_completion == null))
         return .v3;
     if (result.items.len == 0) return .v1;
     return if (result.operation == .list_installed) .v2 else .v3;
@@ -1047,6 +1052,32 @@ fn successfulResult(request: Request) !Result {
             .active_operation_state = "/var/lib/debz/apt/active-operation-v1.json",
         },
     });
+}
+
+test "apt_system_api.test.unchanged success uses v3 with a lock and retained state but no receipt" {
+    var result = try successfulResult(.{
+        .operation = .upgrade,
+        .profile_path = "/profile.json",
+        .packages = &.{},
+    });
+    result.changed = false;
+    result.evidence.transaction_result = null;
+    result.evidence.root_operation_completion = null;
+    result.evidence.active_operation_state = "/state/apt/operations/attempt/state-v1.json";
+    result = try complete(result);
+    const bytes = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"mutation_status\":\"unchanged\"") != null);
+    var invalid = result;
+    invalid.evidence.active_operation_state = null;
+    try std.testing.expectError(error.MissingCompletionEvidence, validateResult(invalid));
+    invalid = result;
+    invalid.evidence.exact_lock = null;
+    try std.testing.expectError(error.MissingCompletionEvidence, validateResult(invalid));
+    invalid = result;
+    invalid.changed = true;
+    try std.testing.expectError(error.MissingCompletionEvidence, validateResult(invalid));
 }
 
 test "apt_system_api.test.multi-package request is one versioned request digest" {

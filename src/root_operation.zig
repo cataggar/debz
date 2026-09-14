@@ -383,7 +383,8 @@ fn validRecoveryReviewClaim(claim: RecoveryReviewClaim) bool {
         )) return false;
     return switch (claim.mutation_status) {
         .unchanged => claim.outer_transaction_sha256 == null and
-            claim.completion_sha256 == null and
+            (claim.completion_sha256 == null or
+                (claim.document_version == recovery_review_schema_version and claim.record_sha256 == null)) and
             (claim.record_sha256 == null or claim.marker_sha256 != null),
         .changed => claim.outer_transaction_sha256 != null or
             (claim.marker_sha256 != null and
@@ -5043,6 +5044,39 @@ test "root_operation.test.terminal review consumption preserves owner identity a
             }
         }
     }
+}
+
+test "root_operation.test.unchanged v2 review may snapshot an unrelated shared completion without a record" {
+    const input: RecoveryReviewClaim = .{
+        .outer_attempt_id = @splat(0x11),
+        .outer_generation = 7,
+        .outer_state_sha256 = @splat(0x22),
+        .profile_sha256 = @splat(0x33),
+        .profile_reference_sha256 = @splat(0x44),
+        .exact_lock_sha256 = @splat(0x55),
+        .semantic_request_sha256 = @splat(0x66),
+        .mutation_status = .unchanged,
+        .nonce = @splat(0x77),
+        .completion_sha256 = @splat(0x88),
+    };
+    const claim = try createRecoveryReviewClaim(input);
+    const bytes = try claim.canonicalJson(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const decoded = try decodeRecoveryReviewClaim(testing.allocator, bytes);
+    try testing.expect(recoveryReviewClaimExactEqual(claim, decoded));
+    var altered = input;
+    altered.completion_sha256.?[0] ^= 1;
+    const changed = try createRecoveryReviewClaim(altered);
+    try testing.expect(!recoveryReviewClaimExactEqual(claim, changed));
+    altered = input;
+    altered.document_version = recovery_review_legacy_schema_version;
+    try testing.expectError(error.InvalidDocument, createRecoveryReviewClaim(altered));
+    altered = input;
+    altered.outer_transaction_sha256 = @splat(0x99);
+    try testing.expectError(error.InvalidDocument, createRecoveryReviewClaim(altered));
+    altered = input;
+    altered.record_sha256 = @splat(0xaa);
+    try testing.expectError(error.InvalidDocument, createRecoveryReviewClaim(altered));
 }
 
 test "root_operation.test.recovery review cancellation restores the exact prior owner" {

@@ -35,6 +35,7 @@
         "authenticated",
         "planned",
         "downloaded",
+        "executing",
         "mutating",
         "verifying",
         "recovery_required",
@@ -47,6 +48,7 @@
       "enum": [
         "pending",
         "succeeded",
+        "unchanged",
         "failed_before_mutation",
         "failed_after_mutation",
         "recovered"
@@ -100,7 +102,8 @@
               "profile_loaded",
               "authenticated",
               "planned",
-              "downloaded"
+              "downloaded",
+              "executing"
             ]
           }
         },
@@ -132,7 +135,7 @@
       "if": {
         "properties": {
           "phase": { "const": "completed" },
-          "outcome": { "const": "failed_before_mutation" }
+          "outcome": { "enum": ["unchanged", "failed_before_mutation"] }
         },
         "required": ["phase", "outcome"]
       },
@@ -141,6 +144,26 @@
           "mutation_started": { "const": false },
           "transaction_result": { "type": "null" },
           "root_operation_completion": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": { "outcome": { "const": "unchanged" } },
+            "required": ["outcome"]
+          },
+          {
+            "properties": { "phase": { "const": "executing" } },
+            "required": ["phase"]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "operation": { "enum": ["install", "remove", "upgrade"] },
+          "exact_lock": { "$ref": "#/$defs/documentBinding" }
         }
       }
     },
@@ -229,6 +252,7 @@
             "enum": [
               "planned",
               "downloaded",
+              "executing",
               "mutating",
               "verifying",
               "recovery_required",
@@ -254,6 +278,7 @@
               "authenticated",
               "planned",
               "downloaded",
+              "executing",
               "mutating"
             ]
           }
@@ -354,6 +379,7 @@
         "properties": {
           "outcome": {
             "enum": [
+              "unchanged",
               "failed_before_mutation",
               "failed_after_mutation",
               "recovered"
