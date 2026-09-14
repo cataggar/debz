@@ -544,8 +544,8 @@ read-only path neither acknowledges the failed attempt nor enables native
 apt/system execution.
 
 The facade's interrupted-completion diagnostics and recovery preparation now
-use that typed pending-failure verifier for nonfinal native attempts without a
-retained receipt or outer completion binding. The published failed completion
+use that typed pending-failure verifier for nonfinal native attempts without an
+outer completion binding. The published failed completion
 must bind the original caller, policy, lock and record, and pending ownership
 must be reconstructed from an independent execution/review token or exact
 operation-local acknowledgment. A foreign saved acknowledgment is not bypassed.
@@ -557,8 +557,25 @@ Fresh verified failure returns `recovery` with `changed: true` and a
 receipt/completion evidence, publish or consume a review, write outer state,
 acknowledge ownership, or replay package work. Missing or foreign authority,
 stale completion, invalid receipt, and unknown outcomes remain unknown/refused.
-Failure receipt retention, durable failed-result history, confirmed recovery
-and cleanup are not yet integrated; the native profile gate remains unchanged.
+
+After a failed native execution returns, the engine freshly verifies the exact
+pending failure, retains its complete independently authorized owner and the
+canonical failed native receipt, then binds that receipt in recovery-required
+outer state. Retention uses the existing immutable operation-local publication:
+identical bytes are reusable after interruption, but conflicting bytes are not
+overwritten. Unknown outcomes and foreign ownership cannot publish failure
+evidence. Interrupted verification, owner/receipt publication or state binding
+leave lower ownership pending, without publishing successful completion,
+committing a final state, acknowledging evidence or replaying package work.
+
+Read-only restart diagnostics can report the retained receipt only after fresh
+typed pending-failure verification and exact canonical operation-local binding
+validation. Missing, corrupt or replaced bound receipts are refused rather than
+repaired from live evidence. A final snapshot or published outer completion
+cannot fall back to this nonfinal failure path, and success-only completion and
+historical verification remain unchanged. Durable failed-result history,
+confirmed recovery and cleanup are not yet integrated; native profiles remain
+gated.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
