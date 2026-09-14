@@ -26884,6 +26884,39 @@ fn testNativePendingFailureDiagnostic(
     });
     harness.store.lower_ownership = token;
     if (retain_owner) harness.store.lower_acknowledgment = failure.owner;
+    if (state.phase == .executing) {
+        // Existing mutating-state cases own the full allocation/crash matrices.
+        harness.verifier.committed_store = &harness.store;
+        var recovery = switch (try harness.engine.prepareRecovery(allocator, prepared.request.profile_path)) {
+            .ready => |ready| ready,
+            .result => |value| {
+                var unexpected = value;
+                defer unexpected.deinit();
+                return error.ExpectedReadyRecovery;
+            },
+        };
+        defer recovery.deinit();
+        try std.testing.expectEqual(VerifiedMutationStatus.changed, recovery.mutation_status);
+        var result = try harness.engine.executeRecovery(allocator, recovery, true);
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+        try std.testing.expect(result.changed);
+        try std.testing.expectEqual(api.DiagnosticId.transaction_failed, result.diagnostics[0].id);
+        try std.testing.expect(documentEqual(
+            try nativeReceiptBinding(prepared.paths.transaction_result, failure.receipt.document),
+            result.evidence.transaction_result.?,
+        ));
+        try std.testing.expect(result.evidence.root_operation_completion == null);
+        try std.testing.expect(harness.store.active_bytes == null);
+        try std.testing.expect(harness.runner.inspect_deferred_acknowledgment == null);
+        try std.testing.expect(harness.runner.inspect_record_source == null);
+        try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls + harness.backend.recover_calls);
+        var final = try operation_state.decode(allocator, harness.store.retained_bytes.?, operation_state.maximum_document_bytes);
+        defer final.deinit();
+        try std.testing.expectEqual(operation_state.Outcome.failed_after_mutation, final.state.outcome);
+        try std.testing.expect(final.state.mutation_started);
+        return;
+    }
     const original_active = try allocator.dupe(u8, harness.store.active_bytes.?);
     defer allocator.free(original_active);
     const original_record = try allocator.dupe(u8, harness.runner.inspect_record_source.?);
