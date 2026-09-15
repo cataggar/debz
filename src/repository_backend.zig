@@ -75,6 +75,60 @@ pub const NativeCachedPreparation = struct {
     }
 };
 
+pub const NativeExecutionResult = union(enum) {
+    unchanged,
+    diagnostic: native_preparation.OwnedDiagnostic,
+    execution: native_runtime.Report,
+
+    pub fn deinit(self: *NativeExecutionResult) void {
+        switch (self.*) {
+            .unchanged => {},
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Executes the verified closure under the original repository caller. Package
+/// completion is not repository completion and never acknowledges the receipt.
+pub fn executeNativeFromCache(
+    allocator: std.mem.Allocator,
+    input: NativeCachePreparationRequest,
+) !NativeExecutionResult {
+    var cached = try prepareNativeFromCache(allocator, input);
+    defer cached.deinit();
+    switch (cached.preparation) {
+        .unchanged => return .unchanged,
+        .diagnostic => |diagnostic| {
+            cached.preparation = .unchanged;
+            return .{ .diagnostic = diagnostic };
+        },
+        .prepared => |*prepared| return .{ .execution = try native_runtime.execute(allocator, .{
+            .attempt = input.attempt,
+            .prepared = prepared,
+            .archives = cached.archives,
+            .operation = .install,
+            .deadline = input.deadline,
+        }) },
+    }
+}
+
+pub const NativeRecoveryRequest = struct {
+    repository: api.Request,
+    attempt: *root_operation.Attempt,
+    deadline: transaction_executor.Deadline,
+};
+
+/// The request authenticates the original repository caller; recovery work
+/// comes only from native persisted inputs, never a new plan, lock or cache.
+pub fn recoverNative(
+    allocator: std.mem.Allocator,
+    input: NativeRecoveryRequest,
+) !native_runtime.Report {
+    try validateNativeRepositoryCaller(input.repository, input.attempt);
+    return native_runtime.recoverWithDeadline(allocator, input.attempt, input.deadline);
+}
+
 /// Owns the complete verified CAS closure through preparation and subsequent
 /// execution, independently of cache eviction or the caller's package buffers.
 /// Cache misses and corruption refuse; this never downloads or repairs objects.
@@ -187,8 +241,20 @@ fn validateNativeArchiveSize(request: api.Request, size: u64) !void {
 
 fn validateNativePreparationCaller(input: NativePreparationRequest) !void {
     const request = input.repository;
+    try validateNativeRepositoryCaller(request, input.attempt);
+    const record = input.attempt.record();
+    if (!record.state.provenPreMutation()) return error.OperationNotMutable;
+    if (!std.mem.eql(u8, record.target_architecture, input.plan.target_architecture))
+        return error.OperationArchitectureMismatch;
+    if (input.plan.actions.len > request.resources.maximum_actions or
+        input.exact_lock.packages.len > request.resources.maximum_actions or
+        input.exact_lock.repositories.len > request.resources.maximum_repositories or
+        input.archives.len > request.resources.maximum_actions)
+        return error.ResourceBudgetExceeded;
+}
+
+fn validateNativeRepositoryCaller(request: api.Request, attempt: *root_operation.Attempt) !void {
     if (api.validateRequest(request) != null) return error.InvalidRepositoryRequest;
-    const attempt = input.attempt;
     if (!attempt.locked()) return error.LockLost;
     const record = attempt.record();
     if (record.backend != .native) return error.OperationBackendMismatch;
@@ -197,18 +263,10 @@ fn validateNativePreparationCaller(input: NativePreparationRequest) !void {
         !std.mem.eql(u8, &record.request_sha256, &repositoryRequestDigest(request, .native)) or
         !std.mem.eql(u8, &record.policy_sha256, &repositoryPolicyDigest(request, .native)))
         return error.RepositoryCallerMismatch;
-    if (!record.state.provenPreMutation()) return error.OperationNotMutable;
-    if (!std.mem.eql(u8, record.target_architecture, input.plan.target_architecture))
-        return error.OperationArchitectureMismatch;
     if (request.architecture) |architecture| {
         if (!std.mem.eql(u8, architecture, record.target_architecture))
             return error.OperationArchitectureMismatch;
     }
-    if (input.plan.actions.len > request.resources.maximum_actions or
-        input.exact_lock.packages.len > request.resources.maximum_actions or
-        input.exact_lock.repositories.len > request.resources.maximum_repositories or
-        input.archives.len > request.resources.maximum_actions)
-        return error.ResourceBudgetExceeded;
 }
 
 fn validateNativePreparationEvidence(allocator: std.mem.Allocator, input: NativePreparationRequest) !void {
@@ -5242,6 +5300,292 @@ test "repository backend native preparation preserves discovered multiarch calle
 
 const ProjectedRepositoryCase = enum { prepare, adopt, after_lock, cleanup };
 
+const RepositoryExecutionCase = enum { success, known_failure, interrupted, missing_helper, unchanged, diagnostic, expired };
+
+const RepositoryExecutionClock = struct {
+    root: root_fs.Root,
+    stop_on_intent: bool = false,
+    expired: bool = false,
+    inspection_error: ?anyerror = null,
+
+    fn now(context: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (!self.expired and self.stop_on_intent) {
+            const found = self.root.entryIfExists(root_fs.Path.init(root_operation.native_intent_path) catch unreachable) catch |err| blk: {
+                self.inspection_error = err;
+                break :blk null;
+            };
+            self.expired = found != null or self.inspection_error != null;
+        }
+        return @intFromBool(self.expired);
+    }
+
+    fn deadline(self: *RepositoryExecutionClock) transaction_executor.Deadline {
+        return .{ .context = self, .nowMsFn = now, .expires_at_ms = 1 };
+    }
+};
+
+fn testRepositoryNativeReceipt(
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    report: native_runtime.Report,
+    failed: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(if (failed) native_runtime.Outcome.failed else .succeeded, report.outcome);
+    const receipt = report.receipt orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(live_root.logical_root_path, receipt.document.install_root);
+    try std.testing.expectEqualStrings(
+        &std.fmt.bytesToHex(attempt.attemptId(), .lower),
+        &receipt.document.attempt_id,
+    );
+    try std.testing.expectEqualStrings(
+        &std.fmt.bytesToHex(attempt.record().program_sha256.?, .lower),
+        &receipt.document.program_sha256,
+    );
+    try std.testing.expect(attempt.locked());
+    try std.testing.expectEqual(root_operation.Outcome.pending, attempt.record().outcome);
+    try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.native_intent_path)) != null);
+    try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(@import("root_operation_completion.zig").document_path)) == null);
+    const bytes = try receipt.document.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    const path = try root_fs.Path.init("fixture/repository-native-receipt.json");
+    if (try root.entryIfExists(path) != null) {
+        const previous = try root.readFileAlloc(allocator, path, @import("native_provenance.zig").maximum_document_bytes);
+        defer allocator.free(previous);
+        try std.testing.expectEqualSlices(u8, previous, bytes);
+    } else try root.publishFile(path, bytes, .{ .overwrite = .fail_if_exists });
+    const trace = try root.readFileAlloc(allocator, try root_fs.Path.init("repository-trace"), 1024);
+    defer allocator.free(trace);
+    try std.testing.expectEqualStrings("preinst\npostinst\n", trace);
+    const payload = try root.readFileAlloc(allocator, try root_fs.Path.init("usr/share/repository-execution"), 1024);
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings("native repository execution\n", payload);
+}
+
+fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *const live_root.Projection) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    try stageNativePreparationDatabase(root, native_architecture_status ++ native_preparation_held_status);
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\n", .{});
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
+    const bytes = try archive_application.test_fixtures.build(allocator, .{
+        .package = "debz-native-repository",
+        .architecture = "all",
+        .control = &.{
+            .{ .path = "preinst", .mode = 0o755, .content = "#!/bin/sh\nprintf 'preinst\\n' >> /repository-trace\n" },
+            .{
+                .path = "postinst",
+                .mode = 0o755,
+                .content = if (case == .known_failure)
+                    "#!/bin/sh\nprintf 'postinst\\n' >> /repository-trace\nexit 12\n"
+                else
+                    "#!/bin/sh\nprintf 'postinst\\n' >> /repository-trace\n",
+            },
+        },
+        .data = &.{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/repository-execution", .content = "native repository execution\n" },
+        },
+    });
+    defer allocator.free(bytes);
+    const request: api.Request = .{
+        .root = live_root.logical_root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(bytes),
+    };
+    const request_bytes = try std.json.Stringify.valueAlloc(allocator, request, .{});
+    defer allocator.free(request_bytes);
+    try root.publishFile(try root_fs.Path.init("fixture/repository-original-request.json"), request_bytes, .{});
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(sha256(bytes)),
+        .sha256 = sha256(bytes),
+        .size = bytes.len,
+        .package = "debz-native-repository",
+        .version = "1.0",
+        .architecture = "all",
+        .acquisition_url = request.descriptor_url,
+        .trust_mode = .pinned_sha256,
+    };
+    var fixture = BindingFixture.init(artifact);
+    var plan = fixture.plan();
+    if (case == .unchanged) {
+        plan.actions = &.{};
+        plan.ordered_actions = &.{};
+        plan.summary = .{};
+        plan.download_bytes = 0;
+    } else if (case == .diagnostic) plan.ordered_actions = fixture.ordered_actions[0..1];
+    var lock = if (case == .unchanged)
+        try exact_lock_v2.create(allocator, .{
+            .target_architecture = plan.target_architecture,
+            .request_sha256 = try operationRequestDigest(allocator, request, plan, .native),
+            .policy_sha256 = repositoryLockPolicyDigest(.native),
+            .repositories = &.{},
+            .local_artifacts = &.{},
+            .packages = &.{},
+            .verified_origins = true,
+        })
+    else
+        try createOperationLock(allocator, plan, artifact, null, request, .native);
+    defer lock.deinit();
+    try root.dir.createDirPath(io, "fixture/package-cache");
+    var cache_dir = try root.openDirectory(try root_fs.Path.init("fixture/package-cache"));
+    defer cache_dir.close(io);
+    var cache = try package_acquisition.Cache.initFromDir(io, cache_dir, .{
+        .maximum_object_bytes = request.cache.maximum_object_bytes,
+    });
+    defer cache.deinit();
+    if (case != .unchanged)
+        try cache.publish(allocator, .{ .bytes = sha256(bytes) }, bytes.len, bytes, .fail_fast, .{});
+    var guard: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
+    defer guard.deinit();
+    try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+    const attempt = guard.active().?;
+    const before = attempt.record().digest_sha256;
+    const original_attempt = attempt.attemptId();
+    var clock: RepositoryExecutionClock = .{
+        .root = root,
+        .stop_on_intent = case == .interrupted,
+        .expired = case == .expired,
+    };
+    const input: NativeCachePreparationRequest = .{
+        .repository = request,
+        .attempt = attempt,
+        .plan = &plan,
+        .exact_lock = &lock.lock,
+        .cache = &cache,
+        .retained_archives = &.{bytes},
+        .deadline = clock.deadline(),
+    };
+    if (case == .expired or case == .missing_helper) {
+        try std.testing.expectError(
+            if (case == .expired) error.DeadlineExceeded else error.NativeHelperTargetMissing,
+            executeNativeFromCache(allocator, input),
+        );
+    } else {
+        var result = try executeNativeFromCache(allocator, input);
+        defer result.deinit();
+        switch (case) {
+            .unchanged => try std.testing.expect(result == .unchanged),
+            .diagnostic => {
+                try std.testing.expect(result == .diagnostic);
+                try std.testing.expectEqual(.missing_configure_barrier, result.diagnostic.diagnostic.code);
+            },
+            .interrupted => {
+                try std.testing.expect(result == .execution);
+                try std.testing.expectEqual(native_runtime.Outcome.recovery_required, result.execution.outcome);
+                try std.testing.expectEqualStrings("deadline_exceeded", result.execution.detail);
+                try std.testing.expect(result.execution.receipt == null);
+                try std.testing.expect(!attempt.record().mutation_started);
+                try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.native_intent_path)) != null);
+            },
+            .success, .known_failure => {
+                try std.testing.expect(result == .execution);
+                try testRepositoryNativeReceipt(root, attempt, result.execution, case == .known_failure);
+            },
+            else => unreachable,
+        }
+    }
+    try std.testing.expect(clock.inspection_error == null);
+    try std.testing.expect(attempt.locked());
+    try std.testing.expectEqual(original_attempt, attempt.attemptId());
+    try std.testing.expectEqualSlices(u8, &repositoryRequestDigest(request, .native), &attempt.record().request_sha256);
+    try std.testing.expectEqualSlices(u8, &repositoryPolicyDigest(request, .native), &attempt.record().policy_sha256);
+    if (case == .unchanged or case == .diagnostic or case == .expired or case == .missing_helper) {
+        if (case != .missing_helper) try std.testing.expectEqual(before, attempt.record().digest_sha256);
+        try std.testing.expect(attempt.record().state.provenPreMutation());
+        try std.testing.expect(!attempt.record().mutation_started);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.native_intent_path)) == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(@import("native_helper.zig").directory)) == null);
+    }
+    if (case != .unchanged)
+        try cache.objects.deleteFile(io, &std.fmt.bytesToHex(sha256(bytes), .lower));
+    try std.testing.expect(try cache.objectSize(.{ .bytes = sha256(bytes) }) == null);
+}
+
+fn recoverProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *const live_root.Projection) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init("fixture/repository-original-request.json"), api.maximum_document_bytes);
+    defer allocator.free(bytes);
+    var request = try std.json.parseFromSlice(api.Request, allocator, bytes, .{ .ignore_unknown_fields = false });
+    defer request.deinit();
+    var guard: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
+    defer guard.deinit();
+    try std.testing.expect(guard.open(request.value, .native, 1_700_000_000) == null);
+    const attempt = guard.active().?;
+    try std.testing.expect(attempt.adopted);
+    const before = attempt.record().digest_sha256;
+    var clock: RepositoryExecutionClock = .{ .root = root };
+    var input: NativeRecoveryRequest = .{
+        .repository = request.value,
+        .attempt = attempt,
+        .deadline = clock.deadline(),
+    };
+    input.repository.no_refresh = !input.repository.no_refresh;
+    try std.testing.expectError(error.RepositoryCallerMismatch, recoverNative(allocator, input));
+    input.repository = request.value;
+    input.repository.resources.maximum_actions += 1;
+    try std.testing.expectError(error.RepositoryCallerMismatch, recoverNative(allocator, input));
+    input.repository = request.value;
+    if (case == .interrupted and !attempt.record().mutation_started) {
+        input.deadline.expires_at_ms = 0;
+        var expired = try recoverNative(allocator, input);
+        defer expired.deinit();
+        try std.testing.expectEqual(native_runtime.Outcome.recovery_required, expired.outcome);
+        try std.testing.expectEqualStrings("deadline_exceeded", expired.detail);
+        input.deadline = clock.deadline();
+    }
+    try std.testing.expectEqual(before, attempt.record().digest_sha256);
+    var report = try recoverNative(allocator, input);
+    defer report.deinit();
+    try testRepositoryNativeReceipt(root, attempt, report, case == .known_failure);
+}
+
+test "repository backend native execution external fixture" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const enabled = std.c.getenv("DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1") or std.os.linux.getpid() != 1)
+        return error.InvalidProjectionFixture;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer root.close();
+    const marker = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init(".debz-native-projection"), 128);
+    defer std.testing.allocator.free(marker);
+    if (!std.mem.eql(u8, marker, "debz native projection fixture v1\n")) return error.InvalidProjectionFixture;
+    const case_bytes = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-execution-case"), 128);
+    defer std.testing.allocator.free(case_bytes);
+    const case = std.meta.stringToEnum(RepositoryExecutionCase, case_bytes) orelse return error.InvalidProjectionFixture;
+    const Callback = struct {
+        case: RepositoryExecutionCase,
+        recover: bool,
+        fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.recover)
+                try recoverProjectedRepositoryCase(self.case, projection)
+            else
+                try executeProjectedRepositoryCase(self.case, projection);
+            return 0;
+        }
+    };
+    const terminal = case == .success or case == .known_failure or case == .interrupted;
+    for (0..if (terminal) @as(usize, 3) else 1) |index| {
+        var callback: Callback = .{ .case = case, .recover = index != 0 };
+        const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+        if (result != .exited or result.exited != 0) {
+            std.debug.print("repository execution case {t}, recovery={}: {any}\n", .{ case, callback.recover, result });
+            return error.InvalidProjectionFixture;
+        }
+    }
+    try root.root.publishFile(try root_fs.Path.init("fixture/repository-execution-complete"), case_bytes, .{});
+}
+
 fn projectedRepositoryCaller(case: ProjectedRepositoryCase, projection: *const live_root.Projection) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5445,6 +5789,8 @@ test "repository backend native preparation bounds all simultaneously retained a
 }
 
 const NativeCacheCase = enum {
+    execution_unchanged,
+    execution_diagnostic,
     local,
     mixed,
     empty,
@@ -5507,6 +5853,26 @@ fn testNativeCacheAllocation(input: NativeCachePreparationRequest) !void {
     }
 }
 
+fn testNativeNoExecutionAllocation(input: NativeCachePreparationRequest, diagnostic: bool) !void {
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (executeNativeFromCache(failing.allocator(), input)) |value| {
+            var result = value;
+            defer result.deinit();
+            try std.testing.expect(result != .execution);
+            if (failing.has_induced_failure) {
+                try std.testing.expect(result == .diagnostic);
+            } else if (diagnostic) {
+                try std.testing.expect(result == .diagnostic);
+                try std.testing.expectEqual(.missing_configure_barrier, result.diagnostic.diagnostic.code);
+            } else try std.testing.expect(result == .unchanged);
+        } else |_| try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
+}
+
 fn testNativeCachePreparation(case: NativeCacheCase) !void {
     const allocator = std.testing.allocator;
     const descriptor_bytes = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
@@ -5533,7 +5899,8 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
     try stageNativePreparationDatabase(root, native_preparation_held_status);
     const root_path = try repositoryTestRoot(allocator, directory.dir);
     defer allocator.free(root_path);
-    const package_count: usize = if (case == .empty) 0 else if (case == .local) 1 else 2;
+    const empty = case == .empty or case == .execution_unchanged;
+    const package_count: usize = if (empty) 0 else if (case == .local or case == .execution_diagnostic) 1 else 2;
     const total = descriptor_bytes.len + (if (package_count == 2) dependency_bytes.len else @as(usize, 0));
     const maximum_package = @max(descriptor_bytes.len, dependency_bytes.len);
     var request: api.Request = .{
@@ -5599,6 +5966,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
     plan.ordered_actions = if (package_count == 0) &.{} else if (package_count == 1) &fixture.ordered_actions else &ordered;
     plan.download_bytes = if (package_count == 0) 0 else total;
     plan.summary = .{ .installs = package_count, .download_bytes = plan.download_bytes };
+    if (case == .execution_diagnostic) plan.ordered_actions = fixture.ordered_actions[0..1];
     const packages = [_]exact_lock_v2.Package{
         .{
             .name = local.package,
@@ -5722,6 +6090,8 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         }
     } else if (case == .allocation_failures) {
         try testNativeCacheAllocation(input);
+    } else if (case == .execution_unchanged or case == .execution_diagnostic) {
+        try testNativeNoExecutionAllocation(input, case == .execution_diagnostic);
     } else {
         var result = try prepareNativeFromCache(allocator, input);
         defer result.deinit();
@@ -5767,7 +6137,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             try std.testing.expectEqual(bound, attempt.record().digest_sha256);
         }
     }
-    if (expected_error != null or case == .empty or case == .allocation_failures)
+    if (expected_error != null or empty or case == .allocation_failures or case == .execution_diagnostic)
         try std.testing.expectEqual(before, attempt.record().digest_sha256);
     try std.testing.expectEqual(case != .lost_lock_after, attempt.locked());
     const status = try root.readFileAlloc(allocator, try root_fs.Path.init("var/lib/dpkg/status"), 4096);
@@ -5811,6 +6181,11 @@ test "repository backend native cached preparation preserves cumulative deadline
 
 test "repository backend native cached preparation cleans up allocation failures" {
     try testNativeCachePreparation(.allocation_failures);
+}
+
+test "repository backend native execution owns unchanged and diagnostic allocation paths" {
+    try testNativeCachePreparation(.execution_unchanged);
+    try testNativeCachePreparation(.execution_diagnostic);
 }
 
 test "repository backend legacy binding byte identities" {

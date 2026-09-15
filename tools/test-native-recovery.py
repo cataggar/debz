@@ -2206,8 +2206,9 @@ def exercise_workflows(
         print(f"workflow-projected-{outcome}: scoped execution, fresh-owner verification, and acknowledgment passed", flush=True)
 
 
-def projection_inside(root: Path, workflow: bool = False, repository: bool = False) -> None:
-    if workflow and repository:
+def projection_inside(root: Path, workflow: bool = False, repository: bool = False,
+                      repository_execution: bool = False) -> None:
+    if sum((workflow, repository, repository_execution)) > 1:
         raise ValueError("projection fixtures are mutually exclusive")
     root = root.resolve(strict=True)
     if (
@@ -2226,21 +2227,24 @@ def projection_inside(root: Path, workflow: bool = False, repository: bool = Fal
         "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp/.cache",
     }
     environment.update(
-        {"DEBZ_NATIVE_REPOSITORY_PROJECTION_FIXTURE": "1"} if repository
+        {"DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE": "1"} if repository_execution
+        else {"DEBZ_NATIVE_REPOSITORY_PROJECTION_FIXTURE": "1"} if repository
         else {"DEBZ_NATIVE_WORKFLOW_REQUEST": "/fixture/request.json"} if workflow
         else {"DEBZ_NATIVE_PROJECTION_FIXTURE": "1"}
     )
     os.execve("/fixture/native-test", ["/fixture/native-test"], environment)
 
 
-def projected_process(root: Path, workflow: bool = False, repository: bool = False) -> subprocess.CompletedProcess:
-    if workflow and repository:
+def projected_process(root: Path, workflow: bool = False, repository: bool = False,
+                      repository_execution: bool = False) -> subprocess.CompletedProcess:
+    if sum((workflow, repository, repository_execution)) > 1:
         raise ValueError("projection fixtures are mutually exclusive")
     return subprocess.run(
         [
             "unshare", "--mount", "--pid", "--fork",
             sys.executable, str(Path(__file__).resolve()),
-            "--repository-projection-inside" if repository
+            "--repository-execution-inside" if repository_execution
+            else "--repository-projection-inside" if repository
             else "--projected-workflow-inside" if workflow else "--projection-inside", str(root),
         ],
         env={
@@ -2288,6 +2292,66 @@ def exercise_repository_projection(executable: Path, workspace: Path, architectu
     print("native-repository-projection: scoped caller preparation, adoption, and cleanup passed", flush=True)
 
 
+def exercise_repository_execution(executable: Path, workspace: Path, architecture: str) -> None:
+    for case in ("success", "known_failure", "interrupted", "missing_helper", "unchanged", "diagnostic", "expired"):
+        root = workspace / f"repository-execution-{case}" / "root"
+        m.make_root(root, architecture)
+        for directory in ("proc", "run", "tmp", "dev"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
+        lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+        (root / "fixture/repository-execution-case").write_text(case)
+        terminal = case in ("success", "known_failure", "interrupted")
+        helper_target = root / triggers.HELPER
+        if terminal:
+            lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+            lifecycle.runtime.copy_program(root, Path("/usr/bin/dpkg-trigger"), "/" + triggers.HELPER.as_posix())
+            helper_bytes, helper_inode = helper_target.read_bytes(), helper_target.stat().st_ino
+        result = projected_process(root, repository_execution=True)
+        assert result.returncode == 0, (case, result.returncode, result.stdout, result.stderr)
+        assert (root / "fixture/repository-execution-complete").read_text() == case
+        assert not list((root / "run/debz/system-root").iterdir()), "repository execution projection leaked"
+        assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir()), "repository recovery reused CAS inputs"
+        assert not (root / "var/lib/debz/root-operation-completion-v1.json").exists(), "package execution completed repository bootstrap"
+        if terminal:
+            caller = document(root / OPERATION)
+            assert caller["outcome"] == "pending"
+            assert caller["surface"] == "repository_bootstrap" and caller["operation"] == "add"
+            proof = document(root / "fixture/repository-native-receipt.json", 16 * 1024 * 1024)
+            validator(PROVENANCE_SCHEMA).validate(proof)
+            assert_digest(proof, PROVENANCE_SCHEMA)
+            retained = retained_documents(root, proof)
+            execution = retained["execution_request"][0]
+            for field in ("request_sha256", "policy_sha256"):
+                assert execution["execution"]["caller"][field] == caller[field]
+            assert execution["execution"]["caller"]["attempt_id"] == caller["attempt_id"]
+            scripts = retained["script_outcome"]
+            assert len(scripts) == 2
+            for script in scripts:
+                assert_output_streams(script)
+                expected_script = f"#!/bin/sh\nprintf '{script['kind']}\\n' >> /repository-trace\n"
+                if script["kind"] == "postinst" and case == "known_failure":
+                    expected_script += "exit 12\n"
+                assert script["script_sha256"] == hashlib.sha256(expected_script.encode()).hexdigest()
+                assert script["spawned"] and script["disposition"] == "exited"
+                assert script["exit_code"] == (12 if script["kind"] == "postinst" and case == "known_failure" else 0)
+            assert_helper_invocations(execution, retained["program"][0], scripts)
+            assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
+            assert helper_target.read_bytes() == helper_bytes and helper_target.stat().st_ino == helper_inode
+            status = (root / "var/lib/dpkg/status").read_text()
+            package = next(value for value in status.split("\n\n") if value.startswith("Package: debz-native-repository\n"))
+            assert ("Status: install ok half-configured\n" if case == "known_failure" else "Status: install ok installed\n") in package
+        else:
+            assert not (root / OPERATION).exists() and not (root / INTENT).exists()
+            assert not helper_target.exists() and not (root / NAMESPACE / "native-helper-cache-v1").exists()
+            assert not (root / "fixture/repository-native-receipt.json").exists()
+            assert not (root / "repository-trace").exists()
+            assert not (root / "usr/share/repository-execution").exists()
+        assert (root / "usr/share/held").read_bytes() == b"untouched\n"
+        print(f"native-repository-execution-{case}: typed outcomes and caller-owned recovery passed", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
@@ -2296,9 +2360,10 @@ def main() -> int:
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--deadline-only", action="store_true")
     parser.add_argument("--repository-projection-only", action="store_true")
+    parser.add_argument("--repository-execution-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
-    if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only)) > 1:
+    if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only, arguments.repository_execution_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -2330,9 +2395,12 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if arguments.repository_projection_only:
+            if arguments.repository_execution_only:
+                exercise_repository_execution(executable, workspace, architecture)
+            elif arguments.repository_projection_only:
                 exercise_projection(executable, workspace)
                 exercise_repository_projection(executable, workspace, architecture)
+                exercise_repository_execution(executable, workspace, architecture)
             else:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
@@ -2351,11 +2419,12 @@ def main() -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] in (
-        "--projection-inside", "--projected-workflow-inside", "--repository-projection-inside",
+        "--projection-inside", "--projected-workflow-inside", "--repository-projection-inside", "--repository-execution-inside",
     ):
         projection_inside(
             Path(sys.argv[2]), workflow=sys.argv[1] == "--projected-workflow-inside",
             repository=sys.argv[1] == "--repository-projection-inside",
+            repository_execution=sys.argv[1] == "--repository-execution-inside",
         )
     else:
         raise SystemExit(main())
