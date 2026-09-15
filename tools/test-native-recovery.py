@@ -2459,6 +2459,70 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
         print(f"native-{name}: typed outcomes and caller-owned recovery passed", flush=True)
 
+    for no_refresh in (False, True):
+        root = workspace / f"repository-unchanged-{no_refresh}" / "root"
+        m.make_root(root, architecture)
+        for directory in ("proc", "run", "tmp", "dev"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
+        lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+        (root / "fixture/repository-execution-case").write_text("unchanged")
+        (root / "fixture/repository-unchanged-bootstrap").write_text("no-refresh" if no_refresh else "refresh")
+        result = projected_process(root, repository_execution=True)
+        assert result.returncode == 0, (no_refresh, result.returncode, result.stdout, result.stderr)
+        assert (root / "fixture/repository-execution-complete").read_text() == "unchanged"
+        assert not list((root / "run/debz/system-root").iterdir())
+        assert not (root / "fixture/unchanged-descriptor.deb").exists()
+        assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir())
+        assert (root / "var/lib/dpkg/status").read_bytes() == (root / "fixture/unchanged-original-status").read_bytes()
+        assert not (root / "repository-trace").exists()
+        for path in (OPERATION, INTENT, PROGRESS, triggers.HELPER,
+                     NAMESPACE / "native-transaction-provenance-v1.json",
+                     NAMESPACE / "root-operation-completion-v1.json",
+                     NAMESPACE / "native-helper-cache-v1"):
+            assert not (root / path).exists(), path
+        callers = document(root / "fixture/repository-unchanged-caller.json")
+        assert callers["outcome"] == "abandoned_before_mutation" and not callers["mutation_started"]
+        assert callers["program_sha256"] is None and callers["authorization_sha256"] is None
+        operations = list((root / NAMESPACE / "repository/operations").iterdir())
+        assert len(operations) == 1
+        operation = operations[0]
+        state = document(operation / "repo-add-state-v1.json")
+        validator("repository-add-state-v1").validate(state)
+        assert state["phase"] == "complete" and state["installed"]
+        assert state["refreshed"] == (not no_refresh) and state["no_refresh"] == no_refresh
+        assert state["provenance_path"].endswith("/native-repository-unchanged-v1.json") and state["diagnostic_id"] is None
+        evidence = document(root / state["provenance_path"].lstrip("/"))
+        validator("native-repository-unchanged-v1").validate(evidence)
+        payload = dict(evidence)
+        evidence_digest = payload.pop("digest_sha256")
+        assert hashlib.sha256(canonical(payload)).hexdigest() == evidence_digest
+        assert evidence["changed"] is False and evidence["receipt"] is None and evidence["action_count"] == 0
+        assert evidence["caller_request_sha256"] == callers["request_sha256"]
+        assert evidence["caller_policy_sha256"] == callers["policy_sha256"]
+        publisher = document(root / "fixture/unchanged-proof-caller.json")
+        assert evidence["caller_attempt_id"] == publisher["attempt_id"] != callers["attempt_id"]
+        assert publisher["outcome"] == "pending" and not publisher["mutation_started"]
+        assert publisher["program_sha256"] is None and publisher["authorization_sha256"] is None
+        assert evidence["root_inode"] == root.stat().st_ino
+        assert evidence["plan_sha256"] == state["plan_sha256"]
+        lock = document(operation / "exact-lock-v2.json")
+        assert evidence["exact_lock_sha256"] == lock["digest_sha256"]
+        assert evidence["descriptor_sha256"] == state["descriptor"]["sha256"]
+        manifest = document(operation / "apt-config-snapshot-v1.json")
+        validator("apt-config-snapshot-v1").validate(manifest)
+        archive = operation / "native-unchanged-descriptor.deb"
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == state["descriptor"]["sha256"]
+        assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+        for expected in state["managed_files"]:
+            path = root / expected["logical_path"].lstrip("/")
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == expected["sha256"]
+        assert not (operation / "native-transaction-provenance-v1.json").exists()
+        assert not (operation / "root-operation-completion-v1.json").exists()
+        assert (root / "usr/share/held").read_bytes() == b"untouched\n"
+        print(f"native-repository-unchanged-{no_refresh}: genuine no-receipt completion passed", flush=True)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)

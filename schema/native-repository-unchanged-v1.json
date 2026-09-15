@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-repository-unchanged-v1",
+  "title": "Native repository no-execution evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "version", "backend", "surface", "operation", "changed", "receipt",
+    "action_count", "install_root", "root_inode", "target_architecture",
+    "foreign_architectures", "caller_attempt_id", "caller_request_sha256",
+    "caller_policy_sha256", "plan_sha256", "exact_lock_sha256", "descriptor_sha256",
+    "database_generation_sha256", "final_state_sha256", "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/native-repository-unchanged-v1" },
+    "version": { "const": 1 },
+    "backend": { "const": "native" },
+    "surface": { "const": "repository_bootstrap" },
+    "operation": { "const": "add" },
+    "changed": { "const": false },
+    "receipt": { "type": "null" },
+    "action_count": { "const": 0 },
+    "install_root": { "type": "string", "pattern": "^/" },
+    "root_inode": { "type": "integer", "minimum": 0 },
+    "target_architecture": { "type": "string", "minLength": 1 },
+    "foreign_architectures": {
+      "type": "array", "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "caller_attempt_id": { "$ref": "#/$defs/digest" },
+    "caller_request_sha256": { "$ref": "#/$defs/digest" },
+    "caller_policy_sha256": { "$ref": "#/$defs/digest" },
+    "plan_sha256": { "$ref": "#/$defs/digest" },
+    "exact_lock_sha256": { "$ref": "#/$defs/digest" },
+    "descriptor_sha256": { "$ref": "#/$defs/digest" },
+    "database_generation_sha256": { "$ref": "#/$defs/digest" },
+    "final_state_sha256": { "$ref": "#/$defs/digest" },
+    "digest_sha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

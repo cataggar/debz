@@ -17417,8 +17417,53 @@ pub const Runtime = struct {
     /// Captures complete root evidence and validates acquired bytes against
     /// their genuine lock origins. This does not publish native active intent.
     pub fn prepare(allocator: std.mem.Allocator, request: PrepareRequest) !native_preparation.ResultWithNoChanges {
+        return prepareInternal(allocator, request, null);
+    }
+
+    pub const UnchangedState = struct {
+        database_generation_sha256: [32]u8,
+        final_state_sha256: [32]u8,
+
+        pub fn eql(self: @This(), other: @This()) bool {
+            return std.mem.eql(u8, &self.database_generation_sha256, &other.database_generation_sha256) and
+                std.mem.eql(u8, &self.final_state_sha256, &other.final_state_sha256);
+        }
+    };
+
+    /// Proves an actual no-execution preparation and captures its full database.
+    /// A still-held, abandoned unexecuted caller may repeat this read-only proof.
+    pub fn verifyUnchanged(allocator: std.mem.Allocator, request: PrepareRequest) !UnchangedState {
         const root = try validateAttempt(request.attempt);
-        if (!request.attempt.record().state.provenPreMutation())
+        const record = request.attempt.record();
+        if (request.plan.actions.len != 0 or request.plan.ordered_actions.len != 0 or
+            request.archives.len != 0 or record.program_sha256 != null or
+            record.authorization_sha256 != null or record.mutation_started or
+            (!record.state.provenPreMutation() and
+                !(record.state == .completed and record.outcome == .abandoned_before_mutation)))
+            return error.InvalidUnchangedRequest;
+        if (try hasActiveEvidence(allocator, root)) return error.RecoveryRequired;
+        if (try readCompletion(allocator, request.attempt)) |value| {
+            var receipt = value;
+            defer receipt.deinit();
+            return error.RecoveryRequired;
+        }
+        var state: UnchangedState = undefined;
+        var result = try prepareInternal(allocator, request, &state);
+        defer result.deinit();
+        return switch (result) {
+            .unchanged => state,
+            .prepared => error.NativeExecutionRequired,
+            .diagnostic => error.NativePreparationRejected,
+        };
+    }
+
+    fn prepareInternal(
+        allocator: std.mem.Allocator,
+        request: PrepareRequest,
+        unchanged: ?*UnchangedState,
+    ) !native_preparation.ResultWithNoChanges {
+        const root = try validateAttempt(request.attempt);
+        if (unchanged == null and !request.attempt.record().state.provenPreMutation())
             return error.OperationNotMutable;
         if (!std.mem.eql(u8, request.attempt.record().target_architecture, request.plan.target_architecture))
             return error.OperationArchitectureMismatch;
@@ -17497,7 +17542,7 @@ pub const Runtime = struct {
             archives,
             &.{},
         );
-        return native_preparation.prepareOrUnchanged(allocator, .{
+        const result = try native_preparation.prepareOrUnchanged(allocator, .{
             .plan = request.plan,
             .exact_lock = request.exact_lock,
             .install_root = request.attempt.record().install_root,
@@ -17513,6 +17558,13 @@ pub const Runtime = struct {
             .archives = archives,
             .trigger_authority = authority,
         });
+        if (result == .unchanged) {
+            if (unchanged) |state| state.* = .{
+                .database_generation_sha256 = database.generation.sha256,
+                .final_state_sha256 = nativeFinalClosureDigest(captured.snapshot),
+            };
+        }
+        return result;
     }
 
     /// Borrows the caller's held attempt and prepared inputs. Never completes,
