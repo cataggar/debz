@@ -13,6 +13,7 @@ pub const Phase = enum {
     authenticated,
     planned,
     downloaded,
+    executing,
     mutating,
     verifying,
     recovery_required,
@@ -23,6 +24,7 @@ pub const Phase = enum {
 pub const Outcome = enum {
     pending,
     succeeded,
+    unchanged,
     failed_before_mutation,
     failed_after_mutation,
     recovered,
@@ -596,6 +598,7 @@ pub fn validate(state: State) !void {
         .authenticated,
         .planned,
         .downloaded,
+        .executing,
         => false,
         .mutating,
         .verifying,
@@ -605,17 +608,18 @@ pub fn validate(state: State) !void {
         .completed => if (state.operation.mutatesRoot())
             switch (state.outcome) {
                 .pending => return error.InvalidOutcome,
-                .failed_before_mutation => false,
+                .unchanged, .failed_before_mutation => false,
                 .succeeded, .failed_after_mutation, .recovered => true,
             }
         else switch (state.outcome) {
             .succeeded, .failed_before_mutation => false,
-            .pending, .failed_after_mutation, .recovered => return error.InvalidOutcome,
+            .pending, .unchanged, .failed_after_mutation, .recovered => return error.InvalidOutcome,
         },
     };
     if (state.mutation_started != expected_mutation_started)
         return error.InvalidMutationState;
-    if (!state.operation.mutatesRoot() and state.mutation_started)
+    if (!state.operation.mutatesRoot() and
+        (state.mutation_started or state.phase == .executing))
         return error.InvalidMutationState;
 
     if (state.operation.mutatesRoot()) {
@@ -625,12 +629,18 @@ pub fn validate(state: State) !void {
             },
             .planned,
             .downloaded,
+            .executing,
             .mutating,
             .verifying,
             .recovery_required,
             .recovering,
             => if (state.exact_lock == null) return error.MissingExactLock,
             .completed => switch (state.outcome) {
+                .unchanged => {
+                    if (state.exact_lock == null) return error.MissingExactLock;
+                    if (state.transaction_result != null or state.root_operation_completion != null)
+                        return error.UnexpectedTransactionEvidence;
+                },
                 .failed_before_mutation => {
                     if (state.transaction_result != null or
                         state.root_operation_completion != null)
@@ -649,6 +659,7 @@ pub fn validate(state: State) !void {
             .authenticated,
             .planned,
             .downloaded,
+            .executing,
             .mutating,
             => if (state.transaction_result != null)
                 return error.UnexpectedTransactionResult,
@@ -721,7 +732,9 @@ fn canTransition(current: Phase, next: Phase) bool {
         .authenticated => next == .planned or next == .downloaded or
             next == .completed,
         .planned => next == .downloaded or next == .completed,
-        .downloaded => next == .mutating or next == .completed,
+        .downloaded => next == .executing or next == .mutating or next == .completed,
+        .executing => next == .mutating or next == .verifying or
+            next == .recovery_required or next == .recovering or next == .completed,
         .mutating => next == .verifying or next == .recovery_required,
         .verifying => next == .completed or next == .recovery_required,
         .recovery_required => next == .recovering or next == .verifying,
@@ -1069,6 +1082,52 @@ fn testCompletedState(allocator: std.mem.Allocator) !OwnedState {
         },
         .updated_unix = 1_800_000_000,
     });
+}
+
+test "apt_system_state.test.executing can finish unchanged without rolling back mutation evidence" {
+    const allocator = std.testing.allocator;
+    var fixture = try testCompletedState(allocator);
+    defer fixture.deinit();
+    var downloaded = fixture.state;
+    downloaded.phase = .downloaded;
+    downloaded.outcome = .pending;
+    downloaded.mutation_started = false;
+    downloaded.transaction_result = null;
+    downloaded.root_operation_completion = null;
+    var executing = downloaded;
+    executing.phase = .executing;
+    executing.generation += 1;
+    try validateTransition(downloaded, executing);
+    var final = executing;
+    final.phase = .completed;
+    final.outcome = .unchanged;
+    final.diagnostic = "native transaction has no package changes";
+    final.generation += 1;
+    try validateTransition(executing, final);
+    var owned = try create(allocator, final);
+    defer owned.deinit();
+    const bytes = try owned.state.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(Outcome.unchanged, decoded.state.outcome);
+    try std.testing.expect(!decoded.state.mutation_started);
+    var mutated = executing;
+    mutated.phase = .recovering;
+    mutated.mutation_started = true;
+    try std.testing.expectError(error.MutationEvidenceRollback, validateTransition(mutated, final));
+    var invalid = final;
+    invalid.exact_lock = null;
+    try std.testing.expectError(error.MissingExactLock, validate(invalid));
+    invalid = final;
+    invalid.transaction_result = fixture.state.transaction_result;
+    try std.testing.expectError(error.UnexpectedTransactionEvidence, validate(invalid));
+    executing.mutation_started = true;
+    try std.testing.expectError(error.InvalidMutationState, validate(executing));
+    executing.mutation_started = false;
+    executing.operation = .update;
+    executing.exact_lock = null;
+    try std.testing.expectError(error.InvalidMutationState, validate(executing));
 }
 
 test "apt_system_state.test.completed state round-trips canonically" {

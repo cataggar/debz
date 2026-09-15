@@ -86,10 +86,42 @@
     { "$ref": "apt-system-result-v1.json#/allOf/6" },
     { "$ref": "apt-system-result-v1.json#/allOf/7" },
     { "$ref": "apt-system-result-v1.json#/allOf/8" },
-    { "$ref": "apt-system-result-v1.json#/allOf/9" },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "success" },
+          "changed": { "const": false },
+          "operation": { "enum": ["install", "remove", "upgrade"] }
+        },
+        "required": ["outcome", "changed", "operation"]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "exact_lock": { "$ref": "apt-system-result-v1.json#/$defs/documentBinding" },
+              "transaction_result": { "type": "null" },
+              "root_operation_completion": { "type": "null" },
+              "active_operation_state": { "$ref": "apt-system-result-v1.json#/$defs/absolutePath" }
+            }
+          }
+        }
+      },
+      "else": { "$ref": "apt-system-result-v1.json#/allOf/9" }
+    },
     { "$ref": "apt-system-result-v1.json#/allOf/10" },
     {
       "oneOf": [
+        {
+          "properties": {
+            "operation": { "enum": ["install", "remove", "upgrade"] },
+            "outcome": { "const": "success" },
+            "changed": { "const": false },
+            "mutation_status": { "const": "unchanged" },
+            "recovery_context": { "type": "null" }
+          },
+          "not": { "required": ["items"] }
+        },
         {
           "properties": {
             "operation": {

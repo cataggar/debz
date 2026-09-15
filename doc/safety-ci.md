@@ -13,6 +13,16 @@ scheduled campaign. x64 runs the longer campaign; x64 and arm64 run all
 deterministic corpora and Debug/ReleaseSafe builds and tests. A failing
 deterministic mutation logs its seed and case indexes for exact replay.
 
+Required build workloads use separate architecture and optimization-mode jobs,
+each retaining the 60-minute limit. Every combination runs the complete build,
+test, fuzz, native differential, and private helper namespace targets with
+`-j2` and timing summaries. Debug jobs also run release packaging and privileged
+orchestration; ReleaseSafe jobs run installed-CLI facade acceptance and the
+download action fixture. Native crash recovery remains a separate required
+workload in both modes on both architectures. The existing `Build and test`
+checks require all four build jobs and both recovery jobs to succeed; failure,
+cancellation, or a skipped workload cannot make the aggregate pass.
+
 The same tests are native `std.testing.fuzz` targets with seed corpora, so
 coverage-guided runs can use `zig build fuzz --fuzz=<cases>` on Zig toolchains
 where the built-in fuzzer is available. CI uses the deterministic runner
@@ -45,6 +55,7 @@ maintainer-script failure, and explicit recovery.
 - ambient APT/GnuPG/proxy/environment access and shell construction;
 - unpinned GitHub Actions or dependencies outside the reviewed allowlist;
 - unpinned external actions in composite action manifests;
+- missing required CI architecture/mode coverage or aggregate failure propagation;
 - missing dependency notices or GPL/LGPL/AGPL production dependencies;
 - expired recorded vulnerability/license reviews or source pins that differ
   from the reviewed libsolv, liblzma, and libzstd inputs;

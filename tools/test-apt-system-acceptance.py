@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Exercise the installed apt facade with real dpkg in a disposable system root."""
+"""Exercise both apt facade backends in disposable installed system roots."""
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import pty
 import re
+import select
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -69,6 +73,7 @@ def prepare_root(root: Path, executable: Path) -> None:
         (Path("/usr/bin/dpkg"), "/usr/bin/dpkg"),
         (Path("/usr/bin/dpkg-deb"), "/usr/bin/dpkg-deb"),
         (Path("/usr/bin/dpkg-split"), "/usr/bin/dpkg-split"),
+        (Path("/usr/bin/dpkg-trigger"), "/usr/bin/dpkg-trigger"),
         (Path("/usr/bin/tar"), "/usr/bin/tar"),
         (Path("/bin/sh"), "/bin/sh"),
     ):
@@ -108,7 +113,7 @@ def prepare_root(root: Path, executable: Path) -> None:
     (root / "etc/apt/apt.conf").write_text("invalid ambient apt configuration\n")
 
 
-def inside(root: Path) -> None:
+def inside(root: Path, backend: str) -> None:
     root = root.resolve(strict=True)
     if (
         os.getpid() != 1
@@ -134,6 +139,12 @@ def inside(root: Path) -> None:
         "/" + str(essential_packages[0].relative_to(root)),
         env=environment, capture_output=True,
     )
+    if backend == "native":
+        for name in ("dpkg", "dpkg-deb", "dpkg-split"):
+            program = root / "usr/bin" / name
+            program.rename(program.with_suffix(".disabled"))
+    helper_path = root / "usr/bin/dpkg-trigger"
+    helper_digest = hashlib.sha256(helper_path.read_bytes()).digest()
     status_path = root / "var/lib/dpkg/status"
     state_path = root / "var/lib/debz"
     initial_status = status_path.read_bytes()
@@ -148,7 +159,11 @@ def inside(root: Path) -> None:
         )
         assert Path("/proc/self/mountinfo").read_bytes() == mountinfo, "live-root mount leaked"
         if result.returncode != expected:
-            for name in ("transaction.journal", "root-operation-v1.json"):
+            for name in (
+                "transaction.journal", "root-operation-v1.json",
+                "root-operation-completion-v1.json", "root-operation-deferred-ack-v1.json",
+                "native-transaction-provenance-v1.json", "apt/active-operation-v1.json",
+            ):
                 evidence_file = state_path / name
                 if evidence_file.is_file():
                     with evidence_file.open("rb") as stream:
@@ -162,7 +177,53 @@ def inside(root: Path) -> None:
         return document
 
     def apt(*args: str, expected: int = 0) -> dict:
-        return cli("apt", "--json", *args, expected=expected)
+        profile = ("--profile", "/etc/debz/native-v2.json") if backend == "native" else ()
+        return cli("apt", *profile, "--json", *args, expected=expected)
+
+    def confirm_recovery(expected: int) -> None:
+        master, slave = pty.openpty()
+        output = bytearray()
+        confirmed = False
+        deadline = time.monotonic() + 60
+        try:
+            with subprocess.Popen(
+                ["chroot", str(root), "/usr/bin/debz", "recover",
+                 "--system-profile", "/etc/debz/native-v2.json"],
+                env=environment, stdin=slave, stdout=slave, stderr=slave,
+            ) as process:
+                os.close(slave)
+                slave = -1
+                try:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"recovery confirmation timed out: {output!r}")
+                        if not select.select([master], [], [], remaining)[0]:
+                            continue
+                        try:
+                            chunk = os.read(master, 4096)
+                        except OSError as error:
+                            if error.errno != errno.EIO:
+                                raise
+                            break
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                        assert len(output) <= 65536, output
+                        if not confirmed and b"Proceed with this reviewed recovery action? [y/N]" in output:
+                            os.write(master, b"y\n")
+                            confirmed = True
+                    assert process.wait(timeout=10) == expected, output
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+        finally:
+            os.close(master)
+            if slave != -1:
+                os.close(slave)
+        assert confirmed, output
+        assert Path("/proc/self/mountinfo").read_bytes() == mountinfo, "live-root mount leaked"
 
     # Invalid syntax must not even create the profile's state hierarchy.
     for args in (("install", "--unsupported", "base-dep"), ("install", "base-dep", "base-dep")):
@@ -178,11 +239,13 @@ def inside(root: Path) -> None:
         version=2, transaction_backend="native",
     )
     (root / "etc/debz/native-v2.json").write_text(json.dumps(native_profile))
+    invalid_profile = {**native_profile, "transaction_backend": "unsupported"}
+    (root / "etc/debz/invalid-v2.json").write_text(json.dumps(invalid_profile))
     for args in (
-        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "update"),
-        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "install", "-y", "base-dep"),
-        ("apt", "--profile", "/etc/debz/native-v2.json", "--json", "list", "--installed"),
-        ("recover", "--system-profile", "/etc/debz/native-v2.json", "--json"),
+        ("apt", "--profile", "/etc/debz/invalid-v2.json", "--json", "update"),
+        ("apt", "--profile", "/etc/debz/invalid-v2.json", "--json", "install", "-y", "base-dep"),
+        ("apt", "--profile", "/etc/debz/invalid-v2.json", "--json", "list", "--installed"),
+        ("recover", "--system-profile", "/etc/debz/invalid-v2.json", "--json"),
     ):
         rejected = cli(*args, expected=8 if args[0] == "recover" else 3)
         assert rejected["changed"] is False
@@ -210,6 +273,7 @@ def inside(root: Path) -> None:
     assert len(set(operations_path.glob("*/transaction-result.json")) - previous_results) == 1
     lock_path = root / evidence["exact_lock"]["path"].lstrip("/")
     lock = json.loads(lock_path.read_bytes())
+    assert lock["version"] == (2 if backend == "native" else 1), lock
     assert {item["name"] for item in lock["packages"]} == closure, lock
     requested = {item["name"] for item in lock["packages"] if item["retention"] == "requested"}
     assert requested == {"base-dep", "alt-a"}
@@ -223,15 +287,22 @@ def inside(root: Path) -> None:
     assert completion["exact_lock"] == evidence["exact_lock"]
     assert completion["transaction_result"] == evidence["transaction_result"]
     assert completion["request_sha256"] == result["request_sha256"]
-    verification = cli(
-        "transaction-result", "verify", "--state-path",
-        str(Path(evidence["transaction_result"]["path"]).parent),
-        "--lock-input", evidence["exact_lock"]["path"],
-        "--architecture", lock["target_architecture"], "--json",
-    )
-    assert verification["lock_sha256"] == evidence["exact_lock"]["digest_sha256"]
-    assert verification["transaction_digest_sha256"] == evidence["transaction_result"]["digest_sha256"]
-    assert verification["package_count"] == len(closure)
+    if backend == "native":
+        receipt = json.loads((root / evidence["transaction_result"]["path"].lstrip("/")).read_bytes())
+        assert receipt["schema"] == "https://debz.dev/schema/native-transaction-provenance-v1", receipt
+        assert receipt["outcome"] == "succeeded", receipt
+        assert receipt["exact_lock_sha256"] == evidence["exact_lock"]["digest_sha256"]
+        assert receipt["digest_sha256"] == evidence["transaction_result"]["digest_sha256"]
+    else:
+        verification = cli(
+            "transaction-result", "verify", "--state-path",
+            str(Path(evidence["transaction_result"]["path"]).parent),
+            "--lock-input", evidence["exact_lock"]["path"],
+            "--architecture", lock["target_architecture"], "--json",
+        )
+        assert verification["lock_sha256"] == evidence["exact_lock"]["digest_sha256"]
+        assert verification["transaction_digest_sha256"] == evidence["transaction_result"]["digest_sha256"]
+        assert verification["package_count"] == len(closure)
     for package in ("base-dep", "alt-a"):
         assert (root / "usr/share/debz-fixtures" / package).is_file()
     installed = apt("list", "--installed")
@@ -249,6 +320,39 @@ def inside(root: Path) -> None:
     upgraded = apt("upgrade", "-y")
     assert upgraded["changed"] is True
     assert (root / "usr/share/debz-fixtures/fixture-upgrade").read_text().startswith("fixture-upgrade=2.0-1:")
+    if backend == "native":
+        lower_completion = json.loads((state_path / "root-operation-completion-v1.json").read_bytes())
+        assert lower_completion["operation"] == "upgrade_all", lower_completion
+        assert lower_completion["discharge"]["operation"] == "upgrade_all", lower_completion
+        assert lower_completion["discharge"]["request_sha256"] == lower_completion["request_sha256"]
+        before_unchanged = status_path.read_bytes()
+        receipts_before_unchanged = set(operations_path.glob("*/transaction-result.json"))
+        unchanged = apt("upgrade", "-y")
+        assert unchanged["version"] == 3, unchanged
+        assert unchanged["changed"] is False, unchanged
+        assert unchanged["evidence"]["transaction_result"] is None, unchanged
+        assert unchanged["evidence"]["root_operation_completion"] is None, unchanged
+        active_path = state_path / "apt/active-operation-v1.json"
+        assert not active_path.exists()
+        unchanged_path = root / unchanged["evidence"]["active_operation_state"].lstrip("/")
+        unchanged_bytes = unchanged_path.read_bytes()
+        unchanged_state = json.loads(unchanged_bytes)
+        assert unchanged_state["outcome"] == "unchanged", unchanged_state
+        assert unchanged_state["mutation_started"] is False, unchanged_state
+        active_path.write_bytes(unchanged_bytes)
+        review = cli("recover", "--system-profile", "/etc/debz/native-v2.json", "--json", expected=2)
+        assert review["changed"] is False, review
+        assert active_path.read_bytes() == unchanged_bytes
+        confirm_recovery(expected=0)
+        assert not active_path.exists()
+        assert unchanged_path.read_bytes() == unchanged_bytes
+        assert status_path.read_bytes() == before_unchanged
+        assert set(operations_path.glob("*/transaction-result.json")) == receipts_before_unchanged
+    reinstalled = apt("install", "-y", "fixture-upgrade=2.0-1")
+    assert reinstalled["changed"] is True, reinstalled
+    assert reinstalled["evidence"]["transaction_result"] is not None, reinstalled
+    assert reinstalled["evidence"]["root_operation_completion"] is not None, reinstalled
+    assert not (state_path / "apt/active-operation-v1.json").exists()
     removed = apt("remove", "-y", "base-dep", "alt-a", "fixture-upgrade")
     assert removed["changed"] is True
     assert {item["package"] for item in apt("list", "--installed")["items"]} == {"essential-core"}
@@ -259,7 +363,28 @@ def inside(root: Path) -> None:
     assert rejected["changed"] is False
     assert status_path.read_bytes() == before_rejection
     assert not (root / "usr/share/debz-fixtures/base-dep").exists()
-    print("apt-system acceptance: multi-package install/remove, exact-lock evidence, "
+    if backend == "native":
+        failure = apt("install", "-y", "fail-script", expected=7)
+        assert failure["changed"] is True
+        assert failure["diagnostics"][0]["id"] == "transaction_failed", failure
+        assert failure["evidence"]["root_operation_completion"] is None
+        receipt_path = root / failure["evidence"]["transaction_result"]["path"].lstrip("/")
+        receipt = json.loads(receipt_path.read_bytes())
+        assert receipt["outcome"] == "failed", receipt
+        active_path = state_path / "apt/active-operation-v1.json"
+        assert not active_path.exists()
+        # Restore the exact durable final state to model interrupted outer clearing.
+        final_path = receipt_path.parent / "state-v1.json"
+        final_bytes = final_path.read_bytes()
+        active_path.write_bytes(final_bytes)
+        recovery = cli("recover", "--system-profile", "/etc/debz/native-v2.json", "--json", expected=2)
+        assert recovery["changed"] is True, recovery
+        assert active_path.read_bytes() == final_bytes
+        confirm_recovery(expected=7)
+        assert not active_path.exists()
+        assert final_path.read_bytes() == final_bytes
+        assert hashlib.sha256(helper_path.read_bytes()).digest() == helper_digest
+    print(f"apt-system acceptance ({backend}): multi-package install/remove, exact-lock evidence, "
           "confirmation, update, upgrade, list, atomic rejection, ambient isolation and mount cleanup passed")
 
 
@@ -267,11 +392,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("debz", nargs="?", type=Path)
     parser.add_argument("--inside", type=Path)
+    parser.add_argument("--transaction-backend", choices=("legacy_dpkg", "native"))
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("required apt-system acceptance needs root and Linux mount/PID/network namespaces")
     if args.inside:
-        inside(args.inside)
+        if args.transaction_backend is None:
+            parser.error("internal acceptance entry requires a transaction backend")
+        inside(args.inside, args.transaction_backend)
         return
     if args.debz is None:
         parser.error("debz executable required")
@@ -280,15 +408,16 @@ def main() -> None:
     host_status = Path("/var/lib/dpkg/status")
     before = hashlib.sha256(host_status.read_bytes()).digest() if host_status.exists() else None
     try:
-        with tempfile.TemporaryDirectory(prefix="apt-system-acceptance-", dir=cache) as workspace:
-            root = Path(workspace) / "root"
-            root.mkdir()
-            prepare_root(root, args.debz.resolve(strict=True))
-            run(
-                "unshare", "--mount", "--net", "--pid", "--fork", "--kill-child=SIGKILL",
-                "--propagation", "private", sys.executable, str(Path(__file__).resolve()),
-                "--inside", str(root),
-            )
+        for backend in (args.transaction_backend,) if args.transaction_backend else ("legacy_dpkg", "native"):
+            with tempfile.TemporaryDirectory(prefix="apt-system-acceptance-", dir=cache) as workspace:
+                root = Path(workspace) / "root"
+                root.mkdir()
+                prepare_root(root, args.debz.resolve(strict=True))
+                run(
+                    "unshare", "--mount", "--net", "--pid", "--fork", "--kill-child=SIGKILL",
+                    "--propagation", "private", sys.executable, str(Path(__file__).resolve()),
+                    "--inside", str(root), "--transaction-backend", backend,
+                )
     finally:
         after = hashlib.sha256(host_status.read_bytes()).digest() if host_status.exists() else None
         assert before == after, "host dpkg status changed"

@@ -329,6 +329,63 @@ class AptSystemResultSchemaTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             self.validate(wrong_phase)
 
+    def test_unchanged_success_requires_a_lock_and_retained_state_without_receipts(self) -> None:
+        document = self.confirmation()
+        del document["items"]
+        document.update(outcome="success", exit_status=0, diagnostics=[])
+        document["evidence"]["active_operation_state"] = "/state/apt/operations/attempt/state-v1.json"
+        self.validate(document)
+        for field in ("exact_lock", "active_operation_state"):
+            with self.subTest(missing=field):
+                changed = copy.deepcopy(document)
+                changed["evidence"][field] = None
+                with self.assertRaises(jsonschema.ValidationError):
+                    self.validate(changed)
+        changed = copy.deepcopy(document)
+        changed["changed"] = True
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(changed)
+        changed = copy.deepcopy(document)
+        changed["evidence"]["transaction_result"] = changed["evidence"]["exact_lock"]
+        with self.assertRaises(jsonschema.ValidationError):
+            self.validate(changed)
+
+    def test_execution_pending_and_unchanged_state_do_not_claim_mutation(self) -> None:
+        validator = jsonschema.Draft202012Validator(json.loads(
+            (ROOT / "schema/apt-system-operation-state-v1.json").read_text()
+        ))
+        result = self.confirmation()
+        document = {
+            "schema": "https://debz.dev/schema/apt-system-operation-state-v1",
+            "version": 1, "attempt_id": "11" * 32, "generation": 2,
+            "operation": "install", "phase": "executing", "mutation_started": False,
+            "outcome": "pending", "request_sha256": result["request_sha256"],
+            "profile": result["profile"], "exact_lock": result["evidence"]["exact_lock"],
+            "transaction_result": None, "root_operation_completion": None,
+            "updated_unix": 1800000000, "diagnostic": "", "digest_sha256": "66" * 32,
+        }
+        validator.validate(document)
+        nonmutating = copy.deepcopy(document)
+        nonmutating.update(operation="update", exact_lock=None)
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(nonmutating)
+        document.update(
+            phase="completed", outcome="unchanged", generation=3,
+            diagnostic="native transaction has no package changes",
+        )
+        validator.validate(document)
+        for field, value in (
+            ("mutation_started", True),
+            ("exact_lock", None),
+            ("transaction_result", document["exact_lock"]),
+            ("operation", "update"),
+        ):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(document)
+                changed[field] = value
+                with self.assertRaises(jsonschema.ValidationError):
+                    validator.validate(changed)
+
     def test_additional_confirmation_diagnostic_fails(self) -> None:
         document = copy.deepcopy(self.confirmation())
         document["diagnostics"].append(

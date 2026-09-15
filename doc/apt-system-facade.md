@@ -20,17 +20,22 @@ outcome before repository, root, or package mutation.
 `zig build test-apt-system-acceptance` is a required Linux CI check on amd64
 and arm64, separate from the adapter and orchestration unit tests. Run it as
 root with Linux mount, PID, and network namespace support, Python 3 with
-`cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, GNU tar, shell,
+`cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, dpkg-trigger, GNU tar, shell,
 ldconfig, start-stop-daemon, rm, and diff available.
 CI invokes the same acceptance script with the preceding build's ReleaseSafe
 executable rather than compiling it again in a separate privileged cache.
 
-The check invokes the built `debz` executable and real dpkg in a disposable
-chroot under the repository's `.zig-cache`, using an authenticated fixture
-repository and an explicit system profile. It exercises update, multi-package
+The check invokes the built `debz` executable in separate disposable legacy and
+native chroots under the repository's `.zig-cache`, using an authenticated fixture
+repository and an explicit system profile. Real dpkg bootstraps each root; the
+native root then disables dpkg, dpkg-deb, and dpkg-split while retaining the real
+dpkg-trigger target. It exercises update, multi-package
 confirmation and installation, retained exact-lock/transaction verification,
 installed listing, upgrade, batch removal, and all-or-nothing planning
-rejection. It also checks unsupported syntax before state creation, isolation
+rejection. Both backends preserve explicit same-version reinstall behavior.
+Native coverage includes unchanged upgrade, receipt-free
+retained history, failed-script history, and TTY-confirmed public recovery.
+It also checks unsupported syntax before state creation, isolation
 from ambient APT configuration/proxies, unchanged host dpkg status, and mount
 cleanup. Missing privileges or fixture prerequisites fail rather than skip.
 The required privileged orchestration suite additionally covers interruption,
@@ -272,16 +277,16 @@ profile binding even when every referenced repository/keyring file is identical.
 Existing operation/recovery evidence cannot be rebound by changing only the
 profile's backend.
 
-**Native apt/system execution remains gated.** This profile contract is
-groundwork for native integration, not an execution switch. The current
-apt/system profile boundary rejects native profiles before operation-state,
-live-root, or backend activity, including update, installed listing, and
-recovery. Normal apt commands report a configuration failure (exit 3).
-Recovery preserves its fail-closed recovery failure (exit 8) with unknown
-mutation status because the profile cannot authorize inspecting prior state.
-Neither path retries through legacy v1 lock or transaction evidence. Explicit
-v2 `legacy_dpkg` profiles remain usable. Native v2 lock/provenance/recovery and
-live-root integration must be completed before lifting that gate.
+**Explicit v2 native profiles enable native apt/system execution.** Update,
+installed listing, installation, removal, upgrade, and profile-bound recovery
+dispatch through the selected backend without fallback. Version 1 profiles and
+the default profile remain legacy; explicit v2 `legacy_dpkg` profiles also remain
+usable. This opt-in does not perform the native-only cutover or complete the
+remaining consumer and cross-architecture parity work.
+
+Native package execution requires a real regular `usr/bin/dpkg-trigger` target
+inside the selected root. Missing targets are refused; the facade neither
+fabricates a placeholder nor replaces the installed helper target.
 
 The apt/system exact-lock verifier takes the reviewed profile's backend
 explicitly at each planning, execution, reconciliation, recovery, and
@@ -292,12 +297,11 @@ preserves the actual schema/version and checks the lock digest, requested
 architecture, and semantic request digest without converting v2 origins into
 v1 repository evidence.
 
-Transaction verification is separately gated: the current legacy verifier
+Transaction verification remains backend-specific: the legacy verifier
 rejects native selection and non-v1 lock bindings before reading evidence.
-Native lock verification alone does not authorize legacy provenance or permit
-native planning/execution. Native receipt/completion publication and
-verification, recovery, and live-root authority must still be integrated before
-native profiles can pass the facade boundary.
+Native lock verification alone does not authorize legacy provenance or prove
+native execution. Native receipt/completion verification uses the distinct
+owner-bound and committed-history paths described below.
 
 The private live-root supervisor can issue an opaque, callback-local projection
 authority to an explicitly projected callback. Owned native verification may
@@ -315,9 +319,13 @@ invocation's permission. Native preparation, execution, persisted backend
 recovery, and ownership cleanup pass it through their in-memory coordinator.
 Root acquisition and record publication revalidate it, as do native runtime
 entry points. The capability never enters a program, receipt, owner marker, or
-recovery document: a later recovery needs its own supervised callback. Native
-facade engine and persisted recovery integration remain incomplete, so the
-central native profile gate is unchanged.
+recovery document: a later recovery needs its own supervised callback.
+
+The facade revalidates the original profile and exact lock before native
+recovery, but passes no replacement lock, source, configuration, or keyring
+inputs to the native backend. Original caller, architecture, and policy
+digests are preserved; the backend's persisted-input-only refusal remains in
+force. Legacy recovery retains its existing options.
 
 `LiveRootRunner.verifyOwnedNative` provides a separate live-owned verification
 gateway. Its request carries an independently retained v2 exact-lock binding,
@@ -364,7 +372,8 @@ or an exact recovery discharge when recovery first creates the completion.
 The classifier binds both to the original caller, native policy, architecture,
 v2 lock, and available native receipt. Cross-backend evidence, mixed discharge
 name/digest pairs, legacy journals, and non-success outcomes cannot prove
-successful recovery.
+successful recovery. Discharge names use the canonical stored operation
+spelling, including `upgrade_all`, rather than the CLI spelling `upgrade-all`.
 
 The private runner returns the complete pending native owner with its recovery
 acknowledgment. It reconstructs that owner from the invocation's retained owner
@@ -374,8 +383,6 @@ survives outer acknowledgment retention and pending-to-acknowledged comparison.
 Native cleanup receives that exact expected marker, while legacy callers retain
 their existing identifier-based upgrade behavior. This ownership handoff is not
 receipt verification or permission to finalize before durable outer completion.
-Native recovery entry-point and known-failure integration still need completion
-before the profile gate can be removed.
 
 The engine's live completion path now consumes owner-bound native success for
 ordinary completion and recovered pending completion. Normal execution compares
@@ -394,9 +401,7 @@ shared file. The storage retention check is only a format/binding check, never
 standalone execution or historical verification. The engine retains the exact
 owner and publishes and commits outer completion before native ownership cleanup
 and active-state clearing. Missing authority, mismatched outcomes, retention
-failures, and interrupted publication leave cleanup unperformed. The profile
-gate continues to prevent public native facade execution until the remaining
-recovery entry points are integrated.
+failures, and interrupted publication leave cleanup unperformed.
 
 Committed native history has a separate verifier. Its request carries the
 expected durable final-state snapshot and complete operation-local owner.
@@ -445,7 +450,7 @@ completion, finalize ownership or replay package work. After confirmation,
 completion obtains fresh owned success again, retains the receipt, commits
 outer evidence and only then finalizes the exact owner. Missing or foreign
 authority, stale completion and unavailable live evidence remain unknown.
-Neither the native profile gate nor the legacy transaction verifier is relaxed.
+The legacy transaction verifier remains separate and does not accept this proof.
 
 Settled native pending success requires a complete pending acknowledgment
 authenticated from the operation-local acknowledgment or independently retained
@@ -719,7 +724,7 @@ leaves evidence for a fresh confirmed completion or final-state cleanup review.
 Restart does not invoke package recovery again. Unknown outcomes and unavailable
 or mismatched live proof cannot commit failure history or acknowledge ownership.
 Completed cleanup still reports transaction failure with no successful outer
-completion. Native profiles remain gated.
+completion.
 
 Receipt retention also takes the reviewed profile backend explicitly. Native
 receipts are decoded as canonical native provenance and retain their actual
@@ -739,8 +744,8 @@ the request. The production adapter copies its configuration for that invocation
 and sets the selected backend only on that copy; it never toggles shared backend
 configuration or inherits a previous invocation's selection. Existing executor,
 process-runner, clock, and fault-injection configuration is preserved. Backend
-errors propagate directly without retrying through another engine, and this
-internal dispatch contract does not remove the native profile or host-root gates.
+errors propagate directly without retrying through another engine. Explicit
+profile selection does not relax standalone host-root restrictions.
 
 Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v2.json`
 for native from the trusted profile backend during preparation, recovery, and
@@ -753,6 +758,38 @@ supports versioned document bindings, so native lock storage needs no new state
 schema or redundant backend field. Exact profile-byte identity remains the
 durable backend authority, and state transitions reject profile replacement or
 lock-version substitution.
+
+### Native unchanged operations
+
+Native execution enters an `executing` outer phase after reservation, before
+the backend outcome is known. Its false `mutation_started` flag is not proof
+that package work did not begin: interruption still requires independently
+bound lower evidence. Changed outcomes enter the existing mutation and
+receipt-verification path without rolling back any recorded mutation evidence.
+Confirmed retries of independently proven pre-mutation attempts use the same
+execution-pending and unchanged-result rules.
+
+A successful no-op instead requires an exact `abandoned` owner derived from
+the independently retained execution token, with no lower operation record.
+The facade revalidates the profile, lock, and outer state, commits a durable
+`unchanged` final snapshot, and only then finalizes ownership and clears the
+active slot. It reports success with `changed=false`, the exact lock, and the
+retained state path, but no transaction receipt or successful completion.
+
+Restart verifies the canonical retained unchanged snapshot and original
+profile, request, lock, and ownership authority. Recovery review binds its exact
+generation and digest; missing, foreign, or changed history cannot authorize
+cleanup. If interruption preceded final publication, exact abandonment can
+prove no package changes but cannot recreate a lost successful result. That
+case is finalized as a pre-mutation interruption, without package replay.
+An unrelated shared lower completion may survive from an earlier transaction.
+A v2 unchanged review binds its digest only as a live snapshot, with no root
+record or transaction proof; a completion naming the unchanged attempt is
+contradictory and refused. V1 review documents retain their original contract.
+
+Native pending-completion publication and verification preserve the exact
+owner version, including unreviewed v2 owners. A v1 marker cannot substitute for
+a v2 owner even when the attempt and acknowledgment IDs match.
 
 `system_profile.load` takes an injected filesystem interface. The profile and
 every source, config, keyring, and credential file are bounded and must be a
@@ -814,7 +851,8 @@ digest; it is not a sequence of singleton product API calls.
 `success`, `usage`, `configuration`, `authentication`, `planning`, `download`,
 `transaction`, `recovery`, and `internal` outcomes. Diagnostics carry a stable
 identifier and the same outcome classification. Human summary text is not a
-machine interface. Itemless results retain the exact v1 wire format and digest.
+machine interface. Existing itemless results retain the exact v1 wire format
+and digest; receipt-free unchanged success uses the v3 extension.
 [`apt-system-result-v2.json`](../schema/apt-system-result-v2.json) is the
 explicit additive result extension used when `list_installed` returns a
 non-empty bounded, owned `items` array preserving each package name and
@@ -823,8 +861,10 @@ its schema, required fields, canonical field order, bytes, and digest remain
 exactly compatible with the original result-v2 contract. No
 `mutation_status` field is added to v2.
 [`apt-system-result-v3.json`](../schema/apt-system-result-v3.json) is selected
-only for an item-bearing mutating `confirmation_required` review or an
-itemless fail-closed result with `mutation_status: "unknown"`. It cannot
+for an item-bearing mutating `confirmation_required` review, an itemless
+fail-closed result with `mutation_status: "unknown"`, or successful unchanged
+package operations. Unchanged success requires an exact lock and retained
+state path and forbids transaction/completion evidence. It cannot
 reinterpret a `list_installed` result. All item and status fields participate
 in the canonical result digest. An UNKNOWN result uses operation `recover`
 with a digest-bound recovery context containing only the requested profile
@@ -865,10 +905,15 @@ and `debz.apt_system_state` define a bounded, canonical, digest-bearing active
 operation record. It binds attempt and generation, operation, request, profile
 and reference evidence, exact lock, transaction result, root-operation
 completion, mutation evidence, phase, outcome, timestamp, and diagnostic.
-Pre-mutation phases require `mutation_started=false`; mutating, verifying,
+Pre-mutation phases and native execution-pending `executing` require
+`mutation_started=false`; `executing` itself never proves no package changes.
+Mutating, verifying,
 recovery-required, and recovering phases require it to remain true. Exact-lock,
 transaction-result, and completion evidence appear only at their defined
-boundaries and can never be removed or changed by a later generation.
+boundaries and can never be removed or changed by a later generation. Native
+no-ops finish from `executing` with outcome `unchanged`, a bound exact lock,
+and no transaction or completion. Existing state encodings are unchanged;
+older readers refuse the new phase/outcome rather than reinterpret them.
 
 The store takes an operation lock, rereads the current canonical state, and
 compares attempt ID, generation, and digest before every transition. The next
@@ -916,7 +961,8 @@ immediately before acquisition and again immediately before mutation, and
 first invokes an internal reservation mode that durably binds the outer
 attempt identity under the lower root-operation lock without repository or
 package mutation. The outer state remains `downloaded` until that reservation
-returns. It is then advanced to `mutating` and `ProductionWorkflow` execute
+returns. Legacy then advances to `mutating`; native advances to `executing`
+until its outcome is known. `ProductionWorkflow` execute
 acquires the locked package closure with the same selectors and exact lock. A
 valid but different replacement is rejected, not merely a malformed lock. The
 only install-root spelling supplied to a backend is
