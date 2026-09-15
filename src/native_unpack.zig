@@ -20887,6 +20887,11 @@ test "native_unpack.test.runtime preparation captures genuine archive and comple
     try testPreparedMixedLifecycle(true, .captured_preparation);
 }
 
+test "native_unpack.test.public runtime preparation preserves unlocked repository packages" {
+    try testPreparedMixedLifecycle(false, .repository_scoped_preparation);
+    try testPreparedMixedLifecycle(true, .repository_scoped_preparation);
+}
+
 test "native_unpack.test.public runtime requires a held native attempt and its physical named root" {
     var fixture: Fixture = undefined;
     try fixture.init(empty_status, &.{});
@@ -21046,6 +21051,7 @@ const MixedLifecycleCase = enum {
     helper_target_removed,
     public_missing_helper,
     captured_preparation,
+    repository_scoped_preparation,
     stale_database,
     wrong_plan,
     foreign_root,
@@ -21057,27 +21063,37 @@ const MixedLifecycleCase = enum {
 
 fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     const empty_closure = case == .empty_closure;
+    const scoped = case == .repository_scoped_preparation;
     const status = try std.fmt.allocPrint(
         testing.allocator,
         "Package: old\nStatus: install ok installed\nVersion: 2.0\nArchitecture: amd64\n" ++
-            "Conffiles:\n /etc/old.conf {s}\n\n",
-        .{hex(16, digestMd5("old configuration\n"))},
+            "Conffiles:\n /etc/old.conf {s}\n\n{s}",
+        .{
+            hex(16, digestMd5("old configuration\n")),
+            if (scoped) "Package: held\nStatus: hold ok installed\nVersion: 3.0\nArchitecture: amd64\n\n" else "",
+        },
     );
     defer testing.allocator.free(status);
     var fixture: Fixture = undefined;
-    try fixture.init(status, &.{.{
+    const info = [_]package_database.InfoEntry{ .{
         .name = "old.list",
         .bytes = if (case == .helper_target_removed)
             "/.\n/etc\n/etc/old.conf\n/usr\n/usr/bin\n/usr/bin/dpkg-trigger\n/usr/share\n/usr/share/old\n"
         else
             "/.\n/etc\n/etc/old.conf\n/usr\n/usr/share\n/usr/share/old\n",
-    }});
+    }, .{
+        .name = "held.list",
+        .bytes = "/.\n/usr\n/usr/share\n/usr/share/held\n",
+    } };
+    try fixture.init(status, info[0..if (scoped) 2 else 1]);
     defer fixture.deinit();
     const root = fixture.root();
     for ([_][]const u8{ "etc", "usr", "usr/share" }) |path|
         try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
     try root.publishFile(try root_fs.Path.init("etc/old.conf"), "old configuration\n", .{});
     try root.publishFile(try root_fs.Path.init("usr/share/old"), "old payload\n", .{});
+    if (scoped)
+        try root.publishFile(try root_fs.Path.init("usr/share/held"), "retained payload\n", .{});
     if (case == .helper_target_removed) {
         try root.ensureDirectory(try root_fs.Path.init("usr/bin"), root_fs.default_directory_permissions);
         try root.publishFile(try root_fs.Path.init(native_helper.target_path), "package-owned helper\n", .{});
@@ -21186,11 +21202,15 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     };
     var root_buffer: [4096]u8 = undefined;
     const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    const preparation_policy: transaction_executor.Policy = .{
+        .conffile = .keep_existing,
+        .exact_lock_verification = if (scoped) .locked_packages else .full_closure,
+    };
     var preparation = try native_preparation.prepare(testing.allocator, .{
         .plan = &solver_plan,
         .exact_lock = &lock.lock,
         .install_root = install_root,
-        .policy = .{ .conffile = .keep_existing },
+        .policy = preparation_policy,
         .script_policy = lifecycleScriptPolicy(),
         .installed = .{
             .generation_sha256 = database.generation.sha256,
@@ -21244,14 +21264,14 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             try caller.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
     }
     defer if (case != .owned) caller.release();
-    if (case == .captured_preparation) {
+    if (case == .captured_preparation or scoped) {
         const original = caller.record().digest_sha256;
         const request: Runtime.PrepareRequest = .{
             .attempt = &caller,
             .plan = &solver_plan,
             .exact_lock = &lock.lock,
             .archives = &.{bytes},
-            .policy = .{ .conffile = .keep_existing },
+            .policy = preparation_policy,
         };
         var captured_preparation = try Runtime.prepare(testing.allocator, request);
         defer captured_preparation.deinit();
@@ -21264,6 +21284,20 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expect(try Runtime.canAbandon(testing.allocator, &caller));
         try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        if (scoped) {
+            const authorization = captured_preparation.prepared.authorization.authorization;
+            const held = authorization.findFinalPackage("held", "amd64").?;
+            try testing.expectEqualStrings("3.0", held.version);
+            try testing.expectEqual(.installed, held.state);
+            try testing.expect(held.dpkg_selection_hold);
+            try testing.expect(lock.lock.findIdentity("held", "amd64") == null);
+            try testing.expect(authorization.findAction("held", "amd64") == null);
+            try testing.expectEqual(@as(usize, 1), captured_program.artifacts.len);
+            try testing.expect(caller.record().operation.eql(.{ .repository_bootstrap = .add }));
+            var full_closure = request;
+            full_closure.policy.exact_lock_verification = .full_closure;
+            try testing.expectError(error.LockClosureMismatch, Runtime.prepare(testing.allocator, full_closure));
+        }
         var missing = request;
         missing.archives = &.{};
         var refused = try Runtime.prepare(testing.allocator, missing);
@@ -21277,6 +21311,11 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         var changed_request = request;
         changed_request.exact_lock = &changed_lock;
         try testing.expectError(error.ArchiveEvidenceMismatch, Runtime.prepare(testing.allocator, changed_request));
+        if (scoped) {
+            try testing.expectEqual(original, caller.record().digest_sha256);
+            try testing.expectEqualStrings(status, try root.readFileAlloc(arena.allocator(), try root_fs.Path.init("var/lib/dpkg/status"), 1024 * 1024));
+            try testing.expectEqualStrings("retained payload\n", try root.readFileAlloc(arena.allocator(), try root_fs.Path.init("usr/share/held"), 4096));
+        }
         try caller.abandonIfPreMutation(testing.allocator);
         return;
     }
