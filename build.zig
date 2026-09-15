@@ -240,6 +240,12 @@ pub fn build(b: *std.Build) void {
     );
     repository_add_step.dependOn(&repository_add_tests.step);
     repository_add_step.dependOn(&run_repository_cli_tests.step);
+    const repository_backend_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"repository_backend.test."},
+    });
+    const run_repository_backend_tests = b.addRunArtifact(repository_backend_tests);
+    repository_add_step.dependOn(&run_repository_backend_tests.step);
     test_step.dependOn(&repository_add_tests.step);
 
     const fuzz_tests = b.addTest(.{
