@@ -289,6 +289,43 @@ bootstrap, acknowledges native execution or releases ownership. Durable outer
 state/completion and repository dispatch remain integration work; native CLI
 activation stays gated.
 
+### Persisting native package-stage checkpoints
+
+`persistNativePackageState` consumes the original `NativeReceiptRequest`; it
+accepts no replacement state, plan, lock, archive or cache. It reads the original
+operation-local state, executable plan and v2 lock through stable no-follow
+file pins. Root, architecture, request/policy, plan digest, lock identity,
+descriptor identity/origin and exact native evidence paths must agree with the
+held caller. Root authority is validated before metadata access and again at
+publication.
+
+Only the package-stage `locked`, `installed` and known package-failure states
+are accepted. Imported, refreshed or complete state is refused rather than
+downgraded or interpreted as bootstrap proof. Before the first checkpoint, the
+adapter retains the genuine native receipt and obtains fresh live package-state
+verification. Once state binds a receipt, missing or corrupt retention refuses;
+it is never silently recreated.
+
+Success publishes `phase=installed`. Known failure publishes `phase=failed`
+with `transaction_failed`, retaining whether the descriptor itself is fully
+installed in the verified current database. A failure in another package
+therefore does not erase a genuinely installed descriptor. Neither outcome
+claims import, refresh or bootstrap completion.
+
+The existing `repository-add-state-v1` schema and backend-specific operation
+directory are reused. Publication is private, atomic and durable; the original
+state/plan/lock pins, caller, projection and invocation deadline are revalidated
+before rename. A changed input refuses instead of being overwritten. Retry
+preserves already-published bytes, inode and diagnostics while completing any
+interrupted file/directory sync.
+
+The owned `NativePackageCheckpoint` contains the persisted state and distinct
+verified native package outcome; call `deinit` when finished. Both success and
+failure leave root ownership and native recovery evidence intact. Descriptor
+material verification, import/refresh recovery, durable outer completion and
+acknowledgment still require integration before native repository CLI dispatch
+can be enabled.
+
 ## Descriptor and repository trust
 
 The MVP descriptor is a Debian binary package. Unpinned acquisition requires

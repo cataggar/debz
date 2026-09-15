@@ -2333,6 +2333,23 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert retained_path.read_bytes() == (root / "fixture/repository-native-receipt.json").read_bytes()
             assert stat.S_IMODE(retained_path.stat().st_mode) == 0o600
             assert not (retained_path.parent / "transaction-result-v2.json").exists()
+            checkpoint_path = retained_path.parent / "repo-add-state-v1.json"
+            checkpoint = document(checkpoint_path)
+            validator("repository-add-state-v1").validate(checkpoint)
+            payload = dict(checkpoint)
+            digest = payload.pop("digest_sha256")
+            assert hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest() == digest
+            original = document(root / "fixture/repository-original-locked-state.json")
+            for field in ("root", "architecture", "no_refresh", "descriptor", "managed_files",
+                          "plan_path", "plan_sha256", "exact_lock_path"):
+                assert checkpoint[field] == original[field]
+            assert checkpoint["plan_sha256"] == caller["plan_sha256"]
+            assert checkpoint["phase"] == ("failed" if case == "known_failure" else "installed")
+            assert checkpoint["installed"] == (case != "known_failure")
+            assert checkpoint["diagnostic_id"] == ("transaction_failed" if case == "known_failure" else None)
+            assert checkpoint["provenance_path"] == retained_logical
+            assert not checkpoint["refreshed"] and checkpoint["manifest_path"] is None
+            assert stat.S_IMODE(checkpoint_path.stat().st_mode) == 0o600
             retained = retained_documents(root, proof)
             execution = retained["execution_request"][0]
             for field in ("request_sha256", "policy_sha256"):

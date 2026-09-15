@@ -394,6 +394,17 @@ allocation cleanup. Restored evidence and fresh legitimate callbacks verify
 without replay, acknowledgment or ownership changes. Existing settled and
 owner-bound verification remains covered by the core recovery family.
 
+Repository package checkpoints reuse the original persisted locked state, plan
+and v2 lock after package execution or fresh recovery with no CAS inputs. Real
+cases bind successful/failed native outcomes to durable generic repository state,
+refuse changed or missing inputs and leaf symlinks, expire before rename, detect
+input replacement during publication, converge after interrupted rename and
+refuse to repair missing already-bound receipts. Fresh callbacks preserve the
+checkpoint inode, script trace and original caller; namespace loss before
+accepting a checkpoint refuses. State-model units additionally preserve an
+installed descriptor on known package failure, later diagnostics and allocation
+cleanup. These remain part of the same repository execution family.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2
