@@ -118,6 +118,33 @@ against the canonical caller record; input order is not authority. Duplicate,
 malformed, and unsafe foreign metadata still refuses without changing the
 caller. Raw foreign ordering remains part of the imported database evidence.
 
+`prepareNativeFromCache` connects the held repository caller and genuine v2
+lock to the existing package CAS and real native preparation. Before loading
+any object, it validates caller/request/policy authority, declared closure
+budgets, sticky evidence, absence of active execution, and the canonical lock.
+Every object is read through the CAS's no-follow, exact-size, SHA-256-verified
+reader; a cache hit is transport, not a replacement for native payload and
+origin validation. Missing or corrupt objects fail without network acquisition,
+repair, or legacy fallback. Local, mixed-origin, and empty closures use the
+same path.
+
+The caller must supply all still-retained package buffers, including an
+acquired descriptor, as `retained_archives`. Their actual lengths plus the
+complete newly loaded closure must fit `maximum_retained_package_bytes`
+before any archive allocation. The closure separately fits
+`maximum_total_package_bytes`, the request's per-package/cache limits, and the
+opened CAS's object limit. Retained buffers are neither reused nor transferred:
+the returned `NativeCachedPreparation` owns its archives and preparation result
+until `deinit`, independently of cache eviction or the caller's buffers.
+All partially loaded archives are released on failure.
+
+The cache adapter requires the existing absolute operation `Deadline` and
+checks it before work, around object reads, and after native preparation.
+It does not reset the timeout or claim to interrupt a single read or CPU-bound
+preparation. Expiry and lock loss discard the result without changing caller
+authority. Native execution still needs its own cumulative-deadline integration
+before repository CLI activation.
+
 Native caller request digests cover every cache, state, network, and aggregate
 resource field; native caller policy digests also bind the actual repository
 executor policy. Legacy caller and executable-lock identities remain

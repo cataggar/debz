@@ -48,12 +48,143 @@ pub const NativePreparationRequest = struct {
     archives: []const []const u8,
 };
 
+pub const NativeCachePreparationRequest = struct {
+    repository: api.Request,
+    attempt: *root_operation.Attempt,
+    plan: *const solver.Plan,
+    exact_lock: *const exact_lock_v2.Lock,
+    cache: *package_acquisition.Cache,
+    /// Package buffers still owned by the caller, including the descriptor.
+    /// These count against retained memory but are not reused or transferred.
+    retained_archives: []const []const u8,
+    /// The existing operation deadline, never a new timeout for this phase.
+    deadline: transaction_executor.Deadline,
+};
+
+pub const NativeCachedPreparation = struct {
+    preparation: native_preparation.ResultWithNoChanges,
+    archives: []const []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *NativeCachedPreparation) void {
+        self.preparation.deinit();
+        for (self.archives) |bytes| self.allocator.free(bytes);
+        self.allocator.free(self.archives);
+        self.* = undefined;
+    }
+};
+
+/// Owns the complete verified CAS closure through preparation and subsequent
+/// execution, independently of cache eviction or the caller's package buffers.
+/// Cache misses and corruption refuse; this never downloads or repairs objects.
+pub fn prepareNativeFromCache(
+    allocator: std.mem.Allocator,
+    input: NativeCachePreparationRequest,
+) !NativeCachedPreparation {
+    _ = try input.deadline.remainingMs();
+    var preparation: NativePreparationRequest = .{
+        .repository = input.repository,
+        .attempt = input.attempt,
+        .plan = input.plan,
+        .exact_lock = input.exact_lock,
+        .archives = &.{},
+    };
+    try validateNativePreparationCaller(preparation);
+    const request = input.repository;
+    if (input.retained_archives.len > request.resources.maximum_actions or
+        input.exact_lock.packages.len > @import("native_program.zig").maximum_artifacts)
+        return error.ResourceBudgetExceeded;
+    var retained_bytes: u64 = 0;
+    for (input.retained_archives) |bytes|
+        try OperationBudget.charge(&retained_bytes, bytes.len, request.resources.maximum_retained_package_bytes);
+    var package_bytes: u64 = 0;
+    for (input.exact_lock.packages) |package| {
+        try validateNativeArchiveSize(request, package.declared_size);
+        if (package.declared_size > input.cache.limits.maximum_object_bytes)
+            return error.ResourceBudgetExceeded;
+        try OperationBudget.charge(&package_bytes, package.declared_size, request.resources.maximum_total_package_bytes);
+        try OperationBudget.charge(&retained_bytes, package.declared_size, request.resources.maximum_retained_package_bytes);
+    }
+    try validateNativePreparationEvidence(allocator, preparation);
+    const lock_bytes = try input.exact_lock.canonicalJson(allocator);
+    defer allocator.free(lock_bytes);
+    var verified_lock = try exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes);
+    defer verified_lock.deinit();
+    preparation.exact_lock = &verified_lock.lock;
+    _ = try input.deadline.remainingMs();
+    const archives = try allocator.alloc([]const u8, verified_lock.lock.packages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (archives[0..initialized]) |bytes| allocator.free(bytes);
+        allocator.free(archives);
+    }
+    for (verified_lock.lock.packages, archives) |package, *bytes| {
+        _ = try input.deadline.remainingMs();
+        bytes.* = try input.cache.lookup(allocator, .{ .bytes = package.sha256 }, package.declared_size, .verify_sha256);
+        initialized += 1;
+        _ = try input.deadline.remainingMs();
+    }
+    preparation.archives = archives;
+    var result = try prepareNative(allocator, preparation);
+    errdefer result.deinit();
+    _ = try input.deadline.remainingMs();
+    try validateNativePreparationCaller(preparation);
+    return .{ .preparation = result, .archives = archives, .allocator = allocator };
+}
+
 /// Prepares already acquired repository inputs under their original caller.
 /// Does not execute, publish intent, release ownership, or complete bootstrap.
 pub fn prepareNative(
     allocator: std.mem.Allocator,
     input: NativePreparationRequest,
 ) !native_preparation.ResultWithNoChanges {
+    try validateNativePreparationCaller(input);
+    var retained_bytes: u64 = 0;
+    for (input.archives) |bytes| {
+        try validateNativeArchiveSize(input.repository, bytes.len);
+        try OperationBudget.charge(&retained_bytes, bytes.len, input.repository.resources.maximum_retained_package_bytes);
+    }
+    if (retained_bytes > input.repository.resources.maximum_total_package_bytes)
+        return error.ResourceBudgetExceeded;
+    try validateNativePreparationEvidence(allocator, input);
+    const record = input.attempt.record();
+    var result = try native_runtime.prepare(allocator, .{
+        .attempt = input.attempt,
+        .plan = input.plan,
+        .exact_lock = input.exact_lock,
+        .archives = input.archives,
+        .policy = repositoryExecutionPolicy(input.repository),
+    });
+    errdefer result.deinit();
+    switch (result) {
+        .prepared => |prepared| {
+            const evidence = try native_operation.evidence(prepared.program.program);
+            inline for (.{
+                "authorization_sha256",       "program_sha256",
+                "database_generation_sha256", "artifact_evidence_sha256",
+            }) |field| {
+                if (@field(record, field)) |bound| {
+                    if (!std.mem.eql(u8, &bound, &@field(evidence, field).?))
+                        return error.OperationEvidenceMismatch;
+                }
+            }
+        },
+        .unchanged => {
+            if (record.authorization_sha256 != null or record.program_sha256 != null)
+                return error.OperationEvidenceMismatch;
+        },
+        .diagnostic => {},
+    }
+    return result;
+}
+
+fn validateNativeArchiveSize(request: api.Request, size: u64) !void {
+    if (size > request.network.maximum_package_bytes or
+        size > request.cache.maximum_object_bytes)
+        return error.ResourceBudgetExceeded;
+}
+
+fn validateNativePreparationCaller(input: NativePreparationRequest) !void {
     const request = input.repository;
     if (api.validateRequest(request) != null) return error.InvalidRepositoryRequest;
     const attempt = input.attempt;
@@ -77,17 +208,12 @@ pub fn prepareNative(
         input.exact_lock.repositories.len > request.resources.maximum_repositories or
         input.archives.len > request.resources.maximum_actions)
         return error.ResourceBudgetExceeded;
-    var retained_bytes: u64 = 0;
-    for (input.archives) |bytes| {
-        if (bytes.len > request.network.maximum_package_bytes or
-            bytes.len > request.cache.maximum_object_bytes)
-            return error.ResourceBudgetExceeded;
-        retained_bytes = std.math.add(u64, retained_bytes, bytes.len) catch
-            return error.ResourceBudgetExceeded;
-    }
-    if (retained_bytes > request.resources.maximum_retained_package_bytes or
-        retained_bytes > request.resources.maximum_total_package_bytes)
-        return error.ResourceBudgetExceeded;
+}
+
+fn validateNativePreparationEvidence(allocator: std.mem.Allocator, input: NativePreparationRequest) !void {
+    const request = input.repository;
+    const attempt = input.attempt;
+    const record = attempt.record();
     try validateLockPolicy(input.exact_lock.*, .native);
     try validateLockRequest(allocator, input.exact_lock.*, request, input.plan.*, .native);
     if (record.plan_sha256) |digest| {
@@ -104,34 +230,6 @@ pub fn prepareNative(
     }
     if (!try native_runtime.canAbandon(allocator, attempt))
         return error.RecoveryRequired;
-    var result = try native_runtime.prepare(allocator, .{
-        .attempt = attempt,
-        .plan = input.plan,
-        .exact_lock = input.exact_lock,
-        .archives = input.archives,
-        .policy = repositoryExecutionPolicy(request),
-    });
-    errdefer result.deinit();
-    switch (result) {
-        .prepared => |prepared| {
-            const evidence = try native_operation.evidence(prepared.program.program);
-            inline for (.{
-                "authorization_sha256",       "program_sha256",
-                "database_generation_sha256", "artifact_evidence_sha256",
-            }) |field| {
-                if (@field(record, field)) |bound| {
-                    if (!std.mem.eql(u8, &bound, &@field(evidence, field).?))
-                        return error.OperationEvidenceMismatch;
-                }
-            }
-        },
-        .unchanged => {
-            if (record.authorization_sha256 != null or record.program_sha256 != null)
-                return error.OperationEvidenceMismatch;
-        },
-        .diagnostic => {},
-    }
-    return result;
 }
 
 pub const Backend = struct {
@@ -4845,6 +4943,28 @@ const NativePreparationCase = enum {
     archive_count,
 };
 
+const native_preparation_held_status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
+
+fn stageNativePreparationDatabase(root: root_fs.Root, status: []const u8) !void {
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
+    try root.dir.createDirPath(root.io, "var/lib/dpkg/info");
+    try root.dir.createDirPath(root.io, "var/lib/dpkg/triggers");
+    try root.dir.createDirPath(root.io, "var/lib/dpkg/updates");
+    const package_database = @import("package_database.zig");
+    try root.publishFile(
+        try root_fs.Path.init("var/lib/dpkg/info/" ++ package_database.info_format_name),
+        package_database.supported_info_format ++ "\n",
+        .{},
+    );
+    try root.publishFile(
+        try root_fs.Path.init("var/lib/dpkg/info/held.list"),
+        "/.\n/usr\n/usr/share\n/usr/share/held\n",
+        .{},
+    );
+    try root.dir.createDirPath(root.io, "usr/share");
+    try root.publishFile(try root_fs.Path.init("usr/share/held"), "untouched\n", .{});
+}
+
 fn testNativePreparation(case: NativePreparationCase) !void {
     const allocator = std.testing.allocator;
     const discovered_architecture = case == .discovered_architecture or
@@ -4863,32 +4983,15 @@ fn testNativePreparation(case: NativePreparationCase) !void {
     var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
     defer root_dir.close(std.testing.io);
     const root = root_fs.Root.init(std.testing.io, root_dir);
-    const held_status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
     const status = if (discovered_architecture)
-        native_architecture_status ++ held_status
+        native_architecture_status ++ native_preparation_held_status
     else
-        held_status;
-    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
-    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
-    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
-    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/updates");
-    const package_database = @import("package_database.zig");
-    try root.publishFile(
-        try root_fs.Path.init("var/lib/dpkg/info/" ++ package_database.info_format_name),
-        package_database.supported_info_format ++ "\n",
-        .{},
-    );
-    try root.publishFile(
-        try root_fs.Path.init("var/lib/dpkg/info/held.list"),
-        "/.\n/usr\n/usr/share\n/usr/share/held\n",
-        .{},
-    );
+        native_preparation_held_status;
+    try stageNativePreparationDatabase(root, status);
     if (discovered_architecture) {
         try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\ni386\narm64\n", .{});
         try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
     }
-    try directory.dir.createDirPath(std.testing.io, "root/usr/share");
-    try root.publishFile(try root_fs.Path.init("usr/share/held"), "untouched\n", .{});
     const root_path = try repositoryTestRoot(allocator, directory.dir);
     defer allocator.free(root_path);
     var request: api.Request = .{
@@ -5138,6 +5241,375 @@ test "repository backend native preparation bounds all simultaneously retained a
         errdefer std.debug.print("native repository budget case: {t}\n", .{case});
         try testNativePreparation(case);
     }
+}
+
+const NativeCacheCase = enum {
+    local,
+    mixed,
+    empty,
+    retained_limit,
+    total_limit,
+    package_limit,
+    cache_limit,
+    declared_overflow,
+    changed_request,
+    changed_plan,
+    legacy_caller,
+    legacy_lock,
+    invalid_lock_digest,
+    active_evidence,
+    missing_object,
+    corrupt_object,
+    invalid_payload,
+    expired_before,
+    expired_during,
+    expired_after,
+    lost_lock_after,
+    allocation_failures,
+};
+
+const NativeCacheClock = struct {
+    calls: usize = 0,
+    expire_on: ?usize = null,
+    lose_on: ?usize = null,
+    locks: *root_operation.TestLockBackend,
+
+    fn now(context: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (self.lose_on == self.calls) self.locks.loseAll();
+        return if (self.expire_on) |call| (if (self.calls >= call) 10 else 0) else 0;
+    }
+};
+
+fn testNativeCacheAllocation(input: NativeCachePreparationRequest) !void {
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (prepareNativeFromCache(failing.allocator(), input)) |value| {
+            var result = value;
+            defer result.deinit();
+            if (result.preparation == .diagnostic) {
+                try std.testing.expect(failing.has_induced_failure);
+            } else {
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expect(result.preparation == .prepared);
+                try std.testing.expectEqual(@as(usize, 2), result.archives.len);
+            }
+        } else |_| {
+            // Lower serializers and preparation can surface allocation failure
+            // as writer errors or diagnostics, not only error.OutOfMemory.
+            try std.testing.expect(failing.has_induced_failure);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
+}
+
+fn testNativeCachePreparation(case: NativeCacheCase) !void {
+    const allocator = std.testing.allocator;
+    const descriptor_bytes = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const dependency = try archive_application.test_fixtures.build(allocator, .{
+        .data = &.{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/demo", .content = "native dependency\n" },
+        },
+    });
+    defer allocator.free(dependency);
+    const dependency_bytes: []const u8 = if (case == .invalid_payload) "invalid deb" else dependency;
+    var descriptor_model = switch (archive_application.prepare(allocator, descriptor_bytes, .{ .local = .{} }, .{})) {
+        .model => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer descriptor_model.deinit();
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const root = root_fs.Root.init(std.testing.io, root_dir);
+    try stageNativePreparationDatabase(root, native_preparation_held_status);
+    const root_path = try repositoryTestRoot(allocator, directory.dir);
+    defer allocator.free(root_path);
+    const package_count: usize = if (case == .empty) 0 else if (case == .local) 1 else 2;
+    const total = descriptor_bytes.len + (if (package_count == 2) dependency_bytes.len else @as(usize, 0));
+    const maximum_package = @max(descriptor_bytes.len, dependency_bytes.len);
+    var request: api.Request = .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor_bytes),
+        .architecture = "amd64",
+        .cache = .{ .maximum_object_bytes = maximum_package },
+        .network = .{ .maximum_package_bytes = maximum_package },
+        .resources = .{
+            .maximum_total_package_bytes = total,
+            .maximum_retained_package_bytes = total + descriptor_bytes.len,
+        },
+    };
+    switch (case) {
+        .retained_limit => request.resources.maximum_retained_package_bytes -= 1,
+        .total_limit => request.resources.maximum_total_package_bytes -= 1,
+        .package_limit => request.network.maximum_package_bytes -= 1,
+        .declared_overflow => {
+            request.cache.maximum_object_bytes = std.math.maxInt(usize);
+            request.network.maximum_package_bytes = std.math.maxInt(usize);
+            request.resources.maximum_total_package_bytes = std.math.maxInt(u64);
+            request.resources.maximum_retained_package_bytes = std.math.maxInt(u64);
+        },
+        else => {},
+    }
+    const local: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(sha256(descriptor_bytes)),
+        .sha256 = sha256(descriptor_bytes),
+        .size = descriptor_bytes.len,
+        .package = descriptor_model.facts.package,
+        .version = descriptor_model.facts.version,
+        .architecture = descriptor_model.facts.architecture,
+        .acquisition_url = request.descriptor_url,
+        .trust_mode = .pinned_sha256,
+    };
+    var fixture = BindingFixture.init(local);
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(0x11);
+    var actions = [_]solver.PlanAction{ fixture.actions[0], .{
+        .kind = .install,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .repository = .{ .id = repository_id, .priority = 500 },
+        .sha256 = package_origin.artifactIdFromSha256(sha256(dependency_bytes)),
+        .package_size = dependency_bytes.len,
+        .installed_size_delta_bytes = 0,
+        .source_package = "demo",
+        .prior_installed = null,
+        .requested = false,
+        .reason = .dependency,
+        .selected_origin = null,
+        .origin = .{ .authenticated_repository = .{ .id = repository_id, .priority = 500 } },
+    } };
+    var ordered = [_]solver.OrderedAction{
+        fixture.ordered_actions[0],
+        .{ .sequence = 1, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = fixture.plan();
+    plan.actions = actions[0..package_count];
+    plan.ordered_actions = if (package_count == 0) &.{} else if (package_count == 1) &fixture.ordered_actions else &ordered;
+    plan.download_bytes = if (package_count == 0) 0 else total;
+    plan.summary = .{ .installs = package_count, .download_bytes = plan.download_bytes };
+    const packages = [_]exact_lock_v2.Package{
+        .{
+            .name = local.package,
+            .version = local.version,
+            .architecture = local.architecture,
+            .origin = .{ .local_artifact = local },
+            .sha256 = local.sha256,
+            .declared_size = local.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "demo",
+            .version = "1.0",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .sha256 = sha256(dependency_bytes),
+            .declared_size = dependency_bytes.len,
+            .retention = .dependency,
+            .dpkg_selection_hold = false,
+        },
+    };
+    const lock_backend: transaction_engine.Kind = if (case == .legacy_lock) .legacy_dpkg else .native;
+    var lock = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = try operationRequestDigest(allocator, request, plan, lock_backend),
+        .policy_sha256 = repositoryLockPolicyDigest(lock_backend),
+        .repositories = if (package_count == 2) &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(2),
+            .index_sha256 = @splat(3),
+            .signer_fingerprints = &.{@splat(4)},
+        }} else &.{},
+        .local_artifacts = if (package_count == 0) &.{} else &.{local},
+        .packages = packages[0..package_count],
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, directory.dir, .{
+        .maximum_object_bytes = request.cache.maximum_object_bytes,
+    });
+    defer cache.deinit();
+    if (package_count != 0 and case != .missing_object)
+        try cache.publish(allocator, .{ .bytes = local.sha256 }, local.size, descriptor_bytes, .fail_fast, .{});
+    if (package_count == 2)
+        try cache.publish(allocator, .{ .bytes = sha256(dependency_bytes) }, dependency_bytes.len, dependency_bytes, .fail_fast, .{});
+    var locks: root_operation.TestLockBackend = .{ .allocator = allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(std.testing.io, root, root_path, locks.interface());
+    var attempt = try coordinator.acquire(allocator, .{
+        .backend = if (case == .legacy_caller) .legacy_dpkg else .native,
+        .operation = .{ .repository_bootstrap = .add },
+        .request_sha256 = repositoryRequestDigest(request, .native),
+        .policy_sha256 = repositoryPolicyDigest(request, .native),
+        .target_architecture = "amd64",
+    });
+    defer attempt.release();
+    const before = attempt.record().digest_sha256;
+    var clock: NativeCacheClock = .{
+        .locks = &locks,
+        .expire_on = switch (case) {
+            .expired_before => 1,
+            .expired_during => 4,
+            .expired_after => 7,
+            else => null,
+        },
+        .lose_on = if (case == .lost_lock_after) 7 else null,
+    };
+    var input: NativeCachePreparationRequest = .{
+        .repository = request,
+        .attempt = &attempt,
+        .plan = &plan,
+        .exact_lock = &lock.lock,
+        .cache = &cache,
+        .retained_archives = &.{descriptor_bytes},
+        .deadline = .{ .context = &clock, .nowMsFn = NativeCacheClock.now, .expires_at_ms = 10 },
+    };
+    var oversized = packages;
+    const key = std.fmt.bytesToHex(local.sha256, .lower);
+    switch (case) {
+        .changed_request => input.repository.no_refresh = true,
+        .changed_plan => actions[0].requested = false,
+        .invalid_lock_digest => lock.lock.digest_sha256[0] ^= 1,
+        .cache_limit => cache.limits.maximum_object_bytes -= 1,
+        .declared_overflow => {
+            oversized[0].declared_size = std.math.maxInt(u64);
+            lock.lock.packages = &oversized;
+        },
+        .corrupt_object => try cache.objects.writeFile(std.testing.io, .{ .sub_path = &key, .data = "corrupt" }),
+        .active_evidence => try root.publishFile(
+            try root_fs.Path.init(@import("native_recovery.zig").intent_path),
+            "active native evidence",
+            .{},
+        ),
+        else => {},
+    }
+    const expected_error: ?anyerror = switch (case) {
+        .retained_limit, .total_limit, .package_limit, .cache_limit, .declared_overflow => error.ResourceBudgetExceeded,
+        .changed_request => error.RepositoryCallerMismatch,
+        .changed_plan => error.RequestEvidenceMismatch,
+        .legacy_caller => error.OperationBackendMismatch,
+        .legacy_lock => error.LockPolicyMismatch,
+        .invalid_lock_digest => error.DigestMismatch,
+        .active_evidence => error.RecoveryRequired,
+        .missing_object => error.CacheMiss,
+        .corrupt_object => error.CorruptObject,
+        .invalid_payload => error.InvalidNativeArchive,
+        .expired_before, .expired_during, .expired_after => error.DeadlineExceeded,
+        .lost_lock_after => error.LockLost,
+        else => null,
+    };
+    if (expected_error) |expected| {
+        try std.testing.expectError(expected, prepareNativeFromCache(allocator, input));
+        if (expected == error.ResourceBudgetExceeded) {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+            try std.testing.expectError(expected, prepareNativeFromCache(failing.allocator(), input));
+        }
+    } else if (case == .allocation_failures) {
+        try testNativeCacheAllocation(input);
+    } else {
+        var result = try prepareNativeFromCache(allocator, input);
+        defer result.deinit();
+        try std.testing.expectEqual(package_count, result.archives.len);
+        if (case == .empty) {
+            try std.testing.expect(result.preparation == .unchanged);
+        } else {
+            try std.testing.expect(result.preparation == .prepared);
+            const authorization = result.preparation.prepared.authorization.authorization;
+            try std.testing.expect(authorization.findFinalPackage("held", "amd64").?.dpkg_selection_hold);
+            try std.testing.expect(authorization.findAction("held", "amd64") == null);
+            for (lock.lock.packages, result.archives) |package, bytes| {
+                try std.testing.expectEqual(package.sha256, sha256(bytes));
+                const object_key = std.fmt.bytesToHex(package.sha256, .lower);
+                try cache.objects.deleteFile(std.testing.io, &object_key);
+                try std.testing.expectEqual(package.sha256, sha256(bytes));
+            }
+            try native_operation.bind(allocator, root, &attempt, result.preparation.prepared.program.program);
+            try std.testing.expectEqualDeep(
+                try native_operation.evidence(result.preparation.prepared.program.program),
+                attempt.record().evidence(),
+            );
+            var repeated = try prepareNative(allocator, .{
+                .repository = request,
+                .attempt = &attempt,
+                .plan = &plan,
+                .exact_lock = &lock.lock,
+                .archives = result.archives,
+            });
+            defer repeated.deinit();
+            try std.testing.expect(repeated == .prepared);
+            try std.testing.expectEqualStrings(
+                &result.preparation.prepared.program.program.digest_sha256,
+                &repeated.prepared.program.program.digest_sha256,
+            );
+            const bound = attempt.record().digest_sha256;
+            var retained: [3][]const u8 = undefined;
+            retained[0] = descriptor_bytes;
+            @memcpy(retained[1 .. 1 + result.archives.len], result.archives);
+            var retry = input;
+            retry.retained_archives = retained[0 .. 1 + result.archives.len];
+            try std.testing.expectError(error.ResourceBudgetExceeded, prepareNativeFromCache(allocator, retry));
+            try std.testing.expectEqual(bound, attempt.record().digest_sha256);
+        }
+    }
+    if (expected_error != null or case == .empty or case == .allocation_failures)
+        try std.testing.expectEqual(before, attempt.record().digest_sha256);
+    try std.testing.expectEqual(case != .lost_lock_after, attempt.locked());
+    const status = try root.readFileAlloc(allocator, try root_fs.Path.init("var/lib/dpkg/status"), 4096);
+    defer allocator.free(status);
+    try std.testing.expectEqualStrings(native_preparation_held_status, status);
+    try std.testing.expect((try root.entryIfExists(try root_fs.Path.init(@import("native_recovery.zig").intent_path)) != null) ==
+        (case == .active_evidence));
+}
+
+test "repository backend native cached preparation owns local mixed and empty closures" {
+    for ([_]NativeCacheCase{ .local, .mixed, .empty }) |case| {
+        errdefer std.debug.print("native cached preparation case: {t}\n", .{case});
+        try testNativeCachePreparation(case);
+    }
+}
+
+test "repository backend native cached preparation preflights complete retained budgets" {
+    for ([_]NativeCacheCase{ .retained_limit, .total_limit, .package_limit, .cache_limit, .declared_overflow }) |case| {
+        errdefer std.debug.print("native cached preparation case: {t}\n", .{case});
+        try testNativeCachePreparation(case);
+    }
+}
+
+test "repository backend native cached preparation refuses foreign authority and invalid cache evidence" {
+    for ([_]NativeCacheCase{
+        .changed_request,     .changed_plan,    .legacy_caller,  .legacy_lock,
+        .invalid_lock_digest, .active_evidence, .missing_object, .corrupt_object,
+        .invalid_payload,
+    }) |case| {
+        errdefer std.debug.print("native cached preparation case: {t}\n", .{case});
+        try testNativeCachePreparation(case);
+    }
+}
+
+test "repository backend native cached preparation preserves cumulative deadlines and ownership" {
+    for ([_]NativeCacheCase{ .expired_before, .expired_during, .expired_after, .lost_lock_after }) |case| {
+        errdefer std.debug.print("native cached preparation case: {t}\n", .{case});
+        try testNativeCachePreparation(case);
+    }
+}
+
+test "repository backend native cached preparation cleans up allocation failures" {
+    try testNativeCachePreparation(.allocation_failures);
 }
 
 test "repository backend legacy binding byte identities" {
