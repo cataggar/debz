@@ -174,6 +174,64 @@ pub fn verifyReviewOwner(
 
 const TerminalOutcome = enum { succeeded, failed };
 
+fn CallerResult(comptime expected_outcome: TerminalOutcome) type {
+    return struct {
+        pub const outcome = expected_outcome;
+        receipt: native_provenance.OwnedDocument,
+
+        pub fn deinit(self: *@This()) void {
+            self.receipt.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub const CallerSuccess = CallerResult(.succeeded);
+pub const CallerFailure = CallerResult(.failed);
+
+/// Verifies package execution under the original held caller, without requiring
+/// or manufacturing outer completion, a deferred owner, or another root lock.
+pub fn verifyCallerSuccess(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+) !CallerSuccess {
+    return verifyCaller(allocator, attempt, expected_receipt, .succeeded);
+}
+
+/// Confirms the actual terminal failure and recorded database, not successful
+/// installation of the desired closure. No recovery or acknowledgment is run.
+pub fn verifyCallerFailure(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+) !CallerFailure {
+    return verifyCaller(allocator, attempt, expected_receipt, .failed);
+}
+
+fn verifyCaller(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+    comptime expected_outcome: TerminalOutcome,
+) !CallerResult(expected_outcome) {
+    var receipt = try native_runtime.readCompletion(allocator, attempt) orelse return error.ReceiptMissing;
+    errdefer receipt.deinit();
+    const proof = receipt.document;
+    try equalDigest(proof.digest_sha256, expected_receipt);
+    if (proof.outcome != (if (expected_outcome == .succeeded) native_provenance.Outcome.succeeded else .failed))
+        return if (expected_outcome == .succeeded) error.TransactionNotSuccessful else error.TransactionNotFailed;
+    const record = attempt.record();
+    const root = attempt.coordinator.root;
+    try verifyStateEvidence(allocator, root, (try root.rootEntry()).inode, null, record, proof, expected_outcome);
+    try verifyPendingEvidence(allocator, root, proof);
+    if (!attempt.locked()) return error.LockLost;
+    try attempt.coordinator.validateProjection();
+    if (!std.mem.eql(u8, &record.digest_sha256, &attempt.record().digest_sha256))
+        return error.OperationEvidenceMismatch;
+    return .{ .receipt = receipt };
+}
+
 fn OwnedResult(comptime expected_outcome: TerminalOutcome) type {
     return struct {
         pub const outcome = expected_outcome;
@@ -462,6 +520,20 @@ fn verifyEvidence(
     try equalDigest(proof.policy_sha256, native_recovery.hexDigest(outer.policy_sha256));
     try equalDigest(proof.root_identity_sha256, native_recovery.hexDigest(outer.root_identity_sha256));
     try optionalDigest(outer.transaction_provenance.document_sha256, proof.digest_sha256);
+    try verifyStateEvidence(allocator, root, root_inode, lock, outer, proof, expected_outcome);
+}
+
+// Live callers bind the same native evidence through their sticky record;
+// completed-owner routes additionally supply and verify the full closure lock.
+fn verifyStateEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    root_inode: u64,
+    lock: ?exact_lock_v2.Lock,
+    authority: anytype,
+    proof: native_provenance.Document,
+    expected_outcome: TerminalOutcome,
+) !void {
     try native_provenance.verifyEvidence(allocator, root, proof);
 
     const authorization_bytes = try readEvidence(allocator, root, proof, .authorization, native_authorization.maximum_document_bytes);
@@ -477,24 +549,28 @@ fn verifyEvidence(
     try evidenceDigest(proof, .program, program.program.digest_sha256);
     if (!program.program.matchesAuthorization(authorized))
         return error.AuthorizationMismatch;
-    try verifyLock(authorized, program.program, lock);
+    if (lock) |value|
+        try verifyLock(authorized, program.program, value)
+    else
+        try verifyProgramPolicy(authorized, program.program);
     const expected_evidence = try native_operation.evidence(program.program);
     inline for (.{
         "authorization_sha256",       "program_sha256",           "plan_sha256",
         "database_generation_sha256", "artifact_evidence_sha256",
     }) |field| {
-        const actual = @field(outer, field) orelse return error.InvalidCompletion;
+        const actual = @field(authority, field) orelse return error.InvalidCompletion;
         if (!std.mem.eql(u8, &actual, &@field(expected_evidence, field).?))
             return error.InvalidCompletion;
     }
-    if (outer.exact_lock == null or !outer.exact_lock.?.eql(expected_evidence.exact_lock.?))
+    if (authority.exact_lock == null or !authority.exact_lock.?.eql(expected_evidence.exact_lock.?))
         return error.LockEvidenceMismatch;
-    if (!textsEqual(outer.foreign_architectures, program.program.foreign_architectures) or
+    if (!std.mem.eql(u8, authority.target_architecture, program.program.target_architecture) or
+        !textsEqual(authority.foreign_architectures, program.program.foreign_architectures) or
         !textsEqual(authorized.foreign_architectures, program.program.foreign_architectures))
         return error.ArchitectureMismatch;
     try equalDigest(proof.authorization_sha256, program.program.authorization_sha256);
     try equalDigest(proof.program_sha256, program.program.digest_sha256);
-    try equalDigest(proof.exact_lock_sha256, native_recovery.hexDigest(lock.digest_sha256));
+    try equalDigest(proof.exact_lock_sha256, native_recovery.hexDigest(expected_evidence.exact_lock.?.digest_sha256));
     try equalDigest(proof.artifact_evidence_sha256, program.program.artifacts_sha256);
     try equalDigest(proof.initial_database_generation_sha256, program.program.installed_database.generation_sha256);
 
@@ -506,8 +582,8 @@ fn verifyEvidence(
     const execution = request.execution();
     try native_execution_request.validateProgram(execution, program.program);
     if (execution.root_inode != root_inode or
-        !std.mem.eql(u8, execution.install_root, install_root) or
-        !execution.caller.operation.eql(outer.operation))
+        !std.mem.eql(u8, execution.install_root, authority.install_root) or
+        !execution.caller.operation.eql(authority.operation))
         return error.InvalidCompletion;
     try equalDigest(execution.caller.attempt_id, proof.attempt_id);
     try equalDigest(execution.caller.request_sha256, proof.request_sha256);
@@ -677,14 +753,7 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         !std.mem.eql(u8, &authorization.request_sha256, &lock.request_sha256) or
         !std.mem.eql(u8, &authorization.solver_policy_sha256, &lock.policy_sha256))
         return error.LockEvidenceMismatch;
-    try equalDigest(program.solver_policy_sha256, native_recovery.hexDigest(authorization.solver_policy_sha256));
-    try equalDigest(program.executor_policy_sha256, native_recovery.hexDigest(authorization.executor_policy_sha256));
-    if (program.policy.conffile != authorization.policy.conffile or
-        program.policy.allow_host_root != authorization.policy.allow_host_root or
-        program.policy.force.len != authorization.policy.force.len)
-        return error.AuthorizationMismatch;
-    for (program.policy.force, authorization.policy.force) |left, right|
-        if (left != right) return error.AuthorizationMismatch;
+    try verifyProgramPolicy(authorization, program);
     try verifyFinalClosure(authorization.final_state, lock);
     for (authorization.actions) |action| {
         const artifact = action.artifact orelse continue;
@@ -717,6 +786,19 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         if (artifact.size != locked.declared_size or !originsEqual(origin, locked.origin))
             return error.LockEvidenceMismatch;
     }
+}
+
+fn verifyProgramPolicy(authorization: native_authorization.Authorization, program: native_program.Program) !void {
+    if (!std.mem.eql(u8, authorization.target_architecture, program.target_architecture))
+        return error.ArchitectureMismatch;
+    try equalDigest(program.solver_policy_sha256, native_recovery.hexDigest(authorization.solver_policy_sha256));
+    try equalDigest(program.executor_policy_sha256, native_recovery.hexDigest(authorization.executor_policy_sha256));
+    if (program.policy.conffile != authorization.policy.conffile or
+        program.policy.allow_host_root != authorization.policy.allow_host_root or
+        program.policy.force.len != authorization.policy.force.len)
+        return error.AuthorizationMismatch;
+    for (program.policy.force, authorization.policy.force) |left, right|
+        if (left != right) return error.AuthorizationMismatch;
 }
 
 fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lock: exact_lock_v2.Lock) !void {

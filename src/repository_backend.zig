@@ -13,6 +13,7 @@ const native_operation = @import("native_operation.zig");
 const native_preparation = @import("native_preparation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
+const native_transaction_result = @import("native_transaction_result.zig");
 const openpgp = @import("openpgp_verifier.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const package_origin = @import("package_origin.zig");
@@ -168,6 +169,41 @@ pub fn retainNativeReceipt(allocator: std.mem.Allocator, input: NativeReceiptReq
 /// verification after the original caller has been completed and cleared.
 pub fn readRetainedNativeReceipt(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativeRetainedReceipt {
     return nativeRepositoryReceipt(allocator, input, false, null);
+}
+
+pub const NativePackageState = union(enum) {
+    succeeded: NativeRetainedReceipt,
+    failed: NativeRetainedReceipt,
+
+    pub fn deinit(self: *NativePackageState) void {
+        switch (self.*) {
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Verifies retained evidence and the current package database under the
+/// original caller. A known failure never becomes successful installation;
+/// neither result completes repository bootstrap or permits early cleanup.
+pub fn verifyNativePackageState(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativePackageState {
+    var retained = try readRetainedNativeReceipt(allocator, input);
+    errdefer retained.deinit();
+    switch (retained.receipt.document.outcome) {
+        .succeeded => {
+            var verified = try native_transaction_result.verifyCallerSuccess(allocator, input.attempt, input.expected_receipt_sha256);
+            defer verified.deinit();
+            try input.validate();
+            return .{ .succeeded = retained };
+        },
+        .failed => {
+            var verified = try native_transaction_result.verifyCallerFailure(allocator, input.attempt, input.expected_receipt_sha256);
+            defer verified.deinit();
+            try input.validate();
+            return .{ .failed = retained };
+        },
+        .recovery_required => return error.InvalidRecoveryProvenance,
+    }
 }
 
 fn nativeRepositoryReceipt(
@@ -5384,7 +5420,7 @@ fn testNativePreparation(case: NativePreparationCase) !void {
                 .expected_receipt_sha256 = @splat('0'),
                 .deadline = clock.deadline(),
             };
-            inline for (.{ retainNativeReceipt, readRetainedNativeReceipt }) |function|
+            inline for (.{ retainNativeReceipt, readRetainedNativeReceipt, verifyNativePackageState }) |function|
                 try std.testing.expectError(expected_error orelse error.NativeReceiptMissing, function(allocator, receipt_input));
             try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("var/lib/debz/repository")) == null);
         },
@@ -5528,7 +5564,7 @@ test "repository backend native receipt storage refuses leaf and ancestor symlin
 const ProjectedRepositoryCase = enum { prepare, adopt, after_lock, cleanup };
 
 const RepositoryExecutionCase = enum { success, known_failure, interrupted, missing_helper, unchanged, diagnostic, expired };
-const RepositoryReceiptScope = enum { retain, read };
+const RepositoryReceiptScope = enum { retain, read, verify };
 
 const RepositoryExecutionClock = struct {
     root: root_fs.Root,
@@ -5561,6 +5597,130 @@ const RepositoryExecutionClock = struct {
         return .{ .context = self, .nowMsFn = now, .expires_at_ms = 1 };
     }
 };
+
+fn testRepositoryNativePackageState(
+    root: root_fs.Root,
+    input: NativeReceiptRequest,
+    failed: bool,
+    exercise_refusals: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    const before = input.attempt.record().digest_sha256;
+    {
+        var result = try verifyNativePackageState(allocator, input);
+        defer result.deinit();
+        try std.testing.expect(if (failed) result == .failed else result == .succeeded);
+        const retained = switch (result) {
+            inline else => |value| value,
+        };
+        try std.testing.expectEqualSlices(u8, &input.expected_receipt_sha256, &retained.receipt.document.digest_sha256);
+    }
+    if (exercise_refusals) {
+        if (!input.attempt.adopted) {
+            var retention_allocations = std.testing.FailingAllocator.init(allocator, .{});
+            {
+                var retained = try readRetainedNativeReceipt(retention_allocations.allocator(), input);
+                defer retained.deinit();
+            }
+            try std.testing.expectEqual(retention_allocations.allocated_bytes, retention_allocations.freed_bytes);
+            var verification_allocations = std.testing.FailingAllocator.init(allocator, .{});
+            {
+                var result = try verifyNativePackageState(verification_allocations.allocator(), input);
+                defer result.deinit();
+            }
+            try std.testing.expectEqual(verification_allocations.allocated_bytes, verification_allocations.freed_bytes);
+            try std.testing.expect(verification_allocations.alloc_index > retention_allocations.alloc_index);
+            // Exercise ownership handoffs without repeatedly hashing the helper
+            // for every allocation in the underlying evidence decoders.
+            for ([_]usize{ 0, retention_allocations.alloc_index, verification_allocations.alloc_index - 1 }) |fail_index| {
+                var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+                if (verifyNativePackageState(failing.allocator(), input)) |value| {
+                    var result = value;
+                    defer result.deinit();
+                    return error.TestUnexpectedResult;
+                } else |_| {
+                    // Canonical writers can report allocation failure as WriteFailed.
+                    try std.testing.expect(failing.has_induced_failure);
+                }
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            }
+        }
+        if (failed) {
+            try std.testing.expectError(
+                error.TransactionNotSuccessful,
+                native_transaction_result.verifyCallerSuccess(allocator, input.attempt, input.expected_receipt_sha256),
+            );
+        } else {
+            try std.testing.expectError(
+                error.TransactionNotFailed,
+                native_transaction_result.verifyCallerFailure(allocator, input.attempt, input.expected_receipt_sha256),
+            );
+        }
+        var late: RepositoryExecutionClock = .{ .root = root, .expire_on_call = 4 };
+        var bounded = input;
+        bounded.deadline = late.deadline();
+        try std.testing.expectError(error.DeadlineExceeded, verifyNativePackageState(allocator, bounded));
+        try std.testing.expectEqual(@as(usize, 4), late.calls);
+
+        const status_path = try root_fs.Path.init("var/lib/dpkg/status");
+        const saved_status = try root_fs.Path.init("fixture/package-state-original-status");
+        const status = try root.readFileAlloc(allocator, status_path, 64 * 1024);
+        defer allocator.free(status);
+        const changed = try std.mem.replaceOwned(u8, allocator, status, "Version: 3.0\n", "Version: 4.0\n");
+        defer allocator.free(changed);
+        try std.testing.expect(!std.mem.eql(u8, status, changed));
+        try root.rename(status_path, saved_status, .fail_if_exists);
+        try root.publishFile(status_path, changed, .{ .overwrite = .fail_if_exists });
+        {
+            var retained = try readRetainedNativeReceipt(allocator, input);
+            defer retained.deinit();
+        }
+        try std.testing.expectError(error.FinalStateMismatch, verifyNativePackageState(allocator, input));
+        const unchanged = try root.readFileAlloc(allocator, status_path, 64 * 1024);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings(changed, unchanged);
+        try root.removeFile(status_path);
+        try root.rename(saved_status, status_path, .fail_if_exists);
+
+        const unresolved = try root_fs.Path.init("var/lib/debz/.debz-native-unresolved-package-state");
+        try root.publishFile(unresolved, "unresolved", .{ .overwrite = .fail_if_exists });
+        try std.testing.expectError(error.UnresolvedNativeEvidence, verifyNativePackageState(allocator, input));
+        try std.testing.expect(try root.entryIfExists(unresolved) != null);
+        try root.removeFile(unresolved);
+
+        var retained = try readRetainedNativeReceipt(allocator, input);
+        defer retained.deinit();
+        var inconsistent = retained.receipt.document;
+        inconsistent.progress_record_count += 1;
+        native_provenance.seal(&inconsistent);
+        const inconsistent_bytes = try inconsistent.canonicalJson(allocator);
+        defer allocator.free(inconsistent_bytes);
+        const shared_path = try root_fs.Path.init(native_provenance.document_path);
+        const retained_path = try root_fs.Path.init(retained.logical_path[1..]);
+        const saved_shared = try root_fs.Path.init("fixture/package-state-original-shared-receipt");
+        const saved_retained = try root_fs.Path.init("fixture/package-state-original-retained-receipt");
+        try root.rename(shared_path, saved_shared, .fail_if_exists);
+        try root.rename(retained_path, saved_retained, .fail_if_exists);
+        try root.publishFile(shared_path, inconsistent_bytes, .{ .permissions = .fromMode(0o600), .overwrite = .fail_if_exists });
+        try root.publishFile(retained_path, inconsistent_bytes, .{ .permissions = .fromMode(0o600), .overwrite = .fail_if_exists });
+        var inconsistent_input = input;
+        inconsistent_input.expected_receipt_sha256 = inconsistent.digest_sha256;
+        {
+            var readable = try readRetainedNativeReceipt(allocator, inconsistent_input);
+            defer readable.deinit();
+        }
+        try std.testing.expectError(error.InvalidRecoveryProgress, verifyNativePackageState(allocator, inconsistent_input));
+        try root.removeFile(shared_path);
+        try root.removeFile(retained_path);
+        try root.rename(saved_shared, shared_path, .fail_if_exists);
+        try root.rename(saved_retained, retained_path, .fail_if_exists);
+    }
+    var verified = try verifyNativePackageState(allocator, input);
+    defer verified.deinit();
+    try std.testing.expect(if (failed) verified == .failed else verified == .succeeded);
+    try std.testing.expectEqual(before, input.attempt.record().digest_sha256);
+    try std.testing.expect(input.attempt.locked());
+}
 
 fn testRepositoryNativeReceipt(
     root: root_fs.Root,
@@ -5596,7 +5756,8 @@ fn testRepositoryNativeReceipt(
         .deadline = clock.deadline(),
     };
     const path = try root_fs.Path.init("fixture/repository-native-receipt.json");
-    if (try root.entryIfExists(path) != null) {
+    const first_receipt = try root.entryIfExists(path) == null;
+    if (!first_receipt) {
         var retained = try readRetainedNativeReceipt(allocator, input);
         defer retained.deinit();
         try std.testing.expectEqualSlices(u8, &receipt.document.digest_sha256, &retained.receipt.document.digest_sha256);
@@ -5636,7 +5797,7 @@ fn testRepositoryNativeReceipt(
         try std.testing.expectEqualSlices(u8, &receipt.document.digest_sha256, &retained.receipt.document.digest_sha256);
         try std.testing.expectEqualStrings(paths.provenance_logical, retained.logical_path);
         try root.publishFile(retained_path, "corrupt receipt", .{ .permissions = .fromMode(0o600) });
-        inline for (.{ retainNativeReceipt, readRetainedNativeReceipt }) |function|
+        inline for (.{ retainNativeReceipt, readRetainedNativeReceipt, verifyNativePackageState }) |function|
             try std.testing.expectError(error.NativeReceiptMismatch, function(allocator, input));
         const corrupt = try root.readFileAlloc(allocator, retained_path, 128);
         defer allocator.free(corrupt);
@@ -5654,6 +5815,8 @@ fn testRepositoryNativeReceipt(
     const retained_inode = (try root.entry(retained_path)).inode;
     var repeated = try retainNativeReceipt(allocator, input);
     defer repeated.deinit();
+    try std.testing.expectEqual(retained_inode, (try root.entry(retained_path)).inode);
+    try testRepositoryNativePackageState(root, input, failed, first_receipt);
     try std.testing.expectEqual(retained_inode, (try root.entry(retained_path)).inode);
     try std.testing.expectEqual(caller_before, attempt.record().digest_sha256);
     const trace = try root.readFileAlloc(allocator, try root_fs.Path.init("repository-trace"), 1024);
@@ -5804,7 +5967,7 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
             .expected_receipt_sha256 = @splat('0'),
             .deadline = receipt_clock.deadline(),
         };
-        inline for (.{ retainNativeReceipt, readRetainedNativeReceipt }) |function|
+        inline for (.{ retainNativeReceipt, readRetainedNativeReceipt, verifyNativePackageState }) |function|
             try std.testing.expectError(error.NativeReceiptMissing, function(allocator, receipt_input));
         try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("var/lib/debz/repository")) == null);
     }
@@ -5866,19 +6029,20 @@ fn recoverProjectedRepositoryCase(
     try testRepositoryNativeReceipt(root, request.value, attempt, report, case == .known_failure);
     if (revoke_scope) |route| {
         const before_retention = attempt.record().digest_sha256;
-        var revoked: RepositoryExecutionClock = .{ .root = root, .revoke_on_call = 2 };
+        var revoked: RepositoryExecutionClock = .{ .root = root, .revoke_on_call = if (route == .verify) 4 else 2 };
         const receipt_input: NativeReceiptRequest = .{
             .repository = request.value,
             .attempt = attempt,
             .expected_receipt_sha256 = report.receipt.?.document.digest_sha256,
             .deadline = revoked.deadline(),
         };
-        try std.testing.expectError(error.InvalidRoot, switch (route) {
-            .retain => retainNativeReceipt(allocator, receipt_input),
-            .read => readRetainedNativeReceipt(allocator, receipt_input),
-        });
+        switch (route) {
+            .retain => try std.testing.expectError(error.InvalidRoot, retainNativeReceipt(allocator, receipt_input)),
+            .read => try std.testing.expectError(error.InvalidRoot, readRetainedNativeReceipt(allocator, receipt_input)),
+            .verify => try std.testing.expectError(error.InvalidRoot, verifyNativePackageState(allocator, receipt_input)),
+        }
         try std.testing.expect(revoked.inspection_error == null);
-        try std.testing.expectEqual(@as(usize, 2), revoked.calls);
+        try std.testing.expectEqual(@as(usize, if (route == .verify) 4 else 2), revoked.calls);
         try std.testing.expectEqual(before_retention, attempt.record().digest_sha256);
         try std.testing.expect(attempt.locked());
     }
@@ -5911,13 +6075,14 @@ test "repository backend native execution external fixture" {
         }
     };
     const terminal = case == .success or case == .known_failure or case == .interrupted;
-    for (0..if (case == .success) @as(usize, 6) else if (terminal) @as(usize, 3) else 1) |index| {
+    for (0..if (case == .success) @as(usize, 7) else if (terminal) @as(usize, 3) else 1) |index| {
         var callback: Callback = .{
             .case = case,
             .recover = index != 0,
             .revoke_scope = if (case == .success) switch (index) {
                 3 => .retain,
                 4 => .read,
+                5 => .verify,
                 else => null,
             } else null,
         };
