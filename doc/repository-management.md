@@ -321,10 +321,56 @@ interrupted file/directory sync.
 
 The owned `NativePackageCheckpoint` contains the persisted state and distinct
 verified native package outcome; call `deinit` when finished. Both success and
-failure leave root ownership and native recovery evidence intact. Descriptor
-material verification, import/refresh recovery, durable outer completion and
-acknowledgment still require integration before native repository CLI dispatch
-can be enabled.
+failure leave root ownership and native recovery evidence intact. It is an
+alias of `NativeRepositoryCheckpoint`, also used by the post-package adapter
+below. Durable outer completion, acknowledgment and dispatch remain separate.
+
+### Resuming native import and refresh
+
+`importAndRefreshNative` accepts the original `NativeReceiptRequest` and
+`NativeImportRefreshDependencies` (acquisition adapters and verification time).
+It shares the original state/plan/lock and live package-outcome checks with the
+package checkpoint. Known package failure returns the truthful failed
+checkpoint without importing configuration or refreshing repositories.
+
+For successful packages, descriptor bytes come only from the original native
+intent's verified artifact blob, bound to the genuine receipt and locked
+descriptor digest/size. The package CAS and descriptor URL are not consulted.
+The strict repository-descriptor profile and static source/keyring inspection
+run again; extracted material must exactly match the persisted managed-file
+evidence. The installed descriptor identity and managed bytes must also agree.
+
+Import uses a metadata-only target snapshot with the original native/foreign
+architecture and no process fallback. The existing
+`apt-config-snapshot-v1.json` is retained privately and durably in the operation
+directory before publishing `phase=imported`. A previously bound manifest must
+exist and match the current snapshot exactly; missing, corrupt or changed
+configuration is refused, not repaired. An interrupted unbound publication may
+converge only with identical bytes.
+
+Unless the original request selected `no_refresh`, the adapter refreshes the
+descriptor's repositories using their original payload keyrings and the
+existing all-or-nothing authenticated metadata pipeline. The post-package
+invocation's resource budget uses the original absolute deadline and clock
+domain, including retry sleeps and metadata staging/publication. No new timeout
+is granted to refresh. Success publishes `phase=refreshed`; `no_refresh` leaves
+the imported checkpoint without creating a metadata cache.
+
+Installed-file/import/refresh failures retain the last durable phase, true
+installed flag and original evidence paths. Operational diagnostics are
+published under the same guards; publication errors propagate rather than
+being hidden. Expired or revoked authority cannot publish a new diagnostic.
+Before manifest or state rename, original input pins, caller/root authority,
+deadline and the live configuration are revalidated. Repeated matching
+checkpoints preserve their inode; already-refreshed state performs no new
+refresh, and known-failure paths never become successful bootstrap.
+
+Call `deinit` on the returned owned `NativeRepositoryCheckpoint`. Neither this
+adapter nor package checkpoint persistence publishes `phase=complete`,
+acknowledges native execution, clears the root operation or releases its lock.
+These checkpoints are resumable bookkeeping, not standalone historical
+completion proof. Durable outer completion and full public/private-runner
+integration are still required before native repository CLI activation.
 
 ## Descriptor and repository trust
 
@@ -335,7 +381,7 @@ SHA-256. Observable URLs remove credentials, fragments, and complete query
 values. Embedded debsigs members may be inventoried but do not authenticate the
 descriptor.
 
-Before dpkg runs, the package is structurally validated with the
+Before package execution, the package is structurally validated with the
 repository-descriptor profile. Every enabled `.list` or `.sources` payload must
 be static, root-relative, and declare `Signed-By`; every referenced keyring
 must be a regular payload file. Keyring bytes are parsed and used to
