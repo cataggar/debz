@@ -2,9 +2,29 @@
 //! Caller request and policy hashes retain their original domains. Native
 //! request/policy hashes remain covered by the immutable program digest.
 const std = @import("std");
+const live_root = @import("live_root.zig");
 const native_program = @import("native_program.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
+
+/// Admits a native target before creating its operation namespace. A host-root
+/// alias requires authority from this exact private projection callback.
+pub fn validateInstallRoot(
+    io: std.Io,
+    root: root_fs.Root,
+    install_root: []const u8,
+    projection: ?*const live_root.Projection,
+) !void {
+    if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
+    if (projection) |authority|
+        return authority.validateRoot(install_root, root.dir.handle);
+    var host = root_fs.openAbsoluteRoot(io, "/") catch return error.HostRootNotSupported;
+    defer host.close();
+    const held = try root.rootEntry();
+    const host_entry = try host.root.rootEntry();
+    if (held.device == host_entry.device and held.inode == host_entry.inode)
+        return error.HostRootNotSupported;
+}
 
 fn digest(value: native_program.Digest) ![32]u8 {
     var bytes: [32]u8 = undefined;
