@@ -405,6 +405,21 @@ accepting a checkpoint refuses. State-model units additionally preserve an
 installed descriptor on known package failure, later diagnostics and allocation
 cleanup. These remain part of the same repository execution family.
 
+The descriptor fixture also includes genuine static sources and signing keys.
+After CAS eviction, new supervised callbacks obtain the descriptor solely from
+the receipt-bound native intent blob, verify installed material, durably import
+the target manifest and perform authenticated refresh. Coverage includes
+changed material evidence, missing original blobs/files, expiry and input or
+configuration replacement before rename, interruptions after manifest and state
+rename, refresh deadline/authentication failure, missing or corrupt bound
+manifests, real namespace revocation and fresh legitimate adoption. No-refresh
+recovery creates no metadata cache, known package failure performs no import,
+and repeated refreshed checkpoints issue no refresh requests. Selected
+allocation failures preserve owned cleanup and checkpoint identity. The external
+oracle checks original bindings, imported source/keyring digests, truthful phase
+flags and private manifest/state permissions; caller ownership, helper identity
+and script traces remain unchanged throughout.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2

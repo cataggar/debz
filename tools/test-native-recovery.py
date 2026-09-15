@@ -2344,11 +2344,33 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
                           "plan_path", "plan_sha256", "exact_lock_path"):
                 assert checkpoint[field] == original[field]
             assert checkpoint["plan_sha256"] == caller["plan_sha256"]
-            assert checkpoint["phase"] == ("failed" if case == "known_failure" else "installed")
+            assert checkpoint["phase"] == ("failed" if case == "known_failure" else "imported" if case == "interrupted" else "refreshed")
             assert checkpoint["installed"] == (case != "known_failure")
             assert checkpoint["diagnostic_id"] == ("transaction_failed" if case == "known_failure" else None)
             assert checkpoint["provenance_path"] == retained_logical
-            assert not checkpoint["refreshed"] and checkpoint["manifest_path"] is None
+            assert checkpoint["refreshed"] == (case == "success")
+            if case == "known_failure":
+                assert checkpoint["manifest_path"] is None
+                assert not (retained_path.parent / "apt-config-snapshot-v1.json").exists()
+            else:
+                manifest_path = root / checkpoint["manifest_path"].lstrip("/")
+                assert manifest_path == retained_path.parent / "apt-config-snapshot-v1.json"
+                manifest = document(manifest_path)
+                validator("apt-config-snapshot-v1").validate(manifest)
+                assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+                for expected in checkpoint["managed_files"]:
+                    installed_path = root / expected["logical_path"].lstrip("/")
+                    assert installed_path.stat().st_size == expected["size"]
+                    assert hashlib.sha256(installed_path.read_bytes()).hexdigest() == expected["sha256"]
+                    imported = next(value for value in manifest["sources"] + manifest["keyrings"]
+                                    if value["logical_path"] == expected["logical_path"])
+                    assert imported["sha256"] == expected["sha256"]
+                if case == "interrupted":
+                    assert checkpoint["no_refresh"]
+                    assert not (root / "var/cache/debz/metadata-v1").exists()
+                else:
+                    assert not checkpoint["no_refresh"]
+                    assert (root / "var/cache/debz/metadata-v1").is_dir()
             assert stat.S_IMODE(checkpoint_path.stat().st_mode) == 0o600
             retained = retained_documents(root, proof)
             execution = retained["execution_request"][0]
@@ -2378,7 +2400,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert not (root / "fixture/repository-retained-receipt-path").exists()
             assert not (root / NAMESPACE / "repository").exists()
             assert not (root / "repository-trace").exists()
-            assert not (root / "usr/share/repository-execution").exists()
+            assert not (root / "usr/share/doc/debz-native-repository/README").exists()
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
         print(f"native-repository-execution-{case}: typed outcomes and caller-owned recovery passed", flush=True)
 
