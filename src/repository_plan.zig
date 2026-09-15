@@ -157,7 +157,10 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
         .backing_allocator = allocator,
         .arena = arena,
     };
-    const canonical = try plan.canonicalJson(allocator);
+    const canonical = plan.canonicalJson(allocator) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
     return plan;
