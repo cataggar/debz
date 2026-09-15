@@ -477,12 +477,69 @@ fn normalizeCapturedNativeArchitecture(
     architecture: []const u8,
 ) void {
     const entry = snapshot.arch orelse return;
-    if (entry.kind != .regular or entry.bytes.len != architecture.len + 1)
+    if (entry.kind != .regular or entry.bytes.len < architecture.len + 1)
         return;
-    if (entry.bytes[entry.bytes.len - 1] != '\n' or
+    if (entry.bytes[architecture.len] != '\n' or
         !std.mem.eql(u8, entry.bytes[0..architecture.len], architecture))
         return;
-    snapshot.arch = null;
+    if (entry.bytes.len == architecture.len + 1) {
+        snapshot.arch = null;
+    } else {
+        var foreign = entry;
+        foreign.bytes = entry.bytes[architecture.len + 1 ..];
+        snapshot.arch = foreign;
+    }
+}
+
+test "native_unpack.test.native architecture headers retain strict foreign metadata" {
+    const cases = [_]struct {
+        bytes: []const u8,
+        foreign_bytes: ?[]const u8,
+        mode: u32 = 0o644,
+        count: usize = 0,
+        diagnostic: ?package_database.Code = null,
+    }{
+        .{ .bytes = "amd64\n", .foreign_bytes = null },
+        .{ .bytes = "amd64\ni386\narm64\n", .foreign_bytes = "i386\narm64\n", .count = 2 },
+        .{ .bytes = "i386\narm64\n", .foreign_bytes = "i386\narm64\n", .count = 2 },
+        .{ .bytes = "amd64\namd64\n", .foreign_bytes = "amd64\n", .diagnostic = .native_architecture_listed },
+        .{ .bytes = "amd64\ni386\ni386\n", .foreign_bytes = "i386\ni386\n", .diagnostic = .duplicate_architecture },
+        .{ .bytes = "amd64\n\n", .foreign_bytes = "\n", .diagnostic = .empty_line },
+        .{ .bytes = "i386\namd64\n", .foreign_bytes = "i386\namd64\n", .diagnostic = .native_architecture_listed },
+        .{ .bytes = "amd64\ni386", .foreign_bytes = "i386", .diagnostic = .unterminated_line },
+        .{ .bytes = "amd64\ni386\n", .foreign_bytes = "i386\n", .mode = 0o666, .diagnostic = .unsafe_mode },
+    };
+    for (cases) |case| {
+        var snapshot: package_database.Snapshot = .{
+            .status = package_database.regularFile(""),
+            .info = &.{.{
+                .name = package_database.info_format_name,
+                .bytes = package_database.supported_info_format ++ "\n",
+            }},
+            .arch = .{ .bytes = case.bytes, .mode = case.mode },
+        };
+        normalizeCapturedNativeArchitecture(&snapshot, "amd64");
+        if (case.foreign_bytes) |bytes| {
+            try testing.expectEqualStrings(bytes, snapshot.arch.?.bytes);
+            try testing.expectEqual(case.mode, snapshot.arch.?.mode);
+        } else try testing.expect(snapshot.arch == null);
+        const result = try package_database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = snapshot,
+        }, .{});
+        switch (result) {
+            .database => |value| {
+                var database = value;
+                defer database.deinit();
+                try testing.expect(case.diagnostic == null);
+                try testing.expectEqual(case.count, database.model.foreign_architectures.len);
+            },
+            .diagnostic => |diagnostic| {
+                try testing.expect(case.diagnostic != null);
+                try testing.expectEqual(case.diagnostic.?, diagnostic.code);
+            },
+        }
+    }
 }
 
 /// `usr/lib`, `/usr/lib`, and `./usr/lib` are the three spellings a Debian
@@ -17323,8 +17380,16 @@ pub const Runtime = struct {
         const foreign = request.attempt.record().foreign_architectures;
         if (foreign.len != database.model.foreign_architectures.len)
             return error.OperationArchitectureMismatch;
-        for (foreign, database.model.foreign_architectures) |expected, actual|
-            if (!std.mem.eql(u8, expected, actual)) return error.OperationArchitectureMismatch;
+        for (foreign) |expected| {
+            var found = false;
+            for (database.model.foreign_architectures) |actual| {
+                if (std.mem.eql(u8, expected, actual)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.OperationArchitectureMismatch;
+        }
         if (database.model.pending_updates.len != 0 or
             database.model.diversions.len != 0 or database.model.stat_overrides.len != 0 or
             database.model.opaque_info.len != 0)

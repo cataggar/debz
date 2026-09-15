@@ -392,10 +392,53 @@ pub const ImportError = error{
     ArchitectureProcessOutputInvalid,
 };
 
-const Architecture = struct {
+pub const Architecture = struct {
     native: []const u8,
     foreign: []const []const u8,
+
+    pub fn eql(self: Architecture, other: Architecture) bool {
+        if (!std.mem.eql(u8, self.native, other.native) or
+            self.foreign.len != other.foreign.len) return false;
+        for (self.foreign, other.foreign) |left, right|
+            if (!std.mem.eql(u8, left, right)) return false;
+        return true;
+    }
 };
+
+pub const OwnedArchitecture = struct {
+    architecture: Architecture,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedArchitecture) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+/// Reads only target architecture metadata. Never invokes a supplied process
+/// runner or reads repository sources/keyrings, including for logical `/`.
+pub fn inspectArchitecture(allocator: std.mem.Allocator, request: Request) !OwnedArchitecture {
+    try validateRootAdapter(request);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    var files_only = request;
+    files_only.dependencies.process = null;
+    return .{
+        .architecture = try discoverArchitecture(arena.allocator(), allocator, files_only),
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+}
+
+fn validateRootAdapter(request: Request) !void {
+    if (!validRootPath(request.root_path) or
+        request.dependencies.filesystem.host_root !=
+            std.mem.eql(u8, request.root_path, "/")) return error.InvalidRootPath;
+}
 
 const KeyCandidate = struct {
     logical_path: []const u8,
@@ -407,10 +450,7 @@ pub fn snapshot(
     allocator: std.mem.Allocator,
     request: Request,
 ) !Snapshot {
-    if (!validRootPath(request.root_path)) return error.InvalidRootPath;
-    if (request.dependencies.filesystem.host_root !=
-        std.mem.eql(u8, request.root_path, "/"))
-        return error.InvalidRootPath;
+    try validateRootAdapter(request);
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -2644,6 +2684,72 @@ const ArchitectureProcess = struct {
         };
     }
 };
+
+test "target_apt_config read-only architecture inspection never invokes process fallback" {
+    for ([_]bool{ false, true }) |host| {
+        var files: MissingFileSystem = .{};
+        var process: ArchitectureProcess = .{};
+        var request: Request = .{
+            .root_path = if (host) "/" else "/alternate",
+            .dependencies = .{
+                .filesystem = files.interface(host),
+                .process = process.interface(),
+            },
+        };
+        try std.testing.expectError(error.NativeArchitectureUnavailable, inspectArchitecture(std.testing.allocator, request));
+        try std.testing.expectEqual(@as(usize, 1), files.calls);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        request.architecture_override = "amd64";
+        var inspected = try inspectArchitecture(std.testing.allocator, request);
+        defer inspected.deinit();
+        try std.testing.expectEqualStrings("amd64", inspected.architecture.native);
+        try std.testing.expectEqual(@as(usize, 0), inspected.architecture.foreign.len);
+        try std.testing.expectEqual(@as(usize, 2), files.calls);
+        try std.testing.expect(!files.unexpected);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        request.dependencies.filesystem.host_root = !host;
+        try std.testing.expectError(error.InvalidRootPath, inspectArchitecture(std.testing.allocator, request));
+        try std.testing.expectEqual(@as(usize, 2), files.calls);
+    }
+}
+
+fn testArchitectureInspectionAllocation(allocator: std.mem.Allocator, request: Request) !void {
+    var inspected = try inspectArchitecture(allocator, request);
+    defer inspected.deinit();
+    try std.testing.expect(inspected.architecture.eql(.{
+        .native = "amd64",
+        .foreign = &.{ "arm64", "i386" },
+    }));
+}
+
+test "target_apt_config read-only architecture inspection owns bounded target evidence" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "Package: dpkg\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/arch",
+        .data = "i386\namd64\narm64\ni386\n",
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var production = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer production.deinit();
+    const request: Request = .{
+        .root_path = root_path,
+        .dependencies = .{ .filesystem = production.interface() },
+    };
+    try testArchitectureInspectionAllocation(std.testing.allocator, request);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testArchitectureInspectionAllocation, .{request});
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/arch",
+        .data = "invalid/architecture\n",
+    });
+    try std.testing.expectError(error.MalformedArchitectureState, inspectArchitecture(std.testing.allocator, request));
+}
 
 test "target_apt_config architecture discovery uses target state and root-only fixed fallback" {
     var directory = std.testing.tmpDir(.{});
