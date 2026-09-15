@@ -438,6 +438,19 @@ completion and discharge digests, original caller/receipt bindings, truthful
 success/failure, matching private local/shared completion, absence of active
 native inputs, and unchanged helper and script evidence.
 
+The same runner additionally exercises the joined native repository resume
+adapter in separate success, known-failure, interrupted-intent and clean-caller
+cases. It checks original state/plan/lock refusal before package recovery,
+caller/policy and deadline refusal, genuine pending reports without fabricated
+receipts, refresh interruption under the shared deadline, and fresh adoption
+after completion/provenance and acknowledgment interruptions. The original
+package CAS is already empty. Exhaustive original-input loading allocation
+failures and selected full-pipeline failures preserve owned cleanup, while
+repeated completion stays stable and a new caller refuses historical state
+after root clear. Clean callers return not-started, not unchanged bootstrap.
+The existing external completion, receipt, helper and script oracle applies to
+both the component and joined-pipeline cases; private-process limits are unchanged.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2

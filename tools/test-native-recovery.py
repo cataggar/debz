@@ -2296,8 +2296,11 @@ def exercise_repository_projection(executable: Path, workspace: Path, architectu
 
 
 def exercise_repository_execution(executable: Path, workspace: Path, architecture: str) -> None:
-    for case in ("success", "known_failure", "interrupted", "missing_helper", "unchanged", "diagnostic", "expired"):
-        root = workspace / f"repository-execution-{case}" / "root"
+    cases = [(case, False) for case in ("success", "known_failure", "interrupted", "missing_helper", "unchanged", "diagnostic", "expired")]
+    cases += [(case, True) for case in ("success", "known_failure", "interrupted", "unchanged")]
+    for case, resume in cases:
+        name = f"repository-{'resume' if resume else 'execution'}-{case}"
+        root = workspace / name / "root"
         m.make_root(root, architecture)
         for directory in ("proc", "run", "tmp", "dev"):
             (root / directory).mkdir(parents=True, exist_ok=True)
@@ -2305,6 +2308,8 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
         lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
         (root / "fixture/repository-execution-case").write_text(case)
+        if resume:
+            (root / "fixture/repository-resume").touch()
         terminal = case in ("success", "known_failure", "interrupted")
         helper_target = root / triggers.HELPER
         if terminal:
@@ -2312,7 +2317,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             lifecycle.runtime.copy_program(root, Path("/usr/bin/dpkg-trigger"), "/" + triggers.HELPER.as_posix())
             helper_bytes, helper_inode = helper_target.read_bytes(), helper_target.stat().st_ino
         result = projected_process(root, repository_execution=True)
-        assert result.returncode == 0, (case, result.returncode, result.stdout, result.stderr)
+        assert result.returncode == 0, (name, result.returncode, result.stdout, result.stderr)
         assert (root / "fixture/repository-execution-complete").read_text() == case
         assert not list((root / "run/debz/system-root").iterdir()), "repository execution projection leaked"
         assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir()), "repository recovery reused CAS inputs"
@@ -2438,7 +2443,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert not (root / "repository-trace").exists()
             assert not (root / "usr/share/doc/debz-native-repository/README").exists()
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
-        print(f"native-repository-execution-{case}: typed outcomes and caller-owned recovery passed", flush=True)
+        print(f"native-{name}: typed outcomes and caller-owned recovery passed", flush=True)
 
 
 def main() -> int:

@@ -67,7 +67,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, source, .{
         .allocate = .alloc_always,
         .parse_numbers = false,
-    }) catch return error.InvalidDocument;
+    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidDocument;
     defer parsed.deinit();
     const root = try object(parsed.value);
     if (try unsigned(u32, root, "schema_version") != 3)
@@ -129,7 +129,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
     }
     const summary_object = try object(root.get("summary") orelse
         return error.InvalidDocument);
-    var plan: solver.Plan = .{
+    const plan: solver.Plan = .{
         .schema_version = 3,
         .target_architecture = try stringDupe(owned, root, "target_architecture"),
         .mode = try enumField(solver.OperationMode, root, "mode"),
@@ -157,7 +157,6 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
         .backing_allocator = allocator,
         .arena = arena,
     };
-    errdefer plan.deinit();
     const canonical = try plan.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
@@ -411,6 +410,16 @@ test "repository_plan.test.canonical executable plan round trips exactly" {
     const replay = try decoded.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(replay);
     try std.testing.expectEqualStrings(canonical, replay);
+    const Decode = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var result = try decode(allocator, bytes);
+            defer result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Decode.run, .{canonical});
+    const noncanonical = try std.fmt.allocPrint(std.testing.allocator, " {s}", .{canonical});
+    defer std.testing.allocator.free(noncanonical);
+    try std.testing.expectError(error.NonCanonicalDocument, decode(std.testing.allocator, noncanonical));
 }
 
 test "repository_plan.test.full width canonical integers replay exactly" {

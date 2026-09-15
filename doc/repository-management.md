@@ -433,6 +433,40 @@ Fresh startup after a fully cleared root, historical reconciliation,
 unchanged/no-receipt outcomes and public/private dispatch remain separate work.
 Call `deinit` on the returned owned `NativeRepositoryCompletion`.
 
+### Resuming the native repository pipeline
+
+`resumeNativeRepository` accepts the original `NativeRecoveryRequest` and
+`NativeImportRefreshDependencies` under an already-held repository caller. The
+original request is supplied by the caller and authenticated against the
+durable request/policy identity; it is not reconstructed from a new descriptor
+download or replacement plan. This adapter joins persisted native recovery,
+package checkpoints, import/refresh and completion without enabling CLI dispatch.
+
+Before recovery can execute package work, the adapter pins and authenticates
+the original repository state, executable plan and genuine v2 lock. Those same
+pins survive recovery into the checkpoint/import/completion pipeline; missing,
+corrupt or replaced inputs are not silently reloaded. Native package recovery
+uses only its original persisted evidence, even after CAS eviction. The
+original absolute invocation deadline and clock domain cover the whole
+pipeline, including authenticated refresh and completion publication.
+
+The owned `NativeRepositoryResume` explicitly distinguishes:
+
+- `not_started`: a clean pre-mutation caller with no repository completion or
+  advanced historical state. This does not mean unchanged or successful
+  bootstrap and does not install, publish completion or release ownership.
+- `pending`: the genuine native runtime report when recovery has no terminal
+  receipt. No import, refresh, acknowledgment or outer completion is attempted.
+- `completed`: the owned repository completion, preserving successful versus
+  known-failed package outcomes and the completion ordering above.
+
+Completed repository state skips import/refresh and resumes acknowledgment from
+retained proof even after native blobs are gone. A fully cleared root under a
+new caller refuses historical repository completion instead of interpreting it
+as not-started or reinstalling. Historical reconciliation and actual
+unchanged/no-receipt completion remain separate work. Call `deinit` on the
+returned result; none of these outcomes releases the supplied caller's lock.
+
 ## Descriptor and repository trust
 
 The MVP descriptor is a Debian binary package. Unpinned acquisition requires
