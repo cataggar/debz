@@ -239,6 +239,7 @@ pub fn build(b: *std.Build) void {
         "Run the hermetic Microsoft-shaped repository add integration",
     );
     repository_add_step.dependOn(&repository_add_tests.step);
+    repository_add_step.dependOn(&run_repository_cli_tests.step);
     test_step.dependOn(&repository_add_tests.step);
 
     const fuzz_tests = b.addTest(.{

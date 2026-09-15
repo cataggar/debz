@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var backend: debz.ProductionRepositoryBackend = .{
         .io = init.io,
+        .transaction_backend = parsed.transaction_backend,
         .process_runner = simulated_dpkg.interface(),
     };
 

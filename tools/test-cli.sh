@@ -295,6 +295,9 @@ for arguments in \
     "repo add --json --url https://one.invalid/config.deb --url https://two.invalid/config.deb" \
     "repo add --json --url https://packages.invalid/config.deb --sha256 malformed" \
     "repo add --json --url https://packages.invalid/config.deb --redirect-limit 65536" \
+    "repo add --json --url https://packages.invalid/config.deb --transaction-backend other" \
+    "repo add --json --url https://packages.invalid/config.deb --transaction-backend" \
+    "repo add --json --url https://packages.invalid/config.deb --transaction-backend native --transaction-backend legacy_dpkg" \
     "repo add --json --url https://packages.invalid/config.deb --deadline-ms 0" \
     "repo add --json --url https://packages.invalid/config.deb --root relative" \
     "repo add --json --url https://packages.invalid/config.deb -- --operand" \
