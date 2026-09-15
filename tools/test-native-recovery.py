@@ -2324,6 +2324,15 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             proof = document(root / "fixture/repository-native-receipt.json", 16 * 1024 * 1024)
             validator(PROVENANCE_SCHEMA).validate(proof)
             assert_digest(proof, PROVENANCE_SCHEMA)
+            retained_logical = (root / "fixture/repository-retained-receipt-path").read_text()
+            assert retained_logical.startswith("/var/lib/debz/repository/operations/")
+            retained_path = root / retained_logical.lstrip("/")
+            assert retained_path.name == "native-transaction-provenance-v1.json"
+            assert retained_path.parent.parent == root / NAMESPACE / "repository/operations"
+            assert len(retained_path.parent.name) == 64 and all(value in "0123456789abcdef" for value in retained_path.parent.name)
+            assert retained_path.read_bytes() == (root / "fixture/repository-native-receipt.json").read_bytes()
+            assert stat.S_IMODE(retained_path.stat().st_mode) == 0o600
+            assert not (retained_path.parent / "transaction-result-v2.json").exists()
             retained = retained_documents(root, proof)
             execution = retained["execution_request"][0]
             for field in ("request_sha256", "policy_sha256"):
@@ -2349,6 +2358,8 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert not (root / OPERATION).exists() and not (root / INTENT).exists()
             assert not helper_target.exists() and not (root / NAMESPACE / "native-helper-cache-v1").exists()
             assert not (root / "fixture/repository-native-receipt.json").exists()
+            assert not (root / "fixture/repository-retained-receipt-path").exists()
+            assert not (root / NAMESPACE / "repository").exists()
             assert not (root / "repository-trace").exists()
             assert not (root / "usr/share/repository-execution").exists()
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
