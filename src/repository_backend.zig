@@ -6080,6 +6080,7 @@ const ProjectedRepositoryCase = enum { prepare, adopt, after_lock, cleanup };
 
 const RepositoryExecutionCase = enum { success, known_failure, interrupted, missing_helper, unchanged, diagnostic, expired };
 const RepositoryReceiptScope = enum { retain, read, verify, checkpoint };
+const repository_execution_source_path = "etc/apt/sources.list.d/microsoft-prod.list";
 
 const RepositoryExecutionClock = struct {
     root: root_fs.Root,
@@ -6146,7 +6147,7 @@ fn stageRepositoryNativeLockedInputs(
         },
         .managed_files = &.{
             .{
-                .logical_path = "/etc/apt/sources.list.d/microsoft-prod.list",
+                .logical_path = "/" ++ repository_execution_source_path,
                 .sha256 = sha256(test_repository_source),
                 .size = test_repository_source.len,
             },
@@ -6589,7 +6590,7 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
             .{ .path = "etc", .kind = '5', .mode = 0o755 },
             .{ .path = "etc/apt", .kind = '5', .mode = 0o755 },
             .{ .path = "etc/apt/sources.list.d", .kind = '5', .mode = 0o755 },
-            .{ .path = "etc/apt/sources.list.d/microsoft-prod.list", .content = test_repository_source },
+            .{ .path = repository_execution_source_path, .content = test_repository_source },
             .{ .path = "usr", .kind = '5', .mode = 0o755 },
             .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
             .{ .path = "usr/share/keyrings", .kind = '5', .mode = 0o755 },
