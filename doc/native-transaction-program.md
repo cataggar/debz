@@ -46,6 +46,23 @@ archives, and trigger work without reviewed authority fail preparation.
 Mixed transactions derive selections and conffile handling per package action,
 not from the enclosing install/upgrade operation.
 
+Full-closure lock verification remains the default. The explicit
+`locked_packages` executor policy supports operation-scoped locks such as
+repository bootstrap: unrelated healthy installed packages are retained from
+the captured database with their exact identities and holds, without inventing
+lock entries, archive origins, or package actions. The native authorization and
+program still bind the complete intended final database and the consumed
+database generation, not just the locked subset. Every changed package still
+requires its original lock and archive evidence; locked retained identities and
+holds remain exact. The verification scope is bound by the executor-policy
+digest and cannot be changed after preparation.
+
+Unhealthy unrelated packages refuse preparation. Pending or awaited trigger
+states require explicit trigger authority even when their trigger-name arrays
+are empty, including on the unchanged path. An empty operation-scoped lock with
+no actions or trigger work may report unchanged only for a healthy captured
+database; it does not produce an execution authorization or receipt.
+
 Preparation has no mutation or command dependencies. Successful output owns
 both documents; compiler diagnostics own their text, including after temporary
 authorization and caller input are released. Acquisition and root preflight

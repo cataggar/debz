@@ -41,6 +41,13 @@ The existing command-report executor cannot stand in for native typed
 preparation, receipts, or recovery. Core product and native system-profile
 support do not imply that repository bootstrap uses those contracts yet.
 
+The native preparation layer now supports the explicit `locked_packages`
+policy used by operation-scoped locks. It retains unrelated healthy packages
+from captured database evidence in the complete native final-state proof,
+without manufacturing artifact origins for them. This is a prerequisite for
+repository bootstrap, not activation of its execution or recovery path; see
+[production preparation](native-transaction-program.md#production-preparation).
+
 `debz repo add` is the authorization to mutate the selected root. It does not
 accept or require `--assume-yes`, `--allow-host-root`,
 `--import-target-apt-config`, `--install-root`, `--refresh`, or a separate

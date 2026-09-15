@@ -481,6 +481,119 @@ test "native_preparation.test.omitted unrequested packages and changed holds ref
     try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
 }
 
+test "native_preparation.test.operation-scoped locks preserve the complete captured final database" {
+    for ([_]bool{ false, true }) |local| {
+        const fixture = try Fixture.init(std.testing.allocator, local);
+        defer fixture.deinit(std.testing.allocator);
+        fixture.installed[2].name = "unlocked";
+        fixture.installed[2].state = .installed;
+        fixture.installed[2].hold = true;
+        var request = fixture.request();
+        try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+        request.policy.exact_lock_verification = .locked_packages;
+        var result = try prepare(std.testing.allocator, request);
+        defer result.deinit();
+        const prepared = try preparedResult(&result);
+        const authorization = prepared.authorization.authorization;
+        const program = prepared.program.program;
+        const preserved = authorization.findFinalPackage("unlocked", "amd64").?;
+        try std.testing.expectEqualStrings("1.0", preserved.version);
+        try std.testing.expectEqual(.installed, preserved.state);
+        try std.testing.expect(preserved.dpkg_selection_hold);
+        try std.testing.expect(fixture.lock.lock.findIdentity("unlocked", "amd64") == null);
+        try std.testing.expect(authorization.findAction("unlocked", "amd64") == null);
+        try std.testing.expectEqual(@as(usize, 2), fixture.lock.lock.packages.len);
+        try std.testing.expectEqual(@as(usize, 2), authorization.actions.len);
+        try std.testing.expectEqual(@as(usize, 4), authorization.final_state.len);
+        try std.testing.expectEqual(@as(usize, 1), program.artifacts.len);
+        try std.testing.expectEqual(fixture.lock.lock.digest_sha256, authorization.exact_lock.digest_sha256);
+        try std.testing.expectEqual(transaction_executor.policyDigest(request.policy), authorization.executor_policy_sha256);
+        try std.testing.expect(program.matchesAuthorization(authorization));
+        try std.testing.expectEqualStrings(
+            &@import("package_origin.zig").artifactIdFromSha256(request.installed.generation_sha256),
+            &program.installed_database.generation_sha256,
+        );
+        const origin = authorization.findAction("app", "amd64").?.artifact.?.origin;
+        if (local) {
+            try std.testing.expect(@import("package_origin.zig").eqlLocalArtifact(Fixture.local_origin, origin.local_artifact));
+        } else {
+            try std.testing.expectEqual(Fixture.repository_id, origin.authenticated_repository.repository_id);
+        }
+        try std.testing.expectError(error.AuthorizationPolicyMismatch, transaction_engine.authorize(.native, .{
+            .plan = request.plan,
+            .install_root = request.install_root,
+            .artifacts = &.{},
+            .policy = fixture.request().policy,
+            .exact_lock_v2 = request.exact_lock,
+        }, &authorization));
+
+        fixture.installed[2].version = "2.0";
+        fixture.installed[2].hold = false;
+        request.installed.generation_sha256[0] ^= 1;
+        var changed = try prepare(std.testing.allocator, request);
+        defer changed.deinit();
+        const changed_prepared = try preparedResult(&changed);
+        try std.testing.expect(!std.mem.eql(u8, &authorization.final_state_sha256, &changed_prepared.authorization.authorization.final_state_sha256));
+        try std.testing.expect(!std.mem.eql(u8, &program.digest_sha256, &changed_prepared.program.program.digest_sha256));
+        try std.testing.expectEqualStrings("1.0", authorization.findFinalPackage("unlocked", "amd64").?.version);
+    }
+}
+
+test "native_preparation.test.operation-scoped locks cannot omit changed packages or relax locked evidence" {
+    const fixture = try Fixture.init(std.testing.allocator, false);
+    defer fixture.deinit(std.testing.allocator);
+    fixture.installed[2].state = .installed;
+    var request = fixture.request();
+    request.policy.exact_lock_verification = .locked_packages;
+    fixture.installed[1].hold = false;
+    try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+    fixture.installed[1].hold = true;
+    const original_digest = fixture.actions[0].sha256;
+    fixture.actions[0].sha256 = @splat('0');
+    try std.testing.expectError(error.AuthorizationArtifactMismatch, prepare(std.testing.allocator, request));
+    fixture.actions[0].sha256 = original_digest;
+    request.archives = &.{};
+    try expectDiagnostic(request, .missing_archive);
+    request.archives = &fixture.archives;
+    var empty = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = fixture.lock.lock.request_sha256,
+        .policy_sha256 = fixture.lock.lock.policy_sha256,
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer empty.deinit();
+    request.exact_lock = &empty.lock;
+    try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
+
+    fixture.plan.actions = &.{};
+    fixture.plan.ordered_actions = &.{};
+    fixture.plan.download_bytes = 0;
+    request.archives = &.{};
+    var unchanged = try prepareOrUnchanged(std.testing.allocator, request);
+    defer unchanged.deinit();
+    try std.testing.expect(unchanged == .unchanged);
+    for ([_]native_program.PackageState{ .not_installed, .half_installed, .unpacked, .half_configured }) |state| {
+        fixture.installed[2].state = state;
+        try std.testing.expectError(error.LockClosureMismatch, prepareOrUnchanged(std.testing.allocator, request));
+    }
+    for ([_]native_program.PackageState{ .triggers_pending, .triggers_awaited }) |state| {
+        fixture.installed[2].state = state;
+        try std.testing.expectError(error.TriggerAuthorityRequired, prepareOrUnchanged(std.testing.allocator, request));
+    }
+}
+
+test "native_preparation.test.operation-scoped preparation owns every allocation failure" {
+    const fixture = try Fixture.init(std.testing.allocator, true);
+    defer fixture.deinit(std.testing.allocator);
+    fixture.installed[2].state = .installed;
+    var request = fixture.request();
+    request.policy.exact_lock_verification = .locked_packages;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{ request, true });
+}
+
 test "native_preparation.test.compiler retains missing archive and lifecycle diagnostics" {
     const fixture = try Fixture.init(std.testing.allocator, false);
     defer fixture.deinit(std.testing.allocator);
@@ -505,6 +618,11 @@ test "native_preparation.test.trigger work cannot disappear without reviewed aut
     fixture.archives[0].triggers = &.{};
     fixture.installed[1].triggers_pending = &.{"refresh"};
     try std.testing.expectError(error.TriggerAuthorityRequired, prepare(std.testing.allocator, fixture.request()));
+    fixture.installed[1].triggers_pending = &.{};
+    for ([_]native_program.PackageState{ .triggers_pending, .triggers_awaited }) |state| {
+        fixture.installed[1].state = state;
+        try std.testing.expectError(error.TriggerAuthorityRequired, prepare(std.testing.allocator, fixture.request()));
+    }
 }
 
 test "native_preparation.test.outputs own text after caller input is released" {
@@ -674,6 +792,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
     for (request.installed.packages) |package| {
         const key = try identity(temporary, package.name, package.architecture);
         if (lock.findIdentity(package.name, package.architecture) != null) continue;
+        var final_package_state: native_authorization.FinalState = .config_files;
         if (action_index.get(key)) |position| {
             const action = actions[position];
             if (!solver.isRemoval(action.kind)) return error.LockClosureMismatch;
@@ -681,19 +800,27 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
                 (package.state != .config_files and !retainsConfiguration(package)))
                 continue;
         } else if (package.state != .config_files) {
-            return error.LockClosureMismatch;
+            if (request.policy.exact_lock_verification != .locked_packages)
+                return error.LockClosureMismatch;
+            // Preserve the captured final database without inventing origins
+            // for healthy packages outside an operation-scoped lock.
+            final_package_state = switch (package.state) {
+                .installed, .triggers_pending, .triggers_awaited => .installed,
+                else => return error.LockClosureMismatch,
+            };
         }
         try final_state.append(temporary, .{
             .name = package.name,
             .version = package.version,
             .architecture = package.architecture,
-            .state = .config_files,
+            .state = final_package_state,
             .dpkg_selection_hold = if (action_index.contains(key)) false else package.hold,
         });
     }
     if (request.trigger_authority == null) {
         for (request.installed.packages) |package| {
-            if (package.triggers_pending.len != 0 or package.triggers_awaited.len != 0 or
+            if (package.state == .triggers_pending or package.state == .triggers_awaited or
+                package.triggers_pending.len != 0 or package.triggers_awaited.len != 0 or
                 package.triggers.len != 0)
                 return error.TriggerAuthorityRequired;
         }
