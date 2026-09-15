@@ -272,6 +272,11 @@ pub fn execute(
     request: Request,
     backend: Backend,
 ) !Result {
+    if (validateRequest(request)) |invalid| return invalid;
+    return backend.execute(allocator, request);
+}
+
+pub fn validateRequest(request: Request) ?Result {
     if (request.api_version != api_version)
         return failure(.usage, .unsupported_api_version, "request", "unsupported repository API version");
     if (!validRoot(request.root))
@@ -314,7 +319,7 @@ pub fn execute(
             !std.ascii.eqlIgnoreCase(proxy_uri.scheme, "https"))
             return failure(.usage, .invalid_request, "request", "proxy URL scheme is unsupported");
     }
-    return backend.execute(allocator, request);
+    return null;
 }
 
 pub fn complete(result: Result) !Result {

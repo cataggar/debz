@@ -83,6 +83,40 @@ backend own their strings with the caller-supplied allocator; call
 `Result.deinit` when finished. Decoded documents return `OwnedResult`, which
 likewise requires `deinit`.
 
+## Native preparation integration
+
+`repository_backend.prepareNative` is the lower-level preparation boundary,
+not the repository-add executor. It takes the repository request, an already
+held native `repository_bootstrap.add` attempt, the genuine v2 lock and
+executable plan, and already acquired archive bytes. It shares
+`repository_api.validateRequest` with normal dispatch, then requires matching
+root, architecture, complete original request, executor policy, and native
+lock request/policy bindings. Existing caller plan, lock, authorization,
+program, database-generation, and artifact bindings cannot be replaced.
+
+Native caller request digests cover every cache, state, network, and aggregate
+resource field; native caller policy digests also bind the actual repository
+executor policy. Legacy caller and executable-lock identities remain
+byte-for-byte unchanged. A newly constructed lock for changed limits does not
+authorize those limits under an earlier native caller.
+
+Preparation bounds action/repository counts and all simultaneously retained
+archive bytes, including total, retained-memory, per-package, and cache-object
+limits. The runtime captures the actual database and validates archive
+identities/origins under the caller's lock using `locked_packages` policy.
+It preserves unrelated healthy package identities and holds. Existing native
+host-root/projection restrictions and database trust checks are unchanged.
+
+The result is an owned native preparation/diagnostic or `unchanged`. Active
+native evidence refuses before preparation, including before an unchanged
+result. `unchanged` describes the package plan, not a completed repository add
+or permission to clear ownership. Preparation never executes packages,
+publishes mutation intent, releases the caller, or acknowledges completion.
+Acquisition, the cumulative operation deadline, helper/execution integration,
+native receipt retention, persisted recovery, and durable outer completion
+remain caller responsibilities. The repository CLI native gate remains in
+place until that complete lifecycle is integrated.
+
 ## Descriptor and repository trust
 
 The MVP descriptor is a Debian binary package. Unpinned acquisition requires

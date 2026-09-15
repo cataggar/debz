@@ -1,5 +1,6 @@
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const archive_application = @import("archive_application.zig");
 const api = @import("repository_api.zig");
 const state_module = @import("repository_state.zig");
 const local_artifact = @import("local_artifact.zig");
@@ -7,6 +8,9 @@ const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const metadata_cache = @import("metadata_cache.zig");
+const native_operation = @import("native_operation.zig");
+const native_preparation = @import("native_preparation.zig");
+const native_runtime = @import("native_unpack.zig").Runtime;
 const openpgp = @import("openpgp_verifier.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const package_origin = @import("package_origin.zig");
@@ -35,6 +39,100 @@ const provenance_name = "transaction-result-v2.json";
 const manifest_name = "apt-config-snapshot-v1.json";
 
 pub const Executor = transaction_engine.Executor;
+
+pub const NativePreparationRequest = struct {
+    repository: api.Request,
+    attempt: *root_operation.Attempt,
+    plan: *const solver.Plan,
+    exact_lock: *const exact_lock_v2.Lock,
+    archives: []const []const u8,
+};
+
+/// Prepares already acquired repository inputs under their original caller.
+/// Does not execute, publish intent, release ownership, or complete bootstrap.
+pub fn prepareNative(
+    allocator: std.mem.Allocator,
+    input: NativePreparationRequest,
+) !native_preparation.ResultWithNoChanges {
+    const request = input.repository;
+    if (api.validateRequest(request) != null) return error.InvalidRepositoryRequest;
+    const attempt = input.attempt;
+    if (!attempt.locked()) return error.LockLost;
+    const record = attempt.record();
+    if (record.backend != .native) return error.OperationBackendMismatch;
+    if (!record.operation.eql(.{ .repository_bootstrap = .add }) or
+        !std.mem.eql(u8, record.install_root, request.root) or
+        !std.mem.eql(u8, &record.request_sha256, &repositoryRequestDigest(request, .native)) or
+        !std.mem.eql(u8, &record.policy_sha256, &repositoryPolicyDigest(request, .native)))
+        return error.RepositoryCallerMismatch;
+    if (!record.state.provenPreMutation()) return error.OperationNotMutable;
+    if (!std.mem.eql(u8, record.target_architecture, input.plan.target_architecture))
+        return error.OperationArchitectureMismatch;
+    if (request.architecture) |architecture| {
+        if (!std.mem.eql(u8, architecture, record.target_architecture))
+            return error.OperationArchitectureMismatch;
+    }
+    if (input.plan.actions.len > request.resources.maximum_actions or
+        input.exact_lock.packages.len > request.resources.maximum_actions or
+        input.exact_lock.repositories.len > request.resources.maximum_repositories or
+        input.archives.len > request.resources.maximum_actions)
+        return error.ResourceBudgetExceeded;
+    var retained_bytes: u64 = 0;
+    for (input.archives) |bytes| {
+        if (bytes.len > request.network.maximum_package_bytes or
+            bytes.len > request.cache.maximum_object_bytes)
+            return error.ResourceBudgetExceeded;
+        retained_bytes = std.math.add(u64, retained_bytes, bytes.len) catch
+            return error.ResourceBudgetExceeded;
+    }
+    if (retained_bytes > request.resources.maximum_retained_package_bytes or
+        retained_bytes > request.resources.maximum_total_package_bytes)
+        return error.ResourceBudgetExceeded;
+    try validateLockPolicy(input.exact_lock.*, .native);
+    try validateLockRequest(allocator, input.exact_lock.*, request, input.plan.*, .native);
+    if (record.plan_sha256) |digest| {
+        if (!std.mem.eql(u8, &digest, &transaction_executor.planDigest(input.plan.*)))
+            return error.PlanEvidenceMismatch;
+    }
+    if (record.exact_lock) |binding| {
+        const expected: root_operation.LockBinding = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = input.exact_lock.digest_sha256,
+        };
+        if (!binding.eql(expected)) return error.LockEvidenceMismatch;
+    }
+    if (!try native_runtime.canAbandon(allocator, attempt))
+        return error.RecoveryRequired;
+    var result = try native_runtime.prepare(allocator, .{
+        .attempt = attempt,
+        .plan = input.plan,
+        .exact_lock = input.exact_lock,
+        .archives = input.archives,
+        .policy = repositoryExecutionPolicy(request),
+    });
+    errdefer result.deinit();
+    switch (result) {
+        .prepared => |prepared| {
+            const evidence = try native_operation.evidence(prepared.program.program);
+            inline for (.{
+                "authorization_sha256",       "program_sha256",
+                "database_generation_sha256", "artifact_evidence_sha256",
+            }) |field| {
+                if (@field(record, field)) |bound| {
+                    if (!std.mem.eql(u8, &bound, &@field(evidence, field).?))
+                        return error.OperationEvidenceMismatch;
+                }
+            }
+        },
+        .unchanged => {
+            if (record.authorization_sha256 != null or record.program_sha256 != null)
+                return error.OperationEvidenceMismatch;
+        },
+        .diagnostic => {},
+    }
+    return result;
+}
 
 pub const Backend = struct {
     io: std.Io,
@@ -2206,6 +2304,12 @@ fn repositoryRequestDigest(request: api.Request, backend: transaction_engine.Kin
         .legacy_dpkg => "debz-repository-request-v1\x00",
         .native => "debz-native-repository-request-v1\x00",
     });
+    if (backend == .native) {
+        hashInt(&hash, request.api_version);
+        hashField(&hash, @tagName(request.operation));
+        hashExecutableRequestFields(&hash, request);
+        return hash.finalResult();
+    }
     hash.update(@tagName(request.operation));
     hash.update("\x00");
     hash.update(request.root);
@@ -2228,6 +2332,8 @@ fn repositoryPolicyDigest(request: api.Request, backend: transaction_engine.Kind
         .legacy_dpkg => "debz-repository-policy-v1\x00",
         .native => "debz-native-repository-policy-v1\x00",
     });
+    if (backend == .native)
+        hash.update(&transaction_executor.policyDigest(repositoryExecutionPolicy(request)));
     hash.update(if (request.no_refresh) "\x01" else "\x00");
     hash.update(if (request.state.path) |value| value else "");
     hash.update("\x00");
@@ -2607,20 +2713,26 @@ fn operationRequestDigest(
         .legacy_dpkg => "debz-repository-add-executable-request-v1\x00",
         .native => "debz-native-repository-add-executable-request-v1\x00",
     });
-    hashField(&hash, request.root);
-    hashField(&hash, request.descriptor_url);
+    hashExecutableRequestFields(&hash, request);
+    hashField(&hash, plan_json);
+    return hash.finalResult();
+}
+
+fn hashExecutableRequestFields(hash: *std.crypto.hash.sha2.Sha256, request: api.Request) void {
+    hashField(hash, request.root);
+    hashField(hash, request.descriptor_url);
     if (request.expected_sha256) |digest| {
         hash.update("\x01");
         hash.update(&digest);
     } else hash.update("\x00");
     hash.update(if (request.no_refresh) "\x01" else "\x00");
-    hashOptionalField(&hash, request.architecture);
-    hashOptionalField(&hash, request.cache.path);
-    hashInt(&hash, request.cache.maximum_object_bytes);
-    hashOptionalField(&hash, request.state.path);
-    hashInt(&hash, request.state.lock_wait_ms);
-    hashInt(&hash, request.state.maximum_operation_state_bytes);
-    hashOptionalField(&hash, request.network.proxy_url);
+    hashOptionalField(hash, request.architecture);
+    hashOptionalField(hash, request.cache.path);
+    hashInt(hash, request.cache.maximum_object_bytes);
+    hashOptionalField(hash, request.state.path);
+    hashInt(hash, request.state.lock_wait_ms);
+    hashInt(hash, request.state.maximum_operation_state_bytes);
+    hashOptionalField(hash, request.network.proxy_url);
     inline for (.{
         request.network.connect_timeout_ms,
         request.network.read_timeout_ms,
@@ -2640,9 +2752,7 @@ fn operationRequestDigest(
         request.resources.maximum_total_package_bytes,
         request.resources.maximum_retained_package_bytes,
         request.resources.maximum_cache_growth_bytes,
-    }) |value| hashInt(&hash, value);
-    hashField(&hash, plan_json);
-    return hash.finalResult();
+    }) |value| hashInt(hash, value);
 }
 
 fn validateLockRequest(
@@ -4501,29 +4611,36 @@ const BindingFixture = struct {
         .trust_mode = .pinned_sha256,
     };
 
-    actions: [1]solver.PlanAction = .{.{
-        .kind = .install,
-        .package = artifact.package,
-        .version = artifact.version,
-        .architecture = artifact.architecture,
-        .repository = null,
-        .sha256 = artifact.artifact_id,
-        .package_size = artifact.size,
-        .installed_size_delta_bytes = 0,
-        .source_package = artifact.package,
-        .prior_installed = null,
-        .requested = true,
-        .reason = .explicit_request,
-        .selected_origin = null,
-        .origin = .{ .local_artifact = .{
-            .evidence = artifact,
-            .solver_priority = 1000,
-        } },
-    }},
-    ordered_actions: [2]solver.OrderedAction = .{
-        .{ .sequence = 0, .kind = .unpack, .package = artifact.package, .version = artifact.version, .architecture = artifact.architecture },
-        .{ .sequence = 1, .kind = .configure_pending, .package = artifact.package, .version = artifact.version, .architecture = artifact.architecture },
-    },
+    actions: [1]solver.PlanAction,
+    ordered_actions: [2]solver.OrderedAction,
+
+    fn init(evidence: package_origin.LocalArtifactEvidence) BindingFixture {
+        return .{
+            .actions = .{.{
+                .kind = .install,
+                .package = evidence.package,
+                .version = evidence.version,
+                .architecture = evidence.architecture,
+                .repository = null,
+                .sha256 = evidence.artifact_id,
+                .package_size = evidence.size,
+                .installed_size_delta_bytes = 0,
+                .source_package = evidence.package,
+                .prior_installed = null,
+                .requested = true,
+                .reason = .explicit_request,
+                .selected_origin = null,
+                .origin = .{ .local_artifact = .{
+                    .evidence = evidence,
+                    .solver_priority = 1000,
+                } },
+            }},
+            .ordered_actions = .{
+                .{ .sequence = 0, .kind = .unpack, .package = evidence.package, .version = evidence.version, .architecture = evidence.architecture },
+                .{ .sequence = 1, .kind = .configure_pending, .package = evidence.package, .version = evidence.version, .architecture = evidence.architecture },
+            },
+        };
+    }
 
     fn plan(self: *BindingFixture) solver.Plan {
         return .{
@@ -4532,8 +4649,8 @@ const BindingFixture = struct {
             .mode = .plan_only,
             .actions = &self.actions,
             .ordered_actions = &self.ordered_actions,
-            .summary = .{ .installs = 1, .download_bytes = artifact.size },
-            .download_bytes = artifact.size,
+            .summary = .{ .installs = 1, .download_bytes = self.actions[0].package_size.? },
+            .download_bytes = self.actions[0].package_size.?,
             .installed_size_delta_bytes = 0,
             .backing_allocator = std.testing.allocator,
             .arena = undefined,
@@ -4541,9 +4658,312 @@ const BindingFixture = struct {
     }
 };
 
+test "repository backend native caller binds every executable request policy field" {
+    const request = BindingFixture.request;
+    const original = repositoryRequestDigest(request, .native);
+    inline for (.{ "cache", "state", "network", "resources" }) |group| {
+        inline for (std.meta.fields(@TypeOf(@field(request, group)))) |field| {
+            var changed = request;
+            const value = &@field(@field(changed, group), field.name);
+            switch (@typeInfo(field.type)) {
+                .int => value.* += 1,
+                .optional => value.* = if (std.mem.eql(u8, field.name, "proxy_url"))
+                    "https://different.example.test"
+                else
+                    "/different",
+                else => @compileError("add coverage for the new repository policy field"),
+            }
+            try std.testing.expect(!std.mem.eql(u8, &original, &repositoryRequestDigest(changed, .native)));
+        }
+    }
+}
+
+const NativePreparationCase = enum {
+    prepared,
+    unchanged,
+    unchanged_active_intent,
+    unchanged_sticky_program,
+    invalid_request,
+    legacy_caller,
+    different_surface,
+    changed_request,
+    wrong_architecture,
+    legacy_lock,
+    changed_plan,
+    sticky_plan,
+    sticky_lock,
+    sticky_program,
+    missing_archive,
+    active_intent,
+    not_mutable,
+    lost_lock,
+    retained_limit,
+    total_limit,
+    aggregate_retained_limit,
+    package_limit,
+    cache_limit,
+    action_limit,
+    archive_count,
+};
+
+fn testNativePreparation(case: NativePreparationCase) !void {
+    const allocator = std.testing.allocator;
+    const empty = case == .unchanged or case == .unchanged_active_intent or
+        case == .unchanged_sticky_program;
+    const bytes = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var model = switch (archive_application.prepare(allocator, bytes, .{ .local = .{} }, .{})) {
+        .model => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer model.deinit();
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+    defer root_dir.close(std.testing.io);
+    const root = root_fs.Root.init(std.testing.io, root_dir);
+    const status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/updates");
+    const package_database = @import("package_database.zig");
+    try root.publishFile(
+        try root_fs.Path.init("var/lib/dpkg/info/" ++ package_database.info_format_name),
+        package_database.supported_info_format ++ "\n",
+        .{},
+    );
+    try root.publishFile(
+        try root_fs.Path.init("var/lib/dpkg/info/held.list"),
+        "/.\n/usr\n/usr/share\n/usr/share/held\n",
+        .{},
+    );
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share");
+    try root.publishFile(try root_fs.Path.init("usr/share/held"), "untouched\n", .{});
+    const root_path = try repositoryTestRoot(allocator, directory.dir);
+    defer allocator.free(root_path);
+    var request: api.Request = .{
+        .root = root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(bytes),
+        .architecture = "amd64",
+    };
+    request.resources.maximum_retained_package_bytes = bytes.len;
+    switch (case) {
+        .retained_limit => request.resources.maximum_retained_package_bytes -= 1,
+        .total_limit => request.resources.maximum_total_package_bytes = bytes.len - 1,
+        .package_limit => request.network.maximum_package_bytes = bytes.len - 1,
+        .cache_limit => request.cache.maximum_object_bytes = bytes.len - 1,
+        .action_limit => request.resources.maximum_actions = 1,
+        .archive_count => {
+            request.resources.maximum_actions = 1;
+            request.resources.maximum_retained_package_bytes = 2 * bytes.len;
+        },
+        else => {},
+    }
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(sha256(bytes)),
+        .sha256 = sha256(bytes),
+        .size = bytes.len,
+        .package = model.facts.package,
+        .version = model.facts.version,
+        .architecture = model.facts.architecture,
+        .acquisition_url = request.descriptor_url,
+        .trust_mode = .pinned_sha256,
+    };
+    var fixture = BindingFixture.init(artifact);
+    var plan = fixture.plan();
+    if (empty) {
+        plan.actions = &.{};
+        plan.ordered_actions = &.{};
+        plan.summary = .{};
+        plan.download_bytes = 0;
+    }
+    var lock = if (empty)
+        try exact_lock_v2.create(allocator, .{
+            .target_architecture = plan.target_architecture,
+            .request_sha256 = try operationRequestDigest(allocator, request, plan, .native),
+            .policy_sha256 = repositoryLockPolicyDigest(.native),
+            .repositories = &.{},
+            .local_artifacts = &.{},
+            .packages = &.{},
+            .verified_origins = true,
+        })
+    else
+        try createOperationLock(
+            allocator,
+            plan,
+            artifact,
+            null,
+            request,
+            if (case == .legacy_lock) .legacy_dpkg else .native,
+        );
+    defer lock.deinit();
+    var extra_actions = [_]solver.PlanAction{ fixture.actions[0], fixture.actions[0] };
+    var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+    var lost_locks: root_operation.TestLockBackend = .{ .allocator = allocator };
+    defer lost_locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        std.testing.io,
+        root,
+        root_path,
+        if (case == .lost_lock) lost_locks.interface() else locks.interface(),
+    );
+    const wrong_digest: [32]u8 = @splat(0x11);
+    var attempt = try coordinator.acquire(allocator, .{
+        .backend = if (case == .legacy_caller) .legacy_dpkg else .native,
+        .operation = if (case == .different_surface)
+            .{ .package_transaction = .install }
+        else
+            .{ .repository_bootstrap = .add },
+        .request_sha256 = repositoryRequestDigest(request, .native),
+        .policy_sha256 = repositoryPolicyDigest(request, .native),
+        .target_architecture = if (case == .wrong_architecture) "arm64" else "amd64",
+        .evidence = .{
+            .plan_sha256 = if (case == .sticky_plan) wrong_digest else null,
+            .exact_lock = if (case == .sticky_lock) .{
+                .schema = exact_lock_v2.schema_id,
+                .version = exact_lock_v2.schema_version,
+                .digest_sha256 = wrong_digest,
+            } else null,
+            .program_sha256 = if (case == .sticky_program or case == .unchanged_sticky_program) wrong_digest else null,
+        },
+    });
+    defer attempt.release();
+    if (case == .not_mutable)
+        try attempt.advance(allocator, .{ .state = .mutation_pending, .phase = .mutation });
+    var before = attempt.record().digest_sha256;
+    var input: NativePreparationRequest = .{
+        .repository = request,
+        .attempt = &attempt,
+        .plan = &plan,
+        .exact_lock = &lock.lock,
+        .archives = if (empty or case == .missing_archive)
+            &.{}
+        else if (case == .aggregate_retained_limit or case == .archive_count)
+            &.{ bytes, bytes }
+        else
+            &.{bytes},
+    };
+    switch (case) {
+        .invalid_request => input.repository.api_version += 1,
+        .changed_request => input.repository.resources.maximum_actions += 1,
+        .changed_plan => fixture.actions[0].requested = false,
+        .action_limit => plan.actions = &extra_actions,
+        .active_intent, .unchanged_active_intent => try root.publishFile(
+            try root_fs.Path.init(@import("native_recovery.zig").intent_path),
+            "incomplete native evidence",
+            .{},
+        ),
+        .lost_lock => lost_locks.loseAll(),
+        else => {},
+    }
+    const expected_error: ?anyerror = switch (case) {
+        .invalid_request => error.InvalidRepositoryRequest,
+        .legacy_caller => error.OperationBackendMismatch,
+        .different_surface, .changed_request => error.RepositoryCallerMismatch,
+        .wrong_architecture => error.OperationArchitectureMismatch,
+        .legacy_lock => error.LockPolicyMismatch,
+        .changed_plan => error.RequestEvidenceMismatch,
+        .sticky_plan => error.PlanEvidenceMismatch,
+        .sticky_lock => error.LockEvidenceMismatch,
+        .sticky_program, .unchanged_sticky_program => error.OperationEvidenceMismatch,
+        .active_intent, .unchanged_active_intent => error.RecoveryRequired,
+        .not_mutable => error.OperationNotMutable,
+        .lost_lock => error.LockLost,
+        .retained_limit,
+        .total_limit,
+        .aggregate_retained_limit,
+        .package_limit,
+        .cache_limit,
+        .action_limit,
+        .archive_count,
+        => error.ResourceBudgetExceeded,
+        else => null,
+    };
+    if (expected_error) |expected| {
+        try std.testing.expectError(expected, prepareNative(allocator, input));
+    } else {
+        var result = try prepareNative(allocator, input);
+        defer result.deinit();
+        switch (case) {
+            .unchanged => try std.testing.expect(result == .unchanged),
+            .missing_archive => {
+                try std.testing.expect(result == .diagnostic);
+                try std.testing.expectEqual(.missing_archive, result.diagnostic.diagnostic.code);
+            },
+            .prepared => {
+                try std.testing.expect(result == .prepared);
+                const authorization = result.prepared.authorization.authorization;
+                const held = authorization.findFinalPackage("held", "amd64").?;
+                try std.testing.expectEqualStrings("3.0", held.version);
+                try std.testing.expect(held.dpkg_selection_hold);
+                try std.testing.expect(authorization.findAction("held", "amd64") == null);
+                try std.testing.expectEqual(@as(usize, 1), result.prepared.program.program.artifacts.len);
+                try std.testing.expectEqualStrings(
+                    &std.fmt.bytesToHex(transaction_executor.policyDigest(repositoryExecutionPolicy(request)), .lower),
+                    &result.prepared.program.program.executor_policy_sha256,
+                );
+                try std.testing.expectEqual(before, attempt.record().digest_sha256);
+                try native_operation.bind(allocator, root, &attempt, result.prepared.program.program);
+                before = attempt.record().digest_sha256;
+                var repeated = try prepareNative(allocator, input);
+                defer repeated.deinit();
+                try std.testing.expect(repeated == .prepared);
+                try std.testing.expectEqualStrings(
+                    &result.prepared.program.program.digest_sha256,
+                    &repeated.prepared.program.program.digest_sha256,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    var observed = (try root_operation.Store.init(root).read(allocator)).?;
+    defer observed.deinit();
+    try std.testing.expectEqual(before, observed.record.digest_sha256);
+    try std.testing.expectEqual(case != .lost_lock, attempt.locked());
+    const observed_status = try root.readFileAlloc(allocator, try root_fs.Path.init("var/lib/dpkg/status"), 4096);
+    defer allocator.free(observed_status);
+    try std.testing.expectEqualStrings(status, observed_status);
+    const retained = try root.readFileAlloc(allocator, try root_fs.Path.init("usr/share/held"), 4096);
+    defer allocator.free(retained);
+    try std.testing.expectEqualStrings("untouched\n", retained);
+    try std.testing.expect((try root.entryIfExists(try root_fs.Path.init(@import("native_recovery.zig").intent_path)) != null) ==
+        (case == .active_intent or case == .unchanged_active_intent));
+}
+
+test "repository backend prepares genuine native inputs without mutating caller or installed packages" {
+    try testNativePreparation(.prepared);
+    try testNativePreparation(.unchanged);
+    try testNativePreparation(.missing_archive);
+}
+
+test "repository backend native preparation refuses changed caller lock plan and active evidence" {
+    for ([_]NativePreparationCase{
+        .invalid_request,         .legacy_caller,            .different_surface, .changed_request,
+        .wrong_architecture,      .legacy_lock,              .changed_plan,      .sticky_plan,
+        .sticky_lock,             .sticky_program,           .active_intent,     .lost_lock,
+        .unchanged_active_intent, .unchanged_sticky_program, .not_mutable,
+    }) |case| {
+        errdefer std.debug.print("native repository preparation case: {t}\n", .{case});
+        try testNativePreparation(case);
+    }
+}
+
+test "repository backend native preparation bounds all simultaneously retained archive bytes" {
+    for ([_]NativePreparationCase{
+        .retained_limit, .total_limit, .aggregate_retained_limit,
+        .package_limit,  .cache_limit, .action_limit,
+        .archive_count,
+    }) |case| {
+        errdefer std.debug.print("native repository budget case: {t}\n", .{case});
+        try testNativePreparation(case);
+    }
+}
+
 test "repository backend legacy binding byte identities" {
     const request = BindingFixture.request;
-    var fixture: BindingFixture = .{};
+    var fixture = BindingFixture.init(BindingFixture.artifact);
     try std.testing.expectEqualStrings(
         "caea06507df178c8c7587c881eb63f50a0c5a2fdd47470f7e0227061cfe67d00",
         &requestOperationId(request, .legacy_dpkg),
@@ -4601,7 +5021,7 @@ test "repository backend separates history without partitioning shared exclusion
 test "repository backend lock domains retain exact origins and reject the other backend" {
     const allocator = std.testing.allocator;
     const request = BindingFixture.request;
-    var fixture: BindingFixture = .{};
+    var fixture = BindingFixture.init(BindingFixture.artifact);
     const plan = fixture.plan();
     for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |backend| {
         const other: transaction_engine.Kind = if (backend == .native) .legacy_dpkg else .native;
