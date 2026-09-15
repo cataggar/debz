@@ -369,11 +369,21 @@ repository CLI activation gate and legacy admission behavior. These cases
 join the default recovery workload; `-Dnative-repository-projection-only=true`
 selects them with the existing read-only projection cases.
 
+Typed repository execution cases use the verified CAS adapter in actual
+supervised root callbacks. They exercise successful and failed scripts,
+deadline interruption after intent, fresh persisted-only recovery after CAS
+eviction, stable repeated receipts and traces, missing helpers, unchanged
+closures and owned preparation diagnostics. Original caller ownership remains
+pending; package completion does not discharge repository bootstrap. The
+default recovery workload includes these cases; use
+`-Dnative-repository-execution-only=true` for the focused family.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2
 zig build test-native-recovery -Dnative-deadline-only=true -j2
 zig build test-native-recovery -Dnative-repository-projection-only=true -j2
+zig build test-native-recovery -Dnative-repository-execution-only=true -j2
 ```
 
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture

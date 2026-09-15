@@ -83,7 +83,7 @@ backend own their strings with the caller-supplied allocator; call
 `Result.deinit` when finished. Decoded documents return `OwnedResult`, which
 likewise requires `deinit`.
 
-## Native preparation integration
+## Native caller integration
 
 `repository_backend.prepareNative` is the lower-level preparation boundary,
 not the repository-add executor. It takes the repository request, an already
@@ -164,10 +164,9 @@ The cache adapter requires the existing absolute operation `Deadline` and
 checks it before work, around object reads, and after native preparation.
 It does not reset the timeout or claim to interrupt a single read or CPU-bound
 preparation. Expiry and lock loss discard the result without changing caller
-authority. The typed native runtime accepts the same absolute deadline for
-execution, with separately bounded persisted recovery; the repository caller
-must pass it through rather than starting a new timeout. Repository CLI
-activation still requires the complete caller-owned lifecycle below.
+authority. `executeNativeFromCache` passes that same absolute deadline into
+native execution rather than starting a new timeout. Repository CLI activation
+still requires the complete caller-owned lifecycle below.
 
 Native caller request digests cover every cache, state, network, and aggregate
 resource field; native caller policy digests also bind the actual repository
@@ -191,6 +190,39 @@ Acquisition, the cumulative operation deadline, helper/execution integration,
 native receipt retention, persisted recovery, and durable outer completion
 remain caller responsibilities. The repository CLI native gate remains in
 place until that complete lifecycle is integrated.
+
+### Typed package execution and recovery
+
+`executeNativeFromCache` consumes `NativeCachePreparationRequest`, prepares the
+complete verified CAS closure, and calls the actual trusted-helper native
+runtime under the original repository attempt and deadline. The adapter owns
+all loaded archive bytes through execution and releases them afterward,
+including on failure. Native execution persists its recovery inputs before
+package mutation; recovery does not depend on this temporary archive bundle.
+
+`NativeExecutionResult` distinguishes `unchanged`, an independently owned
+preparation `diagnostic`, and an owned native `execution` report. Unchanged and
+diagnostic outcomes never deploy a helper, execute scripts, or fabricate a
+receipt. Execution reports preserve native `succeeded`, `failed`,
+`recovery_required`, and `refused` outcomes; terminal success or failure carries
+a genuine native receipt. Call `deinit` on the result. Operational errors
+propagate and must not be interpreted as proof that mutation never started.
+Pre-mutation helper refusal may leave sticky program evidence on the original
+caller without starting package mutation.
+
+`recoverNative` accepts only the original repository request, its held attempt,
+and a fresh invocation's absolute deadline. It authenticates the repository
+operation, root, original request/policy and any explicit architecture before
+invoking bounded native recovery. It accepts no replacement plan, lock,
+archive, cache, helper or repository acquisition input. Completed native
+receipts are adopted without replaying scripts; incomplete safe work resumes
+from persisted native inputs. Changed caller requests and policies refuse.
+
+These adapters neither acknowledge native receipts nor complete, clear,
+abandon or release the repository caller. Package completion is not repository
+bootstrap completion: descriptor import, metadata refresh, immutable outer
+receipt retention and durable outer completion must precede acknowledgment
+and root cleanup. The public repository CLI gate remains unchanged.
 
 ## Descriptor and repository trust
 
