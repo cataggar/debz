@@ -122,6 +122,13 @@ pub const NativeRecoveryRequest = struct {
     repository: api.Request,
     attempt: *root_operation.Attempt,
     deadline: transaction_executor.Deadline,
+
+    fn validate(self: @This()) !void {
+        _ = try self.deadline.remainingMs();
+        try validateNativeRepositoryCaller(self.repository, self.attempt);
+        try self.attempt.coordinator.validateProjection();
+        _ = try native_runtime.validateAttempt(self.attempt);
+    }
 };
 
 /// The request authenticates the original repository caller; recovery work
@@ -142,10 +149,11 @@ pub const NativeReceiptRequest = struct {
     deadline: transaction_executor.Deadline,
 
     fn validate(self: NativeReceiptRequest) !void {
-        _ = try self.deadline.remainingMs();
-        try validateNativeRepositoryCaller(self.repository, self.attempt);
-        try self.attempt.coordinator.validateProjection();
-        _ = try native_runtime.validateAttempt(self.attempt);
+        try self.recoveryRequest().validate();
+    }
+
+    fn recoveryRequest(self: @This()) NativeRecoveryRequest {
+        return .{ .repository = self.repository, .attempt = self.attempt, .deadline = self.deadline };
     }
 };
 
@@ -238,6 +246,90 @@ pub const NativeRepositoryCompletion = struct {
     }
 };
 
+pub const NativeRepositoryResume = union(enum) {
+    not_started,
+    pending: native_runtime.Report,
+    completed: NativeRepositoryCompletion,
+
+    pub fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .not_started => {},
+            inline else => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Resumes an original held caller from persisted inputs through repository
+/// completion. A clean caller is not evidence of an unchanged bootstrap.
+pub fn resumeNativeRepository(
+    allocator: std.mem.Allocator,
+    input: NativeRecoveryRequest,
+    dependencies: NativeImportRefreshDependencies,
+) !NativeRepositoryResume {
+    return resumeNativeRepositoryObserved(allocator, input, dependencies, null);
+}
+
+fn resumeNativeRepositoryObserved(
+    allocator: std.mem.Allocator,
+    input: NativeRecoveryRequest,
+    dependencies: NativeImportRefreshDependencies,
+    observer: ?NativeCompletionObserver,
+) !NativeRepositoryResume {
+    try input.validate();
+    try validateNativeCallerRecord(allocator, input.attempt);
+    if (try native_runtime.canAbandon(allocator, input.attempt)) {
+        var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+        defer paths.deinit();
+        const root = input.attempt.coordinator.root;
+        const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
+        if (try pinNativeCompletion(root, state_path)) |value| {
+            var pin = value;
+            defer pin.close();
+            const observed = try pin.observeStableAlloc(allocator, input.repository.state.maximum_operation_state_bytes);
+            defer allocator.free(observed.bytes);
+            var state = try state_module.decode(allocator, observed.bytes, input.repository.state.maximum_operation_state_bytes);
+            defer state.deinit();
+            if (!std.mem.eql(u8, state.state.root, input.repository.root) or
+                !std.mem.eql(u8, state.state.architecture, input.attempt.record().target_architecture) or
+                state.state.no_refresh != input.repository.no_refresh)
+                return error.RepositoryStateMismatch;
+            if (state.state.provenance_path != null or state.state.installed or state.state.refreshed or
+                state.state.manifest_path != null or phaseAtLeast(state.state.phase, .installed))
+                return error.RepositoryHistoryRequiresReconciliation;
+            _ = try pin.metadata();
+        }
+        const completion_text = try joinLogical(allocator, paths.operation_logical, root_operation_completion.document_name);
+        defer allocator.free(completion_text);
+        for ([_][]const u8{ paths.provenance_logical, completion_text, paths.manifest_logical }) |path| {
+            if (try root.entryIfExists(try root_fs.Path.init(path[1..])) != null)
+                return error.RepositoryHistoryRequiresReconciliation;
+        }
+        try input.validate();
+        try validateNativeCallerRecord(allocator, input.attempt);
+        return .not_started;
+    }
+    var context: NativeCompletionContext = .{ .observer = observer };
+    errdefer if (context.document) |*document| document.deinit();
+    const stage: NativeRepositoryStage = .{ .resume_pipeline = .{ .dependencies = dependencies, .completion = &context } };
+    var original = try NativeRepositoryInputs.read(allocator, input, stage);
+    defer original.deinit();
+    try input.validate();
+    try validateNativeCallerRecord(allocator, input.attempt);
+    var report = try recoverNative(allocator, input);
+    if (report.receipt == null) return .{ .pending = report };
+    defer report.deinit();
+    try input.validate();
+    try original.validate();
+    const checkpoint = try nativeRepositoryCheckpointLoaded(allocator, .{
+        .repository = input.repository,
+        .attempt = input.attempt,
+        .expected_receipt_sha256 = report.receipt.?.document.digest_sha256,
+        .deadline = input.deadline,
+    }, null, stage, &original);
+    return .{ .completed = .{ .checkpoint = checkpoint, .completion = context.document.? } };
+}
+
 /// Publishes terminal repository state and caller completion before native
 /// acknowledgment and root-record cleanup. The caller still owns its lock.
 pub fn completeNative(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativeRepositoryCompletion {
@@ -259,6 +351,10 @@ const NativeRepositoryStage = union(enum) {
     package,
     post_install: NativeImportRefreshDependencies,
     completion: *NativeCompletionContext,
+    resume_pipeline: struct {
+        dependencies: NativeImportRefreshDependencies,
+        completion: *NativeCompletionContext,
+    },
 };
 
 /// Resumes only post-package work from original persisted evidence. Successful
@@ -292,82 +388,137 @@ fn nativeRepositoryCheckpoint(
     observer: ?root_fs.PublishObserver,
     stage: NativeRepositoryStage,
 ) !NativeRepositoryCheckpoint {
-    try input.validate();
-    var paths = try ResolvedPaths.init(allocator, input.repository, .native);
-    defer paths.deinit();
-    const root = input.attempt.coordinator.root;
-    const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
-    var state_file = try root.pinRegularFile(state_path);
-    defer state_file.close();
-    const state_bytes = try state_file.observeStableAlloc(allocator, input.repository.state.maximum_operation_state_bytes);
-    defer allocator.free(state_bytes.bytes);
-    var prior = try state_module.decode(allocator, state_bytes.bytes, input.repository.state.maximum_operation_state_bytes);
-    defer prior.deinit();
-    const state = prior.state;
-    const record = input.attempt.record();
-    if (!std.mem.eql(u8, state.root, input.repository.root) or
-        !std.mem.eql(u8, state.architecture, record.target_architecture) or
-        state.no_refresh != input.repository.no_refresh or
-        state.managed_files.len == 0 or
-        !std.mem.eql(u8, state.plan_path orelse return error.RepositoryStateMismatch, paths.exact_plan_logical) or
-        !std.mem.eql(u8, state.exact_lock_path orelse return error.RepositoryStateMismatch, paths.exact_lock_logical))
-        return error.RepositoryStateMismatch;
-    switch (state.phase) {
-        .locked => {},
-        .installed, .failed, .imported, .refreshed, .complete => {
-            if ((stage == .package and (state.phase == .imported or state.phase == .refreshed)) or
-                (state.phase == .complete and stage != .completion))
-                return error.RepositoryPackageStageAlreadyAdvanced;
-            if (!std.mem.eql(u8, state.provenance_path orelse return error.RepositoryStateMismatch, paths.provenance_logical) or
-                (state.phase == .failed and state.diagnostic_id != .transaction_failed))
-                return error.RepositoryStateMismatch;
-            if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) {
-                if (!std.mem.eql(u8, state.manifest_path orelse return error.RepositoryStateMismatch, paths.manifest_logical))
-                    return error.RepositoryStateMismatch;
-            } else if (state.manifest_path != null or state.refreshed) return error.RepositoryStateMismatch;
-        },
-        else => return error.RepositoryStateMismatch,
+    var original = try NativeRepositoryInputs.read(allocator, input.recoveryRequest(), stage);
+    defer original.deinit();
+    return nativeRepositoryCheckpointLoaded(allocator, input, observer, stage, &original);
+}
+
+const NativeRepositoryInputs = struct {
+    paths: ResolvedPaths,
+    state_file: root_fs.PinnedRegularFile,
+    plan_file: root_fs.PinnedRegularFile,
+    lock_file: root_fs.PinnedRegularFile,
+    state: state_module.OwnedState,
+    descriptor: api.DescriptorIdentity,
+
+    fn deinit(self: *@This()) void {
+        self.state.deinit();
+        self.lock_file.close();
+        self.plan_file.close();
+        self.state_file.close();
+        self.paths.deinit();
+        self.* = undefined;
     }
-    const descriptor_state = state.descriptor orelse return error.RepositoryStateMismatch;
-    const descriptor: api.DescriptorIdentity = .{
-        .package = descriptor_state.package,
-        .version = descriptor_state.version,
-        .architecture = descriptor_state.architecture,
-        .sha256 = descriptor_state.sha256,
-        .size = descriptor_state.size,
-        .effective_url = descriptor_state.effective_url,
-        .trust_mode = descriptor_state.trust_mode,
-    };
-    var plan_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_plan_logical[1..]));
-    defer plan_file.close();
-    const plan_bytes = try plan_file.observeStableAlloc(allocator, repository_plan.maximum_document_bytes);
-    defer allocator.free(plan_bytes.bytes);
-    var plan = try repository_plan.decode(allocator, plan_bytes.bytes);
-    defer plan.deinit();
-    const plan_sha256 = transaction_executor.planDigest(plan);
-    if (!std.mem.eql(u8, &plan_sha256, &(state.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
-        !std.mem.eql(u8, &plan_sha256, &(record.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
-        !std.mem.eql(u8, plan.target_architecture, record.target_architecture))
-        return error.PlanEvidenceMismatch;
-    var lock_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_lock_logical[1..]));
-    defer lock_file.close();
-    const lock_bytes = try lock_file.observeStableAlloc(allocator, exact_lock_v2.maximum_document_bytes);
-    defer allocator.free(lock_bytes.bytes);
-    var lock = try exact_lock_v2.decode(allocator, lock_bytes.bytes, exact_lock_v2.maximum_document_bytes);
-    defer lock.deinit();
-    if (!(record.exact_lock orelse return error.LockEvidenceMismatch).eql(.{
-        .schema = exact_lock_v2.schema_id,
-        .version = exact_lock_v2.schema_version,
-        .digest_sha256 = lock.lock.digest_sha256,
-    })) return error.LockEvidenceMismatch;
-    if (plan.actions.len > input.repository.resources.maximum_actions or
-        lock.lock.packages.len > input.repository.resources.maximum_actions or
-        lock.lock.repositories.len > input.repository.resources.maximum_repositories)
-        return error.ResourceBudgetExceeded;
-    try validateLockPolicy(lock.lock, .native);
-    try validateLockRequest(allocator, lock.lock, input.repository, plan, .native);
-    try validateLockDescriptor(lock.lock, descriptor);
+
+    fn validate(self: *@This()) !void {
+        _ = try self.state_file.metadata();
+        _ = try self.plan_file.metadata();
+        _ = try self.lock_file.metadata();
+    }
+
+    fn read(allocator: std.mem.Allocator, input: NativeRecoveryRequest, stage: NativeRepositoryStage) !@This() {
+        try input.validate();
+        var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+        errdefer paths.deinit();
+        const root = input.attempt.coordinator.root;
+        const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
+        var state_file = try root.pinRegularFile(state_path);
+        errdefer state_file.close();
+        const state_bytes = try state_file.observeStableAlloc(allocator, input.repository.state.maximum_operation_state_bytes);
+        defer allocator.free(state_bytes.bytes);
+        var prior = try state_module.decode(allocator, state_bytes.bytes, input.repository.state.maximum_operation_state_bytes);
+        errdefer prior.deinit();
+        const state = prior.state;
+        const record = input.attempt.record();
+        if (!std.mem.eql(u8, state.root, input.repository.root) or
+            !std.mem.eql(u8, state.architecture, record.target_architecture) or
+            state.no_refresh != input.repository.no_refresh or
+            state.managed_files.len == 0 or
+            !std.mem.eql(u8, state.plan_path orelse return error.RepositoryStateMismatch, paths.exact_plan_logical) or
+            !std.mem.eql(u8, state.exact_lock_path orelse return error.RepositoryStateMismatch, paths.exact_lock_logical))
+            return error.RepositoryStateMismatch;
+        switch (state.phase) {
+            .locked => {},
+            .installed, .failed, .imported, .refreshed, .complete => {
+                if ((stage == .package and (state.phase == .imported or state.phase == .refreshed)) or
+                    (state.phase == .complete and stage != .completion and stage != .resume_pipeline))
+                    return error.RepositoryPackageStageAlreadyAdvanced;
+                if (!std.mem.eql(u8, state.provenance_path orelse return error.RepositoryStateMismatch, paths.provenance_logical) or
+                    (state.phase == .failed and state.diagnostic_id != .transaction_failed))
+                    return error.RepositoryStateMismatch;
+                if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) {
+                    if (!std.mem.eql(u8, state.manifest_path orelse return error.RepositoryStateMismatch, paths.manifest_logical))
+                        return error.RepositoryStateMismatch;
+                } else if (state.manifest_path != null or state.refreshed) return error.RepositoryStateMismatch;
+            },
+            else => return error.RepositoryStateMismatch,
+        }
+        const descriptor_state = state.descriptor orelse return error.RepositoryStateMismatch;
+        const descriptor: api.DescriptorIdentity = .{
+            .package = descriptor_state.package,
+            .version = descriptor_state.version,
+            .architecture = descriptor_state.architecture,
+            .sha256 = descriptor_state.sha256,
+            .size = descriptor_state.size,
+            .effective_url = descriptor_state.effective_url,
+            .trust_mode = descriptor_state.trust_mode,
+        };
+        var plan_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_plan_logical[1..]));
+        errdefer plan_file.close();
+        const plan_bytes = try plan_file.observeStableAlloc(allocator, repository_plan.maximum_document_bytes);
+        defer allocator.free(plan_bytes.bytes);
+        var plan = try repository_plan.decode(allocator, plan_bytes.bytes);
+        defer plan.deinit();
+        const plan_sha256 = transaction_executor.planDigest(plan);
+        if (!std.mem.eql(u8, &plan_sha256, &(state.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
+            !std.mem.eql(u8, &plan_sha256, &(record.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
+            !std.mem.eql(u8, plan.target_architecture, record.target_architecture))
+            return error.PlanEvidenceMismatch;
+        var lock_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_lock_logical[1..]));
+        errdefer lock_file.close();
+        const lock_bytes = try lock_file.observeStableAlloc(allocator, exact_lock_v2.maximum_document_bytes);
+        defer allocator.free(lock_bytes.bytes);
+        var lock = try exact_lock_v2.decode(allocator, lock_bytes.bytes, exact_lock_v2.maximum_document_bytes);
+        defer lock.deinit();
+        if (!(record.exact_lock orelse return error.LockEvidenceMismatch).eql(.{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = lock.lock.digest_sha256,
+        })) return error.LockEvidenceMismatch;
+        if (plan.actions.len > input.repository.resources.maximum_actions or
+            lock.lock.packages.len > input.repository.resources.maximum_actions or
+            lock.lock.repositories.len > input.repository.resources.maximum_repositories)
+            return error.ResourceBudgetExceeded;
+        try validateLockPolicy(lock.lock, .native);
+        try validateLockRequest(allocator, lock.lock, input.repository, plan, .native);
+        try validateLockDescriptor(lock.lock, descriptor);
+        try input.validate();
+        var result: @This() = .{
+            .paths = paths,
+            .state_file = state_file,
+            .plan_file = plan_file,
+            .lock_file = lock_file,
+            .state = prior,
+            .descriptor = descriptor,
+        };
+        try result.validate();
+        return result;
+    }
+};
+
+fn nativeRepositoryCheckpointLoaded(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    observer: ?root_fs.PublishObserver,
+    stage: NativeRepositoryStage,
+    original: *NativeRepositoryInputs,
+) !NativeRepositoryCheckpoint {
     try input.validate();
+    try original.validate();
+    const state = original.state.state;
+    const paths = original.paths;
+    const root = input.attempt.coordinator.root;
+    const descriptor = original.descriptor;
     if (state.provenance_path == null) {
         var retained = try retainNativeReceipt(allocator, input);
         defer retained.deinit();
@@ -386,7 +537,7 @@ fn nativeRepositoryCheckpoint(
     var publication: NativeCheckpointPublication = .{
         .allocator = allocator,
         .input = input,
-        .pins = .{ &state_file, &plan_file, &lock_file },
+        .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
         .observer = observer,
     };
     try publication.persist(allocator, next.state, paths);
@@ -395,6 +546,11 @@ fn nativeRepositoryCheckpoint(
         .post_install => |dependencies| if (package_state == .succeeded)
             try resumeNativeImportRefresh(allocator, &publication, &next, paths, descriptor, package_state.succeeded.receipt.document, dependencies),
         .completion => |context| try finishNativeRepository(allocator, &publication, &next, paths, descriptor, package_state, context),
+        .resume_pipeline => |pipeline| {
+            if (package_state == .succeeded and next.state.phase != .complete)
+                try resumeNativeImportRefresh(allocator, &publication, &next, paths, descriptor, package_state.succeeded.receipt.document, pipeline.dependencies);
+            try finishNativeRepository(allocator, &publication, &next, paths, descriptor, package_state, pipeline.completion);
+        },
     }
     try validateNativeRepositoryCaller(input.repository, input.attempt);
     try input.attempt.coordinator.validateProjection();
@@ -765,14 +921,7 @@ const NativeCompletionPublication = struct {
         try self.checkpoint.validate();
         if (self.local) |pin| _ = try pin.metadata();
         if (self.global) |pin| _ = try pin.metadata();
-        const attempt = self.checkpoint.input.attempt;
-        var active = try attempt.coordinator.store().read(self.checkpoint.allocator);
-        defer if (active) |*value| value.deinit();
-        if (active) |value| {
-            if (!std.mem.eql(u8, &value.record.digest_sha256, &attempt.record().digest_sha256))
-                return error.StaleAttempt;
-        } else if (!attempt.record().clearable() or attempt.record().provenance != .published)
-            return error.NoActiveAttempt;
+        try validateNativeCallerRecord(self.checkpoint.allocator, self.checkpoint.input.attempt);
     }
 
     fn boundary(self: *@This(), point: NativeCompletionPoint) !void {
@@ -786,6 +935,16 @@ const NativeCompletionPublication = struct {
         if (point == .after_rename) try self.context.hit(.after_completion_rename);
     }
 };
+
+fn validateNativeCallerRecord(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !void {
+    var active = try attempt.coordinator.store().read(allocator);
+    defer if (active) |*value| value.deinit();
+    if (active) |value| {
+        if (!std.mem.eql(u8, &value.record.digest_sha256, &attempt.record().digest_sha256))
+            return error.StaleAttempt;
+    } else if (!attempt.record().clearable() or attempt.record().provenance != .published)
+        return error.NoActiveAttempt;
+}
 
 fn validateNativeCompletion(
     input: NativeReceiptRequest,
@@ -7637,6 +7796,171 @@ fn testProjectedNativeCompletion(case: RepositoryExecutionCase, projection: *con
     try std.testing.expectEqualStrings("preinst\npostinst\n", trace);
 }
 
+fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const live_root.Projection, pass: usize) !void {
+    const allocator = std.testing.allocator;
+    var named = try root_fs.openAbsoluteRoot(std.testing.io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init("fixture/repository-original-request.json"), api.maximum_document_bytes);
+    defer allocator.free(bytes);
+    var request = try std.json.parseFromSlice(api.Request, allocator, bytes, .{ .ignore_unknown_fields = false });
+    defer request.deinit();
+    const refresh_retry = case == .success and pass == 0;
+    const step = pass - @intFromBool(case == .success and pass != 0);
+    var guard: RootOperationGuard = .{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .root_projection = projection,
+        .native_completion_only = case != .unchanged and !refresh_retry and (step == 1 or step == 2),
+    };
+    defer guard.deinit();
+    try std.testing.expect(guard.open(request.value, .native, 1_700_000_000) == null);
+    const attempt = guard.active().?;
+    const caller = attempt.record().digest_sha256;
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = &.{}, .descriptor_available = false };
+    const dependencies: NativeImportRefreshDependencies = .{
+        .acquisition = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    const input: NativeRecoveryRequest = .{
+        .repository = request.value,
+        .attempt = attempt,
+        .deadline = .{ .context = &acquisition, .nowMsFn = RepositoryTestAcquisition.nowMilliseconds, .expires_at_ms = 1000 },
+    };
+    if (case == .unchanged) {
+        var result = try resumeNativeRepository(allocator, input, dependencies);
+        defer result.deinit();
+        try std.testing.expect(result == .not_started);
+        try std.testing.expectEqual(caller, attempt.record().digest_sha256);
+    } else if (step == 3) {
+        try std.testing.expectError(error.RepositoryHistoryRequiresReconciliation, resumeNativeRepository(allocator, input, dependencies));
+        try std.testing.expectEqual(caller, attempt.record().digest_sha256);
+    } else {
+        if (pass == 0) {
+            var changed = input;
+            changed.repository.resources.maximum_actions += 1;
+            try std.testing.expectError(error.RepositoryCallerMismatch, resumeNativeRepository(allocator, changed, dependencies));
+            changed = input;
+            changed.deadline.expires_at_ms = 0;
+            try std.testing.expectError(error.DeadlineExceeded, resumeNativeRepository(allocator, changed, dependencies));
+            var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+            defer paths.deinit();
+            const saved = try root_fs.Path.init("fixture/saved-resume-input");
+            for ([_][]const u8{ paths.operation_state_logical, paths.exact_plan_logical, paths.exact_lock_logical }) |path_text| {
+                const path = try root_fs.Path.init(path_text[1..]);
+                try root.rename(path, saved, .fail_if_exists);
+                try std.testing.expectError(error.FileNotFound, resumeNativeRepository(allocator, input, dependencies));
+                try std.testing.expect(try root.entryIfExists(path) == null);
+                try root.rename(saved, path, .fail_if_exists);
+            }
+            try std.testing.expectEqual(caller, attempt.record().digest_sha256);
+            if (case == .success) {
+                var fail_index: usize = 0;
+                while (true) : (fail_index += 1) {
+                    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+                    if (NativeRepositoryInputs.read(failing.allocator(), input, .package)) |value| {
+                        var original = value;
+                        original.deinit();
+                        try std.testing.expect(!failing.has_induced_failure);
+                        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                        break;
+                    } else |_| {
+                        // Existing document codecs may classify an allocation
+                        // failure as invalid input instead of OutOfMemory.
+                        try std.testing.expect(failing.has_induced_failure);
+                    }
+                    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                }
+            }
+            if (case == .interrupted) {
+                var clock: RepositoryExecutionClock = .{ .root = root, .expire_on_call = 5 };
+                changed = input;
+                changed.deadline = clock.deadline();
+                var pending = try resumeNativeRepository(allocator, changed, dependencies);
+                defer pending.deinit();
+                try std.testing.expect(pending == .pending);
+                try std.testing.expectEqualStrings("deadline_exceeded", pending.pending.detail);
+                try std.testing.expect(pending.pending.receipt == null);
+                try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("repository-trace")) == null);
+            }
+        }
+        if (refresh_retry) {
+            acquisition.advance_ms_per_read = 1000;
+            try std.testing.expectError(error.DeadlineExceeded, resumeNativeRepository(allocator, input, dependencies));
+            try std.testing.expectEqual(caller, attempt.record().digest_sha256);
+            try std.testing.expectEqual(root_operation.Outcome.pending, attempt.record().outcome);
+        } else {
+            const Observer = struct {
+                input: NativeRecoveryRequest,
+                fail_at: ?NativeCompletionPoint,
+
+                fn hit(raw: *anyopaque, point: NativeCompletionPoint) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const target = self.input.attempt.coordinator.root;
+                    if (point == .after_final_state and
+                        try target.entryIfExists(try root_fs.Path.init("fixture/repository-pending-caller.json")) == null)
+                    {
+                        const pending = try self.input.attempt.record().canonicalJson(std.testing.allocator);
+                        defer std.testing.allocator.free(pending);
+                        try target.publishFile(try root_fs.Path.init("fixture/repository-pending-caller.json"), pending, .{});
+                        var receipt = (try native_runtime.readCompletion(std.testing.allocator, self.input.attempt)).?;
+                        defer receipt.deinit();
+                        const receipt_bytes = try receipt.document.canonicalJson(std.testing.allocator);
+                        defer std.testing.allocator.free(receipt_bytes);
+                        try target.publishFile(try root_fs.Path.init("fixture/repository-native-receipt.json"), receipt_bytes, .{ .overwrite = .replace });
+                        var paths = try ResolvedPaths.init(std.testing.allocator, self.input.repository, .native);
+                        defer paths.deinit();
+                        try target.publishFile(try root_fs.Path.init("fixture/repository-retained-receipt-path"), paths.provenance_logical, .{ .overwrite = .replace });
+                    }
+                    if (point == .before_clear) {
+                        const completed = try self.input.attempt.record().canonicalJson(std.testing.allocator);
+                        defer std.testing.allocator.free(completed);
+                        try target.publishFile(try root_fs.Path.init("fixture/repository-completed-caller.json"), completed, .{});
+                    }
+                    if (self.fail_at == point) return error.InjectedNativeCompletionFailure;
+                }
+            };
+            var observer: Observer = .{
+                .input = input,
+                .fail_at = switch (step) {
+                    0 => .after_provenance,
+                    1 => .after_native_acknowledgment,
+                    else => null,
+                },
+            };
+            const hooks: NativeCompletionObserver = .{ .context = &observer, .hitFn = Observer.hit };
+            if (observer.fail_at != null) {
+                try std.testing.expectError(error.InjectedNativeCompletionFailure, resumeNativeRepositoryObserved(allocator, input, dependencies, hooks));
+                try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);
+            } else {
+                var result = try resumeNativeRepositoryObserved(allocator, input, dependencies, hooks);
+                defer result.deinit();
+                try std.testing.expect(result == .completed);
+                try std.testing.expectEqual(case == .known_failure, result.completed.checkpoint.package_state == .failed);
+                try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+                var counting = std.testing.FailingAllocator.init(allocator, .{});
+                {
+                    var repeated = try resumeNativeRepository(counting.allocator(), input, dependencies);
+                    defer repeated.deinit();
+                    try std.testing.expect(repeated == .completed);
+                    try std.testing.expectEqual(result.completed.completion.document.digest_sha256, repeated.completed.completion.document.digest_sha256);
+                }
+                try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+                for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
+                    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+                    try std.testing.expectError(error.OutOfMemory, resumeNativeRepository(failing.allocator(), input, dependencies));
+                    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                }
+            }
+            if (step != 0 or case != .success)
+                try std.testing.expectEqual(@as(usize, 0), acquisition.in_release_requests);
+        }
+    }
+    try std.testing.expect(attempt.locked());
+    try std.testing.expectEqual(@as(usize, 0), acquisition.descriptor_reads);
+    try std.testing.expectEqual(@as(usize, 0), acquisition.network_requests);
+}
+
 test "repository backend native execution external fixture" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const enabled = std.c.getenv("DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE") orelse return error.SkipZigTest;
@@ -7650,6 +7974,7 @@ test "repository backend native execution external fixture" {
     const case_bytes = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-execution-case"), 128);
     defer std.testing.allocator.free(case_bytes);
     const case = std.meta.stringToEnum(RepositoryExecutionCase, case_bytes) orelse return error.InvalidProjectionFixture;
+    const resume_repository = try root.root.entryIfExists(try root_fs.Path.init("fixture/repository-resume")) != null;
     const Callback = struct {
         case: RepositoryExecutionCase,
         recover: bool,
@@ -7664,7 +7989,7 @@ test "repository backend native execution external fixture" {
         }
     };
     const terminal = case == .success or case == .known_failure or case == .interrupted;
-    for (0..if (case == .success) @as(usize, 8) else if (terminal) @as(usize, 3) else 1) |index| {
+    for (0..if (resume_repository) @as(usize, 1) else if (case == .success) @as(usize, 8) else if (terminal) @as(usize, 3) else 1) |index| {
         var callback: Callback = .{
             .case = case,
             .recover = index != 0,
@@ -7682,7 +8007,25 @@ test "repository backend native execution external fixture" {
             return error.InvalidProjectionFixture;
         }
     }
-    if (terminal) {
+    if (resume_repository) {
+        const ResumeCallback = struct {
+            case: RepositoryExecutionCase,
+            pass: usize,
+            fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+                const self: *const @This() = @ptrCast(@alignCast(raw.?));
+                try testProjectedNativeResume(self.case, projection, self.pass);
+                return 0;
+            }
+        };
+        for (0..if (case == .success) @as(usize, 5) else if (terminal) @as(usize, 4) else 1) |pass| {
+            var callback: ResumeCallback = .{ .case = case, .pass = pass };
+            const result = try live_root.runProjected(.{ .context = &callback, .child = ResumeCallback.run });
+            if (result != .exited or result.exited != 0) {
+                std.debug.print("repository resume case {t}, pass={d}: {any}\n", .{ case, pass, result });
+                return error.InvalidProjectionFixture;
+            }
+        }
+    } else if (terminal) {
         const ImportCallback = struct {
             case: RepositoryExecutionCase,
             pass: usize,
