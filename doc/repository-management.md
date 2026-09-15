@@ -285,9 +285,9 @@ scope before returning.
 
 Package database proof does not replace descriptor-file, import or refresh
 verification. Neither result publishes outer installed/failure state, completes
-bootstrap, acknowledges native execution or releases ownership. Durable outer
-state/completion and repository dispatch remain integration work; native CLI
-activation stays gated.
+bootstrap, acknowledges native execution or releases ownership. The separate
+checkpoint and completion adapters below handle those obligations; repository
+dispatch remains integration work and native CLI activation stays gated.
 
 ### Persisting native package-stage checkpoints
 
@@ -369,8 +369,69 @@ Call `deinit` on the returned owned `NativeRepositoryCheckpoint`. Neither this
 adapter nor package checkpoint persistence publishes `phase=complete`,
 acknowledges native execution, clears the root operation or releases its lock.
 These checkpoints are resumable bookkeeping, not standalone historical
-completion proof. Durable outer completion and full public/private-runner
-integration are still required before native repository CLI activation.
+completion proof. Use the completion adapter below to discharge the original
+caller; full public/private-runner integration is still required before native
+repository CLI activation.
+
+### Completing native repository ownership
+
+`completeNative` accepts the original `NativeReceiptRequest`, not replacement
+state, plan, lock, manifest or package inputs. It repeats the pinned original
+input bindings and live native package verification. Successful packages must
+have a refreshed checkpoint, or an imported checkpoint when the original
+request selected `no_refresh`, with no outstanding diagnostic. Incomplete
+post-install work is refused. Known package failure stays `phase=failed` with
+`transaction_failed`; it never becomes successful bootstrap.
+
+First successful completion revalidates the original receipt-bound descriptor
+blob, installed descriptor/source/keyring bytes, and the exact bound live target
+manifest. It durably publishes `phase=complete`, completes the original root
+caller, and retains the existing `root-operation-completion-v1.json` both in the
+original operation directory and in the shared root-operation namespace.
+Completion records the real native receipt and either `succeeded` or
+`failed_after_mutation`, with no fabricated command journal. Both completion
+copies must be durable before their digest is published into the caller.
+Only then does it reverify live package state, acknowledge native execution and
+explicitly clear the root record. The caller's lock remains held.
+
+The completion's normal request/policy fields retain the original caller
+identity. Its separate repository/add **discharge request** binds this
+completion operation to the terminal repository state and manifest. Its
+SHA-256 input, in order, is:
+
+```text
+"debz-native-repository-completion-request-v1\0"
+attempt ID + original native request digest + original native policy digest
+expected receipt digest + terminal repository state digest
+manifest-present byte + manifest digest, when present
+```
+
+All IDs/digests are 32 raw bytes except the receipt digest, which is its 64-byte
+lowercase hexadecimal encoding. The presence byte is exactly zero or one.
+This reuses the completion schema's distinct discharge binding, not a freeform
+detail string or a new schema. The native receipt proves the package outcome;
+the discharge additionally binds the repository bookkeeping.
+
+Retries require canonical matching completion bytes and preserve existing
+state/completion inodes. Bound missing, corrupt or different completion files
+refuse without repair. Original state, manifest, current installed material,
+caller and live package evidence remain mandatory. After acknowledgment has
+removed native blobs, an already-retained valid completion permits cleanup
+without reloading the descriptor or consulting the URL/CAS. An interrupted
+settled caller can be adopted only by the narrow completion route: the exact
+original request/policy and caller record are authenticated before acquisition,
+again under exclusion before core recovery adoption, and afterward. Generic
+guard teardown never clears a native completed caller ahead of acknowledgment.
+
+Root/projection authority, input pins, live manifest and the original absolute
+invocation deadline are checked at publication and cleanup boundaries.
+Acknowledgment itself uses the existing native cleanup routine; this does not
+add a separate deadline guard to each unlink. Interruptions retain the original
+caller for fresh scoped recovery, including partial acknowledgment. Repeating
+completion after root clear is supported only under the same still-held caller.
+Fresh startup after a fully cleared root, historical reconciliation,
+unchanged/no-receipt outcomes and public/private dispatch remain separate work.
+Call `deinit` on the returned owned `NativeRepositoryCompletion`.
 
 ## Descriptor and repository trust
 

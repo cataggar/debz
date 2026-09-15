@@ -25,6 +25,7 @@ const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
+const root_operation_completion = @import("root_operation_completion.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const target_apt_config = @import("target_apt_config.zig");
@@ -226,6 +227,40 @@ pub const NativeImportRefreshDependencies = struct {
     now_unix: i64,
 };
 
+pub const NativeRepositoryCompletion = struct {
+    checkpoint: NativeRepositoryCheckpoint,
+    completion: root_operation_completion.OwnedDocument,
+
+    pub fn deinit(self: *@This()) void {
+        self.checkpoint.deinit();
+        self.completion.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Publishes terminal repository state and caller completion before native
+/// acknowledgment and root-record cleanup. The caller still owns its lock.
+pub fn completeNative(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativeRepositoryCompletion {
+    return completeNativeObserved(allocator, input, null);
+}
+
+fn completeNativeObserved(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    observer: ?NativeCompletionObserver,
+) !NativeRepositoryCompletion {
+    var context: NativeCompletionContext = .{ .observer = observer };
+    errdefer if (context.document) |*document| document.deinit();
+    const checkpoint = try nativeRepositoryCheckpoint(allocator, input, null, .{ .completion = &context });
+    return .{ .checkpoint = checkpoint, .completion = context.document.? };
+}
+
+const NativeRepositoryStage = union(enum) {
+    package,
+    post_install: NativeImportRefreshDependencies,
+    completion: *NativeCompletionContext,
+};
+
 /// Resumes only post-package work from original persisted evidence. Successful
 /// import/refresh is not outer completion and leaves native ownership pending.
 pub fn importAndRefreshNative(
@@ -233,7 +268,7 @@ pub fn importAndRefreshNative(
     input: NativeReceiptRequest,
     dependencies: NativeImportRefreshDependencies,
 ) !NativeRepositoryCheckpoint {
-    return nativeRepositoryCheckpoint(allocator, input, null, dependencies);
+    return nativeRepositoryCheckpoint(allocator, input, null, .{ .post_install = dependencies });
 }
 
 /// Publishes package-stage bookkeeping from the original persisted inputs and
@@ -248,14 +283,14 @@ fn persistNativePackageStateObserved(
     input: NativeReceiptRequest,
     observer: ?root_fs.PublishObserver,
 ) !NativePackageCheckpoint {
-    return nativeRepositoryCheckpoint(allocator, input, observer, null);
+    return nativeRepositoryCheckpoint(allocator, input, observer, .package);
 }
 
 fn nativeRepositoryCheckpoint(
     allocator: std.mem.Allocator,
     input: NativeReceiptRequest,
     observer: ?root_fs.PublishObserver,
-    post_install: ?NativeImportRefreshDependencies,
+    stage: NativeRepositoryStage,
 ) !NativeRepositoryCheckpoint {
     try input.validate();
     var paths = try ResolvedPaths.init(allocator, input.repository, .native);
@@ -279,18 +314,18 @@ fn nativeRepositoryCheckpoint(
         return error.RepositoryStateMismatch;
     switch (state.phase) {
         .locked => {},
-        .installed, .failed, .imported, .refreshed => {
-            if (post_install == null and (state.phase == .imported or state.phase == .refreshed))
+        .installed, .failed, .imported, .refreshed, .complete => {
+            if ((stage == .package and (state.phase == .imported or state.phase == .refreshed)) or
+                (state.phase == .complete and stage != .completion))
                 return error.RepositoryPackageStageAlreadyAdvanced;
             if (!std.mem.eql(u8, state.provenance_path orelse return error.RepositoryStateMismatch, paths.provenance_logical) or
                 (state.phase == .failed and state.diagnostic_id != .transaction_failed))
                 return error.RepositoryStateMismatch;
-            if (state.phase == .imported or state.phase == .refreshed) {
+            if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) {
                 if (!std.mem.eql(u8, state.manifest_path orelse return error.RepositoryStateMismatch, paths.manifest_logical))
                     return error.RepositoryStateMismatch;
             } else if (state.manifest_path != null or state.refreshed) return error.RepositoryStateMismatch;
         },
-        .complete => return error.RepositoryPackageStageAlreadyAdvanced,
         else => return error.RepositoryStateMismatch,
     }
     const descriptor_state = state.descriptor orelse return error.RepositoryStateMismatch;
@@ -342,7 +377,7 @@ fn nativeRepositoryCheckpoint(
     // Borrow the already-admitted root; this adapter does not own its descriptor.
     var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
     const installed = try descriptorIdentityInstalled(allocator, filesystem.interface(), descriptor);
-    var next = if (state.phase == .imported or state.phase == .refreshed) blk: {
+    var next = if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) blk: {
         if (package_state != .succeeded or !installed or !state.installed)
             return error.RepositoryStateMismatch;
         break :blk try state_module.create(allocator, state);
@@ -355,8 +390,12 @@ fn nativeRepositoryCheckpoint(
         .observer = observer,
     };
     try publication.persist(allocator, next.state, paths);
-    if (post_install) |dependencies| if (package_state == .succeeded)
-        try resumeNativeImportRefresh(allocator, &publication, &next, paths, descriptor, package_state.succeeded.receipt.document, dependencies);
+    switch (stage) {
+        .package => {},
+        .post_install => |dependencies| if (package_state == .succeeded)
+            try resumeNativeImportRefresh(allocator, &publication, &next, paths, descriptor, package_state.succeeded.receipt.document, dependencies),
+        .completion => |context| try finishNativeRepository(allocator, &publication, &next, paths, descriptor, package_state, context),
+    }
     try validateNativeRepositoryCaller(input.repository, input.attempt);
     try input.attempt.coordinator.validateProjection();
     return .{ .state = next, .package_state = package_state };
@@ -516,6 +555,54 @@ fn nativeDescriptorBytes(
     return bytes;
 }
 
+const NativeDescriptorMaterial = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    validation: deb_payload.Validation,
+    material: DescriptorMaterial,
+
+    fn deinit(self: *@This()) void {
+        self.material.deinit();
+        self.validation.deinit();
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+fn readNativeDescriptorMaterial(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    descriptor: api.DescriptorIdentity,
+    receipt: native_provenance.Document,
+    state: state_module.State,
+) !NativeDescriptorMaterial {
+    const bytes = try nativeDescriptorBytes(allocator, input, descriptor, receipt);
+    errdefer allocator.free(bytes);
+    var validation = switch (deb_payload.inspectLocal(allocator, bytes, .{
+        .source = "repository-descriptor",
+        .filename = std.fs.path.basename(descriptor.effective_url),
+        .size = descriptor.size,
+        .sha256 = descriptor.sha256,
+        .profile = .repository_descriptor,
+    }, .{})) {
+        .diagnostic => |diagnostic| return if (diagnostic.code == .out_of_memory) error.OutOfMemory else error.InvalidRepositoryDescriptor,
+        .validation => |value| value,
+    };
+    errdefer validation.deinit();
+    if (!std.mem.eql(u8, validation.package, descriptor.package) or
+        !std.mem.eql(u8, validation.version, descriptor.version) or
+        !std.mem.eql(u8, validation.architecture, descriptor.architecture))
+        return error.DescriptorIdentityMismatch;
+    var material = try inspectDescriptorMaterial(allocator, &validation, state.architecture, input.repository.network, input.repository.resources);
+    errdefer material.deinit();
+    if (material.evidence.len != state.managed_files.len) return error.RepositoryStateMismatch;
+    for (material.evidence, state.managed_files) |actual, expected| {
+        if (!std.mem.eql(u8, actual.logical_path, expected.logical_path) or actual.size != expected.size or
+            !std.mem.eql(u8, &actual.sha256, &expected.sha256)) return error.RepositoryStateMismatch;
+    }
+    return .{ .allocator = allocator, .bytes = bytes, .validation = validation, .material = material };
+}
+
 fn resumeNativeImportRefresh(
     allocator: std.mem.Allocator,
     publication: *NativeCheckpointPublication,
@@ -527,30 +614,9 @@ fn resumeNativeImportRefresh(
 ) !void {
     const input = publication.input;
     const root = input.attempt.coordinator.root;
-    const bytes = try nativeDescriptorBytes(allocator, input, descriptor, receipt);
-    defer allocator.free(bytes);
-    var validation = switch (deb_payload.inspectLocal(allocator, bytes, .{
-        .source = "repository-descriptor",
-        .filename = std.fs.path.basename(descriptor.effective_url),
-        .size = descriptor.size,
-        .sha256 = descriptor.sha256,
-        .profile = .repository_descriptor,
-    }, .{})) {
-        .diagnostic => |diagnostic| return if (diagnostic.code == .out_of_memory) error.OutOfMemory else error.InvalidRepositoryDescriptor,
-        .validation => |value| value,
-    };
-    defer validation.deinit();
-    if (!std.mem.eql(u8, validation.package, descriptor.package) or
-        !std.mem.eql(u8, validation.version, descriptor.version) or
-        !std.mem.eql(u8, validation.architecture, descriptor.architecture))
-        return error.DescriptorIdentityMismatch;
-    var material = try inspectDescriptorMaterial(allocator, &validation, current.state.architecture, input.repository.network, input.repository.resources);
-    defer material.deinit();
-    if (material.evidence.len != current.state.managed_files.len) return error.RepositoryStateMismatch;
-    for (material.evidence, current.state.managed_files) |actual, expected| {
-        if (!std.mem.eql(u8, actual.logical_path, expected.logical_path) or actual.size != expected.size or
-            !std.mem.eql(u8, &actual.sha256, &expected.sha256)) return error.RepositoryStateMismatch;
-    }
+    var original = try readNativeDescriptorMaterial(allocator, input, descriptor, receipt, current.state);
+    defer original.deinit();
+    const material = &original.material;
     var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
     verifyInstalledDescriptor(allocator, filesystem.interface(), descriptor, material.evidence) catch |err|
         return publication.fail(allocator, current, paths, .installed_verification_failed, err);
@@ -607,7 +673,7 @@ fn resumeNativeImportRefresh(
     var cache = try metadata_cache.Cache.initFromDir(root.io, cache_directory, .{});
     defer cache.deinit();
     try publication.validate();
-    var refreshed = refreshDescriptor(allocator, &material, &material.configuration, &cache, acquisition, input.repository.network, &budget, dependencies.now_unix) catch |err|
+    var refreshed = refreshDescriptor(allocator, material, &material.configuration, &cache, acquisition, input.repository.network, &budget, dependencies.now_unix) catch |err|
         return publication.fail(allocator, current, paths, .refresh_failed, err);
     defer refreshed.deinit(allocator);
     switch (refreshed) {
@@ -627,6 +693,288 @@ fn resumeNativeImportRefresh(
     next.diagnostic_id = null;
     next.diagnostic = "";
     try publication.advance(allocator, current, paths, next);
+}
+
+const NativeCompletionPoint = enum {
+    after_final_state,
+    after_completed_record,
+    before_completion_rename,
+    after_completion_rename,
+    after_local_completion,
+    after_root_completion,
+    after_provenance,
+    before_native_acknowledgment,
+    after_native_acknowledgment,
+    before_clear,
+};
+
+const NativeCompletionObserver = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque, NativeCompletionPoint) anyerror!void,
+};
+
+const NativeCompletionContext = struct {
+    observer: ?NativeCompletionObserver,
+    document: ?root_operation_completion.OwnedDocument = null,
+
+    fn hit(self: *@This(), point: NativeCompletionPoint) !void {
+        if (self.observer) |observer| try observer.hitFn(observer.context, point);
+    }
+};
+
+fn nativeCompletionRequestDigest(
+    input: NativeReceiptRequest,
+    state: state_module.State,
+    manifest_sha256: ?[32]u8,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-native-repository-completion-request-v1\x00");
+    hash.update(&input.attempt.attemptId());
+    hash.update(&repositoryRequestDigest(input.repository, .native));
+    hash.update(&repositoryPolicyDigest(input.repository, .native));
+    hash.update(&input.expected_receipt_sha256);
+    hash.update(&state.digest_sha256);
+    hash.update(&.{@intFromBool(manifest_sha256 != null)});
+    if (manifest_sha256) |digest| hash.update(&digest);
+    return hash.finalResult();
+}
+
+fn pinNativeCompletion(root: root_fs.Root, path: root_fs.Path) !?root_fs.PinnedRegularFile {
+    return root.pinRegularFile(path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn decodeNativeCompletion(
+    allocator: std.mem.Allocator,
+    pin: *const root_fs.PinnedRegularFile,
+) !root_operation_completion.OwnedDocument {
+    const observed = try pin.observeStableAlloc(allocator, root_operation_completion.maximum_document_bytes);
+    defer allocator.free(observed.bytes);
+    return root_operation_completion.decode(allocator, observed.bytes, root_operation_completion.maximum_document_bytes);
+}
+
+const NativeCompletionPublication = struct {
+    checkpoint: *NativeCheckpointPublication,
+    context: *NativeCompletionContext,
+    local: ?*const root_fs.PinnedRegularFile = null,
+    global: ?*const root_fs.PinnedRegularFile = null,
+
+    fn validate(self: *@This()) !void {
+        try self.checkpoint.validate();
+        if (self.local) |pin| _ = try pin.metadata();
+        if (self.global) |pin| _ = try pin.metadata();
+        const attempt = self.checkpoint.input.attempt;
+        var active = try attempt.coordinator.store().read(self.checkpoint.allocator);
+        defer if (active) |*value| value.deinit();
+        if (active) |value| {
+            if (!std.mem.eql(u8, &value.record.digest_sha256, &attempt.record().digest_sha256))
+                return error.StaleAttempt;
+        } else if (!attempt.record().clearable() or attempt.record().provenance != .published)
+            return error.NoActiveAttempt;
+    }
+
+    fn boundary(self: *@This(), point: NativeCompletionPoint) !void {
+        try self.context.hit(point);
+        try self.validate();
+    }
+
+    fn hit(raw: *anyopaque, point: root_fs.PublishPoint) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (point == .before_rename) try self.boundary(.before_completion_rename);
+        if (point == .after_rename) try self.context.hit(.after_completion_rename);
+    }
+};
+
+fn validateNativeCompletion(
+    input: NativeReceiptRequest,
+    document: root_operation_completion.Document,
+    discharge: [32]u8,
+    outcome: root_operation.Outcome,
+) !void {
+    const record = input.attempt.record();
+    const receipt_digest = native_recovery.parseDigest(input.expected_receipt_sha256) orelse return error.NativeReceiptMismatch;
+    if (record.state != .completed or record.outcome != outcome or
+        !document.bindsRecord(record) or document.outcome != outcome or
+        document.transaction_provenance.status != .already_present or
+        !std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id) or
+        !std.mem.eql(u8, &(document.transaction_provenance.document_sha256 orelse return error.NativeCompletionMismatch), &receipt_digest) or
+        document.journal.status != .absent or document.journal.document_sha256 != null or
+        document.discharge.surface != .repository_bootstrap or !std.mem.eql(u8, document.discharge.operation, "add") or
+        !std.mem.eql(u8, &document.discharge.request_sha256, &discharge) or
+        !(target_apt_config.Architecture{ .native = document.target_architecture, .foreign = document.foreign_architectures }).eql(.{
+            .native = record.target_architecture,
+            .foreign = record.foreign_architectures,
+        })) return error.NativeCompletionMismatch;
+    switch (record.provenance) {
+        .pending => {
+            if (document.record_generation != record.generation or
+                !std.mem.eql(u8, &document.record_digest_sha256, &record.digest_sha256))
+                return error.NativeCompletionMismatch;
+        },
+        .published => if (!std.mem.eql(u8, &(record.provenance_sha256 orelse return error.NativeCompletionMismatch), &document.digest_sha256))
+            return error.NativeCompletionMismatch,
+        .not_required => return error.NativeCompletionMismatch,
+    }
+}
+
+fn finishNativeRepository(
+    allocator: std.mem.Allocator,
+    publication: *NativeCheckpointPublication,
+    current: *state_module.OwnedState,
+    paths: ResolvedPaths,
+    descriptor: api.DescriptorIdentity,
+    package_state: NativePackageState,
+    context: *NativeCompletionContext,
+) !void {
+    const input = publication.input;
+    const attempt = input.attempt;
+    const root = attempt.coordinator.root;
+    const failed = package_state == .failed;
+    if (!attempt.record().mutation_started) return error.NativeCompletionMismatch;
+    if (failed) {
+        if (current.state.phase != .failed or current.state.diagnostic_id != .transaction_failed)
+            return error.RepositoryStateMismatch;
+    } else if (current.state.diagnostic_id != null or
+        (current.state.phase != .refreshed and current.state.phase != .complete and
+            !(current.state.phase == .imported and input.repository.no_refresh)) or
+        (!input.repository.no_refresh and !current.state.refreshed))
+        return error.RepositoryPostInstallIncomplete;
+
+    const local_path_text = try joinLogical(allocator, paths.operation_logical, root_operation_completion.document_name);
+    defer allocator.free(local_path_text);
+    const local_path = try root_fs.Path.init(local_path_text[1..]);
+    const global_path = try root_fs.Path.init(root_operation_completion.document_path);
+    var local_pin = try pinNativeCompletion(root, local_path);
+    defer if (local_pin) |*pin| pin.close();
+    var global_pin = try pinNativeCompletion(root, global_path);
+    defer if (global_pin) |*pin| pin.close();
+    var local_document = if (local_pin) |*pin| try decodeNativeCompletion(allocator, pin) else null;
+    defer if (local_document) |*document| document.deinit();
+    var global_document = if (global_pin) |*pin| try decodeNativeCompletion(allocator, pin) else null;
+    defer if (global_document) |*document| document.deinit();
+    if (local_document == null and (attempt.record().provenance == .published or
+        (global_document != null and std.mem.eql(u8, &global_document.?.document.attempt_id, &attempt.attemptId()))))
+        return error.NativeCompletionMissing;
+    if (attempt.record().provenance == .published and global_document == null)
+        return error.NativeCompletionMissing;
+
+    var completion_publication: NativeCompletionPublication = .{
+        .checkpoint = publication,
+        .context = context,
+        .local = if (local_pin) |*pin| pin else null,
+        .global = if (global_pin) |*pin| pin else null,
+    };
+    var manifest_pin: ?root_fs.PinnedRegularFile = null;
+    defer if (manifest_pin) |*pin| pin.close();
+    defer {
+        publication.manifest_file = null;
+        publication.manifest_sha256 = null;
+    }
+    if (!failed) {
+        if (local_document == null) {
+            var original = try readNativeDescriptorMaterial(allocator, input, descriptor, package_state.succeeded.receipt.document, current.state);
+            defer original.deinit();
+        } else if (current.state.phase != .complete) return error.NativeCompletionMismatch;
+        var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
+        try verifyInstalledDescriptor(allocator, filesystem.interface(), descriptor, current.state.managed_files);
+        var snapshot = try nativeRepositorySnapshot(allocator, input);
+        defer snapshot.deinit();
+        try verifyImportedMaterial(snapshot, current.state.managed_files);
+        const manifest_bytes = try snapshot.manifest.manifest.canonicalJson(allocator);
+        defer allocator.free(manifest_bytes);
+        manifest_pin = try root.pinRegularFile(try root_fs.Path.init(paths.manifest_logical[1..]));
+        const observed = try manifest_pin.?.observeStableAlloc(allocator, target_apt_config.maximum_document_bytes);
+        defer allocator.free(observed.bytes);
+        if (!std.mem.eql(u8, manifest_bytes, observed.bytes)) return error.ImportedDigestMismatch;
+        publication.manifest_file = &manifest_pin.?;
+        publication.manifest_sha256 = snapshot.manifest.manifest.digest_sha256;
+    }
+    try completion_publication.validate();
+    const outcome: root_operation.Outcome = if (failed) .failed_after_mutation else .succeeded;
+    if (local_document == null) {
+        if (attempt.record().state == .completed and attempt.record().outcome != outcome)
+            return error.NativeCompletionMismatch;
+        var final_state = current.state;
+        if (!failed) final_state.phase = .complete;
+        try publication.advance(allocator, current, paths, final_state);
+    }
+    const discharge = nativeCompletionRequestDigest(input, current.state, publication.manifest_sha256);
+    if (local_document) |document| try validateNativeCompletion(input, document.document, discharge, outcome);
+    try completion_publication.boundary(.after_final_state);
+    if (attempt.record().state != .completed) {
+        switch (attempt.record().state) {
+            .mutating => try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification }),
+            .recovery_required => try attempt.beginRecovery(allocator, .verification),
+            .verifying, .recovering => {},
+            else => return error.NativeCompletionMismatch,
+        }
+        try completion_publication.validate();
+        try attempt.complete(allocator, outcome);
+    }
+    try completion_publication.boundary(.after_completed_record);
+    if (local_document == null) local_document = try root_operation_completion.create(allocator, .{
+        .record = attempt.record(),
+        .transaction_provenance = .{
+            .status = .already_present,
+            .schema = native_provenance.schema_id,
+            .document_sha256 = native_recovery.parseDigest(input.expected_receipt_sha256) orelse return error.NativeReceiptMismatch,
+            .detail = "verified terminal native repository package receipt",
+        },
+        .journal = .{ .status = .absent, .detail = "native phase evidence; no command journal" },
+        .discharge = .{ .surface = .repository_bootstrap, .operation = "add", .request_sha256 = discharge },
+    });
+    try validateNativeCompletion(input, local_document.?.document, discharge, outcome);
+    const completion_bytes = try local_document.?.document.canonicalJson(allocator);
+    defer allocator.free(completion_bytes);
+    if (local_pin == null) {
+        try retainNativeReceiptBytes(allocator, root, local_path, completion_bytes, .{
+            .context = &completion_publication,
+            .hitFn = NativeCompletionPublication.hit,
+        });
+        local_pin = try root.pinRegularFile(local_path);
+        completion_publication.local = &local_pin.?;
+    }
+    try verifyNativeReceiptBytes(allocator, root, local_path, completion_bytes, true);
+    try completion_publication.boundary(.after_local_completion);
+    if (global_document) |document| {
+        if (std.mem.eql(u8, &document.document.attempt_id, &attempt.attemptId()) or attempt.record().provenance == .published) {
+            if (!std.mem.eql(u8, &document.document.digest_sha256, &local_document.?.document.digest_sha256))
+                return error.NativeCompletionMismatch;
+        }
+    }
+    if (global_document == null or !std.mem.eql(u8, &global_document.?.document.attempt_id, &attempt.attemptId())) {
+        try root.publishFile(global_path, completion_bytes, .{
+            .permissions = .fromMode(0o600),
+            .overwrite = .replace,
+            .durable = true,
+            .observer = .{ .context = &completion_publication, .hitFn = NativeCompletionPublication.hit },
+        });
+        if (global_pin) |*pin| pin.close();
+        global_pin = null;
+        global_pin = try root.pinRegularFile(global_path);
+        completion_publication.global = &global_pin.?;
+    }
+    try verifyNativeReceiptBytes(allocator, root, global_path, completion_bytes, true);
+    try completion_publication.boundary(.after_root_completion);
+    if (attempt.record().provenance == .pending)
+        try attempt.publishProvenance(allocator, local_document.?.document.digest_sha256);
+    try validateNativeCompletion(input, local_document.?.document, discharge, outcome);
+    try completion_publication.boundary(.after_provenance);
+    try completion_publication.boundary(.before_native_acknowledgment);
+    {
+        var live = try verifyNativePackageState(allocator, input);
+        defer live.deinit();
+        if ((live == .failed) != failed) return error.NativeReceiptMismatch;
+    }
+    try completion_publication.validate();
+    try native_runtime.acknowledge(allocator, attempt, input.expected_receipt_sha256);
+    try completion_publication.boundary(.after_native_acknowledgment);
+    try completion_publication.boundary(.before_clear);
+    try attempt.clear();
+    context.document = local_document;
+    local_document = null;
 }
 
 const NativeRefreshClock = struct {
@@ -2849,6 +3197,7 @@ const RootOperationGuard = struct {
     attempt: ?root_operation.Attempt = null,
     acquisition_observer: ?root_operation.AcquisitionObserver = null,
     root_projection: ?*const live_root.Projection = null,
+    native_completion_only: bool = false,
 
     fn open(
         self: *RootOperationGuard,
@@ -2889,6 +3238,14 @@ const RootOperationGuard = struct {
         if (backend == .native) {
             prior = self.coordinator.inspect(self.allocator) catch |err|
                 return mapRootOperationError(err);
+            if (self.native_completion_only) {
+                const record = if (prior) |value| value.record else return mapRootOperationError(error.NoActiveAttempt);
+                if (record.backend != .native or !record.operation.eql(.{ .repository_bootstrap = .add }) or
+                    !record.mutation_started or record.program_sha256 == null or
+                    !std.mem.eql(u8, &record.request_sha256, &request_digest) or
+                    !std.mem.eql(u8, &record.policy_sha256, &policy_digest))
+                    return mapRootOperationError(error.AttemptMismatch);
+            }
             const retain_architecture = if (prior) |value| blk: {
                 const record = value.record;
                 break :blk record.state.blocksMutation() or
@@ -2910,6 +3267,10 @@ const RootOperationGuard = struct {
                 foreign_architectures = discovered.?.architecture.foreign;
             }
         }
+        var completion_acquisition: NativeCompletionAcquisition = .{
+            .guard = self,
+            .expected_sha256 = if (prior) |value| value.record.digest_sha256 else @splat(0),
+        };
         self.attempt = self.coordinator.acquire(self.allocator, .{
             // Repository bootstrap is resumable by construction: its durable
             // operation state already replays acquisition, planning, install,
@@ -2918,7 +3279,8 @@ const RootOperationGuard = struct {
             // request adopts its own evidence and finishes it, while a
             // different descriptor, architecture, policy, or package
             // operation is still refused and leaves the evidence untouched.
-            .intent = .same_operation,
+            .intent = if (self.native_completion_only and backend == .native) .recovery else .same_operation,
+            .adopt_settled_for_acknowledgment = self.native_completion_only and backend == .native,
             .existing = .reclaim_resolved,
             .backend = backend,
             .operation = .{ .repository_bootstrap = .add },
@@ -2927,9 +3289,17 @@ const RootOperationGuard = struct {
             .target_architecture = native_architecture,
             .foreign_architectures = foreign_architectures,
             .wait_ms = request.state.lock_wait_ms,
-            .acquisition_observer = self.acquisition_observer,
+            .acquisition_observer = if (self.native_completion_only and backend == .native)
+                .{ .context = &completion_acquisition, .hitFn = NativeCompletionAcquisition.hit }
+            else
+                self.acquisition_observer,
         }) catch |err| return mapRootOperationError(err);
         if (backend == .native) {
+            if (self.native_completion_only) {
+                validateNativeRepositoryCaller(request, &self.attempt.?) catch |err| return mapRootOperationError(err);
+                if (!std.mem.eql(u8, &self.attempt.?.record().digest_sha256, &prior.?.record.digest_sha256))
+                    return mapRootOperationError(error.AttemptMismatch);
+            }
             const clean = native_runtime.canAbandon(self.allocator, &self.attempt.?) catch |err|
                 return mapRootOperationError(err);
             if (!self.attempt.?.adopted and !clean)
@@ -3169,13 +3539,31 @@ const RootOperationGuard = struct {
                         if (!clean) break :cleanup;
                     }
                     value.abandonIfPreMutation(self.allocator) catch {};
-                } else if (value.record().clearable()) value.clear() catch {};
+                } else if (value.record().backend != .native and value.record().clearable()) value.clear() catch {};
             }
             value.release();
         }
         self.attempt = null;
         if (self.owned_root) |*value| value.close();
         self.owned_root = null;
+    }
+};
+
+const NativeCompletionAcquisition = struct {
+    guard: *RootOperationGuard,
+    expected_sha256: [32]u8,
+
+    fn hit(raw: *anyopaque, point: root_operation.AcquisitionPoint) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.guard.acquisition_observer) |observer| try observer.hit(point);
+        if (point != .after_lock_acquired) return;
+        try self.guard.coordinator.validateProjection();
+        // Recovery adoption is deliberately broad in core. Authenticate the
+        // exact original caller under exclusion before core can reclaim it.
+        var current = try self.guard.coordinator.store().read(self.guard.allocator) orelse return error.NoActiveAttempt;
+        defer current.deinit();
+        if (!std.mem.eql(u8, &current.record.digest_sha256, &self.expected_sha256))
+            return error.AttemptMismatch;
     }
 };
 
@@ -6841,6 +7229,7 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
     const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
     const manifest_path = try root_fs.Path.init(paths.manifest_logical[1..]);
     if (case == .success and pass == 0) {
+        try std.testing.expectError(error.RepositoryPostInstallIncomplete, completeNative(allocator, input));
         var expired = input;
         expired.deadline.expires_at_ms = 0;
         try std.testing.expectError(error.DeadlineExceeded, importAndRefreshNative(allocator, expired, dependencies));
@@ -6883,15 +7272,15 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         try std.testing.expectEqual(state_module.Phase.installed, failed.state.phase);
         try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);
         var crash: NativeReceiptTestCrash = .{ .point = .after_rename };
-        try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), dependencies));
+        try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), .{ .post_install = dependencies }));
         try std.testing.expect(try root.entryIfExists(manifest_path) != null);
         var clock: RepositoryExecutionClock = .{ .root = root };
         var bounded = input;
         bounded.deadline = clock.deadline();
         var expiration: NativeCheckpointTestBoundary = .{ .root = root, .state_path = state_path, .clock = &clock };
-        try std.testing.expectError(error.DeadlineExceeded, nativeRepositoryCheckpoint(allocator, bounded, expiration.observer(), dependencies));
+        try std.testing.expectError(error.DeadlineExceeded, nativeRepositoryCheckpoint(allocator, bounded, expiration.observer(), .{ .post_install = dependencies }));
         var replacement: NativeCheckpointTestBoundary = .{ .root = root, .state_path = state_path };
-        try std.testing.expectError(error.PathChanged, nativeRepositoryCheckpoint(allocator, input, replacement.observer(), dependencies));
+        try std.testing.expectError(error.PathChanged, nativeRepositoryCheckpoint(allocator, input, replacement.observer(), .{ .post_install = dependencies }));
         const replaced = try root.readFileAlloc(allocator, state_path, 128);
         defer allocator.free(replaced);
         try std.testing.expectEqualStrings("changed during verification", replaced);
@@ -6908,10 +7297,10 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
             }
         };
         var change_material: ChangeMaterial = .{ .root = root, .path = source_path };
-        try std.testing.expectError(error.ImportedDigestMismatch, nativeRepositoryCheckpoint(allocator, input, .{ .context = &change_material, .hitFn = ChangeMaterial.hit }, dependencies));
+        try std.testing.expectError(error.ImportedDigestMismatch, nativeRepositoryCheckpoint(allocator, input, .{ .context = &change_material, .hitFn = ChangeMaterial.hit }, .{ .post_install = dependencies }));
         try root.removeFile(source_path);
         try root.rename(try root_fs.Path.init("fixture/import-changed-source"), source_path, .fail_if_exists);
-        try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), dependencies));
+        try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), .{ .post_install = dependencies }));
         acquisition.advance_ms_per_read = 1000;
         try std.testing.expectError(error.DeadlineExceeded, importAndRefreshNative(allocator, input, dependencies));
         acquisition.advance_ms_per_read = 0;
@@ -6925,6 +7314,7 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         try std.testing.expectEqual(state_module.Phase.imported, refresh_failed.state.phase);
         try std.testing.expect(refresh_failed.state.installed and !refresh_failed.state.refreshed);
         try std.testing.expectEqual(api.DiagnosticId.refresh_failed, refresh_failed.state.diagnostic_id.?);
+        try std.testing.expectError(error.RepositoryPostInstallIncomplete, completeNative(allocator, input));
     } else if (case == .success and pass == 1) {
         const saved = try root_fs.Path.init("fixture/import-missing-manifest");
         try root.rename(manifest_path, saved, .fail_if_exists);
@@ -6940,7 +7330,7 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
             }
         };
         var unused: u8 = 0;
-        try std.testing.expectError(error.InvalidRoot, nativeRepositoryCheckpoint(allocator, input, .{ .context = &unused, .hitFn = Revoke.hit }, dependencies));
+        try std.testing.expectError(error.InvalidRoot, nativeRepositoryCheckpoint(allocator, input, .{ .context = &unused, .hitFn = Revoke.hit }, .{ .post_install = dependencies }));
     } else {
         var checkpoint = try importAndRefreshNative(allocator, input, dependencies);
         defer checkpoint.deinit();
@@ -6980,6 +7370,271 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
     try std.testing.expectEqual(caller, attempt.record().digest_sha256);
     try std.testing.expectEqual(root_operation.Outcome.pending, attempt.record().outcome);
     try std.testing.expect(attempt.locked());
+}
+
+fn testNativeCompletionRefusals(input: NativeReceiptRequest) !void {
+    const allocator = std.testing.allocator;
+    const root = input.attempt.coordinator.root;
+    const caller = input.attempt.record().digest_sha256;
+    var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+    defer paths.deinit();
+    const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
+    const manifest_path = try root_fs.Path.init(paths.manifest_logical[1..]);
+    const local_text = try joinLogical(allocator, paths.operation_logical, root_operation_completion.document_name);
+    defer allocator.free(local_text);
+    const local_path = try root_fs.Path.init(local_text[1..]);
+    const global_path = try root_fs.Path.init(root_operation_completion.document_path);
+    const saved = try root_fs.Path.init("fixture/saved-completion-input");
+    const state_inode = (try root.entry(state_path)).inode;
+    var pin = try root.pinRegularFile(local_path);
+    defer pin.close();
+    var completion = try decodeNativeCompletion(allocator, &pin);
+    defer completion.deinit();
+    var wrong_request = completion.document.discharge;
+    wrong_request.request_sha256[0] ^= 1;
+    var different = try root_operation_completion.create(allocator, .{
+        .record = input.attempt.record(),
+        .transaction_provenance = completion.document.transaction_provenance,
+        .journal = completion.document.journal,
+        .discharge = wrong_request,
+    });
+    defer different.deinit();
+    const wrong_bytes = try different.document.canonicalJson(allocator);
+    defer allocator.free(wrong_bytes);
+    for ([_]root_fs.Path{ local_path, global_path }) |path| {
+        const inode = (try root.entry(path)).inode;
+        try root.rename(path, saved, .fail_if_exists);
+        try std.testing.expectError(error.NativeCompletionMissing, completeNative(allocator, input));
+        try std.testing.expect(try root.entryIfExists(path) == null);
+        try root.createSymbolicLink(path, "/fixture/saved-completion-input");
+        try std.testing.expectError(error.NotRegularFile, completeNative(allocator, input));
+        try root.removeFile(path);
+        try root.publishFile(path, "not a completion", .{});
+        try std.testing.expectError(error.NonCanonicalDocument, completeNative(allocator, input));
+        try root.publishFile(path, wrong_bytes, .{ .overwrite = .replace });
+        try std.testing.expectError(error.NativeCompletionMismatch, completeNative(allocator, input));
+        try root.removeFile(path);
+        try root.rename(saved, path, .fail_if_exists);
+        try std.testing.expectEqual(inode, (try root.entry(path)).inode);
+    }
+    try root.rename(manifest_path, saved, .fail_if_exists);
+    try std.testing.expectError(error.FileNotFound, completeNative(allocator, input));
+    try root.publishFile(manifest_path, "changed manifest", .{});
+    try std.testing.expectError(error.ImportedDigestMismatch, completeNative(allocator, input));
+    try root.removeFile(manifest_path);
+    try root.rename(saved, manifest_path, .fail_if_exists);
+    const state_bytes = try root.readFileAlloc(allocator, state_path, state_module.maximum_document_bytes);
+    defer allocator.free(state_bytes);
+    var current = try state_module.decode(allocator, state_bytes, state_module.maximum_document_bytes);
+    defer current.deinit();
+    var downgraded = current.state;
+    downgraded.phase = .refreshed;
+    var changed = try state_module.create(allocator, downgraded);
+    defer changed.deinit();
+    const changed_bytes = try changed.state.canonicalJson(allocator);
+    defer allocator.free(changed_bytes);
+    try root.rename(state_path, saved, .fail_if_exists);
+    try root.publishFile(state_path, changed_bytes, .{});
+    try std.testing.expectError(error.NativeCompletionMismatch, completeNative(allocator, input));
+    try root.removeFile(state_path);
+    try root.rename(saved, state_path, .fail_if_exists);
+    const discharge = completion.document.discharge.request_sha256;
+    var changed_state = current.state;
+    changed_state.digest_sha256[0] ^= 1;
+    var snapshot = try nativeRepositorySnapshot(allocator, input);
+    defer snapshot.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &discharge, &nativeCompletionRequestDigest(input, changed_state, snapshot.manifest.manifest.digest_sha256)));
+    var changed_manifest = snapshot.manifest.manifest.digest_sha256;
+    changed_manifest[0] ^= 1;
+    try std.testing.expect(!std.mem.eql(u8, &discharge, &nativeCompletionRequestDigest(input, current.state, changed_manifest)));
+    var wrong = completion.document;
+    wrong.outcome = .failed_after_mutation;
+    try std.testing.expectError(error.NativeCompletionMismatch, validateNativeCompletion(input, wrong, discharge, .succeeded));
+    wrong = completion.document;
+    wrong.foreign_architectures = &.{"riscv64"};
+    try std.testing.expectError(error.NativeCompletionMismatch, validateNativeCompletion(input, wrong, discharge, .succeeded));
+    wrong = completion.document;
+    wrong.transaction_provenance.document_sha256.?[0] ^= 1;
+    try std.testing.expectError(error.NativeCompletionMismatch, validateNativeCompletion(input, wrong, discharge, .succeeded));
+    try std.testing.expectEqual(state_inode, (try root.entry(state_path)).inode);
+    try std.testing.expectEqual(caller, input.attempt.record().digest_sha256);
+}
+
+fn testProjectedNativeCompletion(case: RepositoryExecutionCase, projection: *const live_root.Projection, pass: usize) !void {
+    const allocator = std.testing.allocator;
+    var named = try root_fs.openAbsoluteRoot(std.testing.io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    const request_bytes = try root.readFileAlloc(allocator, try root_fs.Path.init("fixture/repository-original-request.json"), api.maximum_document_bytes);
+    defer allocator.free(request_bytes);
+    var request = try std.json.parseFromSlice(api.Request, allocator, request_bytes, .{ .ignore_unknown_fields = false });
+    defer request.deinit();
+    if (case == .success and pass == 0) {
+        for (0..2) |index| {
+            var other = request.value;
+            if (index == 0) other.no_refresh = !other.no_refresh else other.resources.maximum_actions += 1;
+            var refused: RootOperationGuard = .{ .io = std.testing.io, .allocator = allocator, .root_projection = projection, .native_completion_only = true };
+            defer refused.deinit();
+            try std.testing.expect(refused.open(other, .native, 1_700_000_000) != null);
+            try std.testing.expect(refused.active() == null);
+        }
+        const RemoveCaller = struct {
+            fn hit(raw: *anyopaque, point: root_operation.AcquisitionPoint) !void {
+                if (point != .after_lock_acquired) return;
+                const target: *const root_fs.Root = @ptrCast(@alignCast(raw));
+                try target.rename(try root_fs.Path.init(root_operation.record_path), try root_fs.Path.init("fixture/saved-completion-caller"), .fail_if_exists);
+            }
+        };
+        var target = root;
+        var refused: RootOperationGuard = .{
+            .io = std.testing.io,
+            .allocator = allocator,
+            .root_projection = projection,
+            .native_completion_only = true,
+            .acquisition_observer = .{ .context = &target, .hitFn = RemoveCaller.hit },
+        };
+        defer refused.deinit();
+        try std.testing.expect(refused.open(request.value, .native, 1_700_000_000) != null);
+        try std.testing.expect(refused.active() == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+        try root.rename(try root_fs.Path.init("fixture/saved-completion-caller"), try root_fs.Path.init(root_operation.record_path), .fail_if_exists);
+    }
+    var guard: RootOperationGuard = .{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .root_projection = projection,
+        .native_completion_only = true,
+    };
+    defer guard.deinit();
+    if (guard.open(request.value, .native, 1_700_000_000)) |failure| {
+        std.debug.print("native completion adoption refused: {s}\n", .{failure.summary});
+        return error.TestUnexpectedResult;
+    }
+    const attempt = guard.active().?;
+    const original_id = attempt.attemptId();
+    var receipt = (try native_runtime.readCompletion(allocator, attempt)).?;
+    defer receipt.deinit();
+    var clock: RepositoryExecutionClock = .{ .root = root };
+    const input: NativeReceiptRequest = .{
+        .repository = request.value,
+        .attempt = attempt,
+        .expected_receipt_sha256 = receipt.document.digest_sha256,
+        .deadline = clock.deadline(),
+    };
+    if (pass == 0) {
+        const pending = try attempt.record().canonicalJson(allocator);
+        defer allocator.free(pending);
+        try root.publishFile(try root_fs.Path.init("fixture/repository-pending-caller.json"), pending, .{ .permissions = .fromMode(0o600) });
+        var changed = input;
+        changed.repository.no_refresh = !changed.repository.no_refresh;
+        try std.testing.expectError(error.RepositoryCallerMismatch, completeNative(allocator, changed));
+    }
+    const points: []const NativeCompletionPoint = if (case == .success) &.{
+        .after_final_state,           .after_completed_record, .before_completion_rename, .after_completion_rename,
+        .after_local_completion,      .after_root_completion,  .after_provenance,         .before_native_acknowledgment,
+        .after_native_acknowledgment, .before_clear,
+    } else &.{ .after_completed_record, .after_provenance, .after_native_acknowledgment };
+    const Observer = struct {
+        point: NativeCompletionPoint,
+        root: root_fs.Root,
+        attempt: *root_operation.Attempt,
+        clock: *RepositoryExecutionClock,
+        record_only: bool = false,
+
+        fn hit(raw: *anyopaque, point: NativeCompletionPoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (point != self.point) return;
+            if (self.record_only) {
+                const bytes = try self.attempt.record().canonicalJson(std.testing.allocator);
+                defer std.testing.allocator.free(bytes);
+                try self.root.publishFile(try root_fs.Path.init("fixture/repository-completed-caller.json"), bytes, .{ .permissions = .fromMode(0o600) });
+                return;
+            }
+            if (point == .before_completion_rename) {
+                const original = try self.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-retained-receipt-path"), root_fs.maximum_path_bytes);
+                defer std.testing.allocator.free(original);
+                const path_text = try std.fmt.allocPrint(std.testing.allocator, "{s}/apt-config-snapshot-v1.json", .{std.fs.path.dirname(original[1..]).?});
+                defer std.testing.allocator.free(path_text);
+                const path = try root_fs.Path.init(path_text);
+                const bytes = try self.root.readFileAlloc(std.testing.allocator, path, target_apt_config.maximum_document_bytes);
+                defer std.testing.allocator.free(bytes);
+                try self.root.rename(path, try root_fs.Path.init("fixture/replaced-completion-manifest"), .fail_if_exists);
+                try self.root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600) });
+                return;
+            }
+            if (point == .before_native_acknowledgment) {
+                try live_root.testing.replaceMountNamespace();
+                return;
+            }
+            if (point == .after_root_completion) {
+                self.clock.expired = true;
+                return;
+            }
+            if (point == .after_provenance) {
+                var intent = try native_recovery.readIntent(std.testing.allocator, self.root);
+                defer intent.deinit();
+                const blob = for (intent.intent.blobs) |value| {
+                    if (value.kind == .artifact) break value;
+                } else return error.InvalidProjectionFixture;
+                try self.root.removeFile(try root_fs.Path.init(blob.storage_path));
+            }
+            return error.InjectedNativeCompletionFailure;
+        }
+
+        fn interface(self: *@This()) NativeCompletionObserver {
+            return .{ .context = self, .hitFn = hit };
+        }
+    };
+    if (pass < points.len) {
+        var observer: Observer = .{ .point = points[pass], .root = root, .attempt = attempt, .clock = &clock };
+        try std.testing.expectError(switch (points[pass]) {
+            .before_completion_rename => error.PathChanged,
+            .before_native_acknowledgment => error.InvalidRoot,
+            .after_root_completion => error.DeadlineExceeded,
+            else => error.InjectedNativeCompletionFailure,
+        }, completeNativeObserved(allocator, input, observer.interface()));
+        if (points[pass] == .before_completion_rename) {
+            var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+            defer paths.deinit();
+            const path = try root_fs.Path.init(paths.manifest_logical[1..]);
+            try root.removeFile(path);
+            try root.rename(try root_fs.Path.init("fixture/replaced-completion-manifest"), path, .fail_if_exists);
+        }
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);
+        if (points[pass] == .after_native_acknowledgment or points[pass] == .before_clear)
+            try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+    } else {
+        if (case == .success) try testNativeCompletionRefusals(input);
+        var observer: Observer = .{ .point = .before_clear, .root = root, .attempt = attempt, .clock = &clock, .record_only = true };
+        var result = try completeNativeObserved(allocator, input, observer.interface());
+        defer result.deinit();
+        const failed = case == .known_failure;
+        try std.testing.expectEqual(if (failed) state_module.Phase.failed else .complete, result.checkpoint.state.state.phase);
+        try std.testing.expectEqual(failed, result.checkpoint.package_state == .failed);
+        try std.testing.expectEqual(if (failed) root_operation.Outcome.failed_after_mutation else .succeeded, result.completion.document.outcome);
+        try std.testing.expectEqual(result.completion.document.digest_sha256, attempt.record().provenance_sha256.?);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.progress_path)) == null);
+        const inode = (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode;
+        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        var repeated = try completeNative(counting.allocator(), input);
+        defer repeated.deinit();
+        try std.testing.expectEqual(result.completion.document.digest_sha256, repeated.completion.document.digest_sha256);
+        try std.testing.expectEqual(result.checkpoint.state.state.digest_sha256, repeated.checkpoint.state.state.digest_sha256);
+        try std.testing.expectEqual(inode, (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode);
+        for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+            try std.testing.expectError(error.OutOfMemory, completeNative(failing.allocator(), input));
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expectEqual(inode, (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode);
+        }
+    }
+    try std.testing.expectEqual(original_id, attempt.attemptId());
+    try std.testing.expect(attempt.locked());
+    const trace = try root.readFileAlloc(allocator, try root_fs.Path.init("repository-trace"), 1024);
+    defer allocator.free(trace);
+    try std.testing.expectEqualStrings("preinst\npostinst\n", trace);
 }
 
 test "repository backend native execution external fixture" {
@@ -7042,6 +7697,23 @@ test "repository backend native execution external fixture" {
             const result = try live_root.runProjected(.{ .context = &callback, .child = ImportCallback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository import case {t}, pass={d}: {any}\n", .{ case, pass, result });
+                return error.InvalidProjectionFixture;
+            }
+        }
+        const CompletionCallback = struct {
+            case: RepositoryExecutionCase,
+            pass: usize,
+            fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+                const self: *const @This() = @ptrCast(@alignCast(raw.?));
+                try testProjectedNativeCompletion(self.case, projection, self.pass);
+                return 0;
+            }
+        };
+        for (0..if (case == .success) @as(usize, 11) else 4) |pass| {
+            var callback: CompletionCallback = .{ .case = case, .pass = pass };
+            const result = try live_root.runProjected(.{ .context = &callback, .child = CompletionCallback.run });
+            if (result != .exited or result.exited != 0) {
+                std.debug.print("repository completion case {t}, pass={d}: {any}\n", .{ case, pass, result });
                 return error.InvalidProjectionFixture;
             }
         }
