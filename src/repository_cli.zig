@@ -9,6 +9,7 @@ pub const OutputFormat = enum {
 
 pub const ParsedAdd = struct {
     request: api.Request,
+    transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg,
     output: OutputFormat = .human,
 };
 
@@ -16,6 +17,7 @@ pub const ParseError = error{
     DuplicateArgument,
     InvalidDigest,
     InvalidNumber,
+    InvalidTransactionBackend,
     MissingUrl,
     MissingValue,
     OutOfMemory,
@@ -30,6 +32,7 @@ const Option = enum {
     no_refresh,
     json,
     architecture,
+    transaction_backend,
     cache_path,
     state_path,
     proxy,
@@ -94,6 +97,12 @@ pub fn parseAdd(arguments: []const []const u8) ParseError!ParsedAdd {
         } else if (std.mem.eql(u8, argument, "--architecture")) {
             try setOnce(&seen, .architecture);
             parsed.request.architecture = try next(arguments, &index);
+        } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
+            try setOnce(&seen, .transaction_backend);
+            parsed.transaction_backend = std.meta.stringToEnum(
+                debz.transaction_engine.Kind,
+                try next(arguments, &index),
+            ) orelse return error.InvalidTransactionBackend;
         } else if (std.mem.eql(u8, argument, "--cache-path")) {
             try setOnce(&seen, .cache_path);
             parsed.request.cache.path = try next(arguments, &index);
@@ -227,6 +236,7 @@ test "repo add parser applies host defaults and explicit overrides" {
     try std.testing.expect(defaults.request.state.path == null);
     try std.testing.expect(!defaults.request.no_refresh);
     try std.testing.expectEqual(OutputFormat.human, defaults.output);
+    try std.testing.expectEqual(debz.transaction_engine.Kind.legacy_dpkg, defaults.transaction_backend);
 
     const overridden = try parseAdd(&.{
         "--url",
@@ -300,6 +310,42 @@ test "repo add parser applies host defaults and explicit overrides" {
     try std.testing.expectEqual(@as(u64, 14), overridden.request.state.lock_wait_ms);
     try std.testing.expectEqual(@as(usize, 7), overridden.request.resources.maximum_actions);
     try std.testing.expectEqual(@as(u64, 112), overridden.request.resources.maximum_cache_growth_bytes);
+}
+
+test "repo add parser binds one explicit transaction backend" {
+    for (std.enums.values(debz.transaction_engine.Kind)) |backend| {
+        const parsed = try parseAdd(&.{
+            "--transaction-backend",
+            @tagName(backend),
+            "--url",
+            "https://packages.test/config.deb",
+        });
+        try std.testing.expectEqual(backend, parsed.transaction_backend);
+        try std.testing.expectEqual(api.api_version, parsed.request.api_version);
+    }
+    for ([_][]const u8{ "", "auto", "dpkg", "Native" }) |invalid| {
+        try std.testing.expectError(error.InvalidTransactionBackend, parseAdd(&.{
+            "--url",
+            "https://packages.test/config.deb",
+            "--transaction-backend",
+            invalid,
+        }));
+    }
+    try std.testing.expectError(error.MissingValue, parseAdd(&.{
+        "--url",
+        "https://packages.test/config.deb",
+        "--transaction-backend",
+    }));
+    for (std.enums.values(debz.transaction_engine.Kind)) |second| {
+        try std.testing.expectError(error.DuplicateArgument, parseAdd(&.{
+            "--url",
+            "https://packages.test/config.deb",
+            "--transaction-backend",
+            "native",
+            "--transaction-backend",
+            @tagName(second),
+        }));
+    }
 }
 
 test "repo add parser rejects missing duplicate malformed and positional inputs" {

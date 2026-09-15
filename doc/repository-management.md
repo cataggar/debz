@@ -27,6 +27,20 @@ bounds, byte limits, lock wait, and aggregate repository/action/metadata/
 package/cache budgets map directly to the v1 request fields; see
 `debz repo add --help` for spellings.
 
+`--transaction-backend legacy_dpkg|native` selects the production backend for
+this invocation; omission preserves `legacy_dpkg`. Selection is separate from
+the unchanged repository API v1 request and is passed directly to
+`ProductionRepositoryBackend.transaction_backend`. Duplicate, missing, and
+unknown selections are usage errors.
+
+Native repository bootstrap is not yet activated. Explicit `native` selection
+returns exit 3 with `transaction_backend_unavailable` before root access,
+operation-state creation, acquisition, or execution. It never falls back to
+dpkg, even when the root contains a completed legacy repository operation.
+The existing command-report executor cannot stand in for native typed
+preparation, receipts, or recovery. Core product and native system-profile
+support do not imply that repository bootstrap uses those contracts yet.
+
 `debz repo add` is the authorization to mutate the selected root. It does not
 accept or require `--assume-yes`, `--allow-host-root`,
 `--import-target-apt-config`, `--install-root`, `--refresh`, or a separate

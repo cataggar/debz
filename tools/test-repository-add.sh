@@ -102,7 +102,7 @@ EOF
 }
 
 full_root="$workspace/full-root"
-full_output=$(run_harness "$full_root")
+full_output=$(run_harness "$full_root" --transaction-backend legacy_dpkg)
 printf '%s' "$full_output" | grep -q 'FIRST=.*"exit_status":0'
 printf '%s' "$full_output" | grep -q 'FIRST=.*"changed":true'
 printf '%s' "$full_output" | grep -q 'FIRST=.*"refreshed_phase":"complete"'
@@ -129,6 +129,40 @@ printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed":false'
 in_release_after=$(grep -c '/repository/dists/debian-stable/InRelease' "$request_log")
 test $((in_release_after - in_release_before)) -eq 2
 test ! -e "$no_refresh_root/etc/apt/sources.list.d/host.list"
+
+"$debz" repo add --transaction-backend invalid --help >"$workspace/backend-help"
+grep -Fq -- '--transaction-backend legacy_dpkg|native' "$workspace/backend-help"
+grep -Fq 'Native repository execution is unavailable' "$workspace/backend-help"
+
+find "$full_root" -type f -exec sha256sum {} + >"$workspace/legacy-before"
+LC_ALL=C sort "$workspace/legacy-before" -o "$workspace/legacy-before"
+requests_before=$(wc -l <"$request_log")
+mkdir -p "$workspace/native-empty"
+for native_root in "$workspace/native-missing" "$workspace/native-empty" "$full_root"; do
+  set +e
+  native=$("$debz" repo add \
+    --url "$descriptor_url" \
+    --root "$native_root" \
+    --sha256 "$descriptor_sha256" \
+    --architecture amd64 \
+    --transaction-backend native \
+    --json 2>"$harness_stderr")
+  native_status=$?
+  set -e
+  test "$native_status" -eq 3
+  test ! -s "$harness_stderr"
+  printf '%s' "$native" | grep -q '"id":"transaction_backend_unavailable"'
+  printf '%s' "$native" | grep -q '"acquired":"pending"'
+  printf '%s' "$native" | grep -q '"changed":false'
+  printf '%s' "$native" | grep -q '"installed":false'
+  printf '%s' "$native" | grep -q '"operation_state":null'
+done
+test "$(wc -l <"$request_log")" -eq "$requests_before"
+test ! -e "$workspace/native-missing"
+test ! -e "$workspace/native-empty/var"
+find "$full_root" -type f -exec sha256sum {} + >"$workspace/legacy-after"
+LC_ALL=C sort "$workspace/legacy-after" -o "$workspace/legacy-after"
+cmp "$workspace/legacy-before" "$workspace/legacy-after"
 
 mismatch_root="$workspace/mismatch-root"
 mkdir -p "$mismatch_root/var/lib/dpkg"

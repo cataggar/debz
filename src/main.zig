@@ -132,6 +132,8 @@ const repository_add_help =
     \\Target options:
     \\  --root PATH                  Target root (default: /)
     \\  --architecture ARCH          Override target dpkg architecture
+    \\  --transaction-backend legacy_dpkg|native (default: legacy_dpkg)
+    \\    Native repository execution is unavailable; selection never falls back.
     \\  --cache-path PATH            Logical cache path inside the target root
     \\  --state-path PATH            Logical state path inside the target root
     \\  --sha256 DIGEST              Expected descriptor SHA-256
@@ -1367,7 +1369,10 @@ fn runRepository(
         std.process.exit(@intFromEnum(repository_api.ExitStatus.usage));
     };
 
-    var backend_context: debz.ProductionRepositoryBackend = .{ .io = init.io };
+    var backend_context: debz.ProductionRepositoryBackend = .{
+        .io = init.io,
+        .transaction_backend = parsed.transaction_backend,
+    };
     var result = repository_api.execute(
         init.arena.allocator(),
         parsed.request,
