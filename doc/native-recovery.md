@@ -166,13 +166,41 @@ Fresh-root target creation is outside this increment.
 
 ### Experimental typed runtime API
 
-`debz.native_runtime` exposes `execute`, `recover`, `readCompletion`, and
+`debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and
 `acknowledge` without exposing fixture controls or a command-shaped executor.
 It supports Linux non-host roots. The caller must retain a live, locked native
 `root_operation.Attempt` and its coordinator throughout each call. The runtime
 reopens the canonical named root without following symlinks and matches its
 device/inode against the held root before work; host roots, lost locks,
 legacy attempts, and mismatched root descriptors are refused.
+
+`execute` accepts an optional absolute `transaction_executor.Deadline` in its
+request. Repository callers can pass the same deadline used for acquisition
+and cache preparation: it is not reset at a native phase or script boundary.
+`recoverWithDeadline` applies a fresh invocation's absolute budget to persisted
+recovery; plain `recover` and requests without a deadline keep their existing
+behavior.
+
+This is a transient execution constraint, not a changed script policy or
+persisted clock. Program, authorization, invocation-policy and recovery hashes
+remain unchanged. The runtime checks expiry before helper work and execution
+intent, at native program/filesystem/database/script boundaries, and before
+terminal publication. Helper probes and running scripts poll cancellation;
+root mutation uses its existing per-step deadline and rollback machinery.
+For deadline handling, staging recovery inputs and publishing their intent
+form one bounded boundary: once started, they finish before the next expiry
+check rather than deliberately leaving a partial recovery workspace.
+Synchronous reads, hashing, validation and individual filesystem calls are
+cooperative boundaries, not interruptible hard real-time operations.
+
+Expiry before execution intent is a refusal. Once execution intent or mutation
+exists, it retains recovery authority and reports `deadline_exceeded` without
+inventing a terminal receipt or releasing the caller. Rollback, durable phase
+checkpoints and recording a stopped child's actual outcome may finish after
+expiry so recovery remains truthful. Once terminal publication begins, that
+durable publication also finishes rather than fabricating a timed-out
+completion. A new recovery budget can resume safe persisted phases, but it
+does not authorize replaying an unknown or deadline-cancelled script.
 
 Prepare with `native_runtime.scriptPolicy()` and supply the owned preparation
 plus immutable archive byte slices to `execute`. Inputs are borrowed for the
@@ -325,9 +353,18 @@ processing. The oracle recomputes every helper-bound invocation digest from
 retained request, program and script evidence. Missing targets, changed helper
 bytes and attempted helper-free recovery are refused.
 
+Cumulative-deadline cases exercise public helper-bound execution and recovery,
+including expired startup without a helper target, two scripts sharing one
+absolute budget, a durably cancelled child that cannot be replayed, and
+expired/fresh recovery using only persisted inputs. These run in the default
+amd64/arm64 recovery workload; `-Dnative-deadline-only=true` selects them for a
+focused local run. Native-unpack units additionally expire during filesystem
+rollback and after a database phase while preserving original caller authority.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2
+zig build test-native-recovery -Dnative-deadline-only=true -j2
 ```
 
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture

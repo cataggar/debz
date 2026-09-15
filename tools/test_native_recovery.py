@@ -81,6 +81,34 @@ class RecoveryOracleTests(unittest.TestCase):
                         )
                     run.assert_not_called()
 
+    def test_execution_deadline_requires_typed_helper_bound_caller(self) -> None:
+        for arguments in (
+            {"deadline_after_ms": 0},
+            {"deadline_after_ms": 0, "caller_owned": True},
+            {"deadline_after_ms": -1, "caller_owned": True, "isolated_helper": True},
+            {"deadline_after_ms": 0, "caller_owned": True, "isolated_helper": True, "core_product": True},
+        ):
+            with self.subTest(arguments=arguments), mock.patch.object(acceptance.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "execution deadlines require"):
+                    acceptance.native(
+                        self.workspace / "driver", self.root, "amd64", "recover",
+                        [], {}, self.workspace, **arguments,
+                    )
+                run.assert_not_called()
+
+    def test_execution_deadline_preserves_zero_in_private_fixture(self) -> None:
+        m.write(self.workspace / "native.report.json", b'{"outcome":"refused"}')
+        with mock.patch.object(
+            acceptance.subprocess, "run",
+            return_value=acceptance.subprocess.CompletedProcess([], 0),
+        ):
+            acceptance.native(
+                self.workspace / "driver", self.root, "amd64", "recover", [], {}, self.workspace,
+                caller_owned=True, isolated_helper=True, deadline_after_ms=0,
+            )
+        request = json.loads((self.workspace / "native.request.json").read_bytes())
+        self.assertEqual(request["deadline_after_ms"], 0)
+
     def test_ignored_crash_selector_cannot_pass_as_a_crash(self) -> None:
         with mock.patch.object(
             acceptance.subprocess, "run",

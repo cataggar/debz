@@ -142,8 +142,10 @@ The cache adapter requires the existing absolute operation `Deadline` and
 checks it before work, around object reads, and after native preparation.
 It does not reset the timeout or claim to interrupt a single read or CPU-bound
 preparation. Expiry and lock loss discard the result without changing caller
-authority. Native execution still needs its own cumulative-deadline integration
-before repository CLI activation.
+authority. The typed native runtime accepts the same absolute deadline for
+execution, with separately bounded persisted recovery; the repository caller
+must pass it through rather than starting a new timeout. Repository CLI
+activation still requires the complete caller-owned lifecycle below.
 
 Native caller request digests cover every cache, state, network, and aggregate
 resource field; native caller policy digests also bind the actual repository
