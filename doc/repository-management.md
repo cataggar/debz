@@ -257,6 +257,38 @@ execution, completes repository bootstrap, or releases root ownership. Durable
 outer installed/import/refresh state and completion remain future integration;
 the repository native CLI gate stays closed.
 
+### Verifying live native package state
+
+`verifyNativePackageState` takes the same `NativeReceiptRequest`, but verifies
+more than retained receipt bytes. It requires the current held original caller,
+the exact operation-local receipt, complete retained authorization/program and
+execution evidence, terminal progress and outcome, consistent active evidence,
+and the current native package database. It accepts no replacement plan, lock
+or archive and performs no package recovery.
+
+The owned `NativePackageState` result distinguishes `succeeded` from `failed`;
+call `deinit` when finished. Success proves the authorized final package closure
+and recorded database. Known failure proves its actual terminal failure and
+recorded database, not that the requested closure was installed. Missing,
+unknown, inconsistent or drifted evidence refuses without rewriting state or
+replaying scripts. Plain receipt retention/readback remains intentionally
+separate and does not acquire these stronger live-state semantics.
+
+The lower `native_transaction_result.verifyCallerSuccess` and
+`verifyCallerFailure` entry points use the already-held original native attempt
+and expected receipt digest. They share native evidence, progress and database
+verification with settled and owner-bound result verification, but do not
+require or fabricate an outer completion, a deferred owner or another lock.
+The repository adapter additionally authenticates the original repository
+request, checks retained bytes and enforces its shared deadline and projection
+scope before returning.
+
+Package database proof does not replace descriptor-file, import or refresh
+verification. Neither result publishes outer installed/failure state, completes
+bootstrap, acknowledges native execution or releases ownership. Durable outer
+state/completion and repository dispatch remain integration work; native CLI
+activation stays gated.
+
 ## Descriptor and repository trust
 
 The MVP descriptor is a Debian binary package. Unpinned acquisition requires

@@ -384,6 +384,16 @@ cover every publication boundary, no-follow storage and allocation cleanup. The
 default recovery workload includes these cases; use
 `-Dnative-repository-execution-only=true` for the focused family.
 
+Live repository package-state verification additionally exercises shared native
+authorization, progress, active-evidence and current-database checks under the
+original caller, without an outer completion or replacement lock. Real cases
+reject healthy-package database drift, unknown active evidence, canonical but
+inconsistent receipt progress metadata, opposite terminal outcomes, late expiry
+and scope loss after verification. Both success and known-failure paths cover
+allocation cleanup. Restored evidence and fresh legitimate callbacks verify
+without replay, acknowledgment or ownership changes. Existing settled and
+owner-bound verification remains covered by the core recovery family.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2
