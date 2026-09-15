@@ -2395,6 +2395,20 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
                           "authorization_sha256", "exact_lock", "plan_sha256", "foreign_architectures"):
                 assert completed_caller[field] == completion[field] == caller[field]
             assert completion["record_generation"] + 1 == completed_caller["generation"]
+            if resume:
+                historical_caller = document(root / "fixture/repository-history-caller.json")
+                assert historical_caller["attempt_id"] != caller["attempt_id"]
+                assert not historical_caller["mutation_started"] and historical_caller["program_sha256"] is None
+                assert historical_caller["outcome"] == "pending"
+                for field in ("request_sha256", "policy_sha256", "target_architecture", "foreign_architectures"):
+                    assert historical_caller[field] == caller[field]
+                if case == "success":
+                    preserved = json.loads((root / "fixture/repository-history-preserved.json").read_text())
+                    assert len(preserved) == 8 and len({value["path"] for value in preserved}) == 8
+                    for value in preserved:
+                        path = root / value["path"]
+                        assert path.stat().st_ino == value["inode"]
+                        assert list(hashlib.sha256(path.read_bytes()).digest()) == value["sha256"]
             assert completion["transaction_provenance"]["schema"] == proof["schema"]
             assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]
             assert completion["journal"]["status"] == "absent" and completion["journal"]["document_sha256"] is None

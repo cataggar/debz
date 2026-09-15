@@ -253,9 +253,9 @@ It requires the same original caller and exact runtime receipt, checks existing
 bytes without writing, and refuses missing retention rather than recreating it.
 This is caller-owned readback, not historical bootstrap proof or a current
 database verifier. Neither API marks packages installed, acknowledges native
-execution, completes repository bootstrap, or releases root ownership. Durable
-outer installed/import/refresh state and completion remain future integration;
-the repository native CLI gate stays closed.
+execution, completes repository bootstrap, or releases root ownership. Use the
+live-state and lifecycle adapters below for those additional guarantees; the
+repository native CLI gate stays closed.
 
 ### Verifying live native package state
 
@@ -429,8 +429,9 @@ Acknowledgment itself uses the existing native cleanup routine; this does not
 add a separate deadline guard to each unlink. Interruptions retain the original
 caller for fresh scoped recovery, including partial acknowledgment. Repeating
 completion after root clear is supported only under the same still-held caller.
-Fresh startup after a fully cleared root, historical reconciliation,
-unchanged/no-receipt outcomes and public/private dispatch remain separate work.
+Use the read-only historical adapter below under a fresh clean caller after
+root clear. Unchanged/no-receipt outcomes and public/private dispatch remain
+separate work.
 Call `deinit` on the returned owned `NativeRepositoryCompletion`.
 
 ### Resuming the native repository pipeline
@@ -459,13 +460,52 @@ The owned `NativeRepositoryResume` explicitly distinguishes:
   receipt. No import, refresh, acknowledgment or outer completion is attempted.
 - `completed`: the owned repository completion, preserving successful versus
   known-failed package outcomes and the completion ordering above.
+- `historical`: verified latest matching retained history under a different,
+  clean held caller, without replaying execution or publishing new completion.
 
 Completed repository state skips import/refresh and resumes acknowledgment from
-retained proof even after native blobs are gone. A fully cleared root under a
-new caller refuses historical repository completion instead of interpreting it
-as not-started or reinstalling. Historical reconciliation and actual
-unchanged/no-receipt completion remain separate work. Call `deinit` on the
-returned result; none of these outcomes releases the supplied caller's lock.
+retained proof even after native blobs are gone. A fresh clean caller encountering
+advanced repository evidence uses historical verification instead of interpreting
+it as not-started or reinstalling. Missing, corrupt or mismatched history refuses;
+it never starts replacement execution. Actual unchanged/no-receipt completion
+remains separate work. Call `deinit` on the returned result; none of these
+outcomes releases the supplied caller's lock.
+
+### Reading retained native repository history
+
+`readNativeRepositoryHistory` accepts a `NativeRecoveryRequest` under a clean
+held native repository/add caller. That caller supplies current exclusion and
+projection authority, not the old execution identity. The adapter requires a
+different original completion attempt ID, the same original request/policy and
+architecture identities, no active native evidence or deferred/review ownership,
+and an unchanged active caller record. It neither creates an old `Attempt` nor
+adopts, acknowledges, completes or clears either caller.
+
+The operation-local and shared completion must be byte-identical canonical
+documents, as must their native receipts. Original state, executable plan and
+v2 lock are pinned and checked against the historical completion's evidence.
+The discharge digest uses the **original** attempt ID and terminal state.
+Successful history additionally requires the recorded refresh (unless the
+original request selected no-refresh), exact installed descriptor material,
+and the original manifest matching the live target configuration. A known
+package failure remains a failed result with its actual recorded database;
+it is never evidence of successful bootstrap.
+
+Native verification rechecks retained authorization, program, execution and
+helper evidence, policy, artifact origins and the complete current database.
+Repository locks cover operation packages rather than every installed package.
+The original executor-policy digest must explicitly bind `locked_packages`:
+every locked package and artifact is still checked, while unrelated preserved
+packages, including holds, remain part of the full native database proof.
+Existing package-transaction full-closure verification is unchanged.
+
+All input pins, live manifest, held caller, projection and the original deadline
+are revalidated before returning the owned `NativeRepositoryHistory`; call
+`deinit` when finished. Repeated reads preserve historical bytes/inodes and the
+fresh caller's record and lock. This intentionally recognizes only the **latest
+matching history**: a newer shared completion/receipt or changed live state
+refuses, even if an older operation-local document still exists. It is not an
+arbitrary historical lookup, unchanged-result adapter or CLI activation.
 
 ## Descriptor and repository trust
 
