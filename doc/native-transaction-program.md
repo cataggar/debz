@@ -52,10 +52,11 @@ repository bootstrap: unrelated healthy installed packages are retained from
 the captured database with their exact identities and holds, without inventing
 lock entries, archive origins, or package actions. The native authorization and
 program still bind the complete intended final database and the consumed
-database generation, not just the locked subset. Every changed package still
-requires its original lock and archive evidence; locked retained identities and
-holds remain exact. The verification scope is bound by the executor-policy
-digest and cannot be changed after preparation.
+database generation, not just the locked subset. Every archive-producing action
+still requires its original lock and archive evidence; removals remain bound to
+the original plan and installed identity. Locked retained identities and holds
+remain exact. The verification scope is bound by the executor-policy digest and
+cannot be changed after preparation.
 
 Unhealthy unrelated packages refuse preparation. Pending or awaited trigger
 states require explicit trigger authority even when their trigger-name arrays
