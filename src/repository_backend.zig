@@ -4,6 +4,7 @@ const archive_application = @import("archive_application.zig");
 const api = @import("repository_api.zig");
 const state_module = @import("repository_state.zig");
 const local_artifact = @import("local_artifact.zig");
+const live_root = @import("live_root.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
@@ -237,6 +238,8 @@ pub const Backend = struct {
     transaction_backend: transaction_engine.Kind = .legacy_dpkg,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
+    /// Borrowed only for this native invocation; never request or state data.
+    root_projection: ?*const live_root.Projection = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
     operation_locks: ?transaction_executor.LockManager = null,
     target_locks: ?transaction_executor.LockManager = null,
@@ -291,7 +294,11 @@ pub const Backend = struct {
         // start while the other holds an unresolved attempt. The transaction
         // backend was already selected above, so an unavailable native
         // selection still fails before any root access.
-        var guard: RootOperationGuard = .{ .io = self.io, .allocator = allocator };
+        var guard: RootOperationGuard = .{
+            .io = self.io,
+            .allocator = allocator,
+            .root_projection = self.root_projection,
+        };
         defer guard.deinit();
         if (guard.open(request, transaction_backend, self.now_unix)) |failure| return failure;
 
@@ -2162,6 +2169,7 @@ const RootOperationGuard = struct {
     coordinator: root_operation.Coordinator = undefined,
     attempt: ?root_operation.Attempt = null,
     acquisition_observer: ?root_operation.AcquisitionObserver = null,
+    root_projection: ?*const live_root.Projection = null,
 
     fn open(
         self: *RootOperationGuard,
@@ -2176,6 +2184,12 @@ const RootOperationGuard = struct {
                 "target",
                 "target root is unsafe or unavailable",
             );
+        if (backend == .native) native_operation.validateInstallRoot(
+            self.io,
+            self.owned_root.?.root,
+            request.root,
+            self.root_projection,
+        ) catch |err| return mapRootOperationError(err);
         self.locks = .{ .allocator = self.allocator, .io = self.io };
         self.coordinator = root_operation.Coordinator.open(
             self.io,
@@ -2183,6 +2197,7 @@ const RootOperationGuard = struct {
             request.root,
             self.locks.interface(),
         ) catch |err| return mapRootOperationError(err);
+        self.coordinator.root_projection = if (backend == .native) self.root_projection else null;
         self.coordinator.now_unix = now_unix;
         const request_digest = repositoryRequestDigest(request, backend);
         const policy_digest = repositoryPolicyDigest(request, backend);
@@ -2516,6 +2531,11 @@ fn mapRootOperationError(err: anyerror) api.Result {
         error.NamespaceUnavailable,
         error.HostRootNotSupported,
         error.OperationRootMismatch,
+        error.InvalidProjection,
+        error.RootReplaced,
+        error.RuntimeReplaced,
+        error.LockReplaced,
+        error.MountpointReplaced,
         => api.failure(
             .usage,
             .invalid_root,
@@ -5218,6 +5238,187 @@ test "repository backend native preparation preserves discovered multiarch calle
     try testNativePreparation(.discovered_architecture);
     try testNativePreparation(.changed_foreign_architecture);
     try testNativePreparation(.duplicate_foreign_architecture);
+}
+
+const ProjectedRepositoryCase = enum { prepare, adopt, after_lock, cleanup };
+
+fn projectedRepositoryCaller(case: ProjectedRepositoryCase, projection: *const live_root.Projection) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    const bytes = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const request: api.Request = .{
+        .root = live_root.logical_root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(bytes),
+    };
+    if (case == .prepare) {
+        var backend: Backend = .{ .io = io, .transaction_backend = .native, .root_projection = projection };
+        var gated = try backend.execute(allocator, request);
+        defer gated.deinit();
+        try std.testing.expectEqual(api.DiagnosticId.transaction_backend_unavailable, gated.diagnostics[0].id);
+        try std.testing.expect(backend.root_projection == projection);
+        for ([_]struct { path: []const u8, authority: ?*const live_root.Projection }{
+            .{ .path = live_root.logical_root_path, .authority = null },
+            .{ .path = "/", .authority = projection },
+            .{ .path = "/fixture", .authority = projection },
+        }) |invalid| {
+            var rejected: RootOperationGuard = .{
+                .io = io,
+                .allocator = allocator,
+                .root_projection = invalid.authority,
+            };
+            defer rejected.deinit();
+            var changed = request;
+            changed.root = invalid.path;
+            var failure = rejected.open(changed, .native, 1_700_000_000) orelse return error.TestUnexpectedResult;
+            defer failure.deinit();
+            try std.testing.expectEqual(api.DiagnosticId.invalid_root, failure.diagnostics[0].id);
+            try std.testing.expect(rejected.active() == null);
+        }
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.namespace_path)) == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("fixture/var/lib/debz")) == null);
+        try stageNativePreparationDatabase(root, native_architecture_status ++ native_preparation_held_status);
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\ni386\narm64\n", .{});
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
+
+        try root.dir.createDirPath(io, "fixture/legacy");
+        var legacy: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
+        defer legacy.deinit();
+        var legacy_request = request;
+        legacy_request.root = "/fixture/legacy";
+        try std.testing.expect(legacy.open(legacy_request, .legacy_dpkg, 1_700_000_000) == null);
+        try std.testing.expect(legacy.coordinator.root_projection == null);
+    }
+    var guard: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
+    defer guard.deinit();
+    var observer_context: u8 = 0;
+    if (case == .after_lock) {
+        const Observer = struct {
+            fn hit(_: *anyopaque, _: root_operation.AcquisitionPoint) !void {
+                try live_root.testing.replaceMountNamespace();
+            }
+        };
+        guard.acquisition_observer = .{ .context = &observer_context, .hitFn = Observer.hit };
+        var failure = guard.open(request, .native, 1_700_000_000) orelse return error.TestUnexpectedResult;
+        defer failure.deinit();
+        try std.testing.expectEqual(api.DiagnosticId.invalid_root, failure.diagnostics[0].id);
+        try std.testing.expect(guard.active() == null);
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+        return;
+    }
+    try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+    const attempt = guard.active().?;
+    try std.testing.expect(guard.coordinator.root_projection == projection);
+    try std.testing.expectEqual(case == .adopt, attempt.adopted);
+    if (case == .adopt) {
+        const expected = try root.readFileAlloc(allocator, try root_fs.Path.init("fixture/repository-caller-digest"), 32);
+        defer allocator.free(expected);
+        try std.testing.expectEqualSlices(u8, expected, &attempt.record().digest_sha256);
+    }
+    var model = switch (archive_application.prepare(allocator, bytes, .{ .local = .{} }, .{})) {
+        .model => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer model.deinit();
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(sha256(bytes)),
+        .sha256 = sha256(bytes),
+        .size = bytes.len,
+        .package = model.facts.package,
+        .version = model.facts.version,
+        .architecture = model.facts.architecture,
+        .acquisition_url = request.descriptor_url,
+        .trust_mode = .pinned_sha256,
+    };
+    var fixture = BindingFixture.init(artifact);
+    var plan = fixture.plan();
+    var lock = try createOperationLock(allocator, plan, artifact, null, request, .native);
+    defer lock.deinit();
+    const input: NativePreparationRequest = .{
+        .repository = request,
+        .attempt = attempt,
+        .plan = &plan,
+        .exact_lock = &lock.lock,
+        .archives = &.{bytes},
+    };
+    const before = attempt.record().digest_sha256;
+    var prepared = try prepareNative(allocator, input);
+    defer prepared.deinit();
+    try std.testing.expect(prepared == .prepared);
+    try std.testing.expectEqual(before, attempt.record().digest_sha256);
+    try std.testing.expectEqualDeep(native_architecture_foreign, attempt.record().foreign_architectures);
+    try std.testing.expectEqualSlices(u8, &repositoryRequestDigest(request, .native), &attempt.record().request_sha256);
+    try std.testing.expectEqualSlices(u8, &repositoryPolicyDigest(request, .native), &attempt.record().policy_sha256);
+    if (case == .adopt) {
+        try std.testing.expectEqual(
+            transaction_executor.planDigest(plan),
+            try native_operation.boundPlan(root, attempt, prepared.prepared.program.program),
+        );
+    } else try native_operation.bind(allocator, root, attempt, prepared.prepared.program.program);
+    const bound = attempt.record().digest_sha256;
+    if (case != .adopt)
+        try root.publishFile(try root_fs.Path.init("fixture/repository-caller-digest"), &bound, .{});
+    if (case == .prepare) {
+        // Leave the genuine reservation for a separate callback to adopt.
+        attempt.release();
+        guard.attempt = null;
+    } else if (case == .cleanup) {
+        try live_root.testing.replaceMountNamespace();
+        try std.testing.expectError(error.InvalidProjection, prepareNative(allocator, input));
+        guard.deinit();
+        var retained = (try root_operation.Store.init(root).read(allocator)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(bound, retained.record.digest_sha256);
+    } else {
+        try std.testing.expectEqual(before, bound);
+        guard.deinit();
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+    }
+    try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.native_intent_path)) == null);
+    const status = try root.readFileAlloc(allocator, try root_fs.Path.init("var/lib/dpkg/status"), 4096);
+    defer allocator.free(status);
+    try std.testing.expectEqualStrings(native_architecture_status ++ native_preparation_held_status, status);
+}
+
+test "repository backend native projected caller external fixture" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const enabled = std.c.getenv("DEBZ_NATIVE_REPOSITORY_PROJECTION_FIXTURE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1") or std.os.linux.getpid() != 1)
+        return error.InvalidProjectionFixture;
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer root.close();
+    const marker = try root.root.readFileAlloc(
+        std.testing.allocator,
+        try root_fs.Path.init(".debz-native-projection"),
+        128,
+    );
+    defer std.testing.allocator.free(marker);
+    if (!std.mem.eql(u8, marker, "debz native projection fixture v1\n"))
+        return error.InvalidProjectionFixture;
+    const Callback = struct {
+        case: ProjectedRepositoryCase,
+        fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            try projectedRepositoryCaller(self.case, projection);
+            return 0;
+        }
+    };
+    for ([_]ProjectedRepositoryCase{ .prepare, .adopt, .after_lock, .cleanup, .adopt }) |case| {
+        var callback: Callback = .{ .case = case };
+        const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+        if (result != .exited or result.exited != 0) {
+            std.debug.print("repository projection case {t}: {any}\n", .{ case, result });
+            return error.InvalidProjectionFixture;
+        }
+    }
+    try root.root.publishFile(
+        try root_fs.Path.init("fixture/repository-projection-complete"),
+        "native repository projection fixture complete\n",
+        .{},
+    );
 }
 
 test "repository backend native preparation refuses changed caller lock plan and active evidence" {

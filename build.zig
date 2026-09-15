@@ -592,6 +592,7 @@ pub fn build(b: *std.Build) void {
             "production workflow external native fixture",
             "native_transaction_result.test.projected root external fixture",
             "apt_system_orchestrator.test.projected native dispatch external fixture",
+            "repository backend native projected caller external fixture",
         },
     });
     const native_lifecycle = b.addSystemCommand(&.{
@@ -690,6 +691,8 @@ pub fn build(b: *std.Build) void {
         native_recovery.addArg("--core-only");
     if (b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false)
         native_recovery.addArg("--deadline-only");
+    if (b.option(bool, "native-repository-projection-only", "Select native repository private-root authority cases") orelse false)
+        native_recovery.addArg("--repository-projection-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );

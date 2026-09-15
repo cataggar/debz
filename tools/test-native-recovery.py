@@ -2206,7 +2206,9 @@ def exercise_workflows(
         print(f"workflow-projected-{outcome}: scoped execution, fresh-owner verification, and acknowledgment passed", flush=True)
 
 
-def projection_inside(root: Path, workflow: bool = False) -> None:
+def projection_inside(root: Path, workflow: bool = False, repository: bool = False) -> None:
+    if workflow and repository:
+        raise ValueError("projection fixtures are mutually exclusive")
     root = root.resolve(strict=True)
     if (
         os.getpid() != 1 or os.geteuid() != 0
@@ -2224,18 +2226,22 @@ def projection_inside(root: Path, workflow: bool = False) -> None:
         "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp/.cache",
     }
     environment.update(
-        {"DEBZ_NATIVE_WORKFLOW_REQUEST": "/fixture/request.json"} if workflow
+        {"DEBZ_NATIVE_REPOSITORY_PROJECTION_FIXTURE": "1"} if repository
+        else {"DEBZ_NATIVE_WORKFLOW_REQUEST": "/fixture/request.json"} if workflow
         else {"DEBZ_NATIVE_PROJECTION_FIXTURE": "1"}
     )
     os.execve("/fixture/native-test", ["/fixture/native-test"], environment)
 
 
-def projected_process(root: Path, workflow: bool = False) -> subprocess.CompletedProcess:
+def projected_process(root: Path, workflow: bool = False, repository: bool = False) -> subprocess.CompletedProcess:
+    if workflow and repository:
+        raise ValueError("projection fixtures are mutually exclusive")
     return subprocess.run(
         [
             "unshare", "--mount", "--pid", "--fork",
             sys.executable, str(Path(__file__).resolve()),
-            "--projected-workflow-inside" if workflow else "--projection-inside", str(root),
+            "--repository-projection-inside" if repository
+            else "--projected-workflow-inside" if workflow else "--projection-inside", str(root),
         ],
         env={
             "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
@@ -2264,6 +2270,24 @@ def exercise_projection(executable: Path, workspace: Path) -> None:
     print("native-projection: exact invocation-bound read-only authority and refusal passed", flush=True)
 
 
+def exercise_repository_projection(executable: Path, workspace: Path, architecture: str) -> None:
+    root = workspace / "repository-projection" / "root"
+    m.make_root(root, architecture)
+    for directory in ("proc", "run", "tmp"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
+    lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+    result = projected_process(root, repository=True)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert (root / "fixture/repository-projection-complete").read_text() == "native repository projection fixture complete\n"
+    assert set((root / NAMESPACE).iterdir()) == {root / NAMESPACE / "root-operation.lock"}
+    assert not list((root / "run/debz/system-root").iterdir()), "repository projection leaked"
+    assert (root / "usr/share/held").read_bytes() == b"untouched\n"
+    assert "Status: hold ok installed\n" in (root / "var/lib/dpkg/status").read_text()
+    assert not (root / "var/lib/dpkg/info/packages-microsoft-prod.list").exists()
+    print("native-repository-projection: scoped caller preparation, adoption, and cleanup passed", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
@@ -2271,10 +2295,11 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--deadline-only", action="store_true")
+    parser.add_argument("--repository-projection-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
-    if arguments.core_only and arguments.deadline_only:
-        parser.error("--core-only and --deadline-only are mutually exclusive")
+    if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only)) > 1:
+        parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
     for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd", "unshare", "mount"):
@@ -2305,14 +2330,19 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if not arguments.core_only:
-                exercise_deadlines(executable, helper, workspace, environment, architecture)
-            if not arguments.deadline_only:
+            if arguments.repository_projection_only:
                 exercise_projection(executable, workspace)
+                exercise_repository_projection(executable, workspace, architecture)
+            else:
                 if not arguments.core_only:
-                    exercise(executable, helper, workspace, environment, architecture)
-                exercise_core(executable, helper, workspace, environment, architecture)
-                exercise_workflows(executable, workspace, environment, architecture, result_cli)
+                    exercise_deadlines(executable, helper, workspace, environment, architecture)
+                if not arguments.deadline_only:
+                    exercise_projection(executable, workspace)
+                    if not arguments.core_only:
+                        exercise_repository_projection(executable, workspace, architecture)
+                        exercise(executable, helper, workspace, environment, architecture)
+                    exercise_core(executable, helper, workspace, environment, architecture)
+                    exercise_workflows(executable, workspace, environment, architecture, result_cli)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")
@@ -2320,7 +2350,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] in ("--projection-inside", "--projected-workflow-inside"):
-        projection_inside(Path(sys.argv[2]), workflow=sys.argv[1] == "--projected-workflow-inside")
+    if len(sys.argv) == 3 and sys.argv[1] in (
+        "--projection-inside", "--projected-workflow-inside", "--repository-projection-inside",
+    ):
+        projection_inside(
+            Path(sys.argv[2]), workflow=sys.argv[1] == "--projected-workflow-inside",
+            repository=sys.argv[1] == "--repository-projection-inside",
+        )
     else:
         raise SystemExit(main())

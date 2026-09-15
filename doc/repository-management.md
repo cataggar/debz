@@ -94,6 +94,28 @@ root, architecture, complete original request, executor policy, and native
 lock request/policy bindings. Existing caller plan, lock, authorization,
 program, database-generation, and artifact bindings cannot be replaced.
 
+Before creating a native repository operation namespace, the root guard
+reuses the core product's native root admission rules. Literal `/` is refused,
+and a physical host-root alias requires the exact authority issued by
+`live_root.runProjected`. `Backend.root_projection` may borrow that opaque
+authority for the current trusted callback at `live_root.logical_root_path`;
+it is not an API request option, serialized permission, or host-root flag.
+
+Only native coordinators receive this authority. It is validated before
+namespace creation and again around root-lock acquisition, before publishing
+a record. Native preparation and cleanup retain the coordinator's original
+scope checks. A different path, descriptor, process, or mount namespace cannot
+inherit the callback's authority. If scope is lost, cleanup retains the
+original reservation rather than abandoning it without authority. A fresh
+supervised callback can adopt the same request and sticky program evidence.
+Legacy root admission and coordination do not inherit native projection
+authority.
+
+This supplies the repository caller's root-authority contract; it neither
+starts a private runner nor enables repository CLI native execution. Helper
+deployment, execution/receipt integration, and outer completion still require
+the complete lifecycle described below.
+
 Native repository reservations resolve target and foreign architectures using
 metadata-only `target_apt_config.inspectArchitecture`, borrowing the guard's
 pinned root. An explicit override or an installed `dpkg` status entry supplies

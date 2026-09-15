@@ -81,6 +81,36 @@ class RecoveryOracleTests(unittest.TestCase):
                         )
                     run.assert_not_called()
 
+    def test_projection_fixture_modes_cannot_be_combined(self) -> None:
+        for function in (acceptance.projection_inside, acceptance.projected_process):
+            with self.subTest(function=function.__name__), mock.patch.object(acceptance.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                    function(self.root, workflow=True, repository=True)
+                run.assert_not_called()
+
+    def test_repository_projection_uses_its_own_guarded_entry(self) -> None:
+        with mock.patch.object(
+            acceptance.subprocess, "run",
+            return_value=acceptance.subprocess.CompletedProcess([], 0),
+        ) as run:
+            acceptance.projected_process(self.root, repository=True)
+        command = run.call_args.args[0]
+        self.assertIn("--repository-projection-inside", command)
+        self.assertNotIn("--projected-workflow-inside", command)
+        self.assertEqual(command[-1], str(self.root))
+
+    def test_repository_projection_refuses_host_root_before_entering(self) -> None:
+        with (
+            mock.patch.object(acceptance.subprocess, "run") as run,
+            mock.patch.object(acceptance.os, "chroot") as chroot,
+            mock.patch.object(acceptance.os, "execve") as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "disposable root and private PID namespace"):
+                acceptance.projection_inside(Path("/"), repository=True)
+            run.assert_not_called()
+            chroot.assert_not_called()
+            execute.assert_not_called()
+
     def test_execution_deadline_requires_typed_helper_bound_caller(self) -> None:
         for arguments in (
             {"deadline_after_ms": 0},

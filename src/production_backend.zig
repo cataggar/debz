@@ -3312,22 +3312,7 @@ fn workflowReconciliationMarker(
     });
 }
 
-fn validateNativeRoot(
-    io: std.Io,
-    root: root_fs.Root,
-    install_root: []const u8,
-    projection: ?*const live_root.Projection,
-) !void {
-    if (std.mem.eql(u8, install_root, "/")) return error.HostRootNotSupported;
-    if (projection) |authority|
-        return authority.validateRoot(install_root, root.dir.handle);
-    var host = root_fs.openAbsoluteRoot(io, "/") catch return error.HostRootNotSupported;
-    defer host.close();
-    const held = try root.rootEntry();
-    const host_entry = try host.root.rootEntry();
-    if (held.device == host_entry.device and held.inode == host_entry.inode)
-        return error.HostRootNotSupported;
-}
+const validateNativeRoot = @import("native_operation.zig").validateInstallRoot;
 
 fn nativeRecoveryHasReplacement(options: api.CommonOptions) bool {
     return options.lock_input_path != null or options.lock_output_path != null or
