@@ -374,7 +374,8 @@ supervised root callbacks. They exercise successful and failed scripts,
 deadline interruption after intent, fresh persisted-only recovery after CAS
 eviction, stable repeated receipts and traces, missing helpers, unchanged
 closures and owned preparation diagnostics. Original caller ownership remains
-pending; package completion does not discharge repository bootstrap. Genuine
+pending through package and import/refresh callbacks; package completion does
+not discharge repository bootstrap. Genuine
 terminal receipts are retained in backend-distinct operation-local files and
 read back in fresh callbacks. Cases cover expired publication, interrupted
 rename/sync convergence, refusal to repair corrupt or missing bound retention,
@@ -418,7 +419,24 @@ and repeated refreshed checkpoints issue no refresh requests. Selected
 allocation failures preserve owned cleanup and checkpoint identity. The external
 oracle checks original bindings, imported source/keyring digests, truthful phase
 flags and private manifest/state permissions; caller ownership, helper identity
-and script traces remain unchanged throughout.
+and script traces remain unchanged throughout those stages.
+
+Final supervised callbacks exercise actual repository completion for refreshed
+success, original no-refresh success and known package failure. They interrupt
+terminal state, completed caller, local/shared completion publication,
+provenance publication, acknowledgment and root clear. Fresh callbacks adopt
+the original caller even after partial or completed native cleanup, without
+replaying scripts or reacquiring descriptor bytes. Coverage rejects incomplete
+refresh and outstanding diagnostics, changed request/policy, caller removal
+during lock acquisition, missing/corrupt/different bound completion, leaf
+symlinks, downgraded terminal state, missing/changed manifests, pinned-manifest
+replacement before completion rename, deadline expiry and namespace revocation.
+Selected allocation failures release owned results without replacing published
+evidence. Same-held-caller retries preserve state/completion identity and keep
+the lock after explicit root clear. The independent oracle checks canonical
+completion and discharge digests, original caller/receipt bindings, truthful
+success/failure, matching private local/shared completion, absence of active
+native inputs, and unchanged helper and script evidence.
 
 ```sh
 zig build test-native-recovery -j2

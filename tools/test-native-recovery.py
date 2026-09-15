@@ -2316,9 +2316,9 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert (root / "fixture/repository-execution-complete").read_text() == case
         assert not list((root / "run/debz/system-root").iterdir()), "repository execution projection leaked"
         assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir()), "repository recovery reused CAS inputs"
-        assert not (root / "var/lib/debz/root-operation-completion-v1.json").exists(), "package execution completed repository bootstrap"
+        assert not (root / OPERATION).exists(), "repository completion did not clear its caller"
         if terminal:
-            caller = document(root / OPERATION)
+            caller = document(root / "fixture/repository-pending-caller.json")
             assert caller["outcome"] == "pending"
             assert caller["surface"] == "repository_bootstrap" and caller["operation"] == "add"
             proof = document(root / "fixture/repository-native-receipt.json", 16 * 1024 * 1024)
@@ -2344,7 +2344,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
                           "plan_path", "plan_sha256", "exact_lock_path"):
                 assert checkpoint[field] == original[field]
             assert checkpoint["plan_sha256"] == caller["plan_sha256"]
-            assert checkpoint["phase"] == ("failed" if case == "known_failure" else "imported" if case == "interrupted" else "refreshed")
+            assert checkpoint["phase"] == ("failed" if case == "known_failure" else "complete")
             assert checkpoint["installed"] == (case != "known_failure")
             assert checkpoint["diagnostic_id"] == ("transaction_failed" if case == "known_failure" else None)
             assert checkpoint["provenance_path"] == retained_logical
@@ -2372,6 +2372,41 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
                     assert not checkpoint["no_refresh"]
                     assert (root / "var/cache/debz/metadata-v1").is_dir()
             assert stat.S_IMODE(checkpoint_path.stat().st_mode) == 0o600
+            completion_path = root / NAMESPACE / "root-operation-completion-v1.json"
+            local_completion = retained_path.parent / completion_path.name
+            assert completion_path.read_bytes() == local_completion.read_bytes()
+            assert stat.S_IMODE(completion_path.stat().st_mode) == 0o600
+            assert stat.S_IMODE(local_completion.stat().st_mode) == 0o600
+            completion = document(completion_path)
+            validator("root-operation-completion-v1").validate(completion)
+            completion_payload = dict(completion)
+            completion_digest = completion_payload.pop("digest_sha256")
+            assert hashlib.sha256(json.dumps(completion_payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest() == completion_digest
+            completed_caller = document(root / "fixture/repository-completed-caller.json")
+            assert completed_caller["state"] == "completed" and completed_caller["provenance"] == "published"
+            assert completed_caller["provenance_sha256"] == completion_digest
+            assert completion["outcome"] == ("failed_after_mutation" if case == "known_failure" else "succeeded")
+            for field in ("attempt_id", "request_sha256", "policy_sha256", "program_sha256",
+                          "authorization_sha256", "exact_lock", "plan_sha256", "foreign_architectures"):
+                assert completed_caller[field] == completion[field] == caller[field]
+            assert completion["record_generation"] + 1 == completed_caller["generation"]
+            assert completion["transaction_provenance"]["schema"] == proof["schema"]
+            assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]
+            assert completion["journal"]["status"] == "absent" and completion["journal"]["document_sha256"] is None
+            discharge = hashlib.sha256(b"debz-native-repository-completion-request-v1\0")
+            for field in ("attempt_id", "request_sha256", "policy_sha256"):
+                discharge.update(bytes.fromhex(caller[field]))
+            discharge.update(proof["digest_sha256"].encode())
+            discharge.update(bytes.fromhex(checkpoint["digest_sha256"]))
+            discharge.update(bytes([case != "known_failure"]))
+            if case != "known_failure":
+                discharge.update(bytes.fromhex(manifest["digest_sha256"]))
+            assert completion["discharge"] == {
+                "surface": "repository_bootstrap", "operation": "add", "request_sha256": discharge.hexdigest(),
+            }
+            assert not (root / INTENT).exists() and not (root / PROGRESS).exists()
+            assert not (root / NAMESPACE / "native-recovery-v1").exists()
+            assert not list((root / NAMESPACE).glob("native-recovery-v1-blob-*"))
             retained = retained_documents(root, proof)
             execution = retained["execution_request"][0]
             for field in ("request_sha256", "policy_sha256"):
@@ -2398,6 +2433,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert not helper_target.exists() and not (root / NAMESPACE / "native-helper-cache-v1").exists()
             assert not (root / "fixture/repository-native-receipt.json").exists()
             assert not (root / "fixture/repository-retained-receipt-path").exists()
+            assert not (root / NAMESPACE / "root-operation-completion-v1.json").exists()
             assert not (root / NAMESPACE / "repository").exists()
             assert not (root / "repository-trace").exists()
             assert not (root / "usr/share/doc/debz-native-repository/README").exists()
