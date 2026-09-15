@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 import jsonschema
 try:
@@ -88,6 +89,7 @@ def native(
     isolated_helper: bool = False,
     core_product: bool = False,
     completion_crash: str | None = None,
+    deadline_after_ms: int | None = None,
 ) -> dict | None:
     m.reference_command(root)
     if operation == "recover" and (archives or packages or crash_at is not None):
@@ -121,6 +123,10 @@ def native(
         if not caller_owned or operation != "recover":
             raise ValueError("native acknowledgment belongs to the recovering caller")
         request["acknowledge_native"] = True
+    if deadline_after_ms is not None:
+        if deadline_after_ms < 0 or not caller_owned or not isolated_helper or core_product:
+            raise ValueError("execution deadlines require a typed helper-bound caller")
+        request["deadline_after_ms"] = deadline_after_ms
     m.write(request_path, json.dumps(request).encode())
     with (destination / "native.log").open("wb") as output:
         result = subprocess.run(
@@ -592,7 +598,8 @@ class Scenario(triggers.Scenario):
 
     def recover(self, *, trigger_execution: bool = False, label: str = "recover",
                 caller_owned: bool = False, acknowledge_native: bool = False,
-                isolated_helper: bool = False, core_product: bool = False) -> dict:
+                isolated_helper: bool = False, core_product: bool = False,
+                deadline_after_ms: int | None = None) -> dict:
         destination = self.directory / label
         destination.mkdir()
         report = native(
@@ -601,6 +608,7 @@ class Scenario(triggers.Scenario):
             caller_owned=caller_owned, acknowledge_native=acknowledge_native,
             isolated_helper=isolated_helper,
             core_product=core_product,
+            deadline_after_ms=deadline_after_ms,
         )
         assert report is not None
         return report
@@ -705,6 +713,120 @@ class Scenario(triggers.Scenario):
         if m.oracle.differences(before, triggers.snapshot(self.candidate)):
             raise AssertionError("blocked mutation changed the interrupted root")
         print(f"{self.directory.name}: unresolved evidence stayed blocked", flush=True)
+
+
+def exercise_deadlines(executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str) -> None:
+    current = Scenario(workspace, "deadline-before-execution", executable, helper, architecture, environment)
+    archive = m.make_package(
+        workspace / "packages/deadline-before", environment, architecture, "1",
+        scripts=lifecycle.scripts(m.PACKAGE, "1"),
+    )
+    (current.candidate / triggers.HELPER).unlink()
+    destination = current.directory / "execute"
+    destination.mkdir()
+    before = triggers.snapshot(current.candidate)
+    report = native(
+        executable, current.candidate, architecture, "install", [archive], environment, destination,
+        caller_owned=True, isolated_helper=True, deadline_after_ms=0,
+    )
+    if report is None or report["outcome"] != "refused" or report["detail"] != "deadline_exceeded":
+        raise AssertionError(f"expired execution was not refused before helper deployment: {report}")
+    if document(current.candidate / OPERATION)["mutation_started"]:
+        raise AssertionError("expired execution crossed the mutation boundary")
+    for path in (INTENT, NAMESPACE / "native-helper-cache-v1"):
+        if (current.candidate / path).exists():
+            raise AssertionError(f"expired execution published native evidence: {path}")
+    if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+        raise AssertionError("expired execution changed package state")
+
+    current = Scenario(workspace, "deadline-script-cumulative", executable, helper, architecture, environment)
+    lifecycle.runtime.copy_program(current.candidate, Path("/bin/sleep"), "/bin/sleep")
+    helper_target = current.candidate / triggers.HELPER
+    shutil.copy2("/usr/bin/dpkg-trigger", helper_target)
+    helper_bytes, helper_inode = helper_target.read_bytes(), helper_target.stat().st_ino
+    scripts = lifecycle.scripts(m.PACKAGE, "1")
+    for kind in ("preinst", "postinst"):
+        scripts[kind] = scripts[kind].removesuffix(b"exit 0\n") + f"""
+printf '%s\\n' '{kind}-begin' >> /deadline-markers
+/bin/sleep 6
+printf '%s\\n' '{kind}-end' >> /deadline-markers
+exit 0
+""".encode()
+    archive = m.make_package(
+        workspace / "packages/deadline-script", environment, architecture, "1", scripts=scripts,
+    )
+    destination = current.directory / "execute"
+    destination.mkdir()
+    started = time.monotonic()
+    report = native(
+        executable, current.candidate, architecture, "install", [archive], environment, destination,
+        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000,
+    )
+    elapsed = time.monotonic() - started
+    if report is None or report["outcome"] != "recovery_required" or report["detail"] != "deadline_exceeded":
+        raise AssertionError(f"cumulative script deadline did not retain recovery: {report}")
+    markers = (current.candidate / "deadline-markers").read_text().splitlines()
+    if markers != ["preinst-begin", "preinst-end", "postinst-begin"] or elapsed > 25:
+        raise AssertionError(f"script deadline was reset, missed, or not polled: {markers}, {elapsed:.2f}s")
+    binding = caller_binding(current.candidate)
+    before = triggers.snapshot(current.candidate)
+    recovered = current.recover(
+        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000, label="fresh-script-recovery",
+    )
+    if recovered["outcome"] != "recovery_required" or recovered["detail"] != "script_outcome_unknown":
+        raise AssertionError(f"fresh recovery did not retain the cancelled script: {recovered}")
+    if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+        raise AssertionError("fresh recovery changed the cancelled script's state")
+    outcomes = [
+        document(path) for path in sorted((current.candidate / NAMESPACE).glob("native-script-outcome-v1-*.json"))
+    ]
+    for outcome in outcomes:
+        validator("native-script-outcome-v1").validate(outcome)
+        assert_digest(outcome, "native-script-outcome-v1")
+        assert_output_streams(outcome)
+        if not outcome["spawned"] or outcome["script_sha256"] != hashlib.sha256(scripts[outcome["kind"]]).hexdigest():
+            raise AssertionError("deadline evidence did not retain the actual script invocation")
+    if {(script["kind"], script["disposition"], script["exit_code"]) for script in outcomes} != {
+        ("preinst", "exited", 0), ("postinst", "cancelled", None),
+    } or len(outcomes) != 2:
+        raise AssertionError("deadline cancellation lost or fabricated a script outcome")
+    intent = document(current.candidate / INTENT, 16 * 1024 * 1024)
+    blobs = {blob["kind"]: blob["storage_path"] for blob in intent["blobs"]}
+    request = document(namespace_path(current.candidate, blobs["request"]), 16 * 1024 * 1024)
+    program = document(current.candidate / NAMESPACE / "native-transaction-program-v1.json", 16 * 1024 * 1024)
+    assert_helper_invocations(request, program, outcomes)
+    current.blocked(binding, caller_owned=True, isolated_helper=True)
+    if (current.candidate / "deadline-markers").read_text().splitlines() != markers:
+        raise AssertionError("fresh recovery replayed a deadline-cancelled script")
+    if helper_target.read_bytes() != helper_bytes or helper_target.stat().st_ino != helper_inode:
+        raise AssertionError("deadline handling replaced the package-owned helper target")
+
+    current = Scenario(workspace, "deadline-persisted-recovery", executable, helper, architecture, environment)
+    archive = m.make_package(
+        workspace / "packages/deadline-recovery", environment, architecture, "1",
+        scripts=lifecycle.scripts(m.PACKAGE, "1"),
+    )
+    binding = current.crash(
+        "install", [archive], "after_execution_intent", caller_owned=True, isolated_helper=True,
+    )
+    before_record = (current.candidate / OPERATION).read_bytes()
+    before = triggers.snapshot(current.candidate)
+    expired = current.recover(
+        caller_owned=True, isolated_helper=True, deadline_after_ms=0, label="expired-recovery",
+    )
+    if expired["outcome"] != "recovery_required" or expired["detail"] != "deadline_exceeded":
+        raise AssertionError(f"expired persisted recovery did not refuse: {expired}")
+    if (current.candidate / OPERATION).read_bytes() != before_record:
+        raise AssertionError("expired pre-mutation recovery rewrote caller authority")
+    if m.oracle.differences(before, triggers.snapshot(current.candidate)):
+        raise AssertionError("expired recovery changed package state")
+    recovered = current.recover(
+        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000, label="fresh-recovery",
+    )
+    if recovered["outcome"] != "applied":
+        raise AssertionError(f"fresh bounded recovery did not resume persisted inputs: {recovered}")
+    provenance(current.candidate, recovered, binding)
+    print("native deadlines: startup refusal, cumulative script cancellation, and persisted recovery passed", flush=True)
 
 
 def exercise(executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str) -> None:
@@ -2148,8 +2270,11 @@ def main() -> int:
     parser.add_argument("--native-helper", type=Path, required=True)
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--core-only", action="store_true")
+    parser.add_argument("--deadline-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
+    if arguments.core_only and arguments.deadline_only:
+        parser.error("--core-only and --deadline-only are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
     for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd", "unshare", "mount"):
@@ -2180,11 +2305,14 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            exercise_projection(executable, workspace)
             if not arguments.core_only:
-                exercise(executable, helper, workspace, environment, architecture)
-            exercise_core(executable, helper, workspace, environment, architecture)
-            exercise_workflows(executable, workspace, environment, architecture, result_cli)
+                exercise_deadlines(executable, helper, workspace, environment, architecture)
+            if not arguments.deadline_only:
+                exercise_projection(executable, workspace)
+                if not arguments.core_only:
+                    exercise(executable, helper, workspace, environment, architecture)
+                exercise_core(executable, helper, workspace, environment, architecture)
+                exercise_workflows(executable, workspace, environment, architecture, result_cli)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")

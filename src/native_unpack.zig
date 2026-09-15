@@ -56,6 +56,41 @@ const version_module = @import("debian_version.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const RuntimeBounds = struct {
+    deadline: ?transaction_executor.Deadline = null,
+    expired: bool = false,
+
+    fn check(self: *RuntimeBounds) error{DeadlineExceeded}!void {
+        if (self.expired) return error.DeadlineExceeded;
+        if (self.deadline) |deadline| {
+            _ = deadline.remainingMs() catch {
+                self.expired = true;
+                return error.DeadlineExceeded;
+            };
+        }
+    }
+
+    fn cancellation(self: *RuntimeBounds) maintainer_script.Cancellation {
+        return .{ .context = self, .cancelledFn = cancelled };
+    }
+
+    fn observeMutation(self: *RuntimeBounds, report: root_mutation.Report) void {
+        if (report.diagnostic) |diagnostic| {
+            if (diagnostic.code == .deadline_exceeded) self.expired = true;
+        }
+    }
+
+    fn cancelled(context: *anyopaque) bool {
+        const self: *RuntimeBounds = @ptrCast(@alignCast(context));
+        self.check() catch return true;
+        return false;
+    }
+};
+
+fn checkRuntimeBounds(bounds: ?*RuntimeBounds) !void {
+    if (bounds) |value| try value.check();
+}
+
 const ExecutionState = struct {
     recovery: ?*native_recovery.Runtime = null,
     action: ?native_recovery.Action = null,
@@ -63,6 +98,11 @@ const ExecutionState = struct {
     phase_ordinal: u16 = 0,
     script_ordinal: u32 = 0,
     phase_steps: ?[]const root_mutation.Step = null,
+    bounds: ?*RuntimeBounds = null,
+
+    fn checkDeadline(self: *ExecutionState) !void {
+        try checkRuntimeBounds(self.bounds);
+    }
 };
 
 fn nativeAction(
@@ -104,7 +144,8 @@ fn beginNativePhase(execution: *ExecutionState, kind: native_recovery.ActionKind
 fn beginNativeProgramStep(
     execution: *ExecutionState,
     step: native_program.Step,
-) native_program.Operation {
+) !native_program.Operation {
+    try execution.checkDeadline();
     execution.program_step = step.sequence;
     execution.phase_ordinal = 0;
     execution.script_ordinal = 0;
@@ -7810,6 +7851,7 @@ fn materialize(
 ) !MaterializationResult {
     var standalone_execution: ExecutionState = .{};
     const execution = request.execution orelse &standalone_execution;
+    try execution.checkDeadline();
     const previous_action = execution.action;
     _ = beginNativePhase(execution, .filesystem);
     defer execution.action = previous_action;
@@ -8017,6 +8059,7 @@ fn materialize(
                 .beforeFn = CombinedMutationHooks.before,
             },
             .allow_recovery_continuation = execution.recovery != null,
+            .deadline = if (execution.bounds) |bounds| bounds.deadline else null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -8061,6 +8104,7 @@ fn materialize(
             else => return err,
         };
     };
+    if (execution.bounds) |bounds| bounds.observeMutation(mutation_report);
     if (mutation_report.outcome == .recovery_required) {
         return .{
             .outcome = .recovery_required,
@@ -8142,6 +8186,7 @@ fn materialize(
 
     if (!owns_attempt) {
         try root_mutation.clear(&engine);
+        try execution.checkDeadline();
         return .{
             .outcome = switch (mutation_report.outcome) {
                 .applied => .applied,
@@ -8260,6 +8305,7 @@ fn executePhaseMaterialization(
 ) !MaterializationResult {
     var standalone_execution: ExecutionState = .{};
     const execution = request.execution orelse &standalone_execution;
+    try execution.checkDeadline();
     const previous_action = execution.action;
     _ = beginNativePhase(execution, .database);
     defer execution.action = previous_action;
@@ -8395,6 +8441,7 @@ fn executePhaseMaterialization(
                 .beforeFn = CombinedMutationHooks.before,
             },
             .allow_recovery_continuation = execution.recovery != null,
+            .deadline = if (execution.bounds) |bounds| bounds.deadline else null,
             .limits = request.mutation_limits,
             .refusal = &refusal,
         },
@@ -8439,6 +8486,7 @@ fn executePhaseMaterialization(
             else => return err,
         };
     };
+    if (execution.bounds) |bounds| bounds.observeMutation(report);
     if (report.outcome == .recovery_required)
         return .{
             .outcome = .recovery_required,
@@ -8539,6 +8587,7 @@ fn executePhaseMaterialization(
         try root_mutation.clear(&engine);
         engine.deinit();
         engine_open = false;
+        try execution.checkDeadline();
         return .{
             .outcome = if (report.outcome == .applied) .applied else .rolled_back,
             .detail = @tagName(report.stage),
@@ -11011,6 +11060,7 @@ const ExternalLifecycleRequest = struct {
     core_product: bool = false,
     core_completion_crash: ?@import("production_backend.zig").CompletionPoint = null,
     isolated_helper: bool = false,
+    deadline_after_ms: ?u64 = null,
 };
 
 const LifecycleOutcome = enum {
@@ -14779,6 +14829,7 @@ fn runLifecycleScript(
     arguments: []const []const u8,
     inject_unknown: bool,
 ) !LifecycleScriptOutcome {
+    try execution.checkDeadline();
     const package = bound_owner orelse
         try lifecycleScriptOwner(authorization.*, target, source);
     const recovery_action = nativeAction(
@@ -15016,6 +15067,7 @@ fn runLifecycleScript(
         null,
     );
     defer allocator.free(in_flight);
+    try execution.checkDeadline();
     if (execution.recovery) |runtime|
         try runtime.append(recovery_action, .in_flight, .none, null);
     publishLifecycleScriptRecord(
@@ -15048,7 +15100,10 @@ fn runLifecycleScript(
         .arguments = arguments,
         .policy = lifecycleScriptPolicy(),
         .helper_mount = if (helper_mount) |*mount| mount else null,
-    }, .{ .launcher = launcher.interface() });
+    }, .{
+        .launcher = launcher.interface(),
+        .cancellation = if (execution.bounds) |bounds| bounds.cancellation() else .never(),
+    });
     defer report.deinit();
 
     if (execution.recovery) |runtime| {
@@ -15389,6 +15444,7 @@ fn finishLifecycleAttempt(
     program_sha256: [32]u8,
     succeeded: bool,
 ) !void {
+    try execution.checkDeadline();
     const runtime = execution.recovery orelse {
         try attempt.advance(allocator, .{
             .state = .verifying,
@@ -16346,12 +16402,14 @@ fn recoverNativeRootMutation(
     root: root_fs.Root,
     attempt: *root_operation.Attempt,
     runtime: *native_recovery.Runtime,
+    bounds: ?*RuntimeBounds,
 ) !bool {
+    try checkRuntimeBounds(bounds);
     var opened = try root_mutation.open(
         allocator,
         root,
         attempt,
-        .{},
+        .{ .deadline = if (bounds) |value| value.deadline else null },
     ) orelse {
         try native_recovery.validateStableManagedState(
             allocator,
@@ -16381,6 +16439,7 @@ fn recoverNativeRootMutation(
         return false;
     };
     const report = try root_mutation.recover(&opened);
+    if (bounds) |value| value.observeMutation(report);
     switch (report.outcome) {
         .applied => {
             const checkpoint_sha256 = try checkpointManagedPaths(
@@ -17310,6 +17369,8 @@ pub const Runtime = struct {
         prepared: *native_preparation.Prepared,
         archives: []const []const u8,
         operation: native_recovery.Operation,
+        /// Transient caller budget; never changes persisted program or policy.
+        deadline: ?transaction_executor.Deadline = null,
     };
 
     pub const Outcome = enum { succeeded, failed, recovery_required, refused };
@@ -17466,6 +17527,8 @@ pub const Runtime = struct {
         crash_at: ?native_recovery.CrashPoint,
     ) !Report {
         const root = try validateAttempt(request.attempt);
+        var bounds: RuntimeBounds = .{ .deadline = request.deadline };
+        bounds.check() catch return deadlineReport(allocator, request.attempt);
         try native_program.validateDocument(request.prepared.program.program);
         const authorization_bytes = try request.prepared.authorization.authorization.canonicalJson(allocator);
         defer allocator.free(authorization_bytes);
@@ -17477,7 +17540,7 @@ pub const Runtime = struct {
         defer authorization.deinit();
         if (!request.prepared.program.program.matchesAuthorization(authorization.authorization))
             return error.InvalidLifecycleProgram;
-        const result = try executePreparedNativeProgramWithHelper(
+        const result = executePreparedNativeProgramWithHelper(
             allocator,
             root,
             request.prepared,
@@ -17487,24 +17550,71 @@ pub const Runtime = struct {
             request.operation,
             crash_at,
             native_helper.bundled(),
-        );
-        return report(allocator, request.attempt, result);
+            &bounds,
+        ) catch |err| switch (err) {
+            error.DeadlineExceeded => return deadlineReport(allocator, request.attempt),
+            else => return err,
+        };
+        return boundedReport(allocator, request.attempt, result, bounds);
     }
 
     /// Recovery consumes only persisted evidence from the original attempt.
     pub fn recover(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
+        return recoverBounded(allocator, attempt, null);
+    }
+
+    pub fn recoverWithDeadline(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        deadline: transaction_executor.Deadline,
+    ) !Report {
+        return recoverBounded(allocator, attempt, deadline);
+    }
+
+    fn recoverBounded(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        deadline: ?transaction_executor.Deadline,
+    ) !Report {
         const root = try validateAttempt(attempt);
+        var bounds: RuntimeBounds = .{ .deadline = deadline };
+        bounds.check() catch return deadlineReport(allocator, attempt);
         if (try readCompletion(allocator, attempt)) |receipt|
             return completedReport(receipt);
-        const result = try recoverPreparedNativeProgramWithHelper(
+        const result = recoverPreparedNativeProgramWithHelper(
             allocator,
             root,
             attempt,
             attempt.coordinator.locks,
             null,
             native_helper.bundled(),
-        );
-        return report(allocator, attempt, result);
+            &bounds,
+        ) catch |err| switch (err) {
+            error.DeadlineExceeded => return deadlineReport(allocator, attempt),
+            else => return err,
+        };
+        return boundedReport(allocator, attempt, result, bounds);
+    }
+
+    fn deadlineReport(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
+        _ = try validateAttempt(attempt);
+        return report(allocator, attempt, .{
+            .outcome = .refused,
+            .detail = "deadline_exceeded",
+            .program_sha256 = if (attempt.record().program_sha256) |digest| native_recovery.hexDigest(digest) else null,
+        });
+    }
+
+    fn boundedReport(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        result: LifecycleResult,
+        bounds: RuntimeBounds,
+    ) !Report {
+        var bounded = result;
+        if (bounds.expired and (result.outcome == .refused or result.outcome == .recovery_required))
+            bounded.detail = "deadline_exceeded";
+        return report(allocator, attempt, bounded);
     }
 
     /// Returns independently owned terminal evidence without probing or
@@ -17686,6 +17796,7 @@ fn executePreparedNativeProgram(
         operation,
         crash_at,
         null,
+        null,
     );
 }
 
@@ -17723,7 +17834,9 @@ fn executePreparedNativeProgramWithHelper(
     operation: native_recovery.Operation,
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
+    bounds: ?*RuntimeBounds,
 ) !LifecycleResult {
+    try checkRuntimeBounds(bounds);
     const program = compiled.program.program;
     if (!std.mem.eql(u8, &program.script_policy_sha256, &native_recovery.hexDigest(
         maintainer_script.policyDigest(lifecycleScriptPolicy()),
@@ -17739,7 +17852,7 @@ fn executePreparedNativeProgramWithHelper(
     defer if (deployment) |*value| value.deinit();
     if (helper_source) |source| {
         deployment = try native_helper.stage(allocator, root, source);
-        try native_helper.probe(allocator, root, deployment.?.binding);
+        try probeNativeHelperWithBounds(allocator, root, deployment.?.binding, bounds);
     }
     const document = try native_execution_request.create(root, attempt, program, operation);
     const bytes = if (deployment) |value|
@@ -17777,7 +17890,27 @@ fn executePreparedNativeProgramWithHelper(
         attempt,
         request.execution(),
         request.helper(),
+        bounds,
     );
+}
+
+fn probeNativeHelperWithBounds(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    helper: native_helper.Binding,
+    bounds: ?*RuntimeBounds,
+) !void {
+    try checkRuntimeBounds(bounds);
+    native_helper.probeWithCancellation(
+        allocator,
+        root,
+        helper,
+        if (bounds) |value| value.cancellation() else .never(),
+    ) catch |err| {
+        try checkRuntimeBounds(bounds);
+        return err;
+    };
+    try checkRuntimeBounds(bounds);
 }
 
 fn validateNativeHelperTargetPlan(
@@ -17901,7 +18034,7 @@ fn recoverPreparedNativeProgram(
     locks: root_operation.LockBackend,
     crash_at: ?native_recovery.CrashPoint,
 ) !LifecycleResult {
-    return recoverPreparedNativeProgramWithHelper(allocator, root, attempt, locks, crash_at, null);
+    return recoverPreparedNativeProgramWithHelper(allocator, root, attempt, locks, crash_at, null, null);
 }
 
 fn recoverPreparedNativeProgramWithHelper(
@@ -17911,7 +18044,9 @@ fn recoverPreparedNativeProgramWithHelper(
     locks: root_operation.LockBackend,
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
+    bounds: ?*RuntimeBounds,
 ) !LifecycleResult {
+    try checkRuntimeBounds(bounds);
     if (try readProductionCompletion(allocator, root, attempt)) |value| {
         var receipt = value;
         defer receipt.deinit();
@@ -17946,7 +18081,7 @@ fn recoverPreparedNativeProgramWithHelper(
     var compiled: CompiledLifecycle = .{ .authorization = authorization, .program = program };
     try native_execution_request.validateBinding(request.execution(), root, attempt, program.program);
     try native_execution_request.validateIntent(request.execution(), intent.intent);
-    if (request.helper()) |helper| try native_helper.probe(allocator, root, helper);
+    if (request.helper()) |helper| try probeNativeHelperWithBounds(allocator, root, helper, bounds);
     if (!std.mem.eql(u8, &program.program.script_policy_sha256, &native_recovery.hexDigest(
         maintainer_script.policyDigest(lifecycleScriptPolicy()),
     ))) return error.UnsupportedScriptPolicy;
@@ -17964,6 +18099,7 @@ fn recoverPreparedNativeProgramWithHelper(
     if (!lifecycleDatabaseMatchesProgram(program.program, database.generation, database.model.packages.len) or
         !std.mem.eql(u8, &native_recovery.hexDigest(native_trigger.stateDigest(database.model)), &intent.intent.initial_trigger_state_sha256))
         return error.RecoveryDatabaseBindingMismatch;
+    try checkRuntimeBounds(bounds);
     if (attempt.record().mutation_started)
         try attempt.beginRecovery(allocator, attempt.record().phase);
     return executeLifecycleProgramWithRequest(
@@ -17981,6 +18117,7 @@ fn recoverPreparedNativeProgramWithHelper(
         attempt,
         request.execution(),
         request.helper(),
+        bounds,
     );
 }
 
@@ -18074,6 +18211,7 @@ fn executeLifecycleProgramInOperation(
         borrowed_attempt,
         null,
         null,
+        null,
     );
 }
 
@@ -18092,7 +18230,9 @@ fn executeLifecycleProgramWithRequest(
     borrowed_attempt: ?*root_operation.Attempt,
     production_request: ?native_execution_request.Document,
     helper_binding: ?native_helper.Binding,
+    bounds: ?*RuntimeBounds,
 ) !LifecycleResult {
+    try checkRuntimeBounds(bounds);
     // The private v1 recovery request cannot describe a caller-owned
     // operation. Do not persist it as if it were a production request.
     if (borrowed_attempt != null and production_request == null and
@@ -18241,7 +18381,7 @@ fn executeLifecycleProgramWithRequest(
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
     var recovery_runtime: native_recovery.Runtime = undefined;
-    var execution_state: ExecutionState = .{};
+    var execution_state: ExecutionState = .{ .bounds = bounds };
     const execution = &execution_state;
     if (recovery_intent) |intent| {
         recovery_runtime = .{
@@ -18298,6 +18438,7 @@ fn executeLifecycleProgramWithRequest(
             root,
             attempt,
             &recovery_runtime,
+            bounds,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
             error.InvalidManagedState,
@@ -18329,6 +18470,7 @@ fn executeLifecycleProgramWithRequest(
             };
         }
     } else if (external.recovery) {
+        try execution.checkDeadline();
         recovery_runtime = try prepareNativeRecovery(
             scratch,
             root,
@@ -18377,6 +18519,7 @@ fn executeLifecycleProgramWithRequest(
             };
         }
     }
+    try execution.checkDeadline();
     const trigger_authority_bytes = try publishTriggerAuthority(
         allocator,
         root,
@@ -18403,7 +18546,7 @@ fn executeLifecycleProgramWithRequest(
             locked_capture.snapshot.status.bytes,
     );
 
-    for (program.steps) |step| switch (beginNativeProgramStep(execution, step)) {
+    for (program.steps) |step| switch (try beginNativeProgramStep(execution, step)) {
         .assert_authorization,
         .assert_root_state,
         .assert_database_generation,
@@ -20330,6 +20473,15 @@ fn typedRuntimeFixtureResult(report: Runtime.Report) LifecycleResult {
     };
 }
 
+const FixtureDeadlineClock = struct {
+    started: std.Io.Timestamp,
+
+    fn now(context: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        return @intCast(self.started.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds());
+    }
+};
+
 fn callerOwnedLifecycleFixture(
     root: root_fs.Root,
     external: ExternalLifecycleRequest,
@@ -20339,6 +20491,11 @@ fn callerOwnedLifecycleFixture(
     raw_request: []const u8,
 ) !LifecycleResult {
     const allocator = testing.allocator;
+    var clock: FixtureDeadlineClock = .{ .started = std.Io.Clock.awake.now(testing.io) };
+    const deadline: ?transaction_executor.Deadline = if (external.deadline_after_ms) |duration|
+        .{ .context = &clock, .nowMsFn = FixtureDeadlineClock.now, .expires_at_ms = duration }
+    else
+        null;
     var coordinator = try root_operation.Coordinator.open(root.io, root, external.root, locks);
     if (external.operation == .recover) {
         var previous = try coordinator.inspect(allocator) orelse return error.RecoveryEvidenceMissing;
@@ -20356,7 +20513,10 @@ fn callerOwnedLifecycleFixture(
         });
         defer attempt.release();
         const result = if (external.isolated_helper) block: {
-            var report = try Runtime.recover(allocator, &attempt);
+            var report = if (deadline) |value|
+                try Runtime.recoverWithDeadline(allocator, &attempt, value)
+            else
+                try Runtime.recover(allocator, &attempt);
             defer report.deinit();
             break :block typedRuntimeFixtureResult(report);
         } else try recoverPreparedNativeProgramWithHelper(
@@ -20364,6 +20524,7 @@ fn callerOwnedLifecycleFixture(
             root,
             &attempt,
             locks,
+            null,
             null,
             null,
         );
@@ -20436,6 +20597,7 @@ fn callerOwnedLifecycleFixture(
             .prepared = compiled.?,
             .archives = archive_bytes,
             .operation = std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
+            .deadline = deadline,
         };
         var report = if (external.crash_at) |crash|
             try Runtime.executeWithCrash(allocator, request, crash)
@@ -20453,6 +20615,7 @@ fn callerOwnedLifecycleFixture(
         locks,
         std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
         external.crash_at,
+        null,
         null,
     );
 }
@@ -20482,6 +20645,7 @@ test "native_unpack.test.lifecycle external fixture" {
         (external.acknowledge_native and (!external.caller_owned or external.operation != .recover)) or
         (external.core_product and (!external.caller_owned or !external.isolated_helper)) or
         (external.core_completion_crash != null and (!external.core_product or external.operation != .recover)) or
+        (external.deadline_after_ms != null and (!external.isolated_helper or external.core_product)) or
         (external.isolated_helper and !external.caller_owned))
         return error.InvalidExternalLifecycleRequest;
     const archive_phase = switch (external.operation) {
@@ -20884,8 +21048,8 @@ test "native_unpack.test.interleaved execution state isolates progress counters 
             .foreign_architectures = &.{},
         } },
     };
-    _ = beginNativeProgramStep(&outer, step);
-    _ = beginNativeProgramStep(&inner, step);
+    _ = try beginNativeProgramStep(&outer, step);
+    _ = try beginNativeProgramStep(&inner, step);
     const outer_action = beginNativePhase(&outer, .filesystem).?;
     const inner_action = beginNativePhase(&inner, .filesystem).?;
     try testing.expectEqual(outer_action, inner_action);
@@ -20899,7 +21063,7 @@ test "native_unpack.test.interleaved execution state isolates progress counters 
     outer.phase_steps = &.{};
     var next_step = step;
     next_step.sequence = 11;
-    _ = beginNativeProgramStep(&inner, next_step);
+    _ = try beginNativeProgramStep(&inner, next_step);
     try testPreparedMixedLifecycle(false, .production);
     try testPreparedMixedLifecycle(true, .production_resume);
     try testing.expectEqual(@as(u32, 7), outer.program_step);
@@ -21117,6 +21281,10 @@ const MixedLifecycleCase = enum {
     public_missing_helper,
     captured_preparation,
     repository_scoped_preparation,
+    deadline_before,
+    deadline_after_intent,
+    deadline_during_filesystem,
+    deadline_after_database,
     stale_database,
     wrong_plan,
     foreign_root,
@@ -21125,6 +21293,151 @@ const MixedLifecycleCase = enum {
     legacy_backend,
     wrong_architecture,
 };
+
+const NativeDeadlineClock = struct {
+    root: root_fs.Root,
+    case: ?MixedLifecycleCase,
+    fired: bool = false,
+    inspection_error: ?anyerror = null,
+
+    fn now(context: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        // A reported mutation deadline must stay latched even if the caller's clock retreats.
+        if (self.fired) return if (self.case == .deadline_during_filesystem) 0 else 10;
+        self.fired = self.shouldExpire() catch |err| blk: {
+            self.inspection_error = err;
+            break :blk true;
+        };
+        return if (self.fired) 10 else 0;
+    }
+
+    fn shouldExpire(self: *NativeDeadlineClock) !bool {
+        return switch (self.case orelse return false) {
+            .deadline_before => true,
+            .deadline_after_intent => try self.root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null,
+            .deadline_during_filesystem => try self.root.entryIfExists(try root_fs.Path.init("usr/share/old")) == null,
+            .deadline_after_database => blk: {
+                const status = try self.root.readFileAlloc(testing.allocator, try root_fs.Path.init("var/lib/dpkg/status"), 16 * 1024);
+                defer testing.allocator.free(status);
+                var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+                while (paragraphs.next()) |paragraph| {
+                    if (std.mem.startsWith(u8, paragraph, "Package: app\n") and
+                        std.mem.indexOf(u8, paragraph, "Status: install ok installed\n") != null)
+                        break :blk true;
+                }
+                break :blk false;
+            },
+            else => unreachable,
+        };
+    }
+
+    fn deadline(self: *NativeDeadlineClock) transaction_executor.Deadline {
+        return .{ .context = self, .nowMsFn = now, .expires_at_ms = 10 };
+    }
+};
+
+fn testPreparedDeadline(
+    root: root_fs.Root,
+    caller: *root_operation.Attempt,
+    compiled: *CompiledLifecycle,
+    bytes: []const u8,
+    case: MixedLifecycleCase,
+) !void {
+    const original = caller.record().digest_sha256;
+    const script_policy = compiled.program.program.script_policy_sha256;
+    const program_digest = compiled.program.program.digest_sha256;
+    var clock: NativeDeadlineClock = .{ .root = root, .case = case };
+    var bounds: RuntimeBounds = .{ .deadline = clock.deadline() };
+    var report = if (case == .deadline_before)
+        try Runtime.execute(testing.allocator, .{
+            .attempt = caller,
+            .prepared = compiled,
+            .archives = &.{bytes},
+            .operation = .install,
+            .deadline = clock.deadline(),
+        })
+    else block: {
+        const result = executePreparedNativeProgramWithHelper(
+            testing.allocator,
+            root,
+            compiled,
+            &.{bytes},
+            caller,
+            caller.coordinator.locks,
+            .install,
+            null,
+            null,
+            &bounds,
+        ) catch |err| switch (err) {
+            error.DeadlineExceeded => break :block try Runtime.deadlineReport(testing.allocator, caller),
+            else => return err,
+        };
+        break :block try Runtime.boundedReport(testing.allocator, caller, result, bounds);
+    };
+    defer report.deinit();
+    try testing.expect(clock.inspection_error == null);
+    try testing.expect(clock.fired);
+    try testing.expectEqualStrings("deadline_exceeded", report.detail);
+    try testing.expect(report.receipt == null);
+    try testing.expect(caller.locked());
+    try testing.expectEqual([_]u8{0x71} ** 32, caller.record().request_sha256);
+    try testing.expectEqual([_]u8{0x72} ** 32, caller.record().policy_sha256);
+    try testing.expectEqual(script_policy, compiled.program.program.script_policy_sha256);
+    try testing.expectEqual(program_digest, compiled.program.program.digest_sha256);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation_completion.document_path)) == null);
+    var expired_deadline = clock.deadline();
+    expired_deadline.expires_at_ms = 0;
+    var expired_recovery = try Runtime.recoverWithDeadline(testing.allocator, caller, expired_deadline);
+    defer expired_recovery.deinit();
+    try testing.expectEqual(report.outcome, expired_recovery.outcome);
+    try testing.expectEqualStrings("deadline_exceeded", expired_recovery.detail);
+    if (case == .deadline_before) {
+        try testing.expectEqual(Runtime.Outcome.refused, report.outcome);
+        try testing.expectEqual(original, caller.record().digest_sha256);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_helper.directory)) == null);
+        try caller.abandonIfPreMutation(testing.allocator);
+        return;
+    }
+    try testing.expectEqual(Runtime.Outcome.recovery_required, report.outcome);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null);
+    if (case == .deadline_after_intent)
+        try testing.expect(!caller.record().mutation_started);
+    if (case == .deadline_during_filesystem) {
+        try testing.expect(bounds.expired);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/old")) != null);
+    }
+    if (case == .deadline_after_database)
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) != null);
+
+    var fresh_clock: NativeDeadlineClock = .{ .root = root, .case = null };
+    var fresh: RuntimeBounds = .{ .deadline = fresh_clock.deadline() };
+    const recovered = try recoverPreparedNativeProgramWithHelper(
+        testing.allocator,
+        root,
+        caller,
+        caller.coordinator.locks,
+        null,
+        null,
+        &fresh,
+    );
+    try testing.expectEqual(LifecycleOutcome.applied, recovered.outcome);
+    try testing.expect(!fresh.expired);
+    var receipt = (try readProductionCompletion(testing.allocator, root, caller)).?;
+    defer receipt.deinit();
+    try testing.expectEqual(native_provenance.Outcome.succeeded, receipt.document.outcome);
+    try testing.expectEqual(program_digest, receipt.document.program_sha256);
+    try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
+}
+
+test "native_unpack.test.cumulative deadlines preserve original callers and recoverable phase evidence" {
+    for ([_]MixedLifecycleCase{
+        .deadline_before, .deadline_after_intent, .deadline_during_filesystem, .deadline_after_database,
+    }) |case| {
+        errdefer std.debug.print("native deadline case: {t}\n", .{case});
+        try testPreparedMixedLifecycle(false, case);
+    }
+}
 
 fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     const empty_closure = case == .empty_closure;
@@ -21312,8 +21625,9 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
     defer locks.deinit();
     var caller: root_operation.Attempt = undefined;
+    var coordinator: root_operation.Coordinator = undefined;
     if (case != .owned) {
-        var coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
+        coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
         caller = try coordinator.acquire(testing.allocator, .{
             .backend = if (case == .legacy_backend) .legacy_dpkg else .native,
             .operation = .{ .repository_bootstrap = .add },
@@ -21329,6 +21643,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             try caller.advance(testing.allocator, .{ .state = .mutation_pending, .phase = .mutation });
     }
     defer if (case != .owned) caller.release();
+    switch (case) {
+        .deadline_before, .deadline_after_intent, .deadline_during_filesystem, .deadline_after_database => return testPreparedDeadline(root, &caller, &compiled, bytes, case),
+        else => {},
+    }
     if (case == .captured_preparation or scoped) {
         const original = caller.record().digest_sha256;
         const request: Runtime.PrepareRequest = .{

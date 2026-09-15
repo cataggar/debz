@@ -688,6 +688,8 @@ pub fn build(b: *std.Build) void {
     native_recovery.addArtifactArg(cli);
     if (b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false)
         native_recovery.addArg("--core-only");
+    if (b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false)
+        native_recovery.addArg("--deadline-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );

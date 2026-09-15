@@ -128,12 +128,21 @@ pub fn stage(allocator: std.mem.Allocator, root: root_fs.Root, source: Source) !
 }
 
 pub fn probe(allocator: std.mem.Allocator, root: root_fs.Root, binding: Binding) !void {
+    return probeWithCancellation(allocator, root, binding, .never());
+}
+
+pub fn probeWithCancellation(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    binding: Binding,
+    cancellation: maintainer_script.Cancellation,
+) !void {
     var mount = try bind(allocator, root, binding);
     defer mount.deinit();
     var execution = try maintainer_script.SystemLauncher.probeHelper(
         allocator,
         &mount,
-        maintainer_script.Cancellation.never(),
+        cancellation,
     );
     defer execution.deinit(allocator);
     switch (execution.outcome) {
