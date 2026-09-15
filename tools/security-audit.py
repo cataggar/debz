@@ -510,6 +510,68 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             "            name: linux-arm64",
         )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
             failures.append(f"ci.yml: {name} must require both architectures within the existing job limit")
+    workload = jobs.get("build-and-test-workload", "")
+    if any(line not in workload.splitlines() for line in (
+        "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
+        "        name: [linux-x64, linux-arm64]",
+        "        optimize: [Debug, ReleaseSafe]",
+        "      OPTIMIZE: ${{ matrix.optimize }}",
+    )) or re.search(r"(?m)^        exclude:", workload):
+        failures.append("ci.yml: build workloads must require both optimization modes on both architectures")
+    steps = dict(re.findall(
+        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
+    ))
+    shared_steps = {
+        "Build and test": (
+            '          zig build -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
+        ),
+        "Compare native materialization, conffiles, lifecycle, and triggers with dpkg": (
+            '          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize="$OPTIMIZE" -j2 --summary all',
+        ),
+        "Require private native helper namespaces": (
+            '          zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all',
+        ),
+    }
+    for name, commands in shared_steps.items():
+        body = steps.get(name, "")
+        if any(line not in body.splitlines() for line in commands) or re.search(r"(?m)^        if:", body):
+            failures.append(f"ci.yml: {name} must run in every build workload")
+    selected_steps = {
+        "Test release packaging": ("Debug", (
+            "        run: zig build test-release -j2 --summary all",
+        )),
+        "Check ReleaseSafe CLI help": ("ReleaseSafe", (
+            "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help",
+        )),
+        "Run required real apt facade acceptance": ("ReleaseSafe", (
+            "            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz",
+        )),
+        "Run required privileged orchestration crash suite": ("Debug", (
+            '            "$(command -v zig)" build test-apt-system \\',
+            "              -Drequire-privileged-orchestration-tests=true \\",
+            "              -j2 --summary all",
+        )),
+        "Prepare native download action fixture": ("ReleaseSafe", (
+            "          python3 tools/generate-integration-repository.py \\",
+        )),
+        "Prepare native exact-lock package closure": ("ReleaseSafe", (
+            "        uses: ./actions/download",
+        )),
+        "Validate native download action outputs": ("ReleaseSafe", (
+            '          test "$CACHE_HIT" = false',
+            '          test -d "$CACHE_PATH"',
+            '          test "$DOWNLOADED" -gt 0',
+            '          test "$REUSED" -eq 0',
+        )),
+    }
+    for name, (mode, commands) in selected_steps.items():
+        lines = steps.get(name, "").splitlines()
+        if any(line not in lines for line in (
+            f"        if: ${{{{ matrix.optimize == '{mode}' }}}}", *commands,
+        )):
+            failures.append(f"ci.yml: {name} must remain required in {mode}")
     recovery = jobs.get("native-recovery", "")
     if any(line not in recovery.splitlines() for line in (
         "          zig build test-native-recovery -j2 --summary all",

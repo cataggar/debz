@@ -322,6 +322,74 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, build == recovery == "success")
 
+    def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
+        match = re.search(
+            r"(?ms)^  build-and-test-workload:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            workflow,
+        )
+        self.assertIsNotNone(match)
+        workload = match[1]
+        for token, replacement in (
+            ("name: [linux-x64, linux-arm64]", "name: [linux-x64]"),
+            ("optimize: [Debug, ReleaseSafe]", "optimize: [Debug]"),
+            ("optimize: [Debug, ReleaseSafe]", "optimize: [ReleaseSafe]"),
+            ("      OPTIMIZE: ${{ matrix.optimize }}", "      OPTIMIZE: Debug"),
+            ("        include:", "        exclude:"),
+            ('          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ("      - name: Build and test\n", "      - name: Build and test\n        if: false\n"),
+            ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
+            ("test-native-materialization test-native-conffiles", "test-native-materialization"),
+            ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
+            ("test-native-helper-namespace", "test"),
+            ("        run: zig build test-release -j2 --summary all", ""),
+            ("        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help", ""),
+            ("            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz", ""),
+            ("              -Drequire-privileged-orchestration-tests=true \\", ""),
+            ("          python3 tools/generate-integration-repository.py \\", ""),
+            ("        uses: ./actions/download", ""),
+            ('          test "$DOWNLOADED" -gt 0', ""),
+        ):
+            with self.subTest(token=token, replacement=replacement):
+                self.assertIn(token, workload)
+                changed = workflow.replace(workload, workload.replace(token, replacement, 1), 1)
+                self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        steps = dict(re.findall(
+            r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
+        ))
+        for name, body in steps.items():
+            if "        if: ${{ matrix.optimize ==" not in body:
+                continue
+            with self.subTest(step=name):
+                changed = workflow.replace(
+                    body, re.sub(r"(?m)^        if:.*$", "        if: false", body), 1,
+                )
+                self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        script = textwrap.dedent(steps["Build and test"].split("        run: |\n", 1)[1])
+        for mode in ("Debug", "ReleaseSafe"):
+            commands = [
+                f"build{target} -Doptimize={mode} -j2 --summary all"
+                for target in ("", " test", " fuzz")
+            ]
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + script],
+                    env={**os.environ, "OPTIMIZE": mode},
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), commands)
+            for command in commands:
+                with self.subTest(mode=mode, failing_command=command):
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", 'zig() { test "$*" != "$FAIL_COMMAND"; }\n' + script],
+                        env={**os.environ, "OPTIMIZE": mode, "FAIL_COMMAND": command},
+                        stdin=subprocess.DEVNULL, capture_output=True, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
     def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
         package = json.loads((ROOT / "actions/install/package.json").read_text())
         self.assertEqual(package["dependencies"], {"@actions/core": "3.0.1"})

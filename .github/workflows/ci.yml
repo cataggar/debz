@@ -680,12 +680,14 @@ jobs:
           grep -q '"outcome":"succeeded"' "$workspace/install-summary.json"
 
   build-and-test-workload:
-    name: Build and test workload (${{ matrix.name }})
+    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        name: [linux-x64, linux-arm64]
+        optimize: [Debug, ReleaseSafe]
         include:
           - os: ubuntu-24.04
             name: linux-x64
@@ -693,7 +695,8 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
             architecture: arm64
-
+    env:
+      OPTIMIZE: ${{ matrix.optimize }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -717,23 +720,23 @@ jobs:
           fi
       - name: Build and test
         run: |
-          zig build
-          zig build test
-          zig build test-release
-          zig build fuzz
-          zig build -Doptimize=ReleaseSafe
-          zig build -Doptimize=ReleaseSafe test
-          zig build -Doptimize=ReleaseSafe fuzz
-          zig build -Doptimize=ReleaseSafe run -- --help
+          zig build -Doptimize="$OPTIMIZE" -j2 --summary all
+          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all
+          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all
+      - name: Test release packaging
+        if: ${{ matrix.optimize == 'Debug' }}
+        run: zig build test-release -j2 --summary all
+      - name: Check ReleaseSafe CLI help
+        if: ${{ matrix.optimize == 'ReleaseSafe' }}
+        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help
       - name: Compare native materialization, conffiles, lifecycle, and triggers with dpkg
         run: |
-          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -j2 --summary all
-          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Require private native helper namespaces
         run: |
-          zig build test-native-helper-namespace -j2 --summary all
-          zig build test-native-helper-namespace -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Run required real apt facade acceptance
+        if: ${{ matrix.optimize == 'ReleaseSafe' }}
         run: |
           sudo env \
             PATH="$PATH" \
@@ -741,6 +744,7 @@ jobs:
             PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \
             python3 tools/test-apt-system-acceptance.py zig-out/bin/debz
       - name: Run required privileged orchestration crash suite
+        if: ${{ matrix.optimize == 'Debug' }}
         run: |
           sudo rm -rf /run/debz
           sudo env \
@@ -748,15 +752,16 @@ jobs:
             ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache-orchestration-required" \
             "$(command -v zig)" build test-apt-system \
               -Drequire-privileged-orchestration-tests=true \
-              --summary all
+              -j2 --summary all
       - name: Normalize privileged orchestration diagnostics
-        if: always()
+        if: ${{ always() && matrix.optimize == 'Debug' }}
         run: |
           sudo chown -R "$USER:$USER" \
             .zig-cache-orchestration-required \
             .zig-global-cache-orchestration-required 2>/dev/null || true
           sudo rm -rf /run/debz
       - name: Prepare native download action fixture
+        if: ${{ matrix.optimize == 'ReleaseSafe' }}
         id: download-fixture
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
@@ -788,6 +793,7 @@ jobs:
             "$workspace/lock.json" >>"$GITHUB_OUTPUT"
           printf '%s\n' "$PWD/zig-out/bin" >>"$GITHUB_PATH"
       - name: Prepare native exact-lock package closure
+        if: ${{ matrix.optimize == 'ReleaseSafe' }}
         id: download
         uses: ./actions/download
         with:
@@ -797,6 +803,7 @@ jobs:
           architecture: ${{ matrix.architecture }}
           cache: 'false'
       - name: Validate native download action outputs
+        if: ${{ matrix.optimize == 'ReleaseSafe' }}
         env:
           CACHE_HIT: ${{ steps.download.outputs.cache-hit }}
           CACHE_PATH: ${{ steps.download.outputs.cache-path }}
