@@ -143,6 +143,7 @@ pub const NativeReceiptRequest = struct {
         _ = try self.deadline.remainingMs();
         try validateNativeRepositoryCaller(self.repository, self.attempt);
         try self.attempt.coordinator.validateProjection();
+        _ = try native_runtime.validateAttempt(self.attempt);
     }
 };
 
@@ -204,6 +205,182 @@ pub fn verifyNativePackageState(allocator: std.mem.Allocator, input: NativeRecei
         },
         .recovery_required => return error.InvalidRecoveryProvenance,
     }
+}
+
+pub const NativePackageCheckpoint = struct {
+    state: state_module.OwnedState,
+    package_state: NativePackageState,
+
+    pub fn deinit(self: *NativePackageCheckpoint) void {
+        self.state.deinit();
+        self.package_state.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Publishes package-stage bookkeeping from the original persisted inputs and
+/// live native outcome. Import, refresh and outer completion remain separate;
+/// this never acknowledges execution or releases the repository caller.
+pub fn persistNativePackageState(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativePackageCheckpoint {
+    return persistNativePackageStateObserved(allocator, input, null);
+}
+
+fn persistNativePackageStateObserved(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    observer: ?root_fs.PublishObserver,
+) !NativePackageCheckpoint {
+    try input.validate();
+    var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+    defer paths.deinit();
+    const root = input.attempt.coordinator.root;
+    const state_path = try root_fs.Path.init(paths.operation_state_logical[1..]);
+    var state_file = try root.pinRegularFile(state_path);
+    defer state_file.close();
+    const state_bytes = try state_file.observeStableAlloc(allocator, input.repository.state.maximum_operation_state_bytes);
+    defer allocator.free(state_bytes.bytes);
+    var prior = try state_module.decode(allocator, state_bytes.bytes, input.repository.state.maximum_operation_state_bytes);
+    defer prior.deinit();
+    const state = prior.state;
+    const record = input.attempt.record();
+    if (!std.mem.eql(u8, state.root, input.repository.root) or
+        !std.mem.eql(u8, state.architecture, record.target_architecture) or
+        state.no_refresh != input.repository.no_refresh or
+        state.managed_files.len == 0 or
+        !std.mem.eql(u8, state.plan_path orelse return error.RepositoryStateMismatch, paths.exact_plan_logical) or
+        !std.mem.eql(u8, state.exact_lock_path orelse return error.RepositoryStateMismatch, paths.exact_lock_logical))
+        return error.RepositoryStateMismatch;
+    switch (state.phase) {
+        .locked => {},
+        .installed, .failed => {
+            if (!std.mem.eql(u8, state.provenance_path orelse return error.RepositoryStateMismatch, paths.provenance_logical) or
+                state.manifest_path != null or state.refreshed or
+                (state.phase == .failed and state.diagnostic_id != .transaction_failed))
+                return error.RepositoryStateMismatch;
+        },
+        .imported, .refreshed, .complete => return error.RepositoryPackageStageAlreadyAdvanced,
+        else => return error.RepositoryStateMismatch,
+    }
+    const descriptor_state = state.descriptor orelse return error.RepositoryStateMismatch;
+    const descriptor: api.DescriptorIdentity = .{
+        .package = descriptor_state.package,
+        .version = descriptor_state.version,
+        .architecture = descriptor_state.architecture,
+        .sha256 = descriptor_state.sha256,
+        .size = descriptor_state.size,
+        .effective_url = descriptor_state.effective_url,
+        .trust_mode = descriptor_state.trust_mode,
+    };
+    var plan_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_plan_logical[1..]));
+    defer plan_file.close();
+    const plan_bytes = try plan_file.observeStableAlloc(allocator, repository_plan.maximum_document_bytes);
+    defer allocator.free(plan_bytes.bytes);
+    var plan = try repository_plan.decode(allocator, plan_bytes.bytes);
+    defer plan.deinit();
+    const plan_sha256 = transaction_executor.planDigest(plan);
+    if (!std.mem.eql(u8, &plan_sha256, &(state.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
+        !std.mem.eql(u8, &plan_sha256, &(record.plan_sha256 orelse return error.PlanEvidenceMismatch)) or
+        !std.mem.eql(u8, plan.target_architecture, record.target_architecture))
+        return error.PlanEvidenceMismatch;
+    var lock_file = try root.pinRegularFile(try root_fs.Path.init(paths.exact_lock_logical[1..]));
+    defer lock_file.close();
+    const lock_bytes = try lock_file.observeStableAlloc(allocator, exact_lock_v2.maximum_document_bytes);
+    defer allocator.free(lock_bytes.bytes);
+    var lock = try exact_lock_v2.decode(allocator, lock_bytes.bytes, exact_lock_v2.maximum_document_bytes);
+    defer lock.deinit();
+    if (!(record.exact_lock orelse return error.LockEvidenceMismatch).eql(.{
+        .schema = exact_lock_v2.schema_id,
+        .version = exact_lock_v2.schema_version,
+        .digest_sha256 = lock.lock.digest_sha256,
+    })) return error.LockEvidenceMismatch;
+    if (plan.actions.len > input.repository.resources.maximum_actions or
+        lock.lock.packages.len > input.repository.resources.maximum_actions or
+        lock.lock.repositories.len > input.repository.resources.maximum_repositories)
+        return error.ResourceBudgetExceeded;
+    try validateLockPolicy(lock.lock, .native);
+    try validateLockRequest(allocator, lock.lock, input.repository, plan, .native);
+    try validateLockDescriptor(lock.lock, descriptor);
+    try input.validate();
+    if (state.provenance_path == null) {
+        var retained = try retainNativeReceipt(allocator, input);
+        defer retained.deinit();
+    }
+    var package_state = try verifyNativePackageState(allocator, input);
+    errdefer package_state.deinit();
+    // Borrow the already-admitted root; this adapter does not own its descriptor.
+    var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
+    const installed = try descriptorIdentityInstalled(allocator, filesystem.interface(), descriptor);
+    var next = try nativePackageCheckpointState(allocator, state, package_state == .failed, installed, paths.provenance_logical);
+    errdefer next.deinit();
+    const bytes = try next.state.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    if (bytes.len > input.repository.state.maximum_operation_state_bytes)
+        return error.DocumentTooLarge;
+    var publication: NativeCheckpointPublication = .{
+        .input = input,
+        .pins = .{ &state_file, &plan_file, &lock_file },
+        .observer = observer,
+    };
+    try publication.validate();
+    if (std.mem.eql(u8, bytes, state_bytes.bytes)) {
+        // Finish durability if an earlier checkpoint stopped after rename.
+        try state_file.file.sync(root.io);
+        try root.syncDirectory(try root_fs.Path.init(paths.operation_logical[1..]));
+        _ = try state_file.metadata();
+    } else {
+        try root.publishFile(state_path, bytes, .{
+            .permissions = .fromMode(0o600),
+            .overwrite = .replace,
+            .durable = true,
+            .observer = .{ .context = &publication, .hitFn = NativeCheckpointPublication.hit },
+        });
+    }
+    try validateNativeRepositoryCaller(input.repository, input.attempt);
+    try input.attempt.coordinator.validateProjection();
+    return .{ .state = next, .package_state = package_state };
+}
+
+const NativeCheckpointPublication = struct {
+    input: NativeReceiptRequest,
+    pins: [3]*const root_fs.PinnedRegularFile,
+    observer: ?root_fs.PublishObserver,
+
+    fn validate(self: *const @This()) !void {
+        try self.input.validate();
+        for (self.pins) |pin| _ = try pin.metadata();
+    }
+
+    fn hit(raw: *anyopaque, point: root_fs.PublishPoint) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.observer) |observer| try observer.hit(point);
+        if (point == .before_rename) try self.validate();
+    }
+};
+
+fn nativePackageCheckpointState(
+    allocator: std.mem.Allocator,
+    prior: state_module.State,
+    failed: bool,
+    installed: bool,
+    provenance_path: []const u8,
+) !state_module.OwnedState {
+    if (!failed and !installed) return error.DescriptorIdentityMismatch;
+    var next = prior;
+    switch (prior.phase) {
+        .locked => {
+            next.phase = if (failed) .failed else .installed;
+            next.installed = installed;
+            next.provenance_path = provenance_path;
+            next.diagnostic_id = if (failed) .transaction_failed else null;
+            next.diagnostic = if (failed) "native repository package transaction failed" else "";
+        },
+        .installed, .failed => {
+            if ((prior.phase == .failed) != failed or prior.installed != installed)
+                return error.RepositoryStateMismatch;
+        },
+        else => return error.RepositoryPackageStageAlreadyAdvanced,
+    }
+    return state_module.create(allocator, next);
 }
 
 fn nativeRepositoryReceipt(
@@ -5422,6 +5599,7 @@ fn testNativePreparation(case: NativePreparationCase) !void {
             };
             inline for (.{ retainNativeReceipt, readRetainedNativeReceipt, verifyNativePackageState }) |function|
                 try std.testing.expectError(expected_error orelse error.NativeReceiptMissing, function(allocator, receipt_input));
+            try std.testing.expectError(expected_error orelse error.FileNotFound, persistNativePackageState(allocator, receipt_input));
             try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("var/lib/debz/repository")) == null);
         },
         else => {},
@@ -5561,10 +5739,65 @@ test "repository backend native receipt storage refuses leaf and ancestor symlin
     try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("actual/receipt.json")) == null);
 }
 
+test "repository backend native package checkpoints preserve installed failure and later diagnostics" {
+    const allocator = std.testing.allocator;
+    const prior: state_module.State = .{
+        .root = "/target",
+        .architecture = "amd64",
+        .no_refresh = false,
+        .phase = .locked,
+        .descriptor = .{
+            .package = "descriptor",
+            .version = "1",
+            .architecture = "all",
+            .sha256 = @splat(1),
+            .size = 1,
+            .effective_url = "file:///descriptor.deb",
+            .trust_mode = .pinned_sha256,
+        },
+        .managed_files = &.{.{ .logical_path = "/etc/repository.list", .sha256 = @splat(2), .size = 1 }},
+        .plan_path = "/state/transaction-plan-v3.json",
+        .plan_sha256 = @splat(3),
+        .exact_lock_path = "/state/exact-lock-v2.json",
+    };
+    const path = "/state/native-transaction-provenance-v1.json";
+    const Allocation = struct {
+        fn run(backing: std.mem.Allocator, state: state_module.State, failed: bool, receipt_path: []const u8) !void {
+            var checkpoint = try nativePackageCheckpointState(backing, state, failed, true, receipt_path);
+            defer checkpoint.deinit();
+        }
+    };
+    inline for (.{ false, true }) |failed|
+        try std.testing.checkAllAllocationFailures(allocator, Allocation.run, .{ prior, failed, path });
+    for ([_]bool{ false, true }) |installed| {
+        var failed = try nativePackageCheckpointState(allocator, prior, true, installed, path);
+        defer failed.deinit();
+        try std.testing.expectEqual(state_module.Phase.failed, failed.state.phase);
+        try std.testing.expectEqual(installed, failed.state.installed);
+        try std.testing.expectEqual(api.DiagnosticId.transaction_failed, failed.state.diagnostic_id.?);
+        var repeated = try nativePackageCheckpointState(allocator, failed.state, true, installed, path);
+        defer repeated.deinit();
+        try std.testing.expectEqual(failed.state.digest_sha256, repeated.state.digest_sha256);
+        try std.testing.expectError(error.RepositoryStateMismatch, nativePackageCheckpointState(allocator, failed.state, false, true, path));
+    }
+    try std.testing.expectError(error.DescriptorIdentityMismatch, nativePackageCheckpointState(allocator, prior, false, false, path));
+    var succeeded = try nativePackageCheckpointState(allocator, prior, false, true, path);
+    defer succeeded.deinit();
+    try std.testing.expectEqual(state_module.Phase.installed, succeeded.state.phase);
+    var import_failed = succeeded.state;
+    import_failed.diagnostic_id = .target_import_failed;
+    import_failed.diagnostic = "import refused";
+    var observed = try nativePackageCheckpointState(allocator, import_failed, false, true, path);
+    defer observed.deinit();
+    try std.testing.expectEqual(api.DiagnosticId.target_import_failed, observed.state.diagnostic_id.?);
+    try std.testing.expectEqualStrings("import refused", observed.state.diagnostic);
+    try std.testing.expectError(error.RepositoryStateMismatch, nativePackageCheckpointState(allocator, succeeded.state, true, true, path));
+}
+
 const ProjectedRepositoryCase = enum { prepare, adopt, after_lock, cleanup };
 
 const RepositoryExecutionCase = enum { success, known_failure, interrupted, missing_helper, unchanged, diagnostic, expired };
-const RepositoryReceiptScope = enum { retain, read, verify };
+const RepositoryReceiptScope = enum { retain, read, verify, checkpoint };
 
 const RepositoryExecutionClock = struct {
     root: root_fs.Root,
@@ -5597,6 +5830,218 @@ const RepositoryExecutionClock = struct {
         return .{ .context = self, .nowMsFn = now, .expires_at_ms = 1 };
     }
 };
+
+fn stageRepositoryNativeLockedInputs(
+    root: root_fs.Root,
+    request: api.Request,
+    plan: solver.Plan,
+    lock: exact_lock_v2.Lock,
+    artifact: package_origin.LocalArtifactEvidence,
+) !void {
+    const allocator = std.testing.allocator;
+    var paths = try ResolvedPaths.init(allocator, request, .native);
+    defer paths.deinit();
+    try root.createDirectoryPath(try root_fs.Path.init(paths.operation_logical[1..]), .fromMode(0o700));
+    const plan_bytes = try plan.canonicalJson(allocator);
+    defer allocator.free(plan_bytes);
+    const lock_bytes = try lock.canonicalJson(allocator);
+    defer allocator.free(lock_bytes);
+    try root.publishFile(try root_fs.Path.init(paths.exact_plan_logical[1..]), plan_bytes, .{ .overwrite = .fail_if_exists });
+    try root.publishFile(try root_fs.Path.init(paths.exact_lock_logical[1..]), lock_bytes, .{ .overwrite = .fail_if_exists });
+    var state = try state_module.create(allocator, .{
+        .root = request.root,
+        .architecture = plan.target_architecture,
+        .no_refresh = request.no_refresh,
+        .phase = .locked,
+        .descriptor = .{
+            .package = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .sha256 = artifact.sha256,
+            .size = artifact.size,
+            .effective_url = artifact.acquisition_url,
+            .trust_mode = .pinned_sha256,
+        },
+        .managed_files = &.{.{
+            .logical_path = "/usr/share/repository-execution",
+            .sha256 = sha256("native repository execution\n"),
+            .size = "native repository execution\n".len,
+        }},
+        .plan_path = paths.exact_plan_logical,
+        .plan_sha256 = transaction_executor.planDigest(plan),
+        .exact_lock_path = paths.exact_lock_logical,
+    });
+    defer state.deinit();
+    const bytes = try state.state.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    try root.publishFile(try root_fs.Path.init(paths.operation_state_logical[1..]), bytes, .{ .permissions = .fromMode(0o600) });
+    try root.publishFile(try root_fs.Path.init("fixture/repository-original-locked-state.json"), bytes, .{ .overwrite = .fail_if_exists });
+}
+
+const NativeCheckpointTestBoundary = struct {
+    root: root_fs.Root,
+    state_path: root_fs.Path,
+    clock: ?*RepositoryExecutionClock = null,
+
+    fn hit(raw: *anyopaque, point: root_fs.PublishPoint) !void {
+        if (point != .before_rename) return;
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.clock) |clock| {
+            clock.expired = true;
+        } else {
+            try self.root.rename(self.state_path, try root_fs.Path.init("fixture/replaced-checkpoint-state"), .fail_if_exists);
+            try self.root.publishFile(self.state_path, "changed during verification", .{ .overwrite = .fail_if_exists });
+        }
+    }
+
+    fn observer(self: *@This()) root_fs.PublishObserver {
+        return .{ .context = self, .hitFn = hit };
+    }
+};
+
+fn testRepositoryNativeCheckpoint(
+    root: root_fs.Root,
+    input: NativeReceiptRequest,
+    failed: bool,
+    first: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+    defer paths.deinit();
+    const path = try root_fs.Path.init(paths.operation_state_logical[1..]);
+    const caller_before = input.attempt.record().digest_sha256;
+    if (first) {
+        const unbound_receipt = try root_fs.Path.init(paths.provenance_logical[1..]);
+        try root.removeFile(unbound_receipt);
+        const original = try root.readFileAlloc(allocator, path, state_module.maximum_document_bytes);
+        defer allocator.free(original);
+        var locked = try state_module.decode(allocator, original, state_module.maximum_document_bytes);
+        defer locked.deinit();
+        try std.testing.expectEqual(state_module.Phase.locked, locked.state.phase);
+        for (0..6) |case| {
+            var changed = locked.state;
+            switch (case) {
+                0 => changed.root = "/different",
+                1 => changed.no_refresh = !changed.no_refresh,
+                2 => changed.plan_sha256.?[0] ^= 1,
+                3 => changed.descriptor.?.version = "different",
+                4 => {
+                    changed.phase = .installed;
+                    changed.installed = true;
+                    changed.provenance_path = "/legacy/transaction-result-v2.json";
+                },
+                5 => {
+                    changed.phase = .imported;
+                    changed.installed = true;
+                    changed.provenance_path = paths.provenance_logical;
+                    changed.manifest_path = paths.manifest_logical;
+                },
+                else => unreachable,
+            }
+            var owned = try state_module.create(allocator, changed);
+            defer owned.deinit();
+            const bytes = try owned.state.canonicalJson(allocator);
+            defer allocator.free(bytes);
+            try root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600) });
+            try std.testing.expectError(switch (case) {
+                2 => error.PlanEvidenceMismatch,
+                3 => error.DescriptorMissingFromLock,
+                5 => error.RepositoryPackageStageAlreadyAdvanced,
+                else => error.RepositoryStateMismatch,
+            }, persistNativePackageState(allocator, input));
+            const after = try root.readFileAlloc(allocator, path, state_module.maximum_document_bytes);
+            defer allocator.free(after);
+            try std.testing.expectEqualSlices(u8, bytes, after);
+        }
+        try root.publishFile(path, original, .{ .permissions = .fromMode(0o600) });
+        const plan_path = try root_fs.Path.init(paths.exact_plan_logical[1..]);
+        const original_plan = try root.readFileAlloc(allocator, plan_path, repository_plan.maximum_document_bytes);
+        defer allocator.free(original_plan);
+        var different_plan = try repository_plan.decode(allocator, original_plan);
+        defer different_plan.deinit();
+        different_plan.actions[0].requested = !different_plan.actions[0].requested;
+        const changed_plan = try different_plan.canonicalJson(allocator);
+        defer allocator.free(changed_plan);
+        try root.publishFile(plan_path, changed_plan, .{});
+        try std.testing.expectError(error.RequestEvidenceMismatch, persistNativePackageState(allocator, input));
+        try root.publishFile(plan_path, original_plan, .{});
+        const lock_path = try root_fs.Path.init(paths.exact_lock_logical[1..]);
+        const original_lock = try root.readFileAlloc(allocator, lock_path, exact_lock_v2.maximum_document_bytes);
+        defer allocator.free(original_lock);
+        var decoded_lock = try exact_lock_v2.decode(allocator, original_lock, exact_lock_v2.maximum_document_bytes);
+        defer decoded_lock.deinit();
+        var wrong_request = decoded_lock.lock.request_sha256;
+        wrong_request[0] ^= 1;
+        var different_lock = try exact_lock_v2.create(allocator, .{
+            .target_architecture = decoded_lock.lock.target_architecture,
+            .request_sha256 = wrong_request,
+            .policy_sha256 = decoded_lock.lock.policy_sha256,
+            .repositories = decoded_lock.lock.repositories,
+            .local_artifacts = decoded_lock.lock.local_artifacts,
+            .packages = decoded_lock.lock.packages,
+            .verified_origins = true,
+        });
+        defer different_lock.deinit();
+        const changed_lock = try different_lock.lock.canonicalJson(allocator);
+        defer allocator.free(changed_lock);
+        try root.publishFile(lock_path, changed_lock, .{});
+        try std.testing.expectError(error.LockEvidenceMismatch, persistNativePackageState(allocator, input));
+        try root.publishFile(lock_path, original_lock, .{});
+        for ([_][]const u8{ paths.operation_state_logical, paths.exact_plan_logical, paths.exact_lock_logical }) |logical| {
+            const missing = try root_fs.Path.init(logical[1..]);
+            const saved = try root_fs.Path.init("fixture/missing-checkpoint-input");
+            try root.rename(missing, saved, .fail_if_exists);
+            try std.testing.expectError(error.FileNotFound, persistNativePackageState(allocator, input));
+            try std.testing.expect(try root.entryIfExists(missing) == null);
+            try root.createSymbolicLink(missing, "/fixture/missing-checkpoint-input");
+            try std.testing.expectError(error.NotRegularFile, persistNativePackageState(allocator, input));
+            try root.removeFile(missing);
+            try root.rename(saved, missing, .fail_if_exists);
+        }
+        var clock: RepositoryExecutionClock = .{ .root = root };
+        var bounded = input;
+        bounded.deadline = clock.deadline();
+        var expiration: NativeCheckpointTestBoundary = .{ .root = root, .state_path = path, .clock = &clock };
+        try std.testing.expectError(error.DeadlineExceeded, persistNativePackageStateObserved(allocator, bounded, expiration.observer()));
+        const observed = try root.readFileAlloc(allocator, path, state_module.maximum_document_bytes);
+        defer allocator.free(observed);
+        try std.testing.expectEqualSlices(u8, original, observed);
+        try std.testing.expect(try root.entryIfExists(unbound_receipt) != null);
+        var replacement: NativeCheckpointTestBoundary = .{ .root = root, .state_path = path };
+        try std.testing.expectError(error.PathChanged, persistNativePackageStateObserved(allocator, input, replacement.observer()));
+        const changed = try root.readFileAlloc(allocator, path, 128);
+        defer allocator.free(changed);
+        try std.testing.expectEqualStrings("changed during verification", changed);
+        try root.removeFile(path);
+        try root.rename(try root_fs.Path.init("fixture/replaced-checkpoint-state"), path, .fail_if_exists);
+        var crash: NativeReceiptTestCrash = .{ .point = .after_rename };
+        try std.testing.expectError(
+            error.InjectedNativeReceiptPublicationFailure,
+            persistNativePackageStateObserved(allocator, input, crash.observer()),
+        );
+    }
+    const before = try root.entry(path);
+    var checkpoint = try persistNativePackageState(allocator, input);
+    defer checkpoint.deinit();
+    try std.testing.expectEqual(before.inode, (try root.entry(path)).inode);
+    try std.testing.expectEqual(if (failed) state_module.Phase.failed else .installed, checkpoint.state.state.phase);
+    try std.testing.expectEqual(!failed, checkpoint.state.state.installed);
+    try std.testing.expectEqual(failed, checkpoint.package_state == .failed);
+    try std.testing.expectEqualStrings(paths.provenance_logical, checkpoint.state.state.provenance_path.?);
+    try std.testing.expect(!checkpoint.state.state.refreshed and checkpoint.state.state.manifest_path == null);
+    if (first) {
+        const receipt_path = try root_fs.Path.init(paths.provenance_logical[1..]);
+        const saved_receipt = try root_fs.Path.init("fixture/checkpoint-retained-receipt");
+        try root.rename(receipt_path, saved_receipt, .fail_if_exists);
+        try std.testing.expectError(error.NativeReceiptMissing, persistNativePackageState(allocator, input));
+        try std.testing.expect(try root.entryIfExists(receipt_path) == null);
+        try root.rename(saved_receipt, receipt_path, .fail_if_exists);
+        try std.testing.expectEqual(before.inode, (try root.entry(path)).inode);
+    }
+    try std.testing.expectEqual(caller_before, input.attempt.record().digest_sha256);
+    try std.testing.expect(input.attempt.locked());
+    try std.testing.expectEqual(root_operation.Outcome.pending, input.attempt.record().outcome);
+}
 
 fn testRepositoryNativePackageState(
     root: root_fs.Root,
@@ -5818,6 +6263,7 @@ fn testRepositoryNativeReceipt(
     try std.testing.expectEqual(retained_inode, (try root.entry(retained_path)).inode);
     try testRepositoryNativePackageState(root, input, failed, first_receipt);
     try std.testing.expectEqual(retained_inode, (try root.entry(retained_path)).inode);
+    try testRepositoryNativeCheckpoint(root, input, failed, first_receipt);
     try std.testing.expectEqual(caller_before, attempt.record().digest_sha256);
     const trace = try root.readFileAlloc(allocator, try root_fs.Path.init("repository-trace"), 1024);
     defer allocator.free(trace);
@@ -5911,6 +6357,8 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
     const attempt = guard.active().?;
     const before = attempt.record().digest_sha256;
     const original_attempt = attempt.attemptId();
+    if (case == .success or case == .known_failure or case == .interrupted)
+        try stageRepositoryNativeLockedInputs(root, request, plan, lock.lock, artifact);
     var clock: RepositoryExecutionClock = .{
         .root = root,
         .stop_on_intent = case == .interrupted,
@@ -5969,7 +6417,12 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
         };
         inline for (.{ retainNativeReceipt, readRetainedNativeReceipt, verifyNativePackageState }) |function|
             try std.testing.expectError(error.NativeReceiptMissing, function(allocator, receipt_input));
-        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("var/lib/debz/repository")) == null);
+        if (case == .interrupted) {
+            try std.testing.expectError(error.NativeReceiptMissing, persistNativePackageState(allocator, receipt_input));
+        } else {
+            try std.testing.expectError(error.FileNotFound, persistNativePackageState(allocator, receipt_input));
+            try std.testing.expect(try root.entryIfExists(try root_fs.Path.init("var/lib/debz/repository")) == null);
+        }
     }
     if (case == .unchanged or case == .diagnostic or case == .expired or case == .missing_helper) {
         if (case != .missing_helper) try std.testing.expectEqual(before, attempt.record().digest_sha256);
@@ -6030,19 +6483,28 @@ fn recoverProjectedRepositoryCase(
     if (revoke_scope) |route| {
         const before_retention = attempt.record().digest_sha256;
         var revoked: RepositoryExecutionClock = .{ .root = root, .revoke_on_call = if (route == .verify) 4 else 2 };
-        const receipt_input: NativeReceiptRequest = .{
+        var receipt_input: NativeReceiptRequest = .{
             .repository = request.value,
             .attempt = attempt,
             .expected_receipt_sha256 = report.receipt.?.document.digest_sha256,
             .deadline = revoked.deadline(),
         };
+        if (route == .checkpoint) {
+            var counter: RepositoryExecutionClock = .{ .root = root };
+            receipt_input.deadline = counter.deadline();
+            var measured = try persistNativePackageState(allocator, receipt_input);
+            defer measured.deinit();
+            revoked.revoke_on_call = counter.calls;
+            receipt_input.deadline = revoked.deadline();
+        }
         switch (route) {
             .retain => try std.testing.expectError(error.InvalidRoot, retainNativeReceipt(allocator, receipt_input)),
             .read => try std.testing.expectError(error.InvalidRoot, readRetainedNativeReceipt(allocator, receipt_input)),
             .verify => try std.testing.expectError(error.InvalidRoot, verifyNativePackageState(allocator, receipt_input)),
+            .checkpoint => try std.testing.expectError(error.InvalidRoot, persistNativePackageState(allocator, receipt_input)),
         }
         try std.testing.expect(revoked.inspection_error == null);
-        try std.testing.expectEqual(@as(usize, if (route == .verify) 4 else 2), revoked.calls);
+        try std.testing.expectEqual(revoked.revoke_on_call.?, revoked.calls);
         try std.testing.expectEqual(before_retention, attempt.record().digest_sha256);
         try std.testing.expect(attempt.locked());
     }
@@ -6075,7 +6537,7 @@ test "repository backend native execution external fixture" {
         }
     };
     const terminal = case == .success or case == .known_failure or case == .interrupted;
-    for (0..if (case == .success) @as(usize, 7) else if (terminal) @as(usize, 3) else 1) |index| {
+    for (0..if (case == .success) @as(usize, 8) else if (terminal) @as(usize, 3) else 1) |index| {
         var callback: Callback = .{
             .case = case,
             .recover = index != 0,
@@ -6083,6 +6545,7 @@ test "repository backend native execution external fixture" {
                 3 => .retain,
                 4 => .read,
                 5 => .verify,
+                6 => .checkpoint,
                 else => null,
             } else null,
         };

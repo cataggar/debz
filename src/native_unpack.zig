@@ -17705,7 +17705,9 @@ pub const Runtime = struct {
         );
     }
 
-    fn validateAttempt(attempt: *root_operation.Attempt) !root_fs.Root {
+    /// Borrows the held caller's freshly validated root. The descriptor remains
+    /// caller-owned; this does not extend projection authority across callbacks.
+    pub fn validateAttempt(attempt: *root_operation.Attempt) !root_fs.Root {
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
         if (!attempt.locked()) return error.LockLost;
         const record = attempt.record();
