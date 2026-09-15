@@ -75,6 +75,15 @@ target state has no native answer, an injected runner may execute the fixed
 argv `/usr/bin/dpkg --print-architecture` with an empty environment. Alternate
 roots never fall back to the host architecture or `uname`.
 
+`inspectArchitecture` provides the same bounded target-metadata discovery
+without importing sources or keyrings. It returns an `OwnedArchitecture`
+containing the native architecture and sorted, deduplicated foreign set;
+call `deinit` when finished. This read-only entry point always disables the
+process runner, even if one is supplied and the logical root is `/`. Missing
+target-native evidence therefore requires an explicit override instead of a
+dpkg subprocess. Root-adapter checks, malformed-input refusals, and allocation
+errors are preserved. The ordinary `snapshot` fallback contract is unchanged.
+
 The canonical `apt-config-snapshot-v1` document records source paths and
 digests, normalized configuration and repository identities, keyring paths,
 digests and fingerprints, global compatibility use, deterministic exclusions,

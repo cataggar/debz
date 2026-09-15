@@ -94,6 +94,30 @@ root, architecture, complete original request, executor policy, and native
 lock request/policy bindings. Existing caller plan, lock, authorization,
 program, database-generation, and artifact bindings cannot be replaced.
 
+Native repository reservations resolve target and foreign architectures using
+metadata-only `target_apt_config.inspectArchitecture`, borrowing the guard's
+pinned root. An explicit override or an installed `dpkg` status entry supplies
+the native architecture; the dpkg executable is never called. Without either,
+native architecture is unavailable rather than inferred from the host.
+The original API request is not rewritten with the discovered architecture.
+
+Clean reservations, including unstarted adopted reservations, are rechecked
+under the root-operation lock before work can proceed. Architecture drift
+refuses without rebinding the caller. Recovery-bearing callers retain their
+original architecture even if current status is incomplete; locked admission
+still rejects different requests and surfaces. Native before/after snapshots
+disable process fallback and require the same native and foreign architecture
+closure. Cleanup abandons a native reservation only after independently
+excluding active native evidence, not from its pre-mutation state alone.
+Legacy discovery, fallback, and caller identities are unchanged.
+
+Native preparation accepts a canonical leading native-architecture line in
+dpkg architecture metadata while retaining the foreign bytes and their file
+mode for strict database import. Foreign membership is compared as a set
+against the canonical caller record; input order is not authority. Duplicate,
+malformed, and unsafe foreign metadata still refuses without changing the
+caller. Raw foreign ordering remains part of the imported database evidence.
+
 Native caller request digests cover every cache, state, network, and aggregate
 resource field; native caller policy digests also bind the actual repository
 executor policy. Legacy caller and executable-lock identities remain

@@ -290,11 +290,17 @@ pub const Backend = struct {
         var architecture_process = target_apt_config.SystemProcessRunner{ .io = self.io };
         var before_snapshot = target_apt_config.snapshot(allocator, .{
             .root_path = request.root,
-            .architecture_override = request.architecture,
+            .architecture_override = if (transaction_backend == .native)
+                guard.active().?.record().target_architecture
+            else
+                request.architecture,
             .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
-                .process = architecture_process.interface(),
+                .process = if (transaction_backend == .legacy_dpkg)
+                    architecture_process.interface()
+                else
+                    null,
             },
         }) catch |err| return api.failure(
             .usage,
@@ -307,7 +313,10 @@ pub const Backend = struct {
         );
         defer before_snapshot.deinit();
         const architecture = before_snapshot.manifest.manifest.native_architecture;
-        if (guard.preflight(architecture)) |failure| return failure;
+        if (guard.preflight(.{
+            .native = architecture,
+            .foreign = before_snapshot.manifest.manifest.foreign_architectures,
+        })) |failure| return failure;
         if (prior_state) |*prior| {
             if (!std.mem.eql(u8, prior.state.root, request.root) or
                 !std.mem.eql(u8, prior.state.architecture, architecture) or
@@ -1809,7 +1818,10 @@ pub const Backend = struct {
             .limits = targetLimits(request.resources),
             .dependencies = .{
                 .filesystem = target_files.interface(),
-                .process = architecture_process.interface(),
+                .process = if (transaction_backend == .legacy_dpkg)
+                    architecture_process.interface()
+                else
+                    null,
             },
         }) catch |err| return progress.fail(
             state_store,
@@ -1820,6 +1832,19 @@ pub const Backend = struct {
             @errorName(err),
         );
         defer after_snapshot.deinit();
+        if (transaction_backend == .native) {
+            if (RootOperationGuard.checkArchitecture(guard.active().?.record(), .{
+                .native = after_snapshot.manifest.manifest.native_architecture,
+                .foreign = after_snapshot.manifest.manifest.foreign_architectures,
+            })) |failure| return progress.fail(
+                state_store,
+                allocator,
+                failure.exit_status,
+                failure.diagnostics[0].id,
+                "import",
+                failure.diagnostics[0].message,
+            );
+        }
         verifyImportedMaterial(after_snapshot, material.evidence) catch |err|
             return progress.fail(
                 state_store,
@@ -2038,6 +2063,7 @@ const RootOperationGuard = struct {
     locks: root_operation.SystemLockBackend = undefined,
     coordinator: root_operation.Coordinator = undefined,
     attempt: ?root_operation.Attempt = null,
+    acquisition_observer: ?root_operation.AcquisitionObserver = null,
 
     fn open(
         self: *RootOperationGuard,
@@ -2060,6 +2086,38 @@ const RootOperationGuard = struct {
             self.locks.interface(),
         ) catch |err| return mapRootOperationError(err);
         self.coordinator.now_unix = now_unix;
+        const request_digest = repositoryRequestDigest(request, backend);
+        const policy_digest = repositoryPolicyDigest(request, backend);
+        var native_architecture = request.architecture orelse "all";
+        var foreign_architectures: []const []const u8 = &.{};
+        var prior: ?root_operation.OwnedRecord = null;
+        defer if (prior) |*value| value.deinit();
+        var discovered: ?target_apt_config.OwnedArchitecture = null;
+        defer if (discovered) |*value| value.deinit();
+        if (backend == .native) {
+            prior = self.coordinator.inspect(self.allocator) catch |err|
+                return mapRootOperationError(err);
+            const retain_architecture = if (prior) |value| blk: {
+                const record = value.record;
+                break :blk record.state.blocksMutation() or
+                    (record.state == .completed and record.provenance == .pending) or
+                    (record.backend == .native and record.program_sha256 != null and
+                        record.outcome != .abandoned_before_mutation) or
+                    (!record.clearable() and record.backend == .native and
+                        record.operation.eql(.{ .repository_bootstrap = .add }) and
+                        std.mem.eql(u8, &record.request_sha256, &request_digest) and
+                        std.mem.eql(u8, &record.policy_sha256, &policy_digest));
+            } else false;
+            if (retain_architecture) {
+                native_architecture = prior.?.record.target_architecture;
+                foreign_architectures = prior.?.record.foreign_architectures;
+            } else {
+                discovered = self.inspectNativeArchitecture(request) catch |err|
+                    return architectureFailure(err);
+                native_architecture = discovered.?.architecture.native;
+                foreign_architectures = discovered.?.architecture.foreign;
+            }
+        }
         self.attempt = self.coordinator.acquire(self.allocator, .{
             // Repository bootstrap is resumable by construction: its durable
             // operation state already replays acquisition, planning, install,
@@ -2072,12 +2130,76 @@ const RootOperationGuard = struct {
             .existing = .reclaim_resolved,
             .backend = backend,
             .operation = .{ .repository_bootstrap = .add },
-            .request_sha256 = repositoryRequestDigest(request, backend),
-            .policy_sha256 = repositoryPolicyDigest(request, backend),
-            .target_architecture = request.architecture orelse "all",
+            .request_sha256 = request_digest,
+            .policy_sha256 = policy_digest,
+            .target_architecture = native_architecture,
+            .foreign_architectures = foreign_architectures,
             .wait_ms = request.state.lock_wait_ms,
+            .acquisition_observer = self.acquisition_observer,
         }) catch |err| return mapRootOperationError(err);
+        if (backend == .native) {
+            const clean = native_runtime.canAbandon(self.allocator, &self.attempt.?) catch |err|
+                return mapRootOperationError(err);
+            if (!self.attempt.?.adopted and !clean)
+                return mapRootOperationError(error.RecoveryRequired);
+            if (clean) {
+                // Recheck under exclusion, including an adopted reservation
+                // that never started. Recovery-bearing callers keep their
+                // original architecture instead of inferring from partial state.
+                var current = self.inspectNativeArchitecture(request) catch |err|
+                    return architectureFailure(err);
+                defer current.deinit();
+                if (checkArchitecture(self.attempt.?.record(), current.architecture)) |failure|
+                    return failure;
+            }
+        }
         return null;
+    }
+
+    fn inspectNativeArchitecture(
+        self: *RootOperationGuard,
+        request: api.Request,
+    ) !target_apt_config.OwnedArchitecture {
+        // This view borrows the guard's pinned root; only the guard closes it.
+        var files: target_apt_config.ProductionFileSystem = .{
+            .io = self.io,
+            .root = self.owned_root.?.root.dir,
+            .host_root = std.mem.eql(u8, request.root, "/"),
+        };
+        return target_apt_config.inspectArchitecture(self.allocator, .{
+            .root_path = request.root,
+            .architecture_override = request.architecture,
+            .limits = targetLimits(request.resources),
+            .dependencies = .{ .filesystem = files.interface() },
+        });
+    }
+
+    fn architectureFailure(err: anyerror) api.Result {
+        return api.failure(
+            if (err == error.OutOfMemory) .internal else .usage,
+            if (err == error.OutOfMemory)
+                .internal_error
+            else if (err == error.NativeArchitectureUnavailable)
+                .architecture_unavailable
+            else
+                .target_configuration_failed,
+            "target",
+            @errorName(err),
+        );
+    }
+
+    fn checkArchitecture(record: root_operation.Record, actual: target_apt_config.Architecture) ?api.Result {
+        const expected: target_apt_config.Architecture = .{
+            .native = record.target_architecture,
+            .foreign = record.foreign_architectures,
+        };
+        if (expected.eql(actual)) return null;
+        return api.failure(
+            .recovery,
+            .recovery_required,
+            "target",
+            "native target architecture no longer matches the original root caller",
+        );
     }
 
     /// Pointer to the live attempt, never a copy: every boundary must be
@@ -2092,9 +2214,11 @@ const RootOperationGuard = struct {
         try attempt.enterRank(rank);
     }
 
-    fn preflight(self: *RootOperationGuard, architecture: []const u8) ?api.Result {
-        _ = architecture;
+    fn preflight(self: *RootOperationGuard, architecture: target_apt_config.Architecture) ?api.Result {
         var attempt = self.active() orelse return null;
+        if (attempt.record().backend == .native) {
+            if (checkArchitecture(attempt.record(), architecture)) |failure| return failure;
+        }
         if (attempt.record().state != .reserved) return null;
         attempt.advance(self.allocator, .{
             .state = .preflight,
@@ -2243,10 +2367,17 @@ const RootOperationGuard = struct {
             // is refused until it is explicitly recovered. A failure here
             // simply leaves the pre-mutation record, which the next attempt
             // reports as an unresolved attempt.
-            if (value.locked()) {
-                if (value.record().state.provenPreMutation())
-                    value.abandonIfPreMutation(self.allocator) catch {}
-                else if (value.record().clearable()) value.clear() catch {};
+            if (value.locked()) cleanup: {
+                if (value.record().state.provenPreMutation()) {
+                    if (value.record().backend == .native) {
+                        const clean = native_runtime.canAbandon(self.allocator, value) catch |err| {
+                            std.log.warn("native repository ownership retained after cleanup inspection failed: {s}", .{@errorName(err)});
+                            break :cleanup;
+                        };
+                        if (!clean) break :cleanup;
+                    }
+                    value.abandonIfPreMutation(self.allocator) catch {};
+                } else if (value.record().clearable()) value.clear() catch {};
             }
             value.release();
         }
@@ -2282,7 +2413,12 @@ fn mapRootOperationError(err: anyerror) api.Result {
             "root-operation",
             "the active root attempt record is unreadable",
         ),
-        error.InvalidRoot, error.RootTooLong, error.NamespaceUnavailable => api.failure(
+        error.InvalidRoot,
+        error.RootTooLong,
+        error.NamespaceUnavailable,
+        error.HostRootNotSupported,
+        error.OperationRootMismatch,
+        => api.failure(
             .usage,
             .invalid_root,
             "target",
@@ -4680,6 +4816,9 @@ test "repository backend native caller binds every executable request policy fie
 
 const NativePreparationCase = enum {
     prepared,
+    discovered_architecture,
+    changed_foreign_architecture,
+    duplicate_foreign_architecture,
     unchanged,
     unchanged_active_intent,
     unchanged_sticky_program,
@@ -4708,6 +4847,8 @@ const NativePreparationCase = enum {
 
 fn testNativePreparation(case: NativePreparationCase) !void {
     const allocator = std.testing.allocator;
+    const discovered_architecture = case == .discovered_architecture or
+        case == .changed_foreign_architecture or case == .duplicate_foreign_architecture;
     const empty = case == .unchanged or case == .unchanged_active_intent or
         case == .unchanged_sticky_program;
     const bytes = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
@@ -4722,7 +4863,11 @@ fn testNativePreparation(case: NativePreparationCase) !void {
     var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
     defer root_dir.close(std.testing.io);
     const root = root_fs.Root.init(std.testing.io, root_dir);
-    const status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
+    const held_status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
+    const status = if (discovered_architecture)
+        native_architecture_status ++ held_status
+    else
+        held_status;
     try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
     try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
     try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
@@ -4738,6 +4883,10 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         "/.\n/usr\n/usr/share\n/usr/share/held\n",
         .{},
     );
+    if (discovered_architecture) {
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\ni386\narm64\n", .{});
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
+    }
     try directory.dir.createDirPath(std.testing.io, "root/usr/share");
     try root.publishFile(try root_fs.Path.init("usr/share/held"), "untouched\n", .{});
     const root_path = try repositoryTestRoot(allocator, directory.dir);
@@ -4749,6 +4898,7 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         .architecture = "amd64",
     };
     request.resources.maximum_retained_package_bytes = bytes.len;
+    if (discovered_architecture) request.architecture = null;
     switch (case) {
         .retained_limit => request.resources.maximum_retained_package_bytes -= 1,
         .total_limit => request.resources.maximum_total_package_bytes = bytes.len - 1,
@@ -4800,6 +4950,8 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         );
     defer lock.deinit();
     var extra_actions = [_]solver.PlanAction{ fixture.actions[0], fixture.actions[0] };
+    var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = allocator };
+    defer guard.deinit();
     var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
     var lost_locks: root_operation.TestLockBackend = .{ .allocator = allocator };
     defer lost_locks.deinit();
@@ -4810,7 +4962,12 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         if (case == .lost_lock) lost_locks.interface() else locks.interface(),
     );
     const wrong_digest: [32]u8 = @splat(0x11);
-    var attempt = try coordinator.acquire(allocator, .{
+    var attempt = if (discovered_architecture) blk: {
+        try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+        const reserved = guard.attempt.?;
+        guard.attempt = null;
+        break :blk reserved;
+    } else try coordinator.acquire(allocator, .{
         .backend = if (case == .legacy_caller) .legacy_dpkg else .native,
         .operation = if (case == .different_surface)
             .{ .package_transaction = .install }
@@ -4850,6 +5007,16 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         .changed_request => input.repository.resources.maximum_actions += 1,
         .changed_plan => fixture.actions[0].requested = false,
         .action_limit => plan.actions = &extra_actions,
+        .changed_foreign_architecture => try root.publishFile(
+            try root_fs.Path.init("var/lib/dpkg/arch"),
+            "amd64\narm64\n",
+            .{},
+        ),
+        .duplicate_foreign_architecture => try root.publishFile(
+            try root_fs.Path.init("var/lib/dpkg/arch"),
+            "amd64\ni386\narm64\ni386\n",
+            .{},
+        ),
         .active_intent, .unchanged_active_intent => try root.publishFile(
             try root_fs.Path.init(@import("native_recovery.zig").intent_path),
             "incomplete native evidence",
@@ -4863,6 +5030,8 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         .legacy_caller => error.OperationBackendMismatch,
         .different_surface, .changed_request => error.RepositoryCallerMismatch,
         .wrong_architecture => error.OperationArchitectureMismatch,
+        .changed_foreign_architecture => error.OperationArchitectureMismatch,
+        .duplicate_foreign_architecture => error.InvalidNativeDatabase,
         .legacy_lock => error.LockPolicyMismatch,
         .changed_plan => error.RequestEvidenceMismatch,
         .sticky_plan => error.PlanEvidenceMismatch,
@@ -4892,7 +5061,7 @@ fn testNativePreparation(case: NativePreparationCase) !void {
                 try std.testing.expect(result == .diagnostic);
                 try std.testing.expectEqual(.missing_archive, result.diagnostic.diagnostic.code);
             },
-            .prepared => {
+            .prepared, .discovered_architecture => {
                 try std.testing.expect(result == .prepared);
                 const authorization = result.prepared.authorization.authorization;
                 const held = authorization.findFinalPackage("held", "amd64").?;
@@ -4905,6 +5074,10 @@ fn testNativePreparation(case: NativePreparationCase) !void {
                     &result.prepared.program.program.executor_policy_sha256,
                 );
                 try std.testing.expectEqual(before, attempt.record().digest_sha256);
+                if (case == .discovered_architecture) {
+                    try std.testing.expectEqualDeep(native_architecture_foreign, authorization.foreign_architectures);
+                    try std.testing.expectEqualDeep(native_architecture_foreign, attempt.record().foreign_architectures);
+                }
                 try native_operation.bind(allocator, root, &attempt, result.prepared.program.program);
                 before = attempt.record().digest_sha256;
                 var repeated = try prepareNative(allocator, input);
@@ -4936,6 +5109,12 @@ test "repository backend prepares genuine native inputs without mutating caller 
     try testNativePreparation(.prepared);
     try testNativePreparation(.unchanged);
     try testNativePreparation(.missing_archive);
+}
+
+test "repository backend native preparation preserves discovered multiarch callers" {
+    try testNativePreparation(.discovered_architecture);
+    try testNativePreparation(.changed_foreign_architecture);
+    try testNativePreparation(.duplicate_foreign_architecture);
 }
 
 test "repository backend native preparation refuses changed caller lock plan and active evidence" {
@@ -5058,6 +5237,230 @@ test "repository backend lock domains retain exact origins and reject the other 
         try std.testing.expectError(error.RequestEvidenceMismatch, validateLockRequest(allocator, lock, request, plan, backend));
         fixture.actions[0].requested = true;
     }
+}
+
+const native_architecture_status = "Package: dpkg\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n\n";
+const native_architecture_foreign: []const []const u8 = &.{ "arm64", "i386" };
+
+fn stageNativeArchitecture(directory: std.Io.Dir) !void {
+    try stageRepositoryTestRoot(directory);
+    try directory.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = native_architecture_status,
+    });
+    try directory.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/arch",
+        .data = "i386\namd64\narm64\n",
+    });
+}
+
+test "repository backend native reservation binds discovered architecture without changing request authority" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageNativeArchitecture(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "https://packages.example.test/descriptor.deb",
+    };
+    var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer guard.deinit();
+    try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+    const record = guard.active().?.record();
+    try std.testing.expectEqualStrings("amd64", record.target_architecture);
+    try std.testing.expectEqualDeep(native_architecture_foreign, record.foreign_architectures);
+    try std.testing.expectEqualSlices(u8, &repositoryRequestDigest(request, .native), &record.request_sha256);
+    try std.testing.expect(request.architecture == null);
+    for ([_]target_apt_config.Architecture{
+        .{ .native = "arm64", .foreign = native_architecture_foreign },
+        .{ .native = "amd64", .foreign = &.{} },
+    }) |changed| {
+        var refused = guard.preflight(changed) orelse return error.TestUnexpectedResult;
+        defer refused.deinit();
+        try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+        try std.testing.expectEqual(record.digest_sha256, guard.active().?.record().digest_sha256);
+    }
+    try std.testing.expect(guard.preflight(.{
+        .native = "amd64",
+        .foreign = native_architecture_foreign,
+    }) == null);
+}
+
+test "repository backend native reservation preserves interrupted architecture instead of rediscovering it" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageNativeArchitecture(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "https://packages.example.test/descriptor.deb",
+    };
+    {
+        var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer guard.deinit();
+        try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+        try std.testing.expect(guard.preflight(.{ .native = "amd64", .foreign = native_architecture_foreign }) == null);
+        try guard.active().?.markMutationStarted(std.testing.allocator, .database);
+    }
+    var original = (try readRootAttempt(directory.dir)).?;
+    defer original.deinit();
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "invalid interrupted status",
+    });
+    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/arch");
+    {
+        var resumed: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer resumed.deinit();
+        try std.testing.expect(resumed.open(request, .native, 1_700_000_001) == null);
+        try std.testing.expect(resumed.active().?.adopted);
+        try std.testing.expectEqual(original.record.digest_sha256, resumed.active().?.record().digest_sha256);
+        try std.testing.expectEqualDeep(native_architecture_foreign, resumed.active().?.record().foreign_architectures);
+    }
+    var changed = request;
+    changed.no_refresh = true;
+    var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer contender.deinit();
+    var refused = contender.open(changed, .native, 1_700_000_002) orelse return error.TestUnexpectedResult;
+    defer refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+    var observed = (try readRootAttempt(directory.dir)).?;
+    defer observed.deinit();
+    try std.testing.expectEqual(original.record.digest_sha256, observed.record.digest_sha256);
+}
+
+test "repository backend native unstarted adoption rechecks architecture without rebinding" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageNativeArchitecture(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "https://packages.example.test/descriptor.deb",
+    };
+    {
+        var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer guard.deinit();
+        try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+        guard.active().?.release();
+        guard.attempt = null;
+    }
+    var original = (try readRootAttempt(directory.dir)).?;
+    defer original.deinit();
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "Package: dpkg\nStatus: install ok installed\nArchitecture: arm64\nVersion: 1\n\n",
+    });
+    {
+        var resumed: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer resumed.deinit();
+        var refused = resumed.open(request, .native, 1_700_000_001) orelse return error.TestUnexpectedResult;
+        defer refused.deinit();
+        try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+        try std.testing.expect(resumed.active().?.adopted);
+        try std.testing.expectEqual(original.record.digest_sha256, resumed.active().?.record().digest_sha256);
+    }
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+}
+
+test "repository backend native reservation rechecks architecture after acquiring exclusion" {
+    const Race = struct {
+        directory: std.Io.Dir,
+        calls: usize = 0,
+
+        fn hit(context: *anyopaque, point: root_operation.AcquisitionPoint) !void {
+            if (point != .after_lock_acquired) return;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            try self.directory.writeFile(std.testing.io, .{
+                .sub_path = "root/var/lib/dpkg/status",
+                .data = "Package: dpkg\nStatus: install ok installed\nArchitecture: arm64\nVersion: 1\n\n",
+            });
+        }
+    };
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageNativeArchitecture(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var race: Race = .{ .directory = directory.dir };
+    {
+        var guard: RootOperationGuard = .{
+            .io = std.testing.io,
+            .allocator = std.testing.allocator,
+            .acquisition_observer = .{ .context = &race, .hitFn = Race.hit },
+        };
+        defer guard.deinit();
+        var refused = guard.open(.{
+            .root = root,
+            .descriptor_url = "https://packages.example.test/descriptor.deb",
+        }, .native, 1_700_000_000) orelse return error.TestUnexpectedResult;
+        defer refused.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
+        try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+        try std.testing.expect(!guard.active().?.record().mutation_started);
+        try std.testing.expectEqualStrings("amd64", guard.active().?.record().target_architecture);
+    }
+    try std.testing.expectEqual(@as(usize, 1), race.calls);
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+}
+
+test "repository backend native reservation needs target evidence or explicit architecture" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var request: api.Request = .{
+        .root = root,
+        .descriptor_url = "https://packages.example.test/descriptor.deb",
+    };
+    {
+        var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer guard.deinit();
+        var refused = guard.open(request, .native, 1_700_000_000) orelse return error.TestUnexpectedResult;
+        defer refused.deinit();
+        try std.testing.expectEqual(api.DiagnosticId.architecture_unavailable, refused.diagnostics[0].id);
+        try std.testing.expect(guard.active() == null);
+    }
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+    request.architecture = "amd64";
+    var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer guard.deinit();
+    try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
+    try std.testing.expectEqualStrings("amd64", guard.active().?.record().target_architecture);
+}
+
+test "repository backend native cleanup never abandons active pre-mutation evidence" {
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var before: [32]u8 = undefined;
+    {
+        var guard: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer guard.deinit();
+        try std.testing.expect(guard.open(.{
+            .root = root,
+            .descriptor_url = "https://packages.example.test/descriptor.deb",
+            .architecture = "amd64",
+        }, .native, 1_700_000_000) == null);
+        before = guard.active().?.record().digest_sha256;
+        try guard.owned_root.?.root.publishFile(
+            try root_fs.Path.init(@import("native_recovery.zig").intent_path),
+            "incomplete native execution",
+            .{},
+        );
+    }
+    var observed = (try readRootAttempt(directory.dir)).?;
+    defer observed.deinit();
+    try std.testing.expectEqual(before, observed.record.digest_sha256);
+    try std.testing.expectEqual(root_operation.Outcome.pending, observed.record.outcome);
 }
 
 test "repository backend binds root callers while sharing live and unresolved exclusion" {
