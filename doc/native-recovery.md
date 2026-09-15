@@ -374,7 +374,13 @@ supervised root callbacks. They exercise successful and failed scripts,
 deadline interruption after intent, fresh persisted-only recovery after CAS
 eviction, stable repeated receipts and traces, missing helpers, unchanged
 closures and owned preparation diagnostics. Original caller ownership remains
-pending; package completion does not discharge repository bootstrap. The
+pending; package completion does not discharge repository bootstrap. Genuine
+terminal receipts are retained in backend-distinct operation-local files and
+read back in fresh callbacks. Cases cover expired publication, interrupted
+rename/sync convergence, refusal to repair corrupt or missing bound retention,
+unchanged caller and receipt identities, and scope loss between live proof and
+retention/readback followed by fresh legitimate adoption. Repository units
+cover every publication boundary, no-follow storage and allocation cleanup. The
 default recovery workload includes these cases; use
 `-Dnative-repository-execution-only=true` for the focused family.
 

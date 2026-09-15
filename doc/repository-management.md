@@ -224,6 +224,39 @@ bootstrap completion: descriptor import, metadata refresh, immutable outer
 receipt retention and durable outer completion must precede acknowledgment
 and root cleanup. The public repository CLI gate remains unchanged.
 
+### Retaining native package receipts
+
+`retainNativeReceipt` takes the original repository request, held native
+attempt, expected terminal receipt digest and the invocation's existing
+absolute deadline. It independently reads and authenticates the runtime's
+terminal evidence instead of trusting supplied receipt bytes. Both successful
+and known-failure package receipts retain their exact native schema, digest
+and outcome; nonterminal or missing evidence refuses.
+
+The returned `NativeRetainedReceipt` owns its logical path and native receipt;
+call `deinit` when finished. Native operation-local receipts use
+`native-transaction-provenance-v1.json`, never the legacy
+`transaction-result-v2.json`. The backend-specific operation-directory
+identity and original request determine the destination, including custom
+state paths. Legacy paths and state schemas are unchanged.
+
+Publication is no-follow, private, durable and non-overwriting. Ancestor
+directory entries are synced, and retry accepts only identical bytes, retaining
+the existing inode and finishing any interrupted file/directory sync. Existing
+foreign, corrupt or non-regular evidence is not repaired. Caller exclusion,
+projection authority and the shared deadline are revalidated before publication.
+Once the receipt is published, durability finishes without relabeling that
+publication as a timeout.
+
+Once outer state binds a retained receipt, use `readRetainedNativeReceipt`.
+It requires the same original caller and exact runtime receipt, checks existing
+bytes without writing, and refuses missing retention rather than recreating it.
+This is caller-owned readback, not historical bootstrap proof or a current
+database verifier. Neither API marks packages installed, acknowledges native
+execution, completes repository bootstrap, or releases root ownership. Durable
+outer installed/import/refresh state and completion remain future integration;
+the repository native CLI gate stays closed.
+
 ## Descriptor and repository trust
 
 The MVP descriptor is a Debian binary package. Unpinned acquisition requires
