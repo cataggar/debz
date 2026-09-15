@@ -446,10 +446,24 @@ receipts, refresh interruption under the shared deadline, and fresh adoption
 after completion/provenance and acknowledgment interruptions. The original
 package CAS is already empty. Exhaustive original-input loading allocation
 failures and selected full-pipeline failures preserve owned cleanup, while
-repeated completion stays stable and a new caller refuses historical state
-after root clear. Clean callers return not-started, not unchanged bootstrap.
+repeated completion stays stable. After root clear, a clean held caller verifies
+the latest matching historical success, original no-refresh success or known
+failure without adopting the old execution identity. Clean callers without
+advanced evidence return not-started, not unchanged bootstrap.
 The existing external completion, receipt, helper and script oracle applies to
 both the component and joined-pipeline cases; private-process limits are unchanged.
+
+Historical cases exercise missing/symlinked inputs, corrupt or differing
+local/shared completion and receipt, changed original state/plan/lock, discharge
+and caller/policy/architecture/outcome mismatches, changed installed source,
+keyring, manifest and an unrelated held package. Active native evidence and
+deferred/review ownership refuse. Pin replacement, deadline expiry and projection
+loss are checked around package verification, with legitimate fresh scoped
+readback afterward. Selected whole-history allocation failures release ownership
+of their results without modifying the caller. The independent oracle compares
+eight historical files' bytes/inodes with a pre-read snapshot and checks that the
+new caller has no execution program or mutation evidence. Operation-scoped lock
+units preserve strict full-closure behavior for other native consumers.
 
 ```sh
 zig build test-native-recovery -j2

@@ -15,6 +15,7 @@ const root_fs = @import("root_fs.zig");
 const root_mutation = @import("root_mutation.zig");
 const root_operation = @import("root_operation.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
+const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 
 pub const schema_id = "io.github.cataggar.debz.transaction-result-summary.v2";
@@ -189,6 +190,76 @@ fn CallerResult(comptime expected_outcome: TerminalOutcome) type {
 pub const CallerSuccess = CallerResult(.succeeded);
 pub const CallerFailure = CallerResult(.failed);
 
+/// Validates fresh exclusion only. Historical execution authority is never
+/// installed in, or borrowed through, this caller.
+pub fn validateRepositoryHistoryCaller(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !void {
+    const root = try native_runtime.validateAttempt(attempt);
+    const record = attempt.record();
+    if (!record.operation.eql(.{ .repository_bootstrap = .add }) or
+        record.program_sha256 != null or !try native_runtime.canAbandon(allocator, attempt))
+        return error.HistoricalCallerNotClean;
+    if (try root.entryIfExists(try root_fs.Path.init(root_operation.deferred_ack_path)) != null)
+        return error.OperationNotSettled;
+    var active = try attempt.coordinator.store().read(allocator) orelse return error.NoActiveAttempt;
+    defer active.deinit();
+    if (!std.mem.eql(u8, &active.record.digest_sha256, &record.digest_sha256))
+        return error.OperationEvidenceMismatch;
+    try attempt.coordinator.validateProjection();
+}
+
+/// Verifies retained repository execution under a different, clean held caller.
+/// It performs no recovery, acknowledgment, record publication or lock release.
+pub fn verifyRepositoryHistory(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    lock: exact_lock_v2.Lock,
+    policy: transaction_executor.Policy,
+    completion: root_operation_completion.Document,
+    receipt: native_provenance.Document,
+) !void {
+    return verifyRepositoryHistoryInternal(allocator, attempt, lock, policy, completion, receipt) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn verifyRepositoryHistoryInternal(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    lock: exact_lock_v2.Lock,
+    policy: transaction_executor.Policy,
+    completion: root_operation_completion.Document,
+    receipt: native_provenance.Document,
+) !void {
+    try validateRepositoryHistoryCaller(allocator, attempt);
+    const caller = attempt.record();
+    const bytes = try completion.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    var canonical = try root_operation_completion.decode(allocator, bytes, root_operation_completion.maximum_document_bytes);
+    defer canonical.deinit();
+    const outer = canonical.document;
+    if (policy.exact_lock_verification != .locked_packages or
+        !outer.operation.eql(.{ .repository_bootstrap = .add }) or
+        std.mem.eql(u8, &outer.attempt_id, &caller.attempt_id) or
+        !std.mem.eql(u8, &outer.request_sha256, &caller.request_sha256) or
+        !std.mem.eql(u8, &outer.policy_sha256, &caller.policy_sha256) or
+        !textsEqual(outer.foreign_architectures, caller.foreign_architectures) or
+        outer.discharge.surface != .repository_bootstrap or
+        !std.mem.eql(u8, outer.discharge.operation, "add") or
+        outer.transaction_provenance.status != .already_present)
+        return error.InvalidCompletion;
+    const outcome: TerminalOutcome = switch (receipt.outcome) {
+        .succeeded => .succeeded,
+        .failed => .failed,
+        .recovery_required => return error.InvalidCompletion,
+    };
+    const root = attempt.coordinator.root;
+    try verifyCompletionEvidence(allocator, root, caller.install_root, (try root.rootEntry()).inode, lock, caller.target_architecture, outer, receipt, outcome, policy);
+    try validateRepositoryHistoryCaller(allocator, attempt);
+    if (!std.mem.eql(u8, &caller.digest_sha256, &attempt.record().digest_sha256))
+        return error.OperationEvidenceMismatch;
+}
+
 /// Verifies package execution under the original held caller, without requiring
 /// or manufacturing outer completion, a deferred owner, or another root lock.
 pub fn verifyCallerSuccess(
@@ -223,7 +294,7 @@ fn verifyCaller(
         return if (expected_outcome == .succeeded) error.TransactionNotSuccessful else error.TransactionNotFailed;
     const record = attempt.record();
     const root = attempt.coordinator.root;
-    try verifyStateEvidence(allocator, root, (try root.rootEntry()).inode, null, record, proof, expected_outcome);
+    try verifyStateEvidence(allocator, root, (try root.rootEntry()).inode, null, record, proof, expected_outcome, null);
     try verifyPendingEvidence(allocator, root, proof);
     if (!attempt.locked()) return error.LockLost;
     try attempt.coordinator.validateProjection();
@@ -494,6 +565,26 @@ fn verifyEvidence(
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
 ) !void {
+    if (outer.operation != .package_transaction) return error.InvalidCompletion;
+    switch (outer.operation.package_transaction) {
+        .install, .remove, .upgrade, .upgrade_all, .reinstall => {},
+        else => return error.InvalidCompletion,
+    }
+    return verifyCompletionEvidence(allocator, root, install_root, root_inode, lock, expected_architecture, outer, proof, expected_outcome, null);
+}
+
+fn verifyCompletionEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    root_inode: u64,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    outer: root_operation_completion.Document,
+    proof: native_provenance.Document,
+    expected_outcome: TerminalOutcome,
+    repository_policy: ?transaction_executor.Policy,
+) !void {
     const lock_bytes = try lock.canonicalJson(allocator);
     defer allocator.free(lock_bytes);
     var validated_lock = try exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes);
@@ -502,7 +593,6 @@ fn verifyEvidence(
         return error.ArchitectureMismatch;
     try verifyTerminalOutcome(expected_outcome, proof.outcome, outer.outcome);
     if (outer.backend != .native or !outer.mutation_started or
-        outer.operation != .package_transaction or
         outer.transaction_provenance.status == .unavailable or
         !std.mem.eql(u8, outer.transaction_provenance.schema, native_provenance.schema_id) or
         outer.journal.status != .absent or outer.journal.document_sha256 != null or
@@ -511,16 +601,12 @@ fn verifyEvidence(
         !std.mem.eql(u8, outer.target_architecture, expected_architecture) or
         !outer.operation.eql(proof.operation))
         return error.InvalidCompletion;
-    switch (outer.operation.package_transaction) {
-        .install, .remove, .upgrade, .upgrade_all, .reinstall => {},
-        else => return error.InvalidCompletion,
-    }
     try equalDigest(proof.attempt_id, native_recovery.hexDigest(outer.attempt_id));
     try equalDigest(proof.request_sha256, native_recovery.hexDigest(outer.request_sha256));
     try equalDigest(proof.policy_sha256, native_recovery.hexDigest(outer.policy_sha256));
     try equalDigest(proof.root_identity_sha256, native_recovery.hexDigest(outer.root_identity_sha256));
     try optionalDigest(outer.transaction_provenance.document_sha256, proof.digest_sha256);
-    try verifyStateEvidence(allocator, root, root_inode, lock, outer, proof, expected_outcome);
+    try verifyStateEvidence(allocator, root, root_inode, lock, outer, proof, expected_outcome, repository_policy);
 }
 
 // Live callers bind the same native evidence through their sticky record;
@@ -533,6 +619,7 @@ fn verifyStateEvidence(
     authority: anytype,
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
+    repository_policy: ?transaction_executor.Policy,
 ) !void {
     try native_provenance.verifyEvidence(allocator, root, proof);
 
@@ -549,8 +636,13 @@ fn verifyStateEvidence(
     try evidenceDigest(proof, .program, program.program.digest_sha256);
     if (!program.program.matchesAuthorization(authorized))
         return error.AuthorizationMismatch;
+    if (repository_policy) |policy| {
+        if (!std.mem.eql(u8, &transaction_executor.policyDigest(policy), &authorized.executor_policy_sha256) or
+            policy.risk.allow_host_root != authorized.policy.allow_host_root)
+            return error.AuthorizationMismatch;
+    }
     if (lock) |value|
-        try verifyLock(authorized, program.program, value)
+        try verifyLock(authorized, program.program, value, if (repository_policy) |policy| policy.exact_lock_verification else .full_closure)
     else
         try verifyProgramPolicy(authorized, program.program);
     const expected_evidence = try native_operation.evidence(program.program);
@@ -741,7 +833,7 @@ fn verifyRemainingFile(
     try equalDigest(native_recovery.hexDigest(sha256), expected_sha256);
 }
 
-fn verifyLock(authorization: native_authorization.Authorization, program: native_program.Program, lock: exact_lock_v2.Lock) !void {
+fn verifyLock(authorization: native_authorization.Authorization, program: native_program.Program, lock: exact_lock_v2.Lock, verification: transaction_executor.ExactLockVerification) !void {
     if (!std.mem.eql(u8, authorization.target_architecture, lock.target_architecture) or
         !std.mem.eql(u8, program.target_architecture, lock.target_architecture))
         return error.ArchitectureMismatch;
@@ -754,7 +846,7 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         !std.mem.eql(u8, &authorization.solver_policy_sha256, &lock.policy_sha256))
         return error.LockEvidenceMismatch;
     try verifyProgramPolicy(authorization, program);
-    try verifyFinalClosure(authorization.final_state, lock);
+    try verifyFinalClosure(authorization.final_state, lock, verification);
     for (authorization.actions) |action| {
         const artifact = action.artifact orelse continue;
         const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
@@ -801,13 +893,18 @@ fn verifyProgramPolicy(authorization: native_authorization.Authorization, progra
         if (left != right) return error.AuthorizationMismatch;
 }
 
-fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lock: exact_lock_v2.Lock) !void {
+fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lock: exact_lock_v2.Lock, verification: transaction_executor.ExactLockVerification) !void {
     var installed: usize = 0;
     for (final_state) |package| {
         switch (package.state) {
             .installed => {
-                const locked = lock.findPackage(package.name, package.version, package.architecture) orelse
+                const locked = lock.findPackage(package.name, package.version, package.architecture) orelse {
+                    // Repository locks omit unrelated packages; live verification
+                    // still covers the entire recorded database.
+                    if (verification == .locked_packages and lock.findIdentity(package.name, package.architecture) == null)
+                        continue;
                     return error.LockEvidenceMismatch;
+                };
                 if (locked.dpkg_selection_hold != package.dpkg_selection_hold)
                     return error.LockEvidenceMismatch;
                 installed += 1;
@@ -1015,7 +1112,7 @@ test "native_transaction_result.test.empty closures retain only authorized resid
         .verified_origins = true,
     });
     defer lock.deinit();
-    try verifyFinalClosure(&.{}, lock.lock);
+    try verifyFinalClosure(&.{}, lock.lock, .full_closure);
     var residual: native_authorization.FinalPackage = .{
         .name = "config-only",
         .version = "1",
@@ -1023,11 +1120,57 @@ test "native_transaction_result.test.empty closures retain only authorized resid
         .state = .config_files,
         .dpkg_selection_hold = false,
     };
-    try verifyFinalClosure(&.{residual}, lock.lock);
+    try verifyFinalClosure(&.{residual}, lock.lock, .full_closure);
     residual.state = .installed;
-    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&.{residual}, lock.lock));
+    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&.{residual}, lock.lock, .full_closure));
     residual.state = .triggers_pending;
-    try std.testing.expectError(error.TransactionNotSuccessful, verifyFinalClosure(&.{residual}, lock.lock));
+    try std.testing.expectError(error.TransactionNotSuccessful, verifyFinalClosure(&.{residual}, lock.lock, .full_closure));
+}
+
+test "native_transaction_result.test.repository locks preserve unlocked packages without weakening full closures" {
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = @splat('1'),
+        .sha256 = @splat(0x11),
+        .size = 1,
+        .package = "descriptor",
+        .version = "1",
+        .architecture = "all",
+        .acquisition_url = "file:///descriptor.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{artifact},
+        .verified_origins = true,
+        .packages = &.{.{
+            .name = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .origin = .{ .local_artifact = artifact },
+            .sha256 = artifact.sha256,
+            .declared_size = artifact.size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+    });
+    defer lock.deinit();
+    var packages = [_]native_authorization.FinalPackage{
+        .{ .name = "descriptor", .version = "1", .architecture = "all", .state = .installed, .dpkg_selection_hold = false },
+        .{ .name = "held", .version = "2", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = true },
+    };
+    try verifyFinalClosure(&packages, lock.lock, .locked_packages);
+    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&packages, lock.lock, .full_closure));
+    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(packages[1..], lock.lock, .locked_packages));
+    packages[0].version = "2";
+    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&packages, lock.lock, .locked_packages));
+    packages[0].version = "1";
+    packages[0].dpkg_selection_hold = true;
+    try std.testing.expectError(error.LockEvidenceMismatch, verifyFinalClosure(&packages, lock.lock, .locked_packages));
+    packages[0].dpkg_selection_hold = false;
+    try verifyFinalClosure(packages[0..1], lock.lock, .full_closure);
 }
 
 fn testOwnedRefusal(
