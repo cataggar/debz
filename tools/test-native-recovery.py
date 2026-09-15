@@ -716,6 +716,7 @@ class Scenario(triggers.Scenario):
 
 
 def exercise_deadlines(executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str) -> None:
+    deadline_seconds = 30
     current = Scenario(workspace, "deadline-before-execution", executable, helper, architecture, environment)
     archive = m.make_package(
         workspace / "packages/deadline-before", environment, architecture, "1",
@@ -745,10 +746,12 @@ def exercise_deadlines(executable: Path, helper: Path, workspace: Path, environm
     shutil.copy2("/usr/bin/dpkg-trigger", helper_target)
     helper_bytes, helper_inode = helper_target.read_bytes(), helper_target.stat().st_ino
     scripts = lifecycle.scripts(m.PACKAGE, "1")
-    for kind in ("preinst", "postinst"):
+    # Leave setup headroom on loaded runners. Each script fits the budget
+    # alone, but their combined sleep must exceed the one shared deadline.
+    for kind, seconds in (("preinst", 8), ("postinst", 25)):
         scripts[kind] = scripts[kind].removesuffix(b"exit 0\n") + f"""
 printf '%s\\n' '{kind}-begin' >> /deadline-markers
-/bin/sleep 6
+/bin/sleep {seconds}
 printf '%s\\n' '{kind}-end' >> /deadline-markers
 exit 0
 """.encode()
@@ -760,18 +763,18 @@ exit 0
     started = time.monotonic()
     report = native(
         executable, current.candidate, architecture, "install", [archive], environment, destination,
-        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000,
+        caller_owned=True, isolated_helper=True, deadline_after_ms=deadline_seconds * 1000,
     )
     elapsed = time.monotonic() - started
     if report is None or report["outcome"] != "recovery_required" or report["detail"] != "deadline_exceeded":
         raise AssertionError(f"cumulative script deadline did not retain recovery: {report}")
     markers = (current.candidate / "deadline-markers").read_text().splitlines()
-    if markers != ["preinst-begin", "preinst-end", "postinst-begin"] or elapsed > 25:
+    if markers != ["preinst-begin", "preinst-end", "postinst-begin"] or elapsed > deadline_seconds + 15:
         raise AssertionError(f"script deadline was reset, missed, or not polled: {markers}, {elapsed:.2f}s")
     binding = caller_binding(current.candidate)
     before = triggers.snapshot(current.candidate)
     recovered = current.recover(
-        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000, label="fresh-script-recovery",
+        caller_owned=True, isolated_helper=True, deadline_after_ms=deadline_seconds * 1000, label="fresh-script-recovery",
     )
     if recovered["outcome"] != "recovery_required" or recovered["detail"] != "script_outcome_unknown":
         raise AssertionError(f"fresh recovery did not retain the cancelled script: {recovered}")
@@ -821,7 +824,7 @@ exit 0
     if m.oracle.differences(before, triggers.snapshot(current.candidate)):
         raise AssertionError("expired recovery changed package state")
     recovered = current.recover(
-        caller_owned=True, isolated_helper=True, deadline_after_ms=10_000, label="fresh-recovery",
+        caller_owned=True, isolated_helper=True, deadline_after_ms=deadline_seconds * 1000, label="fresh-recovery",
     )
     if recovered["outcome"] != "applied":
         raise AssertionError(f"fresh bounded recovery did not resume persisted inputs: {recovered}")
