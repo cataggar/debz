@@ -48,6 +48,17 @@ without manufacturing artifact origins for them. This is a prerequisite for
 repository bootstrap, not activation of its execution or recovery path; see
 [production preparation](native-transaction-program.md#production-preparation).
 
+Repository evidence binding also takes the selected backend explicitly,
+snapshotted once per invocation before acquisition callbacks.
+Native operation-directory identities, root-caller request/policy digests,
+and exact-lock executable-request/solver-policy digests use separate native
+domains. Legacy identities remain byte-for-byte compatible, with no history
+migration. Both backends retain the same root-operation exclusion and
+repository advisory-lock location; separate history does not permit
+concurrent mutation or adoption of another backend's unresolved attempt.
+These bindings do not activate native execution or make legacy journals and
+provenance acceptable native completion evidence.
+
 `debz repo add` is the authorization to mutate the selected root. It does not
 accept or require `--assume-yes`, `--allow-host-root`,
 `--import-target-apt-config`, `--install-root`, `--refresh`, or a separate
@@ -157,10 +168,13 @@ CAS paths and immutable provenance.
 
 Every completed phase atomically updates
 [`repository-add-state-v1`](../schema/repository-add-state-v1.json) under the
-selected state root. Each operation directory is keyed by the SHA-256 identity
-of the descriptor URL, optional expected digest, and `no_refresh`, so identical requests
-resume the same evidence while distinct descriptors coexist. Decoding is
-bounded, canonical, and digest checked. A repository-root advisory lock
+selected state root. Each operation directory is keyed by the backend-specific
+SHA-256 identity of the descriptor URL, optional expected digest, and
+`no_refresh`, so identical requests under one backend resume the same evidence
+while distinct descriptors or backends have separate histories. Existing
+legacy directory names are unchanged. Exact-lock request and policy validation
+also require the selected backend, even though both use the v2 lock schema.
+Decoding is bounded, canonical, and digest checked. A repository-root advisory lock
 serializes add operations even though their evidence directories are separate.
 
 An identical installed package and managed-file set resumes import or refresh

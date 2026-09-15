@@ -76,8 +76,9 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: api.Request,
     ) !api.Result {
+        const transaction_backend = self.transaction_backend;
         const executor = transaction_engine.select(
-            self.transaction_backend,
+            transaction_backend,
             self.executor,
             self.native_executor,
         ) catch return api.failure(
@@ -86,7 +87,7 @@ pub const Backend = struct {
             "transaction",
             "selected transaction backend is unavailable",
         );
-        var paths = try ResolvedPaths.init(allocator, request);
+        var paths = try ResolvedPaths.init(allocator, request, transaction_backend);
         defer paths.deinit();
 
         // Rank 0 of the total lock order. Repository bootstrap shares the
@@ -96,7 +97,7 @@ pub const Backend = struct {
         // selection still fails before any root access.
         var guard: RootOperationGuard = .{ .io = self.io, .allocator = allocator };
         defer guard.deinit();
-        if (guard.open(request, self.transaction_backend, self.now_unix)) |failure| return failure;
+        if (guard.open(request, transaction_backend, self.now_unix)) |failure| return failure;
 
         var production_acquisition = repository_acquisition.Production{ .io = self.io };
         const acquisition_dependencies = self.acquisition_dependencies orelse
@@ -1078,6 +1079,7 @@ pub const Backend = struct {
                 local_evidence,
                 dependency_published,
                 request,
+                transaction_backend,
             ) catch |err| return progress.fail(
                 state_store,
                 allocator,
@@ -1103,7 +1105,7 @@ pub const Backend = struct {
             "lock",
             @errorName(err),
         );
-        validateLockPolicy(lock.lock) catch |err| return progress.fail(
+        validateLockPolicy(lock.lock, transaction_backend) catch |err| return progress.fail(
             state_store,
             allocator,
             .recovery,
@@ -1111,7 +1113,7 @@ pub const Backend = struct {
             "lock",
             @errorName(err),
         );
-        validateLockRequest(allocator, lock.lock, request, plan) catch |err|
+        validateLockRequest(allocator, lock.lock, request, plan, transaction_backend) catch |err|
             return progress.fail(
                 state_store,
                 allocator,
@@ -1972,8 +1974,8 @@ const RootOperationGuard = struct {
             .existing = .reclaim_resolved,
             .backend = backend,
             .operation = .{ .repository_bootstrap = .add },
-            .request_sha256 = repositoryRequestDigest(request),
-            .policy_sha256 = repositoryPolicyDigest(request),
+            .request_sha256 = repositoryRequestDigest(request, backend),
+            .policy_sha256 = repositoryPolicyDigest(request, backend),
             .target_architecture = request.architecture orelse "all",
             .wait_ms = request.state.lock_wait_ms,
         }) catch |err| return mapRootOperationError(err);
@@ -2198,9 +2200,12 @@ fn mapRootOperationError(err: anyerror) api.Result {
 }
 
 /// Bounded digest of the reviewed repository request.
-fn repositoryRequestDigest(request: api.Request) [32]u8 {
+fn repositoryRequestDigest(request: api.Request, backend: transaction_engine.Kind) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-repository-request-v1\x00");
+    hash.update(switch (backend) {
+        .legacy_dpkg => "debz-repository-request-v1\x00",
+        .native => "debz-native-repository-request-v1\x00",
+    });
     hash.update(@tagName(request.operation));
     hash.update("\x00");
     hash.update(request.root);
@@ -2217,9 +2222,12 @@ fn repositoryRequestDigest(request: api.Request) [32]u8 {
     return hash.finalResult();
 }
 
-fn repositoryPolicyDigest(request: api.Request) [32]u8 {
+fn repositoryPolicyDigest(request: api.Request, backend: transaction_engine.Kind) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-repository-policy-v1\x00");
+    hash.update(switch (backend) {
+        .legacy_dpkg => "debz-repository-policy-v1\x00",
+        .native => "debz-native-repository-policy-v1\x00",
+    });
     hash.update(if (request.no_refresh) "\x01" else "\x00");
     hash.update(if (request.state.path) |value| value else "");
     hash.update("\x00");
@@ -2461,7 +2469,11 @@ const ResolvedPaths = struct {
     repository_physical: []u8,
     operation_physical: []u8,
 
-    fn init(allocator: std.mem.Allocator, request: api.Request) !ResolvedPaths {
+    fn init(
+        allocator: std.mem.Allocator,
+        request: api.Request,
+        backend: transaction_engine.Kind,
+    ) !ResolvedPaths {
         const cache_logical = try allocator.dupe(
             u8,
             request.cache.path orelse "/var/cache/debz",
@@ -2484,7 +2496,7 @@ const ResolvedPaths = struct {
             operations_directory_name,
         );
         errdefer allocator.free(operations_logical);
-        const operation_id = requestOperationId(request);
+        const operation_id = requestOperationId(request, backend);
         const operation_logical = try joinLogical(
             allocator,
             operations_logical,
@@ -2561,9 +2573,12 @@ const ResolvedPaths = struct {
     }
 };
 
-fn requestOperationId(request: api.Request) [64]u8 {
+fn requestOperationId(request: api.Request, backend: transaction_engine.Kind) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-repository-add-operation-v1\x00");
+    hash.update(switch (backend) {
+        .legacy_dpkg => "debz-repository-add-operation-v1\x00",
+        .native => "debz-native-repository-add-operation-v1\x00",
+    });
     hash.update(request.descriptor_url);
     hash.update("\x00");
     if (request.expected_sha256) |digest| {
@@ -2583,11 +2598,15 @@ fn operationRequestDigest(
     allocator: std.mem.Allocator,
     request: api.Request,
     plan: solver.Plan,
+    backend: transaction_engine.Kind,
 ) ![32]u8 {
     const plan_json = try plan.canonicalJson(allocator);
     defer allocator.free(plan_json);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-repository-add-executable-request-v1\x00");
+    hash.update(switch (backend) {
+        .legacy_dpkg => "debz-repository-add-executable-request-v1\x00",
+        .native => "debz-native-repository-add-executable-request-v1\x00",
+    });
     hashField(&hash, request.root);
     hashField(&hash, request.descriptor_url);
     if (request.expected_sha256) |digest| {
@@ -2631,8 +2650,9 @@ fn validateLockRequest(
     lock: exact_lock_v2.Lock,
     request: api.Request,
     plan: solver.Plan,
+    backend: transaction_engine.Kind,
 ) !void {
-    const expected = try operationRequestDigest(allocator, request, plan);
+    const expected = try operationRequestDigest(allocator, request, plan, backend);
     if (!std.mem.eql(u8, &expected, &lock.request_sha256))
         return error.RequestEvidenceMismatch;
 }
@@ -3519,6 +3539,7 @@ fn createOperationLock(
     local_evidence: @import("package_origin.zig").LocalArtifactEvidence,
     refreshed: ?*repository_policy.RefreshResult,
     request: api.Request,
+    backend: transaction_engine.Kind,
 ) !exact_lock_v2.OwnedLock {
     var packages: std.ArrayList(exact_lock_v2.Package) = .empty;
     defer packages.deinit(allocator);
@@ -3628,8 +3649,8 @@ fn createOperationLock(
     }
     return exact_lock_v2.create(allocator, .{
         .target_architecture = plan.target_architecture,
-        .request_sha256 = try operationRequestDigest(allocator, request, plan),
-        .policy_sha256 = repositoryLockPolicyDigest(),
+        .request_sha256 = try operationRequestDigest(allocator, request, plan, backend),
+        .policy_sha256 = repositoryLockPolicyDigest(backend),
         .repositories = repositories.items,
         .local_artifacts = &.{local_evidence},
         .packages = packages.items,
@@ -4061,15 +4082,18 @@ fn validateLockDescriptor(
     }
 }
 
-fn validateLockPolicy(lock: exact_lock_v2.Lock) !void {
-    const expected = repositoryLockPolicyDigest();
+fn validateLockPolicy(lock: exact_lock_v2.Lock, backend: transaction_engine.Kind) !void {
+    const expected = repositoryLockPolicyDigest(backend);
     if (!std.mem.eql(u8, &lock.policy_sha256, &expected))
         return error.LockPolicyMismatch;
 }
 
-fn repositoryLockPolicyDigest() [32]u8 {
+fn repositoryLockPolicyDigest(backend: transaction_engine.Kind) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-repository-add-solver-policy-v1\x00");
+    hash.update(switch (backend) {
+        .legacy_dpkg => "debz-repository-add-solver-policy-v1\x00",
+        .native => "debz-native-repository-add-solver-policy-v1\x00",
+    });
     hash.update("no-recommends\x00no-downgrade\x00strict-priority\x00");
     hash.update("exact-lock-verification:locked-packages\x00");
     return hash.finalResult();
@@ -4456,12 +4480,249 @@ fn dependencyFailureNeedsRefresh(failure: solver.PlanFailure) bool {
     return false;
 }
 
+const BindingFixture = struct {
+    const request: api.Request = .{
+        .root = "/srv/roots/repository",
+        .descriptor_url = "https://packages.example.test/descriptor.deb",
+        .expected_sha256 = @splat(0x33),
+        .architecture = "amd64",
+        .cache = .{ .path = "/cache" },
+        .state = .{ .path = "/state" },
+        .network = .{ .proxy_url = "https://proxy.example.test" },
+    };
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = @splat('3'),
+        .sha256 = @splat(0x33),
+        .size = 42,
+        .package = "repo-config",
+        .version = "1.0",
+        .architecture = "all",
+        .acquisition_url = request.descriptor_url,
+        .trust_mode = .pinned_sha256,
+    };
+
+    actions: [1]solver.PlanAction = .{.{
+        .kind = .install,
+        .package = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .repository = null,
+        .sha256 = artifact.artifact_id,
+        .package_size = artifact.size,
+        .installed_size_delta_bytes = 0,
+        .source_package = artifact.package,
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+        .origin = .{ .local_artifact = .{
+            .evidence = artifact,
+            .solver_priority = 1000,
+        } },
+    }},
+    ordered_actions: [2]solver.OrderedAction = .{
+        .{ .sequence = 0, .kind = .unpack, .package = artifact.package, .version = artifact.version, .architecture = artifact.architecture },
+        .{ .sequence = 1, .kind = .configure_pending, .package = artifact.package, .version = artifact.version, .architecture = artifact.architecture },
+    },
+
+    fn plan(self: *BindingFixture) solver.Plan {
+        return .{
+            .schema_version = 3,
+            .target_architecture = "amd64",
+            .mode = .plan_only,
+            .actions = &self.actions,
+            .ordered_actions = &self.ordered_actions,
+            .summary = .{ .installs = 1, .download_bytes = artifact.size },
+            .download_bytes = artifact.size,
+            .installed_size_delta_bytes = 0,
+            .backing_allocator = std.testing.allocator,
+            .arena = undefined,
+        };
+    }
+};
+
+test "repository backend legacy binding byte identities" {
+    const request = BindingFixture.request;
+    var fixture: BindingFixture = .{};
+    try std.testing.expectEqualStrings(
+        "caea06507df178c8c7587c881eb63f50a0c5a2fdd47470f7e0227061cfe67d00",
+        &requestOperationId(request, .legacy_dpkg),
+    );
+    const cases = [_]struct { expected: []const u8, actual: [32]u8 }{
+        .{
+            .expected = "b72b80bda946c7cd579aae95a5736a027321345fa3b7f09180aa496af0cda426",
+            .actual = repositoryRequestDigest(request, .legacy_dpkg),
+        },
+        .{
+            .expected = "42c8799c19d1700dbbebf7f850b219730c7e1cdde334b46577ccb256a0553a59",
+            .actual = repositoryPolicyDigest(request, .legacy_dpkg),
+        },
+        .{
+            .expected = "77dea43d7c7b14ed4f2bc4b1d585f6e48ed46147586c18c9d2257daaa4e88acd",
+            .actual = try operationRequestDigest(std.testing.allocator, request, fixture.plan(), .legacy_dpkg),
+        },
+        .{
+            .expected = "16ea683d1a0e738e5d956a8f652acdc9e53f89b567f4aa37184ffae384f86e55",
+            .actual = repositoryLockPolicyDigest(.legacy_dpkg),
+        },
+    };
+    for (cases) |case| {
+        var actual: [64]u8 = undefined;
+        formatHex(&actual, &case.actual);
+        try std.testing.expectEqualStrings(case.expected, &actual);
+    }
+}
+
+test "repository backend separates history without partitioning shared exclusion paths" {
+    for ([_]bool{ false, true }) |no_refresh| {
+        var request = BindingFixture.request;
+        request.no_refresh = no_refresh;
+        var legacy = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
+        defer legacy.deinit();
+        var native = try ResolvedPaths.init(std.testing.allocator, request, .native);
+        defer native.deinit();
+        inline for (.{
+            "cache_logical",      "cache_physical",      "state_logical",      "state_physical",
+            "repository_logical", "repository_physical", "operations_logical",
+        }) |field| {
+            try std.testing.expectEqualStrings(@field(legacy, field), @field(native, field));
+        }
+        try std.testing.expect(!std.mem.eql(u8, &legacy.operation_id, &native.operation_id));
+        inline for (.{
+            "operation_logical",       "operation_physical", "exact_plan_logical",
+            "exact_lock_logical",      "provenance_logical", "manifest_logical",
+            "operation_state_logical",
+        }) |field| {
+            try std.testing.expect(!std.mem.eql(u8, @field(legacy, field), @field(native, field)));
+        }
+    }
+}
+
+test "repository backend lock domains retain exact origins and reject the other backend" {
+    const allocator = std.testing.allocator;
+    const request = BindingFixture.request;
+    var fixture: BindingFixture = .{};
+    const plan = fixture.plan();
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |backend| {
+        const other: transaction_engine.Kind = if (backend == .native) .legacy_dpkg else .native;
+        var created = try createOperationLock(
+            allocator,
+            plan,
+            BindingFixture.artifact,
+            null,
+            request,
+            backend,
+        );
+        defer created.deinit();
+        const bytes = try created.lock.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        var decoded = try exact_lock_v2.decode(allocator, bytes, exact_lock_v2.maximum_document_bytes);
+        defer decoded.deinit();
+        const lock = decoded.lock;
+        try std.testing.expectEqualSlices(u8, &created.lock.digest_sha256, &lock.digest_sha256);
+        try std.testing.expectEqual(@as(usize, 1), lock.packages.len);
+        try std.testing.expectEqual(@as(usize, 1), lock.local_artifacts.len);
+        try std.testing.expectEqual(@as(usize, 0), lock.repositories.len);
+        try std.testing.expect(package_origin.eqlLocalArtifact(BindingFixture.artifact, lock.local_artifacts[0]));
+        try std.testing.expect(package_origin.eqlLocalArtifact(BindingFixture.artifact, lock.packages[0].origin.local_artifact));
+
+        try validateLockPolicy(lock, backend);
+        try validateLockRequest(allocator, lock, request, plan, backend);
+        try std.testing.expectError(error.LockPolicyMismatch, validateLockPolicy(lock, other));
+        try std.testing.expectError(error.RequestEvidenceMismatch, validateLockRequest(allocator, lock, request, plan, other));
+
+        var changed_request = request;
+        changed_request.resources.maximum_actions -= 1;
+        try std.testing.expectError(error.RequestEvidenceMismatch, validateLockRequest(allocator, lock, changed_request, plan, backend));
+        fixture.actions[0].requested = false;
+        try std.testing.expectError(error.RequestEvidenceMismatch, validateLockRequest(allocator, lock, request, plan, backend));
+        fixture.actions[0].requested = true;
+    }
+}
+
+test "repository backend binds root callers while sharing live and unresolved exclusion" {
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |backend| {
+        const other: transaction_engine.Kind = if (backend == .native) .legacy_dpkg else .native;
+        var directory = std.testing.tmpDir(.{ .iterate = true });
+        defer directory.cleanup();
+        try stageRepositoryTestRoot(directory.dir);
+        const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+        defer std.testing.allocator.free(root);
+        var request = BindingFixture.request;
+        request.root = root;
+        request.state.lock_wait_ms = 0;
+        const request_digest = repositoryRequestDigest(request, backend);
+        const policy_digest = repositoryPolicyDigest(request, backend);
+        try std.testing.expect(!std.mem.eql(u8, &request_digest, &repositoryRequestDigest(request, other)));
+        try std.testing.expect(!std.mem.eql(u8, &policy_digest, &repositoryPolicyDigest(request, other)));
+        {
+            var owner: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            defer owner.deinit();
+            try std.testing.expect(owner.open(request, backend, 1_700_000_000) == null);
+            try std.testing.expectEqual(backend, owner.active().?.record().backend);
+            try std.testing.expectEqualSlices(u8, &request_digest, &owner.active().?.record().request_sha256);
+            try std.testing.expectEqualSlices(u8, &policy_digest, &owner.active().?.record().policy_sha256);
+
+            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            defer contender.deinit();
+            var refused = contender.open(request, other, 1_700_000_000) orelse
+                return error.TestUnexpectedResult;
+            defer refused.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, refused.exit_status);
+            try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+        }
+        try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+
+        var root_dir = try directory.dir.openDir(std.testing.io, "root", .{ .iterate = true });
+        defer root_dir.close(std.testing.io);
+        const store = root_operation.Store.init(.init(std.testing.io, root_dir));
+        const program_digest: [32]u8 = @splat(0x44);
+        var stranded = try root_operation.create(std.testing.allocator, .{
+            .attempt_id = @splat(0x7c),
+            .generation = 2,
+            .install_root = root,
+            .backend = backend,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = .mutating,
+            .phase = .database,
+            .step = 3,
+            .mutation_started = true,
+            .outcome = .pending,
+            .provenance = .pending,
+            .request_sha256 = request_digest,
+            .policy_sha256 = policy_digest,
+            .evidence = .{ .program_sha256 = if (backend == .native) program_digest else null },
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer stranded.deinit();
+        try store.writeAtomic(std.testing.allocator, stranded.record);
+        {
+            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            defer contender.deinit();
+            var refused = contender.open(request, other, 1_700_000_000) orelse
+                return error.TestUnexpectedResult;
+            defer refused.deinit();
+            try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
+            try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+        }
+        var observed = (try readRootAttempt(directory.dir)).?;
+        defer observed.deinit();
+        try std.testing.expectEqualSlices(u8, &stranded.record.digest_sha256, &observed.record.digest_sha256);
+        var resumed: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        defer resumed.deinit();
+        try std.testing.expect(resumed.open(request, backend, 1_700_000_000) == null);
+        try std.testing.expectEqualSlices(u8, &stranded.record.digest_sha256, &resumed.active().?.record().digest_sha256);
+    }
+}
+
 test "repository backend maps alternate-root evidence paths without host inference" {
     var paths = try ResolvedPaths.init(std.testing.allocator, .{
         .root = "/srv/roots/noble",
         .descriptor_url = "https://packages.microsoft.test/config.deb",
         .architecture = "amd64",
-    });
+    }, .legacy_dpkg);
     defer paths.deinit();
     try std.testing.expectEqualStrings(
         "/srv/roots/noble/var/cache/debz",
@@ -4490,14 +4751,14 @@ test "repository backend maps alternate-root evidence paths without host inferen
         .root = "/srv/roots/noble",
         .descriptor_url = "https://packages.microsoft.test/config.deb",
         .architecture = "amd64",
-    });
+    }, .legacy_dpkg);
     defer same.deinit();
     try std.testing.expectEqualSlices(u8, &paths.operation_id, &same.operation_id);
     var distinct = try ResolvedPaths.init(std.testing.allocator, .{
         .root = "/srv/roots/noble",
         .descriptor_url = "https://packages.example.test/config.deb",
         .architecture = "amd64",
-    });
+    }, .legacy_dpkg);
     defer distinct.deinit();
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -4829,6 +5090,7 @@ const RepositoryTestAcquisition = struct {
     network_requests: usize = 0,
     now_ms: u64 = 0,
     advance_ms_per_read: u64 = 0,
+    switch_backend_to_native: ?*transaction_engine.Kind = null,
 
     fn dependencies(self: *RepositoryTestAcquisition) repository_acquisition.Dependencies {
         return .{
@@ -4866,6 +5128,7 @@ const RepositoryTestAcquisition = struct {
         _: repository_acquisition.Deadlines,
     ) !repository_acquisition.FileRead {
         const self: *RepositoryTestAcquisition = @ptrCast(@alignCast(context.?));
+        if (self.switch_backend_to_native) |selection| selection.* = .native;
         const fixture = @import("fixtures/openpgp.zig");
         const bytes: []const u8 = if (std.mem.endsWith(u8, path, "descriptor.deb")) blk: {
             self.descriptor_reads += 1;
@@ -5334,6 +5597,56 @@ fn expectRepositoryEvidence(
     try directory.access(std.testing.io, relative, .{});
 }
 
+test "repository backend snapshots selection before acquisition callbacks" {
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory.dir,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = @import("fixtures/openpgp.zig").created + 30,
+    };
+    acquisition.switch_backend_to_native = &backend.transaction_backend;
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+    };
+    var result = try api.execute(std.testing.allocator, request, backend.interface());
+    defer result.deinit();
+    try std.testing.expectEqual(transaction_engine.Kind.native, backend.transaction_backend);
+    try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expect((try readRootAttempt(directory.dir)) == null);
+    var paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
+    defer paths.deinit();
+    try std.testing.expectEqualStrings(paths.operation_state_logical, result.paths.operation_state.?);
+    var operation_dir = try executor.openOperationDirectory();
+    defer operation_dir.close(std.testing.io);
+    const store = try exact_lock_v2.Store.init(std.testing.io, operation_dir, exact_lock_name);
+    var lock = try store.read(std.testing.allocator, exact_lock_v2.maximum_document_bytes);
+    defer lock.deinit();
+    try validateLockPolicy(lock.lock, .legacy_dpkg);
+    try std.testing.expectError(error.LockPolicyMismatch, validateLockPolicy(lock.lock, .native));
+
+    var next = try api.execute(std.testing.allocator, request, backend.interface());
+    defer next.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, next.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.transaction_backend_unavailable, next.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), acquisition.descriptor_reads);
+}
+
 test "repository backend completes and idempotently resumes every production phase" {
     const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
     var directory = std.testing.tmpDir(.{});
@@ -5427,7 +5740,7 @@ test "repository backend completes and idempotently resumes every production pha
     );
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
 
-    var original_paths = try ResolvedPaths.init(std.testing.allocator, request);
+    var original_paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
     defer original_paths.deinit();
     const provenance_relative = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -5658,7 +5971,7 @@ test "repository backend holds bounded target locks for idempotent verification"
         );
         first.deinit();
 
-        var paths = try ResolvedPaths.init(std.testing.allocator, request);
+        var paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
         defer paths.deinit();
         var operation_dir = try std.Io.Dir.cwd().openDir(
             std.testing.io,
@@ -6071,7 +6384,7 @@ test "repository backend binds execution and recovery provenance to the persiste
     try std.testing.expect(interrupted.paths.provenance == null);
     try std.testing.expect(executor.saw_exact_lock);
 
-    var paths = try ResolvedPaths.init(std.testing.allocator, request);
+    var paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
     defer paths.deinit();
     var operation_dir = try std.Io.Dir.cwd().openDir(
         std.testing.io,
@@ -6186,7 +6499,7 @@ test "repository backend classifies shared transaction journals before recovery"
         first.deinit();
         executor.interrupt_first = false;
 
-        var paths = try ResolvedPaths.init(std.testing.allocator, request);
+        var paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
         defer paths.deinit();
         var operation_dir = try std.Io.Dir.cwd().openDir(
             std.testing.io,
@@ -6349,7 +6662,7 @@ test "repository backend replays the exact durable plan for interrupted dpkg sta
             &executor.recovery_plan_sha256.?,
         );
 
-        var paths = try ResolvedPaths.init(std.testing.allocator, request);
+        var paths = try ResolvedPaths.init(std.testing.allocator, request, .legacy_dpkg);
         defer paths.deinit();
         var operation = try std.Io.Dir.cwd().openDir(
             std.testing.io,
@@ -6769,14 +7082,16 @@ test "repository operation identity separates both no-refresh transitions" {
     };
     var no_refresh = base;
     no_refresh.no_refresh = true;
-    const refreshed_id = requestOperationId(base);
-    const no_refresh_id = requestOperationId(no_refresh);
-    try std.testing.expect(!std.mem.eql(u8, &refreshed_id, &no_refresh_id));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &requestOperationId(no_refresh),
-        &requestOperationId(base),
-    ));
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |backend| {
+        const refreshed_id = requestOperationId(base, backend);
+        const no_refresh_id = requestOperationId(no_refresh, backend);
+        try std.testing.expect(!std.mem.eql(u8, &refreshed_id, &no_refresh_id));
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            &requestOperationId(no_refresh, backend),
+            &requestOperationId(base, backend),
+        ));
+    }
 }
 
 test "opposite no-refresh invocations never reuse or erase durable operation history" {
@@ -6832,6 +7147,7 @@ test "opposite no-refresh invocations never reuse or erase durable operation his
         var first_paths = try ResolvedPaths.init(
             std.testing.allocator,
             first_request,
+            .legacy_dpkg,
         );
         defer first_paths.deinit();
         var first_operation_dir = try std.Io.Dir.cwd().openDir(
@@ -7860,8 +8176,8 @@ test "repository backend adopts a crashed attempt at every durable boundary" {
             .mutation_started = crash.mutation_started,
             .outcome = crash.outcome,
             .provenance = crash.provenance,
-            .request_sha256 = repositoryRequestDigest(request),
-            .policy_sha256 = repositoryPolicyDigest(request),
+            .request_sha256 = repositoryRequestDigest(request, .legacy_dpkg),
+            .policy_sha256 = repositoryPolicyDigest(request, .legacy_dpkg),
             .target_architecture = "amd64",
             .reserved_unix = 1_700_000_000,
             .updated_unix = 1_700_000_000,
@@ -7961,8 +8277,8 @@ test "repository backend never discharges an inherited bridge with its own no-st
             .mutation_started = false,
             .outcome = .pending,
             .provenance = .pending,
-            .request_sha256 = repositoryRequestDigest(request),
-            .policy_sha256 = repositoryPolicyDigest(request),
+            .request_sha256 = repositoryRequestDigest(request, .legacy_dpkg),
+            .policy_sha256 = repositoryPolicyDigest(request, .legacy_dpkg),
             .target_architecture = "amd64",
             .reserved_unix = 1_700_000_000,
             .updated_unix = 1_700_000_000,
@@ -8090,10 +8406,10 @@ test "repository backend reserves a new attempt instead of adopting a settled re
             .provenance = .published,
             .provenance_sha256 = @splat(0xcd),
             .request_sha256 = if (same_request)
-                repositoryRequestDigest(request)
+                repositoryRequestDigest(request, .legacy_dpkg)
             else
                 @splat(0x14),
-            .policy_sha256 = repositoryPolicyDigest(request),
+            .policy_sha256 = repositoryPolicyDigest(request, .legacy_dpkg),
             .target_architecture = "amd64",
             .reserved_unix = 1_700_000_000,
             .updated_unix = 1_700_000_000,
