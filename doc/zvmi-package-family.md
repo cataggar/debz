@@ -118,3 +118,32 @@ credential loading. Authenticated content is bound by the reviewed lock and
 retained native evidence, not by reusing current transport configuration.
 Existing capability and execution-result schemas remain unchanged, including
 the native execution, recovery and inspection gates.
+
+### Binding a particular returned completion
+
+Core native product results expose optional, by-value
+`ProductNativeCompletionEvidence` through `Result.native_completion`.
+A terminal successful or known-failed execution, including persisted-input
+recovery, carries the original product operation, outcome, attempt, lock,
+caller request/policy, receipt, completion and program bindings. Recovery's
+command operation can be `recover` while the evidence correctly describes the
+original `install` or other package operation.
+
+`settlement = cleared` is returned only after ordinary completion,
+acknowledgment and root-record cleanup succeed. `retained` means the outer
+owner's lifecycle still controls the result, including released owners whose
+marker remains; it is not a standalone cleared-root result. Unchanged,
+preflight-refused, incomplete and no-work recovery results do not manufacture
+terminal evidence. Metadata is not ownership or execution authority and does
+not appear in generic `command.v1` JSON; typed consumers must retain it
+separately. Existing native-install evidence and all wire schemas are unchanged.
+
+Use `verifyCompletedResultSuccess(allocator, original_request, completion)`
+to bind readback to a particular returned `native_completion`. Failed or
+retained metadata is refused before filesystem work. The verifier compares
+every returned binding with the independently verified native documents while
+the root lock remains held. A different attempt, altered binding or relabeled
+failure cannot stand in for that result. The older `verifyCompletedSuccess`
+continues to describe matching retained history without asserting which
+invocation returned it. Both methods are read-only, require genuine evidence,
+and leave family execution/recovery/inspection gates unchanged.

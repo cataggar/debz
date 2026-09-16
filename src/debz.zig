@@ -90,6 +90,7 @@ pub const production_backend = @import("production_backend.zig");
 pub const ProductionBackend = production_backend.Backend;
 pub const ProductCompletionPoint = production_backend.CompletionPoint;
 pub const ProductCompletionCrash = production_backend.CompletionCrash;
+pub const ProductNativeCompletionEvidence = product_api.NativeCompletionEvidence;
 pub const package_family_backend = @import("package_family_backend.zig");
 pub const PackageFamilyBackend = package_family_backend.Backend;
 pub const NativePackageFamilyBackend = package_family_backend.NativeBackend;

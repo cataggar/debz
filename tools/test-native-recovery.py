@@ -1225,6 +1225,7 @@ def workflow(
     acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
     owned_verification: dict | None = None,
     family_verification: dict | None = None,
+    capture_evidence: bool = False,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1238,6 +1239,7 @@ def workflow(
         "acknowledgment": acknowledgment,
         "owned_verification": owned_verification,
         "family_verification": family_verification,
+        "native_evidence_output": str(destination / "native-evidence.json") if capture_evidence else None,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
         result = subprocess.run(
@@ -1255,6 +1257,7 @@ def workflow(
         raise AssertionError(f"workflow exited {result.returncode}, expected {expected}: {destination}\n{detail}")
     if completion_crash:
         assert not report_path.exists()
+        assert not (destination / "native-evidence.json").exists()
         return None
     return document(report_path, 64 * 1024)
 
@@ -1387,7 +1390,32 @@ def exercise_workflows(
         "package": family_names[0], "lock_input": original_workflow["options"]["lock_input_path"],
     }
 
-    def verify_family(label: str, original: dict, succeeds: bool = True) -> dict:
+    def completion_evidence(current: lifecycle.Scenario, label: str, outcome: str, settlement: str) -> dict:
+        captured = document(current.directory / label / "native-evidence.json")
+        returned = captured["native_completion"]
+        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert completion["surface"] == "package_transaction"
+        assert returned["operation"].replace("_", "-") == completion["operation"]
+        assert returned["outcome"] == outcome == receipt["outcome"]
+        assert returned["settlement"] == settlement
+        for name, expected in (
+            ("attempt_id", receipt["attempt_id"]),
+            ("lock_sha256", receipt["exact_lock_sha256"]),
+            ("caller_request_sha256", completion["request_sha256"]),
+            ("caller_policy_sha256", completion["policy_sha256"]),
+            ("transaction_digest_sha256", receipt["digest_sha256"]),
+            ("completion_digest_sha256", completion["digest_sha256"]),
+            ("program_sha256", receipt["program_sha256"]),
+        ):
+            # Zig's test transport emits valid UTF-8 byte arrays as strings.
+            raw = returned[name]
+            value = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+            assert value.hex() == expected, name
+            returned[name] = list(value)
+        return returned
+
+    def verify_family(label: str, original: dict, succeeds: bool = True, returned: dict | None = None) -> dict:
         def inventory() -> list[tuple]:
             return sorted(
                 (str(path.relative_to(current.candidate)), entry.st_mode, entry.st_size, entry.st_mtime_ns)
@@ -1398,7 +1426,7 @@ def exercise_workflows(
         before = inventory()
         result = workflow(
             executable, original_workflow, current.directory / label, environment,
-            family_verification={"request": original, "expect_failure": not succeeds},
+            family_verification={"request": original, "expect_failure": not succeeds, "completion": returned},
         )
         assert before == inventory(), "family verification changed the staged root"
         assert not (current.directory / "state/transaction-result.json").exists()
@@ -1417,10 +1445,25 @@ def exercise_workflows(
             assert result["verified"] is False
         return result
 
-    run(current, "plan", request(current, "install", "plan_only", family_names))
+    run(current, "plan", request(current, "install", "plan_only", family_names), capture_evidence=True)
+    assert document(current.directory / "plan/native-evidence.json")["native_completion"] is None
     verify_family("before-execution", original_family, False)
-    run(current, "install", original_workflow)
+    run(current, "install", original_workflow, capture_evidence=True)
+    returned = completion_evidence(current, "install", "succeeded", "cleared")
     first = verify_family("verified", original_family)
+    assert first == verify_family("verified-result", original_family, returned=returned)
+    for field in (
+        "attempt_id", "lock_sha256", "caller_request_sha256", "caller_policy_sha256",
+        "transaction_digest_sha256", "completion_digest_sha256", "program_sha256",
+    ):
+        changed = {**returned, field: [returned[field][0] ^ 1, *returned[field][1:]]}
+        refused = verify_family(f"wrong-result-{field}", original_family, False, changed)
+        assert refused["error"] == "NativeFamilyCompletionMismatch", refused
+    for field, value in (("outcome", "failed"), ("settlement", "retained")):
+        refused = verify_family(f"invalid-result-{field}", original_family, False, {**returned, field: value})
+        assert refused["error"] == "InvalidNativeFamilyCompletion", refused
+    refused = verify_family("wrong-result-operation", original_family, False, {**returned, "operation": "upgrade"})
+    assert refused["error"] == "NativeFamilyCompletionMismatch", refused
     assert first == verify_family("verified-again", original_family)
     assert first == verify_family("customize-equivalent", {**original_family, "operation": "customize"})
     for field, value in (
@@ -1454,9 +1497,15 @@ def exercise_workflows(
     original_workflow = request(current, "install", "execute", ["fail-script"])
     failed_family = {**original_family, "package": "fail-script"}
     run(current, "plan-failure", request(current, "install", "plan_only", ["fail-script"]))
-    failed = run(current, "known-failure", original_workflow, exit_status=7)
+    failed = run(current, "known-failure", original_workflow, exit_status=7, capture_evidence=True)
     assert failed["changed"]
+    failed_completion = completion_evidence(current, "known-failure", "failed", "cleared")
+    verify_family("failed-result-not-success", failed_family, False, failed_completion)
+    verify_family("relabeled-failure-not-success", failed_family, False, {**failed_completion, "outcome": "succeeded"})
     verify_family("failed-not-success", failed_family, False)
+    recovered = run(current, "clean-recovery", request(current, "install", "recover", ["fail-script"]), capture_evidence=True)
+    assert not recovered["changed"]
+    assert document(current.directory / "clean-recovery/native-evidence.json")["native_completion"] is None
     print("family-completed-verification: real receipts, semantic request binding and read-only refusals passed", flush=True)
 
     current = scenario("family-recovered-verification")
@@ -1470,10 +1519,15 @@ def exercise_workflows(
     run(current, "plan", request(current, "install", "plan_only", family_names))
     workflow(
         executable, original_workflow, current.directory / "receipt-interruption", environment,
-        completion_crash="after_native_receipt",
+        completion_crash="after_native_receipt", capture_evidence=True,
     )
     verify_family("pending-not-success", original_family, False)
-    run(current, "recover", request(current, "install", "recover", family_names))
+    run(current, "recover", request(current, "install", "recover", family_names), capture_evidence=True)
+    recovered_completion = completion_evidence(current, "recover", "succeeded", "cleared")
+    assert document(current.directory / "recover/native-evidence.json")["native_install"] is None
+    verify_family("recovered-result-success", original_family, returned=recovered_completion)
+    wrong_attempt = verify_family("foreign-result-not-success", original_family, False, returned)
+    assert wrong_attempt["error"] == "NativeFamilyCompletionMismatch", wrong_attempt
     verify_family("recovered-success", original_family)
     print("family-recovered-verification: pending refusal and original completed request proof passed", flush=True)
 
@@ -1537,8 +1591,9 @@ def exercise_workflows(
         verify_result(current, lock)
     receipt_before = (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
     run(current, "plan-unchanged", request(current, "upgrade_all", "plan_only", []))
-    unchanged = run(current, "unchanged", request(current, "upgrade_all", "execute", []))
+    unchanged = run(current, "unchanged", request(current, "upgrade_all", "execute", []), capture_evidence=True)
     assert not unchanged["changed"]
+    assert document(current.directory / "unchanged/native-evidence.json")["native_completion"] is None
     assert receipt_before == (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
     run(current, "plan-remove", request(current, "remove", "plan_only", names))
     removal_lock = document(current.directory / "workflow.lock.json")
@@ -1673,10 +1728,12 @@ def exercise_workflows(
     assert document(bound)["attempt_id"] == "22" * 32
     assert not (current.candidate / INTENT).exists()
     run(current, "changed-request", owned_request(current, "install", "execute", ["different"]),
-        owner_evidence=bound, exit_status=8)
+        owner_evidence=bound, exit_status=8, capture_evidence=True)
+    assert document(current.directory / "changed-request/native-evidence.json")["native_completion"] is None
     assert (current.candidate / OPERATION).read_bytes() == reserved
     run(current, "execute", owned_request(current, "install", "execute", list(reversed(names))),
-        owner_evidence=bound)
+        owner_evidence=bound, capture_evidence=True)
+    completion_evidence(current, "execute", "succeeded", "retained")
     assert_completion(current, lock)
     released = retain_owner(current, "released")
     assert document(released)["state"] == "released"
