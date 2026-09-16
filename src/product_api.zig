@@ -145,6 +145,24 @@ pub const NativeInstallEvidence = struct {
     } = null,
 };
 
+/// Returned terminal facts, not ownership or execution authority. All fields
+/// are values independent of the receipt, request and allocator lifetimes.
+pub const NativeCompletionEvidence = struct {
+    pub const Outcome = enum { succeeded, failed };
+    pub const Settlement = enum { cleared, retained };
+
+    operation: Operation,
+    outcome: Outcome,
+    settlement: Settlement,
+    attempt_id: [32]u8,
+    lock_sha256: [32]u8,
+    caller_request_sha256: [32]u8,
+    caller_policy_sha256: [32]u8,
+    transaction_digest_sha256: [32]u8,
+    completion_digest_sha256: [32]u8,
+    program_sha256: [32]u8,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -156,6 +174,8 @@ pub const Result = struct {
     diagnostic_count: usize = 0,
     // Explicit native install output carries this evidence; command.v1 does not.
     native_install: ?NativeInstallEvidence = null,
+    // Typed native consumers retain this separately; command.v1 omits it.
+    native_completion: ?NativeCompletionEvidence = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -502,6 +522,32 @@ test "canonical result JSON is stable" {
         "{\"schema\":\"io.github.cataggar.debz.command.v1\",\"api_version\":1,\"operation\":\"info\",\"exit_status\":0,\"changed\":false,\"summary\":\"ok\",\"items\":[{\"package\":\"demo\",\"version\":\"1\",\"architecture\":\"amd64\",\"detail\":null}],\"diagnostics\":[]}\n",
         json,
     );
+}
+
+test "command JSON does not serialize typed native completion evidence" {
+    var result: Result = .{
+        .operation = .recover,
+        .exit_status = .success,
+        .changed = true,
+        .summary = "native recovery completed",
+    };
+    const before = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(before);
+    result.native_completion = .{
+        .operation = .install,
+        .outcome = .succeeded,
+        .settlement = .cleared,
+        .attempt_id = @splat(1),
+        .lock_sha256 = @splat(2),
+        .caller_request_sha256 = @splat(3),
+        .caller_policy_sha256 = @splat(4),
+        .transaction_digest_sha256 = @splat(5),
+        .completion_digest_sha256 = @splat(6),
+        .program_sha256 = @splat(7),
+    };
+    const after = try result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
 test "facade validates confirmation before backend routing" {

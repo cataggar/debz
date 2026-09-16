@@ -334,7 +334,7 @@ pub fn build(b: *std.Build) void {
     );
     const package_family_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"package_family_backend.test."},
+        .filters = &.{ "package_family_backend.test.", "product_api.test." },
     });
     const run_package_family_tests = b.addRunArtifact(package_family_tests);
     production_backend_test_step.dependOn(&run_package_family_tests.step);

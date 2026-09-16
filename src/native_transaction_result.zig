@@ -112,7 +112,55 @@ pub const ExpectedCaller = struct {
     request_sha256: [32]u8,
     policy_sha256: [32]u8,
     foreign_architectures: []const []const u8,
+    completion: ?product_api.NativeCompletionEvidence = null,
 };
+
+/// Describes already-verified documents; this does not verify a root or
+/// establish the supplied settlement state.
+pub fn describeCompletion(
+    outer: root_operation_completion.Document,
+    proof: native_provenance.Document,
+    settlement: product_api.NativeCompletionEvidence.Settlement,
+) !product_api.NativeCompletionEvidence {
+    const outcome: product_api.NativeCompletionEvidence.Outcome = switch (proof.outcome) {
+        .succeeded => .succeeded,
+        .failed => .failed,
+        .recovery_required => return error.InvalidNativeCompletionEvidence,
+    };
+    const operation = switch (outer.operation) {
+        .package_transaction => |value| value,
+        else => return error.InvalidNativeCompletionEvidence,
+    };
+    const receipt_digest = try parseDigest(proof.digest_sha256);
+    const program_digest = try parseDigest(proof.program_sha256);
+    const lock_digest = try parseDigest(proof.exact_lock_sha256);
+    if (outer.backend != .native or proof.backend != .native or !outer.mutation_started or
+        !outer.operation.eql(proof.operation) or
+        outer.outcome != (if (outcome == .succeeded) root_operation.Outcome.succeeded else .failed_after_mutation) or
+        !std.mem.eql(u8, &outer.attempt_id, &try parseDigest(proof.attempt_id)) or
+        !std.mem.eql(u8, &outer.request_sha256, &try parseDigest(proof.request_sha256)) or
+        !std.mem.eql(u8, &outer.policy_sha256, &try parseDigest(proof.policy_sha256)) or
+        !std.mem.eql(u8, &outer.root_identity_sha256, &try parseDigest(proof.root_identity_sha256)) or
+        !std.mem.eql(u8, outer.install_root, proof.install_root) or
+        outer.program_sha256 == null or !std.mem.eql(u8, &outer.program_sha256.?, &program_digest) or
+        outer.exact_lock == null or !std.mem.eql(u8, &outer.exact_lock.?.digest_sha256, &lock_digest) or
+        !std.mem.eql(u8, outer.transaction_provenance.schema, native_provenance.schema_id) or
+        outer.transaction_provenance.document_sha256 == null or
+        !std.mem.eql(u8, &outer.transaction_provenance.document_sha256.?, &receipt_digest))
+        return error.InvalidNativeCompletionEvidence;
+    return .{
+        .operation = operation,
+        .outcome = outcome,
+        .settlement = settlement,
+        .attempt_id = outer.attempt_id,
+        .lock_sha256 = lock_digest,
+        .caller_request_sha256 = outer.request_sha256,
+        .caller_policy_sha256 = outer.policy_sha256,
+        .transaction_digest_sha256 = receipt_digest,
+        .completion_digest_sha256 = outer.digest_sha256,
+        .program_sha256 = program_digest,
+    };
+}
 
 pub fn verifyForCaller(
     allocator: std.mem.Allocator,
@@ -156,6 +204,9 @@ fn verifyInternal(
             !std.mem.eql(u8, &outer.policy_sha256, &caller.policy_sha256) or
             !textsEqual(outer.foreign_architectures, caller.foreign_architectures))
             return error.CallerRequestMismatch;
+        if (caller.completion) |returned|
+            if (!std.meta.eql(returned, try describeCompletion(outer, proof, .cleared)))
+                return error.CompletionResultMismatch;
     }
     try held.validate();
     return .{

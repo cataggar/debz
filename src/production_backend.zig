@@ -24,6 +24,7 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
 const native_recovery = @import("native_recovery.zig");
 const native_provenance = @import("native_provenance.zig");
+const native_transaction_result = @import("native_transaction_result.zig");
 const openpgp = @import("openpgp_verifier.zig");
 
 pub const Executor = transaction_engine.Executor;
@@ -848,6 +849,11 @@ pub const Backend = struct {
             !std.mem.eql(u8, &document.transaction_provenance.document_sha256.?, &receipt_digest) or
             document.transaction_provenance.status == .unavailable or document.journal.status != .absent)
             return error.InvalidNativeCompletion;
+        const native_completion = try native_transaction_result.describeCompletion(
+            document,
+            receipt,
+            if (guard.orchestration_id == null) .cleared else .retained,
+        );
         const defer_clear = guard.orchestration_id != null and
             (guard.ownership_marker == null or guard.ownership_marker.?.state != .released) and
             (guard.preserve_settled or receipt.outcome == .failed or
@@ -885,19 +891,20 @@ pub const Backend = struct {
         }
         if (receipt.outcome == .succeeded) {
             var result = success(request.operation, true, summary, &.{});
+            result.native_completion = native_completion;
             if (install_evidence) |evidence| {
                 result.native_install = evidence;
                 result.native_install.?.receipt = .{
                     .transaction_digest_sha256 = receipt_digest,
                     .completion_digest_sha256 = document.digest_sha256,
-                    .program_sha256 = native_recovery.parseDigest(receipt.program_sha256) orelse
-                        return error.InvalidNativeReceipt,
+                    .program_sha256 = native_completion.program_sha256,
                 };
             }
             return result;
         }
         var failed = api.failure(request.operation, .transaction, .transaction_failed, summary);
         failed.changed = true;
+        failed.native_completion = native_completion;
         return failed;
     }
 
@@ -5422,9 +5429,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
+        native_evidence_output: ?[]const u8 = null,
         family_verification: ?struct {
             request: @import("package_family_backend.zig").Request,
             expect_failure: bool = false,
+            completion: ?api.NativeCompletionEvidence = null,
         } = null,
         owned_verification: ?struct {
             lock_path: []const u8,
@@ -5442,6 +5451,14 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.native_evidence_output) |path|
+        if (!@import("absolute_path.zig").nonRoot(path) or
+            !std.mem.eql(u8, std.fs.path.dirname(path).?, std.fs.path.dirname(external.report) orelse "") or
+            std.mem.eql(u8, path, external.report) or
+            external.family_verification != null or external.owned_verification != null or
+            external.facade_recover or external.prepare_acknowledged_review != null or
+            external.prepare_cleared_review != null)
+            return error.InvalidExternalWorkflowRequest;
     if (external.family_verification) |check|
         if (external.projected or external.withhold_projection or external.completion_crash != null or
             external.owner_evidence != null or external.review_evidence != null or
@@ -5536,7 +5553,10 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         return error.InvalidExternalWorkflowRequest;
     if (external.family_verification) |check| {
         const family: @import("package_family_backend.zig").NativeBackend = .{ .io = std.testing.io };
-        var verified = family.verifyCompletedSuccess(std.testing.allocator, check.request) catch |err| {
+        var verified = (if (check.completion) |returned|
+            family.verifyCompletedResultSuccess(std.testing.allocator, check.request, returned)
+        else
+            family.verifyCompletedSuccess(std.testing.allocator, check.request)) catch |err| {
             if (!check.expect_failure) return err;
             try writeExternalNativeWorkflowReport(external.report, try std.json.Stringify.valueAlloc(allocator, .{
                 .verified = false,
@@ -5713,6 +5733,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         break :verified "{\"verified\":true,\"outcome\":\"succeeded\"}\n";
     } else result: {
         const outcome = try backend.executeWorkflow(allocator, requested);
+        if (external.native_evidence_output) |path|
+            try writeExternalNativeWorkflowReport(path, try std.json.Stringify.valueAlloc(allocator, .{
+                .native_completion = outcome.native_completion,
+                .native_install = outcome.native_install,
+            }, .{}));
         break :result try outcome.canonicalJson(allocator);
     };
     try writeExternalNativeWorkflowReport(external.report, output);

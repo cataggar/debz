@@ -57,7 +57,23 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertEqual(transport["family_verification"], family)
         self.assertIsNone(transport["completion_crash"])
         self.assertIsNone(transport["owned_verification"])
+        self.assertIsNone(transport["native_evidence_output"])
         self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_native_completion_capture_is_separate_from_command_report(self) -> None:
+        destination = self.workspace / "completion-output"
+        with (
+            mock.patch.object(acceptance.subprocess, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(acceptance, "document", return_value={}),
+        ):
+            acceptance.workflow(
+                self.workspace / "driver", {"options": {"install_root": str(self.root)}},
+                destination, {}, capture_evidence=True,
+            )
+        transport = json.loads((destination / "workflow.request.json").read_bytes())
+        self.assertEqual(transport["native_evidence_output"], str(destination / "native-evidence.json"))
+        self.assertNotEqual(transport["native_evidence_output"], transport["report"])
+        self.assertIsNone(transport["family_verification"])
 
     def test_family_verification_still_refuses_host_root_before_spawn(self) -> None:
         with mock.patch.object(acceptance.subprocess, "run") as run:

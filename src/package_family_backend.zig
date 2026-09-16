@@ -285,6 +285,26 @@ pub const NativeBackend = struct {
     /// Read-only proof of a settled successful transaction, not execution,
     /// recovery, an unchanged result, or authority to publish an image.
     pub fn verifyCompletedSuccess(self: @This(), allocator: std.mem.Allocator, original: Request) !VerifiedNativeCompletion {
+        return self.verifyCompleted(allocator, original, null);
+    }
+
+    pub fn verifyCompletedResultSuccess(
+        self: @This(),
+        allocator: std.mem.Allocator,
+        original: Request,
+        returned: product.NativeCompletionEvidence,
+    ) !VerifiedNativeCompletion {
+        if (returned.outcome != .succeeded or returned.settlement != .cleared)
+            return error.InvalidNativeFamilyCompletion;
+        return self.verifyCompleted(allocator, original, returned);
+    }
+
+    fn verifyCompleted(
+        self: @This(),
+        allocator: std.mem.Allocator,
+        original: Request,
+        returned: ?product.NativeCompletionEvidence,
+    ) !VerifiedNativeCompletion {
         if (!validRequest(original, .native) or switch (original.operation) {
             .create, .customize, .update => false,
             else => true,
@@ -314,10 +334,12 @@ pub const NativeBackend = struct {
                 .request_sha256 = production.productRequestDigest(mapped.request),
                 .policy_sha256 = production.planningPolicyDigest(.native, mapped.request.options),
                 .foreign_architectures = mapped.request.options.foreign_architectures,
+                .completion = returned,
             },
             locks.interface(),
         ) catch |err| switch (err) {
             error.CallerRequestMismatch => return error.NativeFamilyRequestMismatch,
+            error.CompletionResultMismatch => return error.NativeFamilyCompletionMismatch,
             else => return err,
         };
         summary.install_root = try allocator.dupe(u8, summary.install_root);
@@ -559,6 +581,39 @@ test "native family completed verification admits only valid original native mut
     request.root = "/missing-native-family-root";
     request.foreign_architectures = &.{ .arm64, .arm64 };
     try std.testing.expectError(error.InvalidNativeFamilyVerificationRequest, backend.verifyCompletedSuccess(std.testing.allocator, request));
+}
+
+test "native family result verification refuses failed and retained completion before filesystem work" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    const request: Request = .{
+        .schema = native_request_schema,
+        .version = native_schema_version,
+        .operation = .create,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{"/missing-family-source"},
+        .keyrings = &.{"/missing-family-key"},
+        .cache = "/missing-family-cache",
+        .state = "/missing-family-state",
+        .package = "hello",
+        .lock_input = "/missing-family-lock",
+    };
+    var completion: product.NativeCompletionEvidence = .{
+        .operation = .install,
+        .outcome = .failed,
+        .settlement = .cleared,
+        .attempt_id = @splat(1),
+        .lock_sha256 = @splat(2),
+        .caller_request_sha256 = @splat(3),
+        .caller_policy_sha256 = @splat(4),
+        .transaction_digest_sha256 = @splat(5),
+        .completion_digest_sha256 = @splat(6),
+        .program_sha256 = @splat(7),
+    };
+    try std.testing.expectError(error.InvalidNativeFamilyCompletion, backend.verifyCompletedResultSuccess(std.testing.allocator, request, completion));
+    completion.outcome = .succeeded;
+    completion.settlement = .retained;
+    try std.testing.expectError(error.InvalidNativeFamilyCompletion, backend.verifyCompletedResultSuccess(std.testing.allocator, request, completion));
 }
 
 test "native family verification request mapping propagates allocation failures without filesystem work" {

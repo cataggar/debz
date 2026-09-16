@@ -271,6 +271,17 @@ with explicit action authorization and retained configuration modeled separately
 Remaining consumer integration and full pinned parity remain roadmap work.
 Legacy stays default, and there is no fallback.
 
+Typed product results additionally return `native_completion` only when a
+terminal native report reaches the end of this completion path. The by-value
+evidence binds the original operation, outcome, attempt, lock, caller hashes,
+receipt, completion and program. Ordinary cleanup returns `cleared`; an
+outer-owned result is `retained` even when its released marker awaits
+finalization. An interrupted path, unchanged closure or no-work recovery does
+not borrow an older receipt to manufacture this evidence. Generic command JSON
+continues to omit native metadata. Consumers can bind a particular returned
+completion during read-only family verification; see
+[the package-family contract](zvmi-package-family.md#binding-a-particular-returned-completion).
+
 The internal batch workflow uses the same native receipt and completion
 protocol. Its recovery request must match the original operation,
 canonical selectors, and request policy before any abandonment or replay.
