@@ -1216,6 +1216,31 @@ def exercise_core(executable: Path, helper: Path, workspace: Path, environment: 
             assert (current.candidate / INTENT).exists()
             assert document(current.candidate / OPERATION)["attempt_id"] == binding["attempt_id"]
             assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            family = {
+                "schema": "io.github.cataggar.debz.package-family.request.v2",
+                "version": 2, "operation": "recover", "root": str(current.candidate),
+                "architecture": architecture, "sources": [], "keyrings": [],
+                "cache": str(current.directory / "unused-family-cache"),
+                "state": str(current.directory / "unused-family-state"),
+            }
+            envelope = {
+                "operation": "install", "mode": "recover", "selectors": [{"name": m.PACKAGE}],
+                "options": {
+                    "install_root": family["root"], "architecture": architecture,
+                    "cache_path": family["cache"], "state_path": family["state"],
+                },
+            }
+            refused = workflow(
+                executable, envelope, current.directory / "family-unknown-recovery", environment,
+                family_execution=family, capture_evidence=True,
+            )
+            assert refused["exit_status"] == "recovery" and not refused["succeeded"] and refused["changed"], refused
+            assert refused["provenance_path"] is None and refused["diagnostic"]["recoverable"]
+            assert "unknown" in refused["diagnostic"]["message"].lower()
+            assert document(current.directory / "family-unknown-recovery/native-evidence.json")["native_completion"] is None
+            assert document(current.candidate / OPERATION)["attempt_id"] == binding["attempt_id"]
+            assert (current.candidate / INTENT).exists()
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
         print(f"{name}: native outcome and original evidence preserved", flush=True)
 
 
@@ -1225,6 +1250,7 @@ def workflow(
     acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
     owned_verification: dict | None = None,
     family_verification: dict | None = None,
+    family_execution: dict | None = None,
     capture_evidence: bool = False,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
@@ -1239,6 +1265,7 @@ def workflow(
         "acknowledgment": acknowledgment,
         "owned_verification": owned_verification,
         "family_verification": family_verification,
+        "family_execution": family_execution,
         "native_evidence_output": str(destination / "native-evidence.json") if capture_evidence else None,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
@@ -1311,6 +1338,36 @@ def exercise_workflows(
     def run(current: lifecycle.Scenario, label: str, value: dict, *, exit_status: int = 0, **options) -> dict:
         result = workflow(executable, value, current.directory / label, environment, **options)
         assert result["exit_status"] == exit_status, result
+        return result
+
+    def family_request(current: lifecycle.Scenario, operation: str, package: str | None = None) -> dict:
+        options = request(current, "install", "recover" if operation == "recover" else "execute", [])["options"]
+        value = {
+            "schema": "io.github.cataggar.debz.package-family.request.v2",
+            "version": 2, "operation": operation, "root": str(current.candidate),
+            "architecture": architecture, "sources": options.get("source_paths", []),
+            "keyrings": options.get("keyring_paths", []),
+            "cache": options["cache_path"], "state": options["state_path"],
+        }
+        if operation != "recover":
+            value["package"] = package
+            value["lock_output" if operation == "resolve_lock" else "lock_input"] = str(current.directory / "workflow.lock.json")
+        return value
+
+    def run_family(current: lifecycle.Scenario, label: str, value: dict, status: str | None = "success") -> dict:
+        result = workflow(
+            executable, request(current, "install", "execute", [value.get("package") or "scenario-main"]),
+            current.directory / label, environment, family_execution=value, capture_evidence=True,
+        )
+        assert result["schema"] == "io.github.cataggar.debz.package-family.result.v2"
+        assert result["version"] == 2 and result["operation"] == value["operation"]
+        if status is not None:
+            assert result["exit_status"] == status, result
+            assert result["succeeded"] == (status == "success"), result
+        assert not (current.directory / "state/transaction-result.json").exists()
+        if result["provenance_path"] is not None:
+            assert result["provenance_path"] == str(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json")
+            assert Path(result["provenance_path"]).is_file()
         return result
 
     def assert_completion(current: lifecycle.Scenario, lock: dict) -> None:
@@ -1522,7 +1579,30 @@ def exercise_workflows(
         completion_crash="after_native_receipt", capture_evidence=True,
     )
     verify_family("pending-not-success", original_family, False)
-    run(current, "recover", request(current, "install", "recover", family_names), capture_evidence=True)
+    recovery_request = family_request(current, "recover")
+    pending_bytes = (current.candidate / OPERATION).read_bytes()
+    for field, value in (
+        ("sources", [str(source)]),
+        ("keyrings", [str(keyring)]),
+        ("lock_input", original_family["lock_input"]),
+        ("lock_output", original_family["lock_input"]),
+        ("package", family_names[0]),
+    ):
+        refused = run_family(current, f"family-reject-{field}", {**recovery_request, field: value}, "usage")
+        assert not refused["changed"] and refused["provenance_path"] is None
+        assert (current.candidate / OPERATION).read_bytes() == pending_bytes
+    original_cache = current.directory / "cache"
+    original_cache.rename(current.directory / "evicted-cache")
+    lock_path = Path(original_family["lock_input"])
+    retained_lock = current.directory / "reviewed.lock"
+    lock_path.rename(retained_lock)
+    try:
+        recovered = run_family(current, "recover", recovery_request)
+    finally:
+        retained_lock.rename(lock_path)
+    assert recovered["changed"] and recovered["lock_path"] is None
+    assert not Path(recovery_request["cache"]).exists()
+    assert not Path(recovery_request["state"]).exists()
     recovered_completion = completion_evidence(current, "recover", "succeeded", "cleared")
     assert document(current.directory / "recover/native-evidence.json")["native_install"] is None
     verify_family("recovered-result-success", original_family, returned=recovered_completion)
@@ -1530,6 +1610,56 @@ def exercise_workflows(
     assert wrong_attempt["error"] == "NativeFamilyCompletionMismatch", wrong_attempt
     verify_family("recovered-success", original_family)
     print("family-recovered-verification: pending refusal and original completed request proof passed", flush=True)
+
+    current = scenario("family-native-install")
+    planned = run_family(current, "family-plan", family_request(current, "resolve_lock", "scenario-main"))
+    assert not planned["changed"] and planned["provenance_path"] is None
+    assert document(Path(planned["lock_path"]))["version"] == 2
+    create_request = family_request(current, "create", "scenario-main")
+    created = run_family(current, "family-create", create_request)
+    assert created["changed"]
+    completion_evidence(current, "family-create", "succeeded", "cleared")
+    reference_dir = current.directory / "reference-create"
+    reference_dir.mkdir()
+    assert lifecycle.reference_phase(
+        current.expected, [archive("base-dep"), archive("scenario-main")], "install",
+        environment, reference_dir, packages=[],
+    ) == 0
+    compare(current.expected, current.candidate)
+    run_family(current, "family-plan-customize", family_request(current, "resolve_lock", "conffile-pkg"))
+    customized = run_family(current, "family-customize", family_request(current, "customize", "conffile-pkg"))
+    assert customized["changed"]
+    completion_evidence(current, "family-customize", "succeeded", "cleared")
+    reference_dir = current.directory / "reference-customize"
+    reference_dir.mkdir()
+    assert lifecycle.reference_phase(
+        current.expected, [archive("conffile-pkg")], "install",
+        environment, reference_dir, packages=[],
+    ) == 0
+    compare(current.expected, current.candidate)
+    run_family(current, "family-plan-failure", family_request(current, "resolve_lock", "fail-script"))
+    failed = run_family(current, "family-failure", family_request(current, "customize", "fail-script"), "transaction")
+    assert failed["changed"] and failed["diagnostic"]["recoverable"]
+    completion_evidence(current, "family-failure", "failed", "cleared")
+    failed_bytes = Path(failed["provenance_path"]).read_bytes()
+    clean = run_family(current, "family-clean-recovery", family_request(current, "recover"))
+    assert not clean["changed"] and clean["provenance_path"] is None and clean["lock_path"] is None
+    assert document(current.directory / "family-clean-recovery/native-evidence.json")["native_completion"] is None
+    assert Path(failed["provenance_path"]).read_bytes() == failed_bytes
+    print("family-native-install: genuine create/customize, known failure and clean recovery passed", flush=True)
+
+    current = lifecycle.Scenario(workspace, "family-missing-helper", executable, architecture, environment)
+    current.seed(archive("essential-core"))
+    assert not (current.candidate / triggers.HELPER).exists()
+    original_status = (current.candidate / "var/lib/dpkg/status").read_bytes()
+    run_family(current, "family-plan", family_request(current, "resolve_lock", "scenario-main"))
+    refused = run_family(current, "family-refused", family_request(current, "create", "scenario-main"), None)
+    assert not refused["succeeded"] and not refused["changed"] and refused["provenance_path"] is None
+    assert "helper" in refused["diagnostic"]["message"].lower(), refused
+    assert not (current.candidate / triggers.HELPER).exists()
+    assert (current.candidate / "var/lib/dpkg/status").read_bytes() == original_status
+    assert document(current.directory / "family-refused/native-evidence.json")["native_completion"] is None
+    print("family-missing-helper: refusal before mutation without a placeholder passed", flush=True)
 
     names = ["scenario-main", "conffile-pkg"]
     current = scenario("workflow-batch")
@@ -1734,6 +1864,10 @@ def exercise_workflows(
     run(current, "execute", owned_request(current, "install", "execute", list(reversed(names))),
         owner_evidence=bound, capture_evidence=True)
     completion_evidence(current, "execute", "succeeded", "retained")
+    retained_bytes = (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").read_bytes()
+    refused = run_family(current, "family-cannot-finalize-owner", family_request(current, "recover"), "recovery")
+    assert not refused["changed"] and refused["provenance_path"] is None
+    assert (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").read_bytes() == retained_bytes
     assert_completion(current, lock)
     released = retain_owner(current, "released")
     assert document(released)["state"] == "released"

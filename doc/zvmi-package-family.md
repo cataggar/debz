@@ -51,10 +51,11 @@ arm64 runners exercise the legacy backend, installing `ubuntu-minimal` into
 empty staged roots and replaying the same exact lock for update and
 reproducibility evidence.
 
-## Native lock resolution
+## Native family workflows
 
 The separate `debz.NativePackageFamilyBackend` provides native version-2
-`resolve_lock` without changing the legacy adapter or converting v1 locks.
+`resolve_lock`, `create`, `customize` and `recover` without changing the legacy
+adapter or converting v1 locks.
 Requests execute through this library API; capability discovery is metadata
 only and does not introduce a package-family execution CLI.
 Initialize it with the caller's `std.Io`; it constructs the real native
@@ -76,19 +77,53 @@ advertise legacy provenance. The returned `OwnedResult` contains a version-2
 `result`, including an independently owned `lock_path`; call `deinit` on the
 owned result after use.
 
-Native capability discovery currently advertises **only `resolve-lock`**,
-exact-lock v2, no provenance schema, unavailable recovery and no apt/dpkg
-invocation. Native create/customize/update/recover/inspect requests remain
-unavailable before filesystem access until their complete family-level
-contracts are integrated. Selecting native never falls back to the legacy
-family adapter, and the ordinary v1 adapter rejects v2 requests.
+Native create/customize require a reviewed lock and use the same native
+install operation. They retain the core planner's behavior: repeated requests
+or matching versions do not imply no work, and an explicit install can select
+reinstallation. If preparation is genuinely unchanged, the adapter preserves
+`changed = false` with typed install evidence and no invented
+receipt or provenance path. Mutation still requires the real trusted helper
+target in the staged root; a missing target refuses before mutation and is
+never replaced with a placeholder.
+
+Changed successes carry the actual core install/completion evidence and pass
+invocation-specific completed-success verification before the family reports
+success. Known failure and incomplete recovery retain the core's actual
+`changed` flag and failed exit status. The owned result's `native_install` and
+`native_completion` are by-value companions to the unchanged common result
+shape; retain them separately when serializing `result`. A terminal
+`provenance_path` identifies the native receipt under the requested root, never
+`STATE/transaction-result.json`. This latest-receipt path can change after
+another transaction; bind it with the returned evidence, not the path alone.
+Post-execution proof failure is recovery-required, preserves the changed flag,
+and does not authorize publication. Any raised API error also prevents image
+publication.
+
+Native recovery accepts explicit root, architecture/foreign architectures,
+cache/state paths and invocation deadline/lock-wait limits, but no package,
+source/config/keyring, lock input/output, credential or proxy replacements.
+Leave execution-policy fields at their defaults; recovery uses the original
+persisted policy, not those fields as overrides. Cache/state paths remain
+explicit and syntactically validated, but recovery does not acquire archives
+or metadata through them. A terminal recovery returns the original completion
+evidence and native provenance, without a replacement lock path. No-work
+recovery returns no new provenance and does not turn a prior failed install
+into success. Unknown script outcomes remain unresolved without replay;
+another outer owner's marker cannot be finalized through this adapter.
+
+Native capability discovery advertises these four operations, exact-lock v2,
+native transaction provenance and disposable-or-recoverable roots, with no
+apt/dpkg invocation. Native update/inspect remain unavailable before filesystem
+work until their distinct contracts are integrated. Selecting native never
+falls back to the legacy family adapter, and the ordinary v1 adapter rejects
+v2 requests.
 
 ## Read-only native completion evidence
 
 `NativePackageFamilyBackend.verifyCompletedSuccess(allocator, original_request)`
 verifies a settled successful native transaction against an explicit v2
-create/customize/update request. It does **not** execute that request, enable
-those operations in `execute`, recover an incomplete transaction or accept a
+create/customize/update request. It does **not** execute that request,
+recover an incomplete transaction or accept a
 known failure as successful installation. Create and customize intentionally
 share the product install operation; their family labels are not independently
 attested.
@@ -116,8 +151,8 @@ credentials, proxies or transport limits. These request fields are validated
 but verification performs no repository refresh, archive acquisition or
 credential loading. Authenticated content is bound by the reviewed lock and
 retained native evidence, not by reusing current transport configuration.
-Existing capability and execution-result schemas remain unchanged, including
-the native execution, recovery and inspection gates.
+Existing capability and common execution-result schemas remain unchanged;
+capabilities identify which native operations are available.
 
 ### Binding a particular returned completion
 
@@ -146,4 +181,4 @@ the root lock remains held. A different attempt, altered binding or relabeled
 failure cannot stand in for that result. The older `verifyCompletedSuccess`
 continues to describe matching retained history without asserting which
 invocation returned it. Both methods are read-only, require genuine evidence,
-and leave family execution/recovery/inspection gates unchanged.
+and do not bypass the remaining native update/inspection gates.
