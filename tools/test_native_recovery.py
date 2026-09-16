@@ -87,6 +87,9 @@ class RecoveryOracleTests(unittest.TestCase):
                 {"workflow": True, "repository": True},
                 {"workflow": True, "repository_execution": True},
                 {"repository": True, "repository_execution": True},
+                {"workflow": True, "repository_cli": True},
+                {"repository": True, "repository_cli": True},
+                {"repository_execution": True, "repository_cli": True},
             ):
                 with self.subTest(function=function.__name__, arguments=arguments), mock.patch.object(acceptance.subprocess, "run") as run:
                     with self.assertRaisesRegex(ValueError, "mutually exclusive"):
@@ -103,6 +106,49 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertIn("--repository-projection-inside", command)
         self.assertNotIn("--projected-workflow-inside", command)
         self.assertEqual(command[-1], str(self.root))
+
+    def test_repository_cli_keeps_the_existing_projection_timeout(self) -> None:
+        with mock.patch.object(acceptance.subprocess, "run") as run:
+            acceptance.projected_process(self.root, repository_cli=True)
+        self.assertIn("--repository-cli-inside", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_repository_cli_runs_one_invocation_with_watchdog_after_its_deadline(self) -> None:
+        fixture = self.root / "fixture"
+        fixture.mkdir()
+        (fixture / "cli-arguments.json").write_text(json.dumps(["repo", "add", "--deadline-ms", "60000"]))
+        (fixture / "cli-case").write_text("success")
+        (fixture / "cli-step").write_text("1")
+        child = mock.Mock(returncode=0)
+        child.poll.return_value = 0
+        child.communicate.return_value = (b'{"exit_status":0}', b"")
+        with (
+            mock.patch.object(acceptance, "Path", side_effect=lambda path: self.root / str(path).lstrip("/")),
+            mock.patch.object(acceptance.subprocess, "Popen", return_value=child) as spawn,
+            mock.patch.object(acceptance.time, "monotonic", return_value=100),
+        ):
+            acceptance.repository_cli_inside({})
+        spawn.assert_called_once()
+        child.communicate.assert_called_once_with(timeout=65)
+        self.assertTrue((fixture / "cli-1.json").is_file())
+        self.assertFalse((fixture / "cli-0.json").exists())
+        self.assertFalse((fixture / "cli-2.json").exists())
+
+    def test_repository_cli_rejects_invalid_invocation_or_unbounded_watchdog_before_spawn(self) -> None:
+        fixture = self.root / "fixture"
+        fixture.mkdir()
+        (fixture / "cli-case").write_text("success")
+        for step, deadline in ((-1, 60000), (3, 60000), (0, 115000)):
+            with self.subTest(step=step, deadline=deadline):
+                (fixture / "cli-arguments.json").write_text(json.dumps(["--deadline-ms", str(deadline)]))
+                (fixture / "cli-step").write_text(str(step))
+                with (
+                    mock.patch.object(acceptance, "Path", side_effect=lambda path: self.root / str(path).lstrip("/")),
+                    mock.patch.object(acceptance.subprocess, "Popen") as spawn,
+                ):
+                    with self.assertRaises(AssertionError):
+                        acceptance.repository_cli_inside({})
+                spawn.assert_not_called()
 
     def test_repository_projection_refuses_host_root_before_entering(self) -> None:
         with (

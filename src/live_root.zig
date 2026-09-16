@@ -24,6 +24,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const transaction_recovery = @import("transaction_recovery.zig");
+const transaction_executor = @import("transaction_executor.zig");
 
 const linux = std.os.linux;
 
@@ -50,6 +51,7 @@ pub const ProjectedRequest = struct {
     context: ?*anyopaque = null,
     child: ProjectedChildFn,
     termination_grace_ms: u64 = 1_000,
+    deadline: ?transaction_executor.Deadline = null,
 };
 
 /// Borrowed authority for this callback's exact private projection, not a
@@ -76,6 +78,7 @@ const Invocation = struct {
         projected: ProjectedChildFn,
     },
     termination_grace_ms: u64,
+    deadline: ?transaction_executor.Deadline = null,
 };
 
 pub const SetupStage = enum(u8) {
@@ -126,6 +129,8 @@ pub const Error = error{
     WaitFailed,
     SystemCallFailed,
     InvalidProjection,
+    DeadlineExceeded,
+    Interrupted,
 };
 
 pub fn platformSupported(os: std.Target.Os.Tag) bool {
@@ -253,6 +258,7 @@ pub fn runProjectedSignalsBlocked(
         .context = request.context,
         .callback = .{ .projected = request.child },
         .termination_grace_ms = request.termination_grace_ms,
+        .deadline = request.deadline,
     }, signal_guard);
 }
 
@@ -273,9 +279,6 @@ fn runInvocation(
             return error.SignalSetupFailed;
     if (linux.geteuid() != 0) return error.NotPrivileged;
 
-    var pinned = try PinnedPaths.open();
-    defer pinned.close();
-
     var watched = interruptSet();
 
     const signal_fd_raw = linux.signalfd(
@@ -286,6 +289,14 @@ fn runInvocation(
     if (linux.errno(signal_fd_raw) != .SUCCESS) return error.SignalSetupFailed;
     const signal_fd: i32 = @intCast(signal_fd_raw);
     defer _ = linux.close(signal_fd);
+
+    var interruption: ?u32 = null;
+    var pinned = PinnedPaths.open(request.deadline, signal_fd, &interruption) catch |err| {
+        if (err == error.Interrupted) return .{ .interrupted = interruption.? };
+        return err;
+    };
+    defer pinned.close();
+    if (request.deadline) |deadline| _ = try deadline.remainingMs();
 
     var report_pipe: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&report_pipe, .{ .CLOEXEC = true })) != .SUCCESS)
@@ -324,10 +335,12 @@ fn runInvocation(
     closeFd(&report_pipe[1]);
     closeFd(&control_pipe[0]);
     _ = linux.setpgid(pid, pid);
-    const waited = try superviseProcess(pid, signal_fd, request.termination_grace_ms);
+    const waited = try superviseProcess(pid, signal_fd, request.termination_grace_ms, request.deadline);
     const failure = readFailure(report_pipe[0]);
     if (failure) |value| return .{ .setup_failed = value };
     if (waited.interrupt) |signal| return .{ .interrupted = signal };
+    if (waited.deadline_exceeded or (request.deadline != null and request.deadline.?.expired()))
+        return error.DeadlineExceeded;
     return termination(waited.status);
 }
 
@@ -366,7 +379,8 @@ const PinnedPaths = struct {
     mountpoint: Identity,
     lock: Identity,
 
-    fn open() Error!PinnedPaths {
+    fn open(deadline: ?transaction_executor.Deadline, signal_fd: i32, interruption: *?u32) Error!PinnedPaths {
+        if (deadline) |limit| _ = try limit.remainingMs();
         const source_fd = try openDirectoryAbsolute("/");
         errdefer _ = linux.close(source_fd);
         const source = try identityOf(source_fd);
@@ -385,10 +399,7 @@ const PinnedPaths = struct {
         if (!privateRootFile(lock_identity) or
             lock_identity.mount_id != runtime.mount_id)
             return error.UnsafeLockFile;
-        switch (linux.errno(linux.flock(lock_fd, 2))) {
-            .SUCCESS => {},
-            else => return error.SystemCallFailed,
-        }
+        try acquireProjectionLock(lock_fd, deadline, signal_fd, interruption);
         const named_lock = try identityAt(runtime_fd, "live-root.lock");
         if (!named_lock.eql(lock_identity)) return error.UnsafeLockFile;
 
@@ -398,6 +409,7 @@ const PinnedPaths = struct {
         const mountpoint = try identityOf(mountpoint_fd);
         const named = try identityAt(runtime_fd, "system-root");
         try validateHostMountpoint(runtime, mountpoint, named);
+        if (deadline) |limit| _ = try limit.remainingMs();
 
         return .{
             .source_fd = source_fd,
@@ -1098,14 +1110,49 @@ fn resetInterruptActions() void {
 const WaitResult = struct {
     status: u32,
     interrupt: ?u32 = null,
+    deadline_exceeded: bool = false,
 };
 
-fn superviseProcess(pid: i32, signal_fd: i32, grace_ms: u64) Error!WaitResult {
+fn acquireProjectionLock(
+    fd: i32,
+    deadline: ?transaction_executor.Deadline,
+    signal_fd: i32,
+    interruption: *?u32,
+) Error!void {
+    const limit = deadline orelse {
+        if (linux.errno(linux.flock(fd, 2)) != .SUCCESS) return error.SystemCallFailed;
+        return;
+    };
+    while (true) {
+        if (readSignal(signal_fd)) |signal| {
+            interruption.* = @intFromEnum(signal);
+            return error.Interrupted;
+        }
+        const remaining = try limit.remainingMs();
+        switch (linux.errno(linux.flock(fd, 2 | 4))) {
+            .SUCCESS => return,
+            .AGAIN, .INTR => sleepMilliseconds(@min(5, remaining)),
+            else => return error.SystemCallFailed,
+        }
+    }
+}
+
+fn superviseProcess(
+    pid: i32,
+    signal_fd: i32,
+    grace_ms: u64,
+    deadline: ?transaction_executor.Deadline,
+) Error!WaitResult {
     var interrupt: ?u32 = null;
+    var expired = false;
     while (!probeExited(pid)) {
         if (readSignal(signal_fd)) |signal| {
             if (interrupt == null) interrupt = @intFromEnum(signal);
             _ = linux.kill(-pid, signal);
+            if (!awaitExit(pid, grace_ms)) _ = linux.kill(-pid, .KILL);
+        } else if (!expired and deadline != null and deadline.?.expired()) {
+            expired = true;
+            _ = linux.kill(-pid, .TERM);
             if (!awaitExit(pid, grace_ms)) _ = linux.kill(-pid, .KILL);
         }
         sleepMilliseconds(5);
@@ -1113,7 +1160,7 @@ fn superviseProcess(pid: i32, signal_fd: i32, grace_ms: u64) Error!WaitResult {
     // The supervisor normally proves its nested PID namespace empty.  This
     // final sweep is issued before reap while the process-group id is pinned.
     _ = linux.kill(-pid, .KILL);
-    return .{ .status = try reapBlocking(pid), .interrupt = interrupt };
+    return .{ .status = try reapBlocking(pid), .interrupt = interrupt, .deadline_exceeded = expired };
 }
 
 const WorkloadResult = struct {
@@ -1763,6 +1810,68 @@ test "live_root.test.interruption orders signal kill and reap" {
         &.{ .signal, .reap },
         polite.events[0..polite.count],
     );
+}
+
+test "live_root.test.projection lock wait retains the original absolute deadline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const holder = try temporary.dir.createFile(std.testing.io, "lock", .{ .read = true });
+    defer holder.close(std.testing.io);
+    const contender = try temporary.dir.openFile(std.testing.io, "lock", .{ .mode = .read_write });
+    defer contender.close(std.testing.io);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(holder.handle, 2)));
+    const Clock = struct {
+        value: u64 = 10,
+        fn now(raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            defer self.value += 1;
+            return self.value;
+        }
+    };
+    var clock: Clock = .{};
+    const deadline: transaction_executor.Deadline = .{
+        .context = &clock,
+        .nowMsFn = Clock.now,
+        .expires_at_ms = 13,
+    };
+    var interruption: ?u32 = null;
+    try std.testing.expectError(error.DeadlineExceeded, acquireProjectionLock(contender.handle, deadline, -1, &interruption));
+    try std.testing.expect(interruption == null);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(holder.handle, 8)));
+    // Even an available lock cannot refresh an expired invocation's budget.
+    try std.testing.expectError(error.DeadlineExceeded, acquireProjectionLock(contender.handle, deadline, -1, &interruption));
+    clock.value = 10;
+    try acquireProjectionLock(contender.handle, deadline, -1, &interruption);
+    try std.testing.expectEqual(linux.E.AGAIN, linux.errno(linux.flock(holder.handle, 2 | 4)));
+}
+
+test "live_root.test.deadline supervisor kills and reaps its own process group" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var guard = try blockWatchedSignals();
+    defer guard.restore() catch @panic("cannot restore signal mask");
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        _ = linux.setpgid(0, 0);
+        while (true) sleepMilliseconds(10);
+    }
+    _ = linux.setpgid(pid, pid);
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 100;
+        }
+    };
+    const result = try superviseProcess(pid, -1, 1, .{
+        .context = null,
+        .nowMsFn = Clock.now,
+        .expires_at_ms = 100,
+    });
+    try std.testing.expect(result.deadline_exceeded and result.interrupt == null);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(linux.SIG.KILL)), termination(result.status).signaled);
+    var status: u32 = undefined;
+    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, &status, 0)));
 }
 
 test "live_root.test.watched signal guard is inherited and restores caller mask" {

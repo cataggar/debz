@@ -133,7 +133,7 @@ const repository_add_help =
     \\  --root PATH                  Target root (default: /)
     \\  --architecture ARCH          Override target dpkg architecture
     \\  --transaction-backend legacy_dpkg|native (default: legacy_dpkg)
-    \\    Native repository execution is unavailable; selection never falls back.
+    \\    Native requires Linux, root privilege, and --root /; never falls back.
     \\  --cache-path PATH            Logical cache path inside the target root
     \\  --state-path PATH            Logical state path inside the target root
     \\  --sha256 DIGEST              Expected descriptor SHA-256
@@ -1373,11 +1373,14 @@ fn runRepository(
         .io = init.io,
         .transaction_backend = parsed.transaction_backend,
     };
-    var result = repository_api.execute(
-        init.arena.allocator(),
-        parsed.request,
-        backend_context.interface(),
-    ) catch {
+    var result = (switch (parsed.transaction_backend) {
+        .native => debz.repository_command.executeNative(init.arena.allocator(), parsed.request),
+        .legacy_dpkg => repository_api.execute(
+            init.arena.allocator(),
+            parsed.request,
+            backend_context.interface(),
+        ),
+    }) catch {
         const internal = repository_api.failure(
             .internal,
             .internal_error,

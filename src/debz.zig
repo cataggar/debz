@@ -13,6 +13,7 @@ pub const apt_system_orchestrator = @import("apt_system_orchestrator.zig");
 pub const repository_api = @import("repository_api.zig");
 pub const repository_state = @import("repository_state.zig");
 pub const repository_backend = @import("repository_backend.zig");
+pub const repository_command = @import("repository_command.zig");
 pub const RepositoryApiVersion = repository_api.api_version;
 pub const RepositoryOperation = repository_api.Operation;
 pub const RepositoryTrustMode = repository_api.TrustMode;
@@ -631,4 +632,5 @@ test {
     _ = repository_api;
     _ = repository_state;
     _ = repository_backend;
+    _ = repository_command;
 }

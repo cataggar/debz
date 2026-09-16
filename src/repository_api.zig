@@ -181,7 +181,9 @@ pub const Result = struct {
             return error.DigestMismatch;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try writeDocument(self, &output.writer);
+        writeDocument(self, &output.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+        };
         const bytes = try output.toOwnedSlice();
         if (bytes.len > maximum_document_bytes) {
             allocator.free(bytes);
@@ -486,7 +488,10 @@ pub fn decode(
     var parsed = std.json.parseFromSlice(WireResult, allocator, source, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return error.InvalidDocument;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDocument,
+    };
     defer parsed.deinit();
     const wire = parsed.value;
     if (!std.mem.eql(u8, wire.schema, schema_id) or wire.version != schema_version)
@@ -579,12 +584,11 @@ pub fn decode(
         diagnostic.phase = try dupeOptional(owned, diagnostic.phase);
         diagnostic.message = try owned.dupe(u8, diagnostic.message);
     }
-    var output: OwnedResult = .{
+    const output: OwnedResult = .{
         .result = result,
         .arena = arena,
         .backing_allocator = allocator,
     };
-    errdefer output.deinit();
     const canonical = try output.result.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
