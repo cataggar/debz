@@ -129,6 +129,52 @@ class RecoveryOracleTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_diagnostic_inspection_retains_partial_package_states_without_success_proof(self) -> None:
+        report = {
+            "schema": "io.github.cataggar.debz.package-family.result.v2", "version": 2,
+            "operation": "inspect", "succeeded": True, "exit_status": "success",
+            "changed": False, "lock_path": None, "provenance_path": None,
+        }
+        inspection = {
+            "root": str(self.root), "diagnostic_only": True, "status_database_present": True,
+            "native_active_evidence": True, "observed_operation": {"state": "recovering"},
+            "deferred_owner": None, "packages": [{
+                "name": "partial", "version": "1", "architecture": "amd64",
+                "status": {"want": "install", "error_state": "reinst_required", "current": "half_configured"},
+            }],
+        }
+        evidence = {"native_install": None, "native_completion": None, "native_inspection": inspection}
+        self.assertEqual(acceptance.diagnostic_inspection(report, evidence, self.root), inspection)
+        for changed in (
+            {**report, "changed": True},
+            {**report, "provenance_path": "/invented/receipt"},
+            {**report, "lock_path": "/invented/lock"},
+            {**report, "operation": "create"},
+        ):
+            with self.assertRaises(AssertionError):
+                acceptance.diagnostic_inspection(changed, evidence, self.root)
+
+    def test_diagnostic_inspection_refuses_completion_or_authoritative_relabelling(self) -> None:
+        report = {
+            "schema": "io.github.cataggar.debz.package-family.result.v2", "version": 2,
+            "operation": "inspect", "succeeded": True, "exit_status": "success",
+            "changed": False, "lock_path": None, "provenance_path": None,
+        }
+        inspection = {
+            "root": str(self.root), "diagnostic_only": True, "status_database_present": False,
+            "native_active_evidence": False, "observed_operation": None,
+            "deferred_owner": None, "packages": [],
+        }
+        original = {"native_install": None, "native_completion": None, "native_inspection": inspection}
+        for changed in (
+            {**original, "native_install": {}},
+            {**original, "native_completion": {}},
+            {**original, "native_inspection": {**inspection, "diagnostic_only": False}},
+            {**original, "native_inspection": {**inspection, "root": "/other-root"}},
+        ):
+            with self.assertRaises(AssertionError):
+                acceptance.diagnostic_inspection(report, changed, self.root)
+
     def test_family_verification_still_refuses_host_root_before_spawn(self) -> None:
         with mock.patch.object(acceptance.subprocess, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):
