@@ -1322,6 +1322,267 @@ def workflow(
     return document(report_path, 64 * 1024)
 
 
+def exercise_scriptless_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    receiver_name = "debz-no-handler-receiver"
+    for new_handler in (False, True):
+        for boundary, drift in (
+            ("before_scriptless_trigger_completion", False),
+            ("after_scriptless_trigger_completion", False),
+            ("before_scriptless_trigger_completion", True),
+        ):
+            name = f"no-handler-{'new' if new_handler else 'installed'}-{boundary}" + ("-drift" if drift else "")
+            current = Scenario(workspace, name, executable, helper, architecture, environment)
+            receiver = m.make_package(
+                current.directory / "receiver", environment, architecture, "1",
+                package=receiver_name, triggers=b"interest-await debz-no-handler\n", scripts={},
+            )
+            second = m.make_package(
+                current.directory / "receiver-second", environment, architecture, "1",
+                package=receiver_name + "-second", triggers=b"interest-await debz-no-handler\n", scripts={},
+            )
+            scripted_name = "debz-no-handler-z-scripted"
+            scripted = m.make_package(
+                current.directory / "receiver-scripted", environment, architecture, "1",
+                package=scripted_name, triggers=b"interest-await debz-no-handler\n",
+                scripts=lifecycle.scripts(scripted_name, "1"),
+            )
+            source = m.make_package(
+                current.directory / "source", environment, architecture, "1",
+                package=triggers.SOURCE, triggers=b"activate-await debz-no-handler\n",
+                scripts=triggers.script_set(triggers.SOURCE, "1"),
+            )
+            if not new_handler:
+                current.seed(receiver, second, scripted)
+            binding = current.crash(
+                "install", [receiver, second, scripted, source] if new_handler else [source], boundary, trigger_execution=True,
+            )
+            assert not (current.candidate / SCRIPT).exists(), "absence invented an in-flight script"
+            authority = document(current.candidate / NAMESPACE / "native-trigger-authority-v1.json")
+            assert [
+                handler["postinst_sha256"] for handler in authority["handlers"]
+                if handler["package"]["name"] == receiver_name
+            ] == [None]
+            assert not any(caller["package"]["name"] == receiver_name for caller in authority["callers"])
+            status = next(record for record in triggers.snapshot(current.candidate)["dpkg"]["status"]
+                          if record["package"] == receiver_name)
+            pending = status.get("triggers-pending") == "debz-no-handler"
+            assert pending == (boundary == "before_scriptless_trigger_completion")
+            if drift:
+                m.write(current.candidate / f"var/lib/dpkg/info/{receiver_name}.postinst", b"#!/bin/sh\nexit 0\n", 0o755)
+                current.blocked(binding)
+                print(f"{name}: changed postinst presence blocks recovery without mutation", flush=True)
+                continue
+            current.completed(binding, trigger_execution=True)
+            proof = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+            retained = retained_documents(current.candidate, proof)
+            for name in (receiver_name, receiver_name + "-second"):
+                assert not any(script["package"] == name for script in retained.get("script_outcome", []))
+                assert not (current.candidate / f"var/lib/dpkg/info/{name}.postinst").exists()
+            assert len([script for script in retained["script_outcome"]
+                        if script["package"] == scripted_name and script["arguments"][0] == "triggered"]) == 1
+
+
+CONSUMER_PARITY_SUITES = ("debian-stable", "ubuntu-26.04")
+CONSUMER_PARITY_CASES = (
+    {"id": "pre-depends", "package": "pre-app", "archives": ("base-dep", "pre-app"),
+     "reference_phases": (("base-dep",), ("pre-app",))},
+    {"id": "virtual-provides", "package": "virtual-consumer", "archives": ("virtual-provider=2.0-1", "virtual-consumer")},
+    {"id": "dependency-cycle", "package": "cycle-a", "archives": ("cycle-a", "cycle-b")},
+    {"id": "without-recommends", "package": "scenario-main", "archives": ("base-dep", "scenario-main")},
+    {"id": "with-recommends", "package": "scenario-main", "archives": ("base-dep", "recommended-addon", "scenario-main"),
+     "recommends": True},
+    {"id": "multiarch-package", "package": "multi-lib", "archives": ("multi-lib",)},
+    {"id": "suite-trigger", "package": "trigger-pkg", "archives": ("trigger-pkg",)},
+    {"id": "upgrade-all", "package": None, "archives": ("fixture-upgrade=2.0-1",),
+     "seeds": ("fixture-upgrade",), "update": True},
+    {"id": "held-unchanged", "package": None, "archives": (), "seeds": ("fixture-upgrade",),
+     "update": True, "hold": "fixture-upgrade"},
+    {"id": "conffile-keep", "package": "conffile-pkg", "archives": ("conffile-pkg",), "conffile": "keep_existing"},
+    {"id": "conffile-replace", "package": "conffile-pkg", "archives": ("conffile-pkg",), "conffile": "use_package_version"},
+    {"id": "known-script-failure", "package": "fail-script", "archives": ("fail-script",), "exit_status": 7},
+)
+
+
+def consumer_parity_coverage(rows: list[dict], architecture: str) -> dict:
+    expected = {(suite, case["id"]) for suite in CONSUMER_PARITY_SUITES for case in CONSUMER_PARITY_CASES}
+    observed = [(row["suite"], row["case"]) for row in rows]
+    if len(observed) != len(set(observed)) or set(observed) != expected:
+        raise AssertionError("native consumer parity matrix is incomplete or duplicated")
+    if architecture not in ("amd64", "arm64") or any(
+        row["architecture"] != architecture or row["consumers"] != ["core-cli", "family", "dpkg-reference"]
+        or row["matched"] is not True for row in rows
+    ):
+        raise AssertionError("native consumer parity matrix lacks actual matching consumers")
+    return {"architecture": architecture, "scope": "signed-hermetic-fixtures", "cases": rows}
+
+
+def exercise_consumer_parity(
+    executable: Path, cli: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    spec = importlib.util.spec_from_file_location("debz_consumer_repository", ROOT / "tools/generate-integration-repository.py")
+    assert spec and spec.loader
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    rows = []
+    for suite in CONSUMER_PARITY_SUITES:
+        repository = workspace / f"consumer-{suite}-repository"
+        generator.write_repository(repository, suite, architecture)
+        source = workspace / f"consumer-{suite}.sources"
+        keyring = repository / "fixture-keyring.gpg"
+        m.write(source, (
+            f"Types: deb\nURIs: file://{repository}\nSuites: {suite}\n"
+            f"Components: main\nArchitectures: {architecture}\nSigned-By: {keyring}\n"
+        ).encode())
+
+        def archive(selector: str) -> Path:
+            name, separator, version = selector.partition("=")
+            if not separator:
+                version = ("1.0-1debian1" if suite == "debian-stable" else "1.0-1ubuntu1") if name == "trigger-pkg" else "1.0-1"
+            matches = list((repository / "pool/main").glob(f"{name}_{version}_*.deb"))
+            assert len(matches) == 1, selector
+            return matches[0]
+
+        for case in CONSUMER_PARITY_CASES:
+            current = lifecycle.Scenario(workspace, f"consumer-{suite}-{case['id']}", executable, architecture, environment)
+            core = current.directory / "core"
+            m.make_root(core, architecture)
+            lifecycle.runtime.copy_program(core, Path("/bin/sh"), "/bin/sh")
+            m.write(core / lifecycle.TRACE, b"")
+            roots = (*current.roots, core)
+            seeds = [archive(name) for name in ("native-helper-target", "essential-core", *case.get("seeds", ()))]
+            policy = case.get("conffile", "keep_existing")
+            if "conffile" in case:
+                previous = current.directory / "previous-conffile.deb"
+                m.write(previous, generator.build_deb("conffile-pkg", "0.1-1", architecture, {}, conffile=True))
+                seeds.append(previous)
+            for index, seed in enumerate(seeds):
+                current.seed(seed)
+                destination = current.directory / f"seed-core-{index}"
+                destination.mkdir()
+                assert lifecycle.reference_phase(core, [seed], "install", environment, destination, packages=[]) == 0
+            for root in roots:
+                if "conffile" in case:
+                    m.write(root / "etc/debz-fixture.conf", b"local user configuration\n")
+                    os.utime(root / "etc/debz-fixture.conf", (m.EPOCH, m.EPOCH))
+                if "hold" in case:
+                    subprocess.run(
+                        [*m.reference_command(root), "--set-selections"], input=f"{case['hold']} hold\n".encode(),
+                        env=environment, capture_output=True, check=True, timeout=30,
+                    )
+            helper_before = {root: ((root / triggers.HELPER).read_bytes(), (root / triggers.HELPER).stat().st_ino) for root in roots}
+            core_lock = current.directory / "core.lock.json"
+            family_lock = current.directory / "family.lock.json"
+            package = case["package"]
+            expected_status = case.get("exit_status", 0)
+            options = [
+                "--install-root", str(core), "--architecture", architecture,
+                "--cache-path", str(current.directory / "core-cache"), "--state-path", str(current.directory / "core-state"),
+                "--source", str(source), "--keyring", str(keyring), "--transaction-backend", "native",
+                "--conffile", policy.replace("_", "-"), "--json",
+            ]
+            if case.get("recommends"):
+                options.append("--recommends")
+
+            def public(label: str, args: list[str], expected: int = 0) -> dict:
+                m.reference_command(core)
+                destination = current.directory / label
+                destination.mkdir()
+                with (destination / "stdout.json").open("wb") as stdout, (destination / "stderr").open("wb") as stderr:
+                    process = subprocess.run([str(cli), *args], env=environment, stdin=subprocess.DEVNULL,
+                                             stdout=stdout, stderr=stderr, timeout=120)
+                assert process.returncode == expected, (case["id"], label, (destination / "stdout.json").read_text())
+                assert not (destination / "stderr").read_bytes()
+                result = document(destination / "stdout.json", 1024 * 1024)
+                if args[0] != "transaction-result":
+                    assert result["exit_status"] == expected and result["operation"] == args[0]
+                return result
+
+            template = {
+                "schema": "io.github.cataggar.debz.package-family.request.v2", "version": 2,
+                "root": str(current.candidate), "architecture": architecture, "sources": [str(source)],
+                "keyrings": [str(keyring)], "cache": str(current.directory / "family-cache"),
+                "state": str(current.directory / "family-state"), "package": package,
+                "conffile": policy, "recommends": case.get("recommends", False),
+            }
+            envelope = {"operation": "install", "mode": "execute", "selectors": [{"name": package or "fixture-upgrade"}],
+                        "options": {"install_root": str(current.candidate), "architecture": architecture,
+                                    "cache_path": template["cache"], "state_path": template["state"]}}
+            initial = {root: triggers.snapshot(root) for root in roots}
+            public("core-plan", ["plan", *options, "--lock-output", str(core_lock), *([package] if package else [])])
+            plan = workflow(
+                executable, envelope, current.directory / "family-plan", environment,
+                family_execution={**template, "operation": "resolve_lock", "lock_output": str(family_lock)},
+                family_update_planning=case.get("update", False), capture_evidence=True,
+            )
+            assert plan["succeeded"] and not plan["changed"], plan
+            assert core_lock.read_bytes() == family_lock.read_bytes(), "consumer plans differ for identical installed inputs"
+            lock = document(core_lock)
+            validator("exact-closure-lock-v2").validate(lock)
+            for root in roots:
+                assert not m.oracle.differences(initial[root], triggers.snapshot(root)), "planning changed installed state"
+            operation = "upgrade-all" if case.get("update") else "install"
+            core_result = public("core-execute", [
+                operation, *options, "--lock-input", str(core_lock), "--assume-yes", "--noninteractive",
+                *([package] if package else []),
+            ], expected_status)
+            family_result = workflow(
+                executable, envelope, current.directory / "family-execute", environment,
+                family_execution={**template, "operation": "update" if case.get("update") else "create",
+                                  "lock_input": str(family_lock)}, capture_evidence=True,
+            )
+            assert family_result["exit_status"] == ("transaction" if expected_status else "success"), family_result
+            assert family_result["succeeded"] == (expected_status == 0)
+            assert family_result["changed"] == core_result["changed"] == bool(case["archives"])
+            assert not (current.directory / "family-state/transaction-result.json").exists()
+            if case["archives"]:
+                for index, names in enumerate(case.get("reference_phases", (case["archives"],))):
+                    destination = current.directory / f"reference-execute-{index}"
+                    destination.mkdir()
+                    status = lifecycle.reference_phase(
+                        current.expected, [archive(name) for name in names], "install",
+                        environment, destination, packages=[], policy=policy,
+                    )
+                    assert status == (1 if expected_status else 0), (
+                        case["id"], (destination / "reference.log").read_text(),
+                    )
+            compare(current.expected, core)
+            compare(current.expected, current.candidate)
+            evidence = document(current.directory / "family-execute/native-evidence.json")
+            for root in roots:
+                assert (root / triggers.HELPER).read_bytes() == helper_before[root][0]
+                assert (root / triggers.HELPER).stat().st_ino == helper_before[root][1]
+            for root in (core, current.candidate):
+                assert not (root / OPERATION).exists() and not (root / INTENT).exists()
+                if not case["archives"]:
+                    assert not (root / NAMESPACE / "native-transaction-provenance-v1.json").exists()
+                    continue
+                receipt = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+                completion = document(root / NAMESPACE / "root-operation-completion-v1.json")
+                validator(PROVENANCE_SCHEMA).validate(receipt)
+                assert_digest(receipt, PROVENANCE_SCHEMA)
+                retained_documents(root, receipt)
+                assert_final_database(root, architecture, receipt)
+                assert receipt["outcome"] == ("failed" if expected_status else "succeeded")
+                assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
+                assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
+                assert receipt["attempt_id"] == completion["attempt_id"]
+            if case["archives"]:
+                assert evidence["native_completion"]["outcome"] == ("failed" if expected_status else "succeeded")
+                if expected_status == 0:
+                    public("core-proof", ["transaction-result", "verify", "--transaction-backend", "native",
+                                         "--install-root", str(core), "--architecture", architecture,
+                                         "--lock-input", str(core_lock), "--json"])
+            else:
+                assert evidence["native_completion"] is None and evidence["native_install"] is None
+                assert family_result["provenance_path"] is None
+            rows.append({"suite": suite, "case": case["id"], "architecture": architecture,
+                         "consumers": ["core-cli", "family", "dpkg-reference"], "matched": True})
+            print(f"consumer-parity-{suite}-{case['id']}: public core, family, dpkg and native evidence matched", flush=True)
+    m.write(workspace / "native-consumer-parity.json", canonical(consumer_parity_coverage(rows, architecture)))
+
+
 def exercise_workflows(
     executable: Path, workspace: Path, environment: dict, architecture: str,
     result_cli: Path | None = None,
@@ -3353,10 +3614,11 @@ def main() -> int:
     parser.add_argument("--repository-projection-only", action="store_true")
     parser.add_argument("--repository-execution-only", action="store_true")
     parser.add_argument("--repository-cli-only", action="store_true")
+    parser.add_argument("--consumer-parity-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
     if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only,
-            arguments.repository_execution_only, arguments.repository_cli_only)) > 1:
+            arguments.repository_execution_only, arguments.repository_cli_only, arguments.consumer_parity_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -3388,7 +3650,12 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if arguments.repository_cli_only:
+            if arguments.consumer_parity_only:
+                if result_cli is None:
+                    parser.error("consumer parity requires --result-cli")
+                exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
+                exercise_consumer_parity(executable, result_cli, workspace, environment, architecture)
+            elif arguments.repository_cli_only:
                 if result_cli is None:
                     parser.error("repository CLI acceptance requires --result-cli")
                 exercise_repository_cli(result_cli, workspace, architecture, environment)
@@ -3414,8 +3681,13 @@ def main() -> int:
                         if result_cli is not None:
                             exercise_repository_cli(result_cli, workspace, architecture, environment)
                         exercise(executable, helper, workspace, environment, architecture)
+                        exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
                     exercise_core(executable, helper, workspace, environment, architecture)
                     exercise_workflows(executable, workspace, environment, architecture, result_cli)
+                    if not arguments.core_only:
+                        if result_cli is None:
+                            parser.error("full native acceptance requires --result-cli for consumer parity")
+                        exercise_consumer_parity(executable, result_cli, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during recovery acceptance")

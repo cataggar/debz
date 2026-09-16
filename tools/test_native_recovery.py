@@ -31,6 +31,62 @@ class RecoveryOracleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_consumer_parity_requires_every_suite_case_and_actual_consumer(self) -> None:
+        rows = [
+            {"suite": suite, "case": case["id"], "architecture": "amd64",
+             "consumers": ["core-cli", "family", "dpkg-reference"], "matched": True}
+            for suite in acceptance.CONSUMER_PARITY_SUITES for case in acceptance.CONSUMER_PARITY_CASES
+        ]
+        report = acceptance.consumer_parity_coverage(rows, "amd64")
+        self.assertEqual(report["scope"], "signed-hermetic-fixtures")
+        self.assertEqual(len(report["cases"]), 24)
+        for incomplete in ([], rows[:-1], [*rows, rows[0]], [{**rows[0], "case": "unreviewed"}, *rows[1:]]):
+            with self.assertRaisesRegex(AssertionError, "incomplete or duplicated"):
+                acceptance.consumer_parity_coverage(incomplete, "amd64")
+        for changed in (
+            {"architecture": "arm64"}, {"consumers": ["core-cli", "dpkg-reference"]}, {"matched": False},
+        ):
+            with self.assertRaisesRegex(AssertionError, "actual matching consumers"):
+                acceptance.consumer_parity_coverage([{**rows[0], **changed}, *rows[1:]], "amd64")
+        with self.assertRaises(AssertionError):
+            acceptance.consumer_parity_coverage(rows, "other")
+
+    def test_consumer_parity_keeps_policy_noop_failure_and_suite_cases(self) -> None:
+        cases = {case["id"]: case for case in acceptance.CONSUMER_PARITY_CASES}
+        self.assertEqual(acceptance.CONSUMER_PARITY_SUITES, ("debian-stable", "ubuntu-26.04"))
+        self.assertTrue(cases["with-recommends"]["recommends"])
+        self.assertNotIn("recommends", cases["without-recommends"])
+        self.assertEqual(cases["held-unchanged"]["archives"], ())
+        self.assertTrue(cases["held-unchanged"]["update"])
+        self.assertEqual(cases["held-unchanged"]["hold"], "fixture-upgrade")
+        self.assertEqual(cases["known-script-failure"]["exit_status"], 7)
+        self.assertEqual(cases["conffile-keep"]["conffile"], "keep_existing")
+        self.assertEqual(cases["conffile-replace"]["conffile"], "use_package_version")
+        self.assertEqual(cases["suite-trigger"]["package"], "trigger-pkg")
+
+    def test_handler_schemas_require_explicit_absence_or_a_real_digest(self) -> None:
+        for schema, definition in (
+            ("native-transaction-authorization-v1", "triggerHandler"),
+            ("native-transaction-program-v1", "triggerHandlerBinding"),
+        ):
+            validator = acceptance.validator(schema)
+            handler_validator = validator.evolve(schema={
+                "$defs": validator.schema["$defs"], "$ref": f"#/$defs/{definition}",
+            })
+            handler = {
+                "package": {"name": "receiver", "version": "1", "architecture": "amd64"},
+                "source": "installed_package", "postinst_sha256": None, "declarations_sha256": "b" * 64,
+            }
+            handler_validator.validate(handler)
+            handler_validator.validate({**handler, "postinst_sha256": "a" * 64})
+            for invalid in (
+                {key: value for key, value in handler.items() if key != "postinst_sha256"},
+                {**handler, "postinst_sha256": ""},
+                {**handler, "postinst_sha256": "not-a-digest"},
+                {**handler, "declarations_sha256": None},
+            ):
+                self.assertFalse(handler_validator.is_valid(invalid))
+
     def test_recovery_still_refuses_host_root_before_spawn(self) -> None:
         with mock.patch.object(acceptance.subprocess, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):

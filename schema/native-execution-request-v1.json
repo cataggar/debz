@@ -31,7 +31,7 @@
               "additionalProperties": false,
               "required": ["package_transaction"],
               "properties": {
-                "package_transaction": {"enum": ["install", "upgrade", "reinstall", "remove"]}
+                "package_transaction": {"enum": ["install", "upgrade", "upgrade_all", "reinstall", "remove"]}
               }
             },
             {

@@ -88,7 +88,8 @@ pub const TriggerHandler = struct {
     version: []const u8,
     architecture: []const u8,
     source: TriggerScriptSource,
-    postinst_sha256: [32]u8,
+    /// Null binds the observed absence of postinst, not permission to skip it.
+    postinst_sha256: ?[32]u8,
     declarations_sha256: [32]u8,
 };
 
@@ -725,7 +726,7 @@ const WireFinalPackage = struct {
 const WireTriggerHandler = struct {
     package: WireIdentity,
     source: TriggerScriptSource,
-    postinst_sha256: []const u8,
+    postinst_sha256: ?[]const u8,
     declarations_sha256: []const u8,
 };
 
@@ -856,7 +857,10 @@ pub fn decode(
                 .version = handler.package.version,
                 .architecture = handler.package.architecture,
                 .source = handler.source,
-                .postinst_sha256 = try parseHex(32, handler.postinst_sha256),
+                .postinst_sha256 = if (handler.postinst_sha256) |value|
+                    try parseHex(32, value)
+                else
+                    null,
                 .declarations_sha256 = try parseHex(32, handler.declarations_sha256),
             };
         }
@@ -1162,7 +1166,10 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
             try writer.writeAll(",\"source\":");
             try writeJsonString(writer, @tagName(handler.source));
             try writer.writeAll(",\"postinst_sha256\":");
-            try writeHexString(writer, &handler.postinst_sha256);
+            if (handler.postinst_sha256) |digest|
+                try writeHexString(writer, &digest)
+            else
+                try writer.writeAll("null");
             try writer.writeAll(",\"declarations_sha256\":");
             try writeHexString(writer, &handler.declarations_sha256);
             try writer.writeByte('}');
@@ -1757,60 +1764,66 @@ test "native_authorization.test.canonical document binds program artifacts and f
 }
 
 test "native_authorization.test.trigger-only authority needs no synthetic action" {
-    const handlers = [_]TriggerHandler{.{
-        .package = "demo",
-        .version = "1",
-        .architecture = "amd64",
-        .source = .installed_package,
-        .postinst_sha256 = @splat(0x31),
-        .declarations_sha256 = @splat(0x32),
-    }};
-    const callers = [_]TriggerCaller{.{
-        .package = "demo",
-        .version = "1",
-        .architecture = "amd64",
-        .source = .installed_package,
-        .kind = .postinst,
-        .script_sha256 = @splat(0x31),
-    }};
-    const final_state = [_]FinalPackage{.{
-        .name = "demo",
-        .version = "1",
-        .architecture = "amd64",
-        .state = .installed,
-        .dpkg_selection_hold = false,
-    }};
-    var input = testInput();
-    input.actions = &.{};
-    input.final_state = &final_state;
-    input.trigger_authority = .{
-        .mode = .process_pending,
-        .defer_triggers = false,
-        .initial_state_sha256 = @splat(0x33),
-        .handlers = &handlers,
-        .callers = &callers,
-        .allowed_triggers = &.{"debz-trigger"},
-        .maximum_invocations = 8,
-    };
-    var owned = try create(std.testing.allocator, input);
-    defer owned.deinit();
-    try std.testing.expectEqual(@as(usize, 0), owned.authorization.actions.len);
-    try std.testing.expectEqual(
-        TriggerMode.process_pending,
-        owned.authorization.trigger_authority.?.mode,
-    );
-    const document = try owned.authorization.canonicalJson(std.testing.allocator);
-    defer std.testing.allocator.free(document);
-    var decoded = try decode(
-        std.testing.allocator,
-        document,
-        maximum_document_bytes,
-    );
-    defer decoded.deinit();
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        decoded.authorization.trigger_authority.?.handlers.len,
-    );
+    for ([_]bool{ false, true }) |absent| {
+        const handlers = [_]TriggerHandler{.{
+            .package = "demo",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .postinst_sha256 = if (absent) null else @as([32]u8, @splat(0x31)),
+            .declarations_sha256 = @splat(0x32),
+        }};
+        const callers = [_]TriggerCaller{.{
+            .package = "demo",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .kind = .postinst,
+            .script_sha256 = @splat(0x31),
+        }};
+        const final_state = [_]FinalPackage{.{
+            .name = "demo",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        }};
+        var input = testInput();
+        input.actions = &.{};
+        input.final_state = &final_state;
+        input.trigger_authority = .{
+            .mode = .process_pending,
+            .defer_triggers = false,
+            .initial_state_sha256 = @splat(0x33),
+            .handlers = &handlers,
+            .callers = if (absent) &.{} else &callers,
+            .allowed_triggers = &.{"debz-trigger"},
+            .maximum_invocations = 8,
+        };
+        var owned = try create(std.testing.allocator, input);
+        defer owned.deinit();
+        try std.testing.expectEqual(@as(usize, 0), owned.authorization.actions.len);
+        try std.testing.expectEqual(
+            TriggerMode.process_pending,
+            owned.authorization.trigger_authority.?.mode,
+        );
+        const document = try owned.authorization.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(document);
+        var decoded = try decode(
+            std.testing.allocator,
+            document,
+            maximum_document_bytes,
+        );
+        defer decoded.deinit();
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            decoded.authorization.trigger_authority.?.handlers.len,
+        );
+        try std.testing.expectEqual(absent, decoded.authorization.trigger_authority.?.handlers[0].postinst_sha256 == null);
+        const roundtrip = try decoded.authorization.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(roundtrip);
+        try std.testing.expectEqualStrings(document, roundtrip);
+    }
 }
 
 test "native_authorization.test.derived trigger final mode binds base and bounds" {
@@ -1819,7 +1832,7 @@ test "native_authorization.test.derived trigger final mode binds base and bounds
         .version = "1.2",
         .architecture = "amd64",
         .source = .new_package,
-        .postinst_sha256 = @splat(0x41),
+        .postinst_sha256 = @as([32]u8, @splat(0x41)),
         .declarations_sha256 = @splat(0x42),
     }};
     var input = testInput();

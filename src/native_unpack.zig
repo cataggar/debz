@@ -141,6 +141,15 @@ fn beginNativePhase(execution: *ExecutionState, kind: native_recovery.ActionKind
     return action;
 }
 
+fn consumeRecoveredDatabasePhase(execution: *ExecutionState) !bool {
+    try execution.checkDeadline();
+    var next = execution.*;
+    _ = beginNativePhase(&next, .database);
+    if (!try recoveredActionApplied(&next)) return false;
+    execution.phase_ordinal = next.phase_ordinal;
+    return true;
+}
+
 fn beginNativeProgramStep(
     execution: *ExecutionState,
     step: native_program.Step,
@@ -8903,6 +8912,10 @@ fn materializeConfigure(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
 ) !MaterializationResult {
+    if (request.execution) |execution| {
+        if (try consumeRecoveredDatabasePhase(execution))
+            return .{ .outcome = .applied, .detail = "recovered_phase" };
+    }
     var captured = try captureDatabaseSnapshot(
         allocator,
         request.root,
@@ -11403,13 +11416,12 @@ fn lifecycleTriggerAuthority(
             try appendUniqueText(allocator, &allowed, declaration.name);
         }
         if (interested) {
-            const script = postinst orelse return error.TriggerHandlerMissing;
             try handlers.append(allocator, .{
                 .package = archive.package,
                 .version = archive.version,
                 .architecture = archive.architecture,
                 .source = .new_package,
-                .postinst_sha256 = script.sha256,
+                .postinst_sha256 = if (postinst) |script| script.sha256 else null,
                 .declarations_sha256 = try lifecycleDeclarationsDigest(
                     allocator,
                     archive.triggers,
@@ -11443,13 +11455,12 @@ fn lifecycleTriggerAuthority(
             try appendUniqueText(allocator, &allowed, declaration.name);
         }
         if (interested) {
-            const script = postinst orelse return error.TriggerHandlerMissing;
             try handlers.append(allocator, .{
                 .package = package.name,
                 .version = package.version,
                 .architecture = package.architecture,
                 .source = .installed_package,
-                .postinst_sha256 = script.sha256,
+                .postinst_sha256 = if (postinst) |script| script.sha256 else null,
                 .declarations_sha256 = try lifecycleDeclarationsDigest(
                     allocator,
                     package.triggers,
@@ -12584,6 +12595,9 @@ fn lifecycleStateStep(
     want: ?package_database.Want,
     error_state: ?package_database.ErrorState,
 ) !MaterializationResult {
+    // Later trigger work may have superseded this already-journaled state.
+    if (try consumeRecoveredDatabasePhase(execution))
+        return .{ .outcome = .applied, .detail = "recovered_phase" };
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
@@ -12612,7 +12626,20 @@ fn lifecycleStateStep(
             record.?.status.current == state.state and
             record.?.status.want == expected_want and
             record.?.status.error_state == expected_error))
-        return .{ .outcome = .applied, .detail = "state_already_recorded" };
+        return lifecycleAuxiliary(
+            execution,
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            &.{},
+            "state-already-recorded",
+        );
     return materializeStateRecord(
         allocator,
         lifecyclePhaseRequest(
@@ -13505,6 +13532,25 @@ fn recoveredTriggerOrdinal(
     return next;
 }
 
+fn resumeTriggerDatabasePhases(execution: *ExecutionState, allocator: std.mem.Allocator, root: root_fs.Root) !void {
+    const runtime = execution.recovery orelse return;
+    if (!runtime.recovering) return;
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    // Completed handlers are no longer pending; their database phases must not
+    // be reused for the remaining handlers after restart.
+    for (progress.document.records) |record| {
+        if (record.action.kind == .database and
+            record.action.program_step == execution.program_step and
+            record.stage == .completed and
+            (record.result == .applied or record.result == .succeeded or record.result == .recovered))
+            execution.phase_ordinal = @max(
+                execution.phase_ordinal,
+                try std.math.add(u16, record.action.substep, 1),
+            );
+    }
+}
+
 fn restoreTriggerCycleSignatures(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -13593,6 +13639,7 @@ fn lifecycleProcessTriggers(
         &.{},
     );
     if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
+    try resumeTriggerDatabasePhases(execution, allocator, root);
     var produced: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer produced.deinit(allocator);
     try restoreTriggerCycleSignatures(
@@ -13619,6 +13666,44 @@ fn lifecycleProcessTriggers(
         invocation_count += 1;
         const binding = triggerHandlerBinding(program.*, handler.package) orelse
             return .{ .outcome = .refused, .detail = "trigger_handler_unbound" };
+        const postinst_sha256 = binding.postinst_sha256 orelse {
+            try execution.checkDeadline();
+            const path = try lifecycleScriptPath(
+                allocator,
+                root,
+                program.target_architecture,
+                handler.package,
+                .postinst,
+                switch (binding.source) {
+                    .installed_package => .installed_package,
+                    .new_package => .new_package,
+                },
+            );
+            defer allocator.free(path);
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.InstalledScriptMismatch;
+            if (execution.recovery) |runtime|
+                runtime.crash.hit(.before_scriptless_trigger_completion);
+            // No process ran: journal only the real pending/awaited database transition.
+            const completed = try lifecycleCompleteTriggerHandler(
+                execution,
+                allocator,
+                root,
+                install_root,
+                program,
+                authorization,
+                locks,
+                attempt,
+                operation,
+                policy,
+                handler.package,
+                null,
+            );
+            if (lifecycleMaterializationFailure(completed)) |failure| return failure;
+            if (execution.recovery) |runtime|
+                runtime.crash.hit(.after_scriptless_trigger_completion);
+            continue;
+        };
         const joined = try std.mem.join(scratch, " ", handler.triggers);
         const arguments = [_][]const u8{ "triggered", joined };
         if (execution.recovery != null) {
@@ -13658,7 +13743,7 @@ fn lifecycleProcessTriggers(
                 .installed_package => .installed_package,
                 .new_package => .new_package,
             },
-            binding.postinst_sha256,
+            postinst_sha256,
             &arguments,
             inject_unknown and !used_fault,
         );
@@ -13849,10 +13934,10 @@ fn publishTriggerAuthority(
                 .installed_package => .installed_package,
                 .new_package => .new_package,
             },
-            .postinst_sha256 = parseHex(
-                32,
-                &handler.postinst_sha256,
-            ) orelse return error.InvalidLifecycleProgram,
+            .postinst_sha256 = if (handler.postinst_sha256) |digest|
+                parseHex(32, &digest) orelse return error.InvalidLifecycleProgram
+            else
+                null,
             .declarations_sha256 = parseHex(
                 32,
                 &handler.declarations_sha256,
@@ -16253,9 +16338,10 @@ fn activeScriptAuthorized(
             @tagName(handler.source),
             @tagName(active.source),
         )) return false;
+        const postinst_sha256 = handler.postinst_sha256 orelse return false;
         const expected_sha256 = parseHex(
             32,
-            &handler.postinst_sha256,
+            &postinst_sha256,
         ) orelse return error.InvalidLifecycleProgram;
         if (!std.mem.eql(
             u8,
@@ -20331,7 +20417,7 @@ test "native_unpack.test.derived trigger closure rejects missing reordered and u
         .version = "1",
         .architecture = "amd64",
         .source = .installed_package,
-        .postinst_sha256 = @splat(0x11),
+        .postinst_sha256 = @as([32]u8, @splat(0x11)),
         .declarations_sha256 = @splat(0x12),
     }};
     const callers = [_]native_authorization.TriggerCaller{.{
@@ -21130,6 +21216,20 @@ test "native_unpack.test.interleaved execution state isolates progress counters 
     try testing.expectEqual(@as(u32, 0), inner.script_ordinal);
     try testing.expect(inner.phase_steps == null);
     try testing.expectEqual(nativeAction(.database, 7, 1, 0), beginNativePhase(&outer, .database).?);
+    const database_action = nativeAction(.database, 11, 0, 0);
+    try inner_runtime.append(database_action, .prepared, .none, null);
+    try testing.expect(!try consumeRecoveredDatabasePhase(&inner));
+    try testing.expectEqual(@as(u16, 0), inner.phase_ordinal);
+    try inner_runtime.append(database_action, .completed, .applied, null);
+    const previous_action = inner.action;
+    try testing.expect(try consumeRecoveredDatabasePhase(&inner));
+    try testing.expectEqual(@as(u16, 1), inner.phase_ordinal);
+    try testing.expectEqual(previous_action, inner.action);
+    inner.phase_ordinal = 0;
+    inner_runtime.recovering = true;
+    try resumeTriggerDatabasePhases(&inner, testing.allocator, inner_runtime.root);
+    try testing.expectEqual(@as(u16, 1), inner.phase_ordinal);
+    try testing.expect(!try consumeRecoveredDatabasePhase(&inner));
 
     for ([_]*ExecutionState{ &outer, &inner }, [_][]const u8{ "outer", "inner" }) |execution, name| {
         try persistRuntimeTriggerEvents(execution, testing.allocator, execution.recovery.?.root, &.{.{

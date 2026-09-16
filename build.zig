@@ -705,6 +705,8 @@ pub fn build(b: *std.Build) void {
         native_recovery.addArg("--repository-execution-only");
     if (b.option(bool, "native-repository-cli-only", "Select public supervised native repository CLI cases") orelse false)
         native_recovery.addArg("--repository-cli-only");
+    if (b.option(bool, "native-consumer-parity-only", "Select family and public core parity across signed fixture suites") orelse false)
+        native_recovery.addArg("--consumer-parity-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );

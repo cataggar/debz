@@ -270,18 +270,35 @@ def exercise(
 ) -> None:
     def package(
         label: str, name: str, declarations: bytes,
-        *, version: str = "1", **script_options,
+        *, version: str = "1", postinst: bool = True, **script_options,
     ) -> Path:
+        scripts = script_set(name, version, **script_options)
+        if not postinst:
+            del scripts["postinst"]
         return m.make_package(
             workspace / "packages" / label, environment, architecture, version,
             package=name, triggers=declarations or None,
-            scripts=script_set(name, version, **script_options),
+            scripts=scripts,
         )
 
     def case(name: str) -> Scenario:
         return Scenario(workspace, name, executable, helper, architecture, environment)
 
     for interest in ("interest-await", "interest-noawait"):
+        scriptless = package(f"{interest}-no-postinst", RECEIVER, f"{interest} {TRIGGER}\n".encode(), postinst=False)
+        source = package(f"{interest}-no-postinst-source", SOURCE, f"activate-await {TRIGGER}\n".encode())
+        for new_handler in (False, True):
+            for defer in (False, True):
+                current = case(f"{interest}-no-postinst-{'new' if new_handler else 'installed'}-{'deferred' if defer else 'immediate'}")
+                if not new_handler:
+                    current.seed(scriptless)
+                current.phase("install", [scriptless, source] if new_handler else [source], defer=defer)
+                if defer:
+                    current.phase("process_triggers")
+                for root in current.roots:
+                    assert not (root / f"var/lib/dpkg/info/{RECEIVER}.postinst").exists()
+                    assert not any(line.startswith(f"{RECEIVER}@1:postinst") for line in snapshot(root)["trace"])
+                current.complete()
         receiver = package(interest, RECEIVER, f"{interest} {TRIGGER}\n".encode())
         for activation in ("activate-await", "activate-noawait"):
             source = package(
@@ -299,6 +316,15 @@ def exercise(
     source = package("aliases-source", SOURCE, f"activate {TRIGGER}\n".encode())
     current = case("default-await-aliases")
     current.seed(receiver)
+    current.phase("install", [source])
+    current.complete()
+
+    scriptless_upgrade = package(
+        "postinst-removed", RECEIVER, f"interest-await {TRIGGER}\n".encode(), version="2", postinst=False,
+    )
+    current = case("upgrade-removes-postinst")
+    current.seed(receiver)
+    current.phase("upgrade", [scriptless_upgrade])
     current.phase("install", [source])
     current.complete()
 

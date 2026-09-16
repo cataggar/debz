@@ -147,7 +147,7 @@ pub const TriggerScriptSource = enum { installed_package, new_package };
 pub const TriggerHandlerBinding = struct {
     package: PackageIdentity,
     source: TriggerScriptSource,
-    postinst_sha256: Digest,
+    postinst_sha256: ?Digest,
     declarations_sha256: Digest,
 };
 
@@ -1235,11 +1235,33 @@ fn pendingDigest(pending: []const PendingTrigger) [32]u8 {
     return hasher.finalResult();
 }
 
+fn hasAbsentTriggerHandler(handlers: anytype) bool {
+    for (handlers) |handler| {
+        if (handler.postinst_sha256 == null) return true;
+    }
+    return false;
+}
+
+fn triggerAuthorityHasher(optional_scripts: bool) Sha256 {
+    var hasher = Sha256.init(.{});
+    // Existing all-script authorities keep their original digest.
+    hasher.update(if (optional_scripts)
+        "debz-native-trigger-authority-optional-postinst-v1\x00"
+    else
+        "debz-native-trigger-authority-v1\x00");
+    return hasher;
+}
+
+fn hashTriggerPostinst(hasher: *Sha256, digest: ?[32]u8, optional_scripts: bool) void {
+    if (optional_scripts) updateByte(hasher, @intFromBool(digest != null));
+    if (digest) |value| hasher.update(&value);
+}
+
 fn triggerAuthorityDigest(
     authority: native_authorization.TriggerAuthority,
 ) [32]u8 {
-    var hasher = Sha256.init(.{});
-    hasher.update("debz-native-trigger-authority-v1\x00");
+    const optional_scripts = hasAbsentTriggerHandler(authority.handlers);
+    var hasher = triggerAuthorityHasher(optional_scripts);
     updateByte(&hasher, @intFromEnum(authority.mode));
     updateByte(&hasher, @intFromBool(authority.defer_triggers));
     hasher.update(&authority.initial_state_sha256);
@@ -1248,7 +1270,7 @@ fn triggerAuthorityDigest(
         updateString(&hasher, handler.version);
         updateString(&hasher, handler.architecture);
         updateByte(&hasher, @intFromEnum(handler.source));
-        hasher.update(&handler.postinst_sha256);
+        hashTriggerPostinst(&hasher, handler.postinst_sha256, optional_scripts);
         hasher.update(&handler.declarations_sha256);
     }
     for (authority.callers) |caller| {
@@ -3148,9 +3170,9 @@ fn compileTriggerAuthority(self: *Compiler) CompileError!?TriggerAuthority {
             else
                 null,
         };
-        if (digest == null or version == null or
+        if (version == null or
             !std.mem.eql(u8, version.?, handler.version) or
-            !std.mem.eql(u8, &digest.?, &handler.postinst_sha256) or
+            !std.meta.eql(digest, handler.postinst_sha256) or
             !std.mem.eql(
                 u8,
                 &declarationsDigest(declarations),
@@ -3169,7 +3191,7 @@ fn compileTriggerAuthority(self: *Compiler) CompileError!?TriggerAuthority {
                 handler.architecture,
             ),
             .source = source,
-            .postinst_sha256 = hex(32, handler.postinst_sha256),
+            .postinst_sha256 = if (handler.postinst_sha256) |value| hex(32, value) else null,
             .declarations_sha256 = hex(32, handler.declarations_sha256),
         };
     }
@@ -3713,8 +3735,8 @@ fn validScriptArguments(arguments: []const []const u8) bool {
 }
 
 fn compiledTriggerAuthorityDigest(authority: TriggerAuthority) ?[32]u8 {
-    var hash = Sha256.init(.{});
-    hash.update("debz-native-trigger-authority-v1\x00");
+    const optional_scripts = hasAbsentTriggerHandler(authority.handlers);
+    var hash = triggerAuthorityHasher(optional_scripts);
     updateByte(&hash, @intFromEnum(authority.mode));
     updateByte(&hash, @intFromBool(authority.defer_triggers));
     const initial = parseDigest(&authority.initial_state_sha256) orelse return null;
@@ -3724,9 +3746,12 @@ fn compiledTriggerAuthorityDigest(authority: TriggerAuthority) ?[32]u8 {
         updateString(&hash, handler.package.version);
         updateString(&hash, handler.package.architecture);
         updateByte(&hash, @intFromEnum(handler.source));
-        const postinst = parseDigest(&handler.postinst_sha256) orelse return null;
+        const postinst: ?[32]u8 = if (handler.postinst_sha256) |value|
+            parseDigest(&value) orelse return null
+        else
+            null;
         const declarations = parseDigest(&handler.declarations_sha256) orelse return null;
-        hash.update(&postinst);
+        hashTriggerPostinst(&hash, postinst, optional_scripts);
         hash.update(&declarations);
     }
     for (authority.callers) |caller| {
@@ -4647,93 +4672,113 @@ test "native_program.test.compensation vectors are strictly bounded and validate
 }
 
 test "native_program.test.trigger-only authority compiles without package actions" {
-    const declarations = [_]TriggerDeclaration{.{
-        .kind = .interest_noawait,
-        .name = "debz-trigger",
-    }};
-    const scripts = [_]InstalledScript{.{
-        .kind = .postinst,
-        .sha256 = @splat(0x41),
-    }};
-    const handlers = [_]native_authorization.TriggerHandler{.{
-        .package = "handler",
-        .version = "1",
-        .architecture = "amd64",
-        .source = .installed_package,
-        .postinst_sha256 = @splat(0x41),
-        .declarations_sha256 = declarationsDigest(&declarations),
-    }};
-    const callers = [_]native_authorization.TriggerCaller{.{
-        .package = "handler",
-        .version = "1",
-        .architecture = "amd64",
-        .source = .installed_package,
-        .kind = .postinst,
-        .script_sha256 = @splat(0x41),
-    }};
-    const final_state = [_]native_authorization.FinalPackage{.{
-        .name = "handler",
-        .version = "1",
-        .architecture = "amd64",
-        .state = .installed,
-        .dpkg_selection_hold = false,
-    }};
-    var authorization = try native_authorization.create(testing.allocator, .{
-        .backend = .native,
-        .target_architecture = "amd64",
-        .install_root = "/srv/root",
-        .request_sha256 = @splat(1),
-        .solver_policy_sha256 = @splat(2),
-        .executor_policy_sha256 = @splat(3),
-        .plan_sha256 = @splat(4),
-        .exact_lock = testLock(),
-        .policy = .{ .conffile = .keep_existing },
-        .actions = &.{},
-        .final_state = &final_state,
-        .trigger_authority = .{
-            .mode = .process_pending,
-            .defer_triggers = false,
-            .initial_state_sha256 = @splat(0x42),
-            .handlers = &handlers,
-            .callers = &callers,
-            .allowed_triggers = &.{"debz-trigger"},
-            .maximum_invocations = 8,
-        },
-    });
-    defer authorization.deinit();
-    const installed = [_]InstalledPackage{.{
-        .name = "handler",
-        .version = "1",
-        .architecture = "amd64",
-        .state = .triggers_pending,
-        .scripts = &scripts,
-        .triggers = &declarations,
-        .triggers_pending = &.{"debz-trigger"},
-    }};
-    var owned = try expectProgram(compile(testing.allocator, .{
-        .authorization = &authorization.authorization,
-        .ordered_actions = &.{},
-        .installed = .{
-            .generation_sha256 = @splat(0x71),
-            .packages = &installed,
-            .trigger_state_sha256 = @splat(0x42),
-        },
-    }));
-    defer owned.deinit();
-    try testing.expect(owned.program.trigger_authority != null);
-    try testing.expectEqual(
-        @as(usize, 1),
-        owned.program.countSteps(.process_deferred_triggers),
-    );
-    const document = try owned.program.canonicalJson(testing.allocator);
-    defer testing.allocator.free(document);
-    var decoded = try decode(
-        testing.allocator,
-        document,
-        maximum_document_bytes,
-    );
-    defer decoded.deinit();
-    try testing.expect(decoded.program.trigger_authority != null);
+    for ([_]bool{ false, true }) |absent| {
+        const declarations = [_]TriggerDeclaration{.{
+            .kind = .interest_noawait,
+            .name = "debz-trigger",
+        }};
+        const scripts = [_]InstalledScript{.{
+            .kind = .postinst,
+            .sha256 = @splat(0x41),
+        }};
+        const handlers = [_]native_authorization.TriggerHandler{.{
+            .package = "handler",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .postinst_sha256 = if (absent) null else @as([32]u8, @splat(0x41)),
+            .declarations_sha256 = declarationsDigest(&declarations),
+        }};
+        const callers = [_]native_authorization.TriggerCaller{.{
+            .package = "handler",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .kind = .postinst,
+            .script_sha256 = @splat(0x41),
+        }};
+        const final_state = [_]native_authorization.FinalPackage{.{
+            .name = "handler",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        }};
+        var authorization = try native_authorization.create(testing.allocator, .{
+            .backend = .native,
+            .target_architecture = "amd64",
+            .install_root = "/srv/root",
+            .request_sha256 = @splat(1),
+            .solver_policy_sha256 = @splat(2),
+            .executor_policy_sha256 = @splat(3),
+            .plan_sha256 = @splat(4),
+            .exact_lock = testLock(),
+            .policy = .{ .conffile = .keep_existing },
+            .actions = &.{},
+            .final_state = &final_state,
+            .trigger_authority = .{
+                .mode = .process_pending,
+                .defer_triggers = false,
+                .initial_state_sha256 = @splat(0x42),
+                .handlers = &handlers,
+                .callers = if (absent) &.{} else &callers,
+                .allowed_triggers = &.{"debz-trigger"},
+                .maximum_invocations = 8,
+            },
+        });
+        defer authorization.deinit();
+        var installed = [_]InstalledPackage{.{
+            .name = "handler",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .triggers_pending,
+            .scripts = if (absent) &.{} else &scripts,
+            .triggers = &declarations,
+            .triggers_pending = &.{"debz-trigger"},
+        }};
+        var owned = try expectProgram(compile(testing.allocator, .{
+            .authorization = &authorization.authorization,
+            .ordered_actions = &.{},
+            .installed = .{
+                .generation_sha256 = @splat(0x71),
+                .packages = &installed,
+                .trigger_state_sha256 = @splat(0x42),
+            },
+        }));
+        defer owned.deinit();
+        try testing.expect(owned.program.trigger_authority != null);
+        try testing.expectEqual(
+            @as(usize, 1),
+            owned.program.countSteps(.process_deferred_triggers),
+        );
+        const document = try owned.program.canonicalJson(testing.allocator);
+        defer testing.allocator.free(document);
+        var decoded = try decode(
+            testing.allocator,
+            document,
+            maximum_document_bytes,
+        );
+        defer decoded.deinit();
+        try testing.expect(decoded.program.trigger_authority != null);
+        try testing.expectEqual(absent, decoded.program.trigger_authority.?.handlers[0].postinst_sha256 == null);
+        const roundtrip = try decoded.program.canonicalJson(testing.allocator);
+        defer testing.allocator.free(roundtrip);
+        try testing.expectEqualStrings(document, roundtrip);
+        try testing.expectEqual(
+            triggerAuthorityDigest(authorization.authorization.trigger_authority.?),
+            compiledTriggerAuthorityDigest(decoded.program.trigger_authority.?).?,
+        );
+        installed[0].scripts = if (absent) &scripts else &.{};
+        try expectDiagnostic(compile(testing.allocator, .{
+            .authorization = &authorization.authorization,
+            .ordered_actions = &.{},
+            .installed = .{
+                .generation_sha256 = @splat(0x71),
+                .packages = &installed,
+                .trigger_state_sha256 = @splat(0x42),
+            },
+        }), .missing_script_evidence);
+    }
 }
 
 /// Every conffile decision the compiler can reach, keyed by the three digests

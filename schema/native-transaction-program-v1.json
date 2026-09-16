@@ -260,7 +260,10 @@
       "properties": {
         "package": { "$ref": "#/$defs/identity" },
         "source": { "enum": ["installed_package", "new_package"] },
-        "postinst_sha256": { "$ref": "#/$defs/sha256" },
+        "postinst_sha256": {
+          "description": "The exact postinst digest, or null for evidence-bound absence.",
+          "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        },
         "declarations_sha256": { "$ref": "#/$defs/sha256" }
       }
     },

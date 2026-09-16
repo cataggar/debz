@@ -28,6 +28,22 @@ awaited state rather than claim that every package is installed. Dynamic
 script activations are constrained by bound trigger-handler identity and
 script evidence; they are not a free-form script-execution capability.
 
+An interested package need not ship `postinst`. Native authorization, compiled
+programs and helper authority represent its observed absence with an explicit
+`postinst_sha256: null`, still binding package/version/architecture, source and
+declarations. The compiler rejects a mismatch in either direction. Processing
+rechecks absence, clears pending/awaited state through the normal database
+journal, and creates no script invocation, outcome or substitute script.
+This applies to incoming and installed handlers, immediate and deferred work,
+and persisted recovery. The package-owned helper target policy is unchanged.
+
+The nullable field is a required, fail-closed extension of the v1 documents:
+all-script documents keep their existing bytes and digests. Authorities
+containing an absent handler use the domain
+`debz-native-trigger-authority-optional-postinst-v1` (NUL terminated) and
+presence-tag each handler digest; absence cannot alias a real script digest.
+Older readers reject the null form rather than silently omitting a handler.
+
 A known failing triggered postinst and a no-progress cycle are distinct from
 an unknowable script outcome. Known failures preserve dpkg-compatible package
 states and stop the appropriate processing chain. An interruption while a
