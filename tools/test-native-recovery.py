@@ -2270,6 +2270,11 @@ def repository_cli_inside(environment: dict[str, str]) -> None:
     arguments = json.loads(Path("/fixture/cli-arguments.json").read_text())
     case = Path("/fixture/cli-case").read_text()
     calls = 1 if case in ("lock_wait", "lock_signal", "unsafe_runtime", "deadline") else 3
+    step = int(Path("/fixture/cli-step").read_text())
+    assert 0 <= step < calls, (case, step)
+    deadline_seconds = int(arguments[arguments.index("--deadline-ms") + 1]) / 1000
+    watchdog_seconds = deadline_seconds + 5
+    assert 0 < watchdog_seconds < 120, watchdog_seconds
     release = Path("/fixture/repository/dists/debian-stable/InRelease")
     backup = release.with_name("InRelease.saved")
     lock = None
@@ -2282,64 +2287,73 @@ def repository_cli_inside(environment: dict[str, str]) -> None:
         Path("/run/debz").mkdir(mode=0o700)
         Path("/run/debz").chmod(0o777)
     try:
-        for step in range(calls):
-            started = time.monotonic()
-            process = subprocess.Popen(
-                ["/fixture/debz", *arguments], env=environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            try:
-                if case == "lock_signal":
-                    until = time.monotonic() + 10
-                    descriptors = Path(f"/proc/{process.pid}/fd")
-                    while True:
-                        found = False
-                        for path in descriptors.iterdir():
-                            try:
-                                target = path.readlink()
-                            except FileNotFoundError:
-                                continue
-                            found |= target == Path("/run/debz/live-root.lock")
-                        if found:
-                            break
-                        if process.poll() is not None or time.monotonic() >= until:
-                            raise AssertionError("native CLI did not enter the projection lock wait")
-                        time.sleep(0.01)
-                    process.send_signal(signal.SIGTERM)
-                if step == 0 and case in ("refresh_failure", "signal"):
-                    until = time.monotonic() + 30
-                    while not Path("/fixture/postinst-entered").exists():
-                        if process.poll() is not None or time.monotonic() >= until:
-                            raise AssertionError("native CLI did not reach the actual package script")
-                        time.sleep(0.01)
-                    if case == "refresh_failure":
-                        release.rename(backup)
-                        Path("/fixture/finish-script").touch()
-                    else:
-                        process.send_signal(signal.SIGTERM)
-                stdout, stderr = process.communicate(timeout=45)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=10)
-            elapsed = time.monotonic() - started
-            Path(f"/fixture/cli-{step}.json").write_bytes(stdout)
-            Path(f"/fixture/cli-{step}.stderr").write_bytes(stderr)
-            Path(f"/fixture/cli-{step}.exit").write_text(str(process.returncode))
-            assert stderr == b"", (process.returncode, stderr)
-            value = json.loads(stdout)
-            assert value["exit_status"] == process.returncode, value
-            if case in ("lock_wait", "lock_signal"):
-                assert elapsed < 3, elapsed
-            if case == "deadline":
-                assert elapsed < 8, elapsed
-            if step == 0 and calls > 1:
-                # Recovery/history must use retained inputs, not fresh acquisition.
-                Path("/fixture/descriptor.deb").unlink()
+        started = time.monotonic()
+        process = subprocess.Popen(
+            ["/fixture/debz", *arguments], env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            if case == "lock_signal":
+                until = time.monotonic() + 10
+                descriptors = Path(f"/proc/{process.pid}/fd")
+                while True:
+                    found = False
+                    for path in descriptors.iterdir():
+                        try:
+                            target = path.readlink()
+                        except FileNotFoundError:
+                            continue
+                        found |= target == Path("/run/debz/live-root.lock")
+                    if found:
+                        break
+                    if process.poll() is not None or time.monotonic() >= until:
+                        raise AssertionError("native CLI did not enter the projection lock wait")
+                    time.sleep(0.01)
+                process.send_signal(signal.SIGTERM)
+            if step == 0 and case in ("refresh_failure", "signal"):
+                until = started + deadline_seconds
+                while not Path("/fixture/postinst-entered").exists():
+                    if process.poll() is not None or time.monotonic() >= until:
+                        raise AssertionError("native CLI did not reach the actual package script")
+                    time.sleep(0.01)
                 if case == "refresh_failure":
-                    backup.rename(release)
-                if case == "signal":
+                    release.rename(backup)
                     Path("/fixture/finish-script").touch()
+                else:
+                    process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=max(0, watchdog_seconds - (time.monotonic() - started)))
+        except subprocess.TimeoutExpired as error:
+            states = [
+                (str(path), json.loads(path.read_bytes())["phase"])
+                for path in Path("/var/lib/debz/repository/operations").glob("*/repo-add-state-v1.json")
+            ]
+            raise AssertionError(
+                f"native CLI {case} invocation {step} exceeded its {watchdog_seconds}s watchdog; "
+                f"exit={process.poll()}, states={states}, script_entered={Path('/fixture/postinst-entered').exists()}"
+            ) from error
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+        elapsed = time.monotonic() - started
+        Path(f"/fixture/cli-{step}.json").write_bytes(stdout)
+        Path(f"/fixture/cli-{step}.stderr").write_bytes(stderr)
+        Path(f"/fixture/cli-{step}.exit").write_text(str(process.returncode))
+        Path(f"/fixture/cli-{step}.elapsed").write_text(str(elapsed))
+        assert stderr == b"", (process.returncode, stderr)
+        value = json.loads(stdout)
+        assert value["exit_status"] == process.returncode, value
+        if case in ("lock_wait", "lock_signal"):
+            assert elapsed < 3, elapsed
+        if case == "deadline":
+            assert elapsed < 8, elapsed
+        if step == 0 and calls > 1:
+            # Recovery/history must use retained inputs, not fresh acquisition.
+            Path("/fixture/descriptor.deb").unlink()
+            if case == "refresh_failure":
+                backup.rename(release)
+            if case == "signal":
+                Path("/fixture/finish-script").touch()
     finally:
         if lock is not None:
             lock.close()
@@ -2463,9 +2477,13 @@ def repository_cli_cases(
             arguments += ["--connect-timeout-ms", "50", "--read-timeout-ms", "50"]
         (root / "fixture/cli-arguments.json").write_text(json.dumps(arguments))
         (root / "fixture/cli-case").write_text(case)
-        result = projected_process(root, repository_cli=True)
-        assert result.returncode == 0, (case, result.returncode, result.stdout, result.stderr)
         calls = 1 if case in ("lock_wait", "lock_signal", "unsafe_runtime", "deadline") else 3
+        for step in range(calls):
+            (root / "fixture/cli-step").write_text(str(step))
+            result = projected_process(root, repository_cli=True)
+            assert result.returncode == 0, (case, step, result.returncode, result.stdout, result.stderr)
+            elapsed = float((root / f"fixture/cli-{step}.elapsed").read_text())
+            print(f"native-repository-cli-{case}[{step}]: {elapsed:.2f}s", flush=True)
         responses = [document(root / f"fixture/cli-{step}.json") for step in range(calls)]
         for step, response in enumerate(responses):
             validator("repository-operation-result-v1").validate(response)

@@ -500,6 +500,12 @@ held no-execution completion, known script failure, persisted refresh recovery
 and historical readback after removing the incoming descriptor archive. A
 loopback HTTP fixture also exercises real threaded acquisition in the fresh
 child I/O context, query redaction and descriptor-free historical readback.
+Each initial, recovery and historical CLI invocation enters its own disposable
+PID/mount namespace while reusing the same retained root. The outer 120-second
+fixture timeout is unchanged; the child watchdog allows the request's original
+deadline and bounded teardown to finish instead of killing a valid invocation
+at an unrelated shorter limit. Per-invocation timings and timeout-state
+diagnostics identify the exact failing lifecycle stage.
 Catchable interruption preserves unknown script outcomes and never replays
 the script; separate cases exercise the projection lock's cumulative deadline and catchable interruption,
 unsafe runtime directories and expiry during real package work. The roots
