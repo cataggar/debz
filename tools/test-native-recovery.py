@@ -2523,6 +2523,79 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
         print(f"native-repository-unchanged-{no_refresh}: genuine no-receipt completion passed", flush=True)
 
+    for case in ("success", "no_refresh", "unchanged", "unchanged_no_refresh",
+                 "known_failure", "interrupted", "completion_interrupted",
+                 "locked_interrupted", "scope_lost", "refresh_failure", "expired"):
+        root = workspace / f"repository-dispatch-{case}" / "root"
+        m.make_root(root, architecture)
+        for directory in ("proc", "run", "tmp", "dev"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
+        lifecycle.runtime.copy_program(root, executable, "/fixture/native-test")
+        (root / "fixture/repository-execution-case").write_text("success")
+        (root / "fixture/repository-dispatch").write_text(case)
+        unchanged = case in ("unchanged", "unchanged_no_refresh")
+        no_refresh = case in ("no_refresh", "unchanged_no_refresh")
+        if not unchanged:
+            lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+            lifecycle.runtime.copy_program(root, Path("/usr/bin/dpkg-trigger"), "/" + triggers.HELPER.as_posix())
+            helper_bytes = (root / triggers.HELPER).read_bytes()
+            helper_inode = (root / triggers.HELPER).stat().st_ino
+        result = projected_process(root, repository_execution=True)
+        assert result.returncode == 0, (case, result.returncode, result.stdout, result.stderr)
+        assert (root / "fixture/repository-execution-complete").read_text() == case
+        results = [document(root / f"fixture/native-dispatch-{step}.json") for step in range(3)]
+        for response in results:
+            validator("repository-operation-result-v1").validate(response)
+            payload = dict(response)
+            digest = payload.pop("digest_sha256")
+            assert hashlib.sha256(canonical(payload)).hexdigest() == digest
+        first, recovered, repeated = results
+        if case == "known_failure":
+            assert all(value["exit_status"] == 7 and not value["installed"] for value in results)
+        else:
+            assert recovered["exit_status"] == repeated["exit_status"] == 0
+            assert recovered["installed"] and repeated["installed"] and not repeated["changed"]
+            assert repeated["refreshed_phase"] == ("skipped" if no_refresh else "complete")
+            assert repeated["refreshed"] == (not no_refresh)
+        if case in ("interrupted", "completion_interrupted", "locked_interrupted",
+                    "scope_lost", "refresh_failure", "expired"):
+            assert first["exit_status"] != 0
+        if case == "refresh_failure":
+            assert first["exit_status"] == 8 and first["installed"] and first["changed"]
+            assert first["diagnostics"][0]["id"] == "refresh_failed"
+        assert not (root / OPERATION).exists()
+        assert not (root / INTENT).exists() and not (root / PROGRESS).exists()
+        assert not list((root / "run/debz/system-root").iterdir())
+        assert not list((root / "var/cache/debz/packages-v1/objects").iterdir())
+        assert (root / "usr/share/held").read_bytes() == b"untouched\n"
+        state_path = root / repeated["paths"]["operation_state"].lstrip("/")
+        state = document(state_path)
+        validator("repository-add-state-v1").validate(state)
+        assert state["phase"] == ("failed" if case == "known_failure" else "complete")
+        assert not (state_path.parent / "transaction-result-v2.json").exists()
+        evidence_path = root / repeated["paths"]["provenance"].lstrip("/")
+        evidence = document(evidence_path, 16 * 1024 * 1024)
+        if unchanged:
+            assert all(not value["changed"] for value in results)
+            assert (root / "var/lib/dpkg/status").read_bytes() == (root / "fixture/dispatch-original-status").read_bytes()
+            assert not (root / "repository-trace").exists()
+            assert not (root / triggers.HELPER).exists()
+            assert not (root / NAMESPACE / "root-operation-completion-v1.json").exists()
+            validator("native-repository-unchanged-v1").validate(evidence)
+            assert evidence["receipt"] is None and evidence["action_count"] == 0
+            lock = document(root / state["exact_lock_path"].lstrip("/"))
+            assert len(lock["packages"]) == 1 and lock["packages"][0]["dpkg_selection_hold"]
+        else:
+            validator(PROVENANCE_SCHEMA).validate(evidence)
+            assert_digest(evidence, PROVENANCE_SCHEMA)
+            assert evidence["outcome"] == ("failed" if case == "known_failure" else "succeeded")
+            assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
+            assert (root / triggers.HELPER).read_bytes() == helper_bytes
+            assert (root / triggers.HELPER).stat().st_ino == helper_inode
+        print(f"native-repository-dispatch-{case}: original request lifecycle and typed results passed", flush=True)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)

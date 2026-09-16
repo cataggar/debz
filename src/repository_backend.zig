@@ -233,6 +233,7 @@ pub const NativePackageCheckpoint = NativeRepositoryCheckpoint;
 pub const NativeImportRefreshDependencies = struct {
     acquisition: repository_acquisition.Dependencies,
     now_unix: i64,
+    result_progress: ?*NativeDispatchProgress = null,
 };
 
 pub const NativeRepositoryCompletion = struct {
@@ -660,6 +661,7 @@ fn completeUnchangedNativeObserved(
         .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
         .observer = null,
         .unchanged = &guard,
+        .result_progress = dependencies.result_progress,
     };
     if (retained == null) {
         try retainNativeReceiptBytes(allocator, root, descriptor_path, material.bytes, .{ .context = &publication, .hitFn = NativeCheckpointPublication.hit });
@@ -965,6 +967,11 @@ fn nativeRepositoryCheckpointLoaded(
         .input = input.recoveryRequest(),
         .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
         .observer = observer,
+        .result_progress = switch (stage) {
+            .post_install => |dependencies| dependencies.result_progress,
+            .resume_pipeline => |pipeline| pipeline.dependencies.result_progress,
+            else => null,
+        },
     };
     try publication.persist(allocator, next.state, paths);
     switch (stage) {
@@ -991,6 +998,7 @@ const NativeCheckpointPublication = struct {
     manifest_file: ?*const root_fs.PinnedRegularFile = null,
     manifest_sha256: ?[32]u8 = null,
     unchanged: ?*NativeUnchangedGuard = null,
+    result_progress: ?*NativeDispatchProgress = null,
 
     fn validate(self: *const @This()) !void {
         try self.input.validate();
@@ -1015,6 +1023,7 @@ const NativeCheckpointPublication = struct {
         const prior = try pin.observeStableAlloc(allocator, self.input.repository.state.maximum_operation_state_bytes);
         defer allocator.free(prior.bytes);
         try self.validate();
+        if (self.result_progress) |progress| try progress.capture(allocator, state);
         if (std.mem.eql(u8, bytes, prior.bytes)) {
             // Finish durability if an earlier checkpoint stopped after rename.
             try pin.file.sync(root.io);
@@ -1929,6 +1938,21 @@ pub const Backend = struct {
         return .{ .context = self, .executeFn = executeOpaque };
     }
 
+    /// Typed request dispatch inside the current supervised native callback.
+    /// The ordinary interface and CLI keep their separate activation gate.
+    pub fn nativeInterface(self: *Backend) api.Backend {
+        return .{ .context = self, .executeFn = executeNativeOpaque };
+    }
+
+    fn executeNativeOpaque(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: api.Request,
+    ) !api.Result {
+        const self: *Backend = @ptrCast(@alignCast(context));
+        return self.executeAdd(allocator, request, .native_runtime);
+    }
+
     fn executeOpaque(
         context: *anyopaque,
         allocator: std.mem.Allocator,
@@ -1943,17 +1967,28 @@ pub const Backend = struct {
         allocator: std.mem.Allocator,
         request: api.Request,
     ) !api.Result {
-        return self.executeAdd(allocator, request) catch |err|
+        return self.executeAdd(allocator, request, .selected_executor) catch |err|
             api.failure(.internal, .internal_error, "internal", @errorName(err));
     }
+
+    const ExecutionPath = enum { selected_executor, native_runtime };
 
     fn executeAdd(
         self: *Backend,
         allocator: std.mem.Allocator,
         request: api.Request,
+        execution_path: ExecutionPath,
     ) !api.Result {
         const transaction_backend = self.transaction_backend;
-        const executor = transaction_engine.select(
+        const native = execution_path == .native_runtime;
+        if (native and (transaction_backend != .native or self.root_projection == null or self.native_executor != null))
+            return api.failure(
+                .unavailable,
+                .transaction_backend_unavailable,
+                "transaction",
+                "native request dispatch requires explicit native selection and current projection authority",
+            );
+        const executor: ?Executor = if (native) null else transaction_engine.select(
             transaction_backend,
             self.executor,
             self.native_executor,
@@ -1965,6 +2000,17 @@ pub const Backend = struct {
         );
         var paths = try ResolvedPaths.init(allocator, request, transaction_backend);
         defer paths.deinit();
+        var production_acquisition = repository_acquisition.Production{ .io = self.io };
+        const acquisition_dependencies = self.acquisition_dependencies orelse production_acquisition.dependencies();
+        var budget: OperationBudget = undefined;
+        if (native) budget = OperationBudget.init(
+            acquisition_dependencies.clock,
+            request.resources,
+            request.network.overall_timeout_ms,
+            allocator,
+        );
+        var native_progress: NativeDispatchProgress = .{};
+        defer native_progress.deinit();
 
         // Rank 0 of the total lock order. Repository bootstrap shares the
         // root's operation namespace with package transactions, so neither can
@@ -1975,19 +2021,29 @@ pub const Backend = struct {
             .io = self.io,
             .allocator = allocator,
             .root_projection = self.root_projection,
+            .native_resume_completion = native,
+            .deadline = if (native) budget.executionDeadline() else null,
         };
         defer guard.deinit();
         if (guard.open(request, transaction_backend, self.now_unix)) |failure| return failure;
 
-        var production_acquisition = repository_acquisition.Production{ .io = self.io };
-        const acquisition_dependencies = self.acquisition_dependencies orelse
-            production_acquisition.dependencies();
-        var budget = OperationBudget.init(
+        if (!native) budget = OperationBudget.init(
             acquisition_dependencies.clock,
             request.resources,
             request.network.overall_timeout_ms,
             allocator,
         );
+        const native_input: ?NativeRecoveryRequest = if (native) .{
+            .repository = request,
+            .attempt = guard.active().?,
+            .deadline = budget.executionDeadline(),
+        } else null;
+        budget.native_input = native_input;
+        const native_dependencies: NativeImportRefreshDependencies = .{
+            .acquisition = acquisition_dependencies,
+            .now_unix = if (native) self.now_unix orelse realNow(self.io) else 0,
+            .result_progress = &native_progress,
+        };
 
         var cache_root = openOrCreateAbsoluteDirectory(self.io, paths.cache_physical) catch
             return api.failure(.usage, .invalid_root, "paths", "cache path is unsafe or unavailable");
@@ -2055,7 +2111,14 @@ pub const Backend = struct {
             return api.failure(.usage, .invalid_root, "paths", "repository operation path is unsafe or unavailable");
         defer operation_dir.close(self.io);
         var state_store = try state_module.Store.init(self.io, operation_dir, operation_state_name);
-        state_store.write_hooks = self.state_write_hooks;
+        var preflight_publication: NativePreflightPublication = .{
+            .input = native_input,
+            .original = self.state_write_hooks,
+        };
+        state_store.write_hooks = if (native)
+            .{ .context = &preflight_publication, .runFn = NativePreflightPublication.hit }
+        else
+            self.state_write_hooks;
 
         var prior_state: ?state_module.OwnedState = state_store.read(
             allocator,
@@ -2065,6 +2128,14 @@ pub const Backend = struct {
             else => return api.failure(.recovery, .state_corrupt, "state", @errorName(err)),
         };
         defer if (prior_state) |*value| value.deinit();
+
+        if (native_input) |input| {
+            var resumed = resumeNativeRepository(allocator, input, native_dependencies) catch |err|
+                return native_progress.failure(allocator, input, err, null);
+            defer resumed.deinit();
+            if (try nativeResumeResult(allocator, input, &resumed, &native_progress)) |result|
+                return result;
+        }
 
         var target_files = target_apt_config.ProductionFileSystem.init(self.io, request.root) catch
             return api.failure(.usage, .invalid_root, "target", "target root is unsafe or unavailable");
@@ -2117,58 +2188,10 @@ pub const Backend = struct {
             .no_refresh = request.no_refresh,
             .maximum_state_bytes = request.state.maximum_operation_state_bytes,
             .paths = paths.logicalEvidence(),
+            .native_input = native_input,
         };
         if (prior_state) |*prior| {
-            progress.durable_phase = prior.state.phase;
-            progress.acquired = if (phaseAtLeast(prior.state.phase, .acquired))
-                .complete
-            else
-                .pending;
-            progress.validated = if (phaseAtLeast(prior.state.phase, .validated))
-                .complete
-            else
-                .pending;
-            progress.authenticated = if (phaseAtLeast(
-                prior.state.phase,
-                .preflight_authenticated,
-            ))
-                .complete
-            else
-                .pending;
-            progress.planned = if (phaseAtLeast(prior.state.phase, .planned))
-                .complete
-            else
-                .pending;
-            if (prior.state.descriptor) |value| progress.descriptor = .{
-                .package = value.package,
-                .version = value.version,
-                .architecture = value.architecture,
-                .sha256 = value.sha256,
-                .size = value.size,
-                .effective_url = value.effective_url,
-                .trust_mode = value.trust_mode,
-            };
-            progress.managed_files = prior.state.managed_files;
-            progress.plan_path = prior.state.plan_path;
-            progress.plan_sha256 = prior.state.plan_sha256;
-            progress.exact_lock_path = prior.state.exact_lock_path;
-            progress.provenance_path = prior.state.provenance_path;
-            progress.manifest_path = prior.state.manifest_path;
-            progress.diagnostic_id = prior.state.diagnostic_id;
-            progress.diagnostic = prior.state.diagnostic;
-            if (prior.state.installed) {
-                progress.installed = true;
-                progress.installed_phase = .complete;
-                progress.imported = if (phaseAtLeast(prior.state.phase, .imported))
-                    .complete
-                else
-                    .pending;
-                progress.refreshed = prior.state.refreshed;
-                progress.refreshed_phase = if (prior.state.refreshed)
-                    .complete
-                else
-                    .pending;
-            }
+            progress.restore(prior.state);
         } else {
             progress.persist(
                 state_store,
@@ -2461,7 +2484,7 @@ pub const Backend = struct {
                 @errorName(err),
             );
         defer metadata.deinit();
-        const now = self.now_unix orelse realNow(self.io);
+        const now = if (native) native_dependencies.now_unix else self.now_unix orelse realNow(self.io);
         {
             var descriptor_refresh = refreshDescriptor(
                 allocator,
@@ -2586,8 +2609,8 @@ pub const Backend = struct {
                         "same descriptor package name is already installed with different identity",
                     );
                 const prior = if (prior_state) |*value| value.state.descriptor else null;
-                if (prior == null or
-                    !std.mem.eql(u8, &prior.?.sha256, &artifact.provenance.sha256.bytes))
+                if (!native and (prior == null or
+                    !std.mem.eql(u8, &prior.?.sha256, &artifact.provenance.sha256.bytes)))
                     return progress.fail(
                         state_store,
                         allocator,
@@ -2609,11 +2632,14 @@ pub const Backend = struct {
                     @errorName(err),
                 );
                 skip_install = true;
-                progress.installed = true;
-                progress.installed_phase = .complete;
-                if (!prior_state.?.state.refreshed and
-                    prior_state.?.state.phase != .complete)
-                    resume_refresh = true;
+                if (!native) {
+                    progress.installed = true;
+                    progress.installed_phase = .complete;
+                }
+                if (prior_state) |value| {
+                    if (!value.state.refreshed and value.state.phase != .complete)
+                        resume_refresh = true;
+                }
             }
         } else if (progress.installed) {
             return progress.fail(
@@ -2687,6 +2713,8 @@ pub const Backend = struct {
                 "plan",
                 @errorName(err),
             )
+        else if (native and skip_install)
+            try unchangedDescriptorPlan(allocator, architecture)
         else blk: {
             var planning = try planDescriptor(
                 allocator,
@@ -2696,7 +2724,7 @@ pub const Backend = struct {
                 architecture,
                 validation.package,
                 validation.version,
-                skip_install,
+                skip_install and !native,
                 request.resources,
             );
             if (planning == .failure) {
@@ -2781,7 +2809,7 @@ pub const Backend = struct {
                     architecture,
                     validation.package,
                     validation.version,
-                    skip_install,
+                    skip_install and !native,
                     request.resources,
                 );
             }
@@ -2815,8 +2843,8 @@ pub const Backend = struct {
         );
         const plan_json = try plan.canonicalJson(allocator);
         defer allocator.free(plan_json);
-        const plan_sha256 = sha256(plan_json);
         const executable_plan_sha256 = transaction_executor.planDigest(plan);
+        const plan_sha256 = if (native) executable_plan_sha256 else sha256(plan_json);
         if (persisted_plan_required) {
             const prior = &prior_state.?.state;
             if (prior.plan_path == null or prior.plan_sha256 == null or
@@ -2831,6 +2859,7 @@ pub const Backend = struct {
                     "persisted executable plan does not match operation state",
                 );
         } else {
+            if (native_input) |input| try input.validate();
             plan_store.writeAtomic(allocator, plan) catch |err| return progress.fail(
                 state_store,
                 allocator,
@@ -2839,6 +2868,7 @@ pub const Backend = struct {
                 "plan",
                 @errorName(err),
             );
+            if (native_input) |input| try input.validate();
         }
         progress.plan_path = paths.exact_plan_logical;
         progress.plan_sha256 = plan_sha256;
@@ -2850,7 +2880,7 @@ pub const Backend = struct {
             descriptor,
             material.evidence,
         ) catch |err| {
-            if (skip_install) {
+            if (skip_install and !native) {
                 progress.installed = true;
                 progress.installed_phase = .complete;
             }
@@ -2869,13 +2899,13 @@ pub const Backend = struct {
             operation_dir,
             exact_lock_name,
         );
-        const persisted_lock_required = skip_install or
+        const persisted_lock_required = (!native and skip_install) or
             if (prior_state) |*prior|
                 phaseAtLeast(prior.state.phase, .locked)
             else
                 false;
         const execution_policy = repositoryExecutionPolicy(request);
-        if (!persisted_lock_required) {
+        if (native or !persisted_lock_required) {
             const journal_state = inspectTransactionJournal(
                 allocator,
                 self.io,
@@ -2961,6 +2991,9 @@ pub const Backend = struct {
                     "lock",
                     @errorName(err),
                 )
+        else if (native and plan.actions.len == 0)
+            createUnchangedOperationLock(allocator, plan, local_evidence, existing orelse return error.DescriptorIdentityMismatch, request) catch |err|
+                return progress.fail(state_store, allocator, .planning, .lock_publication_failed, "lock", @errorName(err))
         else
             createOperationLock(
                 allocator,
@@ -3011,7 +3044,8 @@ pub const Backend = struct {
                 "lock",
                 @errorName(err),
             );
-        if (!persisted_lock_required)
+        if (!persisted_lock_required) {
+            if (native_input) |input| try input.validate();
             lock_store.writeAtomic(allocator, lock.lock) catch |err|
                 return progress.fail(
                     state_store,
@@ -3021,8 +3055,10 @@ pub const Backend = struct {
                     "lock",
                     @errorName(err),
                 );
+            if (native_input) |input| try input.validate();
+        }
         var recovery_needed = incomplete_descriptor;
-        if (persisted_lock_required) {
+        if (!native and persisted_lock_required) {
             const journal = classifyTransactionJournal(
                 allocator,
                 self.io,
@@ -3118,7 +3154,7 @@ pub const Backend = struct {
             descriptor,
             material.evidence,
         ) catch |err| {
-            if (skip_install) {
+            if (skip_install and !native) {
                 progress.installed = true;
                 progress.installed_phase = .complete;
             }
@@ -3158,6 +3194,49 @@ pub const Backend = struct {
             "dependency-acquire",
             @errorName(err),
         );
+
+        if (native_input) |input| {
+            if (plan.actions.len == 0) {
+                var unchanged = completeUnchangedNative(allocator, .{
+                    .recovery = input,
+                    .descriptor_archive = artifact.bytes,
+                }, native_dependencies) catch |err|
+                    return native_progress.failure(allocator, input, err, &progress);
+                defer unchanged.deinit();
+                return nativeStateResult(allocator, input.repository, unchanged.state.state, false);
+            }
+            var execution = executeNativeFromCache(allocator, .{
+                .repository = request,
+                .attempt = input.attempt,
+                .plan = &plan,
+                .exact_lock = &lock.lock,
+                .cache = &package_cache,
+                .retained_archives = &.{artifact.bytes},
+                .deadline = input.deadline,
+            }) catch |err| return native_progress.failure(allocator, input, err, &progress);
+            defer execution.deinit();
+            switch (execution) {
+                .unchanged => return error.NativeExecutionRequired,
+                .diagnostic => |diagnostic| return progress.reportFailure(
+                    allocator,
+                    .planning,
+                    .dependency_planning_failed,
+                    "native-preparation",
+                    diagnostic.diagnostic.detail,
+                ),
+                .execution => |report_value| {
+                    native_progress.runtime_detail = report_value.detail;
+                    if (report_value.receipt == null)
+                        return native_progress.failure(allocator, input, nativePendingError(report_value), &progress);
+                    native_progress.package_installed = report_value.receipt.?.document.outcome == .succeeded;
+                    native_progress.runtime_detail = null;
+                },
+            }
+            var resumed = resumeNativeRepository(allocator, input, native_dependencies) catch |err|
+                return native_progress.failure(allocator, input, err, &progress);
+            defer resumed.deinit();
+            return (try nativeResumeResult(allocator, input, &resumed, &native_progress)) orelse error.NativeExecutionRequired;
+        }
 
         var report: ?transaction_executor.Report = null;
         defer if (report) |*value| value.deinit();
@@ -3388,7 +3467,7 @@ pub const Backend = struct {
                 },
             };
             if (recovery_needed) {
-                recovery_report = executor.recover(
+                recovery_report = executor.?.recover(
                     allocator,
                     .{
                         .plan = &plan,
@@ -3406,7 +3485,7 @@ pub const Backend = struct {
                     @errorName(err),
                 );
             } else {
-                report = executor.execute(allocator, .{
+                report = executor.?.execute(allocator, .{
                     .plan = &plan,
                     .install_root = request.root,
                     .artifacts = artifacts.items,
@@ -3426,7 +3505,7 @@ pub const Backend = struct {
                 {
                     report.?.deinit();
                     report = null;
-                    recovery_report = executor.recover(
+                    recovery_report = executor.?.recover(
                         allocator,
                         .{
                             .plan = &plan,
@@ -3833,6 +3912,123 @@ pub const Backend = struct {
     }
 };
 
+const NativeDispatchProgress = struct {
+    state: ?state_module.OwnedState = null,
+    package_installed: bool = false,
+    runtime_detail: ?[]const u8 = null,
+
+    fn deinit(self: *@This()) void {
+        if (self.state) |*state| state.deinit();
+        self.* = .{};
+    }
+
+    fn capture(self: *@This(), allocator: std.mem.Allocator, state: state_module.State) !void {
+        const owned = try state_module.create(allocator, state);
+        if (self.state) |*prior| prior.deinit();
+        self.state = owned;
+    }
+
+    fn failure(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        input: NativeRecoveryRequest,
+        err: anyerror,
+        fallback: ?*const Progress,
+    ) !api.Result {
+        if (err == error.OutOfMemory) return err;
+        var paths = try ResolvedPaths.init(allocator, input.repository, .native);
+        defer paths.deinit();
+        var progress = if (fallback) |value| value.* else Progress{
+            .root = input.repository.root,
+            .architecture = input.attempt.record().target_architecture,
+            .no_refresh = input.repository.no_refresh,
+            .maximum_state_bytes = input.repository.state.maximum_operation_state_bytes,
+            .paths = paths.logicalEvidence(),
+        };
+        if (self.state) |state| progress.restore(state.state);
+        if (self.package_installed) {
+            progress.installed = true;
+            progress.installed_phase = .complete;
+        }
+        progress.changed = progress.installed and input.attempt.record().mutation_started;
+        if (progress.imported == .complete and input.repository.no_refresh)
+            progress.refreshed_phase = .skipped;
+        const limited = err == error.DeadlineExceeded or err == error.ResourceBudgetExceeded;
+        const id = progress.diagnostic_id orelse if (limited)
+            api.DiagnosticId.resource_limit_exceeded
+        else
+            api.DiagnosticId.recovery_required;
+        return progress.reportFailure(
+            allocator,
+            if (progress.installed) .post_install else if (limited) .unavailable else .recovery,
+            id,
+            "native",
+            if (progress.diagnostic_id != null) progress.diagnostic else self.runtime_detail orelse @errorName(err),
+        );
+    }
+};
+
+const NativePreflightPublication = struct {
+    input: ?NativeRecoveryRequest,
+    original: state_module.WriteHooks,
+
+    fn hit(raw: ?*anyopaque, point: state_module.WriteBoundary) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.original.runFn) |run| try run(self.original.context, point);
+        if (self.input) |input| try input.validate();
+    }
+};
+
+fn nativeStateResult(
+    allocator: std.mem.Allocator,
+    request: api.Request,
+    state: state_module.State,
+    changed: bool,
+) !api.Result {
+    if (state.phase != .complete and state.phase != .failed) return error.RepositoryStateMismatch;
+    var paths = try ResolvedPaths.init(allocator, request, .native);
+    defer paths.deinit();
+    var progress: Progress = .{
+        .root = request.root,
+        .architecture = state.architecture,
+        .no_refresh = request.no_refresh,
+        .maximum_state_bytes = request.state.maximum_operation_state_bytes,
+        .paths = paths.logicalEvidence(),
+    };
+    progress.restore(state);
+    progress.changed = changed and progress.installed;
+    if (progress.imported == .complete and request.no_refresh)
+        progress.refreshed_phase = .skipped;
+    if (state.phase == .failed)
+        return progress.reportFailure(allocator, .transaction, .transaction_failed, "native", state.diagnostic);
+    return progress.success(allocator);
+}
+
+fn nativeResumeResult(
+    allocator: std.mem.Allocator,
+    input: NativeRecoveryRequest,
+    resumed: *const NativeRepositoryResume,
+    progress: *NativeDispatchProgress,
+) !?api.Result {
+    return switch (resumed.*) {
+        .not_started => null,
+        .pending => |report| blk: {
+            progress.runtime_detail = report.detail;
+            break :blk try progress.failure(allocator, input, nativePendingError(report), null);
+        },
+        .completed => |value| try nativeStateResult(allocator, input.repository, value.checkpoint.state.state, true),
+        .historical => |value| try nativeStateResult(allocator, input.repository, value.state.state, false),
+        .unchanged => |value| try nativeStateResult(allocator, input.repository, value.state.state, false),
+    };
+}
+
+fn nativePendingError(report: native_runtime.Report) anyerror {
+    return if (std.mem.eql(u8, report.detail, "deadline_exceeded"))
+        error.DeadlineExceeded
+    else
+        error.NativeRecoveryRequired;
+}
+
 /// Owns rank 0 of the total lock order for one repository bootstrap. It
 /// reserves the shared root attempt before the repository operation lock, so
 /// a repository add and a package transaction can never mutate one root at the
@@ -3848,6 +4044,8 @@ const RootOperationGuard = struct {
     acquisition_observer: ?root_operation.AcquisitionObserver = null,
     root_projection: ?*const live_root.Projection = null,
     native_completion_only: bool = false,
+    native_resume_completion: bool = false,
+    deadline: ?transaction_executor.Deadline = null,
 
     fn open(
         self: *RootOperationGuard,
@@ -3855,6 +4053,7 @@ const RootOperationGuard = struct {
         backend: transaction_engine.Kind,
         now_unix: ?i64,
     ) ?api.Result {
+        if (self.deadline) |deadline| _ = deadline.remainingMs() catch |err| return mapRootOperationError(err);
         self.owned_root = root_fs.openAbsoluteRoot(self.io, request.root) catch
             return api.failure(
                 .usage,
@@ -3888,6 +4087,14 @@ const RootOperationGuard = struct {
         if (backend == .native) {
             prior = self.coordinator.inspect(self.allocator) catch |err|
                 return mapRootOperationError(err);
+            if (self.native_resume_completion) {
+                if (prior) |value| {
+                    const record = value.record;
+                    if (record.backend == .native and record.state == .completed and
+                        record.mutation_started and record.program_sha256 != null)
+                        self.native_completion_only = true;
+                }
+            }
             if (self.native_completion_only) {
                 const record = if (prior) |value| value.record else return mapRootOperationError(error.NoActiveAttempt);
                 if (record.backend != .native or !record.operation.eql(.{ .repository_bootstrap = .add }) or
@@ -3938,8 +4145,11 @@ const RootOperationGuard = struct {
             .policy_sha256 = policy_digest,
             .target_architecture = native_architecture,
             .foreign_architectures = foreign_architectures,
-            .wait_ms = request.state.lock_wait_ms,
-            .acquisition_observer = if (self.native_completion_only and backend == .native)
+            .wait_ms = if (self.deadline) |deadline|
+                @min(request.state.lock_wait_ms, deadline.remainingMs() catch |err| return mapRootOperationError(err))
+            else
+                request.state.lock_wait_ms,
+            .acquisition_observer = if (backend == .native and (self.native_completion_only or self.deadline != null))
                 .{ .context = &completion_acquisition, .hitFn = NativeCompletionAcquisition.hit }
             else
                 self.acquisition_observer,
@@ -4206,7 +4416,8 @@ const NativeCompletionAcquisition = struct {
     fn hit(raw: *anyopaque, point: root_operation.AcquisitionPoint) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.guard.acquisition_observer) |observer| try observer.hit(point);
-        if (point != .after_lock_acquired) return;
+        if (self.guard.deadline) |deadline| _ = try deadline.remainingMs();
+        if (!self.guard.native_completion_only or point != .after_lock_acquired) return;
         try self.guard.coordinator.validateProjection();
         // Recovery adoption is deliberately broad in core. Authenticate the
         // exact original caller under exclusion before core can reclaim it.
@@ -4219,6 +4430,12 @@ const NativeCompletionAcquisition = struct {
 
 fn mapRootOperationError(err: anyerror) api.Result {
     return switch (err) {
+        error.DeadlineExceeded => api.failure(
+            .unavailable,
+            .resource_limit_exceeded,
+            "root-operation",
+            "repository invocation deadline expired while acquiring root ownership",
+        ),
         error.LockTimeout, error.LockUnavailable, error.LockCanceled => api.failure(
             .unavailable,
             .recovery_required,
@@ -4341,6 +4558,37 @@ const Progress = struct {
     durable_phase: state_module.Phase = .initialized,
     diagnostic_id: ?api.DiagnosticId = null,
     diagnostic: []const u8 = "",
+    native_input: ?NativeRecoveryRequest = null,
+
+    fn restore(self: *Progress, state: state_module.State) void {
+        self.durable_phase = state.phase;
+        self.acquired = if (phaseAtLeast(state.phase, .acquired)) .complete else .pending;
+        self.validated = if (phaseAtLeast(state.phase, .validated)) .complete else .pending;
+        self.authenticated = if (phaseAtLeast(state.phase, .preflight_authenticated)) .complete else .pending;
+        self.planned = if (phaseAtLeast(state.phase, .planned)) .complete else .pending;
+        if (state.descriptor) |value| self.descriptor = .{
+            .package = value.package,
+            .version = value.version,
+            .architecture = value.architecture,
+            .sha256 = value.sha256,
+            .size = value.size,
+            .effective_url = value.effective_url,
+            .trust_mode = value.trust_mode,
+        };
+        self.managed_files = state.managed_files;
+        self.plan_path = state.plan_path;
+        self.plan_sha256 = state.plan_sha256;
+        self.exact_lock_path = state.exact_lock_path;
+        self.provenance_path = state.provenance_path;
+        self.manifest_path = state.manifest_path;
+        self.diagnostic_id = state.diagnostic_id;
+        self.diagnostic = state.diagnostic;
+        self.installed = state.installed;
+        self.installed_phase = if (state.installed) .complete else .pending;
+        self.imported = if (state.installed and state.phase != .failed and phaseAtLeast(state.phase, .imported)) .complete else .pending;
+        self.refreshed = state.refreshed;
+        self.refreshed_phase = if (state.refreshed) .complete else .pending;
+    }
 
     /// Digest of the transaction provenance document published for this
     /// operation, when one exists.
@@ -4356,6 +4604,7 @@ const Progress = struct {
         descriptor: ?api.DescriptorIdentity,
         files: []const state_module.FileEvidence,
     ) !void {
+        if (self.native_input) |input| try input.validate();
         var state_descriptor: ?state_module.Descriptor = null;
         if (descriptor orelse self.descriptor) |value| state_descriptor = .{
             .package = value.package,
@@ -4411,6 +4660,8 @@ const Progress = struct {
         phase: []const u8,
         message: []const u8,
     ) !api.Result {
+        if (self.native_input != null)
+            return self.reportFailure(allocator, status, id, phase, message);
         var completed_phase: state_module.Phase = .initialized;
         if (self.acquired == .complete) completed_phase = .acquired;
         if (self.validated == .complete) completed_phase = .validated;
@@ -4457,6 +4708,17 @@ const Progress = struct {
             ) catch {};
             owned.deinit();
         }
+        return self.reportFailure(allocator, status, id, phase, message);
+    }
+
+    fn reportFailure(
+        self: *const Progress,
+        allocator: std.mem.Allocator,
+        status: api.ExitStatus,
+        id: api.DiagnosticId,
+        phase: []const u8,
+        message: []const u8,
+    ) !api.Result {
         var result = api.failure(status, id, phase, message);
         result.acquired = self.acquired;
         result.validated = self.validated;
@@ -4799,6 +5061,14 @@ const OperationBudget = struct {
         if (self.native_input) |input| try input.validate();
         if (self.clock.nowMs() -| self.started_ms >= self.overall_timeout_ms)
             return error.ResourceBudgetExceeded;
+    }
+
+    fn executionDeadline(self: OperationBudget) transaction_executor.Deadline {
+        return .{
+            .context = self.clock.context,
+            .nowMsFn = self.clock.nowMsFn,
+            .expires_at_ms = self.deadline_ms,
+        };
     }
 
     fn remainingTime(self: OperationBudget) !u64 {
@@ -5629,6 +5899,60 @@ fn planDescriptor(
             },
             .max_actions = resources.maximum_actions,
         },
+    });
+}
+
+fn unchangedDescriptorPlan(allocator: std.mem.Allocator, architecture: []const u8) !solver.Plan {
+    // Exact installed identity and material were already checked. This plans
+    // no package work; only Runtime.verifyUnchanged can prove that it is safe.
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    return .{
+        .schema_version = 3,
+        .target_architecture = try arena.allocator().dupe(u8, architecture),
+        .mode = .plan_only,
+        .actions = &.{},
+        .ordered_actions = &.{},
+        .summary = .{},
+        .download_bytes = 0,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = allocator,
+        .arena = arena,
+    };
+}
+
+fn createUnchangedOperationLock(
+    allocator: std.mem.Allocator,
+    plan: solver.Plan,
+    evidence: package_origin.LocalArtifactEvidence,
+    installed: dpkg_status.Package,
+    request: api.Request,
+) !exact_lock_v2.OwnedLock {
+    if (plan.actions.len != 0 or plan.ordered_actions.len != 0 or
+        !installed.status.isFullyInstalled() or
+        !std.mem.eql(u8, installed.name.value, evidence.package) or
+        !std.mem.eql(u8, installed.version.spelling.value, evidence.version) or
+        !std.mem.eql(u8, installed.architecture.value, evidence.architecture))
+        return error.DescriptorIdentityMismatch;
+    return exact_lock_v2.create(allocator, .{
+        .target_architecture = plan.target_architecture,
+        .request_sha256 = try operationRequestDigest(allocator, request, plan, .native),
+        .policy_sha256 = repositoryLockPolicyDigest(.native),
+        .repositories = &.{},
+        .local_artifacts = &.{evidence},
+        .packages = &.{.{
+            .name = evidence.package,
+            .version = evidence.version,
+            .architecture = evidence.architecture,
+            .origin = .{ .local_artifact = evidence },
+            .sha256 = evidence.sha256,
+            .declared_size = evidence.size,
+            .retention = .requested,
+            .dpkg_selection_hold = installed.status.want == .hold,
+        }},
+        .verified_origins = true,
     });
 }
 
@@ -7085,6 +7409,17 @@ test "repository backend native package checkpoints preserve installed failure a
         fn run(backing: std.mem.Allocator, state: state_module.State, failed: bool, receipt_path: []const u8) !void {
             var checkpoint = try nativePackageCheckpointState(backing, state, failed, true, receipt_path);
             defer checkpoint.deinit();
+            if (failed) {
+                var result = try nativeStateResult(backing, .{
+                    .root = state.root,
+                    .descriptor_url = state.descriptor.?.effective_url,
+                }, checkpoint.state, true);
+                defer result.deinit();
+                try std.testing.expectEqual(api.ExitStatus.transaction, result.exit_status);
+                try std.testing.expect(result.installed and result.changed);
+                try std.testing.expectEqual(api.PhaseState.pending, result.imported);
+                try std.testing.expectEqual(api.PhaseState.pending, result.refreshed_phase);
+            }
         }
     };
     inline for (.{ false, true }) |failed|
@@ -7601,16 +7936,8 @@ fn testRepositoryNativeReceipt(
     try std.testing.expectEqualStrings("native repository execution\n", payload);
 }
 
-fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *const live_root.Projection) !void {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
-    defer named.close();
-    const root = named.root;
-    try stageNativePreparationDatabase(root, native_architecture_status ++ native_preparation_held_status);
-    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\n", .{});
-    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
-    const bytes = try archive_application.test_fixtures.build(allocator, .{
+fn repositoryExecutionArchive(allocator: std.mem.Allocator, case: RepositoryExecutionCase) ![]u8 {
+    return archive_application.test_fixtures.build(allocator, .{
         .package = "debz-native-repository",
         .architecture = "all",
         .control = &.{
@@ -7638,6 +7965,18 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
             .{ .path = "usr/share/doc/debz-native-repository/README", .content = "native repository execution\n" },
         },
     });
+}
+
+fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *const live_root.Projection) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    try stageNativePreparationDatabase(root, native_architecture_status ++ native_preparation_held_status);
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\n", .{});
+    try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
+    const bytes = try repositoryExecutionArchive(allocator, case);
     defer allocator.free(bytes);
     if (case == .unchanged and try root.entryIfExists(try root_fs.Path.init("fixture/repository-unchanged-bootstrap")) != null)
         try root.publishFile(try root_fs.Path.init("fixture/unchanged-descriptor.deb"), bytes, .{});
@@ -9039,6 +9378,234 @@ fn testProjectedNativeUnchanged(projection: *const live_root.Projection, no_refr
     try std.testing.expectEqual(@as(usize, if (!no_refresh and pass == 2) 2 else 0), acquisition.in_release_requests);
 }
 
+const NativeDispatchCase = enum {
+    success,
+    no_refresh,
+    unchanged,
+    unchanged_no_refresh,
+    known_failure,
+    interrupted,
+    completion_interrupted,
+    locked_interrupted,
+    scope_lost,
+    refresh_failure,
+    expired,
+};
+
+const NativeDispatchClock = struct {
+    root: root_fs.Root,
+    original: repository_acquisition.Clock,
+    stop_on_intent: bool,
+    stop_on_completion: bool = false,
+    expired: bool = false,
+    inspection_error: ?anyerror = null,
+
+    fn now(raw: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.stop_on_intent and !self.expired) {
+            const entry = self.root.entryIfExists(root_fs.Path.init(native_recovery.intent_path) catch unreachable) catch |err| {
+                self.inspection_error = err;
+                self.expired = true;
+                return std.math.maxInt(u64);
+            };
+            self.expired = entry != null;
+        }
+        if (self.stop_on_completion and !self.expired) {
+            const bytes = self.root.readFileAlloc(std.testing.allocator, root_fs.Path.init(root_operation.record_path) catch unreachable, root_operation.maximum_document_bytes) catch |err| switch (err) {
+                error.FileNotFound => return self.original.nowMs(),
+                else => {
+                    self.inspection_error = err;
+                    self.expired = true;
+                    return std.math.maxInt(u64);
+                },
+            };
+            defer std.testing.allocator.free(bytes);
+            var record = root_operation.decode(std.testing.allocator, bytes, root_operation.maximum_document_bytes) catch |err| {
+                self.inspection_error = err;
+                self.expired = true;
+                return std.math.maxInt(u64);
+            };
+            defer record.deinit();
+            self.expired = record.record.state == .completed and record.record.mutation_started;
+        }
+        return if (self.expired) std.math.maxInt(u64) else self.original.nowMs();
+    }
+};
+
+const NativeDispatchInterruption = struct {
+    root: root_fs.Root,
+    state_path: root_fs.Path,
+    scope_lost: bool,
+    locked_interrupted: bool,
+    fired: bool = false,
+
+    fn hit(raw: ?*anyopaque, boundary: state_module.WriteBoundary) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.fired or boundary != .after_rename) return;
+        if (self.scope_lost) {
+            self.fired = true;
+            return live_root.testing.replaceMountNamespace();
+        }
+        if (self.locked_interrupted) {
+            const bytes = try self.root.readFileAlloc(std.testing.allocator, self.state_path, state_module.maximum_document_bytes);
+            defer std.testing.allocator.free(bytes);
+            var state = try state_module.decode(std.testing.allocator, bytes, state_module.maximum_document_bytes);
+            defer state.deinit();
+            if (state.state.phase == .locked) {
+                self.fired = true;
+                return error.InterruptedNativeLockedState;
+            }
+        }
+    }
+};
+
+fn testProjectedNativeDispatch(projection: *const live_root.Projection, case: NativeDispatchCase, pass: usize) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var named = try root_fs.openAbsoluteRoot(io, live_root.logical_root_path);
+    defer named.close();
+    const root = named.root;
+    const unchanged = case == .unchanged or case == .unchanged_no_refresh;
+    const archive = try repositoryExecutionArchive(allocator, if (case == .known_failure) .known_failure else .success);
+    defer allocator.free(archive);
+    const request: api.Request = .{
+        .root = live_root.logical_root_path,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(archive),
+        .no_refresh = case == .no_refresh or case == .unchanged_no_refresh,
+        .network = .{ .overall_timeout_ms = 120_000 },
+    };
+    if (pass == 0) {
+        try stageNativePreparationDatabase(root, if (unchanged)
+            native_architecture_status ++ native_preparation_held_status ++
+                "Package: debz-native-repository\nStatus: hold ok installed\nArchitecture: all\nVersion: 1.0\nDescription: repository descriptor\n\n"
+        else
+            native_architecture_status ++ native_preparation_held_status);
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\n", .{});
+        try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
+        if (unchanged) {
+            try root.createDirectoryPath(try root_fs.Path.init("etc/apt/sources.list.d"), .fromMode(0o755));
+            try root.createDirectoryPath(try root_fs.Path.init("usr/share/keyrings"), .fromMode(0o755));
+            try root.createDirectoryPath(try root_fs.Path.init("usr/share/doc/debz-native-repository"), .fromMode(0o755));
+            try root.publishFile(try root_fs.Path.init(repository_execution_source_path), test_repository_source, .{});
+            try root.publishFile(try root_fs.Path.init("usr/share/keyrings/microsoft-prod.gpg"), &@import("fixtures/openpgp.zig").keyring, .{});
+            try root.publishFile(try root_fs.Path.init("usr/share/doc/debz-native-repository/README"), "native repository execution\n", .{});
+            try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/debz-native-repository.list"), "/.\n/" ++ repository_execution_source_path ++ "\n/usr/share/keyrings/microsoft-prod.gpg\n/usr/share/doc/debz-native-repository/README\n", .{});
+        }
+        const before = try root.readFileAlloc(allocator, try root_fs.Path.init("var/lib/dpkg/status"), 64 * 1024);
+        defer allocator.free(before);
+        try root.publishFile(try root_fs.Path.init("fixture/dispatch-original-status"), before, .{});
+    }
+    const reacquire = pass == 0 or (pass == 1 and
+        (case == .expired or case == .scope_lost or case == .locked_interrupted));
+    var acquisition: RepositoryTestAcquisition = .{
+        .descriptor = if (reacquire) archive else &.{},
+        .descriptor_available = reacquire,
+        .fail_in_release_request = if (case == .refresh_failure and pass == 0) 2 else null,
+        .advance_ms_per_read = if (case == .expired and pass == 0) request.network.overall_timeout_ms else 0,
+    };
+    var clock: NativeDispatchClock = .{
+        .root = root,
+        .original = acquisition.dependencies().clock,
+        .stop_on_intent = case == .interrupted and pass == 0,
+        .stop_on_completion = case == .completion_interrupted and pass == 0,
+    };
+    var dependencies = acquisition.dependencies();
+    dependencies.clock.context = &clock;
+    dependencies.clock.nowMsFn = NativeDispatchClock.now;
+    var paths = try ResolvedPaths.init(allocator, request, .native);
+    defer paths.deinit();
+    var interruption: NativeDispatchInterruption = .{
+        .root = root,
+        .state_path = try root_fs.Path.init(paths.operation_state_logical[1..]),
+        .scope_lost = case == .scope_lost and pass == 0,
+        .locked_interrupted = case == .locked_interrupted and pass == 0,
+    };
+    var forbidden: struct {
+        fn run(_: *anyopaque, _: transaction_executor.Invocation) !transaction_executor.ProcessResult {
+            return error.LegacyProcessForbidden;
+        }
+    } = .{};
+    var backend: Backend = .{
+        .io = io,
+        .transaction_backend = .native,
+        .root_projection = projection,
+        .process_runner = .{ .context = &forbidden, .runFn = @TypeOf(forbidden).run },
+        .acquisition_dependencies = dependencies,
+        .now_unix = 1_700_000_000,
+        .state_write_hooks = .{ .context = &interruption, .runFn = NativeDispatchInterruption.hit },
+    };
+    var result = try api.execute(allocator, request, backend.nativeInterface());
+    defer result.deinit();
+    const expected_failure = case == .known_failure or
+        (pass == 0 and (case == .interrupted or case == .completion_interrupted or
+            case == .locked_interrupted or case == .scope_lost or case == .refresh_failure or case == .expired));
+    if ((result.exit_status == .success) == expected_failure) {
+        std.debug.print("native dispatch {t} pass={d}: {s}\n", .{ case, pass, result.summary });
+        return error.UnexpectedNativeDispatchResult;
+    }
+    try std.testing.expect(clock.inspection_error == null);
+    try std.testing.expectEqual(@as(usize, 0), acquisition.network_requests);
+    try std.testing.expectEqual(@as(usize, @intFromBool(reacquire and !(case == .scope_lost and pass == 0))), acquisition.descriptor_reads);
+    try std.testing.expectEqual(pass == 0 and (case == .scope_lost or case == .locked_interrupted), interruption.fired);
+    if (case == .refresh_failure and pass == 0) {
+        try std.testing.expect(result.installed and result.changed);
+        try std.testing.expectEqual(api.DiagnosticId.refresh_failed, result.diagnostics[0].id);
+    }
+    if (!expected_failure) {
+        try std.testing.expect(result.installed);
+        try std.testing.expectEqual(!request.no_refresh, result.refreshed);
+        try std.testing.expectEqual(!unchanged and
+            (pass == 0 or (pass == 1 and (case == .interrupted or case == .completion_interrupted or
+                case == .locked_interrupted or case == .scope_lost or case == .refresh_failure or case == .expired))), result.changed);
+    }
+    const result_name = try std.fmt.allocPrint(allocator, "fixture/native-dispatch-{d}.json", .{pass});
+    defer allocator.free(result_name);
+    const result_bytes = try result.canonicalJson(allocator);
+    defer allocator.free(result_bytes);
+    try root.publishFile(try root_fs.Path.init(result_name), result_bytes, .{});
+    if (case == .scope_lost and pass == 0) return;
+    const cache_path = try root_fs.Path.init("var/cache/debz/packages-v1/objects");
+    var objects = try root.openDirectory(cache_path);
+    defer objects.close(io);
+    const object = std.fmt.bytesToHex(request.expected_sha256.?, .lower);
+    objects.deleteFile(io, &object) catch |err| switch (err) {
+        error.FileNotFound => if (case != .expired and pass == 0) return err,
+        else => return err,
+    };
+    if (pass != 0 or (case != .interrupted and case != .completion_interrupted and case != .refresh_failure))
+        try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
+}
+
+test "repository backend typed native dispatch requires scoped explicit selection" {
+    const request: api.Request = .{ .root = "/does-not-exist-native-dispatch", .descriptor_url = "https://example.test/descriptor.deb" };
+    inline for (.{ transaction_engine.Kind.legacy_dpkg, transaction_engine.Kind.native }) |kind| {
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind };
+        var result = try api.execute(std.testing.allocator, request, backend.nativeInterface());
+        defer result.deinit();
+        try std.testing.expectEqual(api.ExitStatus.unavailable, result.exit_status);
+        try std.testing.expectEqual(api.DiagnosticId.transaction_backend_unavailable, result.diagnostics[0].id);
+    }
+}
+
+fn testUnchangedDescriptorPlan(allocator: std.mem.Allocator) !void {
+    var plan = try unchangedDescriptorPlan(allocator, "amd64");
+    defer plan.deinit();
+    const bytes = plan.canonicalJson(allocator) catch |err|
+        return if (err == error.WriteFailed) error.OutOfMemory else err;
+    defer allocator.free(bytes);
+    var restored = try repository_plan.decode(allocator, bytes);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 0), restored.actions.len);
+    try std.testing.expectEqual(@as(usize, 0), restored.ordered_actions.len);
+    try std.testing.expectEqual(transaction_executor.planDigest(plan), transaction_executor.planDigest(restored));
+}
+
+test "repository backend unchanged descriptor planning owns its empty executable inputs" {
+    try testUnchangedDescriptorPlan(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnchangedDescriptorPlan, .{});
+}
+
 test "repository backend native execution external fixture" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const enabled = std.c.getenv("DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE") orelse return error.SkipZigTest;
@@ -9052,6 +9619,30 @@ test "repository backend native execution external fixture" {
     const case_bytes = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-execution-case"), 128);
     defer std.testing.allocator.free(case_bytes);
     const case = std.meta.stringToEnum(RepositoryExecutionCase, case_bytes) orelse return error.InvalidProjectionFixture;
+    if (try root.root.entryIfExists(try root_fs.Path.init("fixture/repository-dispatch")) != null) {
+        const mode = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-dispatch"), 64);
+        defer std.testing.allocator.free(mode);
+        const dispatch_case = std.meta.stringToEnum(NativeDispatchCase, mode) orelse return error.InvalidProjectionFixture;
+        const Callback = struct {
+            case: NativeDispatchCase,
+            pass: usize,
+            fn run(raw: ?*anyopaque, projection: *const live_root.Projection) !u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                try testProjectedNativeDispatch(projection, self.case, self.pass);
+                return 0;
+            }
+        };
+        for (0..3) |pass| {
+            var callback: Callback = .{ .case = dispatch_case, .pass = pass };
+            const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+            if (result != .exited or result.exited != 0) {
+                std.debug.print("repository dispatch {t} pass={d}: {any}\n", .{ dispatch_case, pass, result });
+                return error.InvalidProjectionFixture;
+            }
+        }
+        try root.root.publishFile(try root_fs.Path.init("fixture/repository-execution-complete"), mode, .{});
+        return;
+    }
     if (try root.root.entryIfExists(try root_fs.Path.init("fixture/repository-unchanged-bootstrap")) != null) {
         const mode = try root.root.readFileAlloc(std.testing.allocator, try root_fs.Path.init("fixture/repository-unchanged-bootstrap"), 32);
         defer std.testing.allocator.free(mode);
