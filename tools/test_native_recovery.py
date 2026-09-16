@@ -75,6 +75,33 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertNotEqual(transport["native_evidence_output"], transport["report"])
         self.assertIsNone(transport["family_verification"])
 
+    def test_family_execution_preserves_request_and_separate_evidence(self) -> None:
+        destination = self.workspace / "family-execution"
+        family = {"root": str(self.root), "operation": "create"}
+        with (
+            mock.patch.object(acceptance.subprocess, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(acceptance, "document", return_value={"succeeded": True}),
+        ):
+            acceptance.workflow(
+                self.workspace / "driver", {"options": {"install_root": str(self.root)}},
+                destination, {}, family_execution=family, capture_evidence=True,
+            )
+        transport = json.loads((destination / "workflow.request.json").read_bytes())
+        self.assertEqual(transport["family_execution"], family)
+        self.assertIsNone(transport["family_verification"])
+        self.assertIsNone(transport["completion_crash"])
+        self.assertEqual(transport["native_evidence_output"], str(destination / "native-evidence.json"))
+
+    def test_family_execution_refuses_host_root_before_spawn(self) -> None:
+        with mock.patch.object(acceptance.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):
+                acceptance.workflow(
+                    self.workspace / "driver", {"options": {"install_root": "/"}},
+                    self.workspace / "refused-execution", {},
+                    family_execution={"root": "/", "operation": "create"},
+                )
+            run.assert_not_called()
+
     def test_family_verification_still_refuses_host_root_before_spawn(self) -> None:
         with mock.patch.object(acceptance.subprocess, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):

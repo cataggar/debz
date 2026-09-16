@@ -5430,6 +5430,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
         native_evidence_output: ?[]const u8 = null,
+        family_execution: ?@import("package_family_backend.zig").Request = null,
         family_verification: ?struct {
             request: @import("package_family_backend.zig").Request,
             expect_failure: bool = false,
@@ -5451,6 +5452,15 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.family_execution) |request|
+        if (external.projected or external.withhold_projection or external.completion_crash != null or
+            external.owner_evidence != null or external.review_evidence != null or
+            external.acknowledgment != null or external.owned_verification != null or
+            external.family_verification != null or external.reconciliation_owner_output != null or
+            external.facade_recover or external.prepare_acknowledged_review != null or
+            external.prepare_cleared_review != null or
+            !std.mem.eql(u8, request.root, external.workflow.options.install_root))
+            return error.InvalidExternalWorkflowRequest;
     if (external.native_evidence_output) |path|
         if (!@import("absolute_path.zig").nonRoot(path) or
             !std.mem.eql(u8, std.fs.path.dirname(path).?, std.fs.path.dirname(external.report) orelse "") or
@@ -5551,6 +5561,22 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     );
     if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
         return error.InvalidExternalWorkflowRequest;
+    if (external.family_execution) |request| {
+        const family: @import("package_family_backend.zig").NativeBackend = .{
+            .io = std.testing.io,
+            .now_unix = 1_788_796_860,
+        };
+        var result = try family.execute(std.testing.allocator, request);
+        defer result.deinit();
+        if (result.result.lock_path) |path| {
+            const borrowed = request.lock_output orelse request.lock_input.?;
+            try std.testing.expect(path.ptr != borrowed.ptr);
+        }
+        if (external.native_evidence_output) |path|
+            try writeExternalNativeEvidence(allocator, path, result.native_install, result.native_completion);
+        try writeExternalNativeWorkflowReport(external.report, try std.json.Stringify.valueAlloc(allocator, result.result, .{}));
+        return;
+    }
     if (external.family_verification) |check| {
         const family: @import("package_family_backend.zig").NativeBackend = .{ .io = std.testing.io };
         var verified = (if (check.completion) |returned|
@@ -5734,13 +5760,22 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     } else result: {
         const outcome = try backend.executeWorkflow(allocator, requested);
         if (external.native_evidence_output) |path|
-            try writeExternalNativeWorkflowReport(path, try std.json.Stringify.valueAlloc(allocator, .{
-                .native_completion = outcome.native_completion,
-                .native_install = outcome.native_install,
-            }, .{}));
+            try writeExternalNativeEvidence(allocator, path, outcome.native_install, outcome.native_completion);
         break :result try outcome.canonicalJson(allocator);
     };
     try writeExternalNativeWorkflowReport(external.report, output);
+}
+
+fn writeExternalNativeEvidence(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    install: ?api.NativeInstallEvidence,
+    completion: ?api.NativeCompletionEvidence,
+) !void {
+    try writeExternalNativeWorkflowReport(path, try std.json.Stringify.valueAlloc(allocator, .{
+        .native_completion = completion,
+        .native_install = install,
+    }, .{}));
 }
 
 fn writeExternalNativeWorkflowReport(path: []const u8, output: []const u8) !void {

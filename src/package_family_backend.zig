@@ -4,6 +4,7 @@ const production = @import("production_backend.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const native_transaction_result = @import("native_transaction_result.zig");
+const native_provenance = @import("native_provenance.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
 
@@ -67,13 +68,13 @@ pub const NativeCapabilities = struct {
     transaction_backend: transaction_engine.Kind = .native,
     family: []const u8 = "debian",
     implementations: []const []const u8 = capabilities().implementations,
-    operations: []const []const u8 = &.{"resolve-lock"},
+    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "recover" },
     architectures: []const []const u8 = capabilities().architectures,
     request_schema: []const u8 = native_request_schema,
     result_schema: []const u8 = native_result_schema,
     exact_lock_schema: []const u8 = exact_lock_v2.schema_id,
-    provenance_schema: ?[]const u8 = null,
-    recovery: enum { unavailable } = .unavailable,
+    provenance_schema: ?[]const u8 = native_provenance.schema_id,
+    recovery: RecoveryBehavior = .disposable_or_recoverable,
     invokes_apt: bool = false,
     invokes_dpkg: bool = false,
 
@@ -128,6 +129,7 @@ pub const ErrorId = enum {
     lock_not_emitted,
     provenance_not_emitted,
     backend_unavailable,
+    native_evidence_unavailable,
 };
 
 pub const Diagnostic = struct {
@@ -152,20 +154,7 @@ pub const Backend = struct {
     product_backend: product.Backend,
 
     pub fn execute(self: Backend, allocator: std.mem.Allocator, request: Request) !Result {
-        return self.executeFor(allocator, request, .legacy_dpkg);
-    }
-
-    fn executeFor(self: Backend, allocator: std.mem.Allocator, request: Request, kind: transaction_engine.Kind) !Result {
-        var result = try self.executeRequest(allocator, request, kind);
-        if (kind == .native) {
-            result.schema = native_result_schema;
-            result.version = native_schema_version;
-        }
-        return result;
-    }
-
-    fn executeRequest(self: Backend, allocator: std.mem.Allocator, request: Request, kind: transaction_engine.Kind) !Result {
-        if (!validRequest(request, kind))
+        if (!validRequest(request, .legacy_dpkg))
             return failure(request.operation, .usage, .invalid_request, "invalid explicit package-family request", false);
 
         var mapped = try MappedRequest.init(allocator, request);
@@ -259,6 +248,8 @@ const MappedRequest = struct {
 pub const OwnedResult = struct {
     result: Result,
     arena: std.heap.ArenaAllocator,
+    native_install: ?product.NativeInstallEvidence = null,
+    native_completion: ?product.NativeCompletionEvidence = null,
 
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
@@ -276,8 +267,7 @@ pub const VerifiedNativeCompletion = struct {
     }
 };
 
-/// Native planning has no injectable command-oriented backend or legacy fallback.
-/// Execution and recovery remain unavailable until their family contracts exist.
+/// Native operations have no injectable command-oriented backend or legacy fallback.
 pub const NativeBackend = struct {
     io: std.Io,
     now_unix: ?i64 = null,
@@ -350,26 +340,123 @@ pub const NativeBackend = struct {
         var arena: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena.deinit();
         const owned = arena.allocator();
-        var result: Result = undefined;
-        if (!std.mem.eql(u8, request.schema, native_request_schema) or request.version != native_schema_version) {
-            result = failure(request.operation, .usage, .invalid_request, "native package-family requests require schema v2", false);
-        } else if (request.operation != .resolve_lock) {
-            result = failure(request.operation, .unavailable, .backend_unavailable, "native package-family currently supports only resolve_lock", false);
-        } else {
+        var native_install: ?product.NativeInstallEvidence = null;
+        var native_completion: ?product.NativeCompletionEvidence = null;
+        var result: Result = output: {
+            if (!std.mem.eql(u8, request.schema, native_request_schema) or request.version != native_schema_version)
+                break :output failure(request.operation, .usage, .invalid_request, "native package-family requests require schema v2", false);
+            if (request.operation == .update or request.operation == .inspect)
+                break :output failure(request.operation, .unavailable, .backend_unavailable, "native package-family update and inspection are not yet available", false);
+            if (!validRequest(request, .native))
+                break :output failure(request.operation, .usage, .invalid_request, "invalid explicit native package-family request", false);
+
+            var mapped = try MappedRequest.init(owned, request);
+            defer mapped.deinit();
+            const lock_path = if (request.lock_output orelse request.lock_input) |path|
+                try owned.dupe(u8, path)
+            else
+                null;
+            const provenance_path = if (request.operation != .resolve_lock)
+                try std.fmt.allocPrint(owned, "{s}/{s}", .{ request.root, native_provenance.document_path })
+            else
+                null;
             var native: production.Backend = .{
                 .io = self.io,
                 .transaction_backend = .native,
                 .now_unix = self.now_unix,
             };
-            const backend: Backend = .{ .product_backend = native.interface() };
-            result = try backend.executeFor(owned, request, .native);
-            if (result.lock_path) |path| result.lock_path = try owned.dupe(u8, path);
-        }
+            const response = try product.execute(owned, mapped.request, native.interface());
+            defer freePackageFamilyProductItems(owned, response.items);
+            native_install = response.native_install;
+            native_completion = response.native_completion;
+            if (!consistentNativeEvidence(mapped.request, response))
+                break :output nativeEvidenceFailure(request.operation, response.changed, "native package-family result evidence is inconsistent");
+
+            if (response.exit_status != .success) {
+                var failed = failure(
+                    request.operation,
+                    response.exit_status,
+                    .backend_failed,
+                    response.summary,
+                    response.exit_status == .transaction or response.exit_status == .recovery,
+                );
+                failed.changed = response.changed;
+                if (native_completion != null) failed.provenance_path = provenance_path;
+                break :output failed;
+            }
+            if (response.changed and request.operation != .recover) {
+                var verified = self.verifyCompletedResultSuccess(owned, request, native_completion.?) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    break :output nativeEvidenceFailure(
+                        request.operation,
+                        response.changed,
+                        try std.fmt.allocPrint(owned, "native completion verification failed: {s}", .{@errorName(err)}),
+                    );
+                };
+                defer verified.deinit();
+                if (verified.summary.package_count != native_install.?.package_count)
+                    break :output nativeEvidenceFailure(request.operation, response.changed, "native completion package count differs from the returned install evidence");
+            }
+            break :output .{
+                .operation = request.operation,
+                .succeeded = true,
+                .changed = response.changed,
+                .exit_status = .success,
+                .lock_path = lock_path,
+                .provenance_path = if (native_completion != null) provenance_path else null,
+            };
+        };
         result.schema = native_result_schema;
         result.version = native_schema_version;
-        return .{ .result = result, .arena = arena };
+        return .{
+            .result = result,
+            .arena = arena,
+            .native_install = native_install,
+            .native_completion = native_completion,
+        };
     }
 };
+
+fn nativeEvidenceFailure(operation: Operation, changed: bool, message: []const u8) Result {
+    var result = failure(operation, .recovery, .native_evidence_unavailable, message, true);
+    result.changed = changed;
+    return result;
+}
+
+fn consistentNativeEvidence(request: product.Request, response: product.Result) bool {
+    if (response.operation != request.operation) return false;
+    if (response.native_completion) |completion| {
+        if (!response.changed or completion.settlement != .cleared or
+            (completion.outcome == .succeeded) != (response.exit_status == .success) or
+            (completion.outcome == .failed and response.exit_status != .transaction))
+            return false;
+        if (request.operation != .recover and
+            (completion.operation != request.operation or
+                !std.mem.eql(u8, &completion.caller_request_sha256, &production.productRequestDigest(request)) or
+                !std.mem.eql(u8, &completion.caller_policy_sha256, &production.planningPolicyDigest(.native, request.options))))
+            return false;
+    }
+    if (request.operation == .plan)
+        return !response.changed and response.native_install == null and response.native_completion == null;
+    if (request.operation == .recover)
+        return response.native_install == null and
+            (response.exit_status != .success or response.changed == (response.native_completion != null));
+    if (response.exit_status != .success) return response.native_install == null;
+    const install = response.native_install orelse return false;
+    if (!std.mem.eql(u8, &install.caller_request_sha256, &production.productRequestDigest(request)) or
+        !std.mem.eql(u8, &install.caller_policy_sha256, &production.planningPolicyDigest(.native, request.options)) or
+        response.changed != (install.receipt != null) or
+        response.changed != (response.native_completion != null))
+        return false;
+    if (install.receipt) |receipt| {
+        const completion = response.native_completion.?;
+        return std.mem.eql(u8, &install.lock_sha256, &completion.lock_sha256) and
+            std.mem.eql(u8, &receipt.transaction_digest_sha256, &completion.transaction_digest_sha256) and
+            std.mem.eql(u8, &receipt.completion_digest_sha256, &completion.completion_digest_sha256) and
+            std.mem.eql(u8, &receipt.program_sha256, &completion.program_sha256);
+    }
+    return true;
+}
 
 fn freePackageFamilyProductItems(allocator: std.mem.Allocator, items: []const product.Item) void {
     for (items) |item| {
@@ -385,6 +472,14 @@ fn validRequest(request: Request, kind: transaction_engine.Kind) bool {
     const expected_version = if (kind == .native) native_schema_version else schema_version;
     if (!std.mem.eql(u8, request.schema, expected_schema) or request.version != expected_version) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
+    if (kind == .native and request.operation == .recover) {
+        return request.package == null and request.lock_input == null and request.lock_output == null and
+            request.sources.len == 0 and request.configs.len == 0 and request.keyrings.len == 0 and
+            request.credential_reference == null and request.proxy == null and
+            request.cache_mode == .online and request.repository_policy == .strict_priority and
+            !request.recommends and !request.allow_downgrade and request.conffile == .keep_existing and
+            (request.deadline_ms == null or request.deadline_ms.? != 0);
+    }
     if ((request.sources.len == 0 and request.configs.len == 0) or
         request.keyrings.len == 0 or
         (request.deadline_ms != null and request.deadline_ms.? == 0)) return false;
@@ -464,19 +559,19 @@ test "capabilities are versioned and apt-free" {
     try std.testing.expectEqualStrings("arm64", value.architectures[1]);
 }
 
-test "native capabilities advertise only genuine v2 lock planning" {
+test "native capabilities advertise integrated native install and recovery contracts" {
     const value = nativeCapabilities();
     try std.testing.expectEqual(native_schema_version, value.version);
     try std.testing.expectEqual(transaction_engine.Kind.native, value.transaction_backend);
     try std.testing.expectEqualStrings(exact_lock_v2.schema_id, value.exact_lock_schema);
-    try std.testing.expectEqual(@as(usize, 1), value.operations.len);
+    try std.testing.expectEqual(@as(usize, 4), value.operations.len);
     try std.testing.expectEqualStrings("resolve-lock", value.operations[0]);
-    try std.testing.expect(value.provenance_schema == null);
+    try std.testing.expectEqualStrings(native_provenance.schema_id, value.provenance_schema.?);
     try std.testing.expect(!value.invokes_apt and !value.invokes_dpkg);
     const bytes = try value.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"recovery\":\"unavailable\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"recovery\":\"disposable_or_recoverable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\",\"create\",\"customize\",\"recover\"]") != null);
 }
 
 test "capability backend selection preserves defaults and rejects ambiguous options" {
@@ -511,7 +606,7 @@ test "native family version and operation gates run before filesystem access" {
     try std.testing.expectEqualStrings(native_result_schema, old.result.schema);
     request.schema = native_request_schema;
     request.version = native_schema_version;
-    for ([_]Operation{ .create, .customize, .update, .recover, .inspect }) |operation| {
+    for ([_]Operation{ .update, .inspect }) |operation| {
         request.operation = operation;
         var result = try backend.execute(std.testing.allocator, request);
         defer result.deinit();
@@ -553,6 +648,76 @@ test "native family product refusal retains owned diagnostics and releases faile
             try std.testing.expect(!result.result.diagnostic.?.recoverable);
         }
     }.exercise, .{});
+}
+
+test "native family recovery rejects replacement inputs and execution policy before filesystem work" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    const original: Request = .{
+        .schema = native_request_schema,
+        .version = native_schema_version,
+        .operation = .recover,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{},
+        .keyrings = &.{},
+        .cache = "/missing-family-cache",
+        .state = "/missing-family-state",
+    };
+    try std.testing.expect(validRequest(original, .native));
+    var variants: [12]Request = @splat(original);
+    variants[0].package = "replacement";
+    variants[1].sources = &.{"/replacement-source"};
+    variants[2].configs = &.{"/replacement-config"};
+    variants[3].keyrings = &.{"/replacement-key"};
+    variants[4].lock_input = "/replacement-lock";
+    variants[5].lock_output = "/replacement-output";
+    variants[6].credential_reference = "/replacement-credential";
+    variants[7].proxy = "http://example.invalid";
+    variants[8].recommends = true;
+    variants[9].allow_downgrade = true;
+    variants[10].repository_policy = .best_version;
+    variants[11].conffile = .use_package_version;
+    for (variants) |request| {
+        var refused = try backend.execute(std.testing.allocator, request);
+        defer refused.deinit();
+        try std.testing.expectEqual(product.ExitStatus.usage, refused.result.exit_status);
+        try std.testing.expectEqual(ErrorId.invalid_request, refused.result.diagnostic.?.id);
+        try std.testing.expect(!refused.result.changed and refused.result.provenance_path == null);
+        try std.testing.expect(refused.native_completion == null and refused.native_install == null);
+    }
+}
+
+test "native unchanged install evidence must remain bound and receipt-free" {
+    const request: product.Request = .{
+        .operation = .install,
+        .packages = &.{"hello"},
+        .options = .{
+            .install_root = "/family-root",
+            .cache_path = "/family-cache",
+            .state_path = "/family-state",
+            .architecture = "amd64",
+            .conffile = .keep_existing,
+        },
+    };
+    var response: product.Result = .{
+        .operation = .install,
+        .exit_status = .success,
+        .summary = "no package changes",
+        .native_install = .{
+            .lock_sha256 = @splat(1),
+            .caller_request_sha256 = production.productRequestDigest(request),
+            .caller_policy_sha256 = production.planningPolicyDigest(.native, request.options),
+            .package_count = 1,
+        },
+    };
+    try std.testing.expect(consistentNativeEvidence(request, response));
+    response.changed = true;
+    try std.testing.expect(!consistentNativeEvidence(request, response));
+    response.changed = false;
+    response.native_install.?.caller_request_sha256[0] ^= 1;
+    try std.testing.expect(!consistentNativeEvidence(request, response));
+    response.native_install = null;
+    try std.testing.expect(!consistentNativeEvidence(request, response));
 }
 
 test "native family completed verification admits only valid original native mutation requests" {

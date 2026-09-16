@@ -26,7 +26,7 @@ cmp cli-test-stdout cli-test-stderr
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["version"] == 1; assert v["exact_lock_schema"].endswith("exact-closure-lock-v1")' <cli-test-stdout
 "$debz" package-family-capabilities --transaction-backend native >cli-test-stdout 2>cli-test-stderr
 test ! -s cli-test-stderr
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["version"] == 2; assert v["transaction_backend"] == "native"; assert v["operations"] == ["resolve-lock"]; assert v["exact_lock_schema"].endswith("exact-closure-lock-v2"); assert v["provenance_schema"] is None; assert v["recovery"] == "unavailable"; assert not v["invokes_apt"] and not v["invokes_dpkg"]' <cli-test-stdout
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["version"] == 2; assert v["transaction_backend"] == "native"; assert v["operations"] == ["resolve-lock", "create", "customize", "recover"]; assert v["exact_lock_schema"].endswith("exact-closure-lock-v2"); assert v["provenance_schema"].endswith("native-transaction-provenance-v1"); assert v["recovery"] == "disposable_or_recoverable"; assert not v["invokes_apt"] and not v["invokes_dpkg"]' <cli-test-stdout
 for arguments in \
     "--transaction-backend" \
     "--transaction-backend invalid" \
