@@ -54,7 +54,7 @@ reproducibility evidence.
 ## Native family workflows
 
 The separate `debz.NativePackageFamilyBackend` provides native version-2
-`resolve_lock`, `create`, `customize` and `recover` without changing the legacy
+`resolve_lock`, `create`, `customize`, `update` and `recover` without changing the legacy
 adapter or converting v1 locks.
 Requests execute through this library API; capability discovery is metadata
 only and does not introduce a package-family execution CLI.
@@ -76,6 +76,36 @@ Planning does not execute packages, create a native transaction receipt or
 advertise legacy provenance. The returned `OwnedResult` contains a version-2
 `result`, including an independently owned `lock_path`; call `deinit` on the
 owned result after use.
+
+### Update planning and execution
+
+`NativePackageFamilyBackend.resolveUpdateLock(allocator, request)` accepts the
+same explicit native v2 `resolve_lock` request shape, with a lock output and
+no lock input. A `package` selects a named upgrade (including qualified
+architecture/version selectors); omitting it selects upgrade-all. The method
+does not accept mutation or recovery requests. Ordinary `execute` with
+`resolve_lock` still requires a package and retains install planning semantics.
+No new request version or planning-target field is introduced.
+
+Review the emitted v2 lock, then call `execute` with `operation = .update`,
+the same package selector (or no package for upgrade-all), the same planning
+policy, and that lock as `lock_input`. Install, named-upgrade and upgrade-all
+locks have distinct semantic bindings; changing operation, selector or policy
+refuses rather than reinterpreting or replacing the reviewed lock. Planning
+and authenticated offline replay do not execute packages or acquire root
+operation ownership.
+
+Update preserves the core solver's installed-package and hold policies.
+Successful changed updates carry the original `upgrade` or `upgrade_all`
+completion and pass invocation-specific verification. Genuinely unchanged
+updates return `changed = false`, the reviewed lock path, and no new completion
+or provenance path. Updates never fabricate install-only `native_install`
+evidence, including for unchanged results. A previous latest receipt is not
+evidence of that unchanged invocation. Failed updates remain failed, and
+persisted-only recovery returns the original update completion rather than
+relabelling it as an install.
+
+### Mutation results and recovery
 
 Native create/customize require a reviewed lock and use the same native
 install operation. They retain the core planner's behavior: repeated requests
@@ -111,10 +141,10 @@ recovery returns no new provenance and does not turn a prior failed install
 into success. Unknown script outcomes remain unresolved without replay;
 another outer owner's marker cannot be finalized through this adapter.
 
-Native capability discovery advertises these four operations, exact-lock v2,
+Native capability discovery advertises these five operations, exact-lock v2,
 native transaction provenance and disposable-or-recoverable roots, with no
-apt/dpkg invocation. Native update/inspect remain unavailable before filesystem
-work until their distinct contracts are integrated. Selecting native never
+apt/dpkg invocation. Native inspection remains unavailable before filesystem
+work until its result contract is integrated. Selecting native never
 falls back to the legacy family adapter, and the ordinary v1 adapter rejects
 v2 requests.
 
@@ -181,4 +211,4 @@ the root lock remains held. A different attempt, altered binding or relabeled
 failure cannot stand in for that result. The older `verifyCompletedSuccess`
 continues to describe matching retained history without asserting which
 invocation returned it. Both methods are read-only, require genuine evidence,
-and do not bypass the remaining native update/inspection gates.
+and do not bypass the remaining native inspection gate.

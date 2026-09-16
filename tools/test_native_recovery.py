@@ -102,6 +102,33 @@ class RecoveryOracleTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_family_update_planning_preserves_explicit_method_and_request(self) -> None:
+        destination = self.workspace / "family-update-plan"
+        family = {"root": str(self.root), "operation": "resolve_lock", "package": None}
+        with (
+            mock.patch.object(acceptance.subprocess, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(acceptance, "document", return_value={"succeeded": True}),
+        ):
+            acceptance.workflow(
+                self.workspace / "driver", {"options": {"install_root": str(self.root)}},
+                destination, {}, family_execution=family, family_update_planning=True,
+                capture_evidence=True,
+            )
+        transport = json.loads((destination / "workflow.request.json").read_bytes())
+        self.assertEqual(transport["family_execution"], family)
+        self.assertTrue(transport["family_update_planning"])
+        self.assertIsNone(transport["completion_crash"])
+        self.assertIsNone(transport["family_verification"])
+
+    def test_family_update_planning_requires_family_request_before_spawn(self) -> None:
+        with mock.patch.object(acceptance.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "requires a family request"):
+                acceptance.workflow(
+                    self.workspace / "driver", {"options": {"install_root": str(self.root)}},
+                    self.workspace / "refused-update-plan", {}, family_update_planning=True,
+                )
+            run.assert_not_called()
+
     def test_family_verification_still_refuses_host_root_before_spawn(self) -> None:
         with mock.patch.object(acceptance.subprocess, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):

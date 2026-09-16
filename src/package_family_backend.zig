@@ -7,6 +7,7 @@ const native_transaction_result = @import("native_transaction_result.zig");
 const native_provenance = @import("native_provenance.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
+const solver = @import("solver.zig");
 
 pub const schema_version: u32 = 1;
 pub const capability_schema = "io.github.cataggar.debz.package-family.capabilities.v1";
@@ -68,7 +69,7 @@ pub const NativeCapabilities = struct {
     transaction_backend: transaction_engine.Kind = .native,
     family: []const u8 = "debian",
     implementations: []const []const u8 = capabilities().implementations,
-    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "recover" },
+    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "update", "recover" },
     architectures: []const []const u8 = capabilities().architectures,
     request_schema: []const u8 = native_request_schema,
     result_schema: []const u8 = native_result_schema,
@@ -337,6 +338,16 @@ pub const NativeBackend = struct {
     }
 
     pub fn execute(self: @This(), allocator: std.mem.Allocator, request: Request) !OwnedResult {
+        return self.executeInternal(allocator, request, false);
+    }
+
+    /// Resolve an update-bound lock using a resolve_lock request. An omitted
+    /// package selects upgrade-all; ordinary execute resolution stays install-only.
+    pub fn resolveUpdateLock(self: @This(), allocator: std.mem.Allocator, request: Request) !OwnedResult {
+        return self.executeInternal(allocator, request, true);
+    }
+
+    fn executeInternal(self: @This(), allocator: std.mem.Allocator, request: Request, update_planning: bool) !OwnedResult {
         var arena: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -345,9 +356,11 @@ pub const NativeBackend = struct {
         var result: Result = output: {
             if (!std.mem.eql(u8, request.schema, native_request_schema) or request.version != native_schema_version)
                 break :output failure(request.operation, .usage, .invalid_request, "native package-family requests require schema v2", false);
-            if (request.operation == .update or request.operation == .inspect)
-                break :output failure(request.operation, .unavailable, .backend_unavailable, "native package-family update and inspection are not yet available", false);
-            if (!validRequest(request, .native))
+            if (update_planning and request.operation != .resolve_lock)
+                break :output failure(request.operation, .usage, .invalid_request, "native update lock resolution requires a resolve_lock request", false);
+            if (request.operation == .inspect)
+                break :output failure(request.operation, .unavailable, .backend_unavailable, "native package-family inspection is not yet available", false);
+            if (!validRequestFor(request, .native, update_planning))
                 break :output failure(request.operation, .usage, .invalid_request, "invalid explicit native package-family request", false);
 
             var mapped = try MappedRequest.init(owned, request);
@@ -365,7 +378,17 @@ pub const NativeBackend = struct {
                 .transaction_backend = .native,
                 .now_unix = self.now_unix,
             };
-            const response = try product.execute(owned, mapped.request, native.interface());
+            const response = if (update_planning) planning: {
+                if (product.validate(mapped.request)) |invalid| break :planning invalid;
+                var selectors: [1]solver.PackageSelector = undefined;
+                if (request.package) |package| selectors[0] = production.parseSelector(package);
+                break :planning try native.executeWorkflow(owned, .{
+                    .operation = if (request.package == null) .upgrade_all else .upgrade,
+                    .mode = .plan_only,
+                    .selectors = selectors[0..@intFromBool(request.package != null)],
+                    .options = mapped.request.options,
+                });
+            } else try product.execute(owned, mapped.request, native.interface());
             defer freePackageFamilyProductItems(owned, response.items);
             native_install = response.native_install;
             native_completion = response.native_completion;
@@ -394,8 +417,9 @@ pub const NativeBackend = struct {
                     );
                 };
                 defer verified.deinit();
-                if (verified.summary.package_count != native_install.?.package_count)
-                    break :output nativeEvidenceFailure(request.operation, response.changed, "native completion package count differs from the returned install evidence");
+                if (native_install) |install|
+                    if (verified.summary.package_count != install.package_count)
+                        break :output nativeEvidenceFailure(request.operation, response.changed, "native completion package count differs from the returned install evidence");
             }
             break :output .{
                 .operation = request.operation,
@@ -442,6 +466,8 @@ fn consistentNativeEvidence(request: product.Request, response: product.Result) 
         return response.native_install == null and
             (response.exit_status != .success or response.changed == (response.native_completion != null));
     if (response.exit_status != .success) return response.native_install == null;
+    if (request.operation == .upgrade or request.operation == .upgrade_all)
+        return response.native_install == null and response.changed == (response.native_completion != null);
     const install = response.native_install orelse return false;
     if (!std.mem.eql(u8, &install.caller_request_sha256, &production.productRequestDigest(request)) or
         !std.mem.eql(u8, &install.caller_policy_sha256, &production.planningPolicyDigest(.native, request.options)) or
@@ -468,9 +494,14 @@ fn freePackageFamilyProductItems(allocator: std.mem.Allocator, items: []const pr
 }
 
 fn validRequest(request: Request, kind: transaction_engine.Kind) bool {
+    return validRequestFor(request, kind, false);
+}
+
+fn validRequestFor(request: Request, kind: transaction_engine.Kind, update_planning: bool) bool {
     const expected_schema = if (kind == .native) native_request_schema else request_schema;
     const expected_version = if (kind == .native) native_schema_version else schema_version;
     if (!std.mem.eql(u8, request.schema, expected_schema) or request.version != expected_version) return false;
+    if (update_planning and (kind != .native or request.operation != .resolve_lock)) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
     if (kind == .native and request.operation == .recover) {
         return request.package == null and request.lock_input == null and request.lock_output == null and
@@ -488,7 +519,7 @@ fn validRequest(request: Request, kind: transaction_engine.Kind) bool {
     for (request.keyrings) |path| if (!absolute(path)) return false;
     for (request.foreign_architectures) |architecture|
         if (architecture == request.architecture) return false;
-    if ((request.operation == .resolve_lock or request.operation == .create or request.operation == .customize) and request.package == null) return false;
+    if (((request.operation == .resolve_lock and !update_planning) or request.operation == .create or request.operation == .customize) and request.package == null) return false;
     if (request.operation == .resolve_lock) {
         if (request.lock_input != null or request.lock_output == null) return false;
     } else if (request.operation != .inspect and request.lock_input == null) return false;
@@ -559,19 +590,19 @@ test "capabilities are versioned and apt-free" {
     try std.testing.expectEqualStrings("arm64", value.architectures[1]);
 }
 
-test "native capabilities advertise integrated native install and recovery contracts" {
+test "native capabilities advertise integrated native mutation and recovery contracts" {
     const value = nativeCapabilities();
     try std.testing.expectEqual(native_schema_version, value.version);
     try std.testing.expectEqual(transaction_engine.Kind.native, value.transaction_backend);
     try std.testing.expectEqualStrings(exact_lock_v2.schema_id, value.exact_lock_schema);
-    try std.testing.expectEqual(@as(usize, 4), value.operations.len);
+    try std.testing.expectEqual(@as(usize, 5), value.operations.len);
     try std.testing.expectEqualStrings("resolve-lock", value.operations[0]);
     try std.testing.expectEqualStrings(native_provenance.schema_id, value.provenance_schema.?);
     try std.testing.expect(!value.invokes_apt and !value.invokes_dpkg);
     const bytes = try value.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"recovery\":\"disposable_or_recoverable\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\",\"create\",\"customize\",\"recover\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\",\"create\",\"customize\",\"update\",\"recover\"]") != null);
 }
 
 test "capability backend selection preserves defaults and rejects ambiguous options" {
@@ -606,7 +637,7 @@ test "native family version and operation gates run before filesystem access" {
     try std.testing.expectEqualStrings(native_result_schema, old.result.schema);
     request.schema = native_request_schema;
     request.version = native_schema_version;
-    for ([_]Operation{ .update, .inspect }) |operation| {
+    for ([_]Operation{.inspect}) |operation| {
         request.operation = operation;
         var result = try backend.execute(std.testing.allocator, request);
         defer result.deinit();
@@ -684,6 +715,118 @@ test "native family recovery rejects replacement inputs and execution policy bef
         try std.testing.expectEqual(ErrorId.invalid_request, refused.result.diagnostic.?.id);
         try std.testing.expect(!refused.result.changed and refused.result.provenance_path == null);
         try std.testing.expect(refused.native_completion == null and refused.native_install == null);
+    }
+}
+
+test "native update resolution is explicit and preserves ordinary request admission" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    var request: Request = .{
+        .schema = native_request_schema,
+        .version = native_schema_version,
+        .operation = .resolve_lock,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{"/missing-family-source"},
+        .keyrings = &.{"/missing-family-key"},
+        .cache = "/missing-family-cache",
+        .state = "/missing-family-state",
+        .lock_output = "/missing-family-lock",
+    };
+    try std.testing.expect(validRequestFor(request, .native, true));
+    try std.testing.expect(!validRequest(request, .native));
+    var ordinary = try backend.execute(std.testing.allocator, request);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(product.ExitStatus.usage, ordinary.result.exit_status);
+    for ([_]Operation{ .create, .customize, .update, .recover, .inspect }) |operation| {
+        request.operation = operation;
+        var refused = try backend.resolveUpdateLock(std.testing.allocator, request);
+        defer refused.deinit();
+        try std.testing.expectEqual(product.ExitStatus.usage, refused.result.exit_status);
+        try std.testing.expectEqual(ErrorId.invalid_request, refused.result.diagnostic.?.id);
+        try std.testing.expect(!refused.result.changed and refused.result.lock_path == null);
+        try std.testing.expect(refused.native_completion == null and refused.native_install == null);
+    }
+    request.operation = .resolve_lock;
+    request.schema = request_schema;
+    request.version = schema_version;
+    try std.testing.expect(!validRequestFor(request, .legacy_dpkg, true));
+    var old = try backend.resolveUpdateLock(std.testing.allocator, request);
+    defer old.deinit();
+    try std.testing.expectEqual(product.ExitStatus.usage, old.result.exit_status);
+}
+
+test "native update resolution releases invalid selector allocations without filesystem work" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn exercise(allocator: std.mem.Allocator) !void {
+            const backend: NativeBackend = .{ .io = std.testing.io };
+            var result = try backend.resolveUpdateLock(allocator, .{
+                .schema = native_request_schema,
+                .version = native_schema_version,
+                .operation = .resolve_lock,
+                .root = "/missing-native-family-root",
+                .architecture = .amd64,
+                .sources = &.{"/missing-family-source"},
+                .keyrings = &.{"/missing-family-key"},
+                .cache = "/missing-family-cache",
+                .state = "/missing-family-state",
+                .package = "",
+                .lock_output = "/missing-family-lock",
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(product.ExitStatus.usage, result.result.exit_status);
+            try std.testing.expectEqual(ErrorId.backend_failed, result.result.diagnostic.?.id);
+            try std.testing.expect(!result.result.changed and result.result.lock_path == null);
+        }
+    }.exercise, .{});
+}
+
+test "native update completion does not invent install or unchanged receipt evidence" {
+    for ([_]product.Operation{ .upgrade, .upgrade_all }) |operation| {
+        const request: product.Request = .{
+            .operation = operation,
+            .packages = if (operation == .upgrade) &.{"hello"} else &.{},
+            .options = .{
+                .install_root = "/family-root",
+                .cache_path = "/family-cache",
+                .state_path = "/family-state",
+                .architecture = "amd64",
+                .conffile = .keep_existing,
+            },
+        };
+        var response: product.Result = .{
+            .operation = operation,
+            .exit_status = .success,
+            .summary = "no package changes",
+        };
+        try std.testing.expect(consistentNativeEvidence(request, response));
+        response.changed = true;
+        try std.testing.expect(!consistentNativeEvidence(request, response));
+        response.native_completion = .{
+            .operation = operation,
+            .outcome = .succeeded,
+            .settlement = .cleared,
+            .attempt_id = @splat(1),
+            .lock_sha256 = @splat(2),
+            .caller_request_sha256 = production.productRequestDigest(request),
+            .caller_policy_sha256 = production.planningPolicyDigest(.native, request.options),
+            .transaction_digest_sha256 = @splat(3),
+            .completion_digest_sha256 = @splat(4),
+            .program_sha256 = @splat(5),
+        };
+        try std.testing.expect(consistentNativeEvidence(request, response));
+        response.changed = false;
+        try std.testing.expect(!consistentNativeEvidence(request, response));
+        response.changed = true;
+        response.native_completion.?.operation = .install;
+        try std.testing.expect(!consistentNativeEvidence(request, response));
+        response.native_completion.?.operation = operation;
+        response.native_completion.?.caller_request_sha256[0] ^= 1;
+        try std.testing.expect(!consistentNativeEvidence(request, response));
+        response.native_completion.?.caller_request_sha256[0] ^= 1;
+        response.native_completion.?.outcome = .failed;
+        try std.testing.expect(!consistentNativeEvidence(request, response));
+        response.exit_status = .transaction;
+        try std.testing.expect(consistentNativeEvidence(request, response));
     }
 }
 

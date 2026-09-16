@@ -1251,9 +1251,12 @@ def workflow(
     owned_verification: dict | None = None,
     family_verification: dict | None = None,
     family_execution: dict | None = None,
+    family_update_planning: bool = False,
     capture_evidence: bool = False,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
+    if family_update_planning and family_execution is None:
+        raise ValueError("family update planning requires a family request")
     destination.mkdir()
     request_path = destination / "workflow.request.json"
     report_path = destination / "workflow.report.json"
@@ -1266,6 +1269,7 @@ def workflow(
         "owned_verification": owned_verification,
         "family_verification": family_verification,
         "family_execution": family_execution,
+        "family_update_planning": family_update_planning,
         "native_evidence_output": str(destination / "native-evidence.json") if capture_evidence else None,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
@@ -1354,10 +1358,14 @@ def exercise_workflows(
             value["lock_output" if operation == "resolve_lock" else "lock_input"] = str(current.directory / "workflow.lock.json")
         return value
 
-    def run_family(current: lifecycle.Scenario, label: str, value: dict, status: str | None = "success") -> dict:
+    def run_family(
+        current: lifecycle.Scenario, label: str, value: dict, status: str | None = "success",
+        *, update_planning: bool = False,
+    ) -> dict:
         result = workflow(
             executable, request(current, "install", "execute", [value.get("package") or "scenario-main"]),
-            current.directory / label, environment, family_execution=value, capture_evidence=True,
+            current.directory / label, environment, family_execution=value,
+            family_update_planning=update_planning, capture_evidence=True,
         )
         assert result["schema"] == "io.github.cataggar.debz.package-family.result.v2"
         assert result["version"] == 2 and result["operation"] == value["operation"]
@@ -1453,7 +1461,7 @@ def exercise_workflows(
         receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
         completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
         assert completion["surface"] == "package_transaction"
-        assert returned["operation"].replace("_", "-") == completion["operation"]
+        assert returned["operation"] == completion["operation"]
         assert returned["outcome"] == outcome == receipt["outcome"]
         assert returned["settlement"] == settlement
         for name, expected in (
@@ -1482,7 +1490,8 @@ def exercise_workflows(
 
         before = inventory()
         result = workflow(
-            executable, original_workflow, current.directory / label, environment,
+            executable, request(current, "install", "execute", [original.get("package") or "scenario-main"]),
+            current.directory / label, environment,
             family_verification={"request": original, "expect_failure": not succeeds, "completion": returned},
         )
         assert before == inventory(), "family verification changed the staged root"
@@ -1492,7 +1501,11 @@ def exercise_workflows(
             lock = document(Path(original["lock_input"]))
             receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
             completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
-            assert result["operation"] == "install"
+            expected_operation = (
+                ("upgrade" if original.get("package") is not None else "upgrade-all")
+                if original["operation"] == "update" else "install"
+            )
+            assert result["operation"] == expected_operation
             assert result["lock_sha256"] == lock["digest_sha256"]
             assert result["transaction_digest_sha256"] == receipt["digest_sha256"]
             assert result["completion_digest_sha256"] == completion["digest_sha256"]
@@ -1660,6 +1673,101 @@ def exercise_workflows(
     assert (current.candidate / "var/lib/dpkg/status").read_bytes() == original_status
     assert document(current.directory / "family-refused/native-evidence.json")["native_completion"] is None
     print("family-missing-helper: refusal before mutation without a placeholder passed", flush=True)
+
+    for selected in (f"fixture-upgrade:{architecture}", None):
+        current = scenario("family-update-selected" if selected else "family-update-all")
+        current.seed(archive("fixture-upgrade"))
+        original_status = (current.candidate / "var/lib/dpkg/status").read_bytes()
+        run_family(current, "install-plan", family_request(current, "resolve_lock", "fixture-upgrade"))
+        install_lock = document(current.directory / "workflow.lock.json")
+        update_request = family_request(current, "update", selected)
+        refused = run_family(current, "reject-install-lock", update_request, "planning")
+        assert not refused["changed"] and refused["provenance_path"] is None
+        assert "semantic request" in refused["diagnostic"]["message"]
+        assert (current.candidate / "var/lib/dpkg/status").read_bytes() == original_status
+        plan_request = family_request(current, "resolve_lock", selected)
+        planned = run_family(current, "update-plan", plan_request, update_planning=True)
+        assert not planned["changed"] and planned["provenance_path"] is None
+        lock = document(Path(planned["lock_path"]))
+        validator("exact-closure-lock-v2").validate(lock)
+        assert lock["request_sha256"] != install_lock["request_sha256"]
+        assert document(current.directory / "update-plan/native-evidence.json") == {
+            "native_install": None, "native_completion": None,
+        }
+        assert (current.candidate / "var/lib/dpkg/status").read_bytes() == original_status
+        for label, wrong in (
+            ("install-operation", {**update_request, "operation": "create", "package": "fixture-upgrade"}),
+            ("update-selector", {**update_request, "package": "essential-core"}),
+            ("update-policy", {**update_request, "recommends": True}),
+        ):
+            refused = run_family(current, f"reject-{label}", wrong, "planning")
+            assert not refused["changed"] and refused["provenance_path"] is None
+            assert (current.candidate / "var/lib/dpkg/status").read_bytes() == original_status
+        updated = run_family(current, "update", update_request)
+        assert updated["changed"]
+        returned = completion_evidence(current, "update", "succeeded", "cleared")
+        assert returned["operation"] == ("upgrade" if selected else "upgrade_all")
+        assert document(current.directory / "update/native-evidence.json")["native_install"] is None
+        reference_dir = current.directory / "reference-update"
+        reference_dir.mkdir()
+        assert lifecycle.reference_phase(
+            current.expected, [repository / f"pool/main/fixture-upgrade_2.0-1_{architecture}.deb"],
+            "install", environment, reference_dir, packages=[],
+        ) == 0
+        compare(current.expected, current.candidate)
+        verify_family("verified-update", update_request, returned=returned)
+        verify_family("update-not-install", {**update_request, "operation": "create", "package": "fixture-upgrade"}, False)
+        receipt_before = Path(updated["provenance_path"]).read_bytes()
+        run_family(current, "unchanged-plan", plan_request, update_planning=True)
+        unchanged = run_family(current, "unchanged-update", update_request)
+        assert not unchanged["changed"] and unchanged["provenance_path"] is None
+        assert document(current.directory / "unchanged-update/native-evidence.json") == {
+            "native_install": None, "native_completion": None,
+        }
+        assert Path(updated["provenance_path"]).read_bytes() == receipt_before
+        assert not (current.candidate / OPERATION).exists()
+        compare(current.expected, current.candidate)
+        print(f"{current.directory.name}: bound update, dpkg parity and genuine unchanged result passed", flush=True)
+
+    current = scenario("family-update-recovery")
+    current.seed(archive("fixture-upgrade"))
+    selected = f"fixture-upgrade:{architecture}"
+    run_family(current, "update-plan", family_request(current, "resolve_lock", selected), update_planning=True)
+    update_request = family_request(current, "update", selected)
+    pending = request(current, "upgrade", "execute", [])
+    pending["selectors"] = [{"name": "fixture-upgrade", "architecture": architecture}]
+    workflow(
+        executable, pending, current.directory / "interrupted-update", environment,
+        completion_crash="after_native_receipt", capture_evidence=True,
+    )
+    verify_family("pending-update-not-success", update_request, False)
+    (current.directory / "cache").rename(current.directory / "evicted-cache")
+    lock_path = Path(update_request["lock_input"])
+    retained_lock = current.directory / "retained-update.lock"
+    lock_path.rename(retained_lock)
+    try:
+        recovered = run_family(current, "recover-update", family_request(current, "recover"))
+    finally:
+        retained_lock.rename(lock_path)
+    assert recovered["changed"] and recovered["lock_path"] is None
+    returned = completion_evidence(current, "recover-update", "succeeded", "cleared")
+    assert returned["operation"] == "upgrade"
+    verify_family("verified-recovered-update", update_request, returned=returned)
+    print("family-update-recovery: original update completion after cache/lock eviction passed", flush=True)
+
+    current = scenario("family-update-failure")
+    previous_failure = current.directory / "fail-script-previous.deb"
+    m.write(previous_failure, generator.build_deb("fail-script", "0.1-1", architecture, {}))
+    current.seed(previous_failure)
+    run_family(current, "update-plan", family_request(current, "resolve_lock", "fail-script"), update_planning=True)
+    update_request = family_request(current, "update", "fail-script")
+    failed = run_family(current, "failed-update", update_request, "transaction")
+    assert failed["changed"] and failed["diagnostic"]["recoverable"]
+    returned = completion_evidence(current, "failed-update", "failed", "cleared")
+    assert returned["operation"] == "upgrade"
+    verify_family("failed-update-not-success", update_request, False, returned)
+    verify_family("relabeled-update-not-success", update_request, False, {**returned, "outcome": "succeeded"})
+    print("family-update-failure: failed terminal update is not successful completion", flush=True)
 
     names = ["scenario-main", "conffile-pkg"]
     current = scenario("workflow-batch")
