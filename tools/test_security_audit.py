@@ -10,8 +10,10 @@ import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -23,6 +25,18 @@ SPEC.loader.exec_module(security_audit)
 
 
 class SecurityAuditTests(unittest.TestCase):
+    def test_docs_ignore_disposable_snapshot_payloads_not_repository_docs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="debz-snapshot-docs-") as directory:
+            root = pathlib.Path(directory)
+            for relative in ("doc/local.md", ".real-snapshot/root/usr/share/doc/vendor.md"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("[missing](missing.md)\n")
+            with mock.patch.object(security_audit, "ROOT", root), \
+                    mock.patch.object(security_audit, "fail") as fail:
+                security_audit.audit_docs()
+            fail.assert_called_once_with("doc/local.md: stale local link: missing.md")
+
     def test_zstd_static_option_is_scoped_to_zstd_dependency(self) -> None:
         expected = {
             "target": "target",

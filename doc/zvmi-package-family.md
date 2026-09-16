@@ -48,8 +48,10 @@ The version-1 release-acceptance lane selects the immutable
 source, suite `resolute`, component `main`, and uses
 `/usr/share/keyrings/ubuntu-archive-keyring.gpg` explicitly. Native amd64 and
 arm64 runners exercise the legacy backend, installing `ubuntu-minimal` into
-empty staged roots and replaying the same exact lock for update and
-reproducibility evidence.
+empty staged roots, reproducing the install lock, and resolving a separate
+operation-bound update lock. The zero-command update preserves package status;
+its genuine legacy receipt is verified against that update lock rather than
+presenting the earlier install receipt as new update provenance.
 
 ## Native family workflows
 

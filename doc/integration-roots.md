@@ -95,11 +95,22 @@ component `main`, and the explicit Ubuntu archive keyring. Inputs remain
 visible but validation rejects any value other than that reviewed snapshot.
 Here "natively" describes the runner architecture: this snapshot lane still
 uses the default legacy transaction backend, not native transaction execution.
+Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
+regular, non-symlink Ubuntu archive keyring instead of installing trust material
+on the host. The authenticated lock must identify the reviewed Ubuntu 2018
+archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
+an existing root is never reused or reset by this script.
 
 Each row uses the production CLI to authenticate metadata, resolve and review
 an exact `ubuntu-minimal` closure lock without mutating a root, download and
 validate every payload, create the dpkg root under that exact lock, reproduce
-the lock, and replay it through `upgrade-all`. It verifies dpkg health,
+the install lock, and resolve a separate operation-bound lock for `upgrade-all`.
+The pinned update must execute zero dpkg commands and preserve package status.
+Its genuine legacy receipt is verified against the update lock, separately
+from the verified install receipt; it is not a copy of earlier provenance.
+Unlike a native unchanged result, this legacy replay can report `changed: true`
+and publish a new receipt despite executing zero commands.
+It verifies dpkg health,
 provenance, native architecture, failure-before-mutation for a tampered lock,
 and the absence of apt processes in the root. Metadata, package, total
 download, disk, retry, command, and workflow limits are bounded. Evidence is

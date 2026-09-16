@@ -274,7 +274,7 @@ pub fn build(b: *std.Build) void {
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
     const audit_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_security_audit.py" },
+        &.{ "python3", "-m", "unittest", "tools/test_security_audit.py", "tools/test_real_snapshot_acceptance.py" },
     );
     audit_step.dependOn(&audit_tests.step);
 
