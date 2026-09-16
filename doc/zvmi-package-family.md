@@ -82,3 +82,39 @@ invocation. Native create/customize/update/recover/inspect requests remain
 unavailable before filesystem access until their complete family-level
 contracts are integrated. Selecting native never falls back to the legacy
 family adapter, and the ordinary v1 adapter rejects v2 requests.
+
+## Read-only native completion evidence
+
+`NativePackageFamilyBackend.verifyCompletedSuccess(allocator, original_request)`
+verifies a settled successful native transaction against an explicit v2
+create/customize/update request. It does **not** execute that request, enable
+those operations in `execute`, recover an incomplete transaction or accept a
+known failure as successful installation. Create and customize intentionally
+share the product install operation; their family labels are not independently
+attested.
+
+The verifier shares the adapter's product-request mapping and validation,
+reads the reviewed v2 lock without following symlinks, and uses the existing
+native transaction verifier under its fail-fast, non-creating root lock.
+Before releasing that lock it compares the mapped operation, semantic caller
+request, native solver policy and foreign architectures with the verified
+completion. The existing verifier checks root identity, target architecture,
+the lock, receipt, retained execution evidence and current package database,
+and refuses pending or uncleared execution. It neither acknowledges receipts
+nor creates or rewrites root state.
+
+The returned `NativePackageFamilyVerifiedCompletion` owns its summary's root
+path and must be released with `deinit`. Its `summary.canonicalJson` produces
+the existing native `transaction-result-summary.v2`, not legacy provenance or
+a new family execution result. Verification describes the retained completed
+transaction: it does not prove that a new unchanged invocation performed work
+or reserve the root for subsequent image publication. The image builder still
+owns atomic staging and publication.
+
+Semantic caller hashes do not attest acquisition paths, cache/state locations,
+credentials, proxies or transport limits. These request fields are validated
+but verification performs no repository refresh, archive acquisition or
+credential loading. Authenticated content is bound by the reviewed lock and
+retained native evidence, not by reusing current transport configuration.
+Existing capability and execution-result schemas remain unchanged, including
+the native execution, recovery and inspection gates.

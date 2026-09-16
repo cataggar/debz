@@ -316,6 +316,11 @@ pub const Backend = struct {
 };
 
 pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend) !Result {
+    if (validate(request)) |refusal| return refusal;
+    return backend.execute(allocator, request);
+}
+
+pub fn validate(request: Request) ?Result {
     if (request.api_version != api_version)
         return failure(request.operation, .usage, .unsupported_api_version, "unsupported library API version");
     if (!validAbsolutePath(request.options.install_root) or
@@ -343,7 +348,7 @@ pub fn execute(allocator: std.mem.Allocator, request: Request, backend: Backend)
     if (request.operation.mutates() and request.operation != .refresh and request.operation != .clean and
         request.options.noninteractive and request.options.conffile == .unspecified)
         return failure(request.operation, .usage, .conffile_policy_required, "noninteractive mutation requires an explicit conffile policy");
-    return backend.execute(allocator, request);
+    return null;
 }
 
 pub fn failure(operation: Operation, status: ExitStatus, id: ErrorId, message: []const u8) Result {

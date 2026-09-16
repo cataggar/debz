@@ -103,6 +103,38 @@ pub fn verify(
     expected_architecture: []const u8,
     locks: root_operation.LockBackend,
 ) !Summary {
+    return verifyInternal(allocator, root, install_root, lock, expected_architecture, null, locks);
+}
+
+/// Read-only identity constraints, not caller ownership or execution authority.
+pub const ExpectedCaller = struct {
+    operation: product_api.Operation,
+    request_sha256: [32]u8,
+    policy_sha256: [32]u8,
+    foreign_architectures: []const []const u8,
+};
+
+pub fn verifyForCaller(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: ExpectedCaller,
+    locks: root_operation.LockBackend,
+) !Summary {
+    return verifyInternal(allocator, root, install_root, lock, expected_architecture, expected, locks);
+}
+
+fn verifyInternal(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    lock: exact_lock_v2.Lock,
+    expected_architecture: []const u8,
+    expected: ?ExpectedCaller,
+    locks: root_operation.LockBackend,
+) !Summary {
     var held = try VerificationLock.acquire(root, install_root, locks, null);
     defer held.deinit();
     if (try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null or
@@ -118,6 +150,13 @@ pub fn verify(
     const proof = receipt.document;
     const outer = completion.document;
     try verifyEvidence(allocator, root, install_root, held.inode, lock, expected_architecture, outer, proof, .succeeded);
+    if (expected) |caller| {
+        if (!outer.operation.eql(.{ .package_transaction = caller.operation }) or
+            !std.mem.eql(u8, &outer.request_sha256, &caller.request_sha256) or
+            !std.mem.eql(u8, &outer.policy_sha256, &caller.policy_sha256) or
+            !textsEqual(outer.foreign_architectures, caller.foreign_architectures))
+            return error.CallerRequestMismatch;
+    }
     try held.validate();
     return .{
         .target_architecture = expected_architecture,

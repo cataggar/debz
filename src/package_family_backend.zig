@@ -3,6 +3,9 @@ const product = @import("product_api.zig");
 const production = @import("production_backend.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const native_transaction_result = @import("native_transaction_result.zig");
+const root_fs = @import("root_fs.zig");
+const root_operation = @import("root_operation.zig");
 
 pub const schema_version: u32 = 1;
 pub const capability_schema = "io.github.cataggar.debz.package-family.capabilities.v1";
@@ -165,6 +168,40 @@ pub const Backend = struct {
         if (!validRequest(request, kind))
             return failure(request.operation, .usage, .invalid_request, "invalid explicit package-family request", false);
 
+        var mapped = try MappedRequest.init(allocator, request);
+        defer mapped.deinit();
+        const operation = mapped.request.operation;
+        const response = try product.execute(allocator, mapped.request, self.product_backend);
+        defer freePackageFamilyProductItems(allocator, response.items);
+        if (response.exit_status != .success) {
+            return failure(
+                request.operation,
+                response.exit_status,
+                .backend_failed,
+                response.summary,
+                response.exit_status == .transaction or response.exit_status == .recovery,
+            );
+        }
+        const provenance_path = if (operation.mutates() and operation != .recover and request.lock_input != null)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ request.state, provenance_basename })
+        else
+            null;
+        return .{
+            .operation = request.operation,
+            .succeeded = true,
+            .changed = response.changed,
+            .exit_status = .success,
+            .lock_path = request.lock_output orelse request.lock_input,
+            .provenance_path = provenance_path,
+        };
+    }
+};
+
+const MappedRequest = struct {
+    request: product.Request,
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator, request: Request) !MappedRequest {
         const operation: product.Operation = switch (request.operation) {
             .resolve_lock => .plan,
             .create, .customize => .install,
@@ -176,14 +213,13 @@ pub const Backend = struct {
             try allocator.dupe([]const u8, &.{package})
         else
             &.{};
-        defer if (request.package != null) allocator.free(packages);
+        errdefer allocator.free(packages);
 
         const offline = request.cache_mode == .offline;
         const foreign_architectures = try allocator.alloc([]const u8, request.foreign_architectures.len);
-        defer allocator.free(foreign_architectures);
         for (request.foreign_architectures, 0..) |architecture, index|
             foreign_architectures[index] = architecture.spelling();
-        const response = try product.execute(allocator, .{
+        return .{ .allocator = allocator, .request = .{
             .operation = operation,
             .packages = packages,
             .options = .{
@@ -210,29 +246,13 @@ pub const Backend = struct {
                 .noninteractive = operation.mutates(),
                 .conffile = request.conffile,
             },
-        }, self.product_backend);
-        defer freePackageFamilyProductItems(allocator, response.items);
-        if (response.exit_status != .success) {
-            return failure(
-                request.operation,
-                response.exit_status,
-                .backend_failed,
-                response.summary,
-                response.exit_status == .transaction or response.exit_status == .recovery,
-            );
-        }
-        const provenance_path = if (operation.mutates() and operation != .recover and request.lock_input != null)
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ request.state, provenance_basename })
-        else
-            null;
-        return .{
-            .operation = request.operation,
-            .succeeded = true,
-            .changed = response.changed,
-            .exit_status = .success,
-            .lock_path = request.lock_output orelse request.lock_input,
-            .provenance_path = provenance_path,
-        };
+        } };
+    }
+
+    fn deinit(self: *MappedRequest) void {
+        self.allocator.free(self.request.packages);
+        self.allocator.free(self.request.options.foreign_architectures);
+        self.* = undefined;
     }
 };
 
@@ -246,11 +266,63 @@ pub const OwnedResult = struct {
     }
 };
 
+pub const VerifiedNativeCompletion = struct {
+    summary: native_transaction_result.Summary,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.summary.install_root);
+        self.* = undefined;
+    }
+};
+
 /// Native planning has no injectable command-oriented backend or legacy fallback.
 /// Execution and recovery remain unavailable until their family contracts exist.
 pub const NativeBackend = struct {
     io: std.Io,
     now_unix: ?i64 = null,
+
+    /// Read-only proof of a settled successful transaction, not execution,
+    /// recovery, an unchanged result, or authority to publish an image.
+    pub fn verifyCompletedSuccess(self: @This(), allocator: std.mem.Allocator, original: Request) !VerifiedNativeCompletion {
+        if (!validRequest(original, .native) or switch (original.operation) {
+            .create, .customize, .update => false,
+            else => true,
+        }) return error.InvalidNativeFamilyVerificationRequest;
+        var mapped = try MappedRequest.init(allocator, original);
+        defer mapped.deinit();
+        if (product.validate(mapped.request) != null)
+            return error.InvalidNativeFamilyVerificationRequest;
+
+        const path = original.lock_input.?;
+        var parent = try root_fs.openAbsoluteRoot(self.io, std.fs.path.dirname(path).?);
+        defer parent.close();
+        const store = try exact_lock_v2.Store.init(self.io, parent.root.dir, std.fs.path.basename(path));
+        var lock = try store.read(allocator, exact_lock_v2.maximum_document_bytes);
+        defer lock.deinit();
+        var root = try root_fs.openAbsoluteRoot(self.io, original.root);
+        defer root.close();
+        var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = self.io };
+        var summary = native_transaction_result.verifyForCaller(
+            allocator,
+            root.root,
+            original.root,
+            lock.lock,
+            original.architecture.spelling(),
+            .{
+                .operation = mapped.request.operation,
+                .request_sha256 = production.productRequestDigest(mapped.request),
+                .policy_sha256 = production.planningPolicyDigest(.native, mapped.request.options),
+                .foreign_architectures = mapped.request.options.foreign_architectures,
+            },
+            locks.interface(),
+        ) catch |err| switch (err) {
+            error.CallerRequestMismatch => return error.NativeFamilyRequestMismatch,
+            else => return err,
+        };
+        summary.install_root = try allocator.dupe(u8, summary.install_root);
+        return .{ .summary = summary, .allocator = allocator };
+    }
 
     pub fn execute(self: @This(), allocator: std.mem.Allocator, request: Request) !OwnedResult {
         var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -457,6 +529,61 @@ test "native family product refusal retains owned diagnostics and releases faile
             try std.testing.expectEqual(ErrorId.backend_failed, result.result.diagnostic.?.id);
             try std.testing.expect(!result.result.succeeded and !result.result.changed);
             try std.testing.expect(!result.result.diagnostic.?.recoverable);
+        }
+    }.exercise, .{});
+}
+
+test "native family completed verification admits only valid original native mutation requests" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    var request: Request = .{
+        .operation = .create,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{"/missing-family-source"},
+        .keyrings = &.{"/missing-family-key"},
+        .cache = "/missing-family-cache",
+        .state = "/missing-family-state",
+        .package = "hello",
+        .lock_input = "/missing-family-lock",
+    };
+    try std.testing.expectError(error.InvalidNativeFamilyVerificationRequest, backend.verifyCompletedSuccess(std.testing.allocator, request));
+    request.schema = native_request_schema;
+    request.version = native_schema_version;
+    for ([_]Operation{ .resolve_lock, .recover, .inspect }) |operation| {
+        request.operation = operation;
+        try std.testing.expectError(error.InvalidNativeFamilyVerificationRequest, backend.verifyCompletedSuccess(std.testing.allocator, request));
+    }
+    request.operation = .create;
+    request.root = "/missing/../root";
+    try std.testing.expectError(error.InvalidNativeFamilyVerificationRequest, backend.verifyCompletedSuccess(std.testing.allocator, request));
+    request.root = "/missing-native-family-root";
+    request.foreign_architectures = &.{ .arm64, .arm64 };
+    try std.testing.expectError(error.InvalidNativeFamilyVerificationRequest, backend.verifyCompletedSuccess(std.testing.allocator, request));
+}
+
+test "native family verification request mapping propagates allocation failures without filesystem work" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn exercise(allocator: std.mem.Allocator) !void {
+            const backend: NativeBackend = .{ .io = std.testing.io };
+            var result = backend.verifyCompletedSuccess(allocator, .{
+                .schema = native_request_schema,
+                .version = native_schema_version,
+                .operation = .create,
+                .root = "/missing-native-family-root",
+                .architecture = .amd64,
+                .sources = &.{"/missing-family-source"},
+                .keyrings = &.{"/missing-family-key"},
+                .cache = "/missing-family-cache",
+                .state = "/missing-family-state",
+                .package = "",
+                .lock_input = "/missing-family-lock",
+                .foreign_architectures = &.{.arm64},
+            }) catch |err| {
+                if (err == error.InvalidNativeFamilyVerificationRequest) return;
+                return err;
+            };
+            defer result.deinit();
+            return error.ExpectedVerificationRefusal;
         }
     }.exercise, .{});
 }
