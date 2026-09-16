@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import fcntl
 from functools import cache
 import hashlib
 import importlib.util
@@ -12,11 +13,13 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 import jsonschema
 try:
@@ -2210,8 +2213,8 @@ def exercise_workflows(
 
 
 def projection_inside(root: Path, workflow: bool = False, repository: bool = False,
-                      repository_execution: bool = False) -> None:
-    if sum((workflow, repository, repository_execution)) > 1:
+                      repository_execution: bool = False, repository_cli: bool = False) -> None:
+    if sum((workflow, repository, repository_execution, repository_cli)) > 1:
         raise ValueError("projection fixtures are mutually exclusive")
     root = root.resolve(strict=True)
     if (
@@ -2229,6 +2232,9 @@ def projection_inside(root: Path, workflow: bool = False, repository: bool = Fal
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
         "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp/.cache",
     }
+    if repository_cli:
+        repository_cli_inside(environment)
+        return
     environment.update(
         {"DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE": "1"} if repository_execution
         else {"DEBZ_NATIVE_REPOSITORY_PROJECTION_FIXTURE": "1"} if repository
@@ -2239,14 +2245,15 @@ def projection_inside(root: Path, workflow: bool = False, repository: bool = Fal
 
 
 def projected_process(root: Path, workflow: bool = False, repository: bool = False,
-                      repository_execution: bool = False) -> subprocess.CompletedProcess:
-    if sum((workflow, repository, repository_execution)) > 1:
+                      repository_execution: bool = False, repository_cli: bool = False) -> subprocess.CompletedProcess:
+    if sum((workflow, repository, repository_execution, repository_cli)) > 1:
         raise ValueError("projection fixtures are mutually exclusive")
     return subprocess.run(
         [
             "unshare", "--mount", "--pid", "--fork",
             sys.executable, str(Path(__file__).resolve()),
-            "--repository-execution-inside" if repository_execution
+            "--repository-cli-inside" if repository_cli
+            else "--repository-execution-inside" if repository_execution
             else "--repository-projection-inside" if repository
             else "--projected-workflow-inside" if workflow else "--projection-inside", str(root),
         ],
@@ -2257,6 +2264,261 @@ def projected_process(root: Path, workflow: bool = False, repository: bool = Fal
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=120, check=False,
     )
+
+
+def repository_cli_inside(environment: dict[str, str]) -> None:
+    arguments = json.loads(Path("/fixture/cli-arguments.json").read_text())
+    case = Path("/fixture/cli-case").read_text()
+    calls = 1 if case in ("lock_wait", "lock_signal", "unsafe_runtime", "deadline") else 3
+    release = Path("/fixture/repository/dists/debian-stable/InRelease")
+    backup = release.with_name("InRelease.saved")
+    lock = None
+    if case in ("lock_wait", "lock_signal"):
+        Path("/run/debz").mkdir(mode=0o700)
+        lock = Path("/run/debz/live-root.lock").open("wb")
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    elif case == "unsafe_runtime":
+        Path("/run/debz").mkdir(mode=0o700)
+        Path("/run/debz").chmod(0o777)
+    try:
+        for step in range(calls):
+            started = time.monotonic()
+            process = subprocess.Popen(
+                ["/fixture/debz", *arguments], env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                if case == "lock_signal":
+                    until = time.monotonic() + 10
+                    descriptors = Path(f"/proc/{process.pid}/fd")
+                    while True:
+                        found = False
+                        for path in descriptors.iterdir():
+                            try:
+                                target = path.readlink()
+                            except FileNotFoundError:
+                                continue
+                            found |= target == Path("/run/debz/live-root.lock")
+                        if found:
+                            break
+                        if process.poll() is not None or time.monotonic() >= until:
+                            raise AssertionError("native CLI did not enter the projection lock wait")
+                        time.sleep(0.01)
+                    process.send_signal(signal.SIGTERM)
+                if step == 0 and case in ("refresh_failure", "signal"):
+                    until = time.monotonic() + 30
+                    while not Path("/fixture/postinst-entered").exists():
+                        if process.poll() is not None or time.monotonic() >= until:
+                            raise AssertionError("native CLI did not reach the actual package script")
+                        time.sleep(0.01)
+                    if case == "refresh_failure":
+                        release.rename(backup)
+                        Path("/fixture/finish-script").touch()
+                    else:
+                        process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=45)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+            elapsed = time.monotonic() - started
+            Path(f"/fixture/cli-{step}.json").write_bytes(stdout)
+            Path(f"/fixture/cli-{step}.stderr").write_bytes(stderr)
+            Path(f"/fixture/cli-{step}.exit").write_text(str(process.returncode))
+            assert stderr == b"", (process.returncode, stderr)
+            value = json.loads(stdout)
+            assert value["exit_status"] == process.returncode, value
+            if case in ("lock_wait", "lock_signal"):
+                assert elapsed < 3, elapsed
+            if case == "deadline":
+                assert elapsed < 8, elapsed
+            if step == 0 and calls > 1:
+                # Recovery/history must use retained inputs, not fresh acquisition.
+                Path("/fixture/descriptor.deb").unlink()
+                if case == "refresh_failure":
+                    backup.rename(release)
+                if case == "signal":
+                    Path("/fixture/finish-script").touch()
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def exercise_repository_cli(cli: Path, workspace: Path, architecture: str, environment: dict[str, str]) -> None:
+    network_root = workspace / "repository-cli-network/root/fixture"
+    network_root.mkdir(parents=True)
+    port_file = workspace / "native-cli-http.port"
+    request_log = workspace / "native-cli-http.requests"
+    with (workspace / "native-cli-http.stderr").open("wb") as stderr:
+        server = subprocess.Popen(
+            [sys.executable, str(ROOT / "tools/http-fixture-server.py"),
+             "--root", str(network_root), "--port-file", str(port_file),
+             "--request-log", str(request_log)],
+            env={**environment, "PYTHONDONTWRITEBYTECODE": "1"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+        try:
+            until = time.monotonic() + 10
+            while not port_file.exists() or port_file.stat().st_size == 0:
+                if server.poll() is not None or time.monotonic() >= until:
+                    raise AssertionError("native CLI fixture server did not start")
+                time.sleep(0.01)
+            url = f"http://127.0.0.1:{int(port_file.read_text())}"
+            local_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with local_http.open(url + "/", timeout=5) as response:
+                assert response.status == 200
+                response.read(4096)
+            repository_cli_cases(cli, workspace, architecture, environment, url)
+            requests = request_log.read_text().splitlines()
+            assert requests.count("/descriptor.deb") == 1, requests
+            assert any(path.startswith("/bootstrap-repository/") for path in requests), requests
+            assert any(path.startswith("/repository/") for path in requests), requests
+            assert "native-query-secret" not in request_log.read_text()
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=10)
+
+
+def repository_cli_cases(
+    cli: Path, workspace: Path, architecture: str, environment: dict[str, str], network_url: str,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "debz_native_cli_repository", ROOT / "tools/generate-integration-repository.py",
+    )
+    assert spec and spec.loader
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    repository = workspace / "cli-repository"
+    generator.write_repository(repository, "debian-stable", architecture)
+    keyring = (repository / "fixture-keyring.gpg").read_bytes()
+    for case in ("success", "no_refresh", "unchanged", "unchanged_no_refresh",
+                 "known_failure", "refresh_failure", "signal", "lock_wait", "lock_signal",
+                 "unsafe_runtime", "deadline", "network"):
+        root = workspace / f"repository-cli-{case}" / "root"
+        m.make_root(root, architecture)
+        for directory in ("proc", "run", "tmp", "dev"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        (root / ".debz-native-projection").write_text("debz native projection fixture v1\n")
+        lifecycle.runtime.copy_program(root, cli, "/fixture/debz")
+        lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+        lifecycle.runtime.copy_program(root, Path("/usr/bin/dpkg-trigger"), "/" + triggers.HELPER.as_posix())
+        helper = root / triggers.HELPER
+        helper_bytes, helper_inode = helper.read_bytes(), helper.stat().st_ino
+        shutil.copytree(repository, root / "fixture/repository")
+        shutil.copytree(repository, root / "fixture/bootstrap-repository")
+        transport = network_url if case == "network" else "file:///fixture"
+        m.write(root / "usr/share/keyrings/bootstrap.gpg", keyring)
+        m.write(root / "etc/apt/sources.list.d/bootstrap.sources", (
+            f"Types: deb\nURIs: {transport}/bootstrap-repository\nSuites: debian-stable\n"
+            f"Components: main\nArchitectures: {architecture}\n"
+            "Signed-By: /usr/share/keyrings/bootstrap.gpg\n"
+        ).encode())
+        postinst = b"#!/bin/sh\nprintf 'postinst\\n' >>/repository-trace\n"
+        if case == "known_failure":
+            postinst += b"exit 42\n"
+        if case in ("refresh_failure", "signal", "deadline"):
+            lifecycle.runtime.copy_program(root, Path("/bin/sleep"), "/bin/sleep")
+            postinst += (
+                b"printf entered >/fixture/postinst-entered\n"
+                b"while [ ! -f /fixture/finish-script ]; do /bin/sleep 0.02; done\n"
+            )
+        descriptor = root / "fixture/descriptor.deb"
+        generator.write_repository_descriptor(
+            descriptor, transport + "/repository", "debian-stable", architecture, keyring,
+            scripts={"preinst": b"#!/bin/sh\nprintf 'preinst\\n' >>/repository-trace\n", "postinst": postinst},
+        )
+        unchanged = case in ("unchanged", "unchanged_no_refresh")
+        no_refresh = case in ("no_refresh", "unchanged_no_refresh")
+        if unchanged:
+            m.run(
+                [*m.reference_command(root), "--install",
+                 str(repository / "pool/main/ca-certificates_20240203_all.deb"), str(descriptor)],
+                environment, root.parent / "seed.log",
+            )
+            status = root / "var/lib/dpkg/status"
+            text = status.read_text()
+            assert "Package: packages-microsoft-prod\nStatus: install ok installed\n" in text
+            status.write_text(text.replace(
+                "Package: packages-microsoft-prod\nStatus: install ok installed\n",
+                "Package: packages-microsoft-prod\nStatus: hold ok installed\n",
+            ))
+            (root / "repository-trace").unlink()
+        original_status = (root / "var/lib/dpkg/status").read_bytes()
+        arguments = [
+            "repo", "add", "--url", transport + "/descriptor.deb" + ("?token=native-query-secret" if case == "network" else ""),
+            "--sha256", hashlib.sha256(descriptor.read_bytes()).hexdigest(),
+            "--root", "/", "--architecture", architecture,
+            "--transaction-backend", "native", "--json",
+            "--deadline-ms", "75" if case == "lock_wait" else "3000" if case == "deadline" else "60000",
+        ]
+        if no_refresh:
+            arguments.append("--no-refresh")
+        if case in ("lock_wait", "deadline"):
+            arguments += ["--connect-timeout-ms", "50", "--read-timeout-ms", "50"]
+        (root / "fixture/cli-arguments.json").write_text(json.dumps(arguments))
+        (root / "fixture/cli-case").write_text(case)
+        result = projected_process(root, repository_cli=True)
+        assert result.returncode == 0, (case, result.returncode, result.stdout, result.stderr)
+        calls = 1 if case in ("lock_wait", "lock_signal", "unsafe_runtime", "deadline") else 3
+        responses = [document(root / f"fixture/cli-{step}.json") for step in range(calls)]
+        for step, response in enumerate(responses):
+            validator("repository-operation-result-v1").validate(response)
+            payload = dict(response)
+            digest = payload.pop("digest_sha256")
+            assert hashlib.sha256(canonical(payload)).hexdigest() == digest
+            assert (root / f"fixture/cli-{step}.json").read_bytes() == canonical(response)
+        first = responses[0]
+        if case in ("lock_wait", "lock_signal", "unsafe_runtime", "deadline", "signal"):
+            assert all(value["exit_status"] != 0 for value in responses), responses
+            if case in ("lock_wait", "lock_signal", "unsafe_runtime"):
+                assert not (root / OPERATION).exists()
+                assert (root / "var/lib/dpkg/status").read_bytes() == original_status
+            if case in ("lock_wait", "deadline"):
+                assert first["diagnostics"][0]["id"] == "resource_limit_exceeded", first
+            if case == "signal":
+                assert (root / OPERATION).exists(), "interrupted script lost its native caller"
+                assert all(value["exit_status"] == 9 for value in responses), responses
+                assert responses[-1]["summary"] == "script_outcome_unknown", responses[-1]
+                assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
+        else:
+            if case == "known_failure":
+                assert all(value["exit_status"] == 7 for value in responses), responses
+            else:
+                assert responses[-1]["exit_status"] == responses[1]["exit_status"] == 0, responses
+                assert first["exit_status"] == (8 if case == "refresh_failure" else 0), first
+                assert responses[-1]["installed"] and not responses[-1]["changed"]
+                assert responses[-1]["refreshed_phase"] == ("skipped" if no_refresh else "complete")
+            assert not (root / OPERATION).exists(), case
+            assert not (root / INTENT).exists() and not (root / PROGRESS).exists()
+            evidence = root / responses[-1]["paths"]["provenance"].lstrip("/")
+            if unchanged:
+                assert evidence.name == "native-repository-unchanged-v1.json"
+                proof = document(evidence)
+                assert proof["receipt"] is None and proof["action_count"] == 0 and not proof["changed"]
+                assert not first["changed"] and first["installed"]
+                assert (root / "var/lib/dpkg/status").read_bytes() == original_status
+                assert not (root / "repository-trace").exists()
+            else:
+                proof = document(evidence, 16 * 1024 * 1024)
+                validator(PROVENANCE_SCHEMA).validate(proof)
+                assert_digest(proof, PROVENANCE_SCHEMA)
+                assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
+        mountpoint = root / "run/debz/system-root"
+        assert not mountpoint.exists() or not list(mountpoint.iterdir()), "public native projection leaked"
+        assert helper.read_bytes() == helper_bytes and helper.stat().st_ino == helper_inode
+        assert not (root / "usr/bin/dpkg").exists() and not (root / "usr/bin/dpkg-deb").exists()
+        if case == "network":
+            for directory in ("var/lib/debz", "var/cache/debz", "etc/apt"):
+                for path in (root / directory).rglob("*"):
+                    if path.is_file():
+                        assert b"native-query-secret" not in path.read_bytes(), path
+        print(f"native-repository-cli-{case}: actual public supervised CLI passed", flush=True)
 
 
 def exercise_projection(executable: Path, workspace: Path) -> None:
@@ -2606,9 +2868,11 @@ def main() -> int:
     parser.add_argument("--deadline-only", action="store_true")
     parser.add_argument("--repository-projection-only", action="store_true")
     parser.add_argument("--repository-execution-only", action="store_true")
+    parser.add_argument("--repository-cli-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
-    if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only, arguments.repository_execution_only)) > 1:
+    if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only,
+            arguments.repository_execution_only, arguments.repository_cli_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -2640,12 +2904,22 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if arguments.repository_execution_only:
+            if arguments.repository_cli_only:
+                if result_cli is None:
+                    parser.error("repository CLI acceptance requires --result-cli")
+                exercise_repository_cli(result_cli, workspace, architecture, environment)
+            elif arguments.repository_execution_only:
                 exercise_repository_execution(executable, workspace, architecture)
+                if result_cli is None:
+                    parser.error("repository execution acceptance requires --result-cli")
+                exercise_repository_cli(result_cli, workspace, architecture, environment)
             elif arguments.repository_projection_only:
                 exercise_projection(executable, workspace)
                 exercise_repository_projection(executable, workspace, architecture)
                 exercise_repository_execution(executable, workspace, architecture)
+                if result_cli is None:
+                    parser.error("repository projection acceptance requires --result-cli")
+                exercise_repository_cli(result_cli, workspace, architecture, environment)
             else:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
@@ -2653,6 +2927,8 @@ def main() -> int:
                     exercise_projection(executable, workspace)
                     if not arguments.core_only:
                         exercise_repository_projection(executable, workspace, architecture)
+                        if result_cli is not None:
+                            exercise_repository_cli(result_cli, workspace, architecture, environment)
                         exercise(executable, helper, workspace, environment, architecture)
                     exercise_core(executable, helper, workspace, environment, architecture)
                     exercise_workflows(executable, workspace, environment, architecture, result_cli)
@@ -2665,11 +2941,13 @@ def main() -> int:
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] in (
         "--projection-inside", "--projected-workflow-inside", "--repository-projection-inside", "--repository-execution-inside",
+        "--repository-cli-inside",
     ):
         projection_inside(
             Path(sys.argv[2]), workflow=sys.argv[1] == "--projected-workflow-inside",
             repository=sys.argv[1] == "--repository-projection-inside",
             repository_execution=sys.argv[1] == "--repository-execution-inside",
+            repository_cli=sys.argv[1] == "--repository-cli-inside",
         )
     else:
         raise SystemExit(main())

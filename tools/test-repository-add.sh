@@ -132,7 +132,7 @@ test ! -e "$no_refresh_root/etc/apt/sources.list.d/host.list"
 
 "$debz" repo add --transaction-backend invalid --help >"$workspace/backend-help"
 grep -Fq -- '--transaction-backend legacy_dpkg|native' "$workspace/backend-help"
-grep -Fq 'Native repository execution is unavailable' "$workspace/backend-help"
+grep -Fq 'Native requires Linux, root privilege, and --root /; never falls back.' "$workspace/backend-help"
 
 find "$full_root" -type f -exec sha256sum {} + >"$workspace/legacy-before"
 LC_ALL=C sort "$workspace/legacy-before" -o "$workspace/legacy-before"

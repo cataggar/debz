@@ -365,7 +365,7 @@ Repository projection cases run genuine preparation under the real supervised
 root callback. They cover missing/foreign authority before namespace creation,
 fresh-callback adoption of bound callers, scope loss after lock acquisition,
 and retained ownership when cleanup loses scope. They also preserve the
-repository CLI activation gate and legacy admission behavior. These cases
+ordinary backend admission gate and legacy behavior. These cases
 join the default recovery workload; `-Dnative-repository-projection-only=true`
 selects them with the existing read-only projection cases.
 
@@ -493,7 +493,20 @@ disabled once native inputs are retained. A forbidden legacy process hook
 ensures the typed path does not use command execution. The independent oracle
 validates canonical API results, native versus no-execution evidence, preserved
 holds, exact script traces and helper bytes/inodes, and final caller cleanup.
-The public CLI activation gate is unchanged.
+The same workload additionally invokes the actual `debz repo add
+--transaction-backend native --root /` CLI from disposable roots. Signed local
+bootstrap and descriptor repositories exercise fresh success, no-refresh,
+held no-execution completion, known script failure, persisted refresh recovery
+and historical readback after removing the incoming descriptor archive. A
+loopback HTTP fixture also exercises real threaded acquisition in the fresh
+child I/O context, query redaction and descriptor-free historical readback.
+Catchable interruption preserves unknown script outcomes and never replays
+the script; separate cases exercise the projection lock's cumulative deadline and catchable interruption,
+unsafe runtime directories and expiry during real package work. The roots
+contain neither dpkg nor dpkg-deb, and the oracle checks canonical results,
+native/no-execution evidence, root ownership, exact script traces, helper
+bytes/inodes and absence of leaked projections. Transport units cover invalid,
+truncated, oversized, noncanonical and failed-child result refusal.
 
 ```sh
 zig build test-native-recovery -j2
@@ -501,6 +514,7 @@ zig build test-native-recovery -Doptimize=ReleaseSafe -j2
 zig build test-native-recovery -Dnative-deadline-only=true -j2
 zig build test-native-recovery -Dnative-repository-projection-only=true -j2
 zig build test-native-recovery -Dnative-repository-execution-only=true -j2
+zig build test-native-recovery -Dnative-repository-cli-only=true -j2
 ```
 
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture

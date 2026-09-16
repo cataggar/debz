@@ -274,6 +274,8 @@ def write_repository_descriptor(
     suite: str,
     architecture: str,
     keyring: bytes,
+    *,
+    scripts: dict[str, bytes] | None = None,
 ) -> None:
     source_path = "etc/apt/sources.list.d/microsoft-prod.list"
     keyring_path = "usr/share/keyrings/microsoft-prod.gpg"
@@ -287,12 +289,13 @@ def write_repository_descriptor(
         "Description: Microsoft-shaped repository descriptor fixture\n"
     ).encode()
     script = b"#!/bin/sh\nset -e\nexit 0\n"
+    scripts = scripts or {}
     control_entries = [
         ("./control", control, 0o644),
         ("./conffiles", f"/{source_path}\n".encode(), 0o644),
-        ("./preinst", script, 0o755),
-        ("./postinst", script, 0o755),
-        ("./prerm", script, 0o755),
+        ("./preinst", scripts.get("preinst", script), 0o755),
+        ("./postinst", scripts.get("postinst", script), 0o755),
+        ("./prerm", scripts.get("prerm", script), 0o755),
     ]
     source = (
         f"deb [arch={architecture} signed-by=/{keyring_path}] "

@@ -1282,7 +1282,11 @@ fn importNativeDescriptorMaterial(
     if (input.repository.no_refresh or current.state.refreshed) return;
 
     var acquisition = dependencies.acquisition;
-    var clock: NativeRefreshClock = .{ .input = input, .original = acquisition.clock };
+    var clock: NativeInvocationClock = .{
+        .input = input,
+        .deadline = input.deadline,
+        .original = acquisition.clock,
+    };
     acquisition.clock = clock.interface();
     var budget = OperationBudget.init(acquisition.clock, input.repository.resources, try input.deadline.remainingMs(), allocator);
     budget.deadline_ms = input.deadline.expires_at_ms;
@@ -1636,8 +1640,9 @@ fn finishNativeRepository(
     local_document = null;
 }
 
-const NativeRefreshClock = struct {
-    input: NativeRecoveryRequest,
+const NativeInvocationClock = struct {
+    input: ?NativeRecoveryRequest = null,
+    deadline: transaction_executor.Deadline,
     original: repository_acquisition.Clock,
 
     fn interface(self: *@This()) repository_acquisition.Clock {
@@ -1646,14 +1651,15 @@ const NativeRefreshClock = struct {
 
     fn now(raw: ?*anyopaque) u64 {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        return self.input.deadline.nowMsFn(self.input.deadline.context);
+        return self.deadline.nowMsFn(self.deadline.context);
     }
 
     fn sleep(raw: ?*anyopaque, milliseconds: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        try self.input.validate();
-        try self.original.sleepMs(@min(milliseconds, try self.input.deadline.remainingMs()));
-        try self.input.validate();
+        if (self.input) |input| try input.validate();
+        try self.original.sleepMs(@min(milliseconds, try self.deadline.remainingMs()));
+        if (self.input) |input| try input.validate();
+        _ = try self.deadline.remainingMs();
     }
 };
 
@@ -1926,6 +1932,7 @@ pub const Backend = struct {
     native_executor: ?Executor = null,
     /// Borrowed only for this native invocation; never request or state data.
     root_projection: ?*const live_root.Projection = null,
+    native_deadline: ?transaction_executor.Deadline = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
     operation_locks: ?transaction_executor.LockManager = null,
     target_locks: ?transaction_executor.LockManager = null,
@@ -2001,14 +2008,22 @@ pub const Backend = struct {
         var paths = try ResolvedPaths.init(allocator, request, transaction_backend);
         defer paths.deinit();
         var production_acquisition = repository_acquisition.Production{ .io = self.io };
-        const acquisition_dependencies = self.acquisition_dependencies orelse production_acquisition.dependencies();
+        var acquisition_dependencies = self.acquisition_dependencies orelse production_acquisition.dependencies();
+        var invocation_clock: NativeInvocationClock = undefined;
+        if (native) if (self.native_deadline) |deadline| {
+            invocation_clock = .{ .deadline = deadline, .original = acquisition_dependencies.clock };
+            acquisition_dependencies.clock = invocation_clock.interface();
+        };
         var budget: OperationBudget = undefined;
-        if (native) budget = OperationBudget.init(
-            acquisition_dependencies.clock,
-            request.resources,
-            request.network.overall_timeout_ms,
-            allocator,
-        );
+        if (native) {
+            budget = OperationBudget.init(
+                acquisition_dependencies.clock,
+                request.resources,
+                request.network.overall_timeout_ms,
+                allocator,
+            );
+            if (self.native_deadline) |deadline| budget.retainDeadline(deadline);
+        }
         var native_progress: NativeDispatchProgress = .{};
         defer native_progress.deinit();
 
@@ -5059,7 +5074,8 @@ const OperationBudget = struct {
 
     fn checkTime(self: OperationBudget) !void {
         if (self.native_input) |input| try input.validate();
-        if (self.clock.nowMs() -| self.started_ms >= self.overall_timeout_ms)
+        const now = self.clock.nowMs();
+        if (now >= self.deadline_ms or now -| self.started_ms >= self.overall_timeout_ms)
             return error.ResourceBudgetExceeded;
     }
 
@@ -5071,11 +5087,16 @@ const OperationBudget = struct {
         };
     }
 
+    fn retainDeadline(self: *OperationBudget, deadline: transaction_executor.Deadline) void {
+        self.deadline_ms = @min(self.deadline_ms, deadline.expires_at_ms);
+    }
+
     fn remainingTime(self: OperationBudget) !u64 {
         try self.checkTime();
-        const spent = self.clock.nowMs() -| self.started_ms;
-        if (spent >= self.overall_timeout_ms) return error.ResourceBudgetExceeded;
-        return self.overall_timeout_ms - spent;
+        const now = self.clock.nowMs();
+        const spent = now -| self.started_ms;
+        if (now >= self.deadline_ms or spent >= self.overall_timeout_ms) return error.ResourceBudgetExceeded;
+        return @min(self.overall_timeout_ms - spent, self.deadline_ms - now);
     }
 
     fn descriptorLimit(self: OperationBudget, requested: usize) !usize {
@@ -6970,6 +6991,41 @@ const BindingFixture = struct {
         };
     }
 };
+
+test "repository backend native invocation preserves the outer clock and remaining budget" {
+    const Clock = struct {
+        value: u64,
+        fn now(raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.value;
+        }
+        fn sleep(raw: ?*anyopaque, milliseconds: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.value += milliseconds;
+        }
+    };
+    var outer: Clock = .{ .value = 100 };
+    var acquisition: Clock = .{ .value = 9_000 };
+    const deadline: transaction_executor.Deadline = .{
+        .context = &outer,
+        .nowMsFn = Clock.now,
+        .expires_at_ms = 125,
+    };
+    var clock: NativeInvocationClock = .{
+        .deadline = deadline,
+        .original = .{ .context = &acquisition, .nowMsFn = Clock.now, .sleepMsFn = Clock.sleep },
+    };
+    var budget = OperationBudget.init(clock.interface(), .{}, 500, std.testing.allocator);
+    budget.retainDeadline(deadline);
+    try std.testing.expectEqual(@as(u64, 25), try budget.remainingTime());
+    try std.testing.expectEqual(@as(u64, 25), try budget.executionDeadline().remainingMs());
+    try clock.interface().sleepMs(1_000);
+    try std.testing.expectEqual(@as(u64, 9_025), acquisition.value);
+    outer.value = 125;
+    try std.testing.expectError(error.ResourceBudgetExceeded, budget.remainingTime());
+    try std.testing.expectError(error.DeadlineExceeded, clock.interface().sleepMs(1));
+    try std.testing.expectEqual(@as(u64, 9_025), acquisition.value);
+}
 
 test "repository backend native caller binds every executable request policy field" {
     const request = BindingFixture.request;

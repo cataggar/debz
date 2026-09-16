@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
     repository_add_step.dependOn(&run_repository_cli_tests.step);
     const repository_backend_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "repository_backend.test.", "repository_api.test.", "repository_plan.test.", "target_apt_config.test." },
+        .filters = &.{ "repository_backend.test.", "repository_command.test.", "repository_api.test.", "repository_plan.test.", "target_apt_config.test." },
     });
     const run_repository_backend_tests = b.addRunArtifact(repository_backend_tests);
     repository_add_step.dependOn(&run_repository_backend_tests.step);
@@ -696,6 +696,8 @@ pub fn build(b: *std.Build) void {
         native_recovery.addArg("--repository-projection-only");
     if (b.option(bool, "native-repository-execution-only", "Select typed native repository execution and recovery cases") orelse false)
         native_recovery.addArg("--repository-execution-only");
+    if (b.option(bool, "native-repository-cli-only", "Select public supervised native repository CLI cases") orelse false)
+        native_recovery.addArg("--repository-cli-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );

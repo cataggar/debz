@@ -29,17 +29,17 @@ package/cache budgets map directly to the v1 request fields; see
 
 `--transaction-backend legacy_dpkg|native` selects the production backend for
 this invocation; omission preserves `legacy_dpkg`. Selection is separate from
-the unchanged repository API v1 request and is passed directly to
-`ProductionRepositoryBackend.transaction_backend`. Duplicate, missing, and
-unknown selections are usage errors.
+the unchanged repository API v1 request. Legacy selection uses the ordinary
+production backend; native selection enters the public supervised runner.
+Duplicate, missing, and unknown selections are usage errors.
 
-Native repository bootstrap is not yet activated. Explicit `native` selection
-returns exit 3 with `transaction_backend_unavailable` before root access,
-operation-state creation, acquisition, or execution. It never falls back to
-dpkg, even when the root contains a completed legacy repository operation.
-The existing command-report executor cannot stand in for native typed
-preparation, receipts, or recovery. Core product and native system-profile
-support do not imply that repository bootstrap uses those contracts yet.
+Explicit `native` selection supports `--root /` on privileged Linux through a
+genuine private live-root projection. Alternate root paths, including the
+internal projection spelling, return exit 3 with
+`transaction_backend_unavailable` before root access or acquisition. Native
+selection never falls back to dpkg, including for a completed legacy repository
+operation. The command-report executor cannot stand in for typed native
+preparation, receipts or recovery. See the public runner contract below.
 
 The native preparation layer now supports the explicit `locked_packages`
 policy used by operation-scoped locks. It retains unrelated healthy packages
@@ -188,8 +188,8 @@ or permission to clear ownership. Preparation never executes packages,
 publishes mutation intent, releases the caller, or acknowledges completion.
 Acquisition, the cumulative operation deadline, helper/execution integration,
 native receipt retention, persisted recovery, and durable outer completion
-remain caller responsibilities. The repository CLI native gate remains in
-place until that complete lifecycle is integrated.
+remain caller responsibilities. The public runner and scoped dispatch below
+join these responsibilities without weakening the preparation-only contract.
 
 ### Typed package execution and recovery
 
@@ -222,7 +222,7 @@ These adapters neither acknowledge native receipts nor complete, clear,
 abandon or release the repository caller. Package completion is not repository
 bootstrap completion: descriptor import, metadata refresh, immutable outer
 receipt retention and durable outer completion must precede acknowledgment
-and root cleanup. The public repository CLI gate remains unchanged.
+and root cleanup. The scoped dispatcher joins the complete lifecycle.
 
 ### Retaining native package receipts
 
@@ -254,8 +254,7 @@ bytes without writing, and refuses missing retention rather than recreating it.
 This is caller-owned readback, not historical bootstrap proof or a current
 database verifier. Neither API marks packages installed, acknowledges native
 execution, completes repository bootstrap, or releases root ownership. Use the
-live-state and lifecycle adapters below for those additional guarantees; the
-repository native CLI gate stays closed.
+live-state and lifecycle adapters below for those additional guarantees.
 
 ### Verifying live native package state
 
@@ -286,8 +285,8 @@ scope before returning.
 Package database proof does not replace descriptor-file, import or refresh
 verification. Neither result publishes outer installed/failure state, completes
 bootstrap, acknowledges native execution or releases ownership. The separate
-checkpoint and completion adapters below handle those obligations; repository
-dispatch remains integration work and native CLI activation stays gated.
+checkpoint and completion adapters below handle those obligations and are
+joined by scoped repository dispatch.
 
 ### Persisting native package-stage checkpoints
 
@@ -560,8 +559,9 @@ not recreated even when the caller offers identical bytes.
 `Backend.nativeInterface()` implements the repository request/result API inside
 an existing supervised `live_root.runProjected` callback. It requires explicit
 `.native` selection and that callback's borrowed `root_projection`; it refuses
-command-oriented native executor injection. `Backend.interface()` and the CLI
-remain gated separately until public private-runner transport is integrated.
+command-oriented native executor injection. `Backend.interface()` retains its
+ordinary selection gate; the explicit native CLI uses the supervised runner
+below, not that command-oriented interface.
 
 The scoped interface reserves one original repository caller and includes root
 and repository lock waits in the same invocation deadline as acquisition,
@@ -586,6 +586,35 @@ checkpoint snapshots retain truthful installed/imported/refresh progress when
 later publication, refresh or deadline handling fails. Error reporting neither
 reloads replaced inputs nor rewrites native lifecycle state. Release the result
 with `deinit`; projection authority never escapes the callback.
+
+### Public supervised native runner
+
+`repository_command.executeNative(allocator, request)` is the native CLI
+boundary. It validates the public request and admits only literal `root="/"`;
+it does not treat an arbitrary alternate root or the internal projection path
+as host-root authority. The genuine `live_root.runProjected` callback maps
+the admitted request to `/run/debz/system-root` and passes only that callback's
+borrowed projection to `Backend.nativeInterface()`. Persisted native request
+and policy bindings use this stable projected spelling on every invocation.
+
+One absolute monotonic deadline starts before projection setup. It bounds the
+private-root lock wait and supervisor workload, and is passed into native
+dispatch without restarting the acquisition, planning, root/repository locking,
+execution or recovery budget. Clock failures fail closed. Expiry terminates
+and reaps the runner's process group, with the existing bounded termination
+grace for cleanup. Catchable interrupts use the same supervised teardown.
+An expired or interrupted runner reports recovery required rather than
+claiming that no mutation occurred; retry the same request to reconcile
+retained evidence. Unsafe runtime paths and failed setup never select legacy.
+
+The child creates fresh I/O and allocation state after fork. Only a canonical
+repository result crosses an anonymous close-on-exec memory-file transport,
+bounded by the existing one-MiB result limit. The parent accepts it only after
+successful supervision and cleanup, rejects missing, truncated, oversized,
+trailing, noncanonical or invalid-digest data, and returns an independently
+owned result. It never serializes projection authority, transfers an attempt,
+reconstructs a caller from returned metadata or clears retained ownership
+because transport failed. `deinit` releases the result as for scoped dispatch.
 
 ## Descriptor and repository trust
 
