@@ -40,6 +40,35 @@ class RecoveryOracleTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_family_verification_preserves_expected_request_without_execution_flags(self) -> None:
+        request = {"options": {"install_root": str(self.root)}}
+        family = {"request": {"root": str(self.root)}, "expect_failure": True}
+        destination = self.workspace / "family-verification"
+        with (
+            mock.patch.object(acceptance.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+            mock.patch.object(acceptance, "document", return_value={"verified": False}),
+        ):
+            result = acceptance.workflow(
+                self.workspace / "driver", request, destination, {},
+                family_verification=family,
+            )
+        self.assertEqual(result, {"verified": False})
+        transport = json.loads((destination / "workflow.request.json").read_bytes())
+        self.assertEqual(transport["family_verification"], family)
+        self.assertIsNone(transport["completion_crash"])
+        self.assertIsNone(transport["owned_verification"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_family_verification_still_refuses_host_root_before_spawn(self) -> None:
+        with mock.patch.object(acceptance.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "disposable fixture root"):
+                acceptance.workflow(
+                    self.workspace / "driver", {"options": {"install_root": "/"}},
+                    self.workspace / "refused", {},
+                    family_verification={"request": {"root": "/"}},
+                )
+            run.assert_not_called()
+
     def test_projection_requires_private_disposable_root_before_mounting(self) -> None:
         projected = self.workspace / "projection/root"
         projected.mkdir(parents=True)

@@ -93,6 +93,7 @@ pub const ProductCompletionCrash = production_backend.CompletionCrash;
 pub const package_family_backend = @import("package_family_backend.zig");
 pub const PackageFamilyBackend = package_family_backend.Backend;
 pub const NativePackageFamilyBackend = package_family_backend.NativeBackend;
+pub const NativePackageFamilyVerifiedCompletion = package_family_backend.VerifiedNativeCompletion;
 pub const PackageFamilyRequest = package_family_backend.Request;
 pub const PackageFamilyResult = package_family_backend.Result;
 pub const PackageFamilyOwnedResult = package_family_backend.OwnedResult;

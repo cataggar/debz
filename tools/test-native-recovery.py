@@ -1224,6 +1224,7 @@ def workflow(
     *, completion_crash: str | None = None, owner_evidence: Path | None = None,
     acknowledgment: str | None = None, reconciliation_owner_output: Path | None = None,
     owned_verification: dict | None = None,
+    family_verification: dict | None = None,
 ) -> dict | None:
     m.reference_command(Path(request["options"]["install_root"]))
     destination.mkdir()
@@ -1236,6 +1237,7 @@ def workflow(
         "reconciliation_owner_output": str(reconciliation_owner_output) if reconciliation_owner_output else None,
         "acknowledgment": acknowledgment,
         "owned_verification": owned_verification,
+        "family_verification": family_verification,
     }).encode())
     with (destination / "workflow.log").open("wb") as output:
         result = subprocess.run(
@@ -1372,6 +1374,108 @@ def exercise_workflows(
         assert summary["caller_request_sha256"] == completion["request_sha256"]
         assert summary["caller_policy_sha256"] == completion["policy_sha256"]
         assert summary["program_sha256"] == receipt["program_sha256"]
+
+    current = scenario("family-completed-verification")
+    family_names = ["scenario-main"]
+    original_workflow = request(current, "install", "execute", family_names)
+    original_family = {
+        "schema": "io.github.cataggar.debz.package-family.request.v2",
+        "version": 2, "operation": "create", "root": str(current.candidate),
+        "architecture": architecture, "sources": [str(source)], "keyrings": [str(keyring)],
+        "cache": original_workflow["options"]["cache_path"],
+        "state": original_workflow["options"]["state_path"],
+        "package": family_names[0], "lock_input": original_workflow["options"]["lock_input_path"],
+    }
+
+    def verify_family(label: str, original: dict, succeeds: bool = True) -> dict:
+        def inventory() -> list[tuple]:
+            return sorted(
+                (str(path.relative_to(current.candidate)), entry.st_mode, entry.st_size, entry.st_mtime_ns)
+                for path in current.candidate.rglob("*")
+                for entry in [path.lstat()]
+            )
+
+        before = inventory()
+        result = workflow(
+            executable, original_workflow, current.directory / label, environment,
+            family_verification={"request": original, "expect_failure": not succeeds},
+        )
+        assert before == inventory(), "family verification changed the staged root"
+        assert not (current.directory / "state/transaction-result.json").exists()
+        if succeeds:
+            validator("transaction-result-summary-v2").validate(result)
+            lock = document(Path(original["lock_input"]))
+            receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+            completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+            assert result["operation"] == "install"
+            assert result["lock_sha256"] == lock["digest_sha256"]
+            assert result["transaction_digest_sha256"] == receipt["digest_sha256"]
+            assert result["completion_digest_sha256"] == completion["digest_sha256"]
+            assert result["caller_request_sha256"] == completion["request_sha256"]
+            assert result["caller_policy_sha256"] == completion["policy_sha256"]
+        else:
+            assert result["verified"] is False
+        return result
+
+    run(current, "plan", request(current, "install", "plan_only", family_names))
+    verify_family("before-execution", original_family, False)
+    run(current, "install", original_workflow)
+    first = verify_family("verified", original_family)
+    assert first == verify_family("verified-again", original_family)
+    assert first == verify_family("customize-equivalent", {**original_family, "operation": "customize"})
+    for field, value in (
+        ("package", "another-package"),
+        ("operation", "update"),
+        ("conffile", "use_package_version"),
+        ("allow_downgrade", True),
+        ("recommends", True),
+        ("foreign_architectures", ["arm64" if architecture == "amd64" else "amd64"]),
+    ):
+        result = verify_family(f"mismatch-{field}", {**original_family, field: value}, False)
+        assert result["error"] == "NativeFamilyRequestMismatch", result
+    for name, path in (
+        ("receipt", current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"),
+        ("completion", current.candidate / NAMESPACE / "root-operation-completion-v1.json"),
+        ("database", current.candidate / "var/lib/dpkg/status"),
+        ("lock", Path(original_family["lock_input"])),
+    ):
+        contents = path.read_bytes()
+        try:
+            path.write_bytes(b"invalid completed evidence\n")
+            verify_family(f"invalid-{name}", original_family, False)
+        finally:
+            path.write_bytes(contents)
+    m.write(current.candidate / OPERATION, b"unsettled operation\n")
+    try:
+        verify_family("unsettled", original_family, False)
+    finally:
+        (current.candidate / OPERATION).unlink()
+    assert first == verify_family("final-verified", original_family)
+    original_workflow = request(current, "install", "execute", ["fail-script"])
+    failed_family = {**original_family, "package": "fail-script"}
+    run(current, "plan-failure", request(current, "install", "plan_only", ["fail-script"]))
+    failed = run(current, "known-failure", original_workflow, exit_status=7)
+    assert failed["changed"]
+    verify_family("failed-not-success", failed_family, False)
+    print("family-completed-verification: real receipts, semantic request binding and read-only refusals passed", flush=True)
+
+    current = scenario("family-recovered-verification")
+    original_workflow = request(current, "install", "execute", family_names)
+    original_family = {
+        **original_family, "root": str(current.candidate),
+        "cache": original_workflow["options"]["cache_path"],
+        "state": original_workflow["options"]["state_path"],
+        "lock_input": original_workflow["options"]["lock_input_path"],
+    }
+    run(current, "plan", request(current, "install", "plan_only", family_names))
+    workflow(
+        executable, original_workflow, current.directory / "receipt-interruption", environment,
+        completion_crash="after_native_receipt",
+    )
+    verify_family("pending-not-success", original_family, False)
+    run(current, "recover", request(current, "install", "recover", family_names))
+    verify_family("recovered-success", original_family)
+    print("family-recovered-verification: pending refusal and original completed request proof passed", flush=True)
 
     names = ["scenario-main", "conffile-pkg"]
     current = scenario("workflow-batch")

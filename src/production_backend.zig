@@ -3254,9 +3254,9 @@ fn workflowRootOperation(
     return rootOperationSurface(operation);
 }
 
-/// Bounded digest of the reviewed request. It binds exactly what the caller
-/// asked for, so a resumed attempt can prove it belongs to this request.
-fn productRequestDigest(request: api.Request) [32]u8 {
+/// Bounded semantic caller binding for resumed attempts. Acquisition paths
+/// and transport limits are excluded.
+pub fn productRequestDigest(request: api.Request) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("debz-product-request-v1\x00");
     hash.update(@tagName(request.operation));
@@ -5422,6 +5422,10 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         reconciliation_owner_output: ?[]const u8 = null,
         acknowledgment: ?enum { ownership, recovery } = null,
         facade_recover: bool = false,
+        family_verification: ?struct {
+            request: @import("package_family_backend.zig").Request,
+            expect_failure: bool = false,
+        } = null,
         owned_verification: ?struct {
             lock_path: []const u8,
             lock_sha256: ?[32]u8 = null,
@@ -5438,6 +5442,14 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.family_verification) |check|
+        if (external.projected or external.withhold_projection or external.completion_crash != null or
+            external.owner_evidence != null or external.review_evidence != null or
+            external.acknowledgment != null or external.owned_verification != null or
+            external.reconciliation_owner_output != null or external.facade_recover or
+            external.prepare_acknowledged_review != null or external.prepare_cleared_review != null or
+            !std.mem.eql(u8, check.request.root, external.workflow.options.install_root))
+            return error.InvalidExternalWorkflowRequest;
     if (external.owned_verification) |check|
         if (check.review != null and !external.projected)
             return error.InvalidExternalWorkflowRequest;
@@ -5522,6 +5534,22 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     );
     if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
         return error.InvalidExternalWorkflowRequest;
+    if (external.family_verification) |check| {
+        const family: @import("package_family_backend.zig").NativeBackend = .{ .io = std.testing.io };
+        var verified = family.verifyCompletedSuccess(std.testing.allocator, check.request) catch |err| {
+            if (!check.expect_failure) return err;
+            try writeExternalNativeWorkflowReport(external.report, try std.json.Stringify.valueAlloc(allocator, .{
+                .verified = false,
+                .@"error" = @errorName(err),
+            }, .{}));
+            return;
+        };
+        defer verified.deinit();
+        try std.testing.expect(!check.expect_failure);
+        try std.testing.expect(verified.summary.install_root.ptr != check.request.root.ptr);
+        try writeExternalNativeWorkflowReport(external.report, try verified.summary.canonicalJson(allocator));
+        return;
+    }
     const Crash = struct {
         point: ?CompletionPoint,
         fn hit(context: *anyopaque, point: CompletionPoint) anyerror!void {
