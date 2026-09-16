@@ -6,7 +6,13 @@ and from:
 
 ```sh
 debz package-family-capabilities
+debz package-family-capabilities --transaction-backend native
 ```
+
+Omission of the backend flag preserves the version-1 legacy capability
+document exactly; explicit `legacy_dpkg` returns the same document. Invalid,
+duplicate or missing backend selections are usage errors. Help remains
+metadata-only and takes precedence over other arguments.
 
 Schema version 1 supports resolve-lock, create, customize, update, inspect, and
 recovery for `amd64` and `arm64`, including either architecture as a configured
@@ -16,9 +22,10 @@ configuration, keyring, proxy, cache, or credentials are inherited.
 
 `resolve_lock` is the only operation permitted to omit a lock input. It is
 non-mutating, requires a package and lock output, and derives the canonical
-closure solely from authenticated metadata, an empty installed package
-database, and deterministic solver policy. The caller reviews that artifact
-before create. Every create, customize, update, or recovery request still
+closure from authenticated metadata, the supplied root's installed package
+database (empty for initial image creation), and deterministic solver policy.
+The caller reviews that artifact before create. Every create, customize,
+update, or recovery request still
 requires a previously reviewed exact-lock input; the backend never performs an
 unlocked image mutation. An optional lock output on those operations is an
 atomic canonical copy.
@@ -36,9 +43,42 @@ and diagnostics contain no credential bytes. The caller owns atomic image/root
 staging and must not publish until the result, exact lock, and provenance have
 all been verified.
 
-The release-acceptance lane selects the immutable
+The version-1 release-acceptance lane selects the immutable
 `https://snapshot.ubuntu.com/ubuntu/20260816T000000Z` snapshot in a deb822
 source, suite `resolute`, component `main`, and uses
 `/usr/share/keyrings/ubuntu-archive-keyring.gpg` explicitly. Native amd64 and
-arm64 runners install `ubuntu-minimal` into empty staged roots and replay the
-same exact lock for update and reproducibility evidence.
+arm64 runners exercise the legacy backend, installing `ubuntu-minimal` into
+empty staged roots and replaying the same exact lock for update and
+reproducibility evidence.
+
+## Native lock resolution
+
+The separate `debz.NativePackageFamilyBackend` provides native version-2
+`resolve_lock` without changing the legacy adapter or converting v1 locks.
+Requests execute through this library API; capability discovery is metadata
+only and does not introduce a package-family execution CLI.
+Initialize it with the caller's `std.Io`; it constructs the real native
+production backend rather than accepting a command-shaped executor. Use the
+existing request fields with
+`schema = package_family_backend.native_request_schema` and
+`version = package_family_backend.native_schema_version`. Version/backend
+mismatches fail before backend work. Root, repository, trust, cache, state,
+architecture and reviewed output location remain explicit.
+
+Resolution uses authenticated repository metadata and the supplied root's
+installed-state snapshot through the existing native planner, producing a
+genuine canonical `exact-closure-lock-v2` with authenticated origin, signer,
+snapshot, semantic-request and policy bindings. An empty staged root yields
+the initial image closure. Offline resolution uses only already-authenticated
+cached metadata and never fetches missing packages or repository files.
+Planning does not execute packages, create a native transaction receipt or
+advertise legacy provenance. The returned `OwnedResult` contains a version-2
+`result`, including an independently owned `lock_path`; call `deinit` on the
+owned result after use.
+
+Native capability discovery currently advertises **only `resolve-lock`**,
+exact-lock v2, no provenance schema, unavailable recovery and no apt/dpkg
+invocation. Native create/customize/update/recover/inspect requests remain
+unavailable before filesystem access until their complete family-level
+contracts are integrated. Selecting native never falls back to the legacy
+family adapter, and the ordinary v1 adapter rejects v2 requests.

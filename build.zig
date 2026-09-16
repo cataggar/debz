@@ -332,6 +332,13 @@ pub fn build(b: *std.Build) void {
     production_backend_test_step.dependOn(
         &run_required_production_security_tests.step,
     );
+    const package_family_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"package_family_backend.test."},
+    });
+    const run_package_family_tests = b.addRunArtifact(package_family_tests);
+    production_backend_test_step.dependOn(&run_package_family_tests.step);
+    test_step.dependOn(&run_package_family_tests.step);
     test_step.dependOn(&run_production_backend_tests.step);
 
     const system_profile_test_module = b.createModule(.{

@@ -6883,6 +6883,120 @@ test "production workflow required_security.native reconciliation retains exact 
     }
 }
 
+test "production package family native resolution emits genuine v2 locks and reuses authenticated cache" {
+    const family = @import("package_family_backend.zig");
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(
+        allocator,
+        &directory,
+        "",
+        @embedFile("fixtures/batch_workflow/InRelease"),
+        @embedFile("fixtures/batch_workflow/Packages"),
+        @embedFile("fixtures/batch_workflow/keyring.gpg"),
+    );
+    defer fixture.deinit();
+    const backend: family.NativeBackend = .{
+        .io = std.testing.io,
+        .now_unix = 1_788_796_860,
+    };
+    var request: family.Request = .{
+        .schema = family.native_request_schema,
+        .version = family.native_schema_version,
+        .operation = .resolve_lock,
+        .root = fixture.install_root,
+        .architecture = .amd64,
+        .sources = &fixture.source_paths,
+        .keyrings = &fixture.keyring_paths,
+        .cache = fixture.cache_path,
+        .state = fixture.state_path,
+        .package = "alpha",
+        .lock_output = fixture.lock_path,
+    };
+    var planned = try backend.execute(allocator, request);
+    defer planned.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, planned.result.exit_status);
+    try std.testing.expect(planned.result.succeeded and !planned.result.changed);
+    try std.testing.expectEqualStrings(family.native_result_schema, planned.result.schema);
+    try std.testing.expect(planned.result.provenance_path == null);
+    try std.testing.expectEqualStrings(fixture.lock_path, planned.result.lock_path.?);
+    try std.testing.expect(planned.result.lock_path.?.ptr != fixture.lock_path.ptr);
+
+    const bytes = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v2.maximum_document_bytes);
+    defer allocator.free(bytes);
+    var lock = try exact_lock_v2.decode(allocator, bytes, exact_lock_v2.maximum_document_bytes);
+    defer lock.deinit();
+    try std.testing.expectEqualStrings("amd64", lock.lock.target_architecture);
+    try std.testing.expectEqual(@as(usize, 2), lock.lock.packages.len);
+    try std.testing.expectEqualStrings("alpha", lock.lock.packages[0].name);
+    try std.testing.expectEqualStrings("shared", lock.lock.packages[1].name);
+    try std.testing.expectEqual(@as(usize, 1), lock.lock.repositories.len);
+    try std.testing.expect(lock.lock.repositories[0].signer_fingerprints.len != 0);
+    for (lock.lock.packages) |package| try std.testing.expect(package.origin == .authenticated_repository);
+
+    try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/InRelease");
+    try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/main/binary-amd64/Packages");
+    request.cache_mode = .offline;
+    request.lock_output = fixture.second_lock_path;
+    var cached = try backend.execute(allocator, request);
+    defer cached.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, cached.result.exit_status);
+    const cached_bytes = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v2.maximum_document_bytes);
+    defer allocator.free(cached_bytes);
+    try std.testing.expectEqualSlices(u8, bytes, cached_bytes);
+    const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(1024));
+    defer allocator.free(status);
+    try std.testing.expectEqualStrings("", status);
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/root-operation-v1.json", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "state/transaction-result.json", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/native-execution-intent-v1.json", .{}));
+}
+
+test "production package family native resolution refuses cache misses and unsigned metadata without lock artifacts" {
+    const family = @import("package_family_backend.zig");
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
+    defer fixture.deinit();
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/dists/stable/InRelease",
+        .data = "not signed repository metadata\n",
+    });
+    const backend: family.NativeBackend = .{
+        .io = std.testing.io,
+        .now_unix = 1_788_796_860,
+    };
+    for ([_]family.CacheMode{ .offline, .online }) |mode| {
+        var result = try backend.execute(allocator, .{
+            .schema = family.native_request_schema,
+            .version = family.native_schema_version,
+            .operation = .resolve_lock,
+            .root = fixture.install_root,
+            .architecture = .amd64,
+            .sources = &fixture.source_paths,
+            .keyrings = &fixture.keyring_paths,
+            .cache = fixture.cache_path,
+            .state = fixture.state_path,
+            .package = "hello",
+            .lock_output = fixture.lock_path,
+            .cache_mode = mode,
+        });
+        defer result.deinit();
+        try std.testing.expect(!result.result.succeeded and !result.result.changed);
+        try std.testing.expect(result.result.exit_status != .success);
+        try std.testing.expectEqual(family.ErrorId.backend_failed, result.result.diagnostic.?.id);
+        try std.testing.expect(!result.result.diagnostic.?.recoverable);
+        try std.testing.expect(result.result.lock_path == null and result.result.provenance_path == null);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, fixture.lock_path, .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "state/transaction-result.json", .{}));
+    }
+    const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(1024));
+    defer allocator.free(status);
+    try std.testing.expectEqualStrings("", status);
+}
+
 test "production workflow plans a successful batch install into one exact lock" {
     try testWorkflowLockPlanning(.legacy_dpkg);
     try testWorkflowLockPlanning(.native);

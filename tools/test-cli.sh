@@ -20,6 +20,32 @@ for help in -h --help; do
 done
 test "$("$debz" version)" = "$expected_version"
 
+"$debz" package-family-capabilities >cli-test-stdout
+"$debz" package-family-capabilities --transaction-backend legacy_dpkg >cli-test-stderr
+cmp cli-test-stdout cli-test-stderr
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["version"] == 1; assert v["exact_lock_schema"].endswith("exact-closure-lock-v1")' <cli-test-stdout
+"$debz" package-family-capabilities --transaction-backend native >cli-test-stdout 2>cli-test-stderr
+test ! -s cli-test-stderr
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["version"] == 2; assert v["transaction_backend"] == "native"; assert v["operations"] == ["resolve-lock"]; assert v["exact_lock_schema"].endswith("exact-closure-lock-v2"); assert v["provenance_schema"] is None; assert v["recovery"] == "unavailable"; assert not v["invokes_apt"] and not v["invokes_dpkg"]' <cli-test-stdout
+for arguments in \
+    "--transaction-backend" \
+    "--transaction-backend invalid" \
+    "--transaction-backend native --transaction-backend legacy_dpkg" \
+    "--unknown" \
+    "native"
+do
+    set +e
+    "$debz" package-family-capabilities $arguments >cli-test-stdout 2>cli-test-stderr
+    status_code=$?
+    set -e
+    test "$status_code" -eq 2
+    test ! -s cli-test-stdout
+    grep -q 'invalid package-family capability options' cli-test-stderr
+done
+"$debz" package-family-capabilities --transaction-backend invalid --help >cli-test-stdout 2>cli-test-stderr
+test ! -s cli-test-stderr
+grep -q -- '--transaction-backend legacy_dpkg|native' cli-test-stdout
+
 for arguments in \
     "apt" \
     "apt --help" \
