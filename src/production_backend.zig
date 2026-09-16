@@ -32,7 +32,7 @@ pub const Executor = transaction_engine.Executor;
 /// Internal package workflow contract. Product API v1 remains a singleton
 /// facade for install and remove; orchestrators use this seam when one
 /// reviewed exact lock must bind a batch.
-pub const WorkflowSemanticOperation = enum { install, remove, upgrade_all };
+pub const WorkflowSemanticOperation = enum { install, remove, upgrade_all, upgrade };
 pub const WorkflowMode = enum {
     plan_only,
     download_only,
@@ -257,7 +257,7 @@ pub const Backend = struct {
     ) !api.Result {
         const operation = workflowSurfaceOperation(workflow.operation, workflow.mode);
         const count_valid = switch (workflow.operation) {
-            .install, .remove => workflow.selectors.len != 0,
+            .install, .remove, .upgrade => workflow.selectors.len != 0,
             .upgrade_all => workflow.selectors.len == 0,
         };
         if (!count_valid)
@@ -3222,6 +3222,7 @@ fn workflowSemanticSurface(operation: WorkflowSemanticOperation) api.Operation {
     return switch (operation) {
         .install => .install,
         .remove => .remove,
+        .upgrade => .upgrade,
         .upgrade_all => .upgrade_all,
     };
 }
@@ -4498,6 +4499,7 @@ fn planRequestFromWorkflow(
     if (workflow) |directive| return switch (directive.operation) {
         .install => .{ .install = selectors },
         .remove => .{ .remove = selectors },
+        .upgrade => .{ .upgrade = selectors },
         .upgrade_all => .upgrade_all,
     };
     return switch (operation) {
@@ -4521,6 +4523,7 @@ fn semanticRequestDigest(
         switch (directive.operation) {
             .install => TransactionSemanticOperation.install,
             .remove => TransactionSemanticOperation.remove,
+            .upgrade => TransactionSemanticOperation.upgrade,
             .upgrade_all => TransactionSemanticOperation.upgrade_all,
         }
     else switch (operation) {
@@ -4650,7 +4653,8 @@ fn stringSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
     return true;
 }
 
-fn parseSelector(value: []const u8) solver.PackageSelector {
+/// Split a validated product selector into borrowed fields without allocating.
+pub fn parseSelector(value: []const u8) solver.PackageSelector {
     var name_arch = value;
     var version: ?[]const u8 = null;
     if (std.mem.indexOfScalar(u8, value, '=')) |equals| {
@@ -5431,6 +5435,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         facade_recover: bool = false,
         native_evidence_output: ?[]const u8 = null,
         family_execution: ?@import("package_family_backend.zig").Request = null,
+        family_update_planning: bool = false,
         family_verification: ?struct {
             request: @import("package_family_backend.zig").Request,
             expect_failure: bool = false,
@@ -5452,6 +5457,8 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     const parsed = try std.json.parseFromSlice(External, allocator, bytes, .{});
     defer parsed.deinit();
     const external = parsed.value;
+    if (external.family_update_planning and external.family_execution == null)
+        return error.InvalidExternalWorkflowRequest;
     if (external.family_execution) |request|
         if (external.projected or external.withhold_projection or external.completion_crash != null or
             external.owner_evidence != null or external.review_evidence != null or
@@ -5566,7 +5573,10 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             .io = std.testing.io,
             .now_unix = 1_788_796_860,
         };
-        var result = try family.execute(std.testing.allocator, request);
+        var result = if (external.family_update_planning)
+            try family.resolveUpdateLock(std.testing.allocator, request)
+        else
+            try family.execute(std.testing.allocator, request);
         defer result.deinit();
         if (result.result.lock_path) |path| {
             const borrowed = request.lock_output orelse request.lock_input.?;
@@ -5835,6 +5845,7 @@ fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: any
             .install => .install,
             .remove => .remove,
             .upgrade_all => .upgrade_all,
+            .upgrade => return error.InvalidExternalWorkflowRequest,
         },
         .selectors = external.workflow.selectors,
         .options = external.workflow.options,
@@ -5991,6 +6002,7 @@ fn recoverExternalNativeWorkflow(allocator: std.mem.Allocator, external: anytype
             .install => .install,
             .remove => .remove,
             .upgrade_all => .upgrade_all,
+            .upgrade => return error.InvalidExternalWorkflowRequest,
         },
         .mode = .recover,
         .selectors = external.workflow.selectors,
@@ -7083,6 +7095,73 @@ test "production package family native resolution refuses cache misses and unsig
     const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(1024));
     defer allocator.free(status);
     try std.testing.expectEqualStrings("", status);
+}
+
+test "production package family update resolution binds selectors and replays offline without mutation" {
+    const family = @import("package_family_backend.zig");
+    const allocator = std.testing.allocator;
+    const original_status = "Package: alpha\nVersion: 0\nArchitecture: amd64\nStatus: install ok installed\n\n" ++
+        "Package: shared\nVersion: 1\nArchitecture: amd64\nStatus: install ok installed\n";
+    for ([_]?[]const u8{ "alpha:amd64=1", null }) |package| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.initWithRepository(
+            allocator,
+            &directory,
+            original_status,
+            @embedFile("fixtures/batch_workflow/InRelease"),
+            @embedFile("fixtures/batch_workflow/Packages"),
+            @embedFile("fixtures/batch_workflow/keyring.gpg"),
+        );
+        defer fixture.deinit();
+        const backend: family.NativeBackend = .{ .io = std.testing.io, .now_unix = 1_788_796_860 };
+        var request: family.Request = .{
+            .schema = family.native_request_schema,
+            .version = family.native_schema_version,
+            .operation = .resolve_lock,
+            .root = fixture.install_root,
+            .architecture = .amd64,
+            .sources = &fixture.source_paths,
+            .keyrings = &fixture.keyring_paths,
+            .cache = fixture.cache_path,
+            .state = fixture.state_path,
+            .package = package,
+            .lock_output = fixture.lock_path,
+        };
+        var planned = try backend.resolveUpdateLock(allocator, request);
+        defer planned.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, planned.result.exit_status);
+        try std.testing.expect(!planned.result.changed and planned.result.provenance_path == null);
+        try std.testing.expect(planned.native_install == null and planned.native_completion == null);
+        try std.testing.expect(planned.result.lock_path.?.ptr != fixture.lock_path.ptr);
+        var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+        defer lock.deinit();
+        const selectors: []const solver.PackageSelector = if (package) |value| &.{parseSelector(value)} else &.{};
+        const digest = try semanticRequestDigest(allocator, if (package != null) .upgrade else .upgrade_all, null, selectors);
+        try std.testing.expectEqual(digest, lock.native.lock.request_sha256);
+        try std.testing.expectEqual(@as(usize, 2), lock.native.lock.packages.len);
+        try std.testing.expectEqualStrings("alpha", lock.native.lock.packages[0].name);
+        try std.testing.expectEqualStrings("1", lock.native.lock.packages[0].version);
+        try std.testing.expectEqualStrings("shared", lock.native.lock.packages[1].name);
+        const bytes = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v2.maximum_document_bytes);
+        defer allocator.free(bytes);
+        try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/InRelease");
+        try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/main/binary-amd64/Packages");
+        request.cache_mode = .offline;
+        request.lock_output = fixture.second_lock_path;
+        var cached = try backend.resolveUpdateLock(allocator, request);
+        defer cached.deinit();
+        try std.testing.expectEqual(api.ExitStatus.success, cached.result.exit_status);
+        const cached_bytes = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v2.maximum_document_bytes);
+        defer allocator.free(cached_bytes);
+        try std.testing.expectEqualSlices(u8, bytes, cached_bytes);
+        const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(4096));
+        defer allocator.free(status);
+        try std.testing.expectEqualStrings(original_status, status);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/root-operation-v1.json", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/native-execution-intent-v1.json", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/native-transaction-provenance-v1.json", .{}));
+    }
 }
 
 test "production workflow plans a successful batch install into one exact lock" {
