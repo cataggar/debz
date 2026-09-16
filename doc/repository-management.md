@@ -430,8 +430,8 @@ add a separate deadline guard to each unlink. Interruptions retain the original
 caller for fresh scoped recovery, including partial acknowledgment. Repeating
 completion after root clear is supported only under the same still-held caller.
 Use the read-only historical adapter below under a fresh clean caller after
-root clear. Unchanged/no-receipt outcomes and public/private dispatch remain
-separate work.
+root clear. The separate unchanged adapter below handles operations without
+package execution. Public/private dispatch remains separate work.
 Call `deinit` on the returned owned `NativeRepositoryCompletion`.
 
 ### Resuming the native repository pipeline
@@ -462,13 +462,15 @@ The owned `NativeRepositoryResume` explicitly distinguishes:
   known-failed package outcomes and the completion ordering above.
 - `historical`: verified latest matching retained history under a different,
   clean held caller, without replaying execution or publishing new completion.
+- `unchanged`: completed bootstrap backed by genuine no-execution preparation,
+  with no native transaction receipt or mutated-caller completion document.
 
 Completed repository state skips import/refresh and resumes acknowledgment from
 retained proof even after native blobs are gone. A fresh clean caller encountering
-advanced repository evidence uses historical verification instead of interpreting
-it as not-started or reinstalling. Missing, corrupt or mismatched history refuses;
-it never starts replacement execution. Actual unchanged/no-receipt completion
-remains separate work. Call `deinit` on the returned result; none of these
+advanced repository evidence uses historical verification or the separately
+identified no-execution adapter instead of interpreting it as not-started or
+reinstalling. Missing, corrupt or mismatched evidence refuses; it never starts
+replacement execution. Call `deinit` on the returned result; none of these
 outcomes releases the supplied caller's lock.
 
 ### Reading retained native repository history
@@ -506,6 +508,53 @@ fresh caller's record and lock. This intentionally recognizes only the **latest
 matching history**: a newer shared completion/receipt or changed live state
 refuses, even if an older operation-local document still exists. It is not an
 arbitrary historical lookup, unchanged-result adapter or CLI activation.
+
+### Completing native bootstrap without package execution
+
+`completeUnchangedNative` takes a `NativeUnchangedRequest` containing the
+original `NativeRecoveryRequest`, optionally the original acquired descriptor
+bytes, and the usual import/refresh dependencies. Original state, executable
+plan and v2 lock must already exist. The action and ordered-action lists must
+be empty, but the lock must still bind the installed descriptor's genuine
+artifact origin, digest and identity. An empty lock or a clean caller alone
+does not establish successful bootstrap.
+
+`Runtime.verifyUnchanged` must actually return no-execution preparation against
+the complete current package database. It supplies no archives to execution,
+publishes no native intent/helper/program and runs no maintainer scripts.
+Pending native work, required execution or unsupported preparation refuses.
+The already-installed descriptor and managed source/keyring bytes must match
+the original archive. The full database generation and final-state digest,
+including unrelated installed packages and holds, are checked throughout
+publication and again before caller cleanup.
+
+The original archive is retained privately as `native-unchanged-descriptor.deb`.
+After retention, retries use those bytes rather than a URL or CAS. The separate
+`native-repository-unchanged-v1.json` document records real **no-execution
+evidence**, not a native transaction receipt: `changed=false`, `action_count=0`
+and `receipt=null`. It binds the publishing caller's identity, original
+request/policy, root inode and architecture, plan, lock, descriptor and complete
+database digests. Its digest is SHA-256 over canonical JSON without
+`digest_sha256`. Generic repository state points to this document through its
+existing `provenance_path`; the state-v1 format and legacy semantics are unchanged.
+
+The adapter reuses installed-material import and authenticated refresh under the
+original absolute deadline. `no_refresh` skips network metadata acquisition.
+Only after durable `phase=complete` and fresh input/live-state checks does it
+complete the unexecuted caller as `abandoned_before_mutation` and clear its root
+record, retaining the lock. It never fabricates mutation evidence, publishes a
+`root-operation-completion-v1` document, or acknowledges a nonexistent receipt.
+The owned `NativeRepositoryUnchanged` includes the terminal state, verified
+database digests and current caller ID; call `deinit` when finished.
+
+Interrupted descriptor/evidence/state/import/refresh/cleanup and same-held or
+fresh-caller retries revalidate the original retained evidence. The old proof
+publisher's ID is checked as data, never reconstructed as execution authority.
+Missing bound inputs, altered no-execution proof, changed live database or
+configuration, competing ownership, replaced pins and lost scope/deadline
+refuse without replacing that evidence. An already-bound missing archive is
+not recreated even when the caller offers identical bytes. Full native
+repository public/private-runner dispatch remains gated.
 
 ## Descriptor and repository trust
 

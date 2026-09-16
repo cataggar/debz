@@ -465,6 +465,22 @@ eight historical files' bytes/inodes with a pre-read snapshot and checks that th
 new caller has no execution program or mutation evidence. Operation-scoped lock
 units preserve strict full-closure behavior for other native consumers.
 
+Two additional private-root cases start with an already-installed descriptor
+and genuine descriptor-bound v2 lock, then complete bootstrap with and without
+refresh. They require actual no-execution preparation, retain the original
+archive and dedicated no-execution evidence, and exercise interruptions through
+import/refresh, terminal state, caller abandonment and root clear. Same-held
+and fresh callbacks converge without native receipts, programs, helpers,
+maintainer scripts or mutated-caller completion documents.
+
+The cases also cover refresh failure, missing/symlinked/replaced inputs,
+unavailable bound archives even when identical bytes are offered, corrupt
+no-execution proof, changed installed material and unrelated held-package state,
+competing native/deferred ownership, deadline/projection loss and selected
+allocation failures. The oracle validates the no-execution schema and canonical
+digest, original proof publisher and current unexecuted caller, descriptor/lock/
+plan binding, unchanged dpkg status and absence of native execution artifacts.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2
