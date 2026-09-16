@@ -74,6 +74,7 @@
               "enum": [
                 "install",
                 "upgrade",
+                "upgrade_all",
                 "reinstall",
                 "remove"
               ]

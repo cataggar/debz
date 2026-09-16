@@ -49,6 +49,8 @@ pub const CrashPoint = enum {
     after_trigger_outcome,
     after_provenance,
     after_active_clear,
+    before_scriptless_trigger_completion,
+    after_scriptless_trigger_completion,
 };
 
 pub const CrashController = struct {

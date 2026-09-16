@@ -848,7 +848,7 @@ jobs:
               -o Acquire::https::Timeout=30 update
             sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
-      - name: Exercise native process crashes, recovery, and provenance
+      - name: Exercise native recovery and signed-suite consumer parity
         run: |
           zig build test-native-recovery -j2 --summary all
           zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all

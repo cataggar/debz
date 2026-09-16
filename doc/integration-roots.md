@@ -43,6 +43,25 @@ automatically derived trigger authority, private helper invocation, coalesced
 activation, and the final triggered postinst trace. This does not claim full
 native transaction parity.
 
+`zig build test-native-recovery` also compares the native public core CLI,
+native package-family adapter, and reference dpkg across both signed fixture
+suites. Its 24-row matrix covers Pre-Depends, versioned Provides, dependency
+cycles, Recommends on/off, a Multi-Arch package, suite-specific trigger metadata,
+upgrade-all, held unchanged updates, both conffile policies, and known script
+failure. Plans must be identical for identical installed inputs; execution
+compares payloads, package/trigger databases and script traces, then independently
+checks retained native evidence and receipt-bound completion. The fixtures seed
+a real package-owned helper target and require its bytes and inode to survive.
+No-op results must not invent completion or provenance.
+
+For a focused run, use
+`zig build test-native-recovery -Dnative-consumer-parity-only=true -j2`.
+It includes crash/restart cases around scriptless handler settlement, with
+mixed scripted/scriptless handlers and original archives evicted before
+recovery. The full required recovery jobs run this coverage in Debug and
+ReleaseSafe on matching amd64 and arm64 runners. This is hermetic consumer
+parity, not real vendor-snapshot acceptance or native-only production cutover.
+
 ## Support claims
 
 The suite names identify fixture contracts, not downloaded vendor root
@@ -74,6 +93,8 @@ real-snapshot matrix in `.github/workflows/ci.yml`. It runs natively on
 `https://snapshot.ubuntu.com/ubuntu/20260816T000000Z`, suite `resolute`,
 component `main`, and the explicit Ubuntu archive keyring. Inputs remain
 visible but validation rejects any value other than that reviewed snapshot.
+Here "natively" describes the runner architecture: this snapshot lane still
+uses the default legacy transaction backend, not native transaction execution.
 
 Each row uses the production CLI to authenticate metadata, resolve and review
 an exact `ubuntu-minimal` closure lock without mutating a root, download and

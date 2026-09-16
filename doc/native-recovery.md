@@ -65,6 +65,14 @@ continuation preserves authenticated activations, handler scheduling and cycle
 signatures, and the independently derived deferred final-state expectation.
 Neither a completed handler nor its queued activation may be duplicated.
 
+Package-state no-ops are checkpointed as observed state, so recovery can consume
+them even after later trigger work changes the package to pending or awaited.
+Already-completed configuration/state phases are consumed before rebuilding
+obsolete intermediate states; managed-state verification still runs first.
+Absent-postinst handlers journal only their database transition, never a
+fabricated script outcome. Restart continues the remaining handler database
+phases without reusing completed phase identities.
+
 ## Provenance and completion
 
 ### Private v1 operation ownership

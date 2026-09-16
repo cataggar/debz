@@ -23,7 +23,7 @@ pub const Handler = struct {
     version: []const u8,
     architecture: []const u8,
     source: ScriptSource,
-    postinst_sha256: [32]u8,
+    postinst_sha256: ?[32]u8,
     declarations_sha256: [32]u8,
 };
 
@@ -71,7 +71,7 @@ const WireIdentity = struct {
 const WireHandler = struct {
     package: WireIdentity,
     source: ScriptSource,
-    postinst_sha256: []const u8,
+    postinst_sha256: ?[]const u8,
     declarations_sha256: []const u8,
 };
 
@@ -142,7 +142,8 @@ pub fn authorityJson(
     var handler_digests = try allocator.alloc([2][64]u8, authority.handlers.len);
     defer allocator.free(handler_digests);
     for (authority.handlers, 0..) |handler, index| {
-        handler_digests[index][0] = hex(handler.postinst_sha256);
+        if (handler.postinst_sha256) |digest|
+            handler_digests[index][0] = hex(digest);
         handler_digests[index][1] = hex(handler.declarations_sha256);
         handlers[index] = .{
             .package = .{
@@ -151,7 +152,10 @@ pub fn authorityJson(
                 .architecture = handler.architecture,
             },
             .source = handler.source,
-            .postinst_sha256 = &handler_digests[index][0],
+            .postinst_sha256 = if (handler.postinst_sha256 != null)
+                &handler_digests[index][0]
+            else
+                null,
             .declarations_sha256 = &handler_digests[index][1],
         };
     }
@@ -240,7 +244,10 @@ pub fn decodeAuthority(
             .version = handler.package.version,
             .architecture = handler.package.architecture,
             .source = handler.source,
-            .postinst_sha256 = try parseHex(handler.postinst_sha256),
+            .postinst_sha256 = if (handler.postinst_sha256) |value|
+                try parseHex(value)
+            else
+                null,
             .declarations_sha256 = try parseHex(handler.declarations_sha256),
         };
     }
@@ -838,7 +845,7 @@ test "native_trigger authority binds exact dynamic caller evidence" {
         .version = "1",
         .architecture = "amd64",
         .source = .installed_package,
-        .postinst_sha256 = @splat(0x11),
+        .postinst_sha256 = @as([32]u8, @splat(0x11)),
         .declarations_sha256 = @splat(0x22),
     }};
     const callers = [_]Caller{.{
@@ -888,6 +895,43 @@ test "native_trigger authority binds exact dynamic caller evidence" {
     wrong_program.program_sha256 = @splat(0x33);
     wrong_program.version = "2";
     try std.testing.expect(!callerAuthorized(decoded.authority, wrong_program));
+}
+
+test "native_trigger absent postinst roundtrips without authorizing a caller" {
+    const handlers = [_]Handler{.{
+        .package = "receiver",
+        .version = "1",
+        .architecture = "amd64",
+        .source = .installed_package,
+        .postinst_sha256 = null,
+        .declarations_sha256 = @splat(0x22),
+    }};
+    const authority: Authority = .{
+        .program_sha256 = @splat(0x33),
+        .attempt_id = @splat(0x44),
+        .initial_state_sha256 = @splat(0x55),
+        .handlers = &handlers,
+        .callers = &.{},
+        .allowed_triggers = &.{"debz-trigger"},
+        .maximum_invocations = 8,
+    };
+    const bytes = try authorityJson(std.testing.allocator, authority);
+    defer std.testing.allocator.free(bytes);
+    var decoded = try decodeAuthority(std.testing.allocator, bytes);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.authority.handlers[0].postinst_sha256 == null);
+    try std.testing.expect(!callerAuthorized(decoded.authority, .{
+        .program_sha256 = @splat(0x33),
+        .package = "receiver",
+        .version = "1",
+        .architecture = "amd64",
+        .kind = .postinst,
+        .source = .installed_package,
+        .script_sha256 = @splat(0),
+    }));
+    const roundtrip = try authorityJson(std.testing.allocator, decoded.authority);
+    defer std.testing.allocator.free(roundtrip);
+    try std.testing.expectEqualStrings(bytes, roundtrip);
 }
 
 test "native_trigger malformed queue controls fail closed" {
@@ -953,7 +997,7 @@ test "native_trigger invocation authority refuses absent stale and mismatched ev
         .version = "1",
         .architecture = "amd64",
         .source = .installed_package,
-        .postinst_sha256 = @splat(0x11),
+        .postinst_sha256 = @as([32]u8, @splat(0x11)),
         .declarations_sha256 = @splat(0x22),
     }};
     const callers = [_]Caller{.{
