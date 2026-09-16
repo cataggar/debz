@@ -481,6 +481,20 @@ allocation failures. The oracle validates the no-execution schema and canonical
 digest, original proof publisher and current unexecuted caller, descriptor/lock/
 plan binding, unchanged dpkg status and absence of native execution artifacts.
 
+The same family exercises `Backend.nativeInterface()` through the public
+repository request/result API inside genuine projected callbacks. Fresh changed
+and held unchanged descriptors, each with refresh and no-refresh, cover actual
+acquisition/planning rather than pre-staged executable inputs. Further cases
+cover known script failure, interruption after native intent, locked-state
+publication and caller completion, revoked projection authority, post-install
+refresh failure and acquisition deadline expiry. Fresh callback retries and
+historical readback run after descriptor CAS eviction, with descriptor transport
+disabled once native inputs are retained. A forbidden legacy process hook
+ensures the typed path does not use command execution. The independent oracle
+validates canonical API results, native versus no-execution evidence, preserved
+holds, exact script traces and helper bytes/inodes, and final caller cleanup.
+The public CLI activation gate is unchanged.
+
 ```sh
 zig build test-native-recovery -j2
 zig build test-native-recovery -Doptimize=ReleaseSafe -j2

@@ -553,8 +553,39 @@ publisher's ID is checked as data, never reconstructed as execution authority.
 Missing bound inputs, altered no-execution proof, changed live database or
 configuration, competing ownership, replaced pins and lost scope/deadline
 refuse without replacing that evidence. An already-bound missing archive is
-not recreated even when the caller offers identical bytes. Full native
-repository public/private-runner dispatch remains gated.
+not recreated even when the caller offers identical bytes.
+
+### Scoped native repository request dispatch
+
+`Backend.nativeInterface()` implements the repository request/result API inside
+an existing supervised `live_root.runProjected` callback. It requires explicit
+`.native` selection and that callback's borrowed `root_projection`; it refuses
+command-oriented native executor injection. `Backend.interface()` and the CLI
+remain gated separately until public private-runner transport is integrated.
+
+The scoped interface reserves one original repository caller and includes root
+and repository lock waits in the same invocation deadline as acquisition,
+planning, native execution or persisted recovery, import/refresh and completion.
+Existing native state is resumed before descriptor acquisition or legacy
+provenance/journal classification. Completed native callers are authenticated
+for completion-only adoption, never generically cleared ahead of acknowledgment.
+
+Fresh requests reuse descriptor authentication, dependency planning and bounded
+acquisition. Native operation state binds the executable plan digest expected by
+the native caller, while legacy state retains its existing canonical-file
+digest. Changed plans use the verified native CAS closure and joined completion
+pipeline, not the command-oriented executor bridge. A genuinely unchanged
+installed descriptor gets an empty action plan and a descriptor-bound v2 lock
+that preserves its installed hold selection; it goes directly to no-execution
+completion, without loading execution archives or fabricating an action.
+
+The interface returns owned, canonical repository API results. Known package
+failure stays failed; pending recovery cannot become successful bootstrap.
+Historical and unchanged results report `changed=false`. Verified in-memory
+checkpoint snapshots retain truthful installed/imported/refresh progress when
+later publication, refresh or deadline handling fails. Error reporting neither
+reloads replaced inputs nor rewrites native lifecycle state. Release the result
+with `deinit`; projection authority never escapes the callback.
 
 ## Descriptor and repository trust
 
