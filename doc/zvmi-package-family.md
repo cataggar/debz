@@ -54,8 +54,8 @@ reproducibility evidence.
 ## Native family workflows
 
 The separate `debz.NativePackageFamilyBackend` provides native version-2
-`resolve_lock`, `create`, `customize`, `update` and `recover` without changing the legacy
-adapter or converting v1 locks.
+`resolve_lock`, `create`, `customize`, `update`, `recover` and `inspect` without
+changing the legacy adapter or converting v1 locks.
 Requests execute through this library API; capability discovery is metadata
 only and does not introduce a package-family execution CLI.
 Initialize it with the caller's `std.Io`; it constructs the real native
@@ -141,12 +141,52 @@ recovery returns no new provenance and does not turn a prior failed install
 into success. Unknown script outcomes remain unresolved without replay;
 another outer owner's marker cannot be finalized through this adapter.
 
-Native capability discovery advertises these five operations, exact-lock v2,
+Native capability discovery advertises all six operations, exact-lock v2,
 native transaction provenance and disposable-or-recoverable roots, with no
-apt/dpkg invocation. Native inspection remains unavailable before filesystem
-work until its result contract is integrated. Selecting native never
-falls back to the legacy family adapter, and the ordinary v1 adapter rejects
-v2 requests.
+apt/dpkg invocation. Selecting native never falls back to the legacy family
+adapter, and the ordinary v1 adapter rejects v2 requests.
+
+### Diagnostic inspection
+
+`execute` with `operation = .inspect` returns an owned `native_inspection`
+companion, separately from the unchanged common v2 `result`. Retain it
+separately if serializing only `result`; all inventory strings and arrays live
+until `OwnedResult.deinit`. The companion contains the root, whether the status
+file was present, and every parsed package record sorted by name/architecture.
+Each package includes its version, architecture, and full typed status:
+selection (`want`), error state, and current state. Held, partially configured,
+and config-files-only records are not silently filtered out.
+
+Inspection accepts explicit root, architecture/foreign architectures,
+cache/state paths and an optional invocation deadline. Cache/state paths are
+syntactically validated but not read or created. Repository/config/keyring,
+credential/proxy, package filters, lock input/output and nondefault execution
+policy are refused. Leave `lock_wait_ms` at its default: inspection does not
+acquire or wait for a coordination lock. The deadline is checked between
+bounded read/parse stages. Architecture inputs retain request validation;
+records report their stored architectures rather than being filtered or
+attested against the requested architecture.
+
+The companion always marks `diagnostic_only = true`. It also reports an
+observed root operation's backend/operation/state/mutation flag, an observed
+deferred-owner state, and whether native active evidence was observed. These
+are separate diagnostic observations, **not an atomic database generation or
+proof of a healthy, settled or exactly installed root**. A missing status file
+is reported explicitly with an empty inventory; absence alone does not prove
+a fresh root. Malformed, unreadable or linked status/coordination documents
+fail explicitly rather than becoming an empty or clean result. The active
+evidence flag only reports recognized pending artifacts, not verification of
+their contents.
+
+Fresh and recovery-required roots can be inspected, including while another
+caller holds the coordination lock. Root-anchored reads do not follow
+symlinks, and literal host roots or unscoped host-root aliases are refused.
+Inspection creates no database, namespace, lock, helper, cache or state files,
+does not recover or acknowledge anything, and never emits install/completion
+evidence, a reviewed lock path or provenance. Concurrent writers can change
+the root during or after inspection; successful inspection only means the
+diagnostic observations were obtained. It never authorizes image publication
+or replaces the completed-success proof below.
 
 ## Read-only native completion evidence
 
@@ -210,5 +250,5 @@ every returned binding with the independently verified native documents while
 the root lock remains held. A different attempt, altered binding or relabeled
 failure cannot stand in for that result. The older `verifyCompletedSuccess`
 continues to describe matching retained history without asserting which
-invocation returned it. Both methods are read-only, require genuine evidence,
-and do not bypass the remaining native inspection gate.
+invocation returned it. Both methods are read-only and require genuine
+evidence; diagnostic inspection cannot substitute for either proof.

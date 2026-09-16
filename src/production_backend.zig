@@ -5583,7 +5583,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             try std.testing.expect(path.ptr != borrowed.ptr);
         }
         if (external.native_evidence_output) |path|
-            try writeExternalNativeEvidence(allocator, path, result.native_install, result.native_completion);
+            try writeExternalNativeEvidence(allocator, path, result.native_install, result.native_completion, result.native_inspection);
         try writeExternalNativeWorkflowReport(external.report, try std.json.Stringify.valueAlloc(allocator, result.result, .{}));
         return;
     }
@@ -5770,7 +5770,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     } else result: {
         const outcome = try backend.executeWorkflow(allocator, requested);
         if (external.native_evidence_output) |path|
-            try writeExternalNativeEvidence(allocator, path, outcome.native_install, outcome.native_completion);
+            try writeExternalNativeEvidence(allocator, path, outcome.native_install, outcome.native_completion, null);
         break :result try outcome.canonicalJson(allocator);
     };
     try writeExternalNativeWorkflowReport(external.report, output);
@@ -5781,7 +5781,14 @@ fn writeExternalNativeEvidence(
     path: []const u8,
     install: ?api.NativeInstallEvidence,
     completion: ?api.NativeCompletionEvidence,
+    inspection: ?@import("package_family_backend.zig").NativeInspection,
 ) !void {
+    if (inspection) |value|
+        return writeExternalNativeWorkflowReport(path, try std.json.Stringify.valueAlloc(allocator, .{
+            .native_completion = completion,
+            .native_install = install,
+            .native_inspection = value,
+        }, .{}));
     try writeExternalNativeWorkflowReport(path, try std.json.Stringify.valueAlloc(allocator, .{
         .native_completion = completion,
         .native_install = install,
@@ -7162,6 +7169,105 @@ test "production package family update resolution binds selectors and replays of
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/native-execution-intent-v1.json", .{}));
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz/native-transaction-provenance-v1.json", .{}));
     }
+}
+
+fn nativeFamilyInspectionRequest(fixture: ProductionWorkflowFixture) @import("package_family_backend.zig").Request {
+    const family = @import("package_family_backend.zig");
+    return .{
+        .schema = family.native_request_schema,
+        .version = family.native_schema_version,
+        .operation = .inspect,
+        .root = fixture.install_root,
+        .architecture = .amd64,
+        .foreign_architectures = &.{.arm64},
+        .sources = &.{},
+        .keyrings = &.{},
+        .cache = fixture.cache_path,
+        .state = fixture.state_path,
+    };
+}
+
+test "production native family inspection owns all package states without execution or root writes" {
+    const family = @import("package_family_backend.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const status = "Package: zeta\nVersion: 2\nArchitecture: arm64\nStatus: deinstall ok config-files\n\n" ++
+        "Package: beta\nVersion: 3\nArchitecture: amd64\nStatus: install reinstreq half-configured\n\n" ++
+        "Package: alpha\nVersion: 1\nArchitecture: arm64\nMulti-Arch: same\nStatus: hold ok installed\n\n" ++
+        "Package: alpha\nVersion: 1\nArchitecture: amd64\nMulti-Arch: same\nStatus: hold ok installed\n";
+    var fixture = try ProductionWorkflowFixture.init(std.testing.allocator, &directory, status);
+    defer fixture.deinit();
+    try directory.dir.deleteDir(std.testing.io, "root/var/lib/debz");
+    const request = nativeFamilyInspectionRequest(fixture);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn exercise(allocator: std.mem.Allocator, input: family.Request) !void {
+            const backend: family.NativeBackend = .{ .io = std.testing.io };
+            var result = try backend.execute(allocator, input);
+            defer result.deinit();
+            try std.testing.expect(result.result.succeeded and !result.result.changed);
+            try std.testing.expect(result.result.lock_path == null and result.result.provenance_path == null);
+            try std.testing.expect(result.native_install == null and result.native_completion == null);
+            const inspection = result.native_inspection.?;
+            try std.testing.expect(inspection.diagnostic_only and inspection.status_database_present);
+            try std.testing.expect(inspection.root.ptr != input.root.ptr);
+            try std.testing.expectEqualStrings(input.root, inspection.root);
+            try std.testing.expect(inspection.observed_operation == null and inspection.deferred_owner == null);
+            try std.testing.expect(!inspection.native_active_evidence);
+            try std.testing.expectEqual(@as(usize, 4), inspection.packages.len);
+            try std.testing.expectEqualStrings("alpha", inspection.packages[0].name);
+            try std.testing.expectEqualStrings("amd64", inspection.packages[0].architecture);
+            try std.testing.expectEqualStrings("arm64", inspection.packages[1].architecture);
+            try std.testing.expectEqual(dpkg_status.Want.hold, inspection.packages[0].status.want);
+            try std.testing.expectEqualStrings("beta", inspection.packages[2].name);
+            try std.testing.expect(inspection.packages[2].status.requiresRepair());
+            try std.testing.expectEqual(dpkg_status.CurrentState.config_files, inspection.packages[3].status.current);
+        }
+    }.exercise, .{request});
+    const unchanged = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings(status, unchanged);
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/debz", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/usr/bin/dpkg-trigger", .{}));
+}
+
+test "production native family inspection distinguishes absent state and refuses invalid or linked metadata" {
+    const family = @import("package_family_backend.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(std.testing.allocator, &directory, "");
+    defer fixture.deinit();
+    const request = nativeFamilyInspectionRequest(fixture);
+    const backend: family.NativeBackend = .{ .io = std.testing.io };
+    try directory.dir.deleteDir(std.testing.io, "root/var/lib/debz");
+    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/status");
+    var absent = try backend.execute(std.testing.allocator, request);
+    defer absent.deinit();
+    try std.testing.expect(absent.result.succeeded and !absent.result.changed);
+    try std.testing.expect(!absent.native_inspection.?.status_database_present);
+    try std.testing.expectEqual(@as(usize, 0), absent.native_inspection.?.packages.len);
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/dpkg/status", .{}));
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "not status metadata\n" });
+    var invalid = try backend.execute(std.testing.allocator, request);
+    defer invalid.deinit();
+    try std.testing.expect(!invalid.result.succeeded and !invalid.result.changed);
+    try std.testing.expectEqual(family.ErrorId.native_inspection_unavailable, invalid.result.diagnostic.?.id);
+    try std.testing.expect(invalid.native_inspection == null);
+    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/status");
+    try directory.dir.symLink(std.testing.io, "/dev/null", "root/var/lib/dpkg/status", .{});
+    var linked = try backend.execute(std.testing.allocator, request);
+    defer linked.deinit();
+    try std.testing.expect(!linked.result.succeeded and !linked.result.changed);
+    try std.testing.expect(linked.native_inspection == null);
+    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/status");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/debz");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/debz/root-operation-v1.json", .data = "invalid root operation\n" });
+    var corrupt = try backend.execute(std.testing.allocator, request);
+    defer corrupt.deinit();
+    try std.testing.expect(!corrupt.result.succeeded and !corrupt.result.changed);
+    try std.testing.expect(corrupt.native_inspection == null);
+    const preserved = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/debz/root-operation-v1.json", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("invalid root operation\n", preserved);
 }
 
 test "production workflow plans a successful batch install into one exact lock" {

@@ -74,6 +74,23 @@ def document(path: Path, maximum: int = 1024 * 1024) -> dict:
     return value
 
 
+def diagnostic_inspection(report: dict, evidence: dict, root: Path) -> dict:
+    assert report["schema"] == "io.github.cataggar.debz.package-family.result.v2"
+    assert report["version"] == 2 and report["operation"] == "inspect"
+    assert report["succeeded"] and report["exit_status"] == "success" and not report["changed"]
+    assert report["lock_path"] is None and report["provenance_path"] is None
+    assert evidence["native_install"] is None and evidence["native_completion"] is None
+    value = evidence["native_inspection"]
+    assert value["diagnostic_only"] is True and value["root"] == str(root)
+    assert isinstance(value["status_database_present"], bool) and isinstance(value["native_active_evidence"], bool)
+    identities = [(package["name"], package["architecture"]) for package in value["packages"]]
+    assert identities == sorted(identities) and len(set(identities)) == len(identities)
+    for package in value["packages"]:
+        assert set(package) == {"name", "version", "architecture", "status"}
+        assert set(package["status"]) == {"want", "error_state", "current"}
+    return value
+
+
 def native(
     executable: Path,
     root: Path,
@@ -1241,6 +1258,18 @@ def exercise_core(executable: Path, helper: Path, workspace: Path, environment: 
             assert document(current.candidate / OPERATION)["attempt_id"] == binding["attempt_id"]
             assert (current.candidate / INTENT).exists()
             assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            inspected = workflow(
+                executable, envelope, current.directory / "family-unknown-inspection", environment,
+                family_execution={**family, "operation": "inspect"}, capture_evidence=True,
+            )
+            observed = diagnostic_inspection(
+                inspected, document(current.directory / "family-unknown-inspection/native-evidence.json"),
+                current.candidate,
+            )
+            assert observed["native_active_evidence"]
+            assert observed["observed_operation"]["state"] == document(current.candidate / OPERATION)["state"]
+            assert document(current.candidate / OPERATION)["attempt_id"] == binding["attempt_id"]
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
         print(f"{name}: native outcome and original evidence preserved", flush=True)
 
 
@@ -1345,7 +1374,7 @@ def exercise_workflows(
         return result
 
     def family_request(current: lifecycle.Scenario, operation: str, package: str | None = None) -> dict:
-        options = request(current, "install", "recover" if operation == "recover" else "execute", [])["options"]
+        options = request(current, "install", "recover" if operation in {"recover", "inspect"} else "execute", [])["options"]
         value = {
             "schema": "io.github.cataggar.debz.package-family.request.v2",
             "version": 2, "operation": operation, "root": str(current.candidate),
@@ -1353,7 +1382,7 @@ def exercise_workflows(
             "keyrings": options.get("keyring_paths", []),
             "cache": options["cache_path"], "state": options["state_path"],
         }
-        if operation != "recover":
+        if operation not in {"recover", "inspect"}:
             value["package"] = package
             value["lock_output" if operation == "resolve_lock" else "lock_input"] = str(current.directory / "workflow.lock.json")
         return value
@@ -1377,6 +1406,26 @@ def exercise_workflows(
             assert result["provenance_path"] == str(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json")
             assert Path(result["provenance_path"]).is_file()
         return result
+
+    def inspect_family(current: lifecycle.Scenario, label: str) -> dict:
+        def inventory() -> list[tuple]:
+            return sorted(
+                (str(path.relative_to(current.candidate)), entry.st_mode, entry.st_ino, entry.st_size, entry.st_mtime_ns)
+                for path in current.candidate.rglob("*")
+                for entry in [path.lstat()]
+            )
+
+        before = inventory()
+        original = triggers.snapshot(current.candidate)
+        value = family_request(current, "inspect")
+        report = run_family(current, label, value)
+        observed = diagnostic_inspection(
+            report, document(current.directory / label / "native-evidence.json"), current.candidate,
+        )
+        assert inventory() == before, "diagnostic inspection changed the staged root"
+        assert not m.oracle.differences(original, triggers.snapshot(current.candidate))
+        assert not Path(value["cache"]).exists() and not Path(value["state"]).exists()
+        return observed
 
     def assert_completion(current: lifecycle.Scenario, lock: dict) -> None:
         receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
@@ -1625,6 +1674,9 @@ def exercise_workflows(
     print("family-recovered-verification: pending refusal and original completed request proof passed", flush=True)
 
     current = scenario("family-native-install")
+    initial = inspect_family(current, "inspect-initial")
+    assert initial["observed_operation"] is None and not initial["native_active_evidence"]
+    assert {package["name"] for package in initial["packages"]} == {"essential-core", "native-helper-target"}
     planned = run_family(current, "family-plan", family_request(current, "resolve_lock", "scenario-main"))
     assert not planned["changed"] and planned["provenance_path"] is None
     assert document(Path(planned["lock_path"]))["version"] == 2
@@ -1639,6 +1691,10 @@ def exercise_workflows(
         environment, reference_dir, packages=[],
     ) == 0
     compare(current.expected, current.candidate)
+    with (current.candidate / NAMESPACE / "root-operation.lock").open("rb") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        inspected = inspect_family(current, "inspect-with-root-lock-held")
+    assert "scenario-main" in {package["name"] for package in inspected["packages"]}
     run_family(current, "family-plan-customize", family_request(current, "resolve_lock", "conffile-pkg"))
     customized = run_family(current, "family-customize", family_request(current, "customize", "conffile-pkg"))
     assert customized["changed"]
@@ -1659,11 +1715,15 @@ def exercise_workflows(
     assert not clean["changed"] and clean["provenance_path"] is None and clean["lock_path"] is None
     assert document(current.directory / "family-clean-recovery/native-evidence.json")["native_completion"] is None
     assert Path(failed["provenance_path"]).read_bytes() == failed_bytes
+    inspected = inspect_family(current, "inspect-known-failure")
+    assert next(package for package in inspected["packages"] if package["name"] == "fail-script")["status"]["current"] != "installed"
     print("family-native-install: genuine create/customize, known failure and clean recovery passed", flush=True)
 
     current = lifecycle.Scenario(workspace, "family-missing-helper", executable, architecture, environment)
     current.seed(archive("essential-core"))
     assert not (current.candidate / triggers.HELPER).exists()
+    inspected = inspect_family(current, "inspect-without-helper")
+    assert [package["name"] for package in inspected["packages"]] == ["essential-core"]
     original_status = (current.candidate / "var/lib/dpkg/status").read_bytes()
     run_family(current, "family-plan", family_request(current, "resolve_lock", "scenario-main"))
     refused = run_family(current, "family-refused", family_request(current, "create", "scenario-main"), None)
@@ -1975,6 +2035,9 @@ def exercise_workflows(
     retained_bytes = (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").read_bytes()
     refused = run_family(current, "family-cannot-finalize-owner", family_request(current, "recover"), "recovery")
     assert not refused["changed"] and refused["provenance_path"] is None
+    assert (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").read_bytes() == retained_bytes
+    inspected = inspect_family(current, "inspect-retained-owner")
+    assert inspected["deferred_owner"] == document(current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json")["state"]
     assert (current.candidate / NAMESPACE / "root-operation-deferred-ack-v1.json").read_bytes() == retained_bytes
     assert_completion(current, lock)
     released = retain_owner(current, "released")

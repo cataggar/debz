@@ -8,6 +8,9 @@ const native_provenance = @import("native_provenance.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
 const solver = @import("solver.zig");
+const dpkg_status = @import("dpkg_status.zig");
+const native_operation = @import("native_operation.zig");
+const native_runtime = @import("native_unpack.zig").Runtime;
 
 pub const schema_version: u32 = 1;
 pub const capability_schema = "io.github.cataggar.debz.package-family.capabilities.v1";
@@ -69,7 +72,7 @@ pub const NativeCapabilities = struct {
     transaction_backend: transaction_engine.Kind = .native,
     family: []const u8 = "debian",
     implementations: []const []const u8 = capabilities().implementations,
-    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "update", "recover" },
+    operations: []const []const u8 = &.{ "resolve-lock", "create", "customize", "update", "recover", "inspect" },
     architectures: []const []const u8 = capabilities().architectures,
     request_schema: []const u8 = native_request_schema,
     result_schema: []const u8 = native_result_schema,
@@ -131,6 +134,7 @@ pub const ErrorId = enum {
     provenance_not_emitted,
     backend_unavailable,
     native_evidence_unavailable,
+    native_inspection_unavailable,
 };
 
 pub const Diagnostic = struct {
@@ -246,11 +250,36 @@ const MappedRequest = struct {
     }
 };
 
+pub const InspectedPackage = struct {
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    status: dpkg_status.Status,
+};
+
+/// Diagnostic observations, not an atomic database generation, completed
+/// transaction proof, or authority to mutate or publish the root.
+pub const NativeInspection = struct {
+    root: []const u8,
+    diagnostic_only: bool = true,
+    status_database_present: bool,
+    packages: []const InspectedPackage,
+    observed_operation: ?struct {
+        backend: root_operation.Backend,
+        operation: root_operation.Operation,
+        state: root_operation.State,
+        mutation_started: bool,
+    },
+    deferred_owner: ?root_operation.DeferredAcknowledgmentState,
+    native_active_evidence: bool,
+};
+
 pub const OwnedResult = struct {
     result: Result,
     arena: std.heap.ArenaAllocator,
     native_install: ?product.NativeInstallEvidence = null,
     native_completion: ?product.NativeCompletionEvidence = null,
+    native_inspection: ?NativeInspection = null,
 
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
@@ -353,18 +382,32 @@ pub const NativeBackend = struct {
         const owned = arena.allocator();
         var native_install: ?product.NativeInstallEvidence = null;
         var native_completion: ?product.NativeCompletionEvidence = null;
+        var native_inspection: ?NativeInspection = null;
         var result: Result = output: {
             if (!std.mem.eql(u8, request.schema, native_request_schema) or request.version != native_schema_version)
                 break :output failure(request.operation, .usage, .invalid_request, "native package-family requests require schema v2", false);
             if (update_planning and request.operation != .resolve_lock)
                 break :output failure(request.operation, .usage, .invalid_request, "native update lock resolution requires a resolve_lock request", false);
-            if (request.operation == .inspect)
-                break :output failure(request.operation, .unavailable, .backend_unavailable, "native package-family inspection is not yet available", false);
             if (!validRequestFor(request, .native, update_planning))
                 break :output failure(request.operation, .usage, .invalid_request, "invalid explicit native package-family request", false);
 
             var mapped = try MappedRequest.init(owned, request);
             defer mapped.deinit();
+            if (request.operation == .inspect) {
+                if (product.validate(mapped.request)) |invalid|
+                    break :output failure(request.operation, invalid.exit_status, .invalid_request, invalid.summary, false);
+                native_inspection = self.readInspection(owned, request) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    break :output failure(
+                        request.operation,
+                        .unavailable,
+                        .native_inspection_unavailable,
+                        try std.fmt.allocPrint(owned, "native diagnostic inspection failed: {s}", .{@errorName(err)}),
+                        false,
+                    );
+                };
+                break :output .{ .operation = .inspect, .succeeded = true, .exit_status = .success };
+            }
             const lock_path = if (request.lock_output orelse request.lock_input) |path|
                 try owned.dupe(u8, path)
             else
@@ -437,9 +480,79 @@ pub const NativeBackend = struct {
             .arena = arena,
             .native_install = native_install,
             .native_completion = native_completion,
+            .native_inspection = native_inspection,
+        };
+    }
+
+    fn readInspection(self: @This(), allocator: std.mem.Allocator, request: Request) !NativeInspection {
+        const started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        var root = try root_fs.openAbsoluteRoot(self.io, request.root);
+        defer root.close();
+        try native_operation.validateInstallRoot(self.io, root.root, request.root, null);
+        const original = try root.root.rootEntry();
+        try checkInspectionDeadline(started_ns, std.Io.Clock.awake.now(self.io).nanoseconds, request.deadline_ms);
+        const status_path = try root_fs.Path.init("var/lib/dpkg/status");
+        const present = try root.root.entryIfExists(status_path) != null;
+        const options: dpkg_status.Options = .{};
+        const bytes = if (present)
+            try root.root.readFileAlloc(allocator, status_path, options.limits.deb822.max_total_bytes)
+        else
+            &.{};
+        defer allocator.free(bytes);
+        var parsed = try dpkg_status.parseBorrowed(allocator, bytes, options);
+        defer if (parsed == .database) parsed.database.deinit();
+        const database = switch (parsed) {
+            .diagnostic => return error.InvalidInstalledState,
+            .database => |value| value,
+        };
+        try checkInspectionDeadline(started_ns, std.Io.Clock.awake.now(self.io).nanoseconds, request.deadline_ms);
+        const packages = try allocator.alloc(InspectedPackage, database.packages.len);
+        for (database.packages, packages) |package, *item| item.* = .{
+            .name = try allocator.dupe(u8, package.name.value),
+            .version = try allocator.dupe(u8, package.version.spelling.value),
+            .architecture = try allocator.dupe(u8, package.architecture.value),
+            .status = package.status,
+        };
+        std.mem.sort(InspectedPackage, packages, {}, lessInspectedPackage);
+
+        const store = root_operation.Store.init(root.root);
+        var operation = try store.read(allocator);
+        defer if (operation) |*value| value.deinit();
+        const owner = try store.readDeferredAcknowledgment(allocator);
+        const active = try native_runtime.hasActiveEvidence(allocator, root.root);
+        var named = try root_fs.openAbsoluteRoot(self.io, request.root);
+        defer named.close();
+        const current = try named.root.rootEntry();
+        if (original.inode != current.inode or original.device != current.device)
+            return error.RootIdentityMismatch;
+        try checkInspectionDeadline(started_ns, std.Io.Clock.awake.now(self.io).nanoseconds, request.deadline_ms);
+        return .{
+            .root = try allocator.dupe(u8, request.root),
+            .status_database_present = present,
+            .packages = packages,
+            .observed_operation = if (operation) |value| .{
+                .backend = value.record.backend,
+                .operation = value.record.operation,
+                .state = value.record.state,
+                .mutation_started = value.record.mutation_started,
+            } else null,
+            .deferred_owner = if (owner) |value| value.state else null,
+            .native_active_evidence = active,
         };
     }
 };
+
+fn lessInspectedPackage(_: void, left: InspectedPackage, right: InspectedPackage) bool {
+    const name_order = std.mem.order(u8, left.name, right.name);
+    if (name_order != .eq) return name_order == .lt;
+    return std.mem.lessThan(u8, left.architecture, right.architecture);
+}
+
+fn checkInspectionDeadline(started_ns: i128, now_ns: i128, deadline_ms: ?u64) error{DeadlineExceeded}!void {
+    if (deadline_ms) |limit|
+        if (now_ns - started_ns >= @as(i128, limit) * std.time.ns_per_ms)
+            return error.DeadlineExceeded;
+}
 
 fn nativeEvidenceFailure(operation: Operation, changed: bool, message: []const u8) Result {
     var result = failure(operation, .recovery, .native_evidence_unavailable, message, true);
@@ -503,12 +616,13 @@ fn validRequestFor(request: Request, kind: transaction_engine.Kind, update_plann
     if (!std.mem.eql(u8, request.schema, expected_schema) or request.version != expected_version) return false;
     if (update_planning and (kind != .native or request.operation != .resolve_lock)) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
-    if (kind == .native and request.operation == .recover) {
+    if (kind == .native and (request.operation == .recover or request.operation == .inspect)) {
         return request.package == null and request.lock_input == null and request.lock_output == null and
             request.sources.len == 0 and request.configs.len == 0 and request.keyrings.len == 0 and
             request.credential_reference == null and request.proxy == null and
             request.cache_mode == .online and request.repository_policy == .strict_priority and
             !request.recommends and !request.allow_downgrade and request.conffile == .keep_existing and
+            (request.operation != .inspect or request.lock_wait_ms == 30_000) and
             (request.deadline_ms == null or request.deadline_ms.? != 0);
     }
     if ((request.sources.len == 0 and request.configs.len == 0) or
@@ -590,19 +704,19 @@ test "capabilities are versioned and apt-free" {
     try std.testing.expectEqualStrings("arm64", value.architectures[1]);
 }
 
-test "native capabilities advertise integrated native mutation and recovery contracts" {
+test "native capabilities advertise integrated native family contracts" {
     const value = nativeCapabilities();
     try std.testing.expectEqual(native_schema_version, value.version);
     try std.testing.expectEqual(transaction_engine.Kind.native, value.transaction_backend);
     try std.testing.expectEqualStrings(exact_lock_v2.schema_id, value.exact_lock_schema);
-    try std.testing.expectEqual(@as(usize, 5), value.operations.len);
+    try std.testing.expectEqual(@as(usize, 6), value.operations.len);
     try std.testing.expectEqualStrings("resolve-lock", value.operations[0]);
     try std.testing.expectEqualStrings(native_provenance.schema_id, value.provenance_schema.?);
     try std.testing.expect(!value.invokes_apt and !value.invokes_dpkg);
     const bytes = try value.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"recovery\":\"disposable_or_recoverable\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\",\"create\",\"customize\",\"update\",\"recover\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\",\"create\",\"customize\",\"update\",\"recover\",\"inspect\"]") != null);
 }
 
 test "capability backend selection preserves defaults and rejects ambiguous options" {
@@ -618,7 +732,7 @@ test "capability backend selection preserves defaults and rejects ambiguous opti
     }) |arguments| try std.testing.expectError(error.InvalidCapabilityOptions, parseCapabilitiesBackend(arguments));
 }
 
-test "native family version and operation gates run before filesystem access" {
+test "native family version gates run before filesystem access" {
     const backend: NativeBackend = .{ .io = std.testing.io };
     var request: Request = .{
         .operation = .resolve_lock,
@@ -637,14 +751,6 @@ test "native family version and operation gates run before filesystem access" {
     try std.testing.expectEqualStrings(native_result_schema, old.result.schema);
     request.schema = native_request_schema;
     request.version = native_schema_version;
-    for ([_]Operation{.inspect}) |operation| {
-        request.operation = operation;
-        var result = try backend.execute(std.testing.allocator, request);
-        defer result.deinit();
-        try std.testing.expectEqual(product.ExitStatus.unavailable, result.result.exit_status);
-        try std.testing.expectEqual(ErrorId.backend_unavailable, result.result.diagnostic.?.id);
-        try std.testing.expect(!result.result.changed and result.result.provenance_path == null);
-    }
     var fake: Fake = .{};
     const legacy: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
     request.operation = .resolve_lock;
@@ -716,6 +822,55 @@ test "native family recovery rejects replacement inputs and execution policy bef
         try std.testing.expect(!refused.result.changed and refused.result.provenance_path == null);
         try std.testing.expect(refused.native_completion == null and refused.native_install == null);
     }
+}
+
+test "native diagnostic inspection rejects execution inputs and lock waiting" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    const original: Request = .{
+        .schema = native_request_schema,
+        .version = native_schema_version,
+        .operation = .inspect,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{},
+        .keyrings = &.{},
+        .cache = "/unused-family-cache",
+        .state = "/unused-family-state",
+    };
+    try std.testing.expect(validRequest(original, .native));
+    var variants: [17]Request = @splat(original);
+    variants[0].root = "/";
+    variants[1].package = "filter";
+    variants[2].sources = &.{"/unused-source"};
+    variants[3].configs = &.{"/unused-config"};
+    variants[4].keyrings = &.{"/unused-key"};
+    variants[5].lock_input = "/unused-lock";
+    variants[6].lock_output = "/unused-output";
+    variants[7].credential_reference = "/unused-credential";
+    variants[8].proxy = "http://example.invalid";
+    variants[9].recommends = true;
+    variants[10].allow_downgrade = true;
+    variants[11].repository_policy = .best_version;
+    variants[12].conffile = .use_package_version;
+    variants[13].cache_mode = .offline;
+    variants[14].lock_wait_ms = 1;
+    variants[15].deadline_ms = 0;
+    variants[16].foreign_architectures = &.{.amd64};
+    for (variants) |request| {
+        var refused = try backend.execute(std.testing.allocator, request);
+        defer refused.deinit();
+        try std.testing.expectEqual(product.ExitStatus.usage, refused.result.exit_status);
+        try std.testing.expect(!refused.result.changed);
+        try std.testing.expect(refused.result.lock_path == null and refused.result.provenance_path == null);
+        try std.testing.expect(refused.native_inspection == null and refused.native_install == null and refused.native_completion == null);
+    }
+}
+
+test "native diagnostic deadline uses the complete elapsed budget without overflow" {
+    try checkInspectionDeadline(10, 10 + std.time.ns_per_ms - 1, 1);
+    try std.testing.expectError(error.DeadlineExceeded, checkInspectionDeadline(10, 10 + std.time.ns_per_ms, 1));
+    try checkInspectionDeadline(0, std.math.maxInt(u64), std.math.maxInt(u64));
+    try checkInspectionDeadline(0, std.math.maxInt(i128), null);
 }
 
 test "native update resolution is explicit and preserves ordinary request admission" {
