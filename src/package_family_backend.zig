@@ -1,11 +1,18 @@
 const std = @import("std");
 const product = @import("product_api.zig");
+const production = @import("production_backend.zig");
+const transaction_engine = @import("transaction_engine.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
 
 pub const schema_version: u32 = 1;
 pub const capability_schema = "io.github.cataggar.debz.package-family.capabilities.v1";
 pub const request_schema = "io.github.cataggar.debz.package-family.request.v1";
 pub const result_schema = "io.github.cataggar.debz.package-family.result.v1";
 pub const provenance_basename = "transaction-result.json";
+pub const native_schema_version: u32 = 2;
+pub const native_capability_schema = "io.github.cataggar.debz.package-family.capabilities.v2";
+pub const native_request_schema = "io.github.cataggar.debz.package-family.request.v2";
+pub const native_result_schema = "io.github.cataggar.debz.package-family.result.v2";
 
 pub const Architecture = enum {
     amd64,
@@ -51,6 +58,38 @@ pub fn capabilities() Capabilities {
     return .{};
 }
 
+pub const NativeCapabilities = struct {
+    schema: []const u8 = native_capability_schema,
+    version: u32 = native_schema_version,
+    transaction_backend: transaction_engine.Kind = .native,
+    family: []const u8 = "debian",
+    implementations: []const []const u8 = capabilities().implementations,
+    operations: []const []const u8 = &.{"resolve-lock"},
+    architectures: []const []const u8 = capabilities().architectures,
+    request_schema: []const u8 = native_request_schema,
+    result_schema: []const u8 = native_result_schema,
+    exact_lock_schema: []const u8 = exact_lock_v2.schema_id,
+    provenance_schema: ?[]const u8 = null,
+    recovery: enum { unavailable } = .unavailable,
+    invokes_apt: bool = false,
+    invokes_dpkg: bool = false,
+
+    pub fn canonicalJson(self: @This(), allocator: std.mem.Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(allocator, self, .{ .whitespace = .minified });
+    }
+};
+
+pub fn nativeCapabilities() NativeCapabilities {
+    return .{};
+}
+
+pub fn parseCapabilitiesBackend(arguments: []const []const u8) !transaction_engine.Kind {
+    if (arguments.len == 0) return .legacy_dpkg;
+    if (arguments.len != 2 or !std.mem.eql(u8, arguments[0], "--transaction-backend"))
+        return error.InvalidCapabilityOptions;
+    return std.meta.stringToEnum(transaction_engine.Kind, arguments[1]) orelse error.InvalidTransactionBackend;
+}
+
 /// Stable image-builder boundary. Every host-sensitive input is explicit;
 /// debz never inherits repository, trust, proxy, cache, state, or root policy.
 pub const Request = struct {
@@ -85,6 +124,7 @@ pub const ErrorId = enum {
     backend_failed,
     lock_not_emitted,
     provenance_not_emitted,
+    backend_unavailable,
 };
 
 pub const Diagnostic = struct {
@@ -109,7 +149,20 @@ pub const Backend = struct {
     product_backend: product.Backend,
 
     pub fn execute(self: Backend, allocator: std.mem.Allocator, request: Request) !Result {
-        if (!validRequest(request))
+        return self.executeFor(allocator, request, .legacy_dpkg);
+    }
+
+    fn executeFor(self: Backend, allocator: std.mem.Allocator, request: Request, kind: transaction_engine.Kind) !Result {
+        var result = try self.executeRequest(allocator, request, kind);
+        if (kind == .native) {
+            result.schema = native_result_schema;
+            result.version = native_schema_version;
+        }
+        return result;
+    }
+
+    fn executeRequest(self: Backend, allocator: std.mem.Allocator, request: Request, kind: transaction_engine.Kind) !Result {
+        if (!validRequest(request, kind))
             return failure(request.operation, .usage, .invalid_request, "invalid explicit package-family request", false);
 
         const operation: product.Operation = switch (request.operation) {
@@ -183,6 +236,47 @@ pub const Backend = struct {
     }
 };
 
+pub const OwnedResult = struct {
+    result: Result,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Native planning has no injectable command-oriented backend or legacy fallback.
+/// Execution and recovery remain unavailable until their family contracts exist.
+pub const NativeBackend = struct {
+    io: std.Io,
+    now_unix: ?i64 = null,
+
+    pub fn execute(self: @This(), allocator: std.mem.Allocator, request: Request) !OwnedResult {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var result: Result = undefined;
+        if (!std.mem.eql(u8, request.schema, native_request_schema) or request.version != native_schema_version) {
+            result = failure(request.operation, .usage, .invalid_request, "native package-family requests require schema v2", false);
+        } else if (request.operation != .resolve_lock) {
+            result = failure(request.operation, .unavailable, .backend_unavailable, "native package-family currently supports only resolve_lock", false);
+        } else {
+            var native: production.Backend = .{
+                .io = self.io,
+                .transaction_backend = .native,
+                .now_unix = self.now_unix,
+            };
+            const backend: Backend = .{ .product_backend = native.interface() };
+            result = try backend.executeFor(owned, request, .native);
+            if (result.lock_path) |path| result.lock_path = try owned.dupe(u8, path);
+        }
+        result.schema = native_result_schema;
+        result.version = native_schema_version;
+        return .{ .result = result, .arena = arena };
+    }
+};
+
 fn freePackageFamilyProductItems(allocator: std.mem.Allocator, items: []const product.Item) void {
     for (items) |item| {
         allocator.free(item.package);
@@ -192,8 +286,10 @@ fn freePackageFamilyProductItems(allocator: std.mem.Allocator, items: []const pr
     allocator.free(items);
 }
 
-fn validRequest(request: Request) bool {
-    if (!std.mem.eql(u8, request.schema, request_schema) or request.version != schema_version) return false;
+fn validRequest(request: Request, kind: transaction_engine.Kind) bool {
+    const expected_schema = if (kind == .native) native_request_schema else request_schema;
+    const expected_version = if (kind == .native) native_schema_version else schema_version;
+    if (!std.mem.eql(u8, request.schema, expected_schema) or request.version != expected_version) return false;
     if (!absolute(request.root) or !absolute(request.cache) or !absolute(request.state)) return false;
     if ((request.sources.len == 0 and request.configs.len == 0) or
         request.keyrings.len == 0 or
@@ -272,6 +368,97 @@ test "capabilities are versioned and apt-free" {
     try std.testing.expect(!value.invokes_apt);
     try std.testing.expectEqualStrings("amd64", value.architectures[0]);
     try std.testing.expectEqualStrings("arm64", value.architectures[1]);
+}
+
+test "native capabilities advertise only genuine v2 lock planning" {
+    const value = nativeCapabilities();
+    try std.testing.expectEqual(native_schema_version, value.version);
+    try std.testing.expectEqual(transaction_engine.Kind.native, value.transaction_backend);
+    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, value.exact_lock_schema);
+    try std.testing.expectEqual(@as(usize, 1), value.operations.len);
+    try std.testing.expectEqualStrings("resolve-lock", value.operations[0]);
+    try std.testing.expect(value.provenance_schema == null);
+    try std.testing.expect(!value.invokes_apt and !value.invokes_dpkg);
+    const bytes = try value.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"recovery\":\"unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"operations\":[\"resolve-lock\"]") != null);
+}
+
+test "capability backend selection preserves defaults and rejects ambiguous options" {
+    try std.testing.expectEqual(transaction_engine.Kind.legacy_dpkg, try parseCapabilitiesBackend(&.{}));
+    inline for (.{ "legacy_dpkg", "native" }) |value|
+        try std.testing.expectEqual(std.meta.stringToEnum(transaction_engine.Kind, value).?, try parseCapabilitiesBackend(&.{ "--transaction-backend", value }));
+    try std.testing.expectError(error.InvalidTransactionBackend, parseCapabilitiesBackend(&.{ "--transaction-backend", "other" }));
+    for ([_][]const []const u8{
+        &.{"--transaction-backend"},
+        &.{ "--transaction-backend", "native", "--transaction-backend", "legacy_dpkg" },
+        &.{ "--unknown", "native" },
+        &.{"native"},
+    }) |arguments| try std.testing.expectError(error.InvalidCapabilityOptions, parseCapabilitiesBackend(arguments));
+}
+
+test "native family version and operation gates run before filesystem access" {
+    const backend: NativeBackend = .{ .io = std.testing.io };
+    var request: Request = .{
+        .operation = .resolve_lock,
+        .root = "/missing-native-family-root",
+        .architecture = .amd64,
+        .sources = &.{"/missing-family-source"},
+        .keyrings = &.{"/missing-family-key"},
+        .cache = "/missing-family-cache",
+        .state = "/missing-family-state",
+        .package = "hello",
+        .lock_output = "/missing-family-lock",
+    };
+    var old = try backend.execute(std.testing.allocator, request);
+    defer old.deinit();
+    try std.testing.expectEqual(product.ExitStatus.usage, old.result.exit_status);
+    try std.testing.expectEqualStrings(native_result_schema, old.result.schema);
+    request.schema = native_request_schema;
+    request.version = native_schema_version;
+    for ([_]Operation{ .create, .customize, .update, .recover, .inspect }) |operation| {
+        request.operation = operation;
+        var result = try backend.execute(std.testing.allocator, request);
+        defer result.deinit();
+        try std.testing.expectEqual(product.ExitStatus.unavailable, result.result.exit_status);
+        try std.testing.expectEqual(ErrorId.backend_unavailable, result.result.diagnostic.?.id);
+        try std.testing.expect(!result.result.changed and result.result.provenance_path == null);
+    }
+    var fake: Fake = .{};
+    const legacy: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    request.operation = .resolve_lock;
+    const wrong = try legacy.execute(std.testing.allocator, request);
+    try std.testing.expectEqual(product.ExitStatus.usage, wrong.exit_status);
+    try std.testing.expectEqualStrings(result_schema, wrong.schema);
+    try std.testing.expect(!fake.seen);
+}
+
+test "native family product refusal retains owned diagnostics and releases failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn exercise(allocator: std.mem.Allocator) !void {
+            const backend: NativeBackend = .{ .io = std.testing.io };
+            var result = try backend.execute(allocator, .{
+                .schema = native_request_schema,
+                .version = native_schema_version,
+                .operation = .resolve_lock,
+                .root = "/missing-native-family-root",
+                .architecture = .amd64,
+                .sources = &.{"/missing-family-source"},
+                .keyrings = &.{"/missing-family-key"},
+                .cache = "/missing-family-cache",
+                .state = "/missing-family-state",
+                .package = "",
+                .lock_output = "/missing-family-lock",
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(product.ExitStatus.usage, result.result.exit_status);
+            try std.testing.expectEqualStrings(native_result_schema, result.result.schema);
+            try std.testing.expectEqual(ErrorId.backend_failed, result.result.diagnostic.?.id);
+            try std.testing.expect(!result.result.succeeded and !result.result.changed);
+            try std.testing.expect(!result.result.diagnostic.?.recoverable);
+        }
+    }.exercise, .{});
 }
 
 test "Ubuntu create maps explicit policy to product API" {

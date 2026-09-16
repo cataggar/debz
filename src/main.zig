@@ -326,7 +326,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, command, "package-family-capabilities")) {
-        const json = try debz.packageFamilyCapabilities().canonicalJson(init.arena.allocator());
+        var arguments: std.ArrayList([]const u8) = .empty;
+        while (args.next()) |argument| try arguments.append(init.arena.allocator(), argument);
+        const backend = debz.package_family_backend.parseCapabilitiesBackend(arguments.items) catch |err| {
+            try stderr.print("debz: invalid package-family capability options: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        };
+        const json = try switch (backend) {
+            .legacy_dpkg => debz.packageFamilyCapabilities().canonicalJson(init.arena.allocator()),
+            .native => debz.nativePackageFamilyCapabilities().canonicalJson(init.arena.allocator()),
+        };
         try stdout.writeAll(json);
         try stdout.writeByte('\n');
         return;
@@ -490,6 +500,7 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\
             \\Options:
             \\  -h, --help  Show this help
+            \\  --transaction-backend legacy_dpkg|native (default: legacy_dpkg)
             \\
         ),
         .version => try stdout.writeAll(
