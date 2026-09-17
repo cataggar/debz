@@ -88,6 +88,7 @@ def build_deb(
     trigger: str | None = None,
     helper_target: bool = False,
     native_trigger: bool = False,
+    literal_paths: bool = False,
 ) -> bytes:
     control_fields = {
         "Package": package,
@@ -115,6 +116,8 @@ def build_deb(
     data = f"{package}={version}:{architecture}\n".encode()
     if helper_target:
         payload_path = "./usr/bin/dpkg-trigger"
+    if literal_paths:
+        payload_path = "./usr/lib/systemd/system/system-debz\\x2dliteral.slice"
     return (
         b"!<arch>\n"
         + ar_member("debian-binary", b"2.0\n")
@@ -130,6 +133,7 @@ def package_specs(suite: str, architecture: str):
         ("base-dep", "1.0-1", architecture, {}, {}),
         ("native-helper-target", "1.0-1", architecture, {}, {"helper_target": True}),
         ("native-trigger-pkg", "1.0-1", architecture, {}, {"native_trigger": True}),
+        ("literal-paths-pkg", "1.0-1", architecture, {}, {"literal_paths": True}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
         ("alt-b", "2.0-1", architecture, {}, {}),

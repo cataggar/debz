@@ -214,7 +214,7 @@ pub fn validateIntent(intent: Intent) !void {
             blob.logical_path.len == 0 or blob.logical_path.len > 4096)
             return error.InvalidBlob;
         _ = root_fs.Path.init(blob.storage_path) catch return error.InvalidBlob;
-        _ = root_fs.Path.init(blob.logical_path) catch return error.InvalidBlob;
+        _ = root_fs.Path.initPackage(blob.logical_path) catch return error.InvalidBlob;
         const valid_storage = switch (blob.kind) {
             .request => std.mem.startsWith(
                 u8,
@@ -972,7 +972,7 @@ fn observeManagedEntry(
     path_text: []const u8,
     observed_bytes: *u64,
 ) !ManagedEntry {
-    const path = try root_fs.Path.init(path_text);
+    const path = try root_fs.Path.initPackage(path_text);
     const found = try root.entryIfExists(path) orelse return .{
         .path = path_text,
         .kind = .absent,
@@ -1116,7 +1116,7 @@ fn validateManagedSnapshot(snapshot: ManagedSnapshot) !void {
         return error.InvalidManagedState;
     var previous: ?[]const u8 = null;
     for (snapshot.entries) |entry| {
-        _ = root_fs.Path.init(entry.path) catch
+        _ = root_fs.Path.initPackage(entry.path) catch
             return error.InvalidManagedState;
         if (previous) |path| {
             if (std.mem.order(u8, path, entry.path) != .lt)
@@ -1320,7 +1320,7 @@ pub fn updateManagedState(
             try paths.append(allocator, entry.path);
     }
     for (additional_paths) |path| {
-        _ = try root_fs.Path.init(path);
+        _ = try root_fs.Path.initPackage(path);
         var duplicate = false;
         for (paths.items) |existing| {
             if (std.mem.eql(u8, existing, path)) {

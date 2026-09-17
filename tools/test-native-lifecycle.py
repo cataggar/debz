@@ -35,6 +35,8 @@ RUNTIME_SPEC.loader.exec_module(runtime)
 KINDS = ("preinst", "postinst", "prerm", "postrm")
 FAILURE = "lifecycle-fail"
 TRACE = m.oracle.TRACE_PATH
+LITERAL_PACKAGE = "literal-paths"
+LITERAL_CONFFILE = Path("etc/literal\\config.conf")
 
 
 def scripts(
@@ -324,8 +326,10 @@ class Scenario:
             )
             wanted = "script_failed" if failure else "applied"
             if report["outcome"] != wanted:
+                with (destination / "native.log").open("rb") as log:
+                    detail = log.read(12_000).decode(errors="replace")
                 raise AssertionError(
-                    f"{self.directory.name}/{operation}: expected {wanted}: {report}"
+                    f"{self.directory.name}/{operation}: expected {wanted}: {report}\n{detail}"
                 )
             for name in ("root-operation-v1.json", "root-mutation-v1.json"):
                 if (self.candidate / "var/lib/debz" / name).exists():
@@ -356,6 +360,31 @@ class Scenario:
         print(f"{self.directory.name}: {label} passed", flush=True)
 
 
+def make_literal_packages(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> dict[str, Path]:
+    archives = {}
+    for version in ("1", "2"):
+        def prepare_payload(source: Path, version: str = version) -> None:
+            directory = source / "usr/share/literal\\directory"
+            m.write(directory / "..\\literal", f"literal payload {version}\n".encode())
+            os.link(directory / "..\\literal", directory / "hard\\link")
+            (directory / "symbolic\\link").symlink_to("..\\literal")
+            m.write(
+                source / "usr/lib/systemd/system/system-systemd\\x2dmute.slice",
+                f"literal unit {version}\n".encode(),
+            )
+            m.write(source / LITERAL_CONFFILE, f"literal configuration {version}\n".encode())
+            m.write(source / "DEBIAN/conffiles", f"/{LITERAL_CONFFILE.as_posix()}\n".encode())
+
+        archives[version] = m.make_package(
+            workspace, environment, architecture, version,
+            package=LITERAL_PACKAGE, scripts=scripts(LITERAL_PACKAGE, version),
+            prepare_payload=prepare_payload,
+        )
+    return archives
+
+
 def exercise(
     executable: Path | None,
     workspace: Path,
@@ -372,6 +401,19 @@ def exercise(
 
     def case(name: str) -> Scenario:
         return Scenario(workspace, name, executable, architecture, environment)
+
+    literal_archives = make_literal_packages(workspace / "literal-packages", environment, architecture)
+    for policy in ("keep_existing", "use_package_version"):
+        current = case(f"literal-package-paths-{policy}")
+        current.phase("install", [literal_archives["1"]], names=(LITERAL_PACKAGE,))
+        for root in current.roots:
+            m.write(root / LITERAL_CONFFILE, b"administrator configuration\n")
+            os.utime(root / LITERAL_CONFFILE, (m.EPOCH, m.EPOCH))
+        current.phase("upgrade", [literal_archives["2"]], names=(LITERAL_PACKAGE,), policy=policy)
+        current.phase("reinstall", [literal_archives["2"]], names=(LITERAL_PACKAGE,), policy=policy)
+        current.phase("remove", names=(LITERAL_PACKAGE,))
+        current.phase("purge", names=(LITERAL_PACKAGE,))
+        current.complete()
 
     for operation, initial, final in (
         ("install", None, "1"), ("upgrade", "1", "2"),

@@ -49,6 +49,14 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `diversions` | Complete three-line records typed; malformed records fail. |
 | `statoverride` | Bounded user, group, mode, and path records typed; malformed records fail. |
 
+Package paths use `src/package_path.zig` and preserve literal Linux backslashes
+in ownership lists, checksums, conffiles, file triggers, diversions and
+statoverrides. A systemd filename containing `\x2d` remains that exact filename,
+not a decoded hyphen or a path separator. Traversal, empty components, controls,
+invalid UTF-8 and existing size bounds remain rejected. This does not broaden
+external install-root or private authority-path validation, or admit execution
+on databases with otherwise unsupported metadata.
+
 Co-installed `Multi-Arch: same` instances normally require one version. A
 bounded unpack transaction may temporarily contain an `unpacked` incoming
 version beside an installed sibling's previous version; fully installed

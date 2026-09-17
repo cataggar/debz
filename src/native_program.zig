@@ -33,6 +33,7 @@
 //! the bindings this module validates.
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
@@ -1091,7 +1092,7 @@ fn validTrigger(value: []const u8) bool {
     for (value) |byte| {
         if (byte <= ' ' or byte >= 0x7f) return false;
     }
-    if (value[0] == '/') return absolute_path.nonRoot(value);
+    if (value[0] == '/') return package_path.nonRoot(value);
     if (!std.ascii.isAlphanumeric(value[0])) return false;
     for (value) |byte| {
         if (std.ascii.isAlphanumeric(byte)) continue;
@@ -1526,7 +1527,7 @@ fn prepareInstalledConffiles(
 ) CompileError![]const InstalledConffile {
     const conffiles = try self.arena.dupe(InstalledConffile, package.conffiles);
     for (conffiles) |conffile| {
-        if (conffile.path.len > maximum_path_bytes or !absolute_path.nonRoot(conffile.path))
+        if (conffile.path.len > maximum_path_bytes or !package_path.nonRoot(conffile.path))
             return self.reject(.{
                 .code = .invalid_conffile_metadata,
                 .detail = "path",
@@ -1613,7 +1614,7 @@ fn prepareArchiveConffiles(
 ) CompileError![]const ArchiveConffile {
     const conffiles = try self.arena.dupe(ArchiveConffile, archive.conffiles);
     for (conffiles) |conffile| {
-        if (conffile.path.len > maximum_path_bytes or !absolute_path.nonRoot(conffile.path))
+        if (conffile.path.len > maximum_path_bytes or !package_path.nonRoot(conffile.path))
             return self.reject(.{
                 .code = .invalid_conffile_metadata,
                 .detail = "path",
@@ -2256,7 +2257,7 @@ fn emitPreflight(self: *Compiler) CompileError!void {
 fn emitOwnership(self: *Compiler) CompileError!void {
     const conflicts = try self.arena.dupe(OwnershipConflict, self.input.ownership_conflicts);
     for (conflicts) |conflict| {
-        if (conflict.path.len > maximum_path_bytes or !absolute_path.nonRoot(conflict.path))
+        if (conflict.path.len > maximum_path_bytes or !package_path.nonRoot(conflict.path))
             return self.reject(.{
                 .code = .invalid_ownership_conflict,
                 .detail = "path",
@@ -3948,9 +3949,9 @@ pub fn validateDocument(program: Program) DecodeError!void {
                     return error.InvalidProgram;
             },
             .apply_conffile_decision => |decision| if (decision.path.len > maximum_path_bytes or
-                !absolute_path.nonRoot(decision.path)) return error.InvalidPath,
+                !package_path.nonRoot(decision.path)) return error.InvalidPath,
             .assert_path_ownership => |assertion| if (assertion.path.len > maximum_path_bytes or
-                !absolute_path.nonRoot(assertion.path)) return error.InvalidPath,
+                !package_path.nonRoot(assertion.path)) return error.InvalidPath,
             .record_trigger_interests => |record| for (record.declarations) |declaration| {
                 if (!validTrigger(declaration.name)) return error.InvalidProgram;
             },
@@ -7314,6 +7315,10 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
     try testing.expectEqualStrings(
         absolute_path.schema_pattern,
         definitions.get("absolutePath").?.object.get("pattern").?.string,
+    );
+    try testing.expectEqualStrings(
+        package_path.absolute_schema_pattern,
+        definitions.get("packagePath").?.object.get("pattern").?.string,
     );
     const lock_binding = definitions.get("lockBinding").?.object.get("properties").?.object;
     try testing.expectEqualStrings(

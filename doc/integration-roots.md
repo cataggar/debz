@@ -49,8 +49,9 @@ native transaction parity.
 
 `zig build test-native-recovery` also compares the native public core CLI,
 native package-family adapter, and reference dpkg across both signed fixture
-suites. Its 24-row matrix covers Pre-Depends, versioned Provides, dependency
-cycles, Recommends on/off, a Multi-Arch package, suite-specific trigger metadata,
+suites. Its 26-row matrix covers Pre-Depends, versioned Provides, dependency
+cycles, Recommends on/off, a Multi-Arch package, literal Linux package paths,
+suite-specific trigger metadata,
 upgrade-all, held unchanged updates, both conffile policies, and known script
 failure. Plans must be identical for identical installed inputs; execution
 compares payloads, package/trigger databases and script traces, then independently
@@ -62,7 +63,14 @@ For a focused run, use
 `zig build test-native-recovery -Dnative-consumer-parity-only=true -j2`.
 It includes crash/restart cases around scriptless handler settlement, with
 mixed scripted/scriptless handlers and original archives evicted before
-recovery. The full required recovery jobs run this coverage in Debug and
+recovery. Literal-path install/upgrade cases also cover filesystem publication,
+completed file-trigger handlers, retained evidence, and refusal after a literal
+conffile or retained old script changes during interruption. Upgrade recovery
+compares staged old scripts with the original bound database, not the newly
+installed version's metadata. The lifecycle runner separately compares literal
+files, directories, hard links, symlinks and conffiles through install, upgrade,
+reinstall, removal and purge with both conffile policies.
+The full required recovery jobs run this coverage in Debug and
 ReleaseSafe on matching amd64 and arm64 runners. This is hermetic consumer
 parity, not real vendor-snapshot acceptance or native-only production cutover.
 

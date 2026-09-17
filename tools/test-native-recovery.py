@@ -110,9 +110,10 @@ def native(
     core_product: bool = False,
     completion_crash: str | None = None,
     deadline_after_ms: int | None = None,
+    policy: str | None = None,
 ) -> dict | None:
     m.reference_command(root)
-    if operation == "recover" and (archives or packages or crash_at is not None):
+    if operation == "recover" and (archives or packages or crash_at is not None or policy is not None):
         raise ValueError("recovery consumes persisted evidence, not caller archives or a new crash")
     request_path = destination / "native.request.json"
     report_path = destination / "native.report.json"
@@ -125,6 +126,8 @@ def native(
     }
     if crash_at is not None:
         request["crash_at"] = crash_at
+    if policy is not None:
+        request["policy"] = policy
     if caller_owned:
         request["caller_owned"] = True
     if core_product:
@@ -585,13 +588,14 @@ class Scenario(triggers.Scenario):
         caller_owned: bool = False,
         isolated_helper: bool = False,
         core_product: bool = False,
+        policy: str | None = None,
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
         if compare_reference:
             code = triggers.reference(
                 self.expected, operation, archives, [], self.environment,
-                destination, defer=defer or not trigger_execution,
+                destination, defer=defer or not trigger_execution, policy=policy,
             )
             if bool(code) != failure:
                 raise AssertionError(f"unexpected reference result {code}: {self.directory}")
@@ -602,6 +606,7 @@ class Scenario(triggers.Scenario):
             caller_owned=caller_owned,
             isolated_helper=isolated_helper,
             core_product=core_product,
+            policy=policy,
         )
         binding = caller_binding(self.candidate) if caller_owned else intent_binding(
             document(self.candidate / INTENT, 16 * 1024 * 1024),
@@ -1322,6 +1327,88 @@ def workflow(
     return document(report_path, 64 * 1024)
 
 
+def exercise_literal_path_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    trigger_path = "/usr/share/literal\\directory"
+    for version, boundary, drift in (
+        ("1", "during_filesystem_publication", None),
+        ("1", "after_trigger_outcome", None),
+        ("2", "after_trigger_outcome", None),
+        ("1", "after_trigger_outcome", "conffile"),
+        ("2", "after_trigger_outcome", "staged-script"),
+    ):
+        name = f"literal-paths-v{version}-{boundary}" + (f"-{drift}-drift" if drift else "")
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        packages = lifecycle.make_literal_packages(
+            current.directory / "packages", environment, architecture,
+        )
+        receiver_name = "literal-receiver"
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1",
+            package=receiver_name, triggers=f"interest-noawait {trigger_path}\n".encode(),
+            scripts=lifecycle.scripts(receiver_name, "1"),
+        )
+        helper_target = m.make_package(
+            current.directory / "helper", environment, architecture, "1",
+            package="literal-helper-target",
+            extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
+            prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
+        )
+        current.seed(receiver, helper_target, *([packages["1"]] if version == "2" else []))
+        if version == "2":
+            for root in current.roots:
+                config = root / lifecycle.LITERAL_CONFFILE
+                m.write(config, b"locally edited literal conffile\n")
+                os.utime(config, (946684800, 946684800))
+        helper_path = current.candidate / triggers.HELPER
+        shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+        helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
+        archive = packages[version]
+        binding = current.crash(
+            "upgrade" if version == "2" else "install", [archive], boundary, trigger_execution=True,
+            caller_owned=True, isolated_helper=True, core_product=True, policy="keep_existing",
+        )
+        assert not archive.exists()
+        drift_path = None
+        if drift == "conffile":
+            drift_path = current.candidate / lifecycle.LITERAL_CONFFILE
+        elif drift == "staged-script":
+            drift_path = current.candidate / f"var/lib/debz-lifecycle-scripts/{lifecycle.LITERAL_PACKAGE}:{architecture}.prerm"
+        if drift_path is not None:
+            assert drift_path.is_file()
+            m.write(drift_path, b"changed after interruption\n")
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        if drift:
+            assert report["outcome"] in ("recovery_required", "refused"), report
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            assert drift_path is not None
+            assert drift_path.read_bytes() == b"changed after interruption\n"
+            print(f"{name}: {drift} drift blocks recovery without mutation", flush=True)
+            continue
+        assert report["outcome"] == "applied", report
+        compare(current.expected, current.candidate)
+        proof_path, _ = provenance(current.candidate, report, binding)
+        proof = document(proof_path, 16 * 1024 * 1024)
+        retained = retained_documents(current.candidate, proof)
+        assert trigger_path in retained["authorization"][0]["trigger_authority"]["allowed_triggers"]
+        assert any(
+            "\\" in entry["path"]
+            for snapshot in (retained["managed_state"][0]["stable"], retained["managed_state"][0]["transient"])
+            if snapshot is not None for entry in snapshot["entries"]
+        )
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert completion["attempt_id"] == binding["attempt_id"]
+        assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]
+        assert not (current.candidate / OPERATION).exists()
+        assert not (current.candidate / INTENT).exists()
+        assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
+        print(f"{name}: exact literal paths, trigger evidence and evicted-archive recovery passed", flush=True)
+
+
 def exercise_scriptless_recovery(
     executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
 ) -> None:
@@ -1394,6 +1481,7 @@ CONSUMER_PARITY_CASES = (
     {"id": "with-recommends", "package": "scenario-main", "archives": ("base-dep", "recommended-addon", "scenario-main"),
      "recommends": True},
     {"id": "multiarch-package", "package": "multi-lib", "archives": ("multi-lib",)},
+    {"id": "literal-package-paths", "package": "literal-paths-pkg", "archives": ("literal-paths-pkg",)},
     {"id": "suite-trigger", "package": "trigger-pkg", "archives": ("trigger-pkg",)},
     {"id": "upgrade-all", "package": None, "archives": ("fixture-upgrade=2.0-1",),
      "seeds": ("fixture-upgrade",), "update": True},
@@ -3653,6 +3741,7 @@ def main() -> int:
             if arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
+                exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                 exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
                 exercise_consumer_parity(executable, result_cli, workspace, environment, architecture)
             elif arguments.repository_cli_only:
@@ -3675,6 +3764,7 @@ def main() -> int:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
                 if not arguments.deadline_only:
+                    exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                     exercise_projection(executable, workspace)
                     if not arguments.core_only:
                         exercise_repository_projection(executable, workspace, architecture)

@@ -1230,7 +1230,7 @@ fn decodeStep(allocator: std.mem.Allocator, wire: WireStep) Error!Step {
     if (wire.requires.len > maximum_step_dependencies) return error.NonCanonicalDocument;
     if (wire.path.len == 0 or wire.path.len > maximum_path_bytes)
         return error.NonCanonicalDocument;
-    _ = root_fs.Path.init(wire.path) catch return error.NonCanonicalDocument;
+    _ = root_fs.Path.initPackage(wire.path) catch return error.NonCanonicalDocument;
     for (wire.requires) |value| {
         if (value >= wire.index) return error.NonCanonicalDocument;
     }
@@ -1335,7 +1335,7 @@ fn validateStepShape(step: Step) Error!void {
         if (!validWorkspaceName(name)) return error.NonCanonicalDocument;
     }
     if (step.source) |text| {
-        _ = root_fs.Path.init(text) catch return error.NonCanonicalDocument;
+        _ = root_fs.Path.initPackage(text) catch return error.NonCanonicalDocument;
     }
 }
 
@@ -2070,7 +2070,7 @@ fn build(builder: *Builder, request: PreflightRequest) BuildError!void {
 
 fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
     const text = intent.path();
-    const path = root_fs.Path.init(text) catch
+    const path = root_fs.Path.initPackage(text) catch
         return builder.fail(.preflight, .invalid_path, text);
     try requireEncodable(builder, path.text);
     if (withinNamespace(path.text)) return builder.fail(.preflight, .path_collision, text);
@@ -2236,7 +2236,7 @@ fn requireEncodable(builder: *Builder, text: []const u8) BuildError!void {
 /// exact state or an explicit absence. Every unsupported kind, symbolic-link
 /// component, and cross-device target fails here.
 fn observe(builder: *Builder, path: []const u8) BuildError!Expectation {
-    const resolved = root_fs.Path.init(path) catch
+    const resolved = root_fs.Path.initPackage(path) catch
         return builder.fail(.preflight, .invalid_path, path);
     try requireSameDevice(builder, resolved);
     const observed = builder.root.entryIfExists(resolved) catch |err| return switch (err) {
@@ -2402,7 +2402,7 @@ fn buildStep(
             step.kind = .copy_file;
             step.overwrite = value.overwrite;
             try requireOverwrite(builder, expected, value.overwrite, path.text);
-            const source = root_fs.Path.init(value.source) catch
+            const source = root_fs.Path.initPackage(value.source) catch
                 return builder.fail(.preflight, .invalid_path, value.source);
             try requireEncodable(builder, source.text);
             const source_state = try resolveSource(builder, source.text, requires);
@@ -2472,7 +2472,7 @@ fn buildStep(
             step.kind = .publish_hard_link;
             step.overwrite = value.overwrite;
             try requireOverwrite(builder, expected, value.overwrite, path.text);
-            const source = root_fs.Path.init(value.source) catch
+            const source = root_fs.Path.initPackage(value.source) catch
                 return builder.fail(.preflight, .invalid_path, value.source);
             try requireEncodable(builder, source.text);
             if (std.mem.eql(u8, source.text, path.text))

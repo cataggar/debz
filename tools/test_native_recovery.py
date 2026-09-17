@@ -39,7 +39,7 @@ class RecoveryOracleTests(unittest.TestCase):
         ]
         report = acceptance.consumer_parity_coverage(rows, "amd64")
         self.assertEqual(report["scope"], "signed-hermetic-fixtures")
-        self.assertEqual(len(report["cases"]), 24)
+        self.assertEqual(len(report["cases"]), 26)
         for incomplete in ([], rows[:-1], [*rows, rows[0]], [{**rows[0], "case": "unreviewed"}, *rows[1:]]):
             with self.assertRaisesRegex(AssertionError, "incomplete or duplicated"):
                 acceptance.consumer_parity_coverage(incomplete, "amd64")
@@ -63,6 +63,19 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertEqual(cases["conffile-keep"]["conffile"], "keep_existing")
         self.assertEqual(cases["conffile-replace"]["conffile"], "use_package_version")
         self.assertEqual(cases["suite-trigger"]["package"], "trigger-pkg")
+        self.assertEqual(cases["literal-package-paths"]["archives"], ("literal-paths-pkg",))
+
+    def test_program_package_paths_do_not_broaden_root_authority(self) -> None:
+        validator = acceptance.validator("native-transaction-program-v1")
+        definitions = validator.schema["$defs"]
+        package_path = validator.evolve(schema={"$defs": definitions, "$ref": "#/$defs/packagePath"})
+        authority_path = validator.evolve(schema={"$defs": definitions, "$ref": "#/$defs/absolutePath"})
+        literal = r"/usr/lib/systemd/system/system-systemd\x2dmute.slice"
+        self.assertTrue(package_path.is_valid(literal))
+        self.assertFalse(authority_path.is_valid(literal))
+        for invalid in ("", "/", "/literal/../escape", "/literal//file", "/literal/", "/literal\n", "/literal\x00"):
+            with self.subTest(path=invalid):
+                self.assertFalse(package_path.is_valid(invalid))
 
     def test_handler_schemas_require_explicit_absence_or_a_real_digest(self) -> None:
         for schema, definition in (
