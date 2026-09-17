@@ -91,7 +91,7 @@ database path component.
 | `var/lib/dpkg/triggers/File` and `Unincorp` | Parse and publish interests, activations, awaiting packages, and pending work. Lock files are never package state. |
 | `var/lib/dpkg/arch` | Preserve a validated unique foreign-architecture list. Native architecture comes from the authorized request and must agree with healthy installed state. |
 | `var/lib/dpkg/diversions` | Parse and honor complete three-line diversion records. Malformed records fail preflight. Script-created changes are re-read and validated after the script boundary. |
-| `var/lib/dpkg/statoverride` | Parse and honor bounded owner, group, mode, and path records. Malformed records fail preflight. Script-created changes are re-read and validated after the script boundary. |
+| `var/lib/dpkg/statoverride` | Parse and honor bounded owner, group, mode, and path records using file-backed target-root identities. Malformed records fail preflight. Script-created state is re-read and validated after script boundaries, but metadata resolution stays frozen for the invocation, matching dpkg; a later invocation resolves anew. |
 | `var/lib/dpkg/alternatives/` | Preserve bounded regular-file records managed by package scripts and include their exact bytes in differential state. |
 | `var/lib/dpkg/parts/` | Empty is accepted. Nonempty records are retained and classified during feature inventory before mutation. |
 | `var/lib/dpkg/available` | Preserve as non-authoritative compatibility data; the native engine does not use it for solving or authorization. |

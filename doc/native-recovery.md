@@ -30,6 +30,19 @@ directory membership at completed phases and known script outcomes. Recovery
 checks these durable expectations before continuing; a completed phase marker
 alone cannot authorize resuming over externally changed payload.
 
+Statoverride resolution is frozen for the original invocation. Alongside the
+original override database, recovery stores the exact account-file bytes and
+modes actually required for named identities. These use bounded database-kind
+blobs keyed `statoverride-passwd` and `statoverride-group`, with exact logical
+paths `etc/passwd` and `etc/group`; they are not dpkg database-generation
+members. Existing intent v1 supports these inputs without a schema change.
+Recovery validates their role, presence, bounds and digest and never substitutes
+current account files. Numeric-only records require no identity blobs.
+Managed observations separately track current override/account state across
+known script outcomes, so legitimate script changes can resume using the
+original resolution while subsequent external drift still blocks mutation.
+An initially empty override set also stays empty throughout recovery.
+
 ## Script and trigger continuation
 
 Each invocation has a durable identity distinct from every other invocation,

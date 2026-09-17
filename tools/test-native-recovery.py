@@ -392,6 +392,8 @@ def assert_script_output(script: dict) -> None:
         source = lifecycle.metadata_scripts(script["package"], script["package_version"])
     elif script["package"] == lifecycle.CONFFILE_PACKAGE:
         source = lifecycle.conffile_scripts(script["package"], script["package_version"])
+    elif script["package"] == lifecycle.STATO_PACKAGE:
+        source = lifecycle.statoverride_scripts(script["package"], script["package_version"])
     else:
         source = lifecycle.scripts(script["package"], script["package_version"])
     if hashlib.sha256(source[script["kind"]]).hexdigest() != script["script_sha256"]:
@@ -1352,6 +1354,128 @@ def reference_helper_package(
         extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
         prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
     )
+
+
+def exercise_statoverride_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    for operation, boundary, drift in (
+        ("install", "after_execution_intent", None),
+        ("install", "during_filesystem_publication", None),
+        ("install", "after_script_outcome", None),
+        ("install", "after_failure_outcome", None),
+        ("upgrade", "during_filesystem_publication", None),
+        ("upgrade", "after_script_outcome", None),
+        ("remove", "after_script_outcome", None),
+        ("purge", "after_script_prepared", None),
+        ("install-account", "after_script_outcome", None),
+        ("install-override", "after_script_outcome", None),
+        ("install-created", "after_script_outcome", None),
+        ("install", "after_execution_intent", "passwd-blob"),
+        ("install", "after_execution_intent", "group-blob-missing"),
+        ("install", "after_execution_intent", "passwd"),
+        ("install", "during_filesystem_publication", "group"),
+        ("install", "after_script_prepared", "statoverride"),
+        ("upgrade", "after_trigger_outcome", "owner"),
+    ):
+        name = f"statoverride-{operation}-{boundary}" + (f"-{drift}-drift" if drift else "")
+        changed_by_script = operation.removeprefix("install-") if operation.startswith("install-") else None
+        if changed_by_script is not None:
+            operation = "install"
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        archives = lifecycle.make_statoverride_packages(current.directory / "packages", environment, architecture)
+        records = (
+            f"_debzstat _debzstat 4750 /{lifecycle.STATO_BASE}/mode\n"
+            f"#42420 #42421 0640 /{lifecycle.STATO_LITERAL.as_posix()}\n"
+            "_debzstat _debzstat 0640 /etc/debz-native.conf\n"
+        )
+        for root in current.roots:
+            lifecycle.seed_statoverrides(root, "" if changed_by_script == "created" else records)
+        receiver_name = "statoverride-receiver"
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package=receiver_name,
+            triggers=f"interest-noawait /{lifecycle.STATO_BASE}\n".encode(),
+            scripts=lifecycle.scripts(receiver_name, "1"),
+        )
+        target = reference_helper_package(
+            current.directory / "helper", environment, architecture, package="statoverride-helper-target",
+        )
+        current.seed(receiver, target, *([archives["1"]] if operation != "install" else []))
+        if changed_by_script is not None:
+            for root in current.roots:
+                lifecycle.seed_statoverride_replacement(
+                    root,
+                    "statoverride-passwd-replace" if changed_by_script == "account" else "statoverride-preinst-replace",
+                    lifecycle.STATO_PASSWD.replace(b":42420:", b":42422:")
+                    if changed_by_script == "account" else records.replace("4750", "0750").encode(),
+                )
+        if operation == "purge":
+            current.phase("remove", packages=[lifecycle.STATO_PACKAGE])
+        failure = boundary == "after_failure_outcome"
+        if failure:
+            for root in current.roots:
+                m.write(root / lifecycle.FAILURE, f"{lifecycle.STATO_PACKAGE}@1:postinst:configure\n".encode())
+                os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
+        helper_path = current.candidate / triggers.HELPER
+        shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+        helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
+        version = "2" if operation == "upgrade" else "1"
+        binding = current.crash(
+            operation, [archives[version]] if operation in ("install", "upgrade") else [], boundary,
+            failure=failure, trigger_execution=True, caller_owned=True,
+            isolated_helper=True, core_product=True, policy="keep_existing",
+            packages=(lifecycle.STATO_PACKAGE,),
+        )
+        intent = document(current.candidate / INTENT, 16 * 1024 * 1024)
+        identity_blobs = {blob["key"]: blob for blob in intent["blobs"] if blob["key"].startswith("statoverride-")}
+        assert set(identity_blobs) == (set() if changed_by_script == "created" else {"statoverride-passwd", "statoverride-group"})
+        for key, original in (("statoverride-passwd", lifecycle.STATO_PASSWD), ("statoverride-group", lifecycle.STATO_GROUP)):
+            if key in identity_blobs:
+                blob = identity_blobs[key]
+                assert blob["kind"] == "database" and blob["entry_kind"] == "regular"
+                assert blob["logical_path"] == ("etc/passwd" if key.endswith("passwd") else "etc/group")
+                assert (current.candidate / blob["storage_path"]).read_bytes() == original
+        for archive in archives.values():
+            if archive.exists():
+                archive.unlink()
+            assert not archive.exists()
+        if drift == "passwd":
+            m.write(current.candidate / "etc/passwd", lifecycle.STATO_PASSWD.replace(b":42420:", b":42422:"))
+        elif drift == "group":
+            m.write(current.candidate / "etc/group", lifecycle.STATO_GROUP.replace(b":42421:", b":42423:"))
+        elif drift == "statoverride":
+            m.write(current.candidate / "var/lib/dpkg/statoverride", records.replace("4750", "0750").encode())
+        elif drift == "owner":
+            os.chown(current.candidate / lifecycle.STATO_BASE / "mode", 42422, 42423)
+        elif drift == "passwd-blob":
+            m.write(current.candidate / identity_blobs["statoverride-passwd"]["storage_path"], lifecycle.STATO_PASSWD.replace(b":42420:", b":42422:"))
+        elif drift == "group-blob-missing":
+            (current.candidate / identity_blobs["statoverride-group"]["storage_path"]).unlink()
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
+        if drift is not None:
+            assert report["outcome"] in ("recovery_required", "refused"), report
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            print(f"{name}: statoverride identity and metadata drift blocks mutation", flush=True)
+            continue
+        assert report["outcome"] == ("script_failed" if failure else "applied"), report
+        compare(current.expected, current.candidate)
+        proof_path, proof_bytes = provenance(current.candidate, report, binding)
+        completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+        completion_bytes = completion_path.read_bytes()
+        assert document(completion_path)["outcome"] == ("failed_after_mutation" if failure else "succeeded")
+        assert not (current.candidate / OPERATION).exists() and not (current.candidate / INTENT).exists()
+        before = triggers.snapshot(current.candidate)
+        repeated = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True, label="recover-again",
+        )
+        assert repeated["outcome"] == "applied", repeated
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        assert proof_path.read_bytes() == proof_bytes and completion_path.read_bytes() == completion_bytes
+        print(f"{name}: statoverride lifecycle and archive-evicted core recovery passed", flush=True)
 
 
 def exercise_conffile_lifecycle_recovery(
@@ -3977,6 +4101,7 @@ def main() -> int:
             if arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
+                exercise_statoverride_recovery(executable, helper, workspace, environment, architecture)
                 exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                 exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                 exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
@@ -4002,6 +4127,7 @@ def main() -> int:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
                 if not arguments.deadline_only:
+                    exercise_statoverride_recovery(executable, helper, workspace, environment, architecture)
                     exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                     exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                     exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)

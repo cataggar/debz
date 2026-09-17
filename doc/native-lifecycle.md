@@ -41,6 +41,14 @@ configure/purge retries with and without conffiles. Existing admission guards
 for otherwise unsupported half-installed states remain unchanged.
 No debconf preconfiguration or other active/unknown metadata support is implied.
 
+Statoverrides use file-backed target-root identities and are resolved once
+before scripts, not separately at unpack and configure. A preinst or postinst
+may change the account or override files, but the same invocation keeps its
+original resolved metadata, matching dpkg. A later invocation uses the new
+state. Missing identities refuse before lifecycle mutation. See the
+[metadata contract](native-unpack.md#statoverride-metadata) for directory,
+symlink, hard-link and exact-path behavior.
+
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known
 outcome then settles the conffile records; final directory/info removal follows
@@ -128,6 +136,10 @@ compared independently of the native outcome report.
 
 Advanced fixtures exercise:
 
+- **Statoverrides:** numeric/named identities, new/existing directories,
+  conffiles, symlinks, hard links, literal paths and merged-/usr spellings;
+  invocation-frozen account/override changes; fresh resolution on reinstall;
+  administrator conffile metadata under both policies; and pre-script refusals.
 - **Pre-Depends:** a reviewed configure barrier runs the provider's postinst
   before the consumer's preinst; the consumer script independently requires
   that ordering. The reference uses the corresponding separate dpkg command

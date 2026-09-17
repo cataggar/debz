@@ -70,7 +70,9 @@ than one instance are ambiguous and rejected rather than guessed.
 Inert metadata is a byte payload, not database text: empty contents, binary
 bytes, and missing final newlines are preserved. This classification does not
 admit `config` scripts, alternatives, or arbitrary vendor info files into native
-execution; those remain opaque and guarded, as do diversions and statoverrides.
+execution; those remain opaque and guarded, as do diversions.
+Statoverride filesystem semantics belong to the
+[native unpack/lifecycle layer](native-unpack.md#statoverride-metadata).
 
 The shared `triggers/Lock` is synchronization infrastructure, not a named
 interest file or consumed database generation. `File` and `Unincorp` retain
@@ -160,9 +162,12 @@ against the importer's own bounds before a plan is returned. Planning fails
 closed on unknown packages, more than one change per subject, impossible state
 transitions, unsafe or non-executable scripts, invalid paths, checksums outside
 the accepted checksum grammar, bound violations, interrupted publication in
-`updates/`, and any
-diversion or statoverride that covers a package or path being changed. Mutating
-diversions and statoverrides is not supported in v1.
+`updates/`, and any diversion that covers a package or path being changed.
+`PlanOptions.statoverride_policy` defaults to `.refuse_affected`, which also
+refuses changes covering an overridden path. Native callers that implement the
+filesystem semantics explicitly select `.preserve`; this leaves the original
+override file untouched. Mutating diversions and statoverrides is not supported
+by the database planner.
 
 A change that would move a package's info files between the `name` and
 `name:architecture` spellings also fails closed when the package still owns
@@ -203,8 +208,8 @@ The following are deliberately outside this pure database model:
   applying a `Plan` durably with staging, fsync, and atomic rename;
 - lifecycle, unpack, conffile, and trigger semantics that decide which changes
   to stage;
-- mutation of `diversions` and `statoverride`, which currently fail closed when
-  they cover a changed package or path.
+- mutation of `diversions` and `statoverride`; affected diversions always fail
+  closed, while affected overrides require explicit preservation policy.
 
 ## Cost
 
