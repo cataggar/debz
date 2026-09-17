@@ -719,6 +719,7 @@ pub fn build(b: *std.Build) void {
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
+            "package_path.test.",
             "package_database.test.",
             "package_database_changes.test.",
         },

@@ -2608,7 +2608,7 @@ fn indexInstalledConffiles(builder: *Builder) PlanError!void {
                 .path = conffile.path,
                 .package = record.name,
             });
-            _ = root_fs.Path.init(canonical) catch return builder.fail(.{
+            _ = root_fs.Path.initPackage(canonical) catch return builder.fail(.{
                 .surface = .database,
                 .code = .invalid_path,
                 .path = conffile.path,
@@ -2638,7 +2638,7 @@ fn inspectTouchedConffiles(builder: *Builder) PlanError!void {
         var claimed = builder.transaction_claims.contains(path) or
             builder.final_claim_ancestors.contains(path);
         var removed = !claimed and finalPathRemoved(builder, path);
-        var parent = (root_fs.Path.init(path) catch
+        var parent = (root_fs.Path.initPackage(path) catch
             return builder.fail(.{
                 .surface = .database,
                 .code = .invalid_path,
@@ -2696,7 +2696,7 @@ fn inspectDisappearance(builder: *Builder) PlanError!void {
             if (acted != null and
                 !transactionPackageClaims(builder, entry.path, acted.?)) continue;
             if (displacesOwnerPath(builder, owner, entry.path)) continue;
-            const path = root_fs.Path.init(entry.path) catch
+            const path = root_fs.Path.initPackage(entry.path) catch
                 return builder.fail(.{
                     .surface = .ownership,
                     .code = .invalid_path,
@@ -2809,7 +2809,7 @@ fn observeConffileMd5(
     path: []const u8,
     item: *const PackageWork,
 ) PlanError!?[16]u8 {
-    const resolved = root_fs.Path.init(path) catch
+    const resolved = root_fs.Path.initPackage(path) catch
         return builder.fail(.{
             .surface = .transition,
             .code = .invalid_path,
@@ -2872,7 +2872,7 @@ fn validateGeneratedConffilePath(
         return;
     }
     const entry = builder.request.root.entryIfExists(
-        root_fs.Path.init(path) catch
+        root_fs.Path.initPackage(path) catch
             return builder.fail(.{
                 .surface = .transition,
                 .code = .invalid_path,
@@ -2999,7 +2999,7 @@ fn prepareUnpackConffiles(
             _ = try observeConffileMd5(builder, live, item);
         if (recorded == null and
             (builder.request.root.entryIfExists(
-                root_fs.Path.init(live) catch unreachable,
+                root_fs.Path.initPackage(live) catch unreachable,
             ) catch return builder.fail(.{
                 .surface = .transition,
                 .code = .root_unreadable,
@@ -3115,7 +3115,7 @@ fn preparePackageClaims(
         }
         claim.kind = kindOf(file.kind);
         claim.file = index;
-        _ = root_fs.Path.init(claim.path) catch return builder.fail(.{
+        _ = root_fs.Path.initPackage(claim.path) catch return builder.fail(.{
             .surface = .archive,
             .code = .invalid_path,
             .path = claim.path,
@@ -3263,7 +3263,7 @@ fn indexFinalClaims(builder: *Builder) PlanError!void {
                 };
             }
             try addTransactionClaim(builder, found.value_ptr, current, claim.path);
-            const ancestor = root_fs.Path.init(claim.path) catch
+            const ancestor = root_fs.Path.initPackage(claim.path) catch
                 return builder.fail(.{
                     .surface = .archive,
                     .code = .invalid_path,
@@ -3948,7 +3948,7 @@ fn observeRootState(
     allow_planned_ancestors: bool,
     read_regular_content: bool,
 ) PlanError!?ObservedRoot {
-    const resolved = root_fs.Path.init(path) catch return builder.fail(.{
+    const resolved = root_fs.Path.initPackage(path) catch return builder.fail(.{
         .surface = .archive,
         .code = .invalid_path,
         .path = path,
@@ -4493,14 +4493,14 @@ fn combinedHardlinkObservation(
     expected_links: u64,
     package: []const u8,
 ) PlanError!CombinedHardlinkObservation {
-    const destination_path = root_fs.Path.init(destination) catch
+    const destination_path = root_fs.Path.initPackage(destination) catch
         return builder.fail(.{
             .surface = .archive,
             .code = .invalid_path,
             .path = destination,
             .package = package,
         });
-    const source_path = root_fs.Path.init(source) catch
+    const source_path = root_fs.Path.initPackage(source) catch
         return builder.fail(.{
             .surface = .archive,
             .code = .invalid_path,
@@ -4683,7 +4683,7 @@ fn revalidateDirectoryObservations(builder: *Builder) PlanError!void {
     while (keys.next()) |path| try paths.append(builder.allocator, path.*);
     std.mem.sort([]const u8, paths.items, {}, lessPath);
     for (paths.items) |path| {
-        const resolved = root_fs.Path.init(path) catch
+        const resolved = root_fs.Path.initPackage(path) catch
             return builder.fail(.{
                 .surface = .transition,
                 .code = .invalid_path,
@@ -5174,7 +5174,7 @@ fn synthesizeAncestors(builder: *Builder, item: *PackageWork, package: u32) Plan
     defer seen.deinit(builder.allocator);
 
     for (item.paths.items) |planned| {
-        const resolved = root_fs.Path.init(planned.path) catch
+        const resolved = root_fs.Path.initPackage(planned.path) catch
             return builder.fail(.{
                 .surface = .transition,
                 .code = .invalid_path,
@@ -5502,7 +5502,7 @@ fn observeFinalDirectoryPrefixes(builder: *Builder) PlanError!void {
         if (builder.planned_removals.contains(path) or
             builder.retained_directory_paths.contains(path))
             continue;
-        const resolved = root_fs.Path.init(path) catch
+        const resolved = root_fs.Path.initPackage(path) catch
             return builder.fail(.{
                 .surface = .transition,
                 .code = .invalid_path,
@@ -5802,7 +5802,7 @@ fn inspectPublicationTriggers(builder: *Builder) PlanError!void {
     }
     std.mem.sort([]const u8, affected_paths.items, {}, lessPath);
     for (affected_paths.items) |path| {
-        var cursor: ?root_fs.Path = root_fs.Path.init(path) catch
+        var cursor: ?root_fs.Path = root_fs.Path.initPackage(path) catch
             return builder.fail(.{
                 .surface = .transition,
                 .code = .invalid_path,
@@ -7155,7 +7155,7 @@ fn captureDatabaseFile(
     path: []const u8,
     maximum_bytes: usize,
 ) !?package_database.FileEntry {
-    const resolved = try root_fs.Path.init(path);
+    const resolved = try root_fs.Path.initPackage(path);
     const observed = (try root.entryIfExists(resolved)) orelse return null;
     const kind: package_database.EntryKind = switch (observed.kind) {
         .file => .regular,
@@ -7541,7 +7541,7 @@ fn rootFileSha256(
     path: []const u8,
     maximum_bytes: usize,
 ) ![32]u8 {
-    const resolved = try root_fs.Path.init(path);
+    const resolved = try root_fs.Path.initPackage(path);
     const entry = try root.entry(resolved);
     if (!entry.isRegularFile() or !entry.modeled or entry.link_count != 1)
         return error.UnsupportedConffile;
@@ -7739,10 +7739,10 @@ fn verifyMaterializedFilesystem(
 ) !void {
     for (plan_value.filesystem) |change| switch (change) {
         .remove => |removal| if (try root.entryIfExists(
-            try root_fs.Path.init(removal.path),
+            try root_fs.Path.initPackage(removal.path),
         ) != null) return error.MaterializationVerificationFailed,
         .directory => |directory| {
-            const entry = try root.entry(try root_fs.Path.init(directory.path));
+            const entry = try root.entry(try root_fs.Path.initPackage(directory.path));
             if (!entry.isDirectory() or entry.mode != directory.mode or
                 entry.uid != directory.uid or entry.gid != directory.gid)
                 return error.MaterializationVerificationFailed;
@@ -7752,7 +7752,7 @@ fn verifyMaterializedFilesystem(
             }
         },
         .file => |file| {
-            const path = try root_fs.Path.init(file.path);
+            const path = try root_fs.Path.initPackage(file.path);
             const entry = try root.entry(path);
             if (!entry.isRegularFile() or entry.mode != file.mode or
                 entry.uid != file.uid or entry.gid != file.gid or
@@ -7768,7 +7768,7 @@ fn verifyMaterializedFilesystem(
                 return error.MaterializationVerificationFailed;
         },
         .symlink => |link| {
-            const path = try root_fs.Path.init(link.path);
+            const path = try root_fs.Path.initPackage(link.path);
             const entry = try root.entry(path);
             if (!entry.isSymbolicLink() or entry.uid != link.uid or
                 entry.gid != link.gid or
@@ -7782,8 +7782,8 @@ fn verifyMaterializedFilesystem(
             )) return error.MaterializationVerificationFailed;
         },
         .hardlink => |link| {
-            const target = try root.entry(try root_fs.Path.init(link.path));
-            const source = try root.entry(try root_fs.Path.init(link.source));
+            const target = try root.entry(try root_fs.Path.initPackage(link.path));
+            const source = try root.entry(try root_fs.Path.initPackage(link.source));
             if (!target.isRegularFile() or !source.isRegularFile() or
                 target.device != source.device or target.inode != source.inode)
                 return error.MaterializationVerificationFailed;
@@ -8774,7 +8774,7 @@ fn rootMd5ForConffile(
     compared_bytes: *u64,
     maximum_total: u64,
 ) !?RootConffileDigest {
-    const resolved = try root_fs.Path.init(path);
+    const resolved = try root_fs.Path.initPackage(path);
     const observed = (try root.entryIfExists(resolved)) orelse return null;
     if (!observed.isRegularFile() or !observed.modeled or
         observed.link_count != 1)
@@ -8809,7 +8809,7 @@ fn requireAbsentConffileArtifact(
                 return error.ConffileArtifactCollision;
         }
     }
-    if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+    if (try root.entryIfExists(try root_fs.Path.initPackage(path)) != null)
         return error.ConffileArtifactCollision;
 }
 
@@ -9100,7 +9100,7 @@ fn materializeConfigure(
                         dist,
                     );
                     const live_metadata = request.root.entryIfExists(
-                        try root_fs.Path.init(conffile.path),
+                        try root_fs.Path.initPackage(conffile.path),
                     ) catch return error.UnsupportedConffile;
                     try appendArchiveConffileIntent(
                         &intents,
@@ -9128,7 +9128,7 @@ fn materializeConfigure(
                     const source_sha256 = (live_digest orelse
                         return error.UnsupportedConffile).sha256;
                     const current = try request.root.entry(
-                        try root_fs.Path.init(conffile.path),
+                        try root_fs.Path.initPackage(conffile.path),
                     );
                     try intents.append(allocator, .{ .copy = .{
                         .path = old_path,
@@ -9256,7 +9256,7 @@ fn removableDirectory(
     path: []const u8,
     removing: *const std.StringHashMapUnmanaged(void),
 ) !bool {
-    var directory = try root.openDirectory(try root_fs.Path.init(path));
+    var directory = try root.openDirectory(try root_fs.Path.initPackage(path));
     defer directory.close(root.io);
     var iterator = directory.iterate();
     while (try iterator.next(root.io)) |entry| {
@@ -9491,7 +9491,7 @@ fn materializeRemoval(
             };
             const stored = try owned.dupe(u8, canonical);
             try retained.put(allocator, stored, {});
-            var cursor = (root_fs.Path.init(stored) catch unreachable).parent();
+            var cursor = (root_fs.Path.initPackage(stored) catch unreachable).parent();
             while (cursor) |parent| : (cursor = parent.parent())
                 try retained.put(
                     allocator,
@@ -9554,7 +9554,7 @@ fn materializeRemoval(
             if (surviving_owner or removing.contains(canonical)) continue;
             const stored = try owned.dupe(u8, canonical);
             const observed = (try request.root.entryIfExists(
-                try root_fs.Path.init(stored),
+                try root_fs.Path.initPackage(stored),
             )) orelse continue;
             switch (observed.kind) {
                 .directory => try directories.append(allocator, stored),
@@ -9592,7 +9592,7 @@ fn materializeRemoval(
                         };
                 }
                 const observed = (try request.root.entryIfExists(
-                    try root_fs.Path.init(path),
+                    try root_fs.Path.initPackage(path),
                 )) orelse continue;
                 if (!observed.isRegularFile() or !observed.modeled or
                     observed.link_count != 1)
@@ -10902,7 +10902,7 @@ fn planSnapshot(
 }
 
 fn seedFile(root: root_fs.Root, path: []const u8, bytes: []const u8) !void {
-    const resolved = try root_fs.Path.init(path);
+    const resolved = try root_fs.Path.initPackage(path);
     var components = std.mem.splitScalar(u8, resolved.text, '/');
     var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
     var length: usize = 0;
@@ -10917,7 +10917,7 @@ fn seedFile(root: root_fs.Root, path: []const u8, bytes: []const u8) !void {
         @memcpy(buffer[length .. length + component.len], component);
         length += component.len;
         try root.ensureDirectory(
-            try root_fs.Path.init(buffer[0..length]),
+            try root_fs.Path.initPackage(buffer[0..length]),
             root_fs.default_directory_permissions,
         );
     }
@@ -14067,6 +14067,7 @@ fn stageLifecycleScripts(
     program: *const native_program.Program,
     authorization: *const native_authorization.Authorization,
     models: []archive_application.Model,
+    initial_model: package_database.Model,
     locks: root_operation.LockBackend,
     attempt: *root_operation.Attempt,
     operation: product_api.Operation,
@@ -14135,22 +14136,9 @@ fn stageLifecycleScripts(
         }
     }
 
-    var captured = try captureDatabaseSnapshot(allocator, root, .{});
-    defer captured.deinit();
-    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
-    var database = switch (try package_database.importSnapshot(
-        allocator,
-        .{
-            .native_architecture = program.target_architecture,
-            .snapshot = captured.snapshot,
-        },
-        .{},
-    )) {
-        .database => |value| value,
-        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
-    };
-    defer database.deinit();
-    if (database.model.find(package.name, package.architecture)) |record| {
+    // After an upgrade, live info files describe the new version, not the
+    // original installed scripts retained for this program.
+    if (initial_model.find(package.name, package.architecture)) |record| {
         for (record.scripts) |script| {
             const kind = lifecycleScriptKind(script.kind);
             const source = try std.fmt.allocPrint(
@@ -19175,6 +19163,7 @@ fn executeLifecycleProgramWithRequest(
                 program,
                 authorization,
                 models,
+                initial_model,
                 locks,
                 attempt,
                 operation,

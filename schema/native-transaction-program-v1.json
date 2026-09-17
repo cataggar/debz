@@ -133,6 +133,12 @@
       "type": "string",
       "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
     },
+    "packagePath": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 4096,
+      "pattern": "^/(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001f\\u007f]+)*(?![\\s\\S])"
+    },
     "identity": {
       "type": "object",
       "additionalProperties": false,
@@ -1003,7 +1009,7 @@
         ],
         "properties": {
           "path": {
-            "$ref": "#/$defs/absolutePath"
+            "$ref": "#/$defs/packagePath"
           },
           "holder": {
             "$ref": "#/$defs/packageRef"
@@ -1221,7 +1227,7 @@
             "$ref": "#/$defs/identity"
           },
           "path": {
-            "$ref": "#/$defs/absolutePath"
+            "$ref": "#/$defs/packagePath"
           },
           "policy": {
             "enum": [

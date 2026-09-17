@@ -86,9 +86,17 @@ pub const Path = struct {
 
     /// Accepts only canonical relative paths: at least one component, no
     /// leading `/`, no empty, `.`, or `..` component, no control byte, and no
-    /// `\` (which is a separator on Windows and never appears in a supported
-    /// Debian payload path).
+    /// `\`. Package filenames use initPackage instead.
     pub fn init(text: []const u8) PathError!Path {
+        return initWithBackslashes(text, false);
+    }
+
+    /// Linux package names retain literal backslashes without interpreting them.
+    pub fn initPackage(text: []const u8) PathError!Path {
+        return initWithBackslashes(text, builtin.os.tag != .windows);
+    }
+
+    fn initWithBackslashes(text: []const u8, allow_backslashes: bool) PathError!Path {
         if (text.len == 0) return error.EmptyPath;
         if (text[0] == '/') return error.AbsolutePath;
         if (text.len > maximum_path_bytes) return error.PathTooLong;
@@ -100,7 +108,8 @@ pub const Path = struct {
                 return error.TraversingPath;
             if (component.len > maximum_component_bytes) return error.PathComponentTooLong;
             for (component) |byte| {
-                if (byte < 0x20 or byte == 0x7f or byte == '\\') return error.InvalidPathByte;
+                if (byte < 0x20 or byte == 0x7f or
+                    (!allow_backslashes and byte == '\\')) return error.InvalidPathByte;
             }
             count += 1;
             if (count > maximum_path_components) return error.PathTooDeep;
@@ -116,6 +125,13 @@ pub const Path = struct {
         if (text[0] != '/') return error.AbsolutePath;
         if (!absolute_path.nonRoot(text)) return error.TraversingPath;
         return init(text[1..]);
+    }
+
+    pub fn fromPackageAbsolute(text: []const u8) PathError!Path {
+        if (text.len == 0) return error.EmptyPath;
+        if (text[0] != '/') return error.AbsolutePath;
+        if (!@import("package_path.zig").nonRoot(text)) return error.TraversingPath;
+        return initPackage(text[1..]);
     }
 
     pub fn basename(self: Path) []const u8 {
@@ -790,7 +806,7 @@ pub const Root = struct {
     pub fn openRegularFile(self: Root, path: Path) !File {
         var parent = try self.openParent(path);
         defer parent.close(self.io);
-        return package_acquisition.openRegularFileNoFollow(
+        return package_acquisition.openPackageRegularFileNoFollow(
             parent.dir,
             self.io,
             parent.leaf,
@@ -802,7 +818,7 @@ pub const Root = struct {
     pub fn pinRegularFile(self: Root, path: Path) !PinnedRegularFile {
         var parent = try self.openParent(path);
         errdefer parent.close(self.io);
-        const file = package_acquisition.openRegularFileNoFollow(
+        const file = package_acquisition.openPackageRegularFileNoFollow(
             parent.dir,
             self.io,
             parent.leaf,
@@ -1677,6 +1693,42 @@ test "root_fs.test.path grammar rejects absolute, traversing, and control paths"
     try testing.expectError(error.PathTooDeep, Path.init(deep));
     const long_path = ("ab/" ** ((maximum_path_bytes / 3) + 1)) ++ "a";
     try testing.expectError(error.PathTooLong, Path.init(long_path));
+}
+
+test "root_fs.test.literal package leaves preserve strict authority and no-follow reads" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+    const spelling = "usr\\literal/system-systemd\\x2dmute.slice";
+    const path = try Path.initPackage(spelling);
+    try testing.expectEqualStrings(spelling, path.text);
+    try testing.expectError(error.InvalidPathByte, Path.init(spelling));
+    try testing.expectError(error.TraversingPath, Path.fromAbsolute("/" ++ spelling));
+    try testing.expectEqualStrings(spelling, (try Path.fromPackageAbsolute("/" ++ spelling)).text);
+    try testing.expectError(error.TraversingPath, Path.initPackage("literal\\name/../escape"));
+    try testing.expectError(error.InvalidPathByte, Path.initPackage("literal\\name\n"));
+    try root.createDirectoryPath(path.parent().?, default_directory_permissions);
+    try root.publishFile(path, "literal package bytes\n", .{});
+    const bytes = try root.readFileAlloc(testing.allocator, path, 128);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("literal package bytes\n", bytes);
+    var pinned = try root.pinRegularFile(path);
+    defer pinned.close();
+    var directory = try root.openDirectory(path.parent().?);
+    defer directory.close(root.io);
+    try testing.expectError(
+        error.AccessDenied,
+        package_acquisition.openRegularFileNoFollow(directory, root.io, path.basename()),
+    );
+    const link = try Path.initPackage("usr\\literal/link\\name");
+    try root.createSymbolicLink(link, path.basename());
+    try testing.expectError(error.NotRegularFile, root.openRegularFile(link));
+    try testing.expectError(error.NotRegularFile, root.pinRegularFile(link));
+    try testing.expectError(
+        error.SymbolicLinkComponent,
+        root.entry(try Path.initPackage("usr\\literal/link\\name/child")),
+    );
 }
 
 test "root_fs.test.absolute spellings convert only when canonical" {

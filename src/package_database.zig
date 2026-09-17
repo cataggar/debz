@@ -19,7 +19,7 @@
 //! multi-file mutation from being attempted here.
 const std = @import("std");
 const deb822 = @import("deb822.zig");
-const absolute_path = @import("absolute_path.zig");
+const package_path = @import("package_path.zig");
 const status_model = @import("dpkg_status.zig");
 const version_module = @import("debian_version.zig");
 
@@ -127,7 +127,7 @@ pub fn declaredConffilePath(declaration: []const u8) ?[]const u8 {
         declaration[prefix.len..]
     else
         declaration;
-    if (!absolute_path.nonRoot(path)) return null;
+    if (!package_path.nonRoot(path)) return null;
     return path;
 }
 
@@ -784,7 +784,7 @@ pub fn validArchitecture(architecture: []const u8) bool {
 /// trigger using dpkg's package-name grammar.
 pub fn validTriggerName(name: []const u8) bool {
     if (name.len == 0) return false;
-    if (name[0] == '/') return absolute_path.nonRoot(name);
+    if (name[0] == '/') return package_path.nonRoot(name);
     return validPackageName(name);
 }
 
@@ -1056,7 +1056,7 @@ const FieldInterpreter = struct {
         const path = tokens.next() orelse return self.fail(.invalid_conffile, "Conffiles", package);
         const digest_text = tokens.next() orelse
             return self.fail(.invalid_conffile, "Conffiles", package);
-        if (path.len > self.options.limits.max_path_bytes or !absolute_path.nonRoot(path)) {
+        if (path.len > self.options.limits.max_path_bytes or !package_path.nonRoot(path)) {
             return self.fail(.invalid_conffile, "Conffiles", package);
         }
         const digest: ConffileDigest = if (std.mem.eql(u8, digest_text, "newconffile"))
@@ -1189,29 +1189,16 @@ fn validFieldName(name: []const u8) bool {
 }
 
 pub fn validRelativePath(path: []const u8) bool {
-    if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/') return false;
-    if (!std.unicode.utf8ValidateSlice(path)) return false;
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    for (path) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-    }
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or
-            std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
-            return false;
-    }
-    return true;
+    return package_path.relative(path);
 }
 
 pub fn validAbsolutePath(path: []const u8) bool {
-    return absolute_path.nonRoot(path);
+    return package_path.nonRoot(path);
 }
 
 pub fn validListPath(path: []const u8) bool {
     if (std.mem.eql(u8, path, root_list_path)) return true;
-    return absolute_path.nonRoot(path);
+    return package_path.nonRoot(path);
 }
 
 const InfoSuffix = enum {
@@ -1596,7 +1583,7 @@ const Importer = struct {
                 return self.fail(.triggers_file, .invalid_trigger_record, triggers_file_path, line.number);
             }
             if (trigger.len > self.options.limits.max_trigger_name_bytes or
-                trigger.len == 0 or trigger[0] != '/' or !absolute_path.nonRoot(trigger))
+                trigger.len == 0 or trigger[0] != '/' or !package_path.nonRoot(trigger))
             {
                 return self.fail(.triggers_file, .invalid_trigger_name, triggers_file_path, line.number);
             }
@@ -1833,7 +1820,7 @@ const Importer = struct {
             if (records.items.len >= self.options.limits.max_diversions) {
                 return self.fail(.diversions, .diversion_limit, diversions_path, line.number);
             }
-            if (!absolute_path.nonRoot(from) or !absolute_path.nonRoot(to) or
+            if (!package_path.nonRoot(from) or !package_path.nonRoot(to) or
                 std.mem.eql(u8, from, to) or
                 from.len > self.options.limits.max_path_bytes or
                 to.len > self.options.limits.max_path_bytes)
@@ -1877,7 +1864,7 @@ const Importer = struct {
             if (user.len == 0 or group.len == 0 or path.len == 0 or
                 user.len > 255 or group.len > 255 or
                 path.len > self.options.limits.max_path_bytes or
-                !absolute_path.nonRoot(path))
+                !package_path.nonRoot(path))
             {
                 return self.fail(.statoverride, .invalid_statoverride, statoverride_path, line.number);
             }
@@ -3387,6 +3374,58 @@ test "package_database.test.canonical writers reproduce the imported generation"
     const arch_bytes = try writeArchitectures(testing.allocator, model.foreign_architectures);
     defer testing.allocator.free(arch_bytes);
     try testing.expectEqualStrings(test_fixtures.arch, arch_bytes);
+}
+
+test "package_database.test.literal package paths round trip every database surface" {
+    const config = "/etc/literal\\config.conf";
+    const directory = "/usr/share/literal\\directory";
+    const checksum = "00000000000000000000000000000000";
+    const status = "Package: literal\nStatus: install ok installed\nArchitecture: amd64\n" ++
+        "Version: 1\nConffiles:\n " ++ config ++ " " ++ checksum ++ "\n\n";
+    const list = "/.\n/etc\n" ++ config ++ "\n/usr\n/usr/share\n" ++ directory ++ "\n";
+    const sums = checksum ++ "  etc/literal\\config.conf\n";
+    const declarations = "interest-noawait " ++ directory ++ "\n";
+    const interests = directory ++ " literal/noawait\n";
+    const diversions = "/usr/bin/from\\literal\n/usr/bin/to\\literal\n:\n";
+    const overrides = "root root 755 " ++ config ++ "\n";
+    const info = [_]InfoEntry{
+        .{ .name = "format", .bytes = "1\n" },
+        .{ .name = "literal.list", .bytes = list },
+        .{ .name = "literal.md5sums", .bytes = sums },
+        .{ .name = "literal.conffiles", .bytes = config ++ "\n" },
+        .{ .name = "literal.triggers", .bytes = declarations },
+    };
+    var database = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = .{
+            .status = regularFile(status),
+            .info = &info,
+            .triggers_file = regularFile(interests),
+            .diversions = regularFile(diversions),
+            .statoverride = regularFile(overrides),
+        },
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => |value| {
+            std.debug.print("literal database rejected: {any}\n", .{value});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer database.deinit();
+    const record = database.model.find("literal", "amd64").?;
+    try testing.expect(record.ownsPath(config));
+    try testing.expect(!record.ownsPath("/etc/literal-config.conf"));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try testing.expectEqualStrings(status, try writeStatusDocument(allocator, database.model.packages));
+    try testing.expectEqualStrings(list, try writeFileList(allocator, record.paths.?));
+    try testing.expectEqualStrings(sums, try writeMd5sums(allocator, record.md5sums.?));
+    try testing.expectEqualStrings(config ++ "\n", try writeDeclaredConffiles(allocator, record.declared_conffiles.?));
+    try testing.expectEqualStrings(declarations, try writeTriggerDeclarations(allocator, record.trigger_declarations.?));
+    try testing.expectEqualStrings(interests, try writeTriggerInterests(allocator, database.model.triggers.interests));
+    try testing.expectEqualStrings(diversions, try writeDiversions(allocator, database.model.diversions));
+    try testing.expectEqualStrings(overrides, try writeStatOverrides(allocator, database.model.stat_overrides));
 }
 
 test "package_database.test.named trigger registry and noawait queue marker round trip" {

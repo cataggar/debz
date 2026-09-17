@@ -823,8 +823,28 @@ pub fn openRegularFileNoFollow(
     io: std.Io,
     path: []const u8,
 ) !File {
+    return openRegularLeafNoFollow(dir, io, path, false);
+}
+
+/// Package-root callers have already pinned the parent and validated the
+/// relative path. POSIX leaf names may contain literal backslashes.
+pub fn openPackageRegularFileNoFollow(
+    dir: Dir,
+    io: std.Io,
+    path: []const u8,
+) !File {
+    return openRegularLeafNoFollow(dir, io, path, builtin.os.tag != .windows);
+}
+
+fn openRegularLeafNoFollow(
+    dir: Dir,
+    io: std.Io,
+    path: []const u8,
+    allow_backslashes: bool,
+) !File {
     if (path.len == 0 or std.mem.eql(u8, path, ".") or std.mem.eql(u8, path, "..") or
-        std.mem.indexOfAny(u8, path, "/\\") != null)
+        std.mem.indexOfScalar(u8, path, '/') != null or
+        (!allow_backslashes and std.mem.indexOfScalar(u8, path, '\\') != null))
         return error.AccessDenied;
     const file: File = switch (builtin.os.tag) {
         .linux => blk: {

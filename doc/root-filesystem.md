@@ -24,16 +24,24 @@ descriptor.
 
 ## Path grammar
 
-`root_fs.Path` accepts only canonical root-relative paths:
+`root_fs.Path.init` accepts only canonical root-relative authority paths:
 
 - at least one component and no leading `/`;
 - no empty, `.`, or `..` component and no trailing slash;
-- no NUL or other control byte, and no `\`, which is a separator on Windows and
-  never appears in a supported Debian payload path;
+- no NUL or other control byte, and no `\`;
 - at most 4096 path bytes, 255 component bytes, and 128 components.
 
-`Path.fromAbsolute` converts the canonical absolute spelling used by the dpkg
-database and exact locks; `/` has no relative spelling and is rejected.
+`Path.fromAbsolute` converts strict absolute authority paths; `/` has no
+relative spelling and is rejected. Package paths use `Path.initPackage` and
+`Path.fromPackageAbsolute` instead. On POSIX hosts these retain literal
+backslashes, including systemd's `\x2d` filename spelling; they never decode
+escapes or treat backslashes as separators. Component, traversal, control-byte
+and size bounds remain identical. External install roots, acquisition leaves
+and private evidence storage names keep the strict grammar.
+
+Metadata uses the UTF-8-validating grammar in `src/package_path.zig`.
+Filesystem constructors preserve their existing byte-level behavior, with
+journal encodability checked separately at the serialization boundary.
 Validation happens before any syscall, so malformed database or archive input
 fails closed without touching the root.
 

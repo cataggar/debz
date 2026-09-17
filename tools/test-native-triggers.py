@@ -51,8 +51,11 @@ def reference(
     destination: Path,
     *,
     defer: bool = False,
+    policy: str | None = None,
 ) -> int:
     command = [arg for arg in m.reference_command(root) if arg != "--no-triggers"]
+    if policy is not None:
+        command.append({"keep_existing": "--force-confold", "use_package_version": "--force-confnew"}[policy])
     if defer:
         command.append("--no-triggers")
     if operation in ("install", "upgrade", "downgrade", "reinstall"):

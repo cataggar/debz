@@ -11,6 +11,7 @@
 //! the contract, its canonical bytes, and its validation.
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const maintainer_script = @import("maintainer_script.zig");
@@ -1413,7 +1414,7 @@ fn validTriggerToken(value: []const u8) bool {
         if (byte <= 0x20 or byte >= 0x7f) return false;
     }
     return if (value[0] == '/')
-        absolute_path.nonRoot(value)
+        package_path.nonRoot(value)
     else
         std.mem.indexOfScalar(u8, value, '/') == null;
 }
