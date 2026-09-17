@@ -29,6 +29,10 @@ and fails rather than skipping transaction assertions.
 Refresh, planning, verified downloads, cache replay, payload validation, policy,
 and reproducibility remain mandatory on every host. No qemu or foreign
 executable is used. Foreign packages contain inert data only.
+The native root's script-free helper fixture is reference-installed with
+`dpkg --force-architecture` so foreign rows can seed its genuine package-owned
+target. This is scoped to the disposable fixture root, not production native
+admission or the host architecture database.
 
 The core native planning lane resolves a real v2 lock, compares its repository
 and package evidence with the legacy closure, verifies its independent digest
