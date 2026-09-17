@@ -134,11 +134,11 @@ The pinned fixtures currently exercise a deliberately small part of the profile.
 |---|---|
 | `src/fixtures/packages-microsoft-prod*.deb` | Uncompressed control and data tars, USTAR headers, archive root record, directories, regular files, root ownership, `control` only. |
 | `src/fixtures/deb-payload/*.tar{,.gz,.xz,.zst}` | Uncompressed, gzip, xz, and zstd control and data members. |
-| `tools/generate-integration-repository.py` packages | gzip control and data members, `control`, `conffiles`, `triggers` with `interest-noawait` on a path target, an executable `postinst`, dependencies, `Pre-Depends`, `Provides`, `Conflicts`, `Breaks`, `Replaces`, `Essential`, `Protected`, and `Multi-Arch`. |
+| `tools/generate-integration-repository.py` packages | gzip control and data members, `control`, `conffiles`, `triggers` with `interest-noawait` on a path target, an executable `postinst`, inert `templates`/`shlibs`/`symbols`, dependencies, `Pre-Depends`, `Provides`, `Conflicts`, `Breaks`, `Replaces`, `Essential`, `Protected`, and `Multi-Arch`. |
 
 No pinned fixture ships `md5sums`, symbolic or hard links, setuid or setgid
 payload entries, non-root ownership, GNU long names, `remove-on-upgrade`
-conffiles, retained metadata members, or `config`. Those paths are therefore
+conffiles or `config`. Those paths are therefore
 covered by the adversarial and positive unit tests in
 `src/archive_application.zig` and by the `archive-application-model`,
 `archive-checksum-verification`, and `archive-unsupported-feature` scenarios in

@@ -28,9 +28,22 @@ pub const StagedScript = struct {
     mode: u32 = 0o755,
 };
 
+pub const StagedMetadata = struct {
+    kind: database.RetainedMetadataKind,
+    bytes: []const u8,
+    mode: u32 = 0o644,
+};
+
+pub const MetadataUpdate = union(enum) {
+    preserve,
+    /// The complete replacement set; an empty slice removes every inert member.
+    replace: []const StagedMetadata,
+};
+
 /// A complete package record plus every modeled `info` file it owns. A `null`
 /// component means the file must not exist after publication; it is never
-/// interpreted as "leave whatever is there".
+/// interpreted as "leave whatever is there". Inert metadata has a separate,
+/// explicit preserve/replace policy so existing status-only callers retain it.
 pub const StagedPackage = struct {
     fields: []const database.StatusField,
     paths: ?[]const []const u8 = null,
@@ -38,6 +51,7 @@ pub const StagedPackage = struct {
     declared_conffiles: ?[]const []const u8 = null,
     trigger_declarations: ?[]const database.TriggerDeclaration = null,
     scripts: []const StagedScript = &.{},
+    metadata: MetadataUpdate = .preserve,
 };
 
 pub const StateChange = struct {
@@ -531,6 +545,13 @@ const Builder = struct {
             }
             try self.stageRemove(try self.infoPath(record.info_stem, script.kind.suffix()));
         }
+        for (record.metadata) |member| {
+            if (keep) |replacement| {
+                if (std.mem.eql(u8, replacement.info_stem, record.info_stem) and
+                    replacement.metadataMember(member.kind) != null) continue;
+            }
+            try self.stageRemove(try self.infoPath(record.info_stem, member.kind.suffix()));
+        }
         if (keep == null) {
             for (try self.opaqueFilesOf(record.identity())) |index| {
                 try self.stageRemove(try std.fmt.allocPrint(self.arena, "{s}/{s}", .{
@@ -545,6 +566,7 @@ const Builder = struct {
         self: *Builder,
         record: database.PackageRecord,
         scripts: []const StagedScript,
+        metadata: []const StagedMetadata,
     ) PlanError!void {
         if (record.paths) |paths| {
             try self.stageReplace(
@@ -584,6 +606,40 @@ const Builder = struct {
                 script.mode,
             );
         }
+        for (metadata) |member| {
+            try self.stageReplace(
+                try self.infoPath(record.info_stem, member.kind.suffix()),
+                try self.arena.dupe(u8, member.bytes),
+                member.mode,
+            );
+        }
+    }
+
+    fn metadataFacts(
+        self: *Builder,
+        entries: []const StagedMetadata,
+        package: []const u8,
+    ) PlanError![]const database.RetainedMetadata {
+        if (entries.len > std.enums.values(database.RetainedMetadataKind).len)
+            return self.fail(.info_limit, package);
+        const result = try self.arena.alloc(database.RetainedMetadata, entries.len);
+        var seen = std.EnumSet(database.RetainedMetadataKind).initEmpty();
+        for (entries, 0..) |entry, index| {
+            if (!database.safeFileMode(entry.mode)) return self.fail(.unsafe_mode, package);
+            if (entry.bytes.len > self.options.database.limits.max_info_file_bytes)
+                return self.fail(.file_too_large, package);
+            if (seen.contains(entry.kind)) return self.fail(.duplicate_info_name, package);
+            seen.insert(entry.kind);
+            var digest: [32]u8 = undefined;
+            Sha256.hash(entry.bytes, &digest, .{});
+            result[index] = .{
+                .kind = entry.kind,
+                .mode = entry.mode,
+                .size = entry.bytes.len,
+                .sha256 = digest,
+            };
+        }
+        return result;
     }
 
     fn applyPut(self: *Builder, staged: StagedPackage) PlanError!void {
@@ -644,22 +700,27 @@ const Builder = struct {
             self.records.items[index]
         else
             null;
+        record.metadata = switch (staged.metadata) {
+            .preserve => if (existing) |old| old.metadata else &.{},
+            .replace => |entries| try self.metadataFacts(entries, record.name),
+        };
         if (existing) |old| {
             if (!transitionAllowed(old.status.current, record.status.current)) {
                 return self.fail(.invalid_transition, record.name);
             }
-            // A stem change renames every info file. Modeled files and staged
-            // scripts are republished under the new stem, but the bytes of
-            // retained unmodeled info files are not part of the model, so
-            // renaming them would either lose or orphan them.
+            // A stem change needs explicit bytes for every retained file.
             if (!std.mem.eql(u8, old.info_stem, record.info_stem) and
-                (try self.opaqueFilesOf(record.identity())).len != 0)
+                ((try self.opaqueFilesOf(record.identity())).len != 0 or
+                    (staged.metadata == .preserve and old.metadata.len != 0)))
             {
                 return self.fail(.unsupported_info_rename, record.name);
             }
             try self.guardCoverage(old);
         }
-        try self.stagePackageInfo(record, staged.scripts);
+        try self.stagePackageInfo(record, staged.scripts, switch (staged.metadata) {
+            .preserve => &.{},
+            .replace => |entries| entries,
+        });
         if (existing) |old| {
             try self.removeInfoFiles(old, record);
             self.records.items[slot.?] = record;
@@ -1024,8 +1085,8 @@ const Builder = struct {
             if (write.bytes.len > max_bytes) {
                 return self.failPath(.file_too_large, write.path);
             }
-            // Maintainer scripts are opaque payloads rather than database text.
-            if (script) continue;
+            // Scripts and inert control metadata are byte payloads, not database text.
+            if (script or isMetadataPath(write.path)) continue;
             var rest = write.bytes;
             while (rest.len != 0) {
                 const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
@@ -1045,6 +1106,12 @@ fn isScriptPath(path: []const u8) bool {
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
     const suffix = path[dot + 1 ..];
     return std.meta.stringToEnum(database.ScriptKind, suffix) != null;
+}
+
+fn isMetadataPath(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, database.info_directory ++ "/")) return false;
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
+    return database.RetainedMetadataKind.fromSuffix(path[dot + 1 ..]) != null;
 }
 
 fn lessWrite(_: void, left: PlannedWrite, right: PlannedWrite) bool {
@@ -1742,7 +1809,7 @@ test "package_database_changes.test.renaming info files of a package with retain
     defer allocator.free(entries);
     @memcpy(entries[0..database.test_fixtures.info.len], database.test_fixtures.info);
     entries[database.test_fixtures.info.len] = .{
-        .name = "toolz.templates",
+        .name = "toolz.vendor-data",
         .bytes = "Template: toolz/question\nType: boolean\n",
     };
     var snapshot = database.test_fixtures.snapshot();
@@ -1761,7 +1828,7 @@ test "package_database_changes.test.renaming info files of a package with retain
     try testing.expectEqual(@as(usize, 1), source.model.opaque_info.len);
 
     // `toolz` is published unqualified; declaring `Multi-Arch: same` would move
-    // every info file to `toolz:amd64`, orphaning the retained templates file.
+    // every info file to `toolz:amd64`, orphaning the unmodeled vendor file.
     const renamed = [_]database.StatusField{
         .{ .name = "Package", .value_lines = &.{"toolz"} },
         .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
@@ -1797,7 +1864,7 @@ test "package_database_changes.test.renaming info files of a package with retain
         .plan => |value| value,
     };
     defer staged.deinit();
-    try testing.expect(staged.find("info/toolz.templates") == null);
+    try testing.expect(staged.find("info/toolz.vendor-data") == null);
     try testing.expect(staged.find("info/toolz.md5sums").?.kind == .remove);
     try testing.expect(staged.find("info/toolz.triggers").?.kind == .remove);
     try testing.expect(staged.find("info/toolz.postinst").?.kind == .remove);
@@ -1825,7 +1892,7 @@ test "package_database_changes.test.purge removes retained unmodeled info files"
     defer allocator.free(entries);
     @memcpy(entries[0..database.test_fixtures.info.len], database.test_fixtures.info);
     entries[database.test_fixtures.info.len] = .{
-        .name = "oldpkg.templates",
+        .name = "oldpkg.vendor-data",
         .bytes = "Template: oldpkg/question\nType: boolean\n",
     };
     var snapshot = database.test_fixtures.snapshot();
@@ -1850,7 +1917,7 @@ test "package_database_changes.test.purge removes retained unmodeled info files"
         .plan => |value| value,
     };
     defer staged.deinit();
-    try testing.expect(staged.find("info/oldpkg.templates").?.kind == .remove);
+    try testing.expect(staged.find("info/oldpkg.vendor-data").?.kind == .remove);
 
     var root = try SimulatedRoot.init(testing.allocator, snapshot);
     defer root.deinit();
@@ -1866,6 +1933,162 @@ test "package_database_changes.test.purge removes retained unmodeled info files"
     };
     defer republished.deinit();
     try testing.expectEqual(@as(usize, 0), republished.model.opaque_info.len);
+}
+
+test "package_database_changes.test.inert metadata replacement preserves exact bytes and retires old members" {
+    var root = try SimulatedRoot.init(testing.allocator, database.test_fixtures.snapshot());
+    defer root.deinit();
+    var bytes = "binary\x00\xffmetadata".*;
+    const initial = [_]StagedMetadata{
+        .{ .kind = .templates, .bytes = &bytes, .mode = 0o640 },
+        .{ .kind = .shlibs, .bytes = "no final newline" },
+        .{ .kind = .symbols, .bytes = "", .mode = 0o600 },
+    };
+    const replacement = [_]StagedMetadata{.{ .kind = .shlibs, .bytes = "new generation\n", .mode = 0o640 }};
+    const operations = [_]MetadataUpdate{
+        .{ .replace = &initial },
+        .preserve,
+        .{ .replace = &replacement },
+        .{ .replace = &.{} },
+    };
+    const counts = [_]usize{ 3, 3, 1, 0 };
+    for (operations, counts, 0..) |update, count, index| {
+        var source = switch (try database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = root.snapshot(),
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer source.deinit();
+        var package = newPackage();
+        package.metadata = update;
+        var staged = switch (try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{})) {
+            .plan => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer staged.deinit();
+        if (index == 0) {
+            bytes[0] = 'X';
+            try testing.expectEqualStrings("binary\x00\xffmetadata", staged.find("info/newpkg.templates").?.bytes);
+        } else if (index == 1) {
+            try testing.expect(staged.find("info/newpkg.templates") == null);
+            try testing.expect(staged.find("info/newpkg.shlibs") == null);
+            try testing.expect(staged.find("info/newpkg.symbols") == null);
+        } else if (index == 2) {
+            try testing.expectEqual(WriteKind.remove, staged.find("info/newpkg.templates").?.kind);
+            try testing.expectEqual(WriteKind.remove, staged.find("info/newpkg.symbols").?.kind);
+        } else {
+            try testing.expectEqual(WriteKind.remove, staged.find("info/newpkg.shlibs").?.kind);
+        }
+        try root.apply(staged);
+        var imported = switch (try database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = root.snapshot(),
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer imported.deinit();
+        const record = imported.model.find("newpkg", "amd64").?;
+        try testing.expectEqual(count, record.metadata.len);
+        try testing.expectEqual(@as(usize, 0), imported.model.opaque_info.len);
+        if (index < 2) {
+            try testing.expectEqual(@as(u32, 0o640), record.metadataMember(.templates).?.mode);
+            try testing.expectEqual(@as(usize, 0), record.metadataMember(.symbols).?.size);
+        } else if (index == 2) {
+            try testing.expectEqual(@as(u32, 0o640), record.metadataMember(.shlibs).?.mode);
+        }
+    }
+}
+
+test "package_database_changes.test.inert metadata stem changes require explicit replacement bytes" {
+    const snapshot: database.Snapshot = .{
+        .status = database.regularFile(
+            "Package: toolz\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n\n",
+        ),
+        .info = &.{
+            .{ .name = "toolz.list", .bytes = "/.\n/usr\n/usr/bin\n/usr/bin/toolz\n" },
+            .{ .name = "toolz.templates", .bytes = "binary\x00\xffmetadata", .mode = 0o640 },
+        },
+    };
+    var source = switch (try database.importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer source.deinit();
+    var package: StagedPackage = .{
+        .fields = &.{
+            .{ .name = "Package", .value_lines = &.{"toolz"} },
+            .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+            .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+            .{ .name = "Multi-Arch", .value_lines = &.{"same"} },
+            .{ .name = "Version", .value_lines = &.{"2.0"} },
+            .{ .name = "Description", .value_lines = &.{"example tool"} },
+        },
+        .paths = &.{ "/.", "/usr", "/usr/bin", "/usr/bin/toolz" },
+    };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+        .{ .put_package = package },
+    }, .{}), .unsupported_info_rename);
+    package.metadata = .{ .replace = &.{.{
+        .kind = .templates,
+        .bytes = "binary\x00\xffmetadata",
+        .mode = 0o640,
+    }} };
+    var staged = switch (try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{})) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer staged.deinit();
+    try testing.expectEqual(WriteKind.remove, staged.find("info/toolz.templates").?.kind);
+    const replacement = staged.find("info/toolz:amd64.templates").?;
+    try testing.expectEqualStrings("binary\x00\xffmetadata", replacement.bytes);
+    try testing.expectEqual(@as(u32, 0o640), replacement.mode);
+}
+
+test "package_database_changes.test.inert metadata validates bounds modes and duplicate members" {
+    var source = try importFixture();
+    defer source.deinit();
+    var package = newPackage();
+    package.metadata = .{ .replace = &.{
+        .{ .kind = .templates, .bytes = "one" },
+        .{ .kind = .templates, .bytes = "two" },
+    } };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{}), .duplicate_info_name);
+    package.metadata = .{ .replace = &.{.{ .kind = .shlibs, .bytes = "unsafe", .mode = 0o666 }} };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{}), .unsafe_mode);
+    package.metadata = .{ .replace = &.{.{ .kind = .symbols, .bytes = "too large" }} };
+    try expectPlanDiagnostic(try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{
+        .database = .{ .limits = .{ .max_info_file_bytes = 8 } },
+    }), .file_too_large);
+}
+
+fn checkMetadataAllocations(allocator: std.mem.Allocator, source: database.Database) !void {
+    var package = newPackage();
+    package.metadata = .{ .replace = &.{
+        .{ .kind = .templates, .bytes = "template bytes" },
+        .{ .kind = .shlibs, .bytes = "shared library bytes" },
+        .{ .kind = .symbols, .bytes = "symbol bytes" },
+    } };
+    var staged = switch (try plan(allocator, source, &.{.{ .put_package = package }}, .{})) {
+        .plan => |value| value,
+        .diagnostic => |diagnostic| if (diagnostic.code == .out_of_memory)
+            return error.OutOfMemory
+        else
+            return error.TestUnexpectedResult,
+    };
+    defer staged.deinit();
+    try testing.expect(staged.find("info/newpkg.templates") != null);
+}
+
+test "package_database_changes.test.inert metadata owns partial allocations" {
+    var source = try importFixture();
+    defer source.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, checkMetadataAllocations, .{source});
 }
 
 fn expectImportRejects(snapshot: database.Snapshot, code: database.Code) !void {

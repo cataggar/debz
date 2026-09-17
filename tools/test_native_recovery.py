@@ -39,7 +39,7 @@ class RecoveryOracleTests(unittest.TestCase):
         ]
         report = acceptance.consumer_parity_coverage(rows, "amd64")
         self.assertEqual(report["scope"], "signed-hermetic-fixtures")
-        self.assertEqual(len(report["cases"]), 26)
+        self.assertEqual(len(report["cases"]), 28)
         for incomplete in ([], rows[:-1], [*rows, rows[0]], [{**rows[0], "case": "unreviewed"}, *rows[1:]]):
             with self.assertRaisesRegex(AssertionError, "incomplete or duplicated"):
                 acceptance.consumer_parity_coverage(incomplete, "amd64")
@@ -64,6 +64,7 @@ class RecoveryOracleTests(unittest.TestCase):
         self.assertEqual(cases["conffile-replace"]["conffile"], "use_package_version")
         self.assertEqual(cases["suite-trigger"]["package"], "trigger-pkg")
         self.assertEqual(cases["literal-package-paths"]["archives"], ("literal-paths-pkg",))
+        self.assertEqual(cases["retained-metadata"]["archives"], ("retained-metadata-pkg",))
 
     def test_program_package_paths_do_not_broaden_root_authority(self) -> None:
         validator = acceptance.validator("native-transaction-program-v1")

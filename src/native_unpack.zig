@@ -2534,12 +2534,15 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .architecture = item.identity.architecture,
                 .detail = trigger.target,
             });
-        for (archive.metadata) |member| try builder.deferFeature(.{
-            .feature = .package_metadata,
-            .package = item.identity.name,
-            .architecture = item.identity.architecture,
-            .detail = member.name,
-        });
+        for (archive.metadata) |member| {
+            if (retainedMetadataKind(member) != null) continue;
+            try builder.deferFeature(.{
+                .feature = .package_metadata,
+                .package = item.identity.name,
+                .architecture = item.identity.architecture,
+                .detail = member.name,
+            });
+        }
         const prior = item.prior orelse continue;
         if (builder.request.conffiles == .handoff)
             for (prior.conffiles) |conffile| try builder.deferFeature(.{
@@ -6730,6 +6733,14 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
                 item.declared_conffiles.items,
             .trigger_declarations = trigger_declarations,
             .scripts = lifecycle_scripts,
+            .metadata = .{ .replace = stagedArchiveMetadata(builder.arena, model) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedNativeMetadata => return builder.fail(.{
+                    .surface = .publication,
+                    .code = .program_incomplete,
+                    .package = item.identity.name,
+                }),
+            } },
         } });
     }
     const result = package_database_changes.plan(
@@ -7130,7 +7141,7 @@ const MaterializationRequest = struct {
     borrowed_attempt: ?*root_operation.Attempt = null,
     execution: ?*ExecutionState = null,
     raw_status_verification: bool = false,
-    mutation_last_step: ?*u32 = null,
+    mutation_database_step: ?*u32 = null,
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
 };
@@ -8040,11 +8051,13 @@ fn materialize(
         .plan => |value| value,
     };
     defer mutation_plan.deinit();
-    if (request.mutation_last_step) |slot|
-        slot.* = if (mutation_plan.steps.len == 0)
-            0
-        else
-            @intCast(mutation_plan.steps.len - 1);
+    if (request.mutation_database_step) |slot| {
+        const first_database_path = lowered.database.intents[0].path();
+        slot.* = for (mutation_plan.steps) |step| {
+            if (step.kind == .copy_file and std.mem.eql(u8, step.path, first_database_path))
+                break step.index;
+        } else return error.MaterializationDatabaseMismatch;
+    }
 
     if (execution.recovery) |runtime| {
         if (execution.action) |action|
@@ -8859,6 +8872,35 @@ fn databaseScriptKind(kind: archive_application.ScriptKind) ?package_database.Sc
     };
 }
 
+fn retainedMetadataKind(member: archive_application.MetadataMember) ?package_database.RetainedMetadataKind {
+    if (!package_database.safeFileMode(member.mode) or
+        member.size > (package_database.Limits{}).max_info_file_bytes) return null;
+    return package_database.RetainedMetadataKind.fromSuffix(member.name);
+}
+
+fn supportedArchiveMetadata(model: *const archive_application.Model) bool {
+    for (model.metadata) |member| {
+        if (retainedMetadataKind(member) == null) return false;
+    }
+    return true;
+}
+
+fn stagedArchiveMetadata(
+    allocator: std.mem.Allocator,
+    model: *const archive_application.Model,
+) error{ OutOfMemory, UnsupportedNativeMetadata }![]const package_database_changes.StagedMetadata {
+    const result = try allocator.alloc(package_database_changes.StagedMetadata, model.metadata.len);
+    errdefer allocator.free(result);
+    for (model.metadata, 0..) |member, index| {
+        result[index] = .{
+            .kind = retainedMetadataKind(member) orelse return error.UnsupportedNativeMetadata,
+            .bytes = model.metadataBytes(member),
+            .mode = member.mode,
+        };
+    }
+    return result;
+}
+
 fn stagedArchiveScripts(
     allocator: std.mem.Allocator,
     archive: *const BoundArchive,
@@ -8967,7 +9009,7 @@ fn materializeConfigure(
         if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
             (!request.planning.trigger_execution and
                 archive.model.triggers.len != 0) or
-            archive.model.metadata.len != 0)
+            !supportedArchiveMetadata(&archive.model))
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
         const record = database.model.find(
             archive.model.facts.package,
@@ -9507,6 +9549,10 @@ fn materializeRemoval(
     var directories: std.ArrayList([]const u8) = .empty;
     defer directories.deinit(allocator);
 
+    const shared_root = for (database.model.packages, 0..) |candidate, index| {
+        if (!selected_owners.contains(@intCast(index)) and
+            candidate.ownsPath(package_database.root_list_path)) break true;
+    } else false;
     for (selected_records.items) |record_index| {
         const record = &database.model.packages[record_index];
         if (record.status.error_state != .ok or record.status.want == .hold)
@@ -9532,7 +9578,7 @@ fn materializeRemoval(
 
         for (record.paths orelse &.{}) |listed| {
             const relative = relativeListPath(listed) orelse {
-                if (!purge and record.conffiles.len != 0)
+                if (!purge and record.conffiles.len != 0 and !shared_root)
                     try retained_paths.append(allocator, listed);
                 continue;
             };
@@ -9638,6 +9684,7 @@ fn materializeRemoval(
                         record.*,
                         request.planning.limits.database.limits.max_info_file_bytes,
                     ),
+                    .metadata = if (request.borrowed_attempt != null) .preserve else .{ .replace = &.{} },
                 } });
             }
         } else {
@@ -9665,6 +9712,7 @@ fn materializeRemoval(
                     )
                 else
                     &.{},
+                .metadata = if (request.borrowed_attempt != null) .preserve else .{ .replace = &.{} },
             } });
         }
     }
@@ -9856,20 +9904,54 @@ fn materializeStateRecord(
         if (state.remove_entry) return .{ .outcome = .applied, .detail = "already_absent" };
         return .{ .outcome = .refused, .detail = "package_not_installed" };
     }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const wanted = want_override orelse if (state.hold)
+        package_database.Want.hold
+    else if (state.state == .config_files)
+        package_database.Want.deinstall
+    else
+        package_database.Want.install;
+    const error_state = error_override orelse .ok;
+    // Removal scripts still observe installed metadata. Retire it only when
+    // their successful removal settles the residual configuration record.
     const change: package_database_changes.Change = if (state.remove_entry)
         .{ .remove_package = record.?.identity() }
-    else
-        .{ .set_state = .{
-            .identity = record.?.identity(),
-            .want = want_override orelse if (state.hold)
-                .hold
-            else if (state.state == .config_files)
-                .deinstall
-            else
-                .install,
-            .error_state = error_override orelse .ok,
-            .current = state.state,
+    else if (state.state == .config_files and record.?.metadata.len != 0) block: {
+        const config_version = switch (configVersionField(record.?.*)) {
+            .valid => |value| value,
+            .absent => null,
+            .invalid => return .{ .outcome = .refused, .detail = "config_version" },
+        };
+        break :block .{ .put_package = .{
+            .fields = try phaseStatusFields(
+                owned,
+                record.?.*,
+                wanted,
+                error_state,
+                state.state,
+                config_version,
+                record.?.conffiles,
+            ),
+            .paths = record.?.paths,
+            .md5sums = record.?.md5sums,
+            .declared_conffiles = record.?.declared_conffiles,
+            .trigger_declarations = record.?.trigger_declarations,
+            .scripts = try stagedInstalledScripts(
+                owned,
+                request.root,
+                record.?.*,
+                request.planning.limits.database.limits.max_info_file_bytes,
+            ),
+            .metadata = .{ .replace = &.{} },
         } };
+    } else .{ .set_state = .{
+        .identity = record.?.identity(),
+        .want = wanted,
+        .error_state = error_state,
+        .current = state.state,
+    } };
     var database_plan = switch (try package_database_changes.plan(
         allocator,
         database,
@@ -10145,6 +10227,48 @@ fn materializeDetailedState(
     );
 }
 
+fn snapshotInfoMember(
+    allocator: std.mem.Allocator,
+    snapshot: package_database.Snapshot,
+    record: package_database.PackageRecord,
+    member: anytype,
+) !package_database.InfoEntry {
+    const name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}",
+        .{ record.info_stem, member.kind.suffix() },
+    );
+    defer allocator.free(name);
+    const entry = for (snapshot.info) |candidate| {
+        if (std.mem.eql(u8, candidate.name, name)) break candidate;
+    } else return error.InstalledInfoMissing;
+    if (entry.kind != .regular or entry.mode != member.mode or entry.bytes.len != member.size)
+        return error.InstalledInfoMismatch;
+    var digest: [32]u8 = undefined;
+    Sha256.hash(entry.bytes, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &member.sha256))
+        return error.InstalledInfoMismatch;
+    return entry;
+}
+
+fn snapshotMetadata(
+    allocator: std.mem.Allocator,
+    snapshot: package_database.Snapshot,
+    record: package_database.PackageRecord,
+) ![]const package_database_changes.StagedMetadata {
+    const result = try allocator.alloc(package_database_changes.StagedMetadata, record.metadata.len);
+    errdefer allocator.free(result);
+    for (record.metadata, 0..) |member, index| {
+        const entry = try snapshotInfoMember(allocator, snapshot, record, member);
+        result[index] = .{
+            .kind = member.kind,
+            .bytes = entry.bytes,
+            .mode = entry.mode,
+        };
+    }
+    return result;
+}
+
 fn snapshotScripts(
     allocator: std.mem.Allocator,
     snapshot: package_database.Snapshot,
@@ -10154,21 +10278,13 @@ fn snapshotScripts(
         package_database_changes.StagedScript,
         record.scripts.len,
     );
+    errdefer allocator.free(scripts);
     for (record.scripts, 0..) |script, index| {
-        const name = try std.fmt.allocPrint(
-            allocator,
-            "{s}.{s}",
-            .{ record.info_stem, script.kind.suffix() },
-        );
-        const entry = for (snapshot.info) |candidate| {
-            if (std.mem.eql(u8, candidate.name, name)) break candidate;
-        } else return error.InstalledScriptMissing;
-        if (entry.kind != .regular or entry.bytes.len != script.size)
-            return error.InstalledScriptMismatch;
-        var digest: [32]u8 = undefined;
-        Sha256.hash(entry.bytes, &digest, .{});
-        if (!std.mem.eql(u8, &digest, &script.sha256))
-            return error.InstalledScriptMismatch;
+        const entry = snapshotInfoMember(allocator, snapshot, record, script) catch |err| switch (err) {
+            error.InstalledInfoMissing => return error.InstalledScriptMissing,
+            error.InstalledInfoMismatch => return error.InstalledScriptMismatch,
+            else => return err,
+        };
         scripts[index] = .{
             .kind = script.kind,
             .bytes = entry.bytes,
@@ -10240,6 +10356,7 @@ fn materializeRestoredPackageState(
         .declared_conffiles = initial.declared_conffiles,
         .trigger_declarations = initial.trigger_declarations,
         .scripts = try snapshotScripts(owned, initial_snapshot, initial.*),
+        .metadata = .{ .replace = try snapshotMetadata(owned, initial_snapshot, initial.*) },
     } };
     var database_plan = switch (try package_database_changes.plan(
         allocator,
@@ -12452,7 +12569,7 @@ fn lifecycleDataStep(
     sequence: u32,
     package: native_program.PackageIdentity,
     hooks: root_mutation.Hooks,
-    mutation_last_step: ?*u32,
+    mutation_database_step: ?*u32,
 ) !MaterializationResult {
     const model_index = lifecycleArchiveIndex(models, package) orelse
         return .{ .outcome = .refused, .detail = "archive_missing" };
@@ -12481,7 +12598,7 @@ fn lifecycleDataStep(
         &sequences,
     );
     request.hooks = hooks;
-    request.mutation_last_step = mutation_last_step;
+    request.mutation_database_step = mutation_database_step;
     return materialize(allocator, request);
 }
 
@@ -12625,7 +12742,8 @@ fn lifecycleStateStep(
         (!state.remove_entry and record != null and
             record.?.status.current == state.state and
             record.?.status.want == expected_want and
-            record.?.status.error_state == expected_error))
+            record.?.status.error_state == expected_error and
+            !(state.state == .config_files and record.?.metadata.len != 0)))
         return lifecycleAuxiliary(
             execution,
             allocator,
@@ -15338,6 +15456,8 @@ fn postUnpackHook(
     index: u32,
 ) root_mutation.HookError!void {
     const context: *PostUnpackHook = @ptrCast(@alignCast(context_ptr.?));
+    // The status-old copy verifies even when already satisfied. Payload is
+    // visible here, but the installed control files have not been replaced.
     if (context.fired or boundary != .verify or index != context.target_step)
         return;
     context.fired = true;
@@ -16639,7 +16759,7 @@ fn productionArchives(
             .model => |value| value,
             .diagnostic => return error.RecoveryArtifactBindingMismatch,
         };
-        if (models[index].metadata.len != 0 or models[index].script(.config) != null)
+        if (!supportedArchiveMetadata(&models[index]) or models[index].script(.config) != null)
             return error.InvalidExternalArchive;
     }
     return .{ .models = models, .bytes = ordered };
@@ -16745,7 +16865,7 @@ fn loadRecoveredLifecycleInputs(
             .model => |value| value,
             .diagnostic => return error.InvalidExternalArchive,
         };
-        if (models[index].metadata.len != 0 or
+        if (!supportedArchiveMetadata(&models[index]) or
             models[index].script(.config) != null)
             return error.InvalidExternalArchive;
     }
@@ -17596,7 +17716,7 @@ pub const Runtime = struct {
             if (locked.declared_size != bytes.len or
                 !std.mem.eql(u8, &locked.sha256, &model.provenance().sha256))
                 return error.ArchiveEvidenceMismatch;
-            if (model.metadata.len != 0 or model.script(.config) != null)
+            if (!supportedArchiveMetadata(model) or model.script(.config) != null)
                 return error.UnsupportedNativeArchive;
             origins[index] = locked.origin;
         }
@@ -21017,7 +21137,7 @@ test "native_unpack.test.lifecycle external fixture" {
         };
         errdefer model.deinit();
         if ((!external.triggers and model.triggers.len != 0) or
-            model.metadata.len != 0 or
+            !supportedArchiveMetadata(&model) or
             model.script(.config) != null)
         {
             model.deinit();
@@ -23143,7 +23263,7 @@ test "native_unpack.test.deferred lifecycle features are explicit handoffs" {
         .{ .control = &.{.{ .path = "conffiles", .content = "/etc/demo.conf\n" }}, .feature = .conffile },
         .{ .control = &.{.{ .path = "preinst", .mode = 0o755, .content = "#!/bin/sh\n" }}, .feature = .maintainer_script },
         .{ .control = &.{.{ .path = "triggers", .content = "interest /usr/share/demo\n" }}, .feature = .trigger },
-        .{ .control = &.{.{ .path = "templates", .content = "Template: demo/value\nType: string\n" }}, .feature = .package_metadata },
+        .{ .control = &.{.{ .path = "templates", .mode = 0o666, .content = "Template: demo/value\nType: string\n" }}, .feature = .package_metadata },
     };
     for (cases) |case| {
         var fixture: Fixture = undefined;

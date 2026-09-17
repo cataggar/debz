@@ -89,6 +89,7 @@ def build_deb(
     helper_target: bool = False,
     native_trigger: bool = False,
     literal_paths: bool = False,
+    retained_metadata: bool = False,
 ) -> bytes:
     control_fields = {
         "Package": package,
@@ -100,6 +101,12 @@ def build_deb(
     }
     control = "".join(f"{name}: {value}\n" for name, value in control_fields.items()).encode()
     control_entries = [("./control", control, 0o644)]
+    if retained_metadata:
+        control_entries.extend((
+            ("./templates", f"Template: {package}/value\nType: string\nDescription: inert metadata\n".encode(), 0o644),
+            ("./shlibs", f"libretained 1 {package} (>= {version})\n".encode(), 0o640),
+            ("./symbols", f"libretained.so.1 {package} #MINVER#\n symbol@Base 1\n".encode() + b"\x00\xff", 0o644),
+        ))
     if failing_postinst:
         control_entries.append(("./postinst", b"#!/bin/sh\nexit 42\n", 0o755))
     if conffile:
@@ -134,6 +141,7 @@ def package_specs(suite: str, architecture: str):
         ("native-helper-target", "1.0-1", architecture, {}, {"helper_target": True}),
         ("native-trigger-pkg", "1.0-1", architecture, {}, {"native_trigger": True}),
         ("literal-paths-pkg", "1.0-1", architecture, {}, {"literal_paths": True}),
+        ("retained-metadata-pkg", "1.0-1", architecture, {"Multi-Arch": "same"}, {"retained_metadata": True}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
         ("alt-b", "2.0-1", architecture, {}, {}),

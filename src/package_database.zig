@@ -236,6 +236,28 @@ pub const MaintainerScript = struct {
     sha256: [32]u8,
 };
 
+pub const RetainedMetadataKind = enum {
+    templates,
+    shlibs,
+    symbols,
+
+    pub fn suffix(self: RetainedMetadataKind) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromSuffix(text: []const u8) ?RetainedMetadataKind {
+        return std.meta.stringToEnum(RetainedMetadataKind, text);
+    }
+};
+
+/// Inert control-file bytes are retained exactly, not interpreted as database text.
+pub const RetainedMetadata = struct {
+    kind: RetainedMetadataKind,
+    mode: u32,
+    size: usize,
+    sha256: [32]u8,
+};
+
 pub const TriggerDeclarationKind = enum {
     interest,
     interest_await,
@@ -318,8 +340,7 @@ pub const StatOverrideRecord = struct {
     path: []const u8,
 };
 
-/// A retained but not natively modeled `info` file, such as `templates`,
-/// `shlibs`, `symbols`, `config`, or a vendor extension.
+/// An unmodeled `info` file, such as `config` or a vendor extension.
 pub const OpaqueInfoFile = struct {
     name: []const u8,
     owner: ?Identity,
@@ -362,6 +383,7 @@ pub const PackageRecord = struct {
     declared_conffiles: ?[]const []const u8,
     trigger_declarations: ?[]const TriggerDeclaration,
     scripts: []const MaintainerScript,
+    metadata: []const RetainedMetadata = &.{},
 
     pub fn identity(self: PackageRecord) Identity {
         return .{ .name = self.name, .architecture = self.architecture };
@@ -377,6 +399,13 @@ pub const PackageRecord = struct {
 
     pub fn script(self: PackageRecord, kind: ScriptKind) ?MaintainerScript {
         for (self.scripts) |entry| {
+            if (entry.kind == kind) return entry;
+        }
+        return null;
+    }
+
+    pub fn metadataMember(self: PackageRecord, kind: RetainedMetadataKind) ?RetainedMetadata {
+        for (self.metadata) |entry| {
             if (entry.kind == kind) return entry;
         }
         return null;
@@ -2018,6 +2047,13 @@ const Importer = struct {
         }
         for (scripts) |*list| list.* = .empty;
 
+        const metadata = try self.scratch.alloc(std.ArrayList(RetainedMetadata), records.len);
+        defer {
+            for (metadata) |*list| list.deinit(self.scratch);
+            self.scratch.free(metadata);
+        }
+        for (metadata) |*list| list.* = .empty;
+
         const stems = try self.scratch.alloc(?[]const u8, records.len);
         defer self.scratch.free(stems);
         @memset(stems, null);
@@ -2073,6 +2109,15 @@ const Importer = struct {
                 stems[position] = stem;
             }
 
+            if (RetainedMetadataKind.fromSuffix(suffix_text)) |kind| {
+                try metadata[position].append(self.scratch, .{
+                    .kind = kind,
+                    .mode = entry.mode,
+                    .size = entry.bytes.len,
+                    .sha256 = digestOf(entry.bytes),
+                });
+                continue;
+            }
             switch (infoSuffix(suffix_text)) {
                 .list => records[position].paths = try self.parseList(entry.name, entry.bytes),
                 .md5sums => records[position].md5sums = try self.parseMd5sums(entry.name, entry.bytes),
@@ -2107,6 +2152,7 @@ const Importer = struct {
         for (records, 0..) |*record, position| {
             if (stems[position]) |stem| record.info_stem = stem;
             record.scripts = try self.arena.dupe(MaintainerScript, scripts[position].items);
+            record.metadata = try self.arena.dupe(RetainedMetadata, metadata[position].items);
         }
 
         var trigger_interests: std.ArrayList(TriggerInterest) = .empty;
@@ -2754,6 +2800,16 @@ const Validator = struct {
     /// cost is linear in the record's own entries.
     fn validateRecord(self: *Validator, record: PackageRecord) std.mem.Allocator.Error!?Diagnostic {
         const limits = self.options.limits;
+        var metadata_seen = std.EnumSet(RetainedMetadataKind).initEmpty();
+        for (record.metadata) |entry| {
+            if (!safeFileMode(entry.mode))
+                return self.fail(.info_directory, .unsafe_mode, record.name);
+            if (entry.size > limits.max_info_file_bytes)
+                return self.fail(.info_directory, .file_too_large, record.name);
+            if (metadata_seen.contains(entry.kind))
+                return self.fail(.info_directory, .duplicate_info_name, record.name);
+            metadata_seen.insert(entry.kind);
+        }
         if (record.conffiles.len > limits.max_conffiles_per_package) {
             return self.fail(.status, .conffile_limit, record.name);
         }
@@ -3426,6 +3482,37 @@ test "package_database.test.literal package paths round trip every database surf
     try testing.expectEqualStrings(interests, try writeTriggerInterests(allocator, database.model.triggers.interests));
     try testing.expectEqualStrings(diversions, try writeDiversions(allocator, database.model.diversions));
     try testing.expectEqualStrings(overrides, try writeStatOverrides(allocator, database.model.stat_overrides));
+}
+
+test "package_database.test.inert metadata is typed without interpreting its bytes" {
+    const extra = [_]InfoEntry{
+        .{ .name = "toolz.templates", .bytes = "binary\x00\xffmetadata", .mode = 0o640 },
+        .{ .name = "toolz.shlibs", .bytes = "unterminated metadata" },
+        .{ .name = "toolz.symbols", .bytes = "" },
+        .{ .name = "toolz.vendor-data", .bytes = "still unmodeled\n" },
+    };
+    const entries = test_fixtures.info ++ extra;
+    var snapshot = test_fixtures.snapshot();
+    snapshot.info = entries;
+    var imported = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer imported.deinit();
+    const record = imported.model.find("toolz", "amd64").?;
+    try testing.expectEqual(@as(usize, 3), record.metadata.len);
+    try testing.expectEqual(@as(usize, 1), imported.model.opaque_info.len);
+    try testing.expectEqualStrings("toolz.vendor-data", imported.model.opaque_info[0].name);
+    const member = record.metadataMember(.templates).?;
+    try testing.expectEqual(@as(u32, 0o640), member.mode);
+    try testing.expectEqual(extra[0].bytes.len, member.size);
+    try testing.expectEqual(digestOf(extra[0].bytes), member.sha256);
+    try testing.expectEqual(@as(usize, 0), record.metadataMember(.symbols).?.size);
+    inline for (.{ "config", "alternatives", "../shlibs", "shlibs.old" }) |unsupported|
+        try testing.expect(RetainedMetadataKind.fromSuffix(unsupported) == null);
 }
 
 test "package_database.test.named trigger registry and noawait queue marker round trip" {

@@ -37,6 +37,8 @@ FAILURE = "lifecycle-fail"
 TRACE = m.oracle.TRACE_PATH
 LITERAL_PACKAGE = "literal-paths"
 LITERAL_CONFFILE = Path("etc/literal\\config.conf")
+METADATA_PACKAGE = "retained-metadata"
+METADATA_KINDS = ("templates", "shlibs", "symbols")
 
 
 def scripts(
@@ -360,6 +362,63 @@ class Scenario:
         print(f"{self.directory.name}: {label} passed", flush=True)
 
 
+def metadata_scripts(package: str, version: str) -> dict[str, bytes]:
+    result = scripts(package, version)
+    for kind, source in result.items():
+        observation = f"""
+printf '%s' 'metadata:{package}@{version}:{kind}' >> /{TRACE}
+for member in templates shlibs symbols; do
+    path="/var/lib/dpkg/info/{package}.$member"
+    if [ ! -f "$path" ]; then
+        path="/var/lib/dpkg/info/{package}:$DPKG_MAINTSCRIPT_ARCH.$member"
+    fi
+    value='<absent>'
+    if [ -f "$path" ]; then
+        IFS= read -r value < "$path"
+    fi
+    printf '\\t%s=%s' "$member" "$value" >> /{TRACE}
+done
+printf '\\n' >> /{TRACE}
+""".encode()
+        failure_guard = f"if [ -f /{FAILURE} ]; then\n".encode()
+        result[kind] = source.replace(failure_guard, observation + failure_guard, 1)
+    return result
+
+
+def metadata_contents(version: str) -> dict[str, bytes]:
+    if version == "3":
+        return {}
+    if version not in ("1", "2"):
+        raise ValueError(f"unsupported metadata fixture version: {version}")
+    result = {
+        "templates": f"Template: {METADATA_PACKAGE}/v{version}\nType: string\nDescription: inert fixture\n".encode(),
+        "shlibs": f"libretained-metadata 1 {METADATA_PACKAGE} (>= {version})\n".encode(),
+    }
+    if version == "1":
+        result["symbols"] = f"libretained-metadata.so.1 {METADATA_PACKAGE} #MINVER#\n symbol@Base 1\n".encode() + b"\x00\xff"
+    return result
+
+
+def make_metadata_packages(
+    workspace: Path, environment: dict[str, str], architecture: str, *,
+    multiarch: bool = False, conffile: bool = True,
+) -> dict[str, Path]:
+    result = {}
+    for version in ("1", "2", "3"):
+        def prepare_payload(source: Path, version: str = version) -> None:
+            for name, content in metadata_contents(version).items():
+                m.write(source / "DEBIAN" / name, content, 0o640 if name == "shlibs" else 0o644)
+
+        result[version] = m.make_package(
+            workspace, environment, architecture, version, "conffile" if conffile else "data",
+            package=METADATA_PACKAGE, scripts=metadata_scripts(METADATA_PACKAGE, version),
+            conffile_content=f"metadata configuration {version}\n".encode(),
+            control_fields={"Multi-Arch": "same"} if multiarch else {},
+            prepare_payload=prepare_payload,
+        )
+    return result
+
+
 def make_literal_packages(
     workspace: Path, environment: dict[str, str], architecture: str,
 ) -> dict[str, Path]:
@@ -401,6 +460,65 @@ def exercise(
 
     def case(name: str) -> Scenario:
         return Scenario(workspace, name, executable, architecture, environment)
+
+    metadata_archives = make_metadata_packages(workspace / "metadata-packages", environment, architecture)
+    qualified_metadata = make_metadata_packages(
+        workspace / "metadata-qualified-packages", environment, architecture, multiarch=True,
+    )
+    data_metadata = make_metadata_packages(
+        workspace / "metadata-data-packages", environment, architecture, conffile=False,
+    )
+    for label, first, later in (
+        ("unqualified", metadata_archives, metadata_archives),
+        ("qualified", qualified_metadata, qualified_metadata),
+        ("stem-change", metadata_archives, qualified_metadata),
+    ):
+        current = case(f"retained-metadata-{label}")
+        for operation, version, metadata_set in (
+            ("install", "1", first), ("upgrade", "2", later), ("reinstall", "2", later),
+            ("downgrade", "1", first), ("upgrade", "3", later), ("downgrade", "2", later),
+        ):
+            current.phase(operation, [metadata_set[version]], names=(METADATA_PACKAGE,))
+        current.phase("remove", names=(METADATA_PACKAGE,))
+        current.phase("purge", names=(METADATA_PACKAGE,))
+        current.complete()
+    for label, seed, failures, expected_failure in (
+        ("fresh-postinst-failure", False, ("1:postinst:configure",), True),
+        ("upgrade-old-postrm-compensated", True, ("1:postrm:upgrade",), False),
+        ("upgrade-old-postrm-failure", True, ("1:postrm:upgrade", "2:postrm:failed-upgrade"), True),
+    ):
+        current = case(f"retained-metadata-{label}")
+        if seed:
+            current.seed(metadata_archives["1"])
+        current.fail(*(f"{METADATA_PACKAGE}@{failure}" for failure in failures))
+        current.phase(
+            "upgrade" if seed else "install", [metadata_archives["2" if seed else "1"]],
+            names=(METADATA_PACKAGE,), failure=expected_failure,
+            rollback_clock=(f"usr/share/{METADATA_PACKAGE}/current",)
+            if "2:postrm:failed-upgrade" in failures else (),
+        )
+        current.complete()
+
+    current = case("retained-metadata-direct-purge")
+    current.seed(metadata_archives["1"])
+    current.phase("purge", names=(METADATA_PACKAGE,))
+    current.complete()
+
+    current = case("retained-metadata-configure-retry")
+    current.fail(f"{METADATA_PACKAGE}@1:postinst:configure")
+    current.phase("install", [data_metadata["1"]], names=(METADATA_PACKAGE,), failure=True)
+    current.fail()
+    current.phase("configure", [data_metadata["1"]], names=(METADATA_PACKAGE,))
+    current.complete()
+    for operation in ("remove", "purge"):
+        current = case(f"retained-metadata-{operation}-postrm-failure")
+        current.seed((data_metadata if operation == "purge" else metadata_archives)["1"])
+        current.fail(f"{METADATA_PACKAGE}@1:postrm:{operation}")
+        current.phase(operation, names=(METADATA_PACKAGE,), failure=True)
+        if operation == "purge":
+            current.fail()
+            current.phase("purge", names=(METADATA_PACKAGE,))
+        current.complete()
 
     literal_archives = make_literal_packages(workspace / "literal-packages", environment, architecture)
     for policy in ("keep_existing", "use_package_version"):
