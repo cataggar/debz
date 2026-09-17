@@ -388,6 +388,8 @@ def assert_script_output(script: dict) -> None:
             script["package"], script["package_version"],
             activate=("debz-b",) if script["package"] == "debz-recovery-a" else (),
         )
+    elif script["package"] == lifecycle.METADATA_PACKAGE:
+        source = lifecycle.metadata_scripts(script["package"], script["package_version"])
     else:
         source = lifecycle.scripts(script["package"], script["package_version"])
     if hashlib.sha256(source[script["kind"]]).hexdigest() != script["script_sha256"]:
@@ -458,13 +460,20 @@ def assert_final_database(root: Path, architecture: str, proof: dict) -> None:
             raise AssertionError("database receipt describes a nonregular fixture entry")
         if name == "arch" and raw == f"{architecture}\n".encode():
             continue
-        files[name] = {"bytes": raw.decode(), "kind": "regular", "mode": stat.S_IMODE(metadata.st_mode)}
+        files[name] = {"bytes": raw, "kind": "regular", "mode": stat.S_IMODE(metadata.st_mode)}
+    if "status" not in files:
+        raise AssertionError("final database has no status document")
+
+    def text_file(name: str) -> dict | None:
+        entry = files.get(name)
+        return {**entry, "bytes": entry["bytes"].decode()} if entry is not None else None
+
     closure = {
-        "status": files["status"], "arch": files.get("arch"),
-        "triggers_file": files.get("triggers/File"),
-        "triggers_unincorp": files.get("triggers/Unincorp"),
+        "status": text_file("status"), "arch": text_file("arch"),
+        "triggers_file": text_file("triggers/File"),
+        "triggers_unincorp": text_file("triggers/Unincorp"),
         "triggers_named": [
-            {"name": name.removeprefix("triggers/"), **entry}
+            {"name": name.removeprefix("triggers/"), **text_file(name)}
             for name, entry in files.items()
             if name.startswith("triggers/") and name not in ("triggers/File", "triggers/Unincorp")
         ],
@@ -473,7 +482,7 @@ def assert_final_database(root: Path, architecture: str, proof: dict) -> None:
         raise AssertionError("provenance final-state digest differs from the actual database closure")
     generation = hashlib.sha256(b"debz.package-database.generation.v1\n")
     for name, entry in files.items():
-        raw = entry["bytes"].encode()
+        raw = entry["bytes"]
         generation.update(
             f"{name}\0regular\0{entry['mode']:o}\0{len(raw)}\0{hashlib.sha256(raw).hexdigest()}\n".encode()
         )
@@ -485,6 +494,8 @@ def assert_script_trace(root: Path, proof: dict, scripts: list[dict]) -> None:
     if not scripts:
         return
     lines = m.oracle._read_bounded(root / lifecycle.TRACE, 16 * 1024 * 1024).decode().splitlines()
+    if any(script["package"] == lifecycle.METADATA_PACKAGE for script in scripts):
+        lines = [line for line in lines if not line.startswith(f"metadata:{lifecycle.METADATA_PACKAGE}@")]
     if proof["outcome"] == "recovery_required":
         lines = lines[:-1]
     lines = lines[-len(scripts):]
@@ -589,12 +600,13 @@ class Scenario(triggers.Scenario):
         isolated_helper: bool = False,
         core_product: bool = False,
         policy: str | None = None,
+        packages: tuple[str, ...] = (),
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
         if compare_reference:
             code = triggers.reference(
-                self.expected, operation, archives, [], self.environment,
+                self.expected, operation, archives, list(packages), self.environment,
                 destination, defer=defer or not trigger_execution, policy=policy,
             )
             if bool(code) != failure:
@@ -602,6 +614,7 @@ class Scenario(triggers.Scenario):
         native(
             self.executable, self.candidate, self.architecture,
             operation, archives, self.environment, destination,
+            packages=packages,
             trigger_execution=trigger_execution, defer=defer, crash_at=boundary,
             caller_owned=caller_owned,
             isolated_helper=isolated_helper,
@@ -1327,6 +1340,102 @@ def workflow(
     return document(report_path, 64 * 1024)
 
 
+def reference_helper_package(
+    workspace: Path, environment: dict, architecture: str, *, package: str,
+) -> Path:
+    return m.make_package(
+        workspace, environment, architecture, "1", package=package,
+        extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
+        prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
+    )
+
+
+def exercise_metadata_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    trigger_path = f"/usr/share/{lifecycle.METADATA_PACKAGE}"
+    for operation, boundary, drift in (
+        ("install", "during_filesystem_publication", None),
+        ("upgrade", "after_trigger_outcome", None),
+        ("remove", "after_script_outcome", None),
+        ("purge", "after_script_outcome", None),
+        ("install", "after_trigger_outcome", "bytes"),
+        ("install", "after_trigger_outcome", "mode"),
+        ("install", "after_trigger_outcome", "missing"),
+    ):
+        name = f"metadata-{operation}-{boundary}" + (f"-{drift}-drift" if drift else "")
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        packages = lifecycle.make_metadata_packages(current.directory / "packages", environment, architecture)
+        receiver_name = "metadata-receiver"
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package=receiver_name,
+            triggers=f"interest-noawait {trigger_path}\n".encode(),
+            scripts=lifecycle.scripts(receiver_name, "1"),
+        )
+        target = reference_helper_package(
+            current.directory / "helper", environment, architecture, package="metadata-helper-target",
+        )
+        current.seed(receiver, target, *([packages["1"]] if operation != "install" else []))
+        if operation == "purge":
+            current.phase("remove", packages=[lifecycle.METADATA_PACKAGE])
+        helper_path = current.candidate / triggers.HELPER
+        shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+        helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
+        incoming = [packages["2" if operation == "upgrade" else "1"]] if operation in ("install", "upgrade") else []
+        binding = current.crash(
+            operation, incoming, boundary, trigger_execution=True,
+            caller_owned=True, isolated_helper=True, core_product=True, policy="keep_existing",
+            packages=(lifecycle.METADATA_PACKAGE,) if not incoming else (),
+        )
+        for archive in packages.values():
+            if archive.exists():
+                archive.unlink()
+        if drift:
+            path = current.candidate / f"var/lib/dpkg/info/{lifecycle.METADATA_PACKAGE}.symbols"
+            assert path.is_file() and not path.is_symlink()
+            if drift == "bytes":
+                m.write(path, b"changed during interruption\n", stat.S_IMODE(path.stat().st_mode))
+            elif drift == "mode":
+                path.chmod(0o640)
+            else:
+                path.unlink()
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
+        if drift:
+            assert report["outcome"] in ("recovery_required", "refused"), report
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            print(f"{name}: inert metadata drift blocks recovery without mutation", flush=True)
+            continue
+        assert report["outcome"] == "applied", report
+        compare(current.expected, current.candidate)
+        proof_path, _ = provenance(current.candidate, report, binding)
+        proof = document(proof_path, 16 * 1024 * 1024)
+        retained = retained_documents(current.candidate, proof)
+        if operation in ("upgrade", "remove"):
+            original = lifecycle.metadata_contents("1")["symbols"]
+            assert any(
+                blob["kind"] == "database"
+                and blob["logical_path"].endswith(f"{lifecycle.METADATA_PACKAGE}.symbols")
+                and blob["sha256"] == hashlib.sha256(original).hexdigest()
+                and blob["size"] == len(original)
+                for blob in retained["intent"][0]["blobs"]
+            )
+        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        assert completion["attempt_id"] == binding["attempt_id"]
+        assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]
+        assert not (current.candidate / OPERATION).exists() and not (current.candidate / INTENT).exists()
+        before = triggers.snapshot(current.candidate)
+        repeated = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True, label="recover-again",
+        )
+        assert repeated["outcome"] == "applied", repeated
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        print(f"{name}: metadata bytes, original evidence and archive-evicted recovery passed", flush=True)
+
+
 def exercise_literal_path_recovery(
     executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
 ) -> None:
@@ -1349,11 +1458,9 @@ def exercise_literal_path_recovery(
             package=receiver_name, triggers=f"interest-noawait {trigger_path}\n".encode(),
             scripts=lifecycle.scripts(receiver_name, "1"),
         )
-        helper_target = m.make_package(
-            current.directory / "helper", environment, architecture, "1",
+        helper_target = reference_helper_package(
+            current.directory / "helper", environment, architecture,
             package="literal-helper-target",
-            extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
-            prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
         )
         current.seed(receiver, helper_target, *([packages["1"]] if version == "2" else []))
         if version == "2":
@@ -1482,6 +1589,7 @@ CONSUMER_PARITY_CASES = (
      "recommends": True},
     {"id": "multiarch-package", "package": "multi-lib", "archives": ("multi-lib",)},
     {"id": "literal-package-paths", "package": "literal-paths-pkg", "archives": ("literal-paths-pkg",)},
+    {"id": "retained-metadata", "package": "retained-metadata-pkg", "archives": ("retained-metadata-pkg",)},
     {"id": "suite-trigger", "package": "trigger-pkg", "archives": ("trigger-pkg",)},
     {"id": "upgrade-all", "package": None, "archives": ("fixture-upgrade=2.0-1",),
      "seeds": ("fixture-upgrade",), "update": True},
@@ -3741,6 +3849,7 @@ def main() -> int:
             if arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
+                exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                 exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                 exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
                 exercise_consumer_parity(executable, result_cli, workspace, environment, architecture)
@@ -3764,6 +3873,7 @@ def main() -> int:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
                 if not arguments.deadline_only:
+                    exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                     exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                     exercise_projection(executable, workspace)
                     if not arguments.core_only:

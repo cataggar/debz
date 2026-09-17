@@ -350,6 +350,13 @@ provenance to the original root, attempt, authorization and program, require
 terminal publication before clearing, and prove repeated recovery does not
 rerun work or replace the terminal receipt.
 
+Known inert metadata (`templates`, `shlibs`, `symbols`) participates in complete
+database-generation and retained-blob evidence as raw bytes, including binary
+contents and safe non-default modes. Actual caller-owned core recovery covers
+install, upgrade, removal and purge with file triggers and original archives
+evicted. It preserves original metadata for restoration and refuses byte,
+mode or deletion drift without changing package state or the helper.
+
 The bounded families cover preparation, filesystem/database publication,
 provably unstarted and recorded script outcomes, unknown script outcomes
 (including the old-postrm/unpack overlap), failure compensation, dynamic

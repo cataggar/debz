@@ -28,6 +28,20 @@ is not a substitute for its last configured version. Upgrade preinst and the
 incoming failed-upgrade/abort-upgrade scripts include both old and new versions
 where dpkg does.
 
+Known inert control members (`templates`, `shlibs`, `symbols`) are installed
+with their exact bytes and safe modes, replaced or retired on upgrade,
+reinstall and downgrade, and removed on successful removal/purge. Old upgrade
+`postrm` sees the new payload but the original installed control metadata;
+new control publication follows that callback. Removal retains metadata through
+`postrm remove`, retiring it only on successful settlement. Failed removal
+restores original metadata along with the original package record.
+Lifecycle fixtures compare these observations with dpkg for unqualified,
+architecture-qualified and changing info stems, compensation, failures and
+configure/purge retries without conffiles. Existing conffile failure/retry
+limitations and partial-state admission guards remain separate work; this does
+not admit retries from otherwise unsupported half-installed states.
+No debconf preconfiguration or other active/unknown metadata support is implied.
+
 Known script failures follow the compiled failure transitions and compensation
 ordering. Restoring managed package files is not permission to roll back
 arbitrary script side effects. Before any script can run, durable evidence must
