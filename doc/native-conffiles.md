@@ -70,6 +70,22 @@ recovery-state publication is propagated rather than ignored.
 
 Native amd64 and arm64 CI run the target in Debug and ReleaseSafe.
 `--oracle-only` checks reference fixture consistency; it does not execute
-native code and is not native parity evidence. Production authorization,
-lifecycle/script execution, triggers, recovery orchestration, and provenance
-integration remain later roadmap work.
+native code and is not native parity evidence.
+
+## Lifecycle and recovery integration
+
+The separate [native lifecycle](native-lifecycle.md) runner executes maintainer
+scripts and compares conffile visibility during purge, successful and failed
+purge/retry, and script-recreated files with dpkg. It also covers fresh and
+upgraded postinst failure followed by configuration retry under both policies,
+including administrator edits, deletion and side files. Missing or changed
+staging for an unpacked package, and changed archive digests for a settled
+configuration, remain pre-mutation refusals.
+
+[Native recovery](native-recovery.md) retains the same conffile decisions and
+last-configured version through caller-owned core recovery after archive
+eviction. Settled conffiles remain observed recovery inputs even when retry
+does not write them. Their observations are retained before database mutation,
+so interruption during publication cannot drop drift protection. Known failed
+package work still processes or defers its authorized trigger work without
+turning a failed completion into success.

@@ -166,11 +166,13 @@ fn checkpointManagedPaths(
     runtime: *native_recovery.Runtime,
     action: native_recovery.Action,
     steps: []const root_mutation.Step,
+    observed_paths: []const []const u8,
     transient: bool,
 ) !native_recovery.Digest {
-    const paths = try allocator.alloc([]const u8, steps.len);
+    const paths = try allocator.alloc([]const u8, steps.len + observed_paths.len);
     defer allocator.free(paths);
     for (steps, 0..) |step, index| paths[index] = step.path;
+    @memcpy(paths[steps.len..], observed_paths);
     return native_recovery.updateManagedState(
         allocator,
         runtime.root,
@@ -7131,6 +7133,13 @@ const MaterializationResult = struct {
     detail: []const u8,
 };
 
+const FileTriggerSink = struct {
+    allocator: std.mem.Allocator,
+    source: package_database.Identity,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+    expected_owned_paths: ?native_program.Digest = null,
+};
+
 const MaterializationRequest = struct {
     io: std.Io,
     root: root_fs.Root,
@@ -7142,6 +7151,8 @@ const MaterializationRequest = struct {
     execution: ?*ExecutionState = null,
     raw_status_verification: bool = false,
     mutation_database_step: ?*u32 = null,
+    file_trigger_sink: ?FileTriggerSink = null,
+    observed_paths: []const []const u8 = &.{},
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
 };
@@ -8173,6 +8184,7 @@ fn materialize(
                     runtime,
                     action,
                     mutation_plan.steps,
+                    &.{},
                     false,
                 ),
                 .rolled_back => block: {
@@ -8442,8 +8454,18 @@ fn executePhaseMaterialization(
             artifact_evidence,
     };
     if (execution.recovery) |runtime| {
-        if (execution.action) |action|
+        if (execution.action) |action| {
             try runtime.append(action, .prepared, .none, null);
+            if (request.observed_paths.len != 0)
+                _ = try native_recovery.updateManagedState(
+                    allocator,
+                    request.root,
+                    runtime.intent_sha256,
+                    action,
+                    request.observed_paths,
+                    false,
+                );
+        }
     }
     var combined_hooks: CombinedMutationHooks = .{
         .original = request.hooks,
@@ -8575,6 +8597,7 @@ fn executePhaseMaterialization(
                     runtime,
                     action,
                     mutation_plan.steps,
+                    request.observed_paths,
                     false,
                 ),
                 .rolled_back => block: {
@@ -9004,6 +9027,8 @@ fn materializeConfigure(
     var changes: std.ArrayList(package_database_changes.Change) = .empty;
     defer changes.deinit(allocator);
     var compared_bytes: u64 = 0;
+    var observed_paths: std.ArrayList([]const u8) = .empty;
+    defer observed_paths.deinit(allocator);
 
     for (bound.items) |*archive| {
         if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
@@ -9052,6 +9077,19 @@ fn materializeConfigure(
                 archive.model.fileBytes(file) catch
                     return error.UnsupportedConffile,
             );
+            if (record.status.current == .half_configured) {
+                // Postinst failure does not undo an already-settled conffile.
+                // Retry configuration without consuming or recreating side files.
+                const settled = old orelse return .{
+                    .outcome = .refused,
+                    .detail = "configured_conffile_mismatch",
+                };
+                if (settled.digest != .md5 or settled.obsolete or settled.remove_on_upgrade or
+                    !std.mem.eql(u8, &settled.digest.md5, &packaged_md5))
+                    return .{ .outcome = .refused, .detail = "configured_conffile_mismatch" };
+                try resulting.append(allocator, settled);
+                continue;
+            }
             const staged = try std.fmt.allocPrint(
                 owned,
                 "{s}.dpkg-new",
@@ -9214,16 +9252,29 @@ fn materializeConfigure(
             });
         }
         for (record.conffiles) |old| {
+            if (record.status.current == .half_configured)
+                try observed_paths.append(
+                    allocator,
+                    relativeListPath(old.path) orelse return error.UnsupportedConffile,
+                );
             if (!seen.contains(old.path))
                 try resulting.append(allocator, old);
         }
+        const config_version = if (request.borrowed_attempt != null)
+            switch (configVersionField(record.*)) {
+                .valid => |value| value,
+                .absent => null,
+                .invalid => return .{ .outcome = .refused, .detail = "config_version" },
+            }
+        else
+            null;
         const fields = try phaseStatusFields(
             owned,
             record.*,
             .install,
             .ok,
             .installed,
-            null,
+            config_version,
             resulting.items,
         );
         const lifecycle_scripts: []const package_database_changes.StagedScript =
@@ -9268,9 +9319,11 @@ fn materializeConfigure(
     };
     defer database_intents.deinit();
     try intents.appendSlice(allocator, database_intents.intents);
+    var observed_request = request;
+    observed_request.observed_paths = observed_paths.items;
     return executePhaseMaterialization(
         allocator,
-        request,
+        observed_request,
         intents.items,
         databasePhaseEvidence(database_plan),
         conffilePhaseDigest("configure", database_plan, artifact_evidence),
@@ -9412,12 +9465,21 @@ fn stagedInstalledScripts(
     return result;
 }
 
+const RemovalPhase = enum { remove, purge_conffiles, purge_settlement, purge };
+
 fn materializeRemoval(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
     selections: []const ExternalPackageSelection,
-    purge: bool,
+    phase: RemovalPhase,
 ) !MaterializationResult {
+    if (request.execution) |execution| {
+        if (try consumeRecoveredDatabasePhase(execution))
+            return .{ .outcome = .applied, .detail = "recovered_phase" };
+    }
+    const purge = phase != .remove;
+    const partial_purge = phase != .remove and phase != .purge;
+    const settling_purge = phase == .purge_settlement;
     var captured = try captureDatabaseSnapshot(
         allocator,
         request.root,
@@ -9444,6 +9506,15 @@ fn materializeRemoval(
     };
     defer database.deinit();
     if (phasePreflight(request, database)) |result| return result;
+    if (request.file_trigger_sink) |sink| {
+        if (sink.expected_owned_paths) |digest| {
+            const record = database.model.find(sink.source.name, sink.source.architecture) orelse
+                return error.MaterializationProgramDigest;
+            const expected = parseHex(32, &digest) orelse return error.InvalidLifecycleProgram;
+            if (!std.mem.eql(u8, &expected, &lifecycleOwnedPathsDigest(record.*)))
+                return error.MaterializationProgramDigest;
+        }
+    }
     const arena = try allocator.create(std.heap.ArenaAllocator);
     defer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -9518,7 +9589,7 @@ fn materializeRemoval(
     defer ownership.deinit();
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     defer retained.deinit(allocator);
-    if (!purge) for (selected_records.items) |index| {
+    if (phase != .purge) for (selected_records.items) |index| {
         const record = database.model.packages[index];
         for (record.conffiles) |conffile| {
             const relative = relativeListPath(conffile.path) orelse continue;
@@ -9533,6 +9604,7 @@ fn materializeRemoval(
             };
             const stored = try owned.dupe(u8, canonical);
             try retained.put(allocator, stored, {});
+            if (partial_purge) continue;
             var cursor = (root_fs.Path.initPackage(stored) catch unreachable).parent();
             while (cursor) |parent| : (cursor = parent.parent())
                 try retained.put(
@@ -9548,6 +9620,8 @@ fn materializeRemoval(
     defer files.deinit(allocator);
     var directories: std.ArrayList([]const u8) = .empty;
     defer directories.deinit(allocator);
+    var directory_filters: std.ArrayList(struct { change: usize, fallback_root: bool }) = .empty;
+    defer directory_filters.deinit(allocator);
 
     const shared_root = for (database.model.packages, 0..) |candidate, index| {
         if (!selected_owners.contains(@intCast(index)) and
@@ -9578,7 +9652,8 @@ fn materializeRemoval(
 
         for (record.paths orelse &.{}) |listed| {
             const relative = relativeListPath(listed) orelse {
-                if (!purge and record.conffiles.len != 0 and !shared_root)
+                if (partial_purge or
+                    (!purge and record.conffiles.len != 0 and !shared_root))
                     try retained_paths.append(allocator, listed);
                 continue;
             };
@@ -9588,6 +9663,11 @@ fn materializeRemoval(
                 relative,
                 &alias_buffer,
             ) orelse return .{ .outcome = .refused, .detail = "invalid_path" };
+            if (partial_purge) {
+                if (!retained.contains(canonical))
+                    try retained_paths.append(allocator, listed);
+                continue;
+            }
             if (!purge and retained.contains(canonical)) {
                 try retained_paths.append(allocator, listed);
                 continue;
@@ -9603,7 +9683,10 @@ fn materializeRemoval(
                 try root_fs.Path.initPackage(stored),
             )) orelse continue;
             switch (observed.kind) {
-                .directory => try directories.append(allocator, stored),
+                .directory => {
+                    try directories.append(allocator, stored);
+                    if (!purge) try retained_paths.append(allocator, listed);
+                },
                 .file, .sym_link => {
                     try files.append(allocator, stored);
                     try removing.put(allocator, stored, {});
@@ -9615,7 +9698,7 @@ fn materializeRemoval(
             }
         }
 
-        if (purge) for (record.conffiles) |conffile| {
+        if (purge and !settling_purge) for (record.conffiles) |conffile| {
             const relative = relativeListPath(conffile.path) orelse
                 return .{ .outcome = .refused, .detail = "invalid_conffile" };
             for ([_][]const u8{ "", ".dpkg-old", ".dpkg-dist", ".dpkg-new" }) |suffix| {
@@ -9651,7 +9734,33 @@ fn materializeRemoval(
             }
         };
 
-        if (purge or record.conffiles.len == 0) {
+        // Dpkg leaves control records visible during postrm, then settles
+        // their conffile removal without deleting files recreated by the script.
+        if (phase == .purge_conffiles) continue;
+        const change_index = changes.items.len;
+        if (settling_purge) {
+            try changes.append(allocator, .{ .put_package = .{
+                .fields = try phaseStatusFields(
+                    owned,
+                    record.*,
+                    .purge,
+                    .ok,
+                    .config_files,
+                    null,
+                    &.{},
+                ),
+                .paths = try owned.dupe([]const u8, retained_paths.items),
+                .md5sums = record.md5sums,
+                .declared_conffiles = null,
+                .trigger_declarations = record.trigger_declarations,
+                .scripts = try stagedInstalledScripts(
+                    owned,
+                    request.root,
+                    record.*,
+                    request.planning.limits.database.limits.max_info_file_bytes,
+                ),
+            } });
+        } else if (purge or record.conffiles.len == 0) {
             if (purge or request.borrowed_attempt == null or record.scripts.len == 0) {
                 try changes.append(allocator, .{
                     .remove_package = record.identity(),
@@ -9715,6 +9824,11 @@ fn materializeRemoval(
                 .metadata = if (request.borrowed_attempt != null) .preserve else .{ .replace = &.{} },
             } });
         }
+        if (!purge and changes.items[change_index] == .put_package)
+            try directory_filters.append(allocator, .{
+                .change = change_index,
+                .fallback_root = record.conffiles.len == 0 and !request.planning.trigger_execution,
+            });
     }
 
     std.mem.sort([]const u8, files.items, {}, lessPath);
@@ -9732,6 +9846,23 @@ fn materializeRemoval(
             .path = path,
             .removal = .allow_absent,
         } });
+    }
+    for (directory_filters.items) |filter| {
+        const staged = &changes.items[filter.change].put_package;
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer paths.deinit(allocator);
+        for (staged.paths orelse &.{}) |listed| {
+            if (relativeListPath(listed)) |relative| {
+                var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+                const canonical = canonicalAliasPath(aliases, relative, &buffer) orelse
+                    return .{ .outcome = .refused, .detail = "invalid_path" };
+                if (removing.contains(canonical)) continue;
+            }
+            try paths.append(allocator, listed);
+        }
+        if (paths.items.len == 0 and filter.fallback_root)
+            try paths.append(allocator, package_database.root_list_path);
+        staged.paths = try owned.dupe([]const u8, paths.items);
     }
     if (request.planning.trigger_execution) {
         var interests: std.ArrayList(package_database.TriggerInterest) = .empty;
@@ -9791,6 +9922,15 @@ fn materializeRemoval(
         .diagnostic => return error.MaterializationDatabaseMismatch,
     };
     defer database_intents.deinit();
+    if (request.file_trigger_sink) |sink| {
+        try collectRemovalTriggerEvents(sink, database.model, intents.items);
+        try persistRuntimeTriggerEvents(
+            request.execution orelse return error.InvalidLifecycleProgram,
+            sink.allocator,
+            request.root,
+            sink.events.items,
+        );
+    }
     try intents.appendSlice(allocator, database_intents.intents);
     return executePhaseMaterialization(
         allocator,
@@ -9798,7 +9938,7 @@ fn materializeRemoval(
         intents.items,
         databasePhaseEvidence(database_plan),
         conffilePhaseDigest(
-            if (purge) "purge" else "remove",
+            @tagName(phase),
             database_plan,
             null,
         ),
@@ -9866,6 +10006,13 @@ fn lifecycleAuxiliaryMutation(
     );
 }
 
+fn configuredState(state: package_database.CurrentState) bool {
+    return switch (state) {
+        .installed, .triggers_awaited, .triggers_pending => true,
+        else => false,
+    };
+}
+
 fn materializeStateRecord(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
@@ -9914,12 +10061,13 @@ fn materializeStateRecord(
     else
         package_database.Want.install;
     const error_state = error_override orelse .ok;
-    // Removal scripts still observe installed metadata. Retire it only when
-    // their successful removal settles the residual configuration record.
+    const clear_config_version = configuredState(state.state) and record.?.field("Config-Version") != null;
+    // Control facts settle only after successful scripts: configuration drops
+    // Config-Version, while removal drops the retained inert metadata.
     const change: package_database_changes.Change = if (state.remove_entry)
         .{ .remove_package = record.?.identity() }
-    else if (state.state == .config_files and record.?.metadata.len != 0) block: {
-        const config_version = switch (configVersionField(record.?.*)) {
+    else if (clear_config_version or (state.state == .config_files and record.?.metadata.len != 0)) block: {
+        const config_version = if (clear_config_version) null else switch (configVersionField(record.?.*)) {
             .valid => |value| value,
             .absent => null,
             .invalid => return .{ .outcome = .refused, .detail = "config_version" },
@@ -9944,7 +10092,7 @@ fn materializeStateRecord(
                 record.?.*,
                 request.planning.limits.database.limits.max_info_file_bytes,
             ),
-            .metadata = .{ .replace = &.{} },
+            .metadata = if (state.state == .config_files) .{ .replace = &.{} } else .preserve,
         } };
     } else .{ .set_state = .{
         .identity = record.?.identity(),
@@ -11924,45 +12072,26 @@ fn collectArchiveTriggerEvents(
 }
 
 fn collectRemovalTriggerEvents(
-    allocator: std.mem.Allocator,
-    root: root_fs.Root,
-    architecture: []const u8,
-    package: native_program.PackageRef,
-    expected_owned_paths: native_program.Digest,
-    events: *std.ArrayList(RuntimeTriggerEvent),
+    sink: FileTriggerSink,
+    model: package_database.Model,
+    intents: []const root_mutation.Intent,
 ) !void {
-    var captured = try captureDatabaseSnapshot(allocator, root, .{});
-    defer captured.deinit();
-    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
-    var database = switch (try package_database.importSnapshot(
-        allocator,
-        .{ .native_architecture = architecture, .snapshot = captured.snapshot },
-        .{},
-    )) {
-        .database => |value| value,
-        .diagnostic => return error.InvalidExternalDatabase,
-    };
-    defer database.deinit();
-    const record = database.model.find(package.name, package.architecture) orelse return;
-    const expected = parseHex(32, &expected_owned_paths) orelse
-        return error.InvalidLifecycleProgram;
-    if (!std.mem.eql(
-        u8,
-        &expected,
-        &lifecycleOwnedPathsDigest(record.*),
-    )) return error.MaterializationProgramDigest;
+    const allocator = sink.allocator;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
     var work: usize = 0;
-    for (database.model.triggers.interests) |interest| {
+    for (model.triggers.interests) |interest| {
         if (interest.trigger.len == 0 or interest.trigger[0] != '/') continue;
         const prefix = interest.trigger[1..];
         var touched = false;
-        for (record.paths orelse &.{}) |listed| {
+        for (intents) |intent| {
             work = std.math.add(usize, work, 1) catch
                 return error.TriggerWorkLimit;
             if (work > (Limits{}).max_work) return error.TriggerWorkLimit;
-            const path = relativeListPath(listed) orelse continue;
+            const path = switch (intent) {
+                .remove, .remove_directory => intent.path(),
+                else => continue,
+            };
             if (std.mem.eql(u8, path, prefix) or
                 (path.len > prefix.len and path[prefix.len] == '/' and
                     std.mem.startsWith(u8, path, prefix)))
@@ -11972,11 +12101,11 @@ fn collectRemovalTriggerEvents(
             continue;
         try appendRuntimeTriggerEvent(
             allocator,
-            events,
-            record.identity(),
+            sink.events,
+            sink.source,
             interest.trigger,
             true,
-            database.model.triggers.interests,
+            model.triggers.interests,
             .automatic,
         );
     }
@@ -12667,7 +12796,8 @@ fn lifecycleRemovePackage(
     operation: product_api.Operation,
     policy: transaction_executor.ConffilePolicy,
     package: native_program.PackageRef,
-    purge: bool,
+    phase: RemovalPhase,
+    file_trigger_sink: ?FileTriggerSink,
 ) !MaterializationResult {
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
@@ -12676,24 +12806,26 @@ fn lifecycleRemovePackage(
         .name = package.name,
         .architecture = package.architecture,
     }};
+    var request = lifecyclePhaseRequest(
+        execution,
+        root,
+        install_root,
+        captured.snapshot,
+        &.{},
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{},
+    );
+    request.file_trigger_sink = file_trigger_sink;
     return materializeRemoval(
         allocator,
-        lifecyclePhaseRequest(
-            execution,
-            root,
-            install_root,
-            captured.snapshot,
-            &.{},
-            program,
-            authorization,
-            locks,
-            attempt,
-            operation,
-            policy,
-            &.{},
-        ),
+        request,
         &selection,
-        purge,
+        phase,
     );
 }
 
@@ -12743,6 +12875,7 @@ fn lifecycleStateStep(
             record.?.status.current == state.state and
             record.?.status.want == expected_want and
             record.?.status.error_state == expected_error and
+            !(configuredState(state.state) and record.?.field("Config-Version") != null) and
             !(state.state == .config_files and record.?.metadata.len != 0)))
         return lifecycleAuxiliary(
             execution,
@@ -13721,6 +13854,118 @@ fn persistTriggerCycleSignature(
         .activation,
         .succeeded,
         native_recovery.hexDigest(signature),
+    );
+}
+
+fn lifecycleRunTriggerWork(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    activation_log: *std.ArrayList(RuntimeTriggerEvent),
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    initial_model: package_database.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    sequence: u32,
+    inject_unknown: bool,
+    known_failure: bool,
+) !LifecycleResult {
+    if (known_failure and program.trigger_authority.?.defer_triggers) {
+        // Deferred failure records file events before incorporating the helper
+        // queue; immediate failure incorporates that queue before dispatch.
+        const applied = try lifecycleApplyTriggerEvents(
+            execution,
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            activation_log.items,
+            false,
+        );
+        if (lifecycleMaterializationFailure(applied)) |failure| return failure;
+    }
+    if (program.trigger_authority.?.defer_triggers or known_failure) {
+        const incorporated = try lifecycleIncorporateTriggerQueue(
+            execution,
+            allocator,
+            root,
+            install_root,
+            program,
+            authorization,
+            locks,
+            attempt,
+            operation,
+            policy,
+            scratch,
+            activation_log,
+            known_failure,
+            initial_model.triggers.pending,
+        );
+        if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
+        if (!known_failure) {
+            const derived = try lifecyclePublishDerivedFinalState(
+                execution,
+                allocator,
+                scratch,
+                root,
+                install_root,
+                program,
+                authorization,
+                initial_model,
+                locks,
+                attempt,
+                operation,
+                policy,
+                activation_log.items,
+            );
+            if (lifecycleMaterializationFailure(derived)) |failure| return failure;
+        }
+        if (program.trigger_authority.?.defer_triggers) return .{
+            .outcome = .applied,
+            .detail = "triggers_deferred",
+            .program_sha256 = program.digest_sha256,
+        };
+    }
+    const applied = try lifecycleApplyTriggerEvents(
+        execution,
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        activation_log.items,
+        false,
+    );
+    if (lifecycleMaterializationFailure(applied)) |failure| return failure;
+    return lifecycleProcessTriggers(
+        execution,
+        allocator,
+        scratch,
+        activation_log,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        sequence,
+        inject_unknown,
     );
 }
 
@@ -15326,6 +15571,7 @@ fn runLifecycleScript(
             runtime,
             recovery_action,
             execution.phase_steps orelse &.{},
+            &.{},
             execution.phase_steps != null,
         );
         try runtime.append(
@@ -16641,6 +16887,7 @@ fn recoverNativeRootMutation(
                 runtime,
                 action,
                 opened.journal().steps,
+                &.{},
                 false,
             );
             try runtime.append(
@@ -18779,6 +19026,8 @@ fn executeLifecycleProgramWithRequest(
     defer staging.deinit(allocator);
     var configured: std.StringHashMapUnmanaged(void) = .empty;
     defer configured.deinit(allocator);
+    var purged_conffiles: std.StringHashMapUnmanaged(void) = .empty;
+    defer purged_conffiles.deinit(allocator);
     var consumed_scripts: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer consumed_scripts.deinit(allocator);
     var trigger_events: std.ArrayList(RuntimeTriggerEvent) = .empty;
@@ -19106,8 +19355,36 @@ fn executeLifecycleProgramWithRequest(
                 if ((decision.action == .retain_on_remove and action.kind != .remove) or
                     (decision.action == .delete_on_purge and action.kind != .purge))
                     return error.InvalidLifecycleProgram;
-                // Removal and purge publish their conffiles with the matching
-                // file phase; neither operation has an archive to configure.
+                if (decision.action == .delete_on_purge) {
+                    const key = try std.fmt.allocPrint(
+                        scratch,
+                        "{s}\x00{s}",
+                        .{ package.name, package.architecture },
+                    );
+                    if (!purged_conffiles.contains(key)) {
+                        const result = try lifecycleRemovePackage(
+                            execution,
+                            allocator,
+                            root,
+                            external.root,
+                            program,
+                            authorization,
+                            locks,
+                            attempt,
+                            operation,
+                            conffile_policy,
+                            package,
+                            .purge_conffiles,
+                            if (program.trigger_authority != null) .{
+                                .allocator = scratch,
+                                .source = .{ .name = package.name, .architecture = package.architecture },
+                                .events = &trigger_events,
+                            } else null,
+                        );
+                        if (lifecycleMaterializationFailure(result)) |failure| return failure;
+                        try purged_conffiles.put(allocator, key, {});
+                    }
+                }
                 continue;
             }
             const key = try std.fmt.allocPrint(
@@ -19191,22 +19468,6 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
         .remove_package_files => |intent| {
-            if (program.trigger_authority != null)
-                try collectRemovalTriggerEvents(
-                    scratch,
-                    root,
-                    program.target_architecture,
-                    intent.package.ref(),
-                    intent.owned_paths_sha256,
-                    &trigger_events,
-                );
-            if (program.trigger_authority != null)
-                try persistRuntimeTriggerEvents(
-                    execution,
-                    scratch,
-                    root,
-                    trigger_events.items,
-                );
             const result = try lifecycleRemovePackage(
                 execution,
                 allocator,
@@ -19219,7 +19480,13 @@ fn executeLifecycleProgramWithRequest(
                 operation,
                 conffile_policy,
                 intent.package.ref(),
-                false,
+                .remove,
+                if (program.trigger_authority != null) .{
+                    .allocator = scratch,
+                    .source = .{ .name = intent.package.name, .architecture = intent.package.architecture },
+                    .events = &trigger_events,
+                    .expected_owned_paths = intent.owned_paths_sha256,
+                } else null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
             if (program.trigger_authority != null) {
@@ -19240,6 +19507,29 @@ fn executeLifecycleProgramWithRequest(
             }
         },
         .purge_package_files => |intent| {
+            const key = try std.fmt.allocPrint(
+                scratch,
+                "{s}\x00{s}",
+                .{ intent.package.name, intent.package.architecture },
+            );
+            if (purged_conffiles.contains(key)) {
+                const settled = try lifecycleRemovePackage(
+                    execution,
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    intent.package.ref(),
+                    .purge_settlement,
+                    null,
+                );
+                if (lifecycleMaterializationFailure(settled)) |failure| return failure;
+            }
             const result = try lifecycleRemovePackage(
                 execution,
                 allocator,
@@ -19252,7 +19542,12 @@ fn executeLifecycleProgramWithRequest(
                 operation,
                 conffile_policy,
                 intent.package.ref(),
-                true,
+                .purge,
+                if (program.trigger_authority != null) .{
+                    .allocator = scratch,
+                    .source = .{ .name = intent.package.name, .architecture = intent.package.architecture },
+                    .events = &trigger_events,
+                } else null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
             if (program.trigger_authority != null) {
@@ -19535,7 +19830,26 @@ fn executeLifecycleProgramWithRequest(
                 call.arguments.len != 0 and
                 std.mem.eql(u8, call.arguments[0], "purge"))
             {
-                const result = try lifecycleDetailedState(
+                const key = try std.fmt.allocPrint(
+                    scratch,
+                    "{s}\x00{s}",
+                    .{ call.package.name, call.package.architecture },
+                );
+                const result = if (purged_conffiles.contains(key)) try lifecycleRemovePackage(
+                    execution,
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    call.package.ref(),
+                    .purge_settlement,
+                    null,
+                ) else try lifecycleDetailedState(
                     execution,
                     allocator,
                     root,
@@ -19583,6 +19897,34 @@ fn executeLifecycleProgramWithRequest(
                     null,
                 );
                 if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            }
+            if (program.trigger_authority != null) {
+                const trigger_step = for (program.steps) |candidate| {
+                    if (candidate.operation == .process_deferred_triggers) break candidate;
+                } else return error.InvalidLifecycleProgram;
+                _ = try beginNativeProgramStep(execution, trigger_step);
+                const triggers = try lifecycleRunTriggerWork(
+                    execution,
+                    allocator,
+                    scratch,
+                    &trigger_events,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    initial_model,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    trigger_step.sequence,
+                    false,
+                    true,
+                );
+                switch (triggers.outcome) {
+                    .applied, .trigger_failed => {},
+                    .recovery_required, .script_failed, .handoff, .refused => return triggers,
+                }
             }
             if (!staging_cleaned) {
                 const cleanup = try cleanupLifecycleStaging(
@@ -19651,61 +19993,7 @@ fn executeLifecycleProgramWithRequest(
                     .detail = "trigger",
                     .program_sha256 = program.digest_sha256,
                 };
-            if (program.trigger_authority.?.defer_triggers) {
-                const incorporated = try lifecycleIncorporateTriggerQueue(
-                    execution,
-                    allocator,
-                    root,
-                    external.root,
-                    program,
-                    authorization,
-                    locks,
-                    attempt,
-                    operation,
-                    conffile_policy,
-                    scratch,
-                    &trigger_events,
-                    false,
-                    initial_model.triggers.pending,
-                );
-                if (lifecycleMaterializationFailure(incorporated)) |failure|
-                    return failure;
-                const derived = try lifecyclePublishDerivedFinalState(
-                    execution,
-                    allocator,
-                    scratch,
-                    root,
-                    external.root,
-                    program,
-                    authorization,
-                    initial_model,
-                    locks,
-                    attempt,
-                    operation,
-                    conffile_policy,
-                    trigger_events.items,
-                );
-                if (lifecycleMaterializationFailure(derived)) |failure|
-                    return failure;
-                continue;
-            }
-            const applied_events = try lifecycleApplyTriggerEvents(
-                execution,
-                allocator,
-                root,
-                external.root,
-                program,
-                authorization,
-                locks,
-                attempt,
-                operation,
-                conffile_policy,
-                trigger_events.items,
-                false,
-            );
-            if (lifecycleMaterializationFailure(applied_events)) |failure|
-                return failure;
-            const trigger_result = try lifecycleProcessTriggers(
+            const trigger_result = try lifecycleRunTriggerWork(
                 execution,
                 allocator,
                 scratch,
@@ -19714,6 +20002,7 @@ fn executeLifecycleProgramWithRequest(
                 external.root,
                 program,
                 authorization,
+                initial_model,
                 locks,
                 attempt,
                 operation,
@@ -19724,6 +20013,7 @@ fn executeLifecycleProgramWithRequest(
                     external.fault.?,
                     "after_triggered_postinst_before_record",
                 ),
+                false,
             );
             switch (trigger_result.outcome) {
                 .applied => {},
@@ -20240,7 +20530,7 @@ test "native_unpack.test.materialization external fixture" {
             testing.allocator,
             phase_request,
             external.packages,
-            external.operation == .purge,
+            if (external.operation == .purge) .purge else .remove,
         ) catch |err| switch (err) {
             error.UnsupportedConffile,
             error.ConffileArtifactCollision,

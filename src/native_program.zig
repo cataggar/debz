@@ -2599,6 +2599,18 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
         entry.state = residual_state;
     }
     if (!purge) return;
+    for (package.conffiles) |conffile| {
+        try self.charge(1);
+        last = try self.addStep(.remove, &.{last}, .{ .apply_conffile_decision = .{
+            .package = package_identity,
+            .path = try self.arena.dupe(u8, conffile.path),
+            .policy = self.input.authorization.policy.conffile,
+            .action = .delete_on_purge,
+            .packaged_md5 = null,
+            .recorded_md5 = hex(16, conffile.recorded_md5),
+            .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
+        } });
+    }
     if (installedScript(self, entry.*, .postrm)) |digest| {
         last = try emitScript(
             self,
@@ -2611,18 +2623,6 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
             &.{"purge"},
             .{ .state = .config_files, .unwind = null, .recovery_required = true },
         );
-    }
-    for (package.conffiles) |conffile| {
-        try self.charge(1);
-        last = try self.addStep(.remove, &.{last}, .{ .apply_conffile_decision = .{
-            .package = package_identity,
-            .path = try self.arena.dupe(u8, conffile.path),
-            .policy = self.input.authorization.policy.conffile,
-            .action = .delete_on_purge,
-            .packaged_md5 = null,
-            .recorded_md5 = hex(16, conffile.recorded_md5),
-            .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
-        } });
     }
     last = try self.addStep(.remove, &.{last}, .{ .purge_package_files = .{
         .package = package_identity,
@@ -5285,6 +5285,29 @@ test "native_program.test.remove retains conffiles and publishes the config-file
     try testing.expectEqual(@as(usize, 0), program.countSteps(.purge_package_files));
 }
 
+fn expectConffilePurgeOrdering(program: Program) !void {
+    var conffile_step: ?u32 = null;
+    var script_step: ?u32 = null;
+    for (program.steps) |step| switch (step.operation) {
+        .apply_conffile_decision => |decision| {
+            if (decision.action == .delete_on_purge) conffile_step = step.sequence;
+        },
+        .run_maintainer_script => |call| {
+            if (call.kind == .postrm and std.mem.eql(u8, call.arguments[0], "purge")) {
+                try testing.expect(conffile_step != null);
+                try testing.expect(conffile_step.? < step.sequence);
+                script_step = step.sequence;
+            }
+        },
+        .purge_package_files => {
+            try testing.expect(script_step != null);
+            try testing.expect(script_step.? < step.sequence);
+        },
+        else => {},
+    };
+    try testing.expect(script_step != null);
+}
+
 test "native_program.test.purge removes conffiles and the database record" {
     const actions = [_]native_authorization.Action{.{
         .sequence = 0,
@@ -5308,6 +5331,7 @@ test "native_program.test.purge removes conffiles and the database record" {
     }));
     defer owned.deinit();
     const program = owned.program;
+    try expectConffilePurgeOrdering(program);
     try testing.expectEqualStrings("remove", scriptCallAt(program, 1).?.arguments[0]);
     const purge = scriptCallAt(program, 2).?;
     try testing.expectEqual(maintainer_script.Kind.postrm, purge.kind);
@@ -5349,6 +5373,7 @@ test "native_program.test.purge of a config-files package skips file removal" {
     }));
     defer owned.deinit();
     const program = owned.program;
+    try expectConffilePurgeOrdering(program);
     try testing.expectEqual(@as(usize, 0), program.countSteps(.remove_package_files));
     const purge = scriptCallAt(program, 0).?;
     try testing.expectEqualStrings("purge", purge.arguments[0]);

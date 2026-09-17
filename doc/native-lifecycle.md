@@ -37,10 +37,23 @@ new control publication follows that callback. Removal retains metadata through
 restores original metadata along with the original package record.
 Lifecycle fixtures compare these observations with dpkg for unqualified,
 architecture-qualified and changing info stems, compensation, failures and
-configure/purge retries without conffiles. Existing conffile failure/retry
-limitations and partial-state admission guards remain separate work; this does
-not admit retries from otherwise unsupported half-installed states.
+configure/purge retries with and without conffiles. Existing admission guards
+for otherwise unsupported half-installed states remain unchanged.
 No debconf preconfiguration or other active/unknown metadata support is implied.
+
+Purge deletes conffile bytes and recognized side files before `postrm purge`,
+while leaving the original control records visible to that script. A known
+outcome then settles the conffile records; final directory/info removal follows
+only on success. A failed postrm retains residual directories and its script
+for retry. Files recreated by postrm are not deleted by subsequent settlement.
+Removal ownership lists retain nonshared directories that could not be removed.
+
+Configuration retry from `half-configured` does not repeat conffile decisions.
+Recorded digests must still match the bound archive, but administrator edits,
+deletions and existing side files remain untouched under either policy.
+`Config-Version` survives a failed upgraded postinst and is cleared only after
+successful configuration, preserving the next invocation's last-configured
+argument. Unpacked packages still require matching staged `.dpkg-new` bytes.
 
 Known script failures follow the compiled failure transitions and compensation
 ordering. Restoring managed package files is not permission to roll back

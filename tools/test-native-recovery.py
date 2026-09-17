@@ -390,6 +390,8 @@ def assert_script_output(script: dict) -> None:
         )
     elif script["package"] == lifecycle.METADATA_PACKAGE:
         source = lifecycle.metadata_scripts(script["package"], script["package_version"])
+    elif script["package"] == lifecycle.CONFFILE_PACKAGE:
+        source = lifecycle.conffile_scripts(script["package"], script["package_version"])
     else:
         source = lifecycle.scripts(script["package"], script["package_version"])
     if hashlib.sha256(source[script["kind"]]).hexdigest() != script["script_sha256"]:
@@ -496,6 +498,8 @@ def assert_script_trace(root: Path, proof: dict, scripts: list[dict]) -> None:
     lines = m.oracle._read_bounded(root / lifecycle.TRACE, 16 * 1024 * 1024).decode().splitlines()
     if any(script["package"] == lifecycle.METADATA_PACKAGE for script in scripts):
         lines = [line for line in lines if not line.startswith(f"metadata:{lifecycle.METADATA_PACKAGE}@")]
+    if any(script["package"] == lifecycle.CONFFILE_PACKAGE for script in scripts):
+        lines = [line for line in lines if not line.startswith(f"conffiles:{lifecycle.CONFFILE_PACKAGE}@")]
     if proof["outcome"] == "recovery_required":
         lines = lines[:-1]
     lines = lines[-len(scripts):]
@@ -1348,6 +1352,130 @@ def reference_helper_package(
         extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
         prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
     )
+
+
+def exercise_conffile_lifecycle_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    for operation, boundary, failure, drift in (
+        ("purge", "after_execution_intent", False, False),
+        ("purge", "during_database_publication", False, False),
+        ("purge", "after_script_prepared", False, False),
+        ("purge", "after_script_outcome", False, False),
+        ("purge", "after_failure_outcome", True, False),
+        ("purge", "after_trigger_outcome", True, False),
+        ("purge-deferred", "after_failure_outcome", True, False),
+        ("purge-helper", "after_failure_outcome", True, False),
+        ("purge-helper", "after_trigger_outcome", True, False),
+        ("purge-helper-deferred", "after_failure_outcome", True, False),
+        ("purge", "after_script_return_before_outcome", False, False),
+        ("purge", "after_script_prepared", False, True),
+        ("configure", "after_script_prepared", False, False),
+        ("configure", "during_database_publication", False, False),
+        ("configure", "during_database_publication", False, True),
+        ("configure", "after_script_outcome", False, False),
+        ("configure", "after_script_prepared", False, True),
+        ("configure-upgrade", "after_script_prepared", False, False),
+        ("configure-upgrade", "after_script_outcome", False, False),
+        ("configure-upgrade", "during_database_publication", False, False),
+    ):
+        name = f"conffile-{operation}-{boundary}" + ("-failure" if failure else "") + ("-drift" if drift else "")
+        upgrading = operation == "configure-upgrade"
+        deferred = operation.endswith("-deferred")
+        activate_helper = operation.startswith("purge-helper")
+        if upgrading:
+            operation = "configure"
+        elif operation.startswith("purge-"):
+            operation = "purge"
+        version = "2" if upgrading else "1"
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        archives = lifecycle.make_conffile_packages(current.directory / "packages", environment, architecture)
+        receiver_name = "conffile-receiver"
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package=receiver_name,
+            triggers=(
+                f"interest-noawait /{lifecycle.CONFFILE_PATHS[0].as_posix()}\n"
+                f"interest-noawait {lifecycle.CONFFILE_TRIGGER}\n"
+            ).encode(),
+            scripts=lifecycle.scripts(receiver_name, "1"),
+        )
+        target = reference_helper_package(
+            current.directory / "helper", environment, architecture, package="conffile-helper-target",
+        )
+        current.seed(receiver, target, *([archives["1"]] if operation == "purge" or upgrading else []))
+        if operation == "purge":
+            current.phase("remove", packages=[lifecycle.CONFFILE_PACKAGE])
+        else:
+            for root in current.roots:
+                m.write(root / lifecycle.FAILURE, f"{lifecycle.CONFFILE_PACKAGE}@{version}:postinst:configure\n".encode())
+                os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
+            current.phase("upgrade" if upgrading else "install", [archives[version]], failure=True)
+            for root in current.roots:
+                (root / lifecycle.FAILURE).unlink()
+                for path in lifecycle.CONFFILE_PATHS:
+                    m.write(root / path, b"administrator configuration after failure\n")
+                    os.utime(root / path, (m.EPOCH, m.EPOCH))
+        if failure:
+            for root in current.roots:
+                m.write(root / lifecycle.FAILURE, f"{lifecycle.CONFFILE_PACKAGE}@1:postrm:purge\n".encode())
+                os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
+                if activate_helper:
+                    m.write(root / "conffile-activate", b"")
+                    os.utime(root / "conffile-activate", (m.EPOCH, m.EPOCH))
+        helper_path = current.candidate / triggers.HELPER
+        shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+        helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
+        binding = current.crash(
+            operation, [archives[version]] if operation == "configure" else [], boundary,
+            failure=failure, trigger_execution=True, caller_owned=True,
+            isolated_helper=True, core_product=True, policy="keep_existing",
+            defer=deferred,
+            packages=(lifecycle.CONFFILE_PACKAGE,),
+        )
+        if operation == "purge" and boundary == "during_database_publication":
+            assert any(not (current.candidate / path).exists() for path in lifecycle.CONFFILE_PATHS)
+        for archive in archives.values():
+            if archive.exists():
+                archive.unlink()
+            assert not archive.exists()
+        if drift:
+            m.write(current.candidate / lifecycle.CONFFILE_PATHS[0], b"changed during interruption\n")
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
+        )
+        assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
+        unknown = boundary == "after_script_return_before_outcome"
+        if drift or unknown:
+            assert report["outcome"] in ("recovery_required", "refused"), report
+            if unknown:
+                assert report["detail"] == "native recovery_required: script_outcome_unknown", report
+                provenance(current.candidate, report, binding)
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            print(f"{name}: interrupted conffile evidence blocks mutation", flush=True)
+            continue
+        assert report["outcome"] == ("script_failed" if failure else "applied"), report
+        compare(current.expected, current.candidate)
+        proof_path, proof_bytes = provenance(current.candidate, report, binding)
+        proof = document(proof_path, 16 * 1024 * 1024)
+        assert proof["outcome"] == ("failed" if failure else "succeeded")
+        completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+        completion_bytes = completion_path.read_bytes()
+        completion = document(completion_path)
+        assert completion["outcome"] == ("failed_after_mutation" if failure else "succeeded")
+        assert completion["attempt_id"] == binding["attempt_id"]
+        assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]
+        assert not (current.candidate / OPERATION).exists() and not (current.candidate / INTENT).exists()
+        before = triggers.snapshot(current.candidate)
+        repeated = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True, label="recover-again",
+        )
+        assert repeated["outcome"] == "applied", repeated
+        assert repeated["detail"] == "no native execution requires recovery", repeated
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        assert proof_path.read_bytes() == proof_bytes
+        assert completion_path.read_bytes() == completion_bytes
+        print(f"{name}: conffile lifecycle, receipt and archive-evicted recovery passed", flush=True)
 
 
 def exercise_metadata_recovery(
@@ -3849,6 +3977,7 @@ def main() -> int:
             if arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
+                exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                 exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                 exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                 exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
@@ -3873,6 +4002,7 @@ def main() -> int:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
                 if not arguments.deadline_only:
+                    exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                     exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
                     exercise_literal_path_recovery(executable, helper, workspace, environment, architecture)
                     exercise_projection(executable, workspace)

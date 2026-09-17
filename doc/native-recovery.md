@@ -357,6 +357,16 @@ install, upgrade, removal and purge with file triggers and original archives
 evicted. It preserves original metadata for restoration and refuses byte,
 mode or deletion drift without changing package state or the helper.
 
+Caller-owned core cases also cover conffile purge and fresh/upgraded
+configuration retry, including partial database publication, prepared/recorded
+postrm and postinst outcomes, failed purge and its subsequent trigger work,
+including immediate/deferred file and helper activations, and unknown outcomes.
+Original archives are evicted. Read-only settled conffiles are included in
+managed observations before publication and retained
+through interrupted phase recovery; their drift refuses without mutation.
+Successful and failed receipts/completions remain unchanged on a later clean
+core recovery call, which truthfully reports no active work.
+
 The bounded families cover preparation, filesystem/database publication,
 provably unstarted and recorded script outcomes, unknown script outcomes
 (including the old-postrm/unpack overlap), failure compensation, dynamic
