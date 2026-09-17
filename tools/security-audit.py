@@ -1069,6 +1069,7 @@ def audit_docs() -> None:
             in {
                 ".cache",
                 ".git",
+                ".real-snapshot",
                 ".tmp",
                 ".tools",
                 ".zig-cache",

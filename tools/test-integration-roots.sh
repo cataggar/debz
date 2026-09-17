@@ -382,7 +382,8 @@ if [ "$mode" != smoke ]; then
   native_state="$workspace/native-unused-state"
   mkdir -p "$native_root/var/lib/dpkg"
   : >"$native_root/var/lib/dpkg/status"
-  $privileged dpkg --root="$native_root" --install \
+  # This script-free helper fixture also seeds cross-architecture roots.
+  $privileged dpkg --force-architecture --root="$native_root" --install \
     "$repo/pool/main/native-helper-target_1.0-1_$architecture.deb" \
     >"$workspace/native-seed.log" 2>&1
   native_execution="--install-root $native_root --cache-path $native_cache --state-path $native_state --architecture $architecture --source $source_file --keyring $keyring --transaction-backend native --json"
