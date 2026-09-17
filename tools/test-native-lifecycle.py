@@ -42,6 +42,11 @@ METADATA_KINDS = ("templates", "shlibs", "symbols")
 CONFFILE_PACKAGE = "conffile-lifecycle"
 CONFFILE_PATHS = (Path("etc/debz-native.conf"), Path("etc/conffile\\extra.conf"))
 CONFFILE_TRIGGER = "conffile-purge"
+STATO_PACKAGE = "statoverride-lifecycle"
+STATO_BASE = f"usr/share/{STATO_PACKAGE}"
+STATO_PASSWD = b"root:x:0:0:root:/root:/bin/sh\n_debzstat:x:42420:42421:fixture:/:/bin/sh\n"
+STATO_GROUP = b"root:x:0:\n_debzstat:x:42421:\n"
+STATO_LITERAL = Path("etc/stato\\literal")
 
 
 def scripts(
@@ -507,6 +512,173 @@ def make_conffile_packages(
     return result
 
 
+def statoverride_scripts(package: str, version: str) -> dict[str, bytes]:
+    result = scripts(package, version)
+    replacement = b"""
+if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ]; then
+    if [ -f /statoverride-passwd-replace ]; then
+        /stato-mv /statoverride-passwd-replace /etc/passwd || exit 26
+    fi
+    if [ -f /statoverride-preinst-replace ]; then
+        /stato-mv /statoverride-preinst-replace /var/lib/dpkg/statoverride || exit 27
+    fi
+fi
+if [ "$DPKG_MAINTSCRIPT_NAME" = postinst ] && [ "$1" = configure ] && [ -f /statoverride-postinst-replace ]; then
+    /stato-mv /statoverride-postinst-replace /var/lib/dpkg/statoverride || exit 28
+fi
+"""
+    guard = f"if [ -f /{FAILURE} ]; then\n".encode()
+    for kind, source in result.items():
+        result[kind] = source.replace(guard, replacement + guard, 1)
+    return result
+
+
+def make_statoverride_packages(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> dict[str, Path]:
+    return {
+        version: m.make_package(
+            workspace, environment, architecture, version, "conffile",
+            package=STATO_PACKAGE, scripts=statoverride_scripts(STATO_PACKAGE, version),
+            conffile_content=f"configuration {version}\n".encode(),
+            extra_files={STATO_LITERAL.as_posix(): f"literal version {version}\n".encode()},
+        )
+        for version in ("1", "2")
+    }
+
+
+def seed_statoverrides(root: Path, records: str) -> None:
+    for path, data in (
+        ("etc/passwd", STATO_PASSWD),
+        ("etc/group", STATO_GROUP),
+        ("var/lib/dpkg/statoverride", records.encode()),
+    ):
+        m.write(root / path, data)
+        os.utime(root / path, (m.EPOCH, m.EPOCH))
+
+
+def seed_statoverride_replacement(root: Path, marker: str, content: bytes) -> None:
+    runtime.copy_program(root, Path("/bin/mv").resolve(), "/stato-mv")
+    m.write(root / marker, content)
+    os.utime(root / marker, (m.EPOCH, m.EPOCH))
+
+
+def exercise_statoverride_lifecycle(
+    executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    archives = make_statoverride_packages(workspace / "statoverride-packages", environment, architecture)
+    for name, records, path, expected, existing in (
+        ("numeric", f"#42420 #42421 4750 /{STATO_BASE}/mode\n", "mode", (0o4750, 42420, 42421), False),
+        ("named", f"_debzstat _debzstat 4750 /{STATO_BASE}/mode\n", "mode", (0o4750, 42420, 42421), False),
+        ("directory-new", f"#42420 #42421 2710 /{STATO_BASE}/empty\n", "empty", (0o2710, 42420, 42421), False),
+        ("directory-existing", f"#42420 #42421 2710 /{STATO_BASE}/empty\n", "empty", (0o700, 0, 0), True),
+        ("conffile", "#42420 #42421 0640 /etc/debz-native.conf\n", "/etc/debz-native.conf", (0o640, 42420, 42421), False),
+        ("symlink", f"#42420 #42421 0640 /{STATO_BASE}/current\n", "current", (0o777, 42420, 42421), False),
+        ("literal", f"#42420 #42421 0640 /{STATO_LITERAL.as_posix()}\n", "/" + STATO_LITERAL.as_posix(), (0o640, 42420, 42421), False),
+        ("hardlink-source", f"#42420 #42421 0640 /{STATO_BASE}/data\n", "data", (0o644, 0, 0), False),
+        ("hardlink-target", f"#42420 #42421 0640 /{STATO_BASE}/data.link\n", "data.link", (0o640, 42420, 42421), False),
+        (
+            "hardlink-both",
+            f"#42420 #42421 0640 /{STATO_BASE}/data\n#42422 #42423 0600 /{STATO_BASE}/data.link\n",
+            "data", (0o600, 42422, 42423), False,
+        ),
+    ):
+        current = Scenario(workspace, f"statoverride-{name}", executable, architecture, environment)
+        for root in current.roots:
+            seed_statoverrides(root, records)
+            if existing:
+                (root / STATO_BASE / "empty").mkdir(parents=True)
+                (root / STATO_BASE / "empty").chmod(0o700)
+        for operation, version in (("install", "1"), ("upgrade", "2"), ("reinstall", "2"), ("downgrade", "1")):
+            current.phase(operation, [archives[version]], names=(STATO_PACKAGE,))
+            for root in current.roots:
+                target = root / (path[1:] if path.startswith("/") else f"{STATO_BASE}/{path}")
+                entry = target.lstat()
+                assert (entry.st_mode & 0o7777, entry.st_uid, entry.st_gid) == expected
+                assert (root / STATO_BASE / "data").samefile(root / STATO_BASE / "data.link")
+        current.phase("remove", names=(STATO_PACKAGE,))
+        current.phase("purge", names=(STATO_PACKAGE,))
+        for root in current.roots:
+            assert (root / "var/lib/dpkg/statoverride").read_bytes() == records.encode()
+        current.complete()
+
+    named_record = f"_debzstat _debzstat 4750 /{STATO_BASE}/mode\n"
+    for name, records, marker, content, next_metadata in (
+        ("account-preinst", named_record, "statoverride-passwd-replace", STATO_PASSWD.replace(b":42420:", b":42422:"), (0o4750, 42422, 42421)),
+        ("override-preinst", named_record, "statoverride-preinst-replace", f"#42422 #42423 0640 /{STATO_BASE}/mode\n".encode(), (0o640, 42422, 42423)),
+        ("override-postinst", named_record, "statoverride-postinst-replace", f"#42422 #42423 0640 /{STATO_BASE}/mode\n".encode(), (0o640, 42422, 42423)),
+        ("override-created", "", "statoverride-preinst-replace", named_record.encode(), (0o4750, 42420, 42421)),
+    ):
+        current = Scenario(workspace, f"statoverride-{name}", executable, architecture, environment)
+        for root in current.roots:
+            seed_statoverrides(root, records)
+            seed_statoverride_replacement(root, marker, content)
+        initial_metadata = (0o4750, 42420, 42421) if records else (0o600, 0, 0)
+        for operation, expected in (("install", initial_metadata), ("reinstall", next_metadata)):
+            current.phase(operation, [archives["1"]], names=(STATO_PACKAGE,))
+            for root in current.roots:
+                entry = (root / STATO_BASE / "mode").stat()
+                assert (entry.st_mode & 0o7777, entry.st_uid, entry.st_gid) == expected
+        current.complete()
+
+    alias_archive = m.make_package(
+        workspace / "statoverride-alias-package", environment, architecture, "1",
+        package=STATO_PACKAGE, scripts=statoverride_scripts(STATO_PACKAGE, "1"),
+        extra_files={"usr/bin/statoverride-mode": b"aliased payload\n"},
+    )
+    for spelling in ("bin", "usr/bin"):
+        current = Scenario(workspace, f"statoverride-alias-{spelling.replace('/', '-')}", executable, architecture, environment)
+        for root in current.roots:
+            (root / "usr").mkdir(exist_ok=True)
+            (root / "bin").rename(root / "usr/bin")
+            (root / "bin").symlink_to("usr/bin")
+            os.utime(root / "bin", (m.EPOCH, m.EPOCH), follow_symlinks=False)
+            seed_statoverrides(root, f"#42420 #42421 4750 /{spelling}/statoverride-mode\n")
+        current.phase("install", [alias_archive], names=(STATO_PACKAGE,))
+        expected = (0o4750, 42420, 42421) if spelling == "usr/bin" else (0o644, 0, 0)
+        for root in current.roots:
+            entry = (root / "usr/bin/statoverride-mode").stat()
+            assert (entry.st_mode & 0o7777, entry.st_uid, entry.st_gid) == expected
+        current.complete()
+
+    for policy in ("keep_existing", "use_package_version"):
+        current = Scenario(workspace, f"statoverride-conffile-{policy}", executable, architecture, environment)
+        for root in current.roots:
+            seed_statoverrides(root, "#42420 #42421 0640 /etc/debz-native.conf\n")
+        current.seed(archives["1"])
+        for root in current.roots:
+            path = root / "etc/debz-native.conf"
+            m.write(path, b"administrator configuration\n", 0o600)
+            os.chown(path, 42424, 42425)
+            os.utime(path, (m.EPOCH, m.EPOCH))
+        current.phase("upgrade", [archives["2"]], names=(STATO_PACKAGE,), policy=policy)
+        for root in current.roots:
+            entry = (root / "etc/debz-native.conf").stat()
+            assert (entry.st_mode & 0o7777, entry.st_uid, entry.st_gid) == (0o600, 42424, 42425)
+        current.complete()
+
+    if executable is not None:
+        for name, user, group in (
+            ("missing-user", "nobody", "#42421"),
+            ("missing-group", "#42420", "nogroup"),
+            ("invalid-id", "#4294967295", "#42421"),
+        ):
+            current = Scenario(workspace, f"statoverride-{name}", executable, architecture, environment)
+            for root in current.roots:
+                seed_statoverrides(root, f"{user} {group} 0640 /{STATO_BASE}/mode\n")
+            before = m.snapshot(current.candidate)
+            destination = current.directory / "refusal"
+            destination.mkdir()
+            report = native(
+                executable, current.candidate, [archives["1"]], "install",
+                architecture, environment, destination,
+                packages=current.identities((STATO_PACKAGE,)),
+            )
+            assert report["outcome"] == "refused" and report["detail"] == "invalid_stat_override", report
+            assert not m.oracle.differences(before, m.snapshot(current.candidate))
+            print(f"statoverride-{name}: invalid target-root identities refuse before mutation", flush=True)
+
+
 def exercise_conffile_lifecycle(
     executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
 ) -> None:
@@ -624,6 +796,7 @@ def exercise(
     environment: dict[str, str],
     architecture: str,
 ) -> None:
+    exercise_statoverride_lifecycle(executable, workspace, environment, architecture)
     exercise_conffile_lifecycle(executable, workspace, environment, architecture)
     archives = {
         version: m.make_package(
@@ -988,6 +1161,7 @@ def main() -> int:
         help="check reference fixture consistency only; does not establish native parity",
     )
     parser.add_argument("--workspace", type=Path, help="retain artifacts in a new .tmp directory")
+    parser.add_argument("--reference-dpkg", type=Path)
     arguments = parser.parse_args()
     if arguments.oracle_only == bool(arguments.native_test):
         parser.error("provide a native test executable or --oracle-only, not both")
@@ -1003,6 +1177,7 @@ def main() -> int:
     ).stdout.strip()
     if architecture not in ("amd64", "arm64"):
         raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
+    m.REFERENCE_DPKG = m.reference_dpkg.select(arguments.reference_dpkg, architecture, root_accounts=True)
     temporary_root = ROOT / ".tmp"
     temporary_root.mkdir(exist_ok=True)
     if arguments.workspace:

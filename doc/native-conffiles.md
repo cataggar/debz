@@ -62,7 +62,9 @@ conffile work.
 
 Phase preflight checks program/root/database/policy binding and rejects
 unsupported package states, malformed configuration-version evidence, scripts,
-triggers, diversions, overrides, and opaque metadata. Conffile observations are
+triggers, diversions, and opaque metadata. Bounded statoverrides are supported
+with target-root identity validation; conffile replacement still preserves
+live metadata where required by policy. Conffile observations are
 bounded and staged bytes are checked against the bound archive with SHA-256.
 The final phase digest incorporates the concrete mutation-plan step digest.
 Unexpected preparation failures preserve active evidence, and a failed

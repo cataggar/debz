@@ -129,6 +129,32 @@ package preserves its explicit scalar `Config-Version`. An absent field means
 the package has never been configured, including repeated unconfigured unpack,
 and remains absent. A malformed field is handed off rather than fabricated.
 
+## Statoverride metadata
+
+The private resolver honors bounded `var/lib/dpkg/statoverride` records.
+Numeric `#<decimal-id>` identities need no account lookup; named identities
+resolve only through the selected root's bounded, no-follow `etc/passwd` and
+`etc/group` files, never host NSS. Missing or ambiguous names, invalid IDs,
+overflow and the chown no-change sentinel are refusals before scripts.
+
+Lookup uses the archive's original root-relative spelling, including literal
+backslashes, before merged-/usr alias resolution. Overrides supply owner,
+group and mode for files and newly created directories. Existing directory
+metadata is retained. Symlinks receive owner/group changes, not mode changes.
+The final archive member of a hard-link group determines shared inode metadata:
+its override wins, or its absence restores the regular source's defaults.
+Conffile policy still preserves existing live metadata where required.
+
+Lifecycle execution freezes this interpretation before its first script,
+including when no overrides exist. Script-written account or override changes
+are observed as current state but do not alter that invocation's resolution;
+the next invocation resolves afresh. Recovery retains the original inputs as
+described in [Native recovery](native-recovery.md).
+
+Native database plans explicitly preserve the override file without rewriting
+it, including remove and purge. Diversions, active `config` scripts,
+alternatives and other unsupported vendor state remain guarded.
+
 ## Package identity and ownership
 
 Package identity is always `(name, architecture)`. This prevents a foreign
@@ -308,7 +334,7 @@ digested. Covered features include:
 - package disappearance;
 - held-selection changes;
 - malformed prior `Config-Version` evidence for an unpacked upgrade;
-- diversions, stat overrides, alternatives, and unmodeled package metadata;
+- diversions, alternatives, and unmodeled package metadata;
 - unmodeled `var/lib/dpkg` namespace entries;
 - shared-root interoperability; and
 - filesystem features a supplied observation cannot model safely.

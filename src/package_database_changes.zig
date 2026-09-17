@@ -167,6 +167,8 @@ pub const Limits = struct {
 pub const PlanOptions = struct {
     database: Options = .{},
     limits: Limits = .{},
+    /// Preservation requires the caller to implement filesystem override semantics.
+    statoverride_policy: enum { refuse_affected, preserve } = .refuse_affected,
 };
 
 /// Data-level guard for published state transitions. Lifecycle ordering,
@@ -506,7 +508,9 @@ const Builder = struct {
             if (self.diverted_paths.contains(logical)) {
                 return self.fail(.unsupported_diversion, subject.name);
             }
-            if (self.overridden_paths.contains(logical)) {
+            if (self.options.statoverride_policy == .refuse_affected and
+                self.overridden_paths.contains(logical))
+            {
                 return self.fail(.unsupported_statoverride, subject.name);
             }
         }
@@ -1801,6 +1805,31 @@ test "package_database_changes.test.transition table refuses impossible publicat
     try testing.expect(!transitionAllowed(.config_files, .installed));
     try testing.expect(!transitionAllowed(.half_installed, .installed));
     try testing.expect(!transitionAllowed(.installed, .not_installed));
+}
+
+test "package_database_changes.test.statoverrides require explicit preservation policy" {
+    var snapshot = database.test_fixtures.snapshot();
+    snapshot.statoverride = database.regularFile("#42 #43 4750 /usr/bin/toolz\n");
+    var imported = switch (try database.importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer imported.deinit();
+    const changes = [_]Change{.{ .put_file_list = .{
+        .identity = .{ .name = "toolz", .architecture = "amd64" },
+        .paths = imported.model.find("toolz", "amd64").?.paths.?,
+    } }};
+    try expectPlanDiagnostic(try plan(testing.allocator, imported, &changes, .{}), .unsupported_statoverride);
+    var allowed = switch (try plan(testing.allocator, imported, &changes, .{ .statoverride_policy = .preserve })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer allowed.deinit();
+    for (allowed.writes) |write|
+        try testing.expect(!std.mem.eql(u8, write.path, database.statoverride_path));
 }
 
 test "package_database_changes.test.renaming info files of a package with retained files fails" {

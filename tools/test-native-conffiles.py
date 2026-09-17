@@ -327,6 +327,7 @@ def exercise(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", nargs="?", type=Path)
+    parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument(
         "--oracle-only", action="store_true",
         help="check reference fixture consistency only; not native parity",
@@ -344,6 +345,7 @@ def main() -> int:
     ).stdout.strip()
     if architecture not in ("amd64", "arm64"):
         raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
+    materialization.REFERENCE_DPKG = materialization.reference_dpkg.select(arguments.reference_dpkg, architecture)
     host_status = Path("/var/lib/dpkg/status").read_bytes()
     temporary_root = ROOT / ".tmp"
     temporary_root.mkdir(exist_ok=True)

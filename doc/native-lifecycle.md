@@ -41,6 +41,14 @@ configure/purge retries with and without conffiles. Existing admission guards
 for otherwise unsupported half-installed states remain unchanged.
 No debconf preconfiguration or other active/unknown metadata support is implied.
 
+Statoverrides use file-backed target-root identities and are resolved once
+before scripts, not separately at unpack and configure. A preinst or postinst
+may change the account or override files, but the same invocation keeps its
+original resolved metadata, matching dpkg. A later invocation uses the new
+state. Missing identities refuse before lifecycle mutation. See the
+[metadata contract](native-unpack.md#statoverride-metadata) for directory,
+symlink, hard-link and exact-path behavior.
+
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known
 outcome then settles the conffile records; final directory/info removal follows
@@ -103,12 +111,35 @@ before acknowledgment and cleanup. Other consumers remain independently gated.
 ## Independent reference acceptance
 
 Run on native Linux amd64 or arm64 with `dpkg`, `dpkg-deb`, `ldd`, `/bin/sh`, and
-passwordless `sudo`:
+passwordless `sudo`. Named statoverride comparisons require dpkg 1.22.16 or
+newer, when target-root passwd/group lookup was introduced. Older references
+fail before the workload rather than skipping named-identity coverage.
 
 ```sh
 zig build test-native-lifecycle -j2
 zig build test-native-lifecycle -Doptimize=ReleaseSafe -j2
 ```
+
+CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
+or another compatible Linux host with an older dpkg, prepare that reference
+without root privileges:
+
+```sh
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+zig build test-native-lifecycle test-native-recovery \
+  -Dnative-reference-dpkg="$reference_dpkg" -j2
+```
+
+The helper verifies architecture-specific archive and executable SHA-256 pins,
+extracts into `.cache/native-dpkg-reference/`, and validates the executable on
+each reuse. It never installs a package, rewrites host accounts, changes host
+dpkg, or repairs a tampered cache. The Debian binary requires glibc 2.38 or
+newer and the usual dpkg runtime libraries. Direct fixture drivers accept
+`--reference-dpkg PATH`; the build option forwards it explicitly through
+`sudo` to all five native reference runners. The selected binary is used only
+for reference commands. Host `dpkg-deb` still builds/decodes archives, the
+package-owned reference trigger helper remains unchanged, and fixture/script
+`PATH` does not gain the private prefix.
 
 Only the fixture runner is elevated; Zig compilation is not. Roots, packages,
 requests, snapshots, and logs are created under the worktree's `.tmp` directory.
@@ -128,6 +159,10 @@ compared independently of the native outcome report.
 
 Advanced fixtures exercise:
 
+- **Statoverrides:** numeric/named identities, new/existing directories,
+  conffiles, symlinks, hard links, literal paths and merged-/usr spellings;
+  invocation-frozen account/override changes; fresh resolution on reinstall;
+  administrator conffile metadata under both policies; and pre-script refusals.
 - **Pre-Depends:** a reviewed configure barrier runs the provider's postinst
   before the consumer's preinst; the consumer script independently requires
   that ordering. The reference uses the corresponding separate dpkg command

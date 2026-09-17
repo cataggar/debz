@@ -40,6 +40,7 @@ const native_helper = @import("native_helper.zig");
 const native_operation = @import("native_operation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
+const native_statoverride = @import("native_statoverride.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -99,6 +100,7 @@ const ExecutionState = struct {
     script_ordinal: u32 = 0,
     phase_steps: ?[]const root_mutation.Step = null,
     bounds: ?*RuntimeBounds = null,
+    stat_overrides: ?native_statoverride.Resolved = null,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -273,6 +275,7 @@ pub const Code = enum {
     database_generation_mismatch,
     database_generation_drift,
     updates_pending,
+    invalid_stat_override,
     program_incomplete,
     artifact_missing,
     artifact_duplicate,
@@ -1220,6 +1223,7 @@ const Request = struct {
     lifecycle_execution: bool = false,
     trigger_execution: bool = false,
     lifecycle_sequences: []const u32 = &.{},
+    stat_overrides: ?native_statoverride.Resolved = null,
     limits: Limits = .{},
 };
 
@@ -1450,6 +1454,7 @@ const Builder = struct {
     database: *const package_database.Database,
     ownership: Ownership,
     aliases: AliasEvidence,
+    stat_overrides: native_statoverride.Resolved = .{},
     models: std.ArrayList(*archive_application.Model) = .empty,
     deferred: std.ArrayList(DeferredItem) = .empty,
     work: std.ArrayList(PackageWork) = .empty,
@@ -1851,6 +1856,18 @@ fn hashText(hash: *Sha256, text: []const u8) void {
 
 fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
     try validateProgram(builder);
+    builder.stat_overrides = builder.request.stat_overrides orelse (native_statoverride.read(
+        builder.arena,
+        builder.request.root,
+        builder.database.model.stat_overrides,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return builder.fail(.{
+            .surface = .database,
+            .code = .invalid_stat_override,
+            .path = native_statoverride.database_path,
+        }),
+    });
     if (builder.request.interoperability == .shared_root)
         try builder.deferFeature(.{
             .feature = .dpkg_interoperability,
@@ -2501,10 +2518,6 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
         .feature = .diversion,
         .package = record.package orelse "",
         .detail = record.from,
-    });
-    for (model.stat_overrides) |record| try builder.deferFeature(.{
-        .feature = .stat_override,
-        .detail = record.path,
     });
     for (model.opaque_info) |entry| {
         if (std.mem.endsWith(u8, entry.name, ".alternatives"))
@@ -3444,6 +3457,13 @@ fn describeTransactionClaim(
             }),
         .directory => result.modified_nanoseconds = 0,
     }
+    if (claim.kind == .directory or claim.kind == .symlink) {
+        if (builder.stat_overrides.get(file.path)) |override| {
+            if (claim.kind != .symlink) result.mode = override.mode;
+            result.uid = override.uid;
+            result.gid = override.gid;
+        }
+    }
     return result;
 }
 
@@ -3581,6 +3601,9 @@ fn planClaim(
                 });
             planned.sha256 = effective.sha256;
             planned.md5 = effective.md5;
+            planned.mode = effective.mode;
+            planned.uid = effective.uid;
+            planned.gid = effective.gid;
         },
         .directory => {},
         .symlink => {
@@ -3615,6 +3638,13 @@ fn planClaim(
             planned.gid = effective.gid;
             planned.modified_nanoseconds = effective.modified_nanoseconds;
         },
+    }
+    if (claim.kind == .directory or claim.kind == .symlink) {
+        if (builder.stat_overrides.get(file.path)) |override| {
+            if (claim.kind != .symlink) planned.mode = override.mode;
+            planned.uid = override.uid;
+            planned.gid = override.gid;
+        }
     }
     if (planned.kind == .directory and
         planned.previous != null and
@@ -4464,18 +4494,14 @@ fn sharedMultiArch(
         .symlink => {
             const entry = model.files[claim.file];
             const target = entry.link_literal orelse return builder.fail(mismatch);
-            const uid = std.math.cast(u32, entry.uid) orelse
-                return builder.fail(mismatch);
-            const gid = std.math.cast(u32, entry.gid) orelse
-                return builder.fail(mismatch);
             if (observed.kind != .symlink or
                 observed.link_target == null or
                 !std.mem.eql(u8, observed.link_target.?, target) or
                 !modeledMetadataMatches(
                     observed,
-                    entry.permissions() | (entry.mode & 0o7000),
-                    uid,
-                    gid,
+                    incoming.mode,
+                    incoming.uid,
+                    incoming.gid,
                     @as(i128, entry.mtime) * std.time.ns_per_s,
                 ))
                 return builder.fail(mismatch);
@@ -4983,6 +5009,29 @@ fn prepareEffectiveFiles(builder: *Builder, item: *PackageWork) PlanError!void {
         if (effective.*) |*value| {
             value.group_size = groups.get(value.source_index) orelse
                 return builder.fail(diagnostic);
+        }
+    }
+    if (builder.stat_overrides.paths.count() != 0) {
+        // dpkg applies each member in archive order to the same inode; an
+        // unoverridden final member restores the regular source's defaults.
+        var final_metadata: std.AutoHashMapUnmanaged(usize, native_statoverride.Metadata) = .empty;
+        defer final_metadata.deinit(allocator);
+        for (item.model.files, 0..) |file, index| {
+            const effective = item.effective_files[index] orelse continue;
+            final_metadata.put(allocator, effective.source_index, builder.stat_overrides.get(file.path) orelse .{
+                .mode = effective.mode,
+                .uid = effective.uid,
+                .gid = effective.gid,
+            }) catch return builder.modelAllocationFailure(diagnostic);
+            try builder.chargeWork(1, diagnostic);
+        }
+        for (item.effective_files) |*effective| {
+            if (effective.*) |*value| {
+                const metadata = final_metadata.get(value.source_index).?;
+                value.mode = metadata.mode;
+                value.uid = metadata.uid;
+                value.gid = metadata.gid;
+            }
         }
     }
 }
@@ -6749,7 +6798,11 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
         builder.allocator,
         builder.database.*,
         changes.items,
-        .{ .database = builder.limits.database, .limits = builder.limits.changes },
+        .{
+            .database = builder.limits.database,
+            .limits = builder.limits.changes,
+            .statoverride_policy = .preserve,
+        },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -7691,6 +7744,9 @@ fn lowerMaterializationIntents(
                 modeled,
                 archive.binding,
             );
+            intent.file.mode = file.mode;
+            intent.file.uid = file.uid;
+            intent.file.gid = file.gid;
             intent.file.overwrite = try materializationOverwrite(
                 &publications,
                 file.path,
@@ -8275,9 +8331,10 @@ fn materializationProgramDigest(program: native_program.Program) [32]u8 {
 }
 
 fn phasePreflight(
+    allocator: std.mem.Allocator,
     request: MaterializationRequest,
     database: package_database.Database,
-) ?MaterializationResult {
+) !?MaterializationResult {
     const program = request.planning.program;
     if (request.planning.interoperability != .isolated_root)
         return .{ .outcome = .handoff, .detail = "shared_root" };
@@ -8321,10 +8378,12 @@ fn phasePreflight(
         return .{ .outcome = .handoff, .detail = "trigger" };
     if (database.model.diversions.len != 0)
         return .{ .outcome = .handoff, .detail = "diversion" };
-    if (database.model.stat_overrides.len != 0)
-        return .{ .outcome = .handoff, .detail = "statoverride" };
     if (database.model.opaque_info.len != 0)
         return .{ .outcome = .handoff, .detail = "package_metadata" };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    if (request.planning.stat_overrides == null)
+        _ = try native_statoverride.read(arena.allocator(), request.root, database.model.stat_overrides);
     return null;
 }
 
@@ -8869,6 +8928,7 @@ fn appendArchiveConffileIntent(
     file: archive_application.File,
     overwrite: root_mutation.Overwrite,
     metadata: ?root_fs.Entry,
+    stat_override: ?native_statoverride.Metadata,
 ) !void {
     var intent = try root_mutation.archiveFileIntent(
         path,
@@ -8877,6 +8937,11 @@ fn appendArchiveConffileIntent(
         archive.binding,
     );
     intent.file.overwrite = overwrite;
+    if (stat_override) |override| {
+        intent.file.mode = override.mode;
+        intent.file.uid = override.uid;
+        intent.file.gid = override.gid;
+    }
     if (metadata) |entry| {
         intent.file.mode = entry.mode;
         intent.file.uid = entry.uid;
@@ -9006,7 +9071,7 @@ fn materializeConfigure(
         },
     };
     defer database.deinit();
-    if (phasePreflight(request, database)) |result| return result;
+    if (try phasePreflight(allocator, request, database)) |result| return result;
     var bound = (try bindMaterializationArchives(
         allocator,
         request.planning,
@@ -9029,6 +9094,9 @@ fn materializeConfigure(
     var compared_bytes: u64 = 0;
     var observed_paths: std.ArrayList([]const u8) = .empty;
     defer observed_paths.deinit(allocator);
+    const stat_overrides = request.planning.stat_overrides orelse
+        try native_statoverride.read(owned, request.root, database.model.stat_overrides);
+    try observed_paths.appendSlice(allocator, stat_overrides.observed_paths);
 
     for (bound.items) |*archive| {
         if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
@@ -9156,6 +9224,7 @@ fn materializeConfigure(
                     file,
                     .require_absent,
                     null,
+                    stat_overrides.get(conffile.path),
                 ),
                 .replace_unmodified => try appendArchiveConffileIntent(
                     &intents,
@@ -9165,6 +9234,7 @@ fn materializeConfigure(
                     file,
                     .replace,
                     null,
+                    stat_overrides.get(conffile.path),
                 ),
                 .keep_existing_stage_dist => {
                     const dist = try std.fmt.allocPrint(
@@ -9190,6 +9260,7 @@ fn materializeConfigure(
                         file,
                         .require_absent,
                         live_metadata,
+                        stat_overrides.get(conffile.path),
                     );
                 },
                 .install_stage_old => {
@@ -9228,6 +9299,7 @@ fn materializeConfigure(
                         file,
                         .replace,
                         current,
+                        stat_overrides.get(conffile.path),
                     );
                 },
                 .identical_no_op,
@@ -9295,7 +9367,7 @@ fn materializeConfigure(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| {
@@ -9505,7 +9577,7 @@ fn materializeRemoval(
         },
     };
     defer database.deinit();
-    if (phasePreflight(request, database)) |result| return result;
+    if (try phasePreflight(allocator, request, database)) |result| return result;
     if (request.file_trigger_sink) |sink| {
         if (sink.expected_owned_paths) |digest| {
             const record = database.model.find(sink.source.name, sink.source.architecture) orelse
@@ -9901,7 +9973,7 @@ fn materializeRemoval(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10042,7 +10114,7 @@ fn materializeStateRecord(
         .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
     };
     defer database.deinit();
-    if (phasePreflight(request, database)) |result| return result;
+    if (try phasePreflight(allocator, request, database)) |result| return result;
     const record = database.model.find(
         state.package.name,
         state.package.architecture,
@@ -10104,7 +10176,7 @@ fn materializeStateRecord(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10343,7 +10415,7 @@ fn materializeDetailedState(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10510,7 +10582,7 @@ fn materializeRestoredPackageState(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10627,7 +10699,7 @@ fn materializeTriggerDatabase(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -12674,6 +12746,7 @@ fn lifecyclePhaseRequest(
             .lifecycle_execution = true,
             .trigger_execution = program.trigger_authority != null,
             .lifecycle_sequences = sequences,
+            .stat_overrides = execution.stat_overrides,
         },
         .locks = locks,
         .operation = operation,
@@ -16302,6 +16375,47 @@ fn infoBlobKind(name: []const u8) native_recovery.BlobKind {
     return .database;
 }
 
+fn statOverrideIdentityPath(blob: native_recovery.Blob) !?[]const u8 {
+    const path = if (std.mem.eql(u8, blob.key, native_statoverride.passwd_key))
+        native_statoverride.passwd_path
+    else if (std.mem.eql(u8, blob.key, native_statoverride.group_key))
+        native_statoverride.group_path
+    else
+        return null;
+    if (blob.kind != .database or blob.entry_kind != .regular or
+        blob.size > native_statoverride.maximum_identity_bytes or
+        !std.mem.eql(u8, blob.logical_path, path))
+        return error.InvalidRecoveryIntent;
+    return path;
+}
+
+fn frozenStatOverrides(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    records: []const package_database.StatOverrideRecord,
+    recovery_intent: ?native_recovery.Intent,
+) !native_statoverride.Resolved {
+    const intent = recovery_intent orelse return native_statoverride.read(allocator, root, records);
+    var passwd: ?[]const u8 = null;
+    var group: ?[]const u8 = null;
+    for (intent.blobs) |blob| {
+        const path = try statOverrideIdentityPath(blob) orelse continue;
+        const destination = if (std.mem.eql(u8, path, native_statoverride.passwd_path)) &passwd else &group;
+        if (destination.* != null) return error.InvalidRecoveryIntent;
+        destination.* = try native_recovery.verifyBlob(allocator, root, blob);
+    }
+    const result = try native_statoverride.resolve(allocator, records, passwd, group);
+    var needs_passwd = false;
+    var needs_group = false;
+    for (result.observed_paths) |path| {
+        needs_passwd = needs_passwd or std.mem.eql(u8, path, native_statoverride.passwd_path);
+        needs_group = needs_group or std.mem.eql(u8, path, native_statoverride.group_path);
+    }
+    if (needs_passwd != (passwd != null) or needs_group != (group != null))
+        return error.InvalidRecoveryIntent;
+    return result;
+}
+
 fn prepareNativeRecovery(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -16310,6 +16424,7 @@ fn prepareNativeRecovery(
     raw_request: []const u8,
     archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
+    stat_overrides: native_statoverride.Resolved,
     attempt: *root_operation.Attempt,
     production_request: ?native_execution_request.Document,
     helper_binding: ?native_helper.Binding,
@@ -16432,6 +16547,20 @@ fn prepareNativeRecovery(
             file.mode,
         );
     };
+    for (stat_overrides.identity_files) |file| try appendRecoveryBlob(
+        allocator,
+        root,
+        &blobs,
+        .database,
+        if (std.mem.eql(u8, file.path, native_statoverride.passwd_path))
+            native_statoverride.passwd_key
+        else
+            native_statoverride.group_key,
+        file.path,
+        file.bytes,
+        .regular,
+        file.mode,
+    );
     for (initial_snapshot.info) |entry| {
         const logical = try std.fmt.allocPrint(
             allocator,
@@ -16598,6 +16727,15 @@ fn prepareNativeRecovery(
         root,
         intent.digest_sha256,
     );
+    if (stat_overrides.observed_paths.len != 0)
+        _ = try native_recovery.updateManagedState(
+            allocator,
+            root,
+            intent.digest_sha256,
+            nativeAction(.verification, 0, 0, 0),
+            stat_overrides.observed_paths,
+            false,
+        );
     return .{
         .allocator = allocator,
         .root = root,
@@ -17033,6 +17171,7 @@ fn loadRecoveredLifecycleInputs(
     snapshot.triggers_file = null;
     snapshot.triggers_unincorp = null;
     for (intent.blobs) |blob| {
+        _ = try statOverrideIdentityPath(blob);
         const bytes = try native_recovery.verifyBlob(allocator, root, blob);
         switch (blob.kind) {
             .request => {},
@@ -17055,6 +17194,12 @@ fn loadRecoveredLifecycleInputs(
                     snapshot.diversions = recoveredFileEntry(blob, bytes);
                 } else if (std.mem.eql(u8, blob.key, "statoverride")) {
                     snapshot.statoverride = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, native_statoverride.passwd_key) or
+                    std.mem.eql(u8, blob.key, native_statoverride.group_key))
+                {
+                    // Identity inputs belong to the frozen statoverride lookup,
+                    // not to the dpkg database generation.
+                    continue;
                 } else if (std.mem.eql(u8, blob.key, "triggers-file")) {
                     snapshot.triggers_file = recoveredFileEntry(blob, bytes);
                 } else if (std.mem.eql(u8, blob.key, "triggers-unincorp")) {
@@ -17938,9 +18083,10 @@ pub const Runtime = struct {
             if (!found) return error.OperationArchitectureMismatch;
         }
         if (database.model.pending_updates.len != 0 or
-            database.model.diversions.len != 0 or database.model.stat_overrides.len != 0 or
+            database.model.diversions.len != 0 or
             database.model.opaque_info.len != 0)
             return error.UnsupportedNativeDatabase;
+        _ = try native_statoverride.read(temporary, root, database.model.stat_overrides);
         const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
         const models = try temporary.alloc(archive_application.Model, request.archives.len);
         const origins = try temporary.alloc(exact_lock_v2.PackageOrigin, request.archives.len);
@@ -18744,6 +18890,18 @@ fn executeLifecycleProgramWithRequest(
         !std.mem.eql(u8, external.root, program.install_root) or
         !std.mem.eql(u8, external.architecture, program.target_architecture))
         return error.InvalidLifecycleProgram;
+    const scratch_arena = try allocator.create(std.heap.ArenaAllocator);
+    defer allocator.destroy(scratch_arena);
+    scratch_arena.* = .init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+    const stat_overrides = frozenStatOverrides(scratch, root, initial_model.stat_overrides, recovery_intent) catch |err| {
+        if (recovery_intent != null) return err;
+        return switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .{ .outcome = .refused, .detail = "invalid_stat_override" },
+        };
+    };
     const program_sha256 = parseHex(32, &program.digest_sha256) orelse
         return error.InvalidLifecycleProgram;
     const request_sha256 = parseHex(32, &program.request_sha256) orelse
@@ -18870,13 +19028,11 @@ fn executeLifecycleProgramWithRequest(
         .phase = .preflight,
     });
 
-    const scratch_arena = try allocator.create(std.heap.ArenaAllocator);
-    defer allocator.destroy(scratch_arena);
-    scratch_arena.* = .init(allocator);
-    defer scratch_arena.deinit();
-    const scratch = scratch_arena.allocator();
     var recovery_runtime: native_recovery.Runtime = undefined;
-    var execution_state: ExecutionState = .{ .bounds = bounds };
+    var execution_state: ExecutionState = .{
+        .bounds = bounds,
+        .stat_overrides = stat_overrides,
+    };
     const execution = &execution_state;
     if (recovery_intent) |intent| {
         recovery_runtime = .{
@@ -18974,6 +19130,7 @@ fn executeLifecycleProgramWithRequest(
             raw_request orelse return error.InvalidLifecycleProgram,
             archive_bytes,
             initial_snapshot,
+            execution.stat_overrides.?,
             attempt,
             production_request,
             helper_binding,
@@ -20291,6 +20448,91 @@ test "native_recovery.test.native_provenance.test.contract coverage" {
     try native_provenance.testContract();
 }
 
+test "native_unpack.test.statoverride identities are root-local and bounded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const records = [_]package_database.StatOverrideRecord{
+        .{ .user = "_fixture", .group = "_fixture", .mode = 0o2750, .path = "/usr/share/example" },
+        .{ .user = "#42", .group = "#43", .mode = 0o600, .path = "/etc/literal\\name" },
+    };
+    const passwd = "root:x:0:0::/:/bin/sh\n_fixture:x:42420:42421::/:/bin/sh\n";
+    const group = "root:x:0:\n_fixture:x:42421:\n";
+    const resolved = try native_statoverride.resolve(arena.allocator(), &records, passwd, group);
+    try testing.expectEqual(native_statoverride.Metadata{
+        .mode = 0o2750,
+        .uid = 42420,
+        .gid = 42421,
+    }, resolved.get("usr/share/example").?);
+    try testing.expectEqual(@as(u32, 42), resolved.get("etc/literal\\name").?.uid);
+    try testing.expectEqual(@as(usize, 3), resolved.observed_paths.len);
+    try testing.expectError(error.UnknownStatOverrideIdentity, native_statoverride.resolve(
+        arena.allocator(),
+        &records,
+        "root:x:0:0::/:/bin/sh\n",
+        group,
+    ));
+    try testing.expectError(error.AmbiguousStatOverrideIdentity, native_statoverride.resolve(
+        arena.allocator(),
+        &records,
+        passwd ++ "_fixture:x:1:1::/:/bin/sh\n",
+        group,
+    ));
+    for ([_][]const u8{ "#", "#-1", "#+1", "#4294967295", "#4294967296", "#1x" }) |invalid| {
+        var invalid_record = records[1];
+        invalid_record.user = invalid;
+        try testing.expectError(error.InvalidStatOverrideIdentity, native_statoverride.resolve(
+            arena.allocator(),
+            &.{invalid_record},
+            null,
+            null,
+        ));
+    }
+    const numeric = try native_statoverride.resolve(arena.allocator(), records[1..], null, null);
+    try testing.expectEqual(@as(usize, 1), numeric.observed_paths.len);
+    try testing.expectEqualStrings(native_statoverride.database_path, numeric.observed_paths[0]);
+}
+
+fn testStatOverrideAllocations(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try native_statoverride.resolve(arena.allocator(), &.{
+        .{ .user = "_fixture", .group = "_fixture", .mode = 0o640, .path = "/etc/example" },
+    }, "_fixture:x:42420:42421::/:/bin/sh\n", "_fixture:x:42421:\n");
+}
+
+test "native_unpack.test.statoverride resolution releases partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStatOverrideAllocations, .{});
+}
+
+test "native_unpack.test.statoverride recovery identity blobs have exact bounded roles" {
+    const original: native_recovery.Blob = .{
+        .kind = .database,
+        .key = native_statoverride.passwd_key,
+        .logical_path = native_statoverride.passwd_path,
+        .storage_path = native_recovery.database_directory ++ "/00000.blob",
+        .size = 1,
+        .sha256 = @splat('0'),
+        .mode = 0o644,
+        .entry_kind = .regular,
+    };
+    try testing.expectEqualStrings(native_statoverride.passwd_path, (try statOverrideIdentityPath(original)).?);
+    var group = original;
+    group.key = native_statoverride.group_key;
+    group.logical_path = native_statoverride.group_path;
+    try testing.expectEqualStrings(native_statoverride.group_path, (try statOverrideIdentityPath(group)).?);
+    for (0..4) |index| {
+        var invalid = original;
+        switch (index) {
+            0 => invalid.kind = .installed_script,
+            1 => invalid.entry_kind = .symlink,
+            2 => invalid.logical_path = native_statoverride.group_path,
+            3 => invalid.size = native_statoverride.maximum_identity_bytes + 1,
+            else => unreachable,
+        }
+        try testing.expectError(error.InvalidRecoveryIntent, statOverrideIdentityPath(invalid));
+    }
+}
+
 test "native_unpack.test.materialization external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_MATERIALIZATION_REQUEST") orelse
         return error.SkipZigTest;
@@ -21378,7 +21620,6 @@ test "native_unpack.test.lifecycle external fixture" {
             (database.model.triggers.interests.len != 0 or
                 database.model.triggers.pending.len != 0)) or
         database.model.diversions.len != 0 or
-        database.model.stat_overrides.len != 0 or
         database.model.opaque_info.len != 0)
     {
         try writeLifecycleReport(
@@ -22337,6 +22578,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             request_bytes,
             &.{bytes},
             fixture.snapshot(),
+            .{},
             &caller,
             document,
             null,
