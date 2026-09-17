@@ -22,6 +22,14 @@ GUARD_CONTENT = "debz native materialization fixture v1\n"
 EPOCH = 1_700_000_000
 PACKAGE = "debz-native-demo"
 PAYLOAD = Path("usr/share") / PACKAGE
+REFERENCE_DPKG = "dpkg"
+
+REFERENCE_SPEC = importlib.util.spec_from_file_location(
+    "debz_reference_dpkg", REPOSITORY / "tools/prepare-native-dpkg.py",
+)
+assert REFERENCE_SPEC and REFERENCE_SPEC.loader
+reference_dpkg = importlib.util.module_from_spec(REFERENCE_SPEC)
+REFERENCE_SPEC.loader.exec_module(reference_dpkg)
 
 SPEC = importlib.util.spec_from_file_location(
     "debz_native_differential", REPOSITORY / "tools/native-differential.py"
@@ -165,7 +173,7 @@ def reference_command(root: Path) -> list[str]:
     ):
         raise RuntimeError("reference execution requires a disposable fixture root")
     return [
-        "dpkg", "--force-not-root", "--force-bad-path", "--no-triggers",
+        REFERENCE_DPKG, "--force-not-root", "--force-bad-path", "--no-triggers",
         f"--root={root}",
     ]
 
@@ -364,8 +372,10 @@ def fixture_environment(workspace: Path) -> dict[str, str]:
 
 
 def main() -> int:
+    global REFERENCE_DPKG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", nargs="?", type=Path)
+    parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument(
         "--oracle-only", action="store_true",
         help="check fixture/reference consistency only; does not establish native parity",
@@ -383,6 +393,7 @@ def main() -> int:
     ).stdout.strip()
     if architecture not in ("amd64", "arm64"):
         raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
+    REFERENCE_DPKG = reference_dpkg.select(arguments.reference_dpkg, architecture)
     host_status = Path("/var/lib/dpkg/status").read_bytes()
     temporary_root = REPOSITORY / ".tmp"
     temporary_root.mkdir(exist_ok=True)

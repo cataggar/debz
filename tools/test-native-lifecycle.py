@@ -1161,6 +1161,7 @@ def main() -> int:
         help="check reference fixture consistency only; does not establish native parity",
     )
     parser.add_argument("--workspace", type=Path, help="retain artifacts in a new .tmp directory")
+    parser.add_argument("--reference-dpkg", type=Path)
     arguments = parser.parse_args()
     if arguments.oracle_only == bool(arguments.native_test):
         parser.error("provide a native test executable or --oracle-only, not both")
@@ -1176,6 +1177,7 @@ def main() -> int:
     ).stdout.strip()
     if architecture not in ("amd64", "arm64"):
         raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
+    m.REFERENCE_DPKG = m.reference_dpkg.select(arguments.reference_dpkg, architecture, root_accounts=True)
     temporary_root = ROOT / ".tmp"
     temporary_root.mkdir(exist_ok=True)
     if arguments.workspace:

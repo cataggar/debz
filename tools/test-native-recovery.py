@@ -4057,6 +4057,7 @@ def main() -> int:
     parser.add_argument("native_test", type=Path)
     parser.add_argument("--native-helper", type=Path, required=True)
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--deadline-only", action="store_true")
     parser.add_argument("--repository-projection-only", action="store_true")
@@ -4083,6 +4084,7 @@ def main() -> int:
     ).stdout.strip()
     if architecture not in ("amd64", "arm64"):
         raise RuntimeError(f"unsupported recovery acceptance architecture: {architecture}")
+    m.REFERENCE_DPKG = m.reference_dpkg.select(arguments.reference_dpkg, architecture, root_accounts=True)
     temporary_root = ROOT / ".tmp"
     temporary_root.mkdir(exist_ok=True)
     if arguments.workspace:

@@ -731,7 +731,9 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe -j2 run -- --help
       - name: Compare native materialization, conffiles, lifecycle, and triggers with dpkg
         run: |
-          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize="$OPTIMIZE" -j2 --summary all
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers \
+            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Require private native helper namespaces
         run: |
           zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all
@@ -850,8 +852,9 @@ jobs:
           fi
       - name: Exercise native recovery and signed-suite consumer parity
         run: |
-          zig build test-native-recovery -j2 --summary all
-          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   build-and-test:
     name: Build and test (${{ matrix.name }})

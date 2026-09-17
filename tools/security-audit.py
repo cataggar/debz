@@ -528,7 +528,9 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Compare native materialization, conffiles, lifecycle, and triggers with dpkg": (
-            '          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+            "          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers \\",
+            '            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Require private native helper namespaces": (
             '          zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all',
@@ -574,8 +576,9 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             failures.append(f"ci.yml: {name} must remain required in {mode}")
     recovery = jobs.get("native-recovery", "")
     if any(line not in recovery.splitlines() for line in (
-        "          zig build test-native-recovery -j2 --summary all",
-        "          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all",
+        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
+        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
     )) or re.search(r"(?m)^        if:", recovery):
         failures.append("ci.yml: native recovery must run the full Debug and ReleaseSafe targets")
     gate = jobs.get("build-and-test", "")

@@ -5,6 +5,11 @@ lifecycle, including the experimental caller-owned `debz.native_runtime` API.
 Core product/CLI native execution and persisted-input recovery are experimental;
 this does not enable a product cutover or change legacy recovery.
 
+Reference acceptance uses the same
+[pinned private dpkg option](native-lifecycle.md#independent-reference-acceptance)
+as lifecycle acceptance, including both CI architectures and optimization modes.
+Named statoverride coverage is never skipped for an older host dpkg.
+
 ## Durable execution authority
 
 Before package mutation, native execution persists the exact authorization,

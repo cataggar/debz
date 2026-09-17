@@ -311,8 +311,9 @@ class SecurityAuditTests(unittest.TestCase):
             "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
             '          test "$BUILD_RESULT" = success',
             '          test "$RECOVERY_RESULT" = success',
-            "          zig build test-native-recovery -j2 --summary all",
-            "          zig build test-native-recovery -Doptimize=ReleaseSafe -j2 --summary all",
+            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+            '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
+            '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
             "          - os: ubuntu-24.04-arm",
         ):
             with self.subTest(token=token):
@@ -357,6 +358,8 @@ class SecurityAuditTests(unittest.TestCase):
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
             ("test-native-materialization test-native-conffiles", "test-native-materialization"),
             ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
+            ('reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"', "reference_dpkg=/usr/bin/dpkg"),
+            ('-Dnative-reference-dpkg="$reference_dpkg"', ""),
             ("test-native-helper-namespace", "test"),
             ("        run: zig build test-release -j2 --summary all", ""),
             ("        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help", ""),

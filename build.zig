@@ -716,6 +716,12 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-recovery", "Compare real native crash recovery with dpkg and bound provenance")
         .dependOn(&native_recovery.step);
 
+    if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
+        for ([_]*std.Build.Step.Run{
+            native_materialization, native_conffiles, native_lifecycle, native_triggers, native_recovery,
+        }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
+    }
+
     const package_database_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
