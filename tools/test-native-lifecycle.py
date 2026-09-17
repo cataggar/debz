@@ -39,6 +39,9 @@ LITERAL_PACKAGE = "literal-paths"
 LITERAL_CONFFILE = Path("etc/literal\\config.conf")
 METADATA_PACKAGE = "retained-metadata"
 METADATA_KINDS = ("templates", "shlibs", "symbols")
+CONFFILE_PACKAGE = "conffile-lifecycle"
+CONFFILE_PATHS = (Path("etc/debz-native.conf"), Path("etc/conffile\\extra.conf"))
+CONFFILE_TRIGGER = "conffile-purge"
 
 
 def scripts(
@@ -444,12 +447,184 @@ def make_literal_packages(
     return archives
 
 
+def conffile_scripts(package: str, version: str) -> dict[str, bytes]:
+    result = scripts(package, version)
+    paths = " ".join(shlex.quote("/" + path.as_posix()) for path in CONFFILE_PATHS)
+    for kind, source in result.items():
+        observation = f"""
+printf '%s' 'conffiles:{package}@{version}:{kind}' >> /{TRACE}
+for path in {paths}; do
+    for suffix in '' .dpkg-new .dpkg-old .dpkg-dist; do
+        present=no
+        if [ -e "$path$suffix" ] || [ -L "$path$suffix" ]; then
+            present=yes
+        fi
+        printf '\\t%s%s=%s' "$path" "$suffix" "$present" >> /{TRACE}
+    done
+done
+if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ]; then
+    selected=no
+    declared=no
+    while IFS= read -r line; do
+        case "$line" in
+            'Package: {package}') selected=yes ;;
+            'Package: '*) selected=no ;;
+            'Conffiles:') if [ "$selected" = yes ]; then declared=yes; fi ;;
+        esac
+    done < /var/lib/dpkg/status
+    printf '\\tdeclared=%s' "$declared" >> /{TRACE}
+fi
+printf '\\n' >> /{TRACE}
+if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ] && [ -f /conffile-recreate ]; then
+    /ln /administrator-configuration /etc/debz-native.conf || exit 24
+fi
+if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ] && [ -f /conffile-activate ]; then
+    /usr/bin/dpkg-trigger --no-await {CONFFILE_TRIGGER} || exit 25
+fi
+""".encode()
+        guard = f"if [ -f /{FAILURE} ]; then\n".encode()
+        result[kind] = source.replace(guard, observation + guard, 1)
+    return result
+
+
+def make_conffile_packages(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> dict[str, Path]:
+    result = {}
+    for version in ("1", "2"):
+        def prepare(source: Path, version: str = version) -> None:
+            m.write(source / CONFFILE_PATHS[1], f"extra configuration {version}\n".encode())
+            m.write(
+                source / "DEBIAN/conffiles",
+                "".join(f"/{path.as_posix()}\n" for path in CONFFILE_PATHS).encode(),
+            )
+
+        result[version] = m.make_package(
+            workspace, environment, architecture, version, "conffile",
+            package=CONFFILE_PACKAGE, scripts=conffile_scripts(CONFFILE_PACKAGE, version),
+            conffile_content=f"configuration {version}\n".encode(), prepare_payload=prepare,
+        )
+    return result
+
+
+def exercise_conffile_lifecycle(
+    executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    archives = make_conffile_packages(workspace / "conffile-lifecycle-packages", environment, architecture)
+    for removed in (False, True):
+        for failed in (False, True):
+            current = Scenario(
+                workspace, f"conffile-purge-removed-{removed}-failure-{failed}",
+                executable, architecture, environment,
+            )
+            current.seed(archives["1"])
+            if removed:
+                current.phase("remove", names=(CONFFILE_PACKAGE,))
+            if failed:
+                current.fail(f"{CONFFILE_PACKAGE}@1:postrm:purge")
+            current.phase("purge", names=(CONFFILE_PACKAGE,), failure=failed)
+            if failed:
+                for root in current.roots:
+                    assert all(not (root / path).exists() for path in CONFFILE_PATHS)
+                    assert (root / f"var/lib/dpkg/info/{CONFFILE_PACKAGE}.postrm").is_file()
+                current.fail()
+                current.phase("purge", names=(CONFFILE_PACKAGE,))
+            current.complete()
+
+    for failed in (False, True):
+        current = Scenario(workspace, f"conffile-purge-script-recreates-failure-{failed}", executable, architecture, environment)
+        current.seed(archives["1"])
+        for root in current.roots:
+            runtime.copy_program(root, Path("/bin/ln").resolve(), "/ln")
+            for path, content in (("administrator-configuration", b"administrator configuration\n"), ("conffile-recreate", b"")):
+                m.write(root / path, content)
+                os.utime(root / path, (m.EPOCH, m.EPOCH))
+        if failed:
+            current.fail(f"{CONFFILE_PACKAGE}@1:postrm:purge")
+        current.phase("purge", names=(CONFFILE_PACKAGE,), failure=failed)
+        for root in current.roots:
+            assert (root / CONFFILE_PATHS[0]).samefile(root / "administrator-configuration")
+        if failed:
+            current.fail()
+            for root in current.roots:
+                (root / "conffile-recreate").unlink()
+            current.phase("purge", names=(CONFFILE_PACKAGE,))
+        current.complete()
+
+    for policy in ("keep_existing", "use_package_version"):
+        for upgrade in (False, True):
+            for mutation in ("unchanged", "edited", "missing", "side-files"):
+                current = Scenario(
+                    workspace, f"conffile-configure-retry-{policy}-upgrade-{upgrade}-{mutation}",
+                    executable, architecture, environment,
+                )
+                version = "2" if upgrade else "1"
+                if upgrade:
+                    current.seed(archives["1"])
+                    for root in current.roots:
+                        for path in CONFFILE_PATHS:
+                            m.write(root / path, b"administrator configuration\n")
+                            os.utime(root / path, (m.EPOCH, m.EPOCH))
+                current.fail(f"{CONFFILE_PACKAGE}@{version}:postinst:configure")
+                current.phase(
+                    "upgrade" if upgrade else "install", [archives[version]],
+                    names=(CONFFILE_PACKAGE,), policy=policy, failure=True,
+                )
+                current.fail()
+                for root in current.roots:
+                    for path in CONFFILE_PATHS:
+                        if mutation == "missing":
+                            (root / path).unlink()
+                        elif mutation in ("edited", "side-files"):
+                            target = root / (Path(str(path) + ".dpkg-new") if mutation == "side-files" else path)
+                            m.write(target, b"administrator edit after failure\n")
+                            os.utime(target, (m.EPOCH, m.EPOCH))
+                current.phase("configure", [archives[version]], names=(CONFFILE_PACKAGE,), policy=policy)
+                current.complete()
+
+    if executable is None:
+        return
+    changed = m.make_package(
+        workspace / "conffile-drift-package", environment, architecture, "1", "conffile",
+        package=CONFFILE_PACKAGE, scripts=conffile_scripts(CONFFILE_PACKAGE, "1"),
+        conffile_content=b"different archive configuration\n",
+    )
+    for mode in ("unpacked-missing-stage", "unpacked-changed-stage", "configured-changed-archive"):
+        current = Scenario(workspace, f"conffile-refusal-{mode}", executable, architecture, environment)
+        if mode.startswith("unpacked"):
+            current.seed(archives["1"])
+            current.seed(archives["2"], configure=False)
+            path = current.candidate / (str(CONFFILE_PATHS[0]) + ".dpkg-new")
+            if mode.endswith("missing-stage"):
+                path.unlink()
+            else:
+                m.write(path, b"changed staged configuration\n")
+            expected = "staged_conffile_mismatch"
+        else:
+            current.fail(f"{CONFFILE_PACKAGE}@1:postinst:configure")
+            current.phase("install", [archives["1"]], names=(CONFFILE_PACKAGE,), failure=True)
+            current.fail()
+            expected = "configured_conffile_mismatch"
+        destination = current.directory / "refusal"
+        destination.mkdir()
+        before = m.snapshot(current.candidate)
+        report = native(
+            executable, current.candidate, [changed if mode.startswith("configured") else archives["2"]],
+            "configure", architecture, environment, destination,
+            packages=current.identities((CONFFILE_PACKAGE,)),
+        )
+        assert report["outcome"] == "refused" and report["detail"] == expected, report
+        assert not m.oracle.differences(before, m.snapshot(current.candidate))
+        print(f"conffile-refusal-{mode}: mismatched configuration refuses without mutation", flush=True)
+
+
 def exercise(
     executable: Path | None,
     workspace: Path,
     environment: dict[str, str],
     architecture: str,
 ) -> None:
+    exercise_conffile_lifecycle(executable, workspace, environment, architecture)
     archives = {
         version: m.make_package(
             workspace / "packages", environment, architecture, version,
@@ -504,15 +679,20 @@ def exercise(
     current.phase("purge", names=(METADATA_PACKAGE,))
     current.complete()
 
-    current = case("retained-metadata-configure-retry")
-    current.fail(f"{METADATA_PACKAGE}@1:postinst:configure")
-    current.phase("install", [data_metadata["1"]], names=(METADATA_PACKAGE,), failure=True)
-    current.fail()
-    current.phase("configure", [data_metadata["1"]], names=(METADATA_PACKAGE,))
-    current.complete()
-    for operation in ("remove", "purge"):
-        current = case(f"retained-metadata-{operation}-postrm-failure")
-        current.seed((data_metadata if operation == "purge" else metadata_archives)["1"])
+    for profile, selected in (("data", data_metadata), ("conffile", metadata_archives)):
+        current = case(f"retained-metadata-configure-retry-{profile}")
+        current.fail(f"{METADATA_PACKAGE}@1:postinst:configure")
+        current.phase("install", [selected["1"]], names=(METADATA_PACKAGE,), failure=True)
+        current.fail()
+        current.phase("configure", [selected["1"]], names=(METADATA_PACKAGE,))
+        current.complete()
+    for operation, profile, selected in (
+        ("remove", "conffile", metadata_archives),
+        ("purge", "data", data_metadata),
+        ("purge", "conffile", metadata_archives),
+    ):
+        current = case(f"retained-metadata-{operation}-postrm-failure-{profile}")
+        current.seed(selected["1"])
         current.fail(f"{METADATA_PACKAGE}@1:postrm:{operation}")
         current.phase(operation, names=(METADATA_PACKAGE,), failure=True)
         if operation == "purge":

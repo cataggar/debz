@@ -133,9 +133,9 @@ The compiler expands the authorized actions into dpkg-compatible transitions:
 - remove: `prerm remove`, `half-installed`, owned-file removal retaining
   conffiles, `postrm remove`, `config-files`; without residual conffiles or
   `postrm`, remove drops the status record instead;
-- purge: the remove sequence when files are still installed, then `postrm
-  purge`, conffile deletion, metadata removal, and removal of the status
-  record;
+- purge: the remove sequence when files are still installed, then conffile
+  deletion, `postrm purge`, conffile-record settlement, and final metadata,
+  eligible directory and status-record removal;
 - essential bootstrap materialization precedes all other lifecycle work, and
   each `Pre-Depends` barrier configures every pending package before the next
   unpack. A dependency cycle configures its whole group at one barrier.
@@ -161,6 +161,9 @@ Maintainer scripts are emitted only when the corresponding evidence proves the
 script exists, so the program never plans a call to a script that is not there.
 Ordinary conffile decisions precede `postinst` and follow the configure barrier;
 `remove-on-upgrade` and obsolete marking remain unpack-phase decisions.
+Purge conffile decisions precede its postrm, while final purge cleanup follows
+that script. The encoded step order is part of the existing program digest;
+no document version or input authority is replaced for recovery.
 Removal authorization binds either an absent final record or a residual
 `config-files` record; the compiler checks that choice against the installed
 conffile/script evidence rather than treating every removal as residual.

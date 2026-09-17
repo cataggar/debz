@@ -22,6 +22,14 @@ space-separated trigger-name argument. The name order is observable and is not
 arbitrarily sorted. File-trigger matching follows component boundaries and
 the package paths affected by unpack/removal.
 
+Removal and purge derive file events from the actual planned filesystem
+removals, not merely from ownership lists. Retained conffiles therefore do not
+activate removal triggers; later conffile deletion and eligible directory
+cleanup do. Events remain durably bound to their original package and program.
+Known lifecycle-script failure still processes or defers authorized pending
+work before publishing the failed outcome. It neither discards those events
+nor converts the original package failure into a successful receipt.
+
 Trigger-only processing must consume compiled authority without pretending to
 reinstall an archive. Deferred completion must retain the real pending and
 awaited state rather than claim that every package is installed. Dynamic
