@@ -48,6 +48,13 @@ pub const triggers_unincorp_path = "triggers/Unincorp";
 pub const info_format_name = "format";
 pub const supported_info_format = "1";
 
+pub fn reservedPayloadPath(path: []const u8) bool {
+    if (path.len == database_directory.len)
+        return std.ascii.eqlIgnoreCase(path, database_directory);
+    return path.len > database_directory.len and path[database_directory.len] == '/' and
+        std.ascii.eqlIgnoreCase(path[0..database_directory.len], database_directory);
+}
+
 pub const Limits = struct {
     max_status_bytes: usize = 64 * 1024 * 1024,
     max_packages: usize = 100_000,

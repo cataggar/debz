@@ -394,6 +394,8 @@ def assert_script_output(script: dict) -> None:
         source = lifecycle.conffile_scripts(script["package"], script["package_version"])
     elif script["package"] == lifecycle.STATO_PACKAGE:
         source = lifecycle.statoverride_scripts(script["package"], script["package_version"])
+    elif script["package"] == lifecycle.DIVERSION_PACKAGE:
+        source = lifecycle.diversion_scripts(script["package"], script["package_version"])
     else:
         source = lifecycle.scripts(script["package"], script["package_version"])
     if hashlib.sha256(source[script["kind"]]).hexdigest() != script["script_sha256"]:
@@ -1354,6 +1356,135 @@ def reference_helper_package(
         extra_files={triggers.HELPER.as_posix(): Path("/usr/bin/dpkg-trigger").read_bytes()},
         prepare_payload=lambda source: (source / triggers.HELPER).chmod(0o755),
     )
+
+
+def exercise_diversion_recovery(
+    executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str,
+) -> None:
+    package = lifecycle.DIVERSION_PACKAGE
+    source = f"{lifecycle.DIVERSION_BASE}/mode"
+    destination = source + ".distrib"
+    records = (
+        lifecycle.diversion_records(source, destination)
+        + lifecycle.diversion_records(lifecycle.DIVERSION_LITERAL, lifecycle.DIVERSION_LITERAL + ".distrib")
+        + lifecycle.diversion_records("etc/debz-native.conf", "etc/debz-native.conf.distrib")
+    )
+    for operation, boundary, mutation in (
+        ("install", "after_execution_intent", None),
+        ("install", "during_filesystem_publication", None),
+        ("install", "after_script_outcome", None),
+        ("install", "after_failure_outcome", None),
+        ("upgrade", "during_database_publication", None),
+        ("upgrade", "after_script_outcome", None),
+        ("remove", "after_script_outcome", None),
+        ("purge", "after_script_prepared", None),
+        ("install", "after_script_outcome", "preinst"),
+        ("install", "after_script_outcome", "created"),
+        ("install", "after_script_outcome", "helper"),
+        ("install", "after_script_prepared", "inplace"),
+        ("upgrade", "during_filesystem_publication", "mid-unpack"),
+        ("upgrade", "after_script_prepared", "mid-unpack"),
+        ("install", "after_trigger_outcome", "postinst"),
+        ("install", "after_execution_intent", "database-drift"),
+        ("install", "after_trigger_outcome", "destination-drift"),
+        ("purge", "after_script_prepared", "conffile-drift"),
+    ):
+        name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
+        current = Scenario(workspace, name, executable, helper, architecture, environment)
+        archives = lifecycle.make_diversion_packages(current.directory / "packages", environment, architecture)
+        for root in current.roots:
+            if mutation != "created":
+                lifecycle.seed_diversions(root, records)
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package="diversion-receiver",
+            triggers=f"interest-noawait /{lifecycle.DIVERSION_BASE}\n".encode(),
+            scripts=lifecycle.scripts("diversion-receiver", "1"),
+        )
+        target = reference_helper_package(
+            current.directory / "helper", environment, architecture, package="diversion-helper-target",
+        )
+        current.seed(receiver, target, *([archives["1"]] if operation != "install" else []))
+        if mutation in ("preinst", "created", "postinst"):
+            for root in current.roots:
+                lifecycle.seed_diversion_replacement(
+                    root, "postinst" if mutation == "postinst" else "preinst",
+                    records.replace(destination.encode(), (source + ".changed").encode()),
+                )
+        if mutation == "helper":
+            for root in current.roots:
+                lifecycle.seed_diversion_helper(root, source, source + ".changed")
+        if mutation == "inplace":
+            for root in current.roots:
+                m.write(root / "diversion-inplace-record", records.replace(b".distrib", b".changed"))
+                os.utime(root / "diversion-inplace-record", (m.EPOCH, m.EPOCH))
+        if mutation == "mid-unpack":
+            for root in current.roots:
+                lifecycle.seed_diversion_replacement(
+                    root, "postrm", records.replace(destination.encode(), (source + ".changed").encode()),
+                )
+        if operation == "purge":
+            current.phase("remove", packages=[package])
+        failure = boundary == "after_failure_outcome"
+        if failure:
+            for root in current.roots:
+                m.write(root / lifecycle.FAILURE, f"{package}@1:postinst:configure\n".encode())
+                os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
+        helper_path = current.candidate / triggers.HELPER
+        shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
+        helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
+        version = "2" if operation == "upgrade" else "1"
+        binding = current.crash(
+            operation, [archives[version]] if operation in ("install", "upgrade") else [], boundary,
+            failure=failure, trigger_execution=True, caller_owned=True,
+            isolated_helper=True, core_product=True, policy="keep_existing", packages=(package,),
+        )
+        for archive in archives.values():
+            if archive.exists():
+                archive.unlink()
+            assert not archive.exists()
+        if mutation == "database-drift":
+            lifecycle.seed_diversions(current.candidate, records.replace(b".distrib", b".changed"))
+        elif mutation == "destination-drift":
+            m.write(current.candidate / destination, b"external destination drift\n")
+        elif mutation == "conffile-drift":
+            m.write(current.candidate / "etc/debz-native.conf.distrib", b"external conffile drift\n")
+        before = triggers.snapshot(current.candidate)
+        report = current.recover(trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True)
+        assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
+        if mutation in ("inplace", "mid-unpack"):
+            assert report["outcome"] == "recovery_required", report
+            if mutation == "inplace":
+                assert not (current.candidate / destination).exists()
+            assert not (current.candidate / (source + ".changed")).exists()
+            blocked = triggers.snapshot(current.candidate)
+            repeated = current.recover(
+                trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
+                label=f"recover-blocked-{mutation}",
+            )
+            assert repeated["outcome"] in ("recovery_required", "refused"), repeated
+            assert not m.oracle.differences(blocked, triggers.snapshot(current.candidate))
+            print(f"{name}: unsupported updates and repeated recovery stay blocked", flush=True)
+            continue
+        if mutation and mutation.endswith("-drift"):
+            assert report["outcome"] in ("recovery_required", "refused"), report
+            assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+            print(f"{name}: diversion database and destination drift blocks mutation", flush=True)
+            continue
+        assert report["outcome"] == ("script_failed" if failure else "applied"), report
+        compare(current.expected, current.candidate)
+        proof_path, proof_bytes = provenance(current.candidate, report, binding)
+        completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+        completion_bytes = completion_path.read_bytes()
+        assert document(completion_path)["outcome"] == ("failed_after_mutation" if failure else "succeeded")
+        assert not (current.candidate / OPERATION).exists() and not (current.candidate / INTENT).exists()
+        before = triggers.snapshot(current.candidate)
+        repeated = current.recover(
+            trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True, label="recover-again",
+        )
+        assert repeated["outcome"] == "applied", repeated
+        assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
+        assert proof_path.read_bytes() == proof_bytes and completion_path.read_bytes() == completion_bytes
+        print(f"{name}: diversion lifecycle and archive-evicted core recovery passed", flush=True)
 
 
 def exercise_statoverride_recovery(
@@ -4064,10 +4195,12 @@ def main() -> int:
     parser.add_argument("--repository-execution-only", action="store_true")
     parser.add_argument("--repository-cli-only", action="store_true")
     parser.add_argument("--consumer-parity-only", action="store_true")
+    parser.add_argument("--diversions-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
     if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only,
-            arguments.repository_execution_only, arguments.repository_cli_only, arguments.consumer_parity_only)) > 1:
+            arguments.repository_execution_only, arguments.repository_cli_only, arguments.consumer_parity_only,
+            arguments.diversions_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -4100,9 +4233,12 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if arguments.consumer_parity_only:
+            if arguments.diversions_only:
+                exercise_diversion_recovery(executable, helper, workspace, environment, architecture)
+            elif arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
+                exercise_diversion_recovery(executable, helper, workspace, environment, architecture)
                 exercise_statoverride_recovery(executable, helper, workspace, environment, architecture)
                 exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                 exercise_metadata_recovery(executable, helper, workspace, environment, architecture)
@@ -4129,6 +4265,7 @@ def main() -> int:
                 if not arguments.core_only:
                     exercise_deadlines(executable, helper, workspace, environment, architecture)
                 if not arguments.deadline_only:
+                    exercise_diversion_recovery(executable, helper, workspace, environment, architecture)
                     exercise_statoverride_recovery(executable, helper, workspace, environment, architecture)
                     exercise_conffile_lifecycle_recovery(executable, helper, workspace, environment, architecture)
                     exercise_metadata_recovery(executable, helper, workspace, environment, architecture)

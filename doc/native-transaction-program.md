@@ -321,10 +321,12 @@ returns the typed unavailable result and never falls back.
 
 ## Not in v1
 
-Diversions, statoverride records, and alternatives are preserved by the
-database contract but are not yet expanded into program steps. Live filesystem
-inspection, package-database writes, and script execution remain outside this
-module by design.
+Diversion and statoverride records are preserved by the database contract.
+Their filesystem interpretation belongs to the
+[native unpack/lifecycle layer](native-unpack.md#diversion-routing), not separate
+program steps. Alternatives remain guarded. Live filesystem inspection,
+package-database writes, and script execution remain outside this module by
+design.
 
 Observed digests reach the compiler through the recorded conffile set, so a
 conffile the database does not record yet is decided as newly installed. dpkg

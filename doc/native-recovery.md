@@ -48,6 +48,21 @@ known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
 An initially empty override set also stays empty throughout recovery.
 
+Diversion inputs remain genuine database-generation blobs. Managed checkpoints
+also observe the live diversion database, including initial absence, and the
+actual filesystem destinations. Known atomic script updates may advance that
+state; later external byte, metadata or destination drift blocks continuation.
+Diverted conffiles retained on purge are observed despite having no removal
+intent. In-place diversion edits stop before further native work; recovery does
+not reinterpret those changed bytes as an atomic update or rerun the script.
+Changes during old postrm also block resumed mutation before journal replay;
+the guard applies even if interruption causes the callback to resume outside
+the original in-memory mutation frame. Exact cache and mid-unpack update
+parity remain tracked in [#192](https://github.com/cataggar/debz/issues/192).
+An older checkpoint without diversion observations can resume only while the
+diversion database is absent; a present unobserved database blocks continuation.
+No new recovery schema or substitute diversion database is introduced.
+
 ## Script and trigger continuation
 
 Each invocation has a durable identity distinct from every other invocation,

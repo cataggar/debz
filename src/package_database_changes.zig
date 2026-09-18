@@ -169,6 +169,8 @@ pub const PlanOptions = struct {
     limits: Limits = .{},
     /// Preservation requires the caller to implement filesystem override semantics.
     statoverride_policy: enum { refuse_affected, preserve } = .refuse_affected,
+    /// Preservation requires package-dependent logical/physical path handling.
+    diversion_policy: enum { refuse_affected, preserve } = .refuse_affected,
 };
 
 /// Data-level guard for published state transitions. Lifecycle ordering,
@@ -499,13 +501,17 @@ const Builder = struct {
 
     fn guardCoverage(self: *Builder, subject: database.PackageRecord) PlanError!void {
         try self.prepareCoverage();
-        if (self.diverted_packages.contains(subject.name)) {
+        if (self.options.diversion_policy == .refuse_affected and
+            self.diverted_packages.contains(subject.name))
+        {
             return self.fail(.unsupported_diversion, subject.name);
         }
         const paths = subject.paths orelse return;
         for (paths) |path| {
             const logical = database.logicalListPath(path);
-            if (self.diverted_paths.contains(logical)) {
+            if (self.options.diversion_policy == .refuse_affected and
+                self.diverted_paths.contains(logical))
+            {
                 return self.fail(.unsupported_diversion, subject.name);
             }
             if (self.options.statoverride_policy == .refuse_affected and
@@ -1830,6 +1836,35 @@ test "package_database_changes.test.statoverrides require explicit preservation 
     defer allowed.deinit();
     for (allowed.writes) |write|
         try testing.expect(!std.mem.eql(u8, write.path, database.statoverride_path));
+}
+
+test "package_database_changes.test.diversions require explicit preservation policy" {
+    for ([_][]const u8{ "toolz", "other", ":" }) |owner| {
+        var snapshot = database.test_fixtures.snapshot();
+        const records = try std.fmt.allocPrint(testing.allocator, "/usr/bin/toolz\n/usr/bin/toolz.distrib\n{s}\n", .{owner});
+        defer testing.allocator.free(records);
+        snapshot.diversions = database.regularFile(records);
+        var imported = switch (try database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer imported.deinit();
+        const changes = [_]Change{.{ .put_file_list = .{
+            .identity = .{ .name = "toolz", .architecture = "amd64" },
+            .paths = imported.model.find("toolz", "amd64").?.paths.?,
+        } }};
+        try expectPlanDiagnostic(try plan(testing.allocator, imported, &changes, .{}), .unsupported_diversion);
+        var allowed = switch (try plan(testing.allocator, imported, &changes, .{ .diversion_policy = .preserve })) {
+            .plan => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer allowed.deinit();
+        for (allowed.writes) |write|
+            try testing.expect(!std.mem.eql(u8, write.path, database.diversions_path));
+    }
 }
 
 test "package_database_changes.test.renaming info files of a package with retained files fails" {
