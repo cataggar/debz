@@ -7,6 +7,8 @@ const native_operation = @import("native_operation.zig");
 const native_program = @import("native_program.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
+const native_diversion = @import("native_diversion.zig");
+const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
 const native_trigger = @import("native_trigger.zig");
 const package_origin = @import("package_origin.zig");
@@ -823,10 +825,50 @@ fn verifyStateEvidence(
     try evidenceDigest(proof, .managed_state, managed.document.digest_sha256);
     try equalDigest(managed.document.intent_sha256, proof.execution_intent_sha256);
     if (managed.document.transient != null) return error.InvalidManagedState;
+    try verifyDiversionCacheEvidence(allocator, root, proof, managed.document);
     switch (expected_outcome) {
         .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
         .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
     }
+}
+
+fn verifyDiversionCacheEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    proof: native_provenance.Document,
+    managed: native_recovery.ManagedStateDocument,
+) !void {
+    const entries = if (managed.stable) |snapshot| snapshot.entries else &.{};
+    const cache_entry = for (entries) |entry| {
+        if (std.mem.eql(u8, entry.path, native_recovery.diversion_cache_path)) break entry;
+    } else null;
+    const cache_file = for (proof.evidence_files) |file| {
+        if (file.kind == .diversion_cache) break file;
+    } else null;
+    const expected = cache_entry orelse {
+        if (cache_file != null) return error.InvalidManagedState;
+        return;
+    };
+    const file = cache_file orelse return error.EvidenceMissing;
+    if (expected.kind != .regular) return error.InvalidManagedState;
+    try equalDigest(file.sha256, expected.content_sha256 orelse return error.InvalidManagedState);
+    const bytes = try readEvidence(allocator, root, proof, .diversion_cache, native_diversion_cache.maximum_document_bytes);
+    defer allocator.free(bytes);
+    var decoded = try native_diversion_cache.decode(allocator, bytes, proof.execution_intent_sha256);
+    defer decoded.deinit();
+    try evidenceDigest(proof, .diversion_cache, decoded.digest_sha256);
+    const database_entry = for (entries) |entry| {
+        if (std.mem.eql(u8, entry.path, native_diversion.database_path)) break entry;
+    } else return error.InvalidManagedState;
+    if (decoded.cache.observed) |observed| {
+        if (database_entry.kind != .regular or database_entry.device != observed.device or
+            database_entry.inode != observed.inode)
+            return error.InvalidManagedState;
+        try equalDigest(
+            database_entry.content_sha256 orelse return error.InvalidManagedState,
+            native_recovery.hexDigest(observed.sha256),
+        );
+    } else if (database_entry.kind != .absent) return error.InvalidManagedState;
 }
 
 fn verifyTerminalOutcome(
@@ -880,6 +922,21 @@ fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof
     }) |entry| {
         const file = try evidenceFile(proof, entry[0]);
         try verifyRemainingFile(allocator, root, entry[1], file.sha256, file.size);
+    }
+    const cache_file = for (proof.evidence_files) |file| {
+        if (file.kind == .diversion_cache) break file;
+    } else null;
+    if (try root.entryIfExists(try root_fs.Path.init(native_recovery.diversion_cache_path)) != null) {
+        const file = cache_file orelse return error.UnresolvedNativeEvidence;
+        try verifyRemainingFile(allocator, root, native_recovery.diversion_cache_path, file.sha256, file.size);
+        const bytes = (try native_recovery.readManagedFile(
+            allocator,
+            root,
+            proof.execution_intent_sha256,
+            native_recovery.diversion_cache_path,
+            native_diversion_cache.maximum_document_bytes,
+        )) orelse return error.InvalidManagedState;
+        allocator.free(bytes);
     }
     for (proof.evidence_files) |file| {
         if (file.kind != .script_outcome) continue;

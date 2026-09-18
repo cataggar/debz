@@ -271,7 +271,10 @@ def exercise_diversion_triggers(
     archives = lifecycle.make_diversion_packages(workspace / "diversion-packages", environment, architecture)
     source = f"{lifecycle.DIVERSION_BASE}/mode"
     destination = source + ".distrib"
-    for name, interest in (("source", source), ("destination", destination), ("updated", source + ".changed")):
+    for name, interest in (
+        ("source", source), ("destination", destination), ("updated", source + ".changed"),
+        ("cached-old", destination), ("cached-new", source + ".changed"),
+    ):
         current = Scenario(workspace, f"diversion-trigger-{name}", executable, helper, architecture, environment)
         watcher = "diversion-watcher"
         receiver = m.make_package(
@@ -284,7 +287,16 @@ def exercise_diversion_triggers(
         if name == "updated":
             for root in current.roots:
                 lifecycle.seed_diversion_replacement(root, "preinst", lifecycle.diversion_records(source, interest))
+        if name.startswith("cached-"):
+            for root in current.roots:
+                lifecycle.seed_diversion_inplace(
+                    root, "preinst", lifecycle.diversion_records(source, source + ".changed"),
+                )
         current.phase("install", [archives["1"]])
+        if name.startswith("cached-"):
+            for root in current.roots:
+                trace = (root / lifecycle.TRACE).read_text()
+                assert (f"{watcher}@1:postinst\t{watcher}\tpostinst\t{architecture}\t2\t9:triggered" in trace) == (name == "cached-old")
         current.phase("upgrade", [archives["2"]])
         current.phase("remove", packages=[lifecycle.DIVERSION_PACKAGE])
         current.phase("purge", packages=[lifecycle.DIVERSION_PACKAGE])

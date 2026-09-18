@@ -881,6 +881,31 @@ pub const FieldsResult = union(enum) {
     diagnostic: Diagnostic,
 };
 
+pub const DiversionsResult = union(enum) {
+    records: []const DiversionRecord,
+    diagnostic: Diagnostic,
+};
+
+/// Interpret a captured diversion file without constructing a database.
+/// Strings borrow `bytes`; derived slices are allocated from `arena`.
+pub fn interpretDiversions(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    bytes: []const u8,
+    limits: Limits,
+) std.mem.Allocator.Error!DiversionsResult {
+    var importer: Importer = .{
+        .arena = arena,
+        .scratch = scratch,
+        .options = .{ .limits = limits },
+    };
+    const records = importer.readDiversions(regularFile(bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Invalid => return .{ .diagnostic = importer.diagnostic.? },
+    };
+    return .{ .records = records };
+}
+
 /// Interpret one ordered status paragraph. `fields` and every string it
 /// references must outlive the returned record; only derived slices are
 /// allocated from `arena`. Import and change staging share this routine so a
@@ -1841,6 +1866,16 @@ const Importer = struct {
         };
     }
 
+    fn readDiversions(self: *Importer, entry: ?FileEntry) ImportError![]const DiversionRecord {
+        const bytes = (try self.consume(
+            .diversions,
+            diversions_path,
+            entry,
+            self.options.limits.max_database_file_bytes,
+        )) orelse return &.{};
+        return self.parseDiversions(bytes);
+    }
+
     fn parseDiversions(self: *Importer, bytes: []const u8) ImportError![]const DiversionRecord {
         var records: std.ArrayList(DiversionRecord) = .empty;
         defer records.deinit(self.scratch);
@@ -2238,15 +2273,7 @@ const Importer = struct {
             try self.parsePendingTriggers(bytes)
         else
             &.{};
-        const diversions: []const DiversionRecord = if (try self.consume(
-            .diversions,
-            diversions_path,
-            snapshot.diversions,
-            limits.max_database_file_bytes,
-        )) |bytes|
-            try self.parseDiversions(bytes)
-        else
-            &.{};
+        const diversions = try self.readDiversions(snapshot.diversions);
         const stat_overrides: []const StatOverrideRecord = if (try self.consume(
             .statoverride,
             statoverride_path,

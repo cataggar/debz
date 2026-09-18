@@ -239,6 +239,7 @@
             "intent",
             "progress",
             "managed_state",
+            "diversion_cache",
             "trigger_events",
             "script_outcome",
             "active_script",

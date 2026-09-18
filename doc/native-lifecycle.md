@@ -51,7 +51,9 @@ symlink, hard-link and exact-path behavior.
 
 Diversions use package-dependent logical/physical routing. Normal atomic
 `dpkg-divert` updates are observed at subsequent phase boundaries; in-place
-edits require recovery instead of being treated as a fresh diversion map.
+edits retain the invocation's cached routes rather than becoming a fresh map.
+Malformed live edits remain refused, and the next invocation reads current
+records independently.
 Updates during an in-progress unpack's old postrm remain explicitly blocked;
 their previous-route/backup semantics are tracked in
 [#192](https://github.com/cataggar/debz/issues/192).

@@ -31,6 +31,7 @@ pub const request_directory = workspace_directory ++ "/request";
 pub const script_outcome_prefix = "native-script-outcome-v1-";
 pub const trigger_events_path = "var/lib/debz/native-trigger-events-v1.json";
 pub const managed_state_path = "var/lib/debz/native-managed-state-v1.json";
+pub const diversion_cache_path = "var/lib/debz/native-diversion-cache-v1.json";
 pub const maximum_intent_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_progress_bytes: usize = 64 * 1024 * 1024;
 pub const maximum_records: usize = 200_000;
@@ -966,6 +967,25 @@ fn managedEntryEqual(left: ManagedEntry, right: ManagedEntry) bool {
     return left.directory_entries == right.directory_entries;
 }
 
+fn managedRegularEntry(path: []const u8, observation: root_fs.RegularFileObservation) ManagedEntry {
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observation.bytes, &digest, .{});
+    return .{
+        .path = path,
+        .kind = .regular,
+        .mode = observation.entry.mode,
+        .uid = observation.entry.uid,
+        .gid = observation.entry.gid,
+        .device = observation.entry.device,
+        .inode = observation.entry.inode,
+        .link_count = observation.entry.link_count,
+        .modified_nanoseconds = observation.entry.modified_nanoseconds,
+        .change_nanoseconds = observation.change_nanoseconds,
+        .size = observation.entry.size,
+        .content_sha256 = hexDigest(digest),
+    };
+}
+
 fn observeManagedEntry(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -1015,21 +1035,7 @@ fn observeManagedEntry(
                 maximum_managed_file_bytes,
             );
             defer allocator.free(observation.bytes);
-            var digest: [32]u8 = undefined;
-            Sha256.hash(observation.bytes, &digest, .{});
-            var result = base;
-            result.mode = observation.entry.mode;
-            result.uid = observation.entry.uid;
-            result.gid = observation.entry.gid;
-            result.device = observation.entry.device;
-            result.inode = observation.entry.inode;
-            result.link_count = observation.entry.link_count;
-            result.modified_nanoseconds =
-                observation.entry.modified_nanoseconds;
-            result.change_nanoseconds = observation.change_nanoseconds;
-            result.size = observation.entry.size;
-            result.content_sha256 = hexDigest(digest);
-            break :block result;
+            break :block managedRegularEntry(path_text, observation);
         },
         .symlink => block: {
             var pinned = try root.pinSymbolicLink(path);
@@ -1454,6 +1460,40 @@ pub fn validateStableManagedState(
     }
 }
 
+/// A null result means the checkpoint does not authorize this path, not that
+/// the live path is absent.
+pub fn readManagedFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    path: []const u8,
+    maximum_bytes: usize,
+) !?[]u8 {
+    if (maximum_bytes > maximum_managed_file_bytes)
+        return error.ManagedStateLimit;
+    var current = try readManagedState(allocator, root);
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256))
+        return error.InvalidManagedState;
+    const snapshot = current.document.transient orelse current.document.stable orelse return null;
+    for (snapshot.entries) |expected| {
+        if (!std.mem.eql(u8, expected.path, path)) continue;
+        if (expected.kind != .regular) return error.InvalidManagedState;
+        var pinned = root.pinRegularFile(try root_fs.Path.initPackage(path)) catch |err| switch (err) {
+            error.FileNotFound => return error.ManagedStateChanged,
+            else => return err,
+        };
+        defer pinned.close();
+        const observation = try pinned.observeStableAlloc(allocator, maximum_bytes);
+        errdefer allocator.free(observation.bytes);
+        if (!observation.entry.modeled) return error.UnmodeledManagedState;
+        if (!managedEntryEqual(expected, managedRegularEntry(path, observation)))
+            return error.ManagedStateChanged;
+        return observation.bytes;
+    }
+    return null;
+}
+
 pub fn managedCheckpointMatchesAction(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -1831,7 +1871,18 @@ pub fn cleanup(
     root: root_fs.Root,
     intent: Intent,
 ) !void {
-    _ = allocator;
+    const cache_path = try root_fs.Path.init(diversion_cache_path);
+    if (try root.entryIfExists(cache_path) != null) {
+        const bytes = (try readManagedFile(
+            allocator,
+            root,
+            intent.digest_sha256,
+            diversion_cache_path,
+            maximum_managed_state_bytes,
+        )) orelse return error.InvalidManagedState;
+        allocator.free(bytes);
+        try root.removeFile(cache_path);
+    }
     for (intent.blobs) |blob| {
         root.removeFile(try root_fs.Path.init(blob.storage_path)) catch |err|
             switch (err) {

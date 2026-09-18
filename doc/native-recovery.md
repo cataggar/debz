@@ -50,18 +50,32 @@ An initially empty override set also stays empty throughout recovery.
 
 Diversion inputs remain genuine database-generation blobs. Managed checkpoints
 also observe the live diversion database, including initial absence, and the
-actual filesystem destinations. Known atomic script updates may advance that
+actual filesystem destinations. Known script updates may advance observed
 state; later external byte, metadata or destination drift blocks continuation.
 Diverted conffiles retained on purge are observed despite having no removal
-intent. In-place diversion edits stop before further native work; recovery does
-not reinterpret those changed bytes as an atomic update or rerun the script.
-Changes during old postrm also block resumed mutation before journal replay;
+intent.
+
+`native-diversion-cache-v1.json` binds the invocation's genuinely loaded bytes
+and file identity separately from the latest observed live identity and digest.
+Its canonical base64 payload preserves exact input bytes, not a reconstructed
+database. The private file is itself a managed observation and a retained
+`diversion_cache` evidence member, bound to the original execution intent.
+Recovery restores cached routes while pinning the matching current file;
+valid in-place edits do not silently become atomic reloads. Cache byte, mode,
+identity and deletion drift blocks continuation before mutation-journal replay.
+Malformed live input remains refused. Known script outcomes are not rerun.
+
+Changes during old postrm still block resumed mutation before journal replay;
 the guard applies even if interruption causes the callback to resume outside
-the original in-memory mutation frame. Exact cache and mid-unpack update
-parity remain tracked in [#192](https://github.com/cataggar/debz/issues/192).
+the original in-memory mutation frame, or an identical atomic replacement would
+activate previously ignored in-place edits. Mid-unpack update parity remains
+tracked in [#192](https://github.com/cataggar/debz/issues/192).
+Older executions without cache evidence retain their atomic-update guards;
+they never reconstruct an effective cache from changed live bytes.
 An older checkpoint without diversion observations can resume only while the
 diversion database is absent; a present unobserved database blocks continuation.
-No new recovery schema or substitute diversion database is introduced.
+Existing intent, progress and managed-state schemas are unchanged. The new
+cache evidence does not substitute or rewrite the live diversion database.
 
 ## Script and trigger continuation
 
