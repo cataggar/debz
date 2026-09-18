@@ -264,6 +264,62 @@ class Scenario:
         print(f"{self.directory.name}: {label} passed", flush=True)
 
 
+def exercise_diversion_triggers(
+    executable: Path | None, helper: Path | None, workspace: Path,
+    environment: dict[str, str], architecture: str,
+) -> None:
+    archives = lifecycle.make_diversion_packages(workspace / "diversion-packages", environment, architecture)
+    source = f"{lifecycle.DIVERSION_BASE}/mode"
+    destination = source + ".distrib"
+    for name, interest in (("source", source), ("destination", destination), ("updated", source + ".changed")):
+        current = Scenario(workspace, f"diversion-trigger-{name}", executable, helper, architecture, environment)
+        watcher = "diversion-watcher"
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package=watcher,
+            scripts=lifecycle.scripts(watcher, "1"), triggers=f"interest-noawait /{interest}\n".encode(),
+        )
+        for root in current.roots:
+            lifecycle.seed_diversions(root, lifecycle.diversion_records(source, destination))
+        current.seed(receiver)
+        if name == "updated":
+            for root in current.roots:
+                lifecycle.seed_diversion_replacement(root, "preinst", lifecycle.diversion_records(source, interest))
+        current.phase("install", [archives["1"]])
+        current.phase("upgrade", [archives["2"]])
+        current.phase("remove", packages=[lifecycle.DIVERSION_PACKAGE])
+        current.phase("purge", packages=[lifecycle.DIVERSION_PACKAGE])
+        for root in current.roots:
+            trace = (root / lifecycle.TRACE).read_text()
+            assert (f"{watcher}@1:postinst\t{watcher}\tpostinst\t{architecture}\t2\t9:triggered" in trace) == (name != "source")
+        current.complete()
+
+    for spelling in ("bin", "usr/bin"):
+        current = Scenario(workspace, f"diversion-trigger-alias-{spelling.replace('/', '-')}", executable, helper, architecture, environment)
+        source = "usr/bin/diversion-mode"
+        destination = "bin/diversion-mode.distrib"
+        archive = m.make_package(
+            current.directory / "package", environment, architecture, "1", package=lifecycle.DIVERSION_PACKAGE,
+            scripts=lifecycle.diversion_scripts(lifecycle.DIVERSION_PACKAGE, "1"),
+            extra_files={source: b"aliased diversion\n"},
+        )
+        receiver = m.make_package(
+            current.directory / "receiver", environment, architecture, "1", package="diversion-watcher",
+            scripts=lifecycle.scripts("diversion-watcher", "1"),
+            triggers=f"interest-noawait /{spelling}/diversion-mode.distrib\n".encode(),
+        )
+        for root in current.roots:
+            (root / "bin/sh").rename(root / "usr/bin/sh")
+            (root / "bin").rmdir()
+            (root / "bin").symlink_to("usr/bin")
+            os.utime(root / "bin", (m.EPOCH, m.EPOCH), follow_symlinks=False)
+            lifecycle.seed_diversions(root, lifecycle.diversion_records(source, destination))
+        current.seed(receiver)
+        current.phase("install", [archive])
+        current.phase("remove", packages=[lifecycle.DIVERSION_PACKAGE])
+        current.phase("purge", packages=[lifecycle.DIVERSION_PACKAGE])
+        current.complete()
+
+
 def exercise(
     executable: Path | None,
     helper: Path | None,
@@ -271,6 +327,7 @@ def exercise(
     environment: dict[str, str],
     architecture: str,
 ) -> None:
+    exercise_diversion_triggers(executable, helper, workspace, environment, architecture)
     def package(
         label: str, name: str, declarations: bytes,
         *, version: str = "1", postinst: bool = True, **script_options,
@@ -599,6 +656,7 @@ def main() -> int:
     )
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--reference-dpkg", type=Path)
+    parser.add_argument("--diversions-only", action="store_true")
     arguments = parser.parse_args()
     if arguments.oracle_only == bool(arguments.native_test):
         parser.error("provide a native test executable or --oracle-only, not both")
@@ -635,7 +693,10 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            exercise(executable, helper, workspace, environment, architecture)
+            if arguments.diversions_only:
+                exercise_diversion_triggers(executable, helper, workspace, environment, architecture)
+            else:
+                exercise(executable, helper, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during trigger acceptance")

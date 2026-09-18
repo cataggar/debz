@@ -41,6 +41,7 @@ const native_operation = @import("native_operation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_statoverride = @import("native_statoverride.zig");
+const native_diversion = @import("native_diversion.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -101,6 +102,7 @@ const ExecutionState = struct {
     phase_steps: ?[]const root_mutation.Step = null,
     bounds: ?*RuntimeBounds = null,
     stat_overrides: ?native_statoverride.Resolved = null,
+    diversion_observation: ?native_diversion.Observation = null,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -171,6 +173,7 @@ fn checkpointManagedPaths(
     observed_paths: []const []const u8,
     transient: bool,
 ) !native_recovery.Digest {
+    try validateManagedDiversionUpdate(allocator, runtime, transient);
     const paths = try allocator.alloc([]const u8, steps.len + observed_paths.len);
     defer allocator.free(paths);
     for (steps, 0..) |step, index| paths[index] = step.path;
@@ -183,6 +186,37 @@ fn checkpointManagedPaths(
         paths,
         transient,
     );
+}
+
+fn validateManagedDiversionUpdate(
+    allocator: std.mem.Allocator,
+    runtime: *const native_recovery.Runtime,
+    in_progress: bool,
+) !void {
+    var managed = try native_recovery.readManagedState(allocator, runtime.root);
+    defer managed.deinit();
+    if (!std.mem.eql(u8, &managed.document.intent_sha256, &runtime.intent_sha256))
+        return error.InvalidManagedState;
+    if (managed.document.transient orelse managed.document.stable) |previous| {
+        for (previous.entries) |entry| {
+            if (!std.mem.eql(u8, entry.path, native_diversion.database_path)) continue;
+            const before: ?native_diversion.Observation = switch (entry.kind) {
+                .absent => null,
+                .regular => .{
+                    .device = entry.device,
+                    .inode = entry.inode,
+                    .sha256 = parseHex(32, &(entry.content_sha256 orelse return error.InvalidManagedState)) orelse
+                        return error.InvalidManagedState,
+                },
+                else => return error.InvalidManagedState,
+            };
+            try native_diversion.validateUpdate(before, try native_diversion.observe(allocator, runtime.root), in_progress);
+            return;
+        }
+    }
+    // Older checkpoints cannot authorize an unobserved diversion database.
+    if (try native_diversion.observe(allocator, runtime.root) != null)
+        return error.InvalidManagedState;
 }
 
 const CombinedMutationHooks = struct {
@@ -276,6 +310,7 @@ pub const Code = enum {
     database_generation_drift,
     updates_pending,
     invalid_stat_override,
+    invalid_diversion,
     program_incomplete,
     artifact_missing,
     artifact_duplicate,
@@ -750,7 +785,7 @@ fn containsOwner(list: []const u32, value: u32) bool {
     return false;
 }
 
-pub const OwnershipError = error{ OutOfMemory, AliasCollision };
+pub const OwnershipError = error{ OutOfMemory, AliasCollision, InvalidDiversion };
 
 /// Builds the ownership index of one imported generation.
 ///
@@ -769,6 +804,8 @@ pub fn indexOwnership(
     model: package_database.Model,
     aliases: AliasEvidence,
 ) OwnershipError!Ownership {
+    var diversions = try native_diversion.Index.init(allocator, model.diversions);
+    defer diversions.deinit(allocator);
     var owners = try allocator.alloc(Owner, model.packages.len);
     errdefer allocator.free(owners);
     var total: usize = 0;
@@ -793,10 +830,12 @@ pub fn indexOwnership(
         seen.clearRetainingCapacity();
         for (paths) |listed| {
             const relative = relativeListPath(listed) orelse continue;
+            if (diversions.targets.contains(relative)) return error.InvalidDiversion;
+            const physical = diversions.physical(relative, record.name);
             const canonical = try canonicalOwnedPath(
                 allocator,
                 aliases,
-                relative,
+                physical,
                 &rewritten,
             );
             if ((try seen.getOrPut(allocator, canonical)).found_existing)
@@ -805,7 +844,7 @@ pub fn indexOwnership(
                 .path = canonical,
                 .listed = listed,
                 .owner = @intCast(index),
-                .aliased = canonical.ptr != relative.ptr,
+                .aliased = canonical.ptr != physical.ptr,
             });
         }
     }
@@ -1455,6 +1494,7 @@ const Builder = struct {
     ownership: Ownership,
     aliases: AliasEvidence,
     stat_overrides: native_statoverride.Resolved = .{},
+    diversions: native_diversion.Index = .{},
     models: std.ArrayList(*archive_application.Model) = .empty,
     deferred: std.ArrayList(DeferredItem) = .empty,
     work: std.ArrayList(PackageWork) = .empty,
@@ -1674,6 +1714,11 @@ fn plan(allocator: std.mem.Allocator, request: Request) std.mem.Allocator.Error!
             .code = .duplicate_archive_path,
             .path = package_database.database_directory,
         }),
+        error.InvalidDiversion => return refusalResult(arena, allocator, .{
+            .surface = .database,
+            .code = .invalid_diversion,
+            .path = native_diversion.database_path,
+        }),
     };
     defer ownership.deinit();
 
@@ -1856,6 +1901,17 @@ fn hashText(hash: *Sha256, text: []const u8) void {
 
 fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
     try validateProgram(builder);
+    builder.diversions = native_diversion.Index.init(
+        builder.arena,
+        builder.database.model.diversions,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidDiversion => return builder.fail(.{
+            .surface = .database,
+            .code = .invalid_diversion,
+            .path = native_diversion.database_path,
+        }),
+    };
     builder.stat_overrides = builder.request.stat_overrides orelse (native_statoverride.read(
         builder.arena,
         builder.request.root,
@@ -2514,11 +2570,6 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .detail = queued.trigger,
             });
         };
-    for (model.diversions) |record| try builder.deferFeature(.{
-        .feature = .diversion,
-        .package = record.package orelse "",
-        .detail = record.from,
-    });
     for (model.opaque_info) |entry| {
         if (std.mem.endsWith(u8, entry.name, ".alternatives"))
             try builder.deferFeature(.{ .feature = .alternatives, .detail = entry.name })
@@ -2618,7 +2669,7 @@ fn indexInstalledConffiles(builder: *Builder) PlanError!void {
             var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             const canonical = canonicalAliasPath(
                 builder.aliases,
-                relative,
+                builder.diversions.physical(relative, record.name),
                 &buffer,
             ) orelse return builder.fail(.{
                 .surface = .database,
@@ -2781,6 +2832,26 @@ fn normalizePath(builder: *Builder, archive_path: []const u8) PlanError!Claim {
     };
 }
 
+fn normalizePackagePath(
+    builder: *Builder,
+    item: *const PackageWork,
+    archive_path: []const u8,
+) PlanError!Claim {
+    if (builder.diversions.targets.contains(archive_path))
+        return builder.fail(.{
+            .surface = .database,
+            .code = .invalid_diversion,
+            .path = archive_path,
+            .package = item.identity.name,
+        });
+    var claim = try normalizePath(
+        builder,
+        builder.diversions.physical(archive_path, item.identity.name),
+    );
+    claim.archive_path = archive_path;
+    return claim;
+}
+
 fn absoluteSpelling(builder: *Builder, path: []const u8) PlanError![]const u8 {
     return std.fmt.allocPrint(builder.arena, "/{s}", .{path});
 }
@@ -2814,7 +2885,7 @@ fn findRecordedConffile(
         var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const normalized = canonicalAliasPath(
             builder.aliases,
-            relative,
+            builder.diversions.physical(relative, record.name),
             &buffer,
         ) orelse continue;
         if (std.mem.eql(u8, normalized, canonical)) return conffile;
@@ -2923,9 +2994,9 @@ fn prepareUnpackConffiles(
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(builder.allocator);
     for (item.model.conffiles) |conffile| {
-        const normalized = try normalizePath(builder, conffile.path);
+        const normalized = try normalizePackagePath(builder, item, conffile.path);
         const live = normalized.path;
-        const absolute = try absoluteSpelling(builder, live);
+        const absolute = try absoluteSpelling(builder, conffile.path);
         try seen.put(builder.allocator, live, {});
         const recorded = if (item.prior) |prior|
             findRecordedConffile(builder, prior, live)
@@ -3065,7 +3136,7 @@ fn prepareUnpackConffiles(
             var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             const live = canonicalAliasPath(
                 builder.aliases,
-                relative,
+                builder.diversions.physical(relative, prior.name),
                 &buffer,
             ) orelse continue;
             if (seen.contains(live)) continue;
@@ -3110,11 +3181,11 @@ fn preparePackageClaims(
 
     try prepareEffectiveFiles(builder, item);
     const claims = try builder.arena.alloc(Claim, model.files.len);
-    var owned_paths: std.StringHashMapUnmanaged(void) = .empty;
+    var owned_paths: std.StringHashMapUnmanaged(Kind) = .empty;
     defer owned_paths.deinit(builder.allocator);
 
     for (model.files, 0..) |file, index| {
-        var claim = try normalizePath(builder, file.path);
+        var claim = try normalizePackagePath(builder, item, file.path);
         if (builder.request.conffiles == .unpack and file.conffile) {
             const conffile = plannedConffile(item, claim.path) orelse
                 return builder.fail(.{
@@ -3147,7 +3218,7 @@ fn preparePackageClaims(
                 .package = item.identity.name,
             });
         }
-        if (reservedDatabasePath(claim.path)) return builder.fail(.{
+        if (package_database.reservedPayloadPath(claim.path)) return builder.fail(.{
             .surface = .archive,
             .code = .reserved_path,
             .path = claim.path,
@@ -3155,35 +3226,16 @@ fn preparePackageClaims(
         });
         claims[index] = claim;
 
-        // Aliasing is the only way one archive can name a path twice, and a
-        // second name for the same non-directory entry is unresolvable.
         const found = try owned_paths.getOrPut(builder.allocator, claim.path);
         if (found.found_existing) {
-            if (claim.kind != .directory) return builder.fail(.{
+            return builder.fail(.{
                 .surface = .alias,
-                .code = .duplicate_archive_path,
+                .code = if (found.value_ptr.* == claim.kind) .duplicate_archive_path else .alias_kind_conflict,
                 .path = claim.path,
                 .package = item.identity.name,
             });
         }
-    }
-
-    // Directory duplicates left by aliasing collapse to one claim so the same
-    // path is never owned twice by the same package.
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(builder.allocator);
-    var kinds: std.StringHashMapUnmanaged(Kind) = .empty;
-    defer kinds.deinit(builder.allocator);
-    for (claims) |claim| {
-        const found = try kinds.getOrPut(builder.allocator, claim.path);
-        if (found.found_existing) {
-            if (found.value_ptr.* != claim.kind) return builder.fail(.{
-                .surface = .alias,
-                .code = .alias_kind_conflict,
-                .path = claim.path,
-                .package = item.identity.name,
-            });
-        } else found.value_ptr.* = claim.kind;
+        found.value_ptr.* = claim.kind;
     }
 
     item.claims = claims;
@@ -3195,11 +3247,7 @@ fn planPackageClaims(
     item: *PackageWork,
     package: u32,
 ) PlanError!void {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(builder.allocator);
     for (item.claims) |claim| {
-        const duplicate = try seen.getOrPut(builder.allocator, claim.path);
-        if (duplicate.found_existing) continue;
         try planClaim(builder, item, package, claim, item.model);
     }
 }
@@ -3430,7 +3478,7 @@ fn describeTransactionClaim(
             result.gid = effective.gid;
             result.modified_nanoseconds = effective.modified_nanoseconds;
             if (effective.group_size > 1) {
-                const group = try normalizePath(builder, effective.source_path);
+                const group = try normalizePackagePath(builder, item, effective.source_path);
                 result.hardlink_group = group.path;
                 result.hardlink_group_size = effective.group_size;
                 result.hardlink_group_digest =
@@ -3444,7 +3492,7 @@ fn describeTransactionClaim(
                 if (claim.kind == .hardlink) result.link_source = group.path;
             }
             if (claim.kind == .hardlink and result.link_source == null) {
-                const source = try normalizePath(builder, effective.source_path);
+                const source = try normalizePackagePath(builder, item, effective.source_path);
                 result.link_source = source.path;
             }
         },
@@ -3509,14 +3557,6 @@ fn transactionClaimsCompatible(
     return left.mode == right.mode and left.uid == right.uid and
         left.gid == right.gid and
         left.modified_nanoseconds == right.modified_nanoseconds;
-}
-
-fn reservedDatabasePath(path: []const u8) bool {
-    const reserved = package_database.database_directory;
-    if (path.len == reserved.len)
-        return std.ascii.eqlIgnoreCase(path, reserved);
-    return path.len > reserved.len and path[reserved.len] == '/' and
-        std.ascii.eqlIgnoreCase(path[0..reserved.len], reserved);
 }
 
 fn planClaim(
@@ -3629,7 +3669,7 @@ fn planClaim(
                 .path = claim.path,
                 .package = item.identity.name,
             });
-            const source = try normalizePath(builder, effective.source_path);
+            const source = try normalizePackagePath(builder, item, effective.source_path);
             planned.link_source = source.path;
             planned.sha256 = effective.sha256;
             planned.md5 = effective.md5;
@@ -5071,7 +5111,7 @@ fn holderChecksum(
     var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
     const canonical = canonicalAliasPath(
         builder.aliases,
-        listed,
+        builder.diversions.physical(listed, holder.identity.name),
         &buffer,
     ) orelse return null;
     if (!std.mem.eql(u8, canonical, path)) return null;
@@ -5309,6 +5349,14 @@ fn synthesizeAncestors(builder: *Builder, item: *PackageWork, package: u32) Plan
                     .package = item.identity.name,
                 });
             }
+            if (builder.diversions.redirected(planned.archive_path, item.identity.name) != null or
+                builder.diversions.redirected(ancestor.text, item.identity.name) != null)
+                return builder.fail(.{
+                    .surface = .transition,
+                    .code = .prefix_transition_unsafe,
+                    .path = ancestor.text,
+                    .package = item.identity.name,
+                });
             try seen.put(builder.allocator, ancestor.text, {});
             const diagnostic: Diagnostic = .{
                 .surface = .transition,
@@ -6000,28 +6048,10 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
             item.model.files[index]
         else
             null;
-        const conffile = if (archive_file) |file|
-            file.conffile and builder.request.conffiles == .unpack
-        else
-            false;
-        const logical_path = if (conffile)
-            (plannedConffile(item, (try normalizePath(
-                builder,
-                archive_file.?.path,
-            )).path) orelse return builder.fail(.{
-                .surface = .publication,
-                .code = .program_incomplete,
-                .path = planned.path,
-                .package = item.identity.name,
-            })).path
-        else
-            planned.path;
+        const logical_path = if (archive_file) |file| file.path else planned.path;
         try item.list_paths.append(
             builder.allocator,
-            if (conffile)
-                try absoluteSpelling(builder, logical_path)
-            else
-                planned.absolute,
+            try absoluteSpelling(builder, logical_path),
         );
         switch (planned.kind) {
             .regular, .hardlink => try item.md5sums.append(builder.allocator, .{
@@ -6035,7 +6065,10 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
         if (conffile.action != .mark_obsolete) continue;
         try item.list_paths.append(
             builder.allocator,
-            try absoluteSpelling(builder, conffile.path),
+            if (conffile.recorded) |recorded|
+                recorded.path
+            else
+                try absoluteSpelling(builder, conffile.path),
         );
     }
     const first_payload_path: usize = if (item.model.root != null) 1 else 0;
@@ -6711,7 +6744,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             const canonical = canonicalAliasPath(
                 builder.aliases,
-                relative,
+                builder.diversions.physical(relative, record.name),
                 &buffer,
             ) orelse return builder.fail(.{
                 .surface = .lowering,
@@ -6802,6 +6835,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             .database = builder.limits.database,
             .limits = builder.limits.changes,
             .statoverride_policy = .preserve,
+            .diversion_policy = .preserve,
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -8376,12 +8410,11 @@ fn phasePreflight(
         (database.model.triggers.interests.len != 0 or
             database.model.triggers.pending.len != 0))
         return .{ .outcome = .handoff, .detail = "trigger" };
-    if (database.model.diversions.len != 0)
-        return .{ .outcome = .handoff, .detail = "diversion" };
     if (database.model.opaque_info.len != 0)
         return .{ .outcome = .handoff, .detail = "package_metadata" };
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    _ = try native_diversion.Index.init(arena.allocator(), database.model.diversions);
     if (request.planning.stat_overrides == null)
         _ = try native_statoverride.read(arena.allocator(), request.root, database.model.stat_overrides);
     return null;
@@ -8894,16 +8927,10 @@ fn rootMd5ForConffile(
 
 fn requireAbsentConffileArtifact(
     root: root_fs.Root,
-    model: package_database.Model,
+    ownership: Ownership,
     path: []const u8,
 ) !void {
-    for (model.packages) |record| {
-        for (record.paths orelse &.{}) |listed| {
-            const relative = relativeListPath(listed) orelse continue;
-            if (std.mem.eql(u8, relative, path))
-                return error.ConffileArtifactCollision;
-        }
-    }
+    if (ownership.owned(path)) return error.ConffileArtifactCollision;
     if (try root.entryIfExists(try root_fs.Path.initPackage(path)) != null)
         return error.ConffileArtifactCollision;
 }
@@ -9097,6 +9124,11 @@ fn materializeConfigure(
     const stat_overrides = request.planning.stat_overrides orelse
         try native_statoverride.read(owned, request.root, database.model.stat_overrides);
     try observed_paths.appendSlice(allocator, stat_overrides.observed_paths);
+    const diversions = try native_diversion.Index.init(owned, database.model.diversions);
+    const aliases = try detectAliases(allocator, request.root);
+    defer deinitAliasEvidence(allocator, aliases);
+    var ownership = try indexOwnership(allocator, database.model, aliases);
+    defer ownership.deinit();
 
     for (bound.items) |*archive| {
         if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
@@ -9129,6 +9161,12 @@ fn materializeConfigure(
         defer seen.deinit(allocator);
 
         for (archive.model.conffiles) |conffile| {
+            var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const physical = try owned.dupe(u8, canonicalAliasPath(
+                aliases,
+                diversions.physical(conffile.path, record.name),
+                &path_buffer,
+            ) orelse return error.UnsupportedConffile);
             const absolute = try std.fmt.allocPrint(
                 owned,
                 "/{s}",
@@ -9161,7 +9199,7 @@ fn materializeConfigure(
             const staged = try std.fmt.allocPrint(
                 owned,
                 "{s}.dpkg-new",
-                .{conffile.path},
+                .{physical},
             );
             const staged_md5 = try rootMd5ForConffile(
                 allocator,
@@ -9186,7 +9224,7 @@ fn materializeConfigure(
                 .md5 => live_digest = try rootMd5ForConffile(
                     allocator,
                     request.root,
-                    conffile.path,
+                    physical,
                     request.planning.limits.max_compare_bytes,
                     &compared_bytes,
                     request.planning.limits.max_compared_bytes,
@@ -9219,7 +9257,7 @@ fn materializeConfigure(
                 .install_new, .restore_missing => try appendArchiveConffileIntent(
                     &intents,
                     allocator,
-                    conffile.path,
+                    physical,
                     archive,
                     file,
                     .require_absent,
@@ -9229,7 +9267,7 @@ fn materializeConfigure(
                 .replace_unmodified => try appendArchiveConffileIntent(
                     &intents,
                     allocator,
-                    conffile.path,
+                    physical,
                     archive,
                     file,
                     .replace,
@@ -9240,17 +9278,17 @@ fn materializeConfigure(
                     const dist = try std.fmt.allocPrint(
                         owned,
                         "{s}.dpkg-dist",
-                        .{conffile.path},
+                        .{physical},
                     );
                     if (archive.model.findFile(dist) != null)
                         return error.ConffileArtifactCollision;
                     try requireAbsentConffileArtifact(
                         request.root,
-                        database.model,
+                        ownership,
                         dist,
                     );
                     const live_metadata = request.root.entryIfExists(
-                        try root_fs.Path.initPackage(conffile.path),
+                        try root_fs.Path.initPackage(physical),
                     ) catch return error.UnsupportedConffile;
                     try appendArchiveConffileIntent(
                         &intents,
@@ -9267,23 +9305,23 @@ fn materializeConfigure(
                     const old_path = try std.fmt.allocPrint(
                         owned,
                         "{s}.dpkg-old",
-                        .{conffile.path},
+                        .{physical},
                     );
                     if (archive.model.findFile(old_path) != null)
                         return error.ConffileArtifactCollision;
                     try requireAbsentConffileArtifact(
                         request.root,
-                        database.model,
+                        ownership,
                         old_path,
                     );
                     const source_sha256 = (live_digest orelse
                         return error.UnsupportedConffile).sha256;
                     const current = try request.root.entry(
-                        try root_fs.Path.initPackage(conffile.path),
+                        try root_fs.Path.initPackage(physical),
                     );
                     try intents.append(allocator, .{ .copy = .{
                         .path = old_path,
-                        .source = conffile.path,
+                        .source = physical,
                         .source_sha256 = source_sha256,
                         .mode = current.mode,
                         .uid = current.uid,
@@ -9294,7 +9332,7 @@ fn materializeConfigure(
                     try appendArchiveConffileIntent(
                         &intents,
                         allocator,
-                        conffile.path,
+                        physical,
                         archive,
                         file,
                         .replace,
@@ -9324,11 +9362,17 @@ fn materializeConfigure(
             });
         }
         for (record.conffiles) |old| {
-            if (record.status.current == .half_configured)
+            if (record.status.current == .half_configured) {
+                var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
                 try observed_paths.append(
                     allocator,
-                    relativeListPath(old.path) orelse return error.UnsupportedConffile,
+                    try owned.dupe(u8, canonicalAliasPath(
+                        aliases,
+                        diversions.physical(relativeListPath(old.path) orelse return error.UnsupportedConffile, record.name),
+                        &path_buffer,
+                    ) orelse return error.UnsupportedConffile),
                 );
+            }
             if (!seen.contains(old.path))
                 try resulting.append(allocator, old);
         }
@@ -9367,7 +9411,7 @@ fn materializeConfigure(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| {
@@ -9661,6 +9705,10 @@ fn materializeRemoval(
     defer ownership.deinit();
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     defer retained.deinit(allocator);
+    const diversions = try native_diversion.Index.init(owned, database.model.diversions);
+    var observed_paths: std.ArrayList([]const u8) = .empty;
+    defer observed_paths.deinit(allocator);
+    try observed_paths.appendSlice(allocator, request.observed_paths);
     if (phase != .purge) for (selected_records.items) |index| {
         const record = database.model.packages[index];
         for (record.conffiles) |conffile| {
@@ -9668,13 +9716,15 @@ fn materializeRemoval(
             var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             const canonical = canonicalAliasPath(
                 aliases,
-                relative,
+                diversions.physical(relative, record.name),
                 &buffer,
             ) orelse return .{
                 .outcome = .refused,
                 .detail = "invalid_conffile",
             };
             const stored = try owned.dupe(u8, canonical);
+            if (diversions.redirected(relative, record.name) != null)
+                try observed_paths.append(allocator, stored);
             try retained.put(allocator, stored, {});
             if (partial_purge) continue;
             var cursor = (root_fs.Path.initPackage(stored) catch unreachable).parent();
@@ -9684,6 +9734,19 @@ fn materializeRemoval(
                     try owned.dupe(u8, parent.text),
                     {},
                 );
+            if (diversions.redirected(relative, record.name) != null) {
+                cursor = (try root_fs.Path.initPackage(relative)).parent();
+                while (cursor) |parent| : (cursor = parent.parent()) {
+                    var parent_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+                    const physical_parent = canonicalAliasPath(
+                        aliases,
+                        diversions.physical(parent.text, record.name),
+                        &parent_buffer,
+                    ) orelse return .{ .outcome = .refused, .detail = "invalid_conffile" };
+                    if (!retained.contains(physical_parent))
+                        try retained.put(allocator, try owned.dupe(u8, physical_parent), {});
+                }
+            }
         }
     };
     var removing: std.StringHashMapUnmanaged(void) = .empty;
@@ -9692,7 +9755,11 @@ fn materializeRemoval(
     defer files.deinit(allocator);
     var directories: std.ArrayList([]const u8) = .empty;
     defer directories.deinit(allocator);
-    var directory_filters: std.ArrayList(struct { change: usize, fallback_root: bool }) = .empty;
+    var directory_filters: std.ArrayList(struct {
+        change: usize,
+        fallback_root: bool,
+        record: *const package_database.PackageRecord,
+    }) = .empty;
     defer directory_filters.deinit(allocator);
 
     const shared_root = for (database.model.packages, 0..) |candidate, index| {
@@ -9732,9 +9799,12 @@ fn materializeRemoval(
             var alias_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             const canonical = canonicalAliasPath(
                 aliases,
-                relative,
+                diversions.physical(relative, record.name),
                 &alias_buffer,
             ) orelse return .{ .outcome = .refused, .detail = "invalid_path" };
+            if (purge and diversions.redirected(relative, record.name) != null and
+                findDatabaseConffile(record.*, listed) != null)
+                continue;
             if (partial_purge) {
                 if (!retained.contains(canonical))
                     try retained_paths.append(allocator, listed);
@@ -9745,11 +9815,15 @@ fn materializeRemoval(
                 continue;
             }
             var surviving_owner = false;
+            var surviving_logical_owner = false;
             for (ownership.ownersOf(canonical)) |owned_path| {
-                if (!selected_owners.contains(owned_path.owner))
+                if (!selected_owners.contains(owned_path.owner)) {
                     surviving_owner = true;
+                    if (std.mem.eql(u8, owned_path.listed, listed))
+                        surviving_logical_owner = true;
+                }
             }
-            if (surviving_owner or removing.contains(canonical)) continue;
+            if (surviving_logical_owner or removing.contains(canonical)) continue;
             const stored = try owned.dupe(u8, canonical);
             const observed = (try request.root.entryIfExists(
                 try root_fs.Path.initPackage(stored),
@@ -9760,6 +9834,7 @@ fn materializeRemoval(
                     if (!purge) try retained_paths.append(allocator, listed);
                 },
                 .file, .sym_link => {
+                    if (surviving_owner) continue;
                     try files.append(allocator, stored);
                     try removing.put(allocator, stored, {});
                 },
@@ -9773,6 +9848,13 @@ fn materializeRemoval(
         if (purge and !settling_purge) for (record.conffiles) |conffile| {
             const relative = relativeListPath(conffile.path) orelse
                 return .{ .outcome = .refused, .detail = "invalid_conffile" };
+            var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const physical = canonicalAliasPath(aliases, diversions.physical(relative, record.name), &path_buffer) orelse
+                return .{ .outcome = .refused, .detail = "invalid_conffile" };
+            if (diversions.redirected(relative, record.name) != null) {
+                try observed_paths.append(allocator, try owned.dupe(u8, physical));
+                continue;
+            }
             for ([_][]const u8{ "", ".dpkg-old", ".dpkg-dist", ".dpkg-new" }) |suffix| {
                 // dpkg deliberately leaves the saved administrator version
                 // created by remove-on-upgrade outside package ownership.
@@ -9782,7 +9864,7 @@ fn materializeRemoval(
                 const path = try std.fmt.allocPrint(
                     owned,
                     "{s}{s}",
-                    .{ relative, suffix },
+                    .{ physical, suffix },
                 );
                 if (removing.contains(path)) continue;
                 for (ownership.ownersOf(path)) |owned_path| {
@@ -9839,7 +9921,7 @@ fn materializeRemoval(
                 });
             } else {
                 if (retained_paths.items.len == 0 and
-                    !request.planning.trigger_execution)
+                    !request.planning.trigger_execution and !shared_root)
                     try retained_paths.append(
                         allocator,
                         package_database.root_list_path,
@@ -9899,7 +9981,8 @@ fn materializeRemoval(
         if (!purge and changes.items[change_index] == .put_package)
             try directory_filters.append(allocator, .{
                 .change = change_index,
-                .fallback_root = record.conffiles.len == 0 and !request.planning.trigger_execution,
+                .fallback_root = record.conffiles.len == 0 and !request.planning.trigger_execution and !shared_root,
+                .record = record,
             });
     }
 
@@ -9913,12 +9996,17 @@ fn materializeRemoval(
         if (removing.contains(path)) continue;
         if (!try removableDirectory(request.root, path, &removing))
             continue;
+        for (ownership.ownersOf(path)) |entry| {
+            if (!selected_owners.contains(entry.owner))
+                return .{ .outcome = .handoff, .detail = "alias_ownership" };
+        }
         try removing.put(allocator, path, {});
         try intents.append(allocator, .{ .remove_directory = .{
             .path = path,
             .removal = .allow_absent,
         } });
     }
+    var prefix_work: usize = 0;
     for (directory_filters.items) |filter| {
         const staged = &changes.items[filter.change].put_package;
         var paths: std.ArrayList([]const u8) = .empty;
@@ -9926,14 +10014,35 @@ fn materializeRemoval(
         for (staged.paths orelse &.{}) |listed| {
             if (relativeListPath(listed)) |relative| {
                 var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
-                const canonical = canonicalAliasPath(aliases, relative, &buffer) orelse
+                const canonical = canonicalAliasPath(aliases, diversions.physical(relative, filter.record.name), &buffer) orelse
                     return .{ .outcome = .refused, .detail = "invalid_path" };
                 if (removing.contains(canonical)) continue;
             }
             try paths.append(allocator, listed);
         }
+        var ancestors: std.StringHashMapUnmanaged(void) = .empty;
+        defer ancestors.deinit(allocator);
+        var included: std.StringHashMapUnmanaged(void) = .empty;
+        defer included.deinit(allocator);
+        for (paths.items) |listed| {
+            try included.put(allocator, listed, {});
+            const relative = relativeListPath(listed) orelse continue;
+            var cursor = (try root_fs.Path.initPackage(relative)).parent();
+            while (cursor) |parent| : (cursor = parent.parent()) {
+                prefix_work += 1;
+                if (prefix_work > request.planning.limits.max_work)
+                    return .{ .outcome = .refused, .detail = "path_limit" };
+                if ((try ancestors.getOrPut(allocator, parent.text)).found_existing) break;
+            }
+        }
+        for (filter.record.paths orelse &.{}) |listed| {
+            const relative = relativeListPath(listed) orelse continue;
+            if (ancestors.contains(relative) and !included.contains(listed))
+                try paths.append(allocator, listed);
+        }
         if (paths.items.len == 0 and filter.fallback_root)
             try paths.append(allocator, package_database.root_list_path);
+        std.mem.sort([]const u8, paths.items, {}, lessPath);
         staged.paths = try owned.dupe([]const u8, paths.items);
     }
     if (request.planning.trigger_execution) {
@@ -9973,7 +10082,7 @@ fn materializeRemoval(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -9995,7 +10104,7 @@ fn materializeRemoval(
     };
     defer database_intents.deinit();
     if (request.file_trigger_sink) |sink| {
-        try collectRemovalTriggerEvents(sink, database.model, intents.items);
+        try collectRemovalTriggerEvents(sink, database.model, ownership, diversions, intents.items);
         try persistRuntimeTriggerEvents(
             request.execution orelse return error.InvalidLifecycleProgram,
             sink.allocator,
@@ -10004,9 +10113,11 @@ fn materializeRemoval(
         );
     }
     try intents.appendSlice(allocator, database_intents.intents);
+    var observed_request = request;
+    observed_request.observed_paths = observed_paths.items;
     return executePhaseMaterialization(
         allocator,
-        request,
+        observed_request,
         intents.items,
         databasePhaseEvidence(database_plan),
         conffilePhaseDigest(
@@ -10176,7 +10287,7 @@ fn materializeStateRecord(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10415,7 +10526,7 @@ fn materializeDetailedState(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10582,7 +10693,7 @@ fn materializeRestoredPackageState(
         allocator,
         database,
         &.{change},
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -10699,7 +10810,7 @@ fn materializeTriggerDatabase(
         allocator,
         database,
         changes.items,
-        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve },
+        .{ .database = request.planning.limits.database, .statoverride_policy = .preserve, .diversion_policy = .preserve },
     )) {
         .plan => |value| value,
         .diagnostic => |diagnostic| return .{
@@ -11542,6 +11653,10 @@ fn lifecycleInstalledEvidence(
     root: root_fs.Root,
     model: package_database.Model,
 ) ![]const native_program.InstalledPackage {
+    var diversions = try native_diversion.Index.init(allocator, model.diversions);
+    defer diversions.deinit(allocator);
+    const aliases = try detectAliases(allocator, root);
+    defer deinitAliasEvidence(allocator, aliases);
     const result = try allocator.alloc(
         native_program.InstalledPackage,
         model.packages.len,
@@ -11567,10 +11682,17 @@ fn lifecycleInstalledEvidence(
                 .md5 => |value| value,
                 .new_conffile => return error.UnsupportedLifecycleConffile,
             };
+            const relative = relativeListPath(conffile.path) orelse return error.UnsupportedLifecycleConffile;
+            var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const physical = canonicalAliasPath(
+                aliases,
+                diversions.physical(relative, record.name),
+                &path_buffer,
+            ) orelse return error.UnsupportedLifecycleConffile;
             const observed = try rootMd5ForConffile(
                 allocator,
                 root,
-                relativeListPath(conffile.path) orelse return error.UnsupportedLifecycleConffile,
+                physical,
                 (Limits{}).max_compare_bytes,
                 &compared_bytes,
                 (Limits{}).max_compared_bytes,
@@ -12120,10 +12242,13 @@ fn collectArchiveTriggerEvents(
     }
     var seen_file: std.StringHashMapUnmanaged(void) = .empty;
     defer seen_file.deinit(allocator);
+    var diversions = try native_diversion.Index.init(allocator, database.model.diversions);
+    defer diversions.deinit(allocator);
     for (database.model.triggers.interests) |interest| {
         if (interest.trigger.len == 0 or interest.trigger[0] != '/' or
             !(try archiveTouchesFileTrigger(
                 model,
+                diversions,
                 interest.trigger,
                 &work,
                 (Limits{}).max_work,
@@ -12146,11 +12271,26 @@ fn collectArchiveTriggerEvents(
 fn collectRemovalTriggerEvents(
     sink: FileTriggerSink,
     model: package_database.Model,
+    ownership: Ownership,
+    diversions: native_diversion.Index,
     intents: []const root_mutation.Intent,
 ) !void {
     const allocator = sink.allocator;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
+    var names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer names.deinit(allocator);
+    for (ownership.owners, 0..) |owner, index| {
+        if (!std.mem.eql(u8, owner.identity.name, sink.source.name) or
+            !std.mem.eql(u8, owner.identity.architecture, sink.source.architecture))
+            continue;
+        for (ownership.ownedBy(@intCast(index))) |entry_index| {
+            const entry = ownership.entries[entry_index];
+            const relative = relativeListPath(entry.listed) orelse return error.InvalidLifecycleProgram;
+            try names.put(allocator, entry.path, diversions.physical(relative, sink.source.name));
+        }
+        break;
+    }
     var work: usize = 0;
     for (model.triggers.interests) |interest| {
         if (interest.trigger.len == 0 or interest.trigger[0] != '/') continue;
@@ -12160,10 +12300,11 @@ fn collectRemovalTriggerEvents(
             work = std.math.add(usize, work, 1) catch
                 return error.TriggerWorkLimit;
             if (work > (Limits{}).max_work) return error.TriggerWorkLimit;
-            const path = switch (intent) {
+            const physical = switch (intent) {
                 .remove, .remove_directory => intent.path(),
                 else => continue,
             };
+            const path = names.get(physical) orelse physical;
             if (std.mem.eql(u8, path, prefix) or
                 (path.len > prefix.len and path[prefix.len] == '/' and
                     std.mem.startsWith(u8, path, prefix)))
@@ -12258,6 +12399,7 @@ fn simulateTriggerActivation(
 
 fn archiveTouchesFileTrigger(
     model: *const archive_application.Model,
+    diversions: native_diversion.Index,
     trigger: []const u8,
     work: *usize,
     maximum_work: usize,
@@ -12268,10 +12410,11 @@ fn archiveTouchesFileTrigger(
         work.* = std.math.add(usize, work.*, 1) catch
             return error.TriggerWorkLimit;
         if (work.* > maximum_work) return error.TriggerWorkLimit;
-        if (std.mem.eql(u8, file.path, relative) or
-            (file.path.len > relative.len and
-                file.path[relative.len] == '/' and
-                std.mem.startsWith(u8, file.path, relative)))
+        const path = diversions.physical(file.path, model.facts.package);
+        if (std.mem.eql(u8, path, relative) or
+            (path.len > relative.len and
+                path[relative.len] == '/' and
+                std.mem.startsWith(u8, path, relative)))
             return true;
     }
     return false;
@@ -15339,6 +15482,9 @@ fn runLifecycleScript(
     inject_unknown: bool,
 ) !LifecycleScriptOutcome {
     try execution.checkDeadline();
+    const mid_unpack = execution.phase_steps != null or
+        (kind == .postrm and source == .installed_package and
+            sequence < program.steps.len and program.steps[sequence].phase == .unpack);
     const package = bound_owner orelse
         try lifecycleScriptOwner(authorization.*, target, source);
     const recovery_action = nativeAction(
@@ -15639,14 +15785,22 @@ fn runLifecycleScript(
             arguments,
             report,
         );
-        managed_checkpoint_sha256 = try checkpointManagedPaths(
+        if (mid_unpack and execution.phase_steps == null)
+            validateManagedDiversionUpdate(allocator, runtime, true) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
+        managed_checkpoint_sha256 = checkpointManagedPaths(
             allocator,
             runtime,
             recovery_action,
             execution.phase_steps orelse &.{},
             &.{},
             execution.phase_steps != null,
-        );
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
         try runtime.append(
             recovery_action,
             .outcome,
@@ -15668,6 +15822,16 @@ fn runLifecycleScript(
         if (recovery_action.kind == .trigger)
             runtime.crash.hit(.after_trigger_outcome);
     }
+    const next_diversions = try native_diversion.observe(allocator, root);
+    native_diversion.validateUpdate(
+        execution.diversion_observation,
+        next_diversions,
+        mid_unpack,
+    ) catch |err| {
+        try attempt.requireRecovery(allocator, .script);
+        return err;
+    };
+    execution.diversion_observation = next_diversions;
     const code = switch (report.outcome) {
         .exited => |value| value,
         else => if (!report.outcome.spawned())
@@ -15767,7 +15931,16 @@ const PostUnpackHook = struct {
     unknown_outcome: bool = false,
     rollback_required: bool = false,
     failed_compensation: ?u32 = null,
+    diversion_failure: ?native_diversion.UpdateError = null,
 };
+
+fn diversionUpdateFailure(err: anyerror) ?native_diversion.UpdateError {
+    return switch (err) {
+        error.UnsupportedInPlaceDiversionUpdate => error.UnsupportedInPlaceDiversionUpdate,
+        error.UnsupportedMidUnpackDiversionUpdate => error.UnsupportedMidUnpackDiversionUpdate,
+        else => null,
+    };
+}
 
 fn postUnpackHook(
     context_ptr: ?*anyopaque,
@@ -15796,7 +15969,8 @@ fn postUnpackHook(
         context.script.call.script_sha256,
         context.script.call.arguments,
         context.inject_unknown,
-    ) catch {
+    ) catch |err| {
+        context.diversion_failure = diversionUpdateFailure(err);
         context.attempt.requireRecovery(context.allocator, .script) catch
             return error.SimulatedCrash;
         return error.SimulatedCrash;
@@ -15827,7 +16001,8 @@ fn postUnpackHook(
             unwind.script_sha256,
             unwind.arguments,
             false,
-        ) catch {
+        ) catch |err| {
+            context.diversion_failure = diversionUpdateFailure(err);
             context.attempt.requireRecovery(context.allocator, .script) catch
                 return error.SimulatedCrash;
             return error.SimulatedCrash;
@@ -15868,7 +16043,8 @@ fn postUnpackHook(
             call.script_sha256,
             call.arguments,
             false,
-        ) catch {
+        ) catch |err| {
+            context.diversion_failure = diversionUpdateFailure(err);
             context.attempt.requireRecovery(context.allocator, .script) catch
                 return error.SimulatedCrash;
             return error.SimulatedCrash;
@@ -16727,15 +16903,17 @@ fn prepareNativeRecovery(
         root,
         intent.digest_sha256,
     );
-    if (stat_overrides.observed_paths.len != 0)
-        _ = try native_recovery.updateManagedState(
-            allocator,
-            root,
-            intent.digest_sha256,
-            nativeAction(.verification, 0, 0, 0),
-            stat_overrides.observed_paths,
-            false,
-        );
+    const observed_paths = try allocator.alloc([]const u8, stat_overrides.observed_paths.len + 1);
+    @memcpy(observed_paths[0..stat_overrides.observed_paths.len], stat_overrides.observed_paths);
+    observed_paths[stat_overrides.observed_paths.len] = native_diversion.database_path;
+    _ = try native_recovery.updateManagedState(
+        allocator,
+        root,
+        intent.digest_sha256,
+        nativeAction(.verification, 0, 0, 0),
+        observed_paths,
+        false,
+    );
     return .{
         .allocator = allocator,
         .root = root,
@@ -16989,6 +17167,7 @@ fn recoverNativeRootMutation(
         attempt,
         .{ .deadline = if (bounds) |value| value.deadline else null },
     ) orelse {
+        try validateManagedDiversionUpdate(allocator, runtime, false);
         try native_recovery.validateStableManagedState(
             allocator,
             root,
@@ -16997,6 +17176,7 @@ fn recoverNativeRootMutation(
         return true;
     };
     defer opened.deinit();
+    try validateManagedDiversionUpdate(allocator, runtime, true);
     if (try native_recovery.managedStateHasTransient(
         allocator,
         root,
@@ -18083,9 +18263,9 @@ pub const Runtime = struct {
             if (!found) return error.OperationArchitectureMismatch;
         }
         if (database.model.pending_updates.len != 0 or
-            database.model.diversions.len != 0 or
             database.model.opaque_info.len != 0)
             return error.UnsupportedNativeDatabase;
+        _ = try native_diversion.Index.init(temporary, database.model.diversions);
         _ = try native_statoverride.read(temporary, root, database.model.stat_overrides);
         const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
         const models = try temporary.alloc(archive_application.Model, request.archives.len);
@@ -18532,7 +18712,7 @@ fn executePreparedNativeProgramWithHelper(
         request.execution(),
         request.helper(),
         bounds,
-    );
+    ) catch |err| return lifecycleExecutionError(err);
 }
 
 fn probeNativeHelperWithBounds(
@@ -18759,7 +18939,7 @@ fn recoverPreparedNativeProgramWithHelper(
         request.execution(),
         request.helper(),
         bounds,
-    );
+    ) catch |err| return lifecycleExecutionError(err);
 }
 
 fn acknowledgePreparedNativeProgram(
@@ -18853,7 +19033,21 @@ fn executeLifecycleProgramInOperation(
         null,
         null,
         null,
-    );
+    ) catch |err| return lifecycleExecutionError(err);
+}
+
+fn lifecycleExecutionError(err: anyerror) !LifecycleResult {
+    return switch (err) {
+        error.UnsupportedInPlaceDiversionUpdate => .{
+            .outcome = .recovery_required,
+            .detail = "unsupported_in_place_diversion_update",
+        },
+        error.UnsupportedMidUnpackDiversionUpdate => .{
+            .outcome = .recovery_required,
+            .detail = "unsupported_mid_unpack_diversion_update",
+        },
+        else => err,
+    };
 }
 
 fn executeLifecycleProgramWithRequest(
@@ -19032,6 +19226,7 @@ fn executeLifecycleProgramWithRequest(
     var execution_state: ExecutionState = .{
         .bounds = bounds,
         .stat_overrides = stat_overrides,
+        .diversion_observation = try native_diversion.observe(allocator, root),
     };
     const execution = &execution_state;
     if (recovery_intent) |intent| {
@@ -19095,6 +19290,8 @@ fn executeLifecycleProgramWithRequest(
             error.InvalidManagedState,
             error.UnmodeledManagedState,
             error.ManagedStateLimit,
+            error.UnsupportedInPlaceDiversionUpdate,
+            error.UnsupportedMidUnpackDiversionUpdate,
             => block: {
                 try attempt.requireRecovery(allocator, .verification);
                 break :block false;
@@ -19289,6 +19486,7 @@ fn executeLifecycleProgramWithRequest(
                 if (post_unpack != null) &hook_context.target_step else null,
             );
             if (post_unpack != null) {
+                if (hook_context.diversion_failure) |err| return err;
                 if (hook_context.unknown_outcome) return .{
                     .outcome = .recovery_required,
                     .detail = "script_outcome_unknown",
@@ -20533,6 +20731,144 @@ test "native_unpack.test.statoverride recovery identity blobs have exact bounded
     }
 }
 
+test "native_unpack.test.diversions map exact logical names with literal package exemptions" {
+    var index = try native_diversion.Index.init(testing.allocator, &.{
+        .{ .from = "/usr/bin/tool", .to = "/usr/bin/tool.distrib", .package = "wrapper" },
+        .{ .from = "/usr/lib/local\\file", .to = "/usr/lib/local\\file.distrib", .package = null },
+        .{ .from = "/usr/share/directory", .to = "/usr/share/directory.distrib", .package = "wrapper:amd64" },
+    });
+    defer index.deinit(testing.allocator);
+    try testing.expectEqualStrings("usr/bin/tool", index.physical("usr/bin/tool", "wrapper"));
+    try testing.expectEqualStrings("usr/bin/tool.distrib", index.physical("usr/bin/tool", "original"));
+    try testing.expectEqualStrings("usr/lib/local\\file.distrib", index.physical("usr/lib/local\\file", "wrapper"));
+    try testing.expectEqualStrings("usr/share/directory.distrib", index.physical("usr/share/directory", "wrapper"));
+    try testing.expectEqualStrings("usr/share/directory/child", index.physical("usr/share/directory/child", "wrapper"));
+}
+
+test "native_unpack.test.diversion indexes refuse ambiguous endpoints" {
+    const first: package_database.DiversionRecord = .{
+        .from = "/usr/bin/tool",
+        .to = "/usr/bin/tool.distrib",
+        .package = null,
+    };
+    for ([_]package_database.DiversionRecord{
+        first,
+        .{ .from = first.to, .to = "/usr/bin/other", .package = null },
+        .{ .from = "/usr/bin/other", .to = first.from, .package = null },
+        .{ .from = "/usr/bin/other", .to = first.to, .package = null },
+        .{ .from = "/usr/bin/self", .to = "/usr/bin/self", .package = null },
+    }) |second| {
+        try testing.expectError(error.InvalidDiversion, native_diversion.Index.init(testing.allocator, &.{ first, second }));
+    }
+}
+
+fn testDiversionIndexAllocations(allocator: std.mem.Allocator) !void {
+    var index = try native_diversion.Index.init(allocator, &.{
+        .{ .from = "/usr/bin/tool", .to = "/usr/bin/tool.distrib", .package = "wrapper" },
+        .{ .from = "/usr/lib/local\\file", .to = "/usr/lib/local\\file.distrib", .package = null },
+    });
+    defer index.deinit(allocator);
+}
+
+test "native_unpack.test.diversion indexes release partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDiversionIndexAllocations, .{});
+}
+
+test "native_unpack.test.diversion updates require atomic replacement when bytes change" {
+    const before: native_diversion.Observation = .{ .device = 3, .inode = 4, .sha256 = @splat(5) };
+    try before.validateAtomicUpdate(before);
+    try before.validateAtomicUpdate(.{ .device = 3, .inode = 6, .sha256 = @splat(7) });
+    try before.validateAtomicUpdate(.{ .device = 6, .inode = 4, .sha256 = @splat(7) });
+    try testing.expectError(error.UnsupportedInPlaceDiversionUpdate, before.validateAtomicUpdate(.{
+        .device = 3,
+        .inode = 4,
+        .sha256 = @splat(7),
+    }));
+}
+
+test "native_unpack.test.mid-unpack diversion changes are bounded independently of inode replacement" {
+    const before: native_diversion.Observation = .{ .device = 3, .inode = 4, .sha256 = @splat(5) };
+    const changed: native_diversion.Observation = .{ .device = 3, .inode = 6, .sha256 = @splat(7) };
+    try native_diversion.validateUpdate(null, null, true);
+    try native_diversion.validateUpdate(null, changed, false);
+    try native_diversion.validateUpdate(before, null, false);
+    try native_diversion.validateUpdate(before, changed, false);
+    try native_diversion.validateUpdate(before, .{ .device = 3, .inode = 6, .sha256 = before.sha256 }, true);
+    try testing.expectError(error.UnsupportedMidUnpackDiversionUpdate, native_diversion.validateUpdate(before, changed, true));
+    try testing.expectError(error.UnsupportedMidUnpackDiversionUpdate, native_diversion.validateUpdate(null, changed, true));
+    try testing.expectError(error.UnsupportedMidUnpackDiversionUpdate, native_diversion.validateUpdate(before, null, true));
+}
+
+test "native_unpack.test.diversion indexes reject reserved and invalid package endpoints" {
+    for ([_][]const u8{
+        "/var/lib/dpkg",
+        "/var/lib/dpkg/status",
+        "/VAR/lib/dpkg/diversions",
+        "/var/lib/debz",
+        "/var/lib/debz/root-operation-v1.json",
+        "/../escape",
+        "//duplicate",
+        "/.",
+    }) |endpoint| {
+        for ([_]package_database.DiversionRecord{
+            .{ .from = "/usr/bin/tool", .to = endpoint, .package = null },
+            .{ .from = endpoint, .to = "/usr/bin/tool.distrib", .package = null },
+        }) |record|
+            try testing.expectError(error.InvalidDiversion, native_diversion.Index.init(testing.allocator, &.{record}));
+    }
+}
+
+test "native_unpack.test.diversion recovery requires evidence for a present database" {
+    for ([_]bool{ false, true }) |checkpointed| {
+        var fixture: Fixture = undefined;
+        try fixture.init("", &.{});
+        defer fixture.deinit();
+        const root = fixture.root();
+        try root.ensureDirectory(
+            try root_fs.Path.init(root_operation.namespace_path),
+            root_fs.default_directory_permissions,
+        );
+        const runtime: native_recovery.Runtime = .{
+            .allocator = testing.allocator,
+            .root = root,
+            .intent_sha256 = @splat('0'),
+        };
+        const action = nativeAction(.verification, 0, 0, 0);
+        try native_recovery.initializeProgress(testing.allocator, root, runtime.intent_sha256);
+        try native_recovery.initializeManagedState(testing.allocator, root, runtime.intent_sha256);
+        if (checkpointed) _ = try native_recovery.updateManagedState(
+            testing.allocator,
+            root,
+            runtime.intent_sha256,
+            action,
+            &.{},
+            false,
+        );
+        for ([_]bool{ false, true }) |in_progress|
+            try validateManagedDiversionUpdate(testing.allocator, &runtime, in_progress);
+        try root.publishFile(
+            try root_fs.Path.init(native_diversion.database_path),
+            "/usr/bin/tool\n/usr/bin/tool.distrib\n:\n",
+            .{},
+        );
+        for ([_]bool{ false, true }) |in_progress|
+            try testing.expectError(
+                error.InvalidManagedState,
+                validateManagedDiversionUpdate(testing.allocator, &runtime, in_progress),
+            );
+        _ = try native_recovery.updateManagedState(
+            testing.allocator,
+            root,
+            runtime.intent_sha256,
+            action,
+            &.{native_diversion.database_path},
+            false,
+        );
+        for ([_]bool{ false, true }) |in_progress|
+            try validateManagedDiversionUpdate(testing.allocator, &runtime, in_progress);
+    }
+}
+
 test "native_unpack.test.materialization external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_MATERIALIZATION_REQUEST") orelse
         return error.SkipZigTest;
@@ -21619,7 +21955,6 @@ test "native_unpack.test.lifecycle external fixture" {
         (!external.triggers and
             (database.model.triggers.interests.len != 0 or
                 database.model.triggers.pending.len != 0)) or
-        database.model.diversions.len != 0 or
         database.model.opaque_info.len != 0)
     {
         try writeLifecycleReport(
@@ -21630,6 +21965,17 @@ test "native_unpack.test.lifecycle external fixture" {
         );
         return;
     }
+    var diversions = native_diversion.Index.init(testing.allocator, database.model.diversions) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidDiversion => {
+            try writeLifecycleReport(testing.allocator, testing.io, external.report, .{
+                .outcome = .refused,
+                .detail = "invalid_diversion",
+            });
+            return;
+        },
+    };
+    defer diversions.deinit(testing.allocator);
 
     const archive_bytes = try testing.allocator.alloc([]u8, external.archives.len);
     defer testing.allocator.free(archive_bytes);

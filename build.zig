@@ -716,6 +716,10 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-recovery", "Compare real native crash recovery with dpkg and bound provenance")
         .dependOn(&native_recovery.step);
 
+    if (b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false) {
+        for ([_]*std.Build.Step.Run{ native_lifecycle, native_triggers, native_recovery }) |runner|
+            runner.addArg("--diversions-only");
+    }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
         for ([_]*std.Build.Step.Run{
             native_materialization, native_conffiles, native_lifecycle, native_triggers, native_recovery,

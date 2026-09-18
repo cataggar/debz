@@ -152,8 +152,45 @@ the next invocation resolves afresh. Recovery retains the original inputs as
 described in [Native recovery](native-recovery.md).
 
 Native database plans explicitly preserve the override file without rewriting
-it, including remove and purge. Diversions, active `config` scripts,
-alternatives and other unsupported vendor state remain guarded.
+it, including remove and purge. Active `config` scripts, alternatives and other
+unsupported vendor state remain guarded.
+
+## Diversion routing
+
+The bounded diversion index separates logical package names from filesystem
+destinations. A local `:` record or another package's record redirects the exact
+source path; the literal unqualified owning package is exempt. An
+architecture-qualified record owner is not an exemption for that package's
+unqualified name. Diversions do not rewrite descendants by prefix.
+
+Routing precedes proven merged-/usr normalization. Ownership observations,
+hard-link sources, replacements and removals use the resolved destination;
+ownership lists, checksums and conffile declarations retain the archive's
+logical spelling. Symlink targets remain literal. Statoverrides continue to
+match the original source name, not the diversion destination.
+
+Existing destination parents and explicitly supplied directories are honored.
+Missing destination parents, an absent diverted source directory needed by
+children, conflicting endpoints, canonical claim collisions and reserved
+database/private destinations refuse rather than synthesizing a different
+successful result. Ambiguous same-package alias ownership remains guarded.
+Logical directory ownership and retained ancestors are kept distinct from
+physical co-ownership when removing merged-/usr paths.
+
+The native database planner opts into preserving diversion records; it does not
+rewrite them. Maintainer scripts may atomically replace the database, including
+through genuine `dpkg-divert`. Later phases re-read and validate that state.
+An in-place content edit is explicitly unsupported: dpkg caches that inode's
+old records, and native execution does not pretend that re-reading the changed
+bytes is equivalent. Such edits stop further work with recovery required.
+Changes during an upgrade's old-postrm callback are also guarded, including
+after a fresh-process resume of the interrupted unpack. They require dpkg's
+previous-route trigger and retained `.dpkg-tmp` behavior; this and exact
+in-place cache semantics are tracked in [#192](https://github.com/cataggar/debz/issues/192).
+
+For focused development, `-Dnative-diversions-only=true` selects just the
+diversion profiles in the existing lifecycle, trigger and recovery build
+targets. Their default workloads and CI still run all profiles.
 
 ## Package identity and ownership
 
@@ -255,6 +292,7 @@ The fixed merged-`/usr` alias table covers `bin`, `sbin`, and the supported
 `lib*` spellings. Only a root-observed link to the exact `usr/<name>` target
 authorizes normalization. A foreign link is an alias escape. The original
 archive spelling and normalized canonical path are both retained in the plan.
+Publication uses the logical archive spelling, including for aliased paths.
 
 Directory claims may be co-owned. An existing directory is an ownership-list
 update only: its administrator-selected metadata is not described as a write.
@@ -334,7 +372,7 @@ digested. Covered features include:
 - package disappearance;
 - held-selection changes;
 - malformed prior `Config-Version` evidence for an unpacked upgrade;
-- diversions, alternatives, and unmodeled package metadata;
+- alternatives and unmodeled package metadata;
 - unmodeled `var/lib/dpkg` namespace entries;
 - shared-root interoperability; and
 - filesystem features a supplied observation cannot model safely.

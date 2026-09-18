@@ -85,12 +85,12 @@ database path component.
 | `var/lib/dpkg/status-old` | Retain the immediately preceding complete status generation when publishing a new one. |
 | `var/lib/dpkg/updates/` | Empty is accepted. Nonempty update fragments are treated as interrupted database publication and require explicit native recovery before another mutation. |
 | `var/lib/dpkg/info/*.list` | Parse bounded absolute package paths, build the ownership index, and publish the exact final owned path set. |
-| `var/lib/dpkg/info/*.md5sums` | Parse and publish lowercase MD5 plus canonical relative payload paths. |
+| `var/lib/dpkg/info/*.md5sums` | Parse and publish lowercase MD5 plus canonical relative logical archive paths, not diversion destinations. |
 | `var/lib/dpkg/info/*.{preinst,postinst,prerm,postrm}` | Validate regular no-follow files and preserve or replace them according to lifecycle state. |
 | `var/lib/dpkg/info/*.triggers` | Parse and publish the package trigger declarations. |
 | `var/lib/dpkg/triggers/File` and `Unincorp` | Parse and publish interests, activations, awaiting packages, and pending work. Lock files are never package state. |
 | `var/lib/dpkg/arch` | Preserve a validated unique foreign-architecture list. Native architecture comes from the authorized request and must agree with healthy installed state. |
-| `var/lib/dpkg/diversions` | Parse and honor complete three-line diversion records. Malformed records fail preflight. Script-created changes are re-read and validated after the script boundary. |
+| `var/lib/dpkg/diversions` | Parse and honor complete three-line records with exact logical/physical routing and literal package exemptions. Malformed/conflicting or reserved-path records fail preflight. Atomic changes at ordinary script boundaries are re-read and validated; in-place and mid-unpack old-postrm edits explicitly require recovery (follow-up [#192](https://github.com/cataggar/debz/issues/192)). |
 | `var/lib/dpkg/statoverride` | Parse and honor bounded owner, group, mode, and path records using file-backed target-root identities. Malformed records fail preflight. Script-created state is re-read and validated after script boundaries, but metadata resolution stays frozen for the invocation, matching dpkg; a later invocation resolves anew. |
 | `var/lib/dpkg/alternatives/` | Preserve bounded regular-file records managed by package scripts and include their exact bytes in differential state. |
 | `var/lib/dpkg/parts/` | Empty is accepted. Nonempty records are retained and classified during feature inventory before mutation. |

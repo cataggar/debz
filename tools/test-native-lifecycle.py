@@ -47,6 +47,9 @@ STATO_BASE = f"usr/share/{STATO_PACKAGE}"
 STATO_PASSWD = b"root:x:0:0:root:/root:/bin/sh\n_debzstat:x:42420:42421:fixture:/:/bin/sh\n"
 STATO_GROUP = b"root:x:0:\n_debzstat:x:42421:\n"
 STATO_LITERAL = Path("etc/stato\\literal")
+DIVERSION_PACKAGE = "diversion-lifecycle"
+DIVERSION_BASE = f"usr/share/{DIVERSION_PACKAGE}"
+DIVERSION_LITERAL = "etc/diversion\\literal"
 
 
 def scripts(
@@ -679,6 +682,277 @@ def exercise_statoverride_lifecycle(
             print(f"statoverride-{name}: invalid target-root identities refuse before mutation", flush=True)
 
 
+def diversion_scripts(package: str, version: str) -> dict[str, bytes]:
+    result = scripts(package, version)
+    replacement = b"""
+replacement="/diversion-$DPKG_MAINTSCRIPT_NAME-replace"
+if [ -f "$replacement" ]; then
+    /diversion-mv "$replacement" /var/lib/dpkg/diversions || exit 26
+fi
+if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ -f /diversion-helper-record ]; then
+    {
+        IFS= read -r source || exit 27
+        IFS= read -r destination || exit 27
+    } < /diversion-helper-record
+    /diversion-helper --local --no-rename --remove "$source" || exit 28
+    /diversion-helper --local --no-rename --divert "$destination" --add "$source" || exit 28
+fi
+if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ -f /diversion-inplace-record ]; then
+    while IFS= read -r line; do
+        printf '%s\\n' "$line"
+    done < /diversion-inplace-record > /var/lib/dpkg/diversions
+fi
+"""
+    guard = f"if [ -f /{FAILURE} ]; then\n".encode()
+    return {kind: source.replace(guard, replacement + guard, 1) for kind, source in result.items()}
+
+
+def make_diversion_packages(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> dict[str, Path]:
+    return {
+        version: m.make_package(
+            workspace, environment, architecture, version, "conffile",
+            package=DIVERSION_PACKAGE, scripts=diversion_scripts(DIVERSION_PACKAGE, version),
+            conffile_content=f"configuration {version}\n".encode(),
+            extra_files={DIVERSION_LITERAL: f"literal version {version}\n".encode()},
+        )
+        for version in ("1", "2")
+    }
+
+
+def diversion_records(source: str, destination: str, package: str = ":") -> bytes:
+    return f"/{source}\n/{destination}\n{package}\n".encode()
+
+
+def seed_diversions(root: Path, records: bytes) -> None:
+    m.write(root / "var/lib/dpkg/diversions", records)
+    os.utime(root / "var/lib/dpkg/diversions", (m.EPOCH, m.EPOCH))
+
+
+def seed_diversion_replacement(root: Path, kind: str, records: bytes) -> None:
+    runtime.copy_program(root, Path("/bin/mv").resolve(), "/diversion-mv")
+    path = root / f"diversion-{kind}-replace"
+    m.write(path, records)
+    os.utime(path, (m.EPOCH, m.EPOCH))
+
+def seed_diversion_helper(root: Path, source: str, destination: str) -> None:
+    runtime.copy_program(root, Path("/usr/bin/dpkg-divert"), "/diversion-helper")
+    path = root / "diversion-helper-record"
+    m.write(path, f"/{source}\n/{destination}\n".encode())
+    os.utime(path, (m.EPOCH, m.EPOCH))
+
+
+def exercise_diversion_lifecycle(
+    executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    archives = make_diversion_packages(workspace / "diversion-packages", environment, architecture)
+    for name, member, owner, override in (
+        ("local", "mode", ":", ""),
+        ("other-package", "mode", "wrapper", ""),
+        ("exempt-package", "mode", DIVERSION_PACKAGE, ""),
+        ("qualified-owner", "mode", f"{DIVERSION_PACKAGE}:{architecture}", ""),
+        ("symlink", "current", ":", ""),
+        ("hardlink-source", "data", ":", ""),
+        ("hardlink-member", "data.link", ":", ""),
+        ("directory", "empty", ":", ""),
+        ("literal", DIVERSION_LITERAL, ":", ""),
+        ("conffile", "etc/debz-native.conf", ":", ""),
+        ("override-source", "mode", ":", f"#42420 #42421 4750 /{DIVERSION_BASE}/mode\n"),
+        ("override-destination", "mode", ":", f"#42420 #42421 4750 /{DIVERSION_BASE}/mode.distrib\n"),
+    ):
+        current = Scenario(workspace, f"diversion-{name}", executable, architecture, environment)
+        source = member if member.startswith("etc/") else f"{DIVERSION_BASE}/{member}"
+        destination = source + ".distrib"
+        records = diversion_records(source, destination, owner)
+        for root in current.roots:
+            seed_diversions(root, records)
+            m.write(root / "var/lib/dpkg/statoverride", override.encode())
+            if name != "directory":
+                m.write(root / source, b"administrator payload\n")
+                os.utime(root / source, (m.EPOCH, m.EPOCH))
+        for operation, version in (("install", "1"), ("upgrade", "2"), ("reinstall", "2"), ("downgrade", "1")):
+            current.phase(operation, [archives[version]], names=(DIVERSION_PACKAGE,))
+            for root in current.roots:
+                physical = source if owner == DIVERSION_PACKAGE else destination
+                assert (root / physical).exists() or (root / physical).is_symlink()
+                if name != "directory" and owner != DIVERSION_PACKAGE:
+                    assert (root / source).read_bytes() == b"administrator payload\n"
+                listed = (root / f"var/lib/dpkg/info/{DIVERSION_PACKAGE}.list").read_text().splitlines()
+                assert "/" + source in listed and "/" + destination not in listed
+                data = destination if name == "hardlink-source" else f"{DIVERSION_BASE}/data"
+                link = destination if name == "hardlink-member" else f"{DIVERSION_BASE}/data.link"
+                assert (root / data).samefile(root / link)
+        current.phase("remove", names=(DIVERSION_PACKAGE,))
+        current.phase("purge", names=(DIVERSION_PACKAGE,))
+        for root in current.roots:
+            assert (root / "var/lib/dpkg/diversions").read_bytes() == records
+            if name == "conffile":
+                assert (root / destination).read_bytes() == b"configuration 1\n"
+        current.complete()
+
+    current = Scenario(workspace, "diversion-genuine-helper", executable, architecture, environment)
+    source = f"{DIVERSION_BASE}/mode"
+    for root in current.roots:
+        seed_diversions(root, diversion_records(source, source + ".original"))
+        seed_diversion_helper(root, source, source + ".changed")
+    current.phase("install", [archives["1"]], names=(DIVERSION_PACKAGE,))
+    current.phase("upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,))
+    current.phase("remove", names=(DIVERSION_PACKAGE,))
+    current.phase("purge", names=(DIVERSION_PACKAGE,))
+    current.complete()
+
+    for name, source, destination in (
+        ("existing-parent-file", f"{DIVERSION_BASE}/mode", "opt/diverted-mode"),
+        ("existing-parent-link", f"{DIVERSION_BASE}/data", "opt/diverted-data"),
+        ("existing-parent-conffile", "etc/debz-native.conf", "opt/diverted.conf"),
+        ("existing-source-directory", DIVERSION_BASE, DIVERSION_BASE + ".distrib"),
+    ):
+        current = Scenario(workspace, f"diversion-{name}", executable, architecture, environment)
+        for root in current.roots:
+            seed_diversions(root, diversion_records(source, destination))
+            (root / "opt").mkdir()
+            if name == "existing-source-directory":
+                m.write(root / source / "administrator-file", b"administrator payload\n")
+                os.utime(root / source / "administrator-file", (m.EPOCH, m.EPOCH))
+        current.phase("install", [archives["1"]], names=(DIVERSION_PACKAGE,))
+        current.phase("upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,))
+        current.phase("remove", names=(DIVERSION_PACKAGE,))
+        current.phase("purge", names=(DIVERSION_PACKAGE,))
+        current.complete()
+
+    if executable is not None:
+        source = f"{DIVERSION_BASE}/mode"
+        for name, records, expected, pristine in (
+            ("duplicate", diversion_records(source, source + ".first") + diversion_records(source, source + ".second"), "invalid_diversion", True),
+            ("chain", diversion_records(source, source + ".first") + diversion_records(source + ".first", source + ".second"), "invalid_diversion", True),
+            ("missing-parent", diversion_records(source, "opt/diverted/mode"), "prefix_transition_unsafe", False),
+            ("directory-parent", diversion_records(DIVERSION_BASE, DIVERSION_BASE + ".distrib"), "prefix_transition_unsafe", False),
+            ("destination-member", diversion_records(source, f"{DIVERSION_BASE}/data"), "invalid_diversion", False),
+            ("direct-destination", diversion_records("usr/share/unshipped-file", source), "invalid_diversion", False),
+            ("reserved-destination", diversion_records(source, "var/lib/dpkg/diversions"), "invalid_diversion", True),
+            ("private-destination", diversion_records(source, "var/lib/debz/root-operation-v1.json"), "invalid_diversion", True),
+            ("inplace", diversion_records(source, source + ".original"), "unsupported_in_place_diversion_update", False),
+        ):
+            current = Scenario(workspace, f"diversion-refusal-{name}", executable, architecture, environment)
+            seed_diversions(current.candidate, records)
+            if name == "inplace":
+                m.write(current.candidate / "diversion-inplace-record", diversion_records(source, source + ".changed"))
+                os.utime(current.candidate / "diversion-inplace-record", (m.EPOCH, m.EPOCH))
+            excludes = ("var/lib/debz", m.GUARD, *(f"var/lib/dpkg/{path}" for path in m.oracle.LOCK_FILES))
+            before = m.oracle.capture_tree(current.candidate, m.oracle.Limits(), excludes)
+            output = current.directory / "refusal"
+            output.mkdir()
+            report = native(
+                executable, current.candidate, [archives["1"]], "install", architecture, environment, output,
+                packages=current.identities((DIVERSION_PACKAGE,)),
+            )
+            assert report["outcome"] in ("refused", "recovery_required") and report["detail"] == expected, report
+            if pristine:
+                assert not m.oracle.differences(
+                    before, m.oracle.capture_tree(current.candidate, m.oracle.Limits(), excludes),
+                )
+            assert not (current.candidate / source).exists()
+            print(f"diversion-refusal-{name}: unsupported routing refuses explicitly", flush=True)
+
+    source = f"{DIVERSION_BASE}/mode"
+    for kind, initially_present in (("preinst", True), ("preinst", False), ("postinst", True)):
+        current = Scenario(
+            workspace, f"diversion-{kind}-initial-{initially_present}", executable, architecture, environment,
+        )
+        records = diversion_records(source, source + ".changed")
+        for root in current.roots:
+            if initially_present:
+                seed_diversions(root, diversion_records(source, source + ".original"))
+            seed_diversion_replacement(root, kind, records)
+        current.phase("install", [archives["1"]], names=(DIVERSION_PACKAGE,))
+        for root in current.roots:
+            assert (root / (source + (".original" if kind == "postinst" else ".changed"))).is_file()
+        current.phase("reinstall", [archives["1"]], names=(DIVERSION_PACKAGE,))
+        current.phase("remove", names=(DIVERSION_PACKAGE,))
+        current.phase("purge", names=(DIVERSION_PACKAGE,))
+        current.complete()
+
+    if executable is not None:
+        current = Scenario(workspace, "diversion-refusal-mid-unpack", executable, architecture, environment)
+        source = f"{DIVERSION_BASE}/mode"
+        for root in current.roots:
+            seed_diversions(root, diversion_records(source, source + ".original"))
+        current.seed(archives["1"])
+        seed_diversion_replacement(
+            current.candidate, "postrm", diversion_records(source, source + ".changed"),
+        )
+        output = current.directory / "refusal"
+        output.mkdir()
+        report = native(
+            executable, current.candidate, [archives["2"]], "upgrade", architecture, environment, output,
+            packages=current.identities((DIVERSION_PACKAGE,)),
+        )
+        assert report["outcome"] == "recovery_required" and report["detail"] == "unsupported_mid_unpack_diversion_update", report
+        assert not (current.candidate / (source + ".changed")).exists()
+        print("diversion-refusal-mid-unpack: old-postrm route changes stop before settlement", flush=True)
+
+    for spelling in ("bin", "usr/bin"):
+        source = f"{spelling}/diversion-mode"
+        destination = "bin/diversion-mode.distrib"
+        archive = m.make_package(
+            workspace / f"diversion-alias-{spelling.replace('/', '-')}-package", environment, architecture, "1",
+            package=DIVERSION_PACKAGE, scripts=diversion_scripts(DIVERSION_PACKAGE, "1"),
+            extra_files={source: b"aliased diversion\n"},
+        )
+        current = Scenario(workspace, f"diversion-alias-{spelling.replace('/', '-')}", executable, architecture, environment)
+        alias_owner = m.make_package(
+            current.directory / "alias-owner", environment, architecture, "1", package="alias-owner",
+            prepare_payload=lambda payload: (payload / "bin").mkdir(),
+        )
+        for root in current.roots:
+            (root / "usr").mkdir(exist_ok=True)
+            (root / "bin").rename(root / "usr/bin")
+            (root / "bin").symlink_to("usr/bin")
+            os.utime(root / "bin", (m.EPOCH, m.EPOCH), follow_symlinks=False)
+            seed_diversions(root, diversion_records(source, destination))
+            m.write(root / source, b"administrator payload\n")
+            os.utime(root / source, (m.EPOCH, m.EPOCH))
+        current.seed(alias_owner)
+        current.phase("install", [archive], names=(DIVERSION_PACKAGE,))
+        current.phase("reinstall", [archive], names=(DIVERSION_PACKAGE,))
+        current.phase("remove", names=(DIVERSION_PACKAGE,))
+        current.phase("purge", names=(DIVERSION_PACKAGE,))
+        current.complete()
+
+    for policy in ("keep_existing", "use_package_version"):
+        current = Scenario(workspace, f"diversion-conffile-update-{policy}", executable, architecture, environment)
+        source = "etc/debz-native.conf"
+        destination = source + ".original"
+        for root in current.roots:
+            seed_diversions(root, diversion_records(source, destination))
+        current.seed(archives["1"])
+        for root in current.roots:
+            m.write(root / destination, b"administrator configuration\n", 0o600)
+            os.utime(root / destination, (m.EPOCH, m.EPOCH))
+            seed_diversion_replacement(root, "preinst", diversion_records(source, source + ".changed"))
+        current.phase("upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,), policy=policy)
+        current.phase("remove", names=(DIVERSION_PACKAGE,), policy=policy)
+        current.phase("purge", names=(DIVERSION_PACKAGE,), policy=policy)
+        current.complete()
+
+        current = Scenario(workspace, f"diversion-conffile-{policy}", executable, architecture, environment)
+        source = "etc/debz-native.conf"
+        destination = source + ".distrib"
+        for root in current.roots:
+            seed_diversions(root, diversion_records(source, destination))
+        current.seed(archives["1"])
+        for root in current.roots:
+            m.write(root / destination, b"administrator configuration\n", 0o600)
+            os.utime(root / destination, (m.EPOCH, m.EPOCH))
+        current.phase("upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,), policy=policy)
+        current.phase("purge", names=(DIVERSION_PACKAGE,), policy=policy)
+        for root in current.roots:
+            assert (root / destination).is_file()
+            assert (root / (destination + (".dpkg-dist" if policy == "keep_existing" else ".dpkg-old"))).is_file()
+        current.complete()
+
+
 def exercise_conffile_lifecycle(
     executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
 ) -> None:
@@ -796,6 +1070,7 @@ def exercise(
     environment: dict[str, str],
     architecture: str,
 ) -> None:
+    exercise_diversion_lifecycle(executable, workspace, environment, architecture)
     exercise_statoverride_lifecycle(executable, workspace, environment, architecture)
     exercise_conffile_lifecycle(executable, workspace, environment, architecture)
     archives = {
@@ -1162,6 +1437,7 @@ def main() -> int:
     )
     parser.add_argument("--workspace", type=Path, help="retain artifacts in a new .tmp directory")
     parser.add_argument("--reference-dpkg", type=Path)
+    parser.add_argument("--diversions-only", action="store_true")
     arguments = parser.parse_args()
     if arguments.oracle_only == bool(arguments.native_test):
         parser.error("provide a native test executable or --oracle-only, not both")
@@ -1193,7 +1469,10 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            exercise(executable, workspace, environment, architecture)
+            if arguments.diversions_only:
+                exercise_diversion_lifecycle(executable, workspace, environment, architecture)
+            else:
+                exercise(executable, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during lifecycle acceptance")

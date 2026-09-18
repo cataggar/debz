@@ -2110,7 +2110,7 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
 
 /// Journal, progress log, staging, and backup entries are never mutation
 /// targets. A plan that names one would corrupt its own recovery evidence.
-fn withinNamespace(path: []const u8) bool {
+pub fn withinNamespace(path: []const u8) bool {
     if (std.mem.eql(u8, path, namespace_path)) return true;
     return std.mem.startsWith(u8, path, namespace_path ++ "/");
 }

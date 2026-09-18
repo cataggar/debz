@@ -62,13 +62,21 @@ conffile work.
 
 Phase preflight checks program/root/database/policy binding and rejects
 unsupported package states, malformed configuration-version evidence, scripts,
-triggers, diversions, and opaque metadata. Bounded statoverrides are supported
+triggers and opaque metadata. Bounded statoverrides and diversions are supported
 with target-root identity validation; conffile replacement still preserves
 live metadata where required by policy. Conffile observations are
 bounded and staged bytes are checked against the bound archive with SHA-256.
 The final phase digest incorporates the concrete mutation-plan step digest.
 Unexpected preparation failures preserve active evidence, and a failed
 recovery-state publication is propagated rather than ignored.
+
+Diverted conffiles are staged, compared and configured at their physical
+destination, but retain their logical name in control records and checksums.
+Both administrator-conffile policies and side files apply at that destination.
+Removal retains them; purge retires their package records without deleting
+diverted live or side files, matching dpkg. Retained diverted conffiles remain
+managed observations during recovery, even when purge has no deletion intent
+for them. The package owning a diversion remains exempt.
 
 Native amd64 and arm64 CI run the target in Debug and ReleaseSafe.
 `--oracle-only` checks reference fixture consistency; it does not execute

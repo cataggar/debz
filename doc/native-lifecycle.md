@@ -49,12 +49,25 @@ state. Missing identities refuse before lifecycle mutation. See the
 [metadata contract](native-unpack.md#statoverride-metadata) for directory,
 symlink, hard-link and exact-path behavior.
 
+Diversions use package-dependent logical/physical routing. Normal atomic
+`dpkg-divert` updates are observed at subsequent phase boundaries; in-place
+edits require recovery instead of being treated as a fresh diversion map.
+Updates during an in-progress unpack's old postrm remain explicitly blocked;
+their previous-route/backup semantics are tracked in
+[#192](https://github.com/cataggar/debz/issues/192).
+File-trigger matching uses the diversion destination spelling, including when
+that spelling resolves through a merged-/usr alias. See
+[diversion routing](native-unpack.md#diversion-routing).
+
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known
 outcome then settles the conffile records; final directory/info removal follows
 only on success. A failed postrm retains residual directories and its script
 for retry. Files recreated by postrm are not deleted by subsequent settlement.
 Removal ownership lists retain nonshared directories that could not be removed.
+Diverted conffiles are an explicit exception: dpkg leaves the diverted live
+file and its side files on purge while retiring the package's logical records.
+The administrator's source path is not overwritten or removed.
 
 Configuration retry from `half-configured` does not repeat conffile decisions.
 Recorded digests must still match the bound archive, but administrator edits,
