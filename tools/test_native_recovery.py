@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -30,6 +32,31 @@ class RecoveryOracleTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_cached_diversion_evidence_keeps_loaded_and_observed_bytes_distinct(self) -> None:
+        raw = b"/usr/bin/tool\n/usr/bin/tool.original\n:\n"
+        loaded = {"device": 3, "inode": 4, "sha256": list(hashlib.sha256(raw).digest())}
+        observed = {**loaded, "sha256": list(hashlib.sha256(b"changed live bytes").digest())}
+        cached = {"loaded": loaded, "observed": observed, "contents_base64": base64.b64encode(raw).decode()}
+        acceptance.assert_cached_diversion_contents(cached)
+        for changed in (
+            {"loaded": {**loaded, "sha256": [0] * 32}},
+            {"observed": {**observed, "inode": 5}},
+            {"observed": None},
+            {"contents_base64": base64.b64encode(b"other cached bytes").decode()},
+        ):
+            with self.assertRaises(AssertionError):
+                acceptance.assert_cached_diversion_contents({**cached, **changed})
+
+    def test_cached_diversion_evidence_distinguishes_absent_and_empty(self) -> None:
+        absent = {"loaded": None, "observed": None, "contents_base64": None}
+        acceptance.assert_cached_diversion_contents(absent)
+        with self.assertRaises(AssertionError):
+            acceptance.assert_cached_diversion_contents({**absent, "contents_base64": ""})
+        observation = {"device": 3, "inode": 4, "sha256": list(hashlib.sha256(b"").digest())}
+        acceptance.assert_cached_diversion_contents({
+            "loaded": observation, "observed": observation, "contents_base64": "",
+        })
 
     def test_consumer_parity_requires_every_suite_case_and_actual_consumer(self) -> None:
         rows = [

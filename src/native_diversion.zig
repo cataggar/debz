@@ -71,6 +71,12 @@ pub const CachedRecords = struct {
         self.* = undefined;
     }
 
+    pub fn clone(self: CachedRecords, allocator: std.mem.Allocator) !CachedRecords {
+        var result = try CachedRecords.init(allocator, self.bytes, self.loaded);
+        result.observed = self.observed;
+        return result;
+    }
+
     pub fn refresh(self: *CachedRecords, bytes: ?[]const u8, observation: ?Observation) !bool {
         try validateObservedBytes(bytes, observation);
         if (std.meta.eql(self.observed, observation)) return false;
@@ -176,8 +182,7 @@ pub const Session = struct {
             (expected.loaded == null) != (expected.observed == null) or
             (expected.loaded != null and !expected.loaded.?.sameFile(expected.observed.?)))
             return error.InvalidDiversionObservation;
-        var cached = try CachedRecords.init(allocator, expected.bytes, expected.loaded);
-        cached.observed = expected.observed;
+        const cached = try expected.clone(allocator);
         live.cache.deinit();
         live.cache = cached;
         return live;

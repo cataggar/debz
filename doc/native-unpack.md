@@ -192,6 +192,13 @@ previous-route trigger and retained `.dpkg-tmp` behavior, tracked in
 [#192](https://github.com/cataggar/debz/issues/192). This also blocks an atomic
 replacement that activates earlier in-place edits without changing live bytes.
 
+File-trigger routing keeps an owned snapshot of the cache used by each unpack.
+Recovery-enabled executions persist that snapshot, bound to the original
+intent and program step, so later script updates cannot retarget an earlier
+publication during re-entry. This is a foundation for the full #192
+previous-route, retained-backup and partial-rollback semantics; it does not
+remove the mid-unpack guard.
+
 For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build
 targets. Their default workloads and CI still run all profiles.

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-unpack-diversion-v1",
+  "title": "Native unpack diversion input v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "intent_sha256",
+    "program_step",
+    "cache_json",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-unpack-diversion-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "program_step": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "cache_json": {
+      "type": "string",
+      "maxLength": 89482584,
+      "contentMediaType": "application/json",
+      "contentSchema": {
+        "$ref": "https://debz.dev/schema/native-diversion-cache-v1"
+      }
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}
