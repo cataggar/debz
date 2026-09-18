@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import nullcontext
 import fcntl
 from functools import cache
@@ -62,6 +63,7 @@ EVIDENCE_SCHEMAS = {
     "intent": "native-execution-intent-v1",
     "progress": "native-execution-progress-v1",
     "managed_state": "native-managed-state-v1",
+    "diversion_cache": "native-diversion-cache-v1",
     "trigger_events": "native-trigger-events-v1",
     "script_outcome": "native-script-outcome-v1",
 }
@@ -291,9 +293,41 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             if value["intent_sha256"] != proof["execution_intent_sha256"]:
                 raise AssertionError("retained evidence belongs to another execution intent")
         documents.setdefault(kind, []).append(value)
-    for kind in EVIDENCE_SCHEMAS.keys() - {"script_outcome", "execution_request"}:
+    for kind in EVIDENCE_SCHEMAS.keys() - {"script_outcome", "execution_request", "diversion_cache"}:
         if len(documents.get(kind, [])) != 1:
             raise AssertionError(f"missing or duplicated retained {kind}")
+    managed = documents["managed_state"][0]
+    snapshot = managed["transient"] or managed["stable"]
+    managed_entries = {entry["path"]: entry for entry in snapshot["entries"]} if snapshot else {}
+    cache_entry = managed_entries.get("var/lib/debz/native-diversion-cache-v1.json")
+    caches = documents.get("diversion_cache", [])
+    if cache_entry is None:
+        if caches:
+            raise AssertionError("retained diversion cache has no managed binding")
+    else:
+        if len(caches) != 1:
+            raise AssertionError("managed diversion cache has no unique retained evidence")
+        cache_file = next(entry for entry in proof["evidence_files"] if entry["kind"] == "diversion_cache")
+        if cache_entry["kind"] != "regular" or cache_entry["content_sha256"] != cache_file["sha256"]:
+            raise AssertionError("retained diversion cache differs from its managed checkpoint")
+        cached = caches[0]
+        live = managed_entries["var/lib/dpkg/diversions"]
+        if cached["loaded"] is None:
+            if cached["observed"] is not None or cached["contents_base64"] is not None or live["kind"] != "absent":
+                raise AssertionError("absent diversion cache has inconsistent evidence")
+        else:
+            raw = base64.b64decode(cached["contents_base64"], validate=True)
+            if base64.b64encode(raw).decode() != cached["contents_base64"]:
+                raise AssertionError("diversion cache bytes are not canonically encoded")
+            if hashlib.sha256(raw).digest() != bytes(cached["loaded"]["sha256"]):
+                raise AssertionError("cached diversion bytes differ from their loaded digest")
+            observed = cached["observed"]
+            if any(cached["loaded"][key] != observed[key] for key in ("device", "inode")):
+                raise AssertionError("cached and observed diversion file identities differ")
+            if live["kind"] != "regular" or any(live[key] != observed[key] for key in ("device", "inode")):
+                raise AssertionError("diversion cache does not bind the managed live file")
+            if live["content_sha256"] != bytes(observed["sha256"]).hex():
+                raise AssertionError("observed diversion bytes differ from the managed checkpoint")
     request_blobs = [blob for blob in documents["intent"][0]["blobs"] if blob["kind"] == "request"]
     if len(request_blobs) != 1:
         raise AssertionError("intent did not retain exactly one request binding")
@@ -1382,12 +1416,25 @@ def exercise_diversion_recovery(
         ("install", "after_script_outcome", "created"),
         ("install", "after_script_outcome", "helper"),
         ("install", "after_script_prepared", "inplace"),
+        ("install", "after_script_outcome", "inplace"),
+        ("install", "after_failure_outcome", "inplace"),
+        ("install", "after_script_return_before_outcome", "inplace-unknown"),
+        ("upgrade", "during_filesystem_publication", "inplace"),
+        ("remove", "after_script_outcome", "inplace-prerm"),
+        ("purge", "after_script_prepared", "inplace-postrm"),
+        ("install", "after_script_outcome", "inplace-empty"),
+        ("install", "after_trigger_outcome", "atomic-then-inplace"),
         ("upgrade", "during_filesystem_publication", "mid-unpack"),
         ("upgrade", "after_script_prepared", "mid-unpack"),
+        ("upgrade", "during_filesystem_publication", "mid-cached-route"),
+        ("upgrade", "after_script_prepared", "mid-cached-route"),
         ("install", "after_trigger_outcome", "postinst"),
         ("install", "after_execution_intent", "database-drift"),
         ("install", "after_trigger_outcome", "destination-drift"),
         ("purge", "after_script_prepared", "conffile-drift"),
+        ("install", "after_execution_intent", "cache-file-drift"),
+        ("install", "after_execution_intent", "cache-mode-drift"),
+        ("install", "after_execution_intent", "cache-missing-drift"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
         current = Scenario(workspace, name, executable, helper, architecture, environment)
@@ -1413,17 +1460,31 @@ def exercise_diversion_recovery(
         if mutation == "helper":
             for root in current.roots:
                 lifecycle.seed_diversion_helper(root, source, source + ".changed")
-        if mutation == "inplace":
+        if mutation in ("inplace", "inplace-prerm", "inplace-empty", "inplace-unknown"):
             for root in current.roots:
-                m.write(root / "diversion-inplace-record", records.replace(b".distrib", b".changed"))
-                os.utime(root / "diversion-inplace-record", (m.EPOCH, m.EPOCH))
+                lifecycle.seed_diversion_inplace(
+                    root, "prerm" if mutation == "inplace-prerm" else "preinst",
+                    b"" if mutation == "inplace-empty" else records.replace(b".distrib", b".changed"),
+                )
+        if mutation == "atomic-then-inplace":
+            for root in current.roots:
+                lifecycle.seed_diversion_replacement(root, "preinst", records.replace(b".distrib", b".atomic"))
+                lifecycle.seed_diversion_inplace(root, "postinst", records.replace(b".distrib", b".changed"))
         if mutation == "mid-unpack":
             for root in current.roots:
                 lifecycle.seed_diversion_replacement(
                     root, "postrm", records.replace(destination.encode(), (source + ".changed").encode()),
                 )
+        if mutation == "mid-cached-route":
+            for root in current.roots:
+                changed = records.replace(destination.encode(), (source + ".changed").encode())
+                lifecycle.seed_diversion_inplace(root, "preinst", changed)
+                lifecycle.seed_diversion_replacement(root, "postrm", changed)
         if operation == "purge":
             current.phase("remove", packages=[package])
+        if mutation == "inplace-postrm":
+            for root in current.roots:
+                lifecycle.seed_diversion_inplace(root, "postrm", records.replace(b".distrib", b".changed"))
         failure = boundary == "after_failure_outcome"
         if failure:
             for root in current.roots:
@@ -1448,12 +1509,18 @@ def exercise_diversion_recovery(
             m.write(current.candidate / destination, b"external destination drift\n")
         elif mutation == "conffile-drift":
             m.write(current.candidate / "etc/debz-native.conf.distrib", b"external conffile drift\n")
+        elif mutation == "cache-file-drift":
+            m.write(current.candidate / NAMESPACE / "native-diversion-cache-v1.json", b"external cache drift\n")
+        elif mutation == "cache-mode-drift":
+            (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").chmod(0o644)
+        elif mutation == "cache-missing-drift":
+            (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").unlink()
         before = triggers.snapshot(current.candidate)
         report = current.recover(trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True)
         assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
-        if mutation in ("inplace", "mid-unpack"):
+        if mutation in ("mid-unpack", "mid-cached-route", "inplace-unknown"):
             assert report["outcome"] == "recovery_required", report
-            if mutation == "inplace":
+            if mutation == "inplace-unknown":
                 assert not (current.candidate / destination).exists()
             assert not (current.candidate / (source + ".changed")).exists()
             blocked = triggers.snapshot(current.candidate)

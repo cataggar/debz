@@ -42,6 +42,7 @@ const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_statoverride = @import("native_statoverride.zig");
 const native_diversion = @import("native_diversion.zig");
+const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -103,6 +104,7 @@ const ExecutionState = struct {
     bounds: ?*RuntimeBounds = null,
     stat_overrides: ?native_statoverride.Resolved = null,
     diversion_observation: ?native_diversion.Observation = null,
+    diversion_cache: ?*native_diversion.Session = null,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -173,6 +175,21 @@ fn checkpointManagedPaths(
     observed_paths: []const []const u8,
     transient: bool,
 ) !native_recovery.Digest {
+    if (try readManagedDiversionCache(allocator, runtime.root, runtime.intent_sha256)) |value| {
+        var cached = value;
+        cached.deinit();
+    }
+    return checkpointManagedPathsAfterCacheValidation(allocator, runtime, action, steps, observed_paths, transient);
+}
+
+fn checkpointManagedPathsAfterCacheValidation(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    action: native_recovery.Action,
+    steps: []const root_mutation.Step,
+    observed_paths: []const []const u8,
+    transient: bool,
+) !native_recovery.Digest {
     try validateManagedDiversionUpdate(allocator, runtime, transient);
     const paths = try allocator.alloc([]const u8, steps.len + observed_paths.len);
     defer allocator.free(paths);
@@ -199,6 +216,23 @@ fn validateManagedDiversionUpdate(
         return error.InvalidManagedState;
     if (managed.document.transient orelse managed.document.stable) |previous| {
         for (previous.entries) |entry| {
+            if (!std.mem.eql(u8, entry.path, native_recovery.diversion_cache_path)) continue;
+            if (entry.kind != .regular) return error.InvalidManagedState;
+            const bytes = try runtime.root.readFileAlloc(
+                allocator,
+                try root_fs.Path.init(native_recovery.diversion_cache_path),
+                native_diversion_cache.maximum_document_bytes,
+            );
+            defer allocator.free(bytes);
+            var cached = try native_diversion_cache.decode(allocator, bytes, runtime.intent_sha256);
+            defer cached.deinit();
+            const observed = try native_diversion.observe(allocator, runtime.root);
+            try cached.cache.validateRefresh(observed, in_progress);
+            if (!std.meta.eql(cached.cache.observed, observed))
+                return error.ManagedStateChanged;
+            return;
+        }
+        for (previous.entries) |entry| {
             if (!std.mem.eql(u8, entry.path, native_diversion.database_path)) continue;
             const before: ?native_diversion.Observation = switch (entry.kind) {
                 .absent => null,
@@ -217,6 +251,75 @@ fn validateManagedDiversionUpdate(
     // Older checkpoints cannot authorize an unobserved diversion database.
     if (try native_diversion.observe(allocator, runtime.root) != null)
         return error.InvalidManagedState;
+}
+
+fn readManagedDiversionCache(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+) !?native_diversion_cache.Decoded {
+    const bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        intent_sha256,
+        native_recovery.diversion_cache_path,
+        native_diversion_cache.maximum_document_bytes,
+    )) orelse {
+        if (try root.entryIfExists(try root_fs.Path.init(native_recovery.diversion_cache_path)) != null)
+            return error.InvalidManagedState;
+        return null;
+    };
+    defer allocator.free(bytes);
+    return try native_diversion_cache.decode(allocator, bytes, intent_sha256);
+}
+
+fn writeDiversionCache(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+    cache: native_diversion.CachedRecords,
+    overwrite: root_fs.OverwritePolicy,
+) !void {
+    const bytes = try native_diversion_cache.encode(allocator, cache, intent_sha256);
+    defer allocator.free(bytes);
+    try root.publishFile(try root_fs.Path.init(native_recovery.diversion_cache_path), bytes, .{
+        .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
+        .overwrite = overwrite,
+        .durable = true,
+    });
+}
+
+fn refreshExecutionDiversions(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    in_progress: bool,
+) !void {
+    if (execution.diversion_cache) |session| {
+        if (execution.recovery) |runtime| {
+            var stored = (try readManagedDiversionCache(allocator, root, runtime.intent_sha256)) orelse
+                return error.InvalidManagedState;
+            defer stored.deinit();
+            if (!std.meta.eql(stored.cache.loaded, session.cache.loaded) or
+                !std.meta.eql(stored.cache.observed, session.cache.observed) or
+                (stored.cache.bytes == null) != (session.cache.bytes == null) or
+                (stored.cache.bytes != null and !std.mem.eql(u8, stored.cache.bytes.?, session.cache.bytes.?)))
+                return error.InvalidManagedState;
+        }
+        const changed = session.refresh(root, in_progress) catch |err| switch (err) {
+            error.InvalidDiversion => return error.InvalidDiversionUpdate,
+            else => return err,
+        };
+        if (changed) {
+            if (execution.recovery) |runtime|
+                try writeDiversionCache(allocator, root, runtime.intent_sha256, session.cache, .replace);
+        }
+        execution.diversion_observation = session.cache.observed;
+        return;
+    }
+    const next = try native_diversion.observe(allocator, root);
+    try native_diversion.validateUpdate(execution.diversion_observation, next, in_progress);
+    execution.diversion_observation = next;
 }
 
 const CombinedMutationHooks = struct {
@@ -804,7 +907,16 @@ pub fn indexOwnership(
     model: package_database.Model,
     aliases: AliasEvidence,
 ) OwnershipError!Ownership {
-    var diversions = try native_diversion.Index.init(allocator, model.diversions);
+    return indexOwnershipWithDiversions(allocator, model, aliases, model.diversions);
+}
+
+fn indexOwnershipWithDiversions(
+    allocator: std.mem.Allocator,
+    model: package_database.Model,
+    aliases: AliasEvidence,
+    records: []const package_database.DiversionRecord,
+) OwnershipError!Ownership {
+    var diversions = try native_diversion.Index.init(allocator, records);
     defer diversions.deinit(allocator);
     var owners = try allocator.alloc(Owner, model.packages.len);
     errdefer allocator.free(owners);
@@ -1263,6 +1375,7 @@ const Request = struct {
     trigger_execution: bool = false,
     lifecycle_sequences: []const u32 = &.{},
     stat_overrides: ?native_statoverride.Resolved = null,
+    diversion_records: ?[]const package_database.DiversionRecord = null,
     limits: Limits = .{},
 };
 
@@ -1707,7 +1820,12 @@ fn plan(allocator: std.mem.Allocator, request: Request) std.mem.Allocator.Error!
     };
     defer imported.deinit();
 
-    var ownership = indexOwnership(allocator, imported.model, aliases) catch |err| switch (err) {
+    var ownership = indexOwnershipWithDiversions(
+        allocator,
+        imported.model,
+        aliases,
+        request.diversion_records orelse imported.model.diversions,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return outOfMemory(arena, allocator),
         error.AliasCollision => return refusalResult(arena, allocator, .{
             .surface = .alias,
@@ -1903,7 +2021,7 @@ fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
     try validateProgram(builder);
     builder.diversions = native_diversion.Index.init(
         builder.arena,
-        builder.database.model.diversions,
+        builder.request.diversion_records orelse builder.database.model.diversions,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDiversion => return builder.fail(.{
@@ -9124,10 +9242,11 @@ fn materializeConfigure(
     const stat_overrides = request.planning.stat_overrides orelse
         try native_statoverride.read(owned, request.root, database.model.stat_overrides);
     try observed_paths.appendSlice(allocator, stat_overrides.observed_paths);
-    const diversions = try native_diversion.Index.init(owned, database.model.diversions);
+    const diversion_records = request.planning.diversion_records orelse database.model.diversions;
+    const diversions = try native_diversion.Index.init(owned, diversion_records);
     const aliases = try detectAliases(allocator, request.root);
     defer deinitAliasEvidence(allocator, aliases);
-    var ownership = try indexOwnership(allocator, database.model, aliases);
+    var ownership = try indexOwnershipWithDiversions(allocator, database.model, aliases, diversion_records);
     defer ownership.deinit();
 
     for (bound.items) |*archive| {
@@ -9694,10 +9813,12 @@ fn materializeRemoval(
     const aliases = detectAliases(allocator, request.root) catch
         return .{ .outcome = .handoff, .detail = "root_alias" };
     defer deinitAliasEvidence(allocator, aliases);
-    var ownership = indexOwnership(
+    const diversion_records = request.planning.diversion_records orelse database.model.diversions;
+    var ownership = indexOwnershipWithDiversions(
         allocator,
         database.model,
         aliases,
+        diversion_records,
     ) catch return .{
         .outcome = .refused,
         .detail = "ownership_index",
@@ -9705,7 +9826,7 @@ fn materializeRemoval(
     defer ownership.deinit();
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     defer retained.deinit(allocator);
-    const diversions = try native_diversion.Index.init(owned, database.model.diversions);
+    const diversions = try native_diversion.Index.init(owned, diversion_records);
     var observed_paths: std.ArrayList([]const u8) = .empty;
     defer observed_paths.deinit(allocator);
     try observed_paths.appendSlice(allocator, request.observed_paths);
@@ -12210,6 +12331,7 @@ fn collectArchiveTriggerEvents(
     architecture: []const u8,
     model: *const archive_application.Model,
     events: *std.ArrayList(RuntimeTriggerEvent),
+    diversion_records: ?[]const package_database.DiversionRecord,
 ) !void {
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
@@ -12242,7 +12364,7 @@ fn collectArchiveTriggerEvents(
     }
     var seen_file: std.StringHashMapUnmanaged(void) = .empty;
     defer seen_file.deinit(allocator);
-    var diversions = try native_diversion.Index.init(allocator, database.model.diversions);
+    var diversions = try native_diversion.Index.init(allocator, diversion_records orelse database.model.diversions);
     defer diversions.deinit(allocator);
     for (database.model.triggers.interests) |interest| {
         if (interest.trigger.len == 0 or interest.trigger[0] != '/' or
@@ -12890,6 +13012,7 @@ fn lifecyclePhaseRequest(
             .trigger_execution = program.trigger_authority != null,
             .lifecycle_sequences = sequences,
             .stat_overrides = execution.stat_overrides,
+            .diversion_records = if (execution.diversion_cache) |cache| cache.cache.records else null,
         },
         .locks = locks,
         .operation = operation,
@@ -15221,6 +15344,16 @@ fn retainNativeEvidence(
         .receipt_name = "managed-state.json",
         .document_sha256 = managed.digest_sha256,
     });
+    if (try readManagedDiversionCache(scratch, root, intent.digest_sha256)) |value| {
+        var cached = value;
+        defer cached.deinit();
+        try sources.append(scratch, .{
+            .kind = .diversion_cache,
+            .source_path = native_recovery.diversion_cache_path,
+            .receipt_name = "diversion-cache.json",
+            .document_sha256 = cached.digest_sha256,
+        });
+    }
     try sources.append(scratch, .{
         .kind = .trigger_events,
         .source_path = native_recovery.trigger_events_path,
@@ -15785,12 +15918,16 @@ fn runLifecycleScript(
             arguments,
             report,
         );
+        refreshExecutionDiversions(execution, allocator, root, mid_unpack) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
         if (mid_unpack and execution.phase_steps == null)
             validateManagedDiversionUpdate(allocator, runtime, true) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;
             };
-        managed_checkpoint_sha256 = checkpointManagedPaths(
+        managed_checkpoint_sha256 = checkpointManagedPathsAfterCacheValidation(
             allocator,
             runtime,
             recovery_action,
@@ -15821,17 +15958,12 @@ fn runLifecycleScript(
         }
         if (recovery_action.kind == .trigger)
             runtime.crash.hit(.after_trigger_outcome);
+    } else {
+        refreshExecutionDiversions(execution, allocator, root, mid_unpack) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
     }
-    const next_diversions = try native_diversion.observe(allocator, root);
-    native_diversion.validateUpdate(
-        execution.diversion_observation,
-        next_diversions,
-        mid_unpack,
-    ) catch |err| {
-        try attempt.requireRecovery(allocator, .script);
-        return err;
-    };
-    execution.diversion_observation = next_diversions;
     const code = switch (report.outcome) {
         .exited => |value| value,
         else => if (!report.outcome.spawned())
@@ -15938,6 +16070,7 @@ fn diversionUpdateFailure(err: anyerror) ?native_diversion.UpdateError {
     return switch (err) {
         error.UnsupportedInPlaceDiversionUpdate => error.UnsupportedInPlaceDiversionUpdate,
         error.UnsupportedMidUnpackDiversionUpdate => error.UnsupportedMidUnpackDiversionUpdate,
+        error.InvalidDiversionUpdate => error.InvalidDiversionUpdate,
         else => null,
     };
 }
@@ -16601,6 +16734,7 @@ fn prepareNativeRecovery(
     archive_bytes: []const []const u8,
     initial_snapshot: package_database.Snapshot,
     stat_overrides: native_statoverride.Resolved,
+    diversion_cache: native_diversion.CachedRecords,
     attempt: *root_operation.Attempt,
     production_request: ?native_execution_request.Document,
     helper_binding: ?native_helper.Binding,
@@ -16903,9 +17037,11 @@ fn prepareNativeRecovery(
         root,
         intent.digest_sha256,
     );
-    const observed_paths = try allocator.alloc([]const u8, stat_overrides.observed_paths.len + 1);
+    try writeDiversionCache(allocator, root, intent.digest_sha256, diversion_cache, .fail_if_exists);
+    const observed_paths = try allocator.alloc([]const u8, stat_overrides.observed_paths.len + 2);
     @memcpy(observed_paths[0..stat_overrides.observed_paths.len], stat_overrides.observed_paths);
     observed_paths[stat_overrides.observed_paths.len] = native_diversion.database_path;
+    observed_paths[stat_overrides.observed_paths.len + 1] = native_recovery.diversion_cache_path;
     _ = try native_recovery.updateManagedState(
         allocator,
         root,
@@ -17159,8 +17295,17 @@ fn recoverNativeRootMutation(
     attempt: *root_operation.Attempt,
     runtime: *native_recovery.Runtime,
     bounds: ?*RuntimeBounds,
+    diversion_cache: *?native_diversion.Session,
 ) !bool {
     try checkRuntimeBounds(bounds);
+    if (try readManagedDiversionCache(allocator, root, runtime.intent_sha256)) |value| {
+        var cached = value;
+        defer cached.deinit();
+        diversion_cache.* = native_diversion.Session.restore(allocator, root, cached.cache) catch |err| switch (err) {
+            error.InvalidDiversionObservation => return error.ManagedStateChanged,
+            else => return err,
+        };
+    }
     var opened = try root_mutation.open(
         allocator,
         root,
@@ -17635,6 +17780,7 @@ fn orphanNativeEvidenceDetail(
             std.mem.eql(u8, name, native_recovery.program_name) or
             std.mem.eql(u8, name, "native-execution-progress-v1.log") or
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
+            std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
             std.mem.eql(u8, name, "native-trigger-events-v1.json") or
             std.mem.startsWith(
                 u8,
@@ -19046,6 +19192,10 @@ fn lifecycleExecutionError(err: anyerror) !LifecycleResult {
             .outcome = .recovery_required,
             .detail = "unsupported_mid_unpack_diversion_update",
         },
+        error.InvalidDiversionUpdate => .{
+            .outcome = .recovery_required,
+            .detail = "invalid_diversion_update",
+        },
         else => err,
     };
 }
@@ -19222,11 +19372,29 @@ fn executeLifecycleProgramWithRequest(
         .phase = .preflight,
     });
 
+    var diversion_session: ?native_diversion.Session = null;
+    defer if (diversion_session) |*session| session.deinit();
+    if (recovery_intent == null) {
+        diversion_session = try native_diversion.Session.open(allocator, root);
+        const captured_diversions: ?[]const u8 = if (locked_capture.snapshot.diversions) |entry| entry.bytes else null;
+        const cached_diversions = diversion_session.?.cache.bytes;
+        if ((captured_diversions == null) != (cached_diversions == null) or
+            (captured_diversions != null and !std.mem.eql(u8, captured_diversions.?, cached_diversions.?)))
+        {
+            if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = "database_generation_drift",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    }
     var recovery_runtime: native_recovery.Runtime = undefined;
     var execution_state: ExecutionState = .{
         .bounds = bounds,
         .stat_overrides = stat_overrides,
         .diversion_observation = try native_diversion.observe(allocator, root),
+        .diversion_cache = if (diversion_session) |*session| session else null,
     };
     const execution = &execution_state;
     if (recovery_intent) |intent| {
@@ -19285,6 +19453,7 @@ fn executeLifecycleProgramWithRequest(
             attempt,
             &recovery_runtime,
             bounds,
+            &diversion_session,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
             error.InvalidManagedState,
@@ -19317,6 +19486,7 @@ fn executeLifecycleProgramWithRequest(
                 .program_sha256 = program.digest_sha256,
             };
         }
+        execution.diversion_cache = if (diversion_session) |*session| session else null;
     } else if (external.recovery) {
         try execution.checkDeadline();
         recovery_runtime = try prepareNativeRecovery(
@@ -19328,6 +19498,7 @@ fn executeLifecycleProgramWithRequest(
             archive_bytes,
             initial_snapshot,
             execution.stat_overrides.?,
+            execution.diversion_cache.?.cache,
             attempt,
             production_request,
             helper_binding,
@@ -19690,6 +19861,7 @@ fn executeLifecycleProgramWithRequest(
                     program.target_architecture,
                     &models[model_index],
                     &trigger_events,
+                    if (execution.diversion_cache) |cache| cache.cache.records else null,
                 );
                 try persistRuntimeTriggerEvents(
                     execution,
@@ -20743,6 +20915,228 @@ test "native_unpack.test.diversions map exact logical names with literal package
     try testing.expectEqualStrings("usr/lib/local\\file.distrib", index.physical("usr/lib/local\\file", "wrapper"));
     try testing.expectEqualStrings("usr/share/directory.distrib", index.physical("usr/share/directory", "wrapper"));
     try testing.expectEqualStrings("usr/share/directory/child", index.physical("usr/share/directory/child", "wrapper"));
+}
+
+fn testDiversionObservation(bytes: []const u8, device: u64, inode: u64) native_diversion.Observation {
+    var digest: [32]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return .{ .device = device, .inode = inode, .sha256 = digest };
+}
+
+test "native_unpack.test.diversion cache owns records and reloads only changed file identities" {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    var mutable = original.*;
+    const before = testDiversionObservation(&mutable, 3, 4);
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, &mutable, before);
+    defer cache.deinit();
+    mutable[1] = 'x';
+    try testing.expectEqualStrings(original, cache.bytes.?);
+    try testing.expect(!try cache.refresh(original, before));
+    const inplace = testDiversionObservation(changed, 3, 4);
+    try testing.expect(!try cache.refresh(changed, inplace));
+    try testing.expectEqualStrings("usr/bin/tool.original", cache.index.physical("usr/bin/tool", "tool"));
+    try testing.expectEqualDeep(before, cache.loaded.?);
+    try testing.expectEqualDeep(inplace, cache.observed.?);
+    try testing.expect(!try cache.refresh(changed, inplace));
+    const replaced = testDiversionObservation(changed, 3, 5);
+    try testing.expect(try cache.refresh(changed, replaced));
+    try testing.expectEqualStrings("usr/bin/tool.changed", cache.index.physical("usr/bin/tool", "tool"));
+    try testing.expectEqualDeep(replaced, cache.loaded.?);
+    try testing.expect(try cache.refresh(original, testDiversionObservation(original, 4, 5)));
+    try testing.expectEqualStrings("usr/bin/tool.original", cache.index.physical("usr/bin/tool", "tool"));
+    const retained = cache.bytes.?.ptr;
+    try testing.expect(try cache.refresh(original, testDiversionObservation(original, 4, 6)));
+    try testing.expect(cache.bytes.?.ptr == retained);
+}
+
+test "native_unpack.test.diversion cache distinguishes absence from an empty file" {
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, null, null);
+    defer cache.deinit();
+    try testing.expect(!try cache.refresh(null, null));
+    try testing.expect(try cache.refresh("", testDiversionObservation("", 3, 4)));
+    try testing.expect(cache.loaded != null and cache.bytes != null);
+    try testing.expectEqual(@as(usize, 0), cache.records.len);
+    try testing.expect(try cache.refresh(null, null));
+    try testing.expect(cache.loaded == null and cache.bytes == null);
+}
+
+test "native_unpack.test.diversion cache refuses malformed live edits without advancing evidence" {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const before = testDiversionObservation(original, 3, 4);
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, original, before);
+    defer cache.deinit();
+    for ([_][]const u8{
+        "incomplete-record\n",
+        "/usr/bin/tool\n/../escape\n:\n",
+        "/usr/bin/tool\n/var/lib/debz/cache\n:\n",
+        original ++ original,
+    }) |invalid| {
+        for ([_]u64{ 4, 5 }) |inode| {
+            try testing.expectError(
+                error.InvalidDiversion,
+                cache.refresh(invalid, testDiversionObservation(invalid, 3, inode)),
+            );
+            try testing.expectEqualDeep(before, cache.loaded.?);
+            try testing.expectEqualDeep(before, cache.observed.?);
+            try testing.expectEqualStrings(original, cache.bytes.?);
+        }
+    }
+    try testing.expectError(error.InvalidDiversionObservation, cache.refresh("", before));
+    try testing.expectError(error.InvalidDiversionObservation, cache.refresh(null, before));
+    try testing.expectError(error.InvalidDiversionObservation, cache.refresh(original, null));
+    try testing.expectEqualDeep(before, cache.observed.?);
+}
+
+fn testDiversionCacheAllocations(allocator: std.mem.Allocator) !void {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    var cache = try native_diversion.CachedRecords.init(allocator, original, testDiversionObservation(original, 3, 4));
+    defer cache.deinit();
+    try testing.expect(!try cache.refresh(changed, testDiversionObservation(changed, 3, 4)));
+    try testing.expect(try cache.refresh(changed, testDiversionObservation(changed, 3, 5)));
+    try testing.expect(try cache.refresh(null, null));
+}
+
+test "native_unpack.test.diversion cache preserves ownership on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDiversionCacheAllocations, .{});
+}
+
+test "native_unpack.test.diversion cache evidence retains loaded bytes and binds the invocation" {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    const loaded = testDiversionObservation(original, 3, 4);
+    const observed = testDiversionObservation(changed, 3, 4);
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, original, loaded);
+    defer cache.deinit();
+    try testing.expect(!try cache.refresh(changed, observed));
+    const bytes = try native_diversion_cache.encode(testing.allocator, cache, @splat('0'));
+    defer testing.allocator.free(bytes);
+    var decoded = try native_diversion_cache.decode(testing.allocator, bytes, @splat('0'));
+    defer decoded.deinit();
+    try testing.expectEqualStrings(original, decoded.cache.bytes.?);
+    try testing.expectEqualDeep(loaded, decoded.cache.loaded.?);
+    try testing.expectEqualDeep(observed, decoded.cache.observed.?);
+    try testing.expectEqualStrings("usr/bin/tool.original", decoded.cache.index.physical("usr/bin/tool", "tool"));
+    try testing.expectError(
+        error.InvalidDiversionCache,
+        native_diversion_cache.decode(testing.allocator, bytes, @splat('1')),
+    );
+    const spaced = try std.fmt.allocPrint(testing.allocator, " {s}", .{bytes});
+    defer testing.allocator.free(spaced);
+    try testing.expectError(
+        error.InvalidDiversionCache,
+        native_diversion_cache.decode(testing.allocator, spaced, @splat('0')),
+    );
+    bytes[bytes.len - 3] = if (bytes[bytes.len - 3] == '0') '1' else '0';
+    try testing.expectError(
+        error.InvalidDiversionCache,
+        native_diversion_cache.decode(testing.allocator, bytes, @splat('0')),
+    );
+}
+
+test "native_unpack.test.diversion cache evidence distinguishes absent and empty inputs" {
+    for ([_]?[]const u8{ null, "" }) |contents| {
+        var cache = try native_diversion.CachedRecords.init(
+            testing.allocator,
+            contents,
+            if (contents) |bytes| testDiversionObservation(bytes, 3, 4) else null,
+        );
+        defer cache.deinit();
+        const bytes = try native_diversion_cache.encode(testing.allocator, cache, @splat('0'));
+        defer testing.allocator.free(bytes);
+        var decoded = try native_diversion_cache.decode(testing.allocator, bytes, @splat('0'));
+        defer decoded.deinit();
+        try testing.expectEqual(contents == null, decoded.cache.bytes == null);
+        try testing.expectEqualDeep(cache.loaded, decoded.cache.loaded);
+    }
+}
+
+fn testDiversionCacheEvidenceAllocations(allocator: std.mem.Allocator) !void {
+    const records = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    var cache = try native_diversion.CachedRecords.init(allocator, records, testDiversionObservation(records, 3, 4));
+    defer cache.deinit();
+    const bytes = try native_diversion_cache.encode(allocator, cache, @splat('0'));
+    defer allocator.free(bytes);
+    var decoded = try native_diversion_cache.decode(allocator, bytes, @splat('0'));
+    defer decoded.deinit();
+}
+
+test "native_unpack.test.diversion cache evidence releases partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, testDiversionCacheEvidenceAllocations, .{});
+}
+
+test "native_unpack.test.pinned diversion cache restores effective records without accepting live drift" {
+    var fixture: Fixture = undefined;
+    try fixture.init("", &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    const path = try root_fs.Path.init(native_diversion.database_path);
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    try root.publishFile(path, original, .{});
+    var session = try native_diversion.Session.open(testing.allocator, root);
+    defer session.deinit();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = native_diversion.database_path, .data = changed });
+    try testing.expect(try session.refresh(root, false));
+    try testing.expectEqualStrings(original, session.cache.bytes.?);
+    try testing.expect(!try session.refresh(root, true));
+    const bytes = try native_diversion_cache.encode(testing.allocator, session.cache, @splat('0'));
+    defer testing.allocator.free(bytes);
+    var decoded = try native_diversion_cache.decode(testing.allocator, bytes, @splat('0'));
+    defer decoded.deinit();
+    var restored = try native_diversion.Session.restore(testing.allocator, root, decoded.cache);
+    defer restored.deinit();
+    try testing.expectEqualStrings("usr/bin/tool.original", restored.cache.index.physical("usr/bin/tool", "tool"));
+    try root.publishFile(path, changed, .{ .overwrite = .replace });
+    try testing.expectError(error.UnsupportedMidUnpackDiversionUpdate, session.refresh(root, true));
+    try testing.expectEqualStrings(original, session.cache.bytes.?);
+    try testing.expectError(
+        error.InvalidDiversionObservation,
+        native_diversion.Session.restore(testing.allocator, root, decoded.cache),
+    );
+    try testing.expect(try session.refresh(root, false));
+    try testing.expectEqualStrings(changed, session.cache.bytes.?);
+    try testing.expectEqualStrings("usr/bin/tool.changed", session.cache.index.physical("usr/bin/tool", "tool"));
+    try root.removeFile(path);
+    try testing.expect(try session.refresh(root, false));
+    try testing.expect(session.pinned == null and session.cache.bytes == null);
+}
+
+test "native_unpack.test.managed cache reads require observed bytes and metadata" {
+    var fixture: Fixture = undefined;
+    try fixture.init("", &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.ensureDirectory(try root_fs.Path.init(root_operation.namespace_path), root_fs.default_directory_permissions);
+    const intent: native_recovery.Digest = @splat('0');
+    const path = try root_fs.Path.init(native_recovery.diversion_cache_path);
+    try native_recovery.initializeProgress(testing.allocator, root, intent);
+    try native_recovery.initializeManagedState(testing.allocator, root, intent);
+    try root.publishFile(path, "cache evidence", .{});
+    try testing.expect(try native_recovery.readManagedFile(
+        testing.allocator,
+        root,
+        intent,
+        path.text,
+        1024,
+    ) == null);
+    _ = try native_recovery.updateManagedState(
+        testing.allocator,
+        root,
+        intent,
+        nativeAction(.verification, 0, 0, 0),
+        &.{path.text},
+        false,
+    );
+    const bytes = (try native_recovery.readManagedFile(testing.allocator, root, intent, path.text, 1024)).?;
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("cache evidence", bytes);
+    try root.publishFile(path, "cache evidence", .{ .overwrite = .replace });
+    try testing.expectError(
+        error.ManagedStateChanged,
+        native_recovery.readManagedFile(testing.allocator, root, intent, path.text, 1024),
+    );
 }
 
 test "native_unpack.test.diversion indexes refuse ambiguous endpoints" {
@@ -22916,6 +23310,8 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try native_operation.bind(testing.allocator, root, &caller, compiled.program.program);
         const document = try native_execution_request.create(root, &caller, compiled.program.program, .install);
         const request_bytes = try native_execution_request.encode(arena.allocator(), document);
+        var diversion_cache = try native_diversion.Session.open(testing.allocator, root);
+        defer diversion_cache.deinit();
         _ = try prepareNativeRecovery(
             arena.allocator(),
             root,
@@ -22925,6 +23321,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             &.{bytes},
             fixture.snapshot(),
             .{},
+            diversion_cache.cache,
             &caller,
             document,
             null,

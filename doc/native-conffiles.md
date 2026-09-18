@@ -72,6 +72,8 @@ recovery-state publication is propagated rather than ignored.
 
 Diverted conffiles are staged, compared and configured at their physical
 destination, but retain their logical name in control records and checksums.
+Routing uses the invocation's effective diversion cache, not just the latest
+live diversion bytes.
 Both administrator-conffile policies and side files apply at that destination.
 Removal retains them; purge retires their package records without deleting
 diverted live or side files, matching dpkg. Retained diverted conffiles remain

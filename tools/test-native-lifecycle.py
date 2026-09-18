@@ -697,10 +697,14 @@ if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ -f /diversion-helper-record ]; th
     /diversion-helper --local --no-rename --remove "$source" || exit 28
     /diversion-helper --local --no-rename --divert "$destination" --add "$source" || exit 28
 fi
+inplace="/diversion-$DPKG_MAINTSCRIPT_NAME-inplace"
 if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ -f /diversion-inplace-record ]; then
+    inplace=/diversion-inplace-record
+fi
+if [ -f "$inplace" ]; then
     while IFS= read -r line; do
         printf '%s\\n' "$line"
-    done < /diversion-inplace-record > /var/lib/dpkg/diversions
+    done < "$inplace" > /var/lib/dpkg/diversions
 fi
 """
     guard = f"if [ -f /{FAILURE} ]; then\n".encode()
@@ -735,6 +739,13 @@ def seed_diversion_replacement(root: Path, kind: str, records: bytes) -> None:
     path = root / f"diversion-{kind}-replace"
     m.write(path, records)
     os.utime(path, (m.EPOCH, m.EPOCH))
+
+
+def seed_diversion_inplace(root: Path, kind: str, records: bytes) -> None:
+    path = root / f"diversion-{kind}-inplace"
+    m.write(path, records)
+    os.utime(path, (m.EPOCH, m.EPOCH))
+
 
 def seed_diversion_helper(root: Path, source: str, destination: str) -> None:
     runtime.copy_program(root, Path("/usr/bin/dpkg-divert"), "/diversion-helper")
@@ -832,13 +843,12 @@ def exercise_diversion_lifecycle(
             ("direct-destination", diversion_records("usr/share/unshipped-file", source), "invalid_diversion", False),
             ("reserved-destination", diversion_records(source, "var/lib/dpkg/diversions"), "invalid_diversion", True),
             ("private-destination", diversion_records(source, "var/lib/debz/root-operation-v1.json"), "invalid_diversion", True),
-            ("inplace", diversion_records(source, source + ".original"), "unsupported_in_place_diversion_update", False),
+            ("malformed-inplace", diversion_records(source, source + ".original"), "invalid_diversion_update", False),
         ):
             current = Scenario(workspace, f"diversion-refusal-{name}", executable, architecture, environment)
             seed_diversions(current.candidate, records)
-            if name == "inplace":
-                m.write(current.candidate / "diversion-inplace-record", diversion_records(source, source + ".changed"))
-                os.utime(current.candidate / "diversion-inplace-record", (m.EPOCH, m.EPOCH))
+            if name == "malformed-inplace":
+                seed_diversion_inplace(current.candidate, "preinst", b"incomplete-record\n")
             excludes = ("var/lib/debz", m.GUARD, *(f"var/lib/dpkg/{path}" for path in m.oracle.LOCK_FILES))
             before = m.oracle.capture_tree(current.candidate, m.oracle.Limits(), excludes)
             output = current.directory / "refusal"
@@ -854,6 +864,42 @@ def exercise_diversion_lifecycle(
                 )
             assert not (current.candidate / source).exists()
             print(f"diversion-refusal-{name}: unsupported routing refuses explicitly", flush=True)
+
+    for name, operation, kind, conffile, empty in (
+        ("install", "install", "preinst", False, False),
+        ("upgrade", "upgrade", "preinst", False, False),
+        ("postinst", "install", "postinst", False, False),
+        ("remove", "remove", "prerm", False, False),
+        ("empty", "install", "preinst", False, True),
+        ("conffile", "upgrade", "preinst", True, False),
+    ):
+        current = Scenario(workspace, f"diversion-cache-{name}", executable, architecture, environment)
+        source = "etc/debz-native.conf" if conffile else f"{DIVERSION_BASE}/mode"
+        for root in current.roots:
+            seed_diversions(root, diversion_records(source, source + ".original"))
+        if operation != "install":
+            current.seed(archives["1"])
+        for root in current.roots:
+            seed_diversion_inplace(root, kind, b"" if empty else diversion_records(source, source + ".changed"))
+        version = "2" if operation == "upgrade" else "1"
+        current.phase(operation, [archives[version]] if operation != "remove" else [], names=(DIVERSION_PACKAGE,))
+        if operation != "remove":
+            current.phase("reinstall", [archives[version]], names=(DIVERSION_PACKAGE,))
+            current.phase("remove", names=(DIVERSION_PACKAGE,))
+        current.phase("purge", names=(DIVERSION_PACKAGE,))
+        current.complete()
+
+    current = Scenario(workspace, "diversion-cache-atomic-then-inplace", executable, architecture, environment)
+    source = f"{DIVERSION_BASE}/mode"
+    for root in current.roots:
+        seed_diversions(root, diversion_records(source, source + ".original"))
+        seed_diversion_replacement(root, "preinst", diversion_records(source, source + ".atomic"))
+        seed_diversion_inplace(root, "postinst", diversion_records(source, source + ".changed"))
+    current.phase("install", [archives["1"]], names=(DIVERSION_PACKAGE,))
+    current.phase("reinstall", [archives["1"]], names=(DIVERSION_PACKAGE,))
+    current.phase("remove", names=(DIVERSION_PACKAGE,))
+    current.phase("purge", names=(DIVERSION_PACKAGE,))
+    current.complete()
 
     source = f"{DIVERSION_BASE}/mode"
     for kind, initially_present in (("preinst", True), ("preinst", False), ("postinst", True)):

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-diversion-cache-v1",
+  "title": "Native diversion cache v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "intent_sha256",
+    "loaded",
+    "observed",
+    "contents_base64",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-diversion-cache-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "loaded": {
+      "oneOf": [
+        { "$ref": "#/$defs/observation" },
+        { "type": "null" }
+      ]
+    },
+    "observed": {
+      "oneOf": [
+        { "$ref": "#/$defs/observation" },
+        { "type": "null" }
+      ]
+    },
+    "contents_base64": {
+      "type": ["string", "null"],
+      "maxLength": 89478488,
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+    },
+    "digest_sha256": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "loaded": { "type": "null" } }
+      },
+      "then": {
+        "properties": {
+          "observed": { "type": "null" },
+          "contents_base64": { "type": "null" }
+        }
+      },
+      "else": {
+        "properties": {
+          "observed": { "$ref": "#/$defs/observation" },
+          "contents_base64": { "type": "string" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "inode", "sha256"],
+      "properties": {
+        "device": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "inode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "sha256": {
+          "type": "array",
+          "minItems": 32,
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          }
+        }
+      }
+    }
+  }
+}

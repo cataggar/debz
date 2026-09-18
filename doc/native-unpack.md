@@ -180,13 +180,17 @@ physical co-ownership when removing merged-/usr paths.
 The native database planner opts into preserving diversion records; it does not
 rewrite them. Maintainer scripts may atomically replace the database, including
 through genuine `dpkg-divert`. Later phases re-read and validate that state.
-An in-place content edit is explicitly unsupported: dpkg caches that inode's
-old records, and native execution does not pretend that re-reading the changed
-bytes is equivalent. Such edits stop further work with recovery required.
+Valid in-place edits retain the invocation's previously loaded records, matching
+dpkg's inode-aware cache. The loaded descriptor stays pinned; an atomic
+replacement or a newly created file reloads the effective records. A subsequent
+invocation starts from the current file. Live records are still validated:
+malformed or unsupported edits require recovery even when dpkg would continue
+using its old cache. The cache never replaces the genuine live database.
 Changes during an upgrade's old-postrm callback are also guarded, including
 after a fresh-process resume of the interrupted unpack. They require dpkg's
-previous-route trigger and retained `.dpkg-tmp` behavior; this and exact
-in-place cache semantics are tracked in [#192](https://github.com/cataggar/debz/issues/192).
+previous-route trigger and retained `.dpkg-tmp` behavior, tracked in
+[#192](https://github.com/cataggar/debz/issues/192). This also blocks an atomic
+replacement that activates earlier in-place edits without changing live bytes.
 
 For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build
