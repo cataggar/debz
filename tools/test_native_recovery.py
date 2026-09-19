@@ -362,6 +362,24 @@ class RecoveryOracleTests(unittest.TestCase):
                         )
                     run.assert_not_called()
 
+    def test_rollback_crash_seam_cannot_replace_recovery_inputs_or_core_completion(self) -> None:
+        for options in (
+            {"operation": "install", "caller_owned": True, "isolated_helper": True},
+            {"operation": "recover", "caller_owned": True, "isolated_helper": True, "core_product": True},
+            {"operation": "recover"},
+            {"operation": "recover", "caller_owned": True, "isolated_helper": True,
+             "recovery_crash": "after_execution_intent"},
+        ):
+            arguments = {"recovery_crash": "during_known_unpack_rollback", **options}
+            operation = arguments.pop("operation")
+            with self.subTest(options=options), mock.patch.object(acceptance.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "rollback crashes"):
+                    acceptance.native(
+                        self.workspace / "driver", self.root, "amd64", operation, [],
+                        {}, self.workspace, **arguments,
+                    )
+                run.assert_not_called()
+
     def test_projection_fixture_modes_cannot_be_combined(self) -> None:
         for function in (acceptance.projection_inside, acceptance.projected_process):
             for arguments in (
