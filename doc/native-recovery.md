@@ -65,6 +65,22 @@ valid in-place edits do not silently become atomic reloads. Cache byte, mode,
 identity and deletion drift blocks continuation before mutation-journal replay.
 Malformed live input remains refused. Known script outcomes are not rerun.
 
+Each unpack also freezes its effective cache before payload work in a managed
+`native-unpack-diversion-v1-<program-step>.json` input. Initial checkpoints
+observe every planned per-step path as absent. The canonical envelope binds the
+original execution intent and exact unpack step to the original
+`native-diversion-cache-v1` document, including its loaded/observed distinction.
+Re-entry uses these historical inputs for unpack routing and file-trigger
+selection rather than the invocation's later cache. This prevents a later
+postinst replacement from retargeting an earlier unpack during recovery.
+
+Retained `unpack_diversion_cache` evidence carries the same filesystem action
+identity. Completed-result verification checks the original program step,
+managed bytes and envelope binding; pending cleanup checks surviving files and
+rejects unbound extra names. Cleanup validates all cache inputs before removing
+any of them. Older executions without initial per-step observations never gain
+retrospectively reconstructed input files.
+
 Changes during old postrm still block resumed mutation before journal replay;
 the guard applies even if interruption causes the callback to resume outside
 the original in-memory mutation frame, or an identical atomic replacement would
@@ -74,8 +90,8 @@ Older executions without cache evidence retain their atomic-update guards;
 they never reconstruct an effective cache from changed live bytes.
 An older checkpoint without diversion observations can resume only while the
 diversion database is absent; a present unobserved database blocks continuation.
-Existing intent, progress and managed-state schemas are unchanged. The new
-cache evidence does not substitute or rewrite the live diversion database.
+Existing intent, progress and managed-state schemas are unchanged. The cache
+and per-unpack evidence do not substitute or rewrite the live diversion database.
 
 ## Script and trigger continuation
 

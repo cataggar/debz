@@ -979,6 +979,7 @@ fn installReleaseFiles(
         "native-execution-request-v2.json",
         "native-managed-state-v1.json",
         "native-diversion-cache-v1.json",
+        "native-unpack-diversion-v1.json",
         "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",
         "native-transaction-program-v1.json",

@@ -9,6 +9,7 @@ const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
+const native_unpack_diversion = @import("native_unpack_diversion.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
 const native_trigger = @import("native_trigger.zig");
 const package_origin = @import("package_origin.zig");
@@ -826,6 +827,7 @@ fn verifyStateEvidence(
     try equalDigest(managed.document.intent_sha256, proof.execution_intent_sha256);
     if (managed.document.transient != null) return error.InvalidManagedState;
     try verifyDiversionCacheEvidence(allocator, root, proof, managed.document);
+    try verifyUnpackDiversionEvidence(allocator, root, proof, managed.document, program.program, progress.document);
     switch (expected_outcome) {
         .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
         .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
@@ -871,6 +873,63 @@ fn verifyDiversionCacheEvidence(
     } else if (database_entry.kind != .absent) return error.InvalidManagedState;
 }
 
+fn verifyUnpackDiversionEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    proof: native_provenance.Document,
+    managed: native_recovery.ManagedStateDocument,
+    program: native_program.Program,
+    progress: native_recovery.ProgressDocument,
+) !void {
+    var entries: std.AutoHashMapUnmanaged(u32, native_recovery.ManagedEntry) = .empty;
+    defer entries.deinit(allocator);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(allocator);
+    if (managed.stable) |snapshot| for (snapshot.entries) |entry| {
+        const step = (try native_recovery.unpackDiversionStep(entry.path)) orelse continue;
+        if (step >= program.steps.len or program.steps[step].sequence != step or
+            program.steps[step].operation != .unpack_package or
+            (entry.kind != .regular and entry.kind != .absent))
+            return error.InvalidManagedState;
+        if (entry.kind == .absent and native_recovery.latest(progress, .{
+            .kind = .filesystem,
+            .program_step = step,
+            .substep = 0,
+            .ordinal = 0,
+        }) != null) return error.EvidenceMissing;
+        const found = try entries.getOrPut(allocator, step);
+        if (found.found_existing) return error.InvalidManagedState;
+        found.value_ptr.* = entry;
+    };
+    for (proof.evidence_files) |file| {
+        if (file.kind != .unpack_diversion_cache) continue;
+        const action = file.action orelse return error.EvidenceMissing;
+        if (action.kind != .filesystem or action.substep != 0 or action.ordinal != 0)
+            return error.InvalidEvidence;
+        const entry = entries.get(action.program_step) orelse return error.InvalidManagedState;
+        if (entry.kind != .regular or entry.size != file.size)
+            return error.InvalidManagedState;
+        if ((try seen.getOrPut(allocator, action.program_step)).found_existing)
+            return error.InvalidEvidence;
+        try equalDigest(file.sha256, entry.content_sha256 orelse return error.InvalidManagedState);
+        const bytes = try readEvidenceFile(allocator, root, file, native_unpack_diversion.maximum_document_bytes);
+        defer allocator.free(bytes);
+        var decoded = try native_unpack_diversion.decode(
+            allocator,
+            bytes,
+            proof.execution_intent_sha256,
+            action.program_step,
+        );
+        defer decoded.deinit();
+        try equalDigest(file.document_sha256 orelse return error.EvidenceMissing, decoded.digest_sha256);
+    }
+    var iterator = entries.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.kind == .regular and !seen.contains(entry.key_ptr.*))
+            return error.EvidenceMissing;
+    }
+}
+
 fn verifyTerminalOutcome(
     expected: TerminalOutcome,
     receipt: native_provenance.Outcome,
@@ -899,12 +958,18 @@ fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof
     for (observed.members) |member| {
         if (std.mem.startsWith(u8, member.name, ".debz-native-"))
             return error.UnresolvedNativeEvidence;
-        if (!std.mem.startsWith(u8, member.name, native_recovery.script_outcome_prefix)) continue;
+        const script = std.mem.startsWith(u8, member.name, native_recovery.script_outcome_prefix);
+        const unpack = std.mem.startsWith(u8, member.name, native_recovery.unpack_diversion_prefix);
+        if (!script and !unpack) continue;
         var matched = false;
         for (proof.evidence_files) |file| {
-            if (file.kind != .script_outcome) continue;
+            if ((script and file.kind != .script_outcome) or
+                (unpack and file.kind != .unpack_diversion_cache)) continue;
             var path_buffer: [128]u8 = undefined;
-            const path = try activeScriptOutcomePath(file, &path_buffer);
+            const path = if (script)
+                try activeScriptOutcomePath(file, &path_buffer)
+            else
+                try activeUnpackDiversionPath(file, &path_buffer);
             if (std.mem.eql(u8, member.name, std.fs.path.basename(path))) {
                 matched = true;
                 break;
@@ -939,11 +1004,33 @@ fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof
         allocator.free(bytes);
     }
     for (proof.evidence_files) |file| {
-        if (file.kind != .script_outcome) continue;
+        if (file.kind != .script_outcome and file.kind != .unpack_diversion_cache) continue;
         var path_buffer: [128]u8 = undefined;
-        const path = try activeScriptOutcomePath(file, &path_buffer);
+        const path = if (file.kind == .script_outcome)
+            try activeScriptOutcomePath(file, &path_buffer)
+        else
+            try activeUnpackDiversionPath(file, &path_buffer);
         try verifyRemainingFile(allocator, root, path, file.sha256, file.size);
+        if (file.kind == .unpack_diversion_cache and
+            try root.entryIfExists(try root_fs.Path.init(path)) != null)
+        {
+            const bytes = (try native_recovery.readManagedFile(
+                allocator,
+                root,
+                proof.execution_intent_sha256,
+                path,
+                native_unpack_diversion.maximum_document_bytes,
+            )) orelse return error.InvalidManagedState;
+            allocator.free(bytes);
+        }
     }
+}
+
+fn activeUnpackDiversionPath(file: native_provenance.EvidenceFile, buffer: *[128]u8) ![]const u8 {
+    const action = file.action orelse return error.EvidenceMissing;
+    if (action.kind != .filesystem or action.substep != 0 or action.ordinal != 0)
+        return error.InvalidEvidence;
+    return native_recovery.unpackDiversionPath(action.program_step, buffer);
 }
 
 fn activeScriptOutcomePath(file: native_provenance.EvidenceFile, buffer: *[128]u8) ![]const u8 {
@@ -1109,6 +1196,15 @@ fn readEvidence(
     maximum_bytes: usize,
 ) ![]u8 {
     const file = try evidenceFile(receipt, kind);
+    return readEvidenceFile(allocator, root, file, maximum_bytes);
+}
+
+fn readEvidenceFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    file: native_provenance.EvidenceFile,
+    maximum_bytes: usize,
+) ![]u8 {
     if (file.size > maximum_bytes) return error.EvidenceTooLarge;
     const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(file.path), maximum_bytes);
     errdefer allocator.free(bytes);

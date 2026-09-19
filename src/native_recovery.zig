@@ -32,11 +32,33 @@ pub const script_outcome_prefix = "native-script-outcome-v1-";
 pub const trigger_events_path = "var/lib/debz/native-trigger-events-v1.json";
 pub const managed_state_path = "var/lib/debz/native-managed-state-v1.json";
 pub const diversion_cache_path = "var/lib/debz/native-diversion-cache-v1.json";
+pub const unpack_diversion_prefix = "native-unpack-diversion-v1-";
 pub const maximum_intent_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_progress_bytes: usize = 64 * 1024 * 1024;
 pub const maximum_records: usize = 200_000;
 pub const maximum_blobs: usize = 200_000;
 pub const crash_exit_code: u8 = 86;
+
+pub fn unpackDiversionPath(program_step: u32, buffer: *[128]u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        root_operation.namespace_path ++ "/" ++ unpack_diversion_prefix ++ "{d}.json",
+        .{program_step},
+    );
+}
+
+pub fn unpackDiversionStep(path: []const u8) !?u32 {
+    const prefix = root_operation.namespace_path ++ "/" ++ unpack_diversion_prefix;
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, ".json") or path.len <= prefix.len + ".json".len)
+        return error.InvalidUnpackDiversionPath;
+    const step = std.fmt.parseUnsigned(u32, path[prefix.len .. path.len - ".json".len], 10) catch
+        return error.InvalidUnpackDiversionPath;
+    var buffer: [128]u8 = undefined;
+    if (!std.mem.eql(u8, path, try unpackDiversionPath(step, &buffer)))
+        return error.InvalidUnpackDiversionPath;
+    return step;
+}
 
 pub const CrashPoint = enum {
     after_execution_intent,
@@ -1866,23 +1888,56 @@ pub fn verifyBlob(
     return bytes;
 }
 
+fn cleanupDiversionEvidence(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+) !void {
+    var namespace = try root.pinDirectory(try root_fs.Path.init(root_operation.namespace_path));
+    defer namespace.close();
+    var observed = try namespace.observeAlloc(allocator, maximum_records, 64 * 1024 * 1024);
+    defer observed.deinit();
+    for (observed.members) |member| {
+        if (!std.mem.startsWith(u8, member.name, unpack_diversion_prefix)) continue;
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
+        _ = (try unpackDiversionStep(path)) orelse return error.InvalidManagedState;
+        const bytes = (try readManagedFile(
+            allocator,
+            root,
+            intent_sha256,
+            path,
+            maximum_managed_state_bytes,
+        )) orelse return error.InvalidManagedState;
+        allocator.free(bytes);
+    }
+    const cache_path = try root_fs.Path.init(diversion_cache_path);
+    const cache_present = try root.entryIfExists(cache_path) != null;
+    if (cache_present) {
+        const bytes = (try readManagedFile(
+            allocator,
+            root,
+            intent_sha256,
+            diversion_cache_path,
+            maximum_managed_state_bytes,
+        )) orelse return error.InvalidManagedState;
+        allocator.free(bytes);
+    }
+    for (observed.members) |member| {
+        if (!std.mem.startsWith(u8, member.name, unpack_diversion_prefix)) continue;
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
+        try root.removeFile(try root_fs.Path.init(path));
+    }
+    if (cache_present) try root.removeFile(cache_path);
+}
+
 pub fn cleanup(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     intent: Intent,
 ) !void {
-    const cache_path = try root_fs.Path.init(diversion_cache_path);
-    if (try root.entryIfExists(cache_path) != null) {
-        const bytes = (try readManagedFile(
-            allocator,
-            root,
-            intent.digest_sha256,
-            diversion_cache_path,
-            maximum_managed_state_bytes,
-        )) orelse return error.InvalidManagedState;
-        allocator.free(bytes);
-        try root.removeFile(cache_path);
-    }
+    try cleanupDiversionEvidence(allocator, root, intent.digest_sha256);
     for (intent.blobs) |blob| {
         root.removeFile(try root_fs.Path.init(blob.storage_path)) catch |err|
             switch (err) {
@@ -1916,6 +1971,38 @@ pub fn cleanup(
         };
     }
     try root.syncDirectory(try root_fs.Path.init(root_operation.namespace_path));
+}
+
+test "native_recovery.test.diversion cleanup validates every cache before deleting evidence" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const intent: Digest = @splat('0');
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    var buffer: [128]u8 = undefined;
+    const unpack = try root_fs.Path.init(try unpackDiversionPath(7, &buffer));
+    const cache = try root_fs.Path.init(diversion_cache_path);
+    try root.publishFile(unpack, "bound unpack bytes", .{});
+    try root.publishFile(cache, "bound current bytes", .{});
+    const action: Action = .{ .kind = .verification, .program_step = 0, .substep = 0, .ordinal = 0 };
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{ unpack.text, cache.text }, false);
+    try root.publishFile(cache, "changed current bytes", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, cleanupDiversionEvidence(testing.allocator, root, intent));
+    try testing.expect(try root.entryIfExists(unpack) != null);
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
+    try root.publishFile(unpack, "changed unpack bytes", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, cleanupDiversionEvidence(testing.allocator, root, intent));
+    try testing.expect(try root.entryIfExists(cache) != null);
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
+    try cleanupDiversionEvidence(testing.allocator, root, intent);
+    try cleanupDiversionEvidence(testing.allocator, root, intent);
+    try testing.expect(try root.entryIfExists(unpack) == null);
+    try testing.expect(try root.entryIfExists(cache) == null);
 }
 
 fn canonicalJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {

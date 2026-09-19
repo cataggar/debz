@@ -43,6 +43,7 @@ const native_recovery = @import("native_recovery.zig");
 const native_statoverride = @import("native_statoverride.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
+const native_unpack_diversion = @import("native_unpack_diversion.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -287,6 +288,63 @@ fn writeDiversionCache(
         .overwrite = overwrite,
         .durable = true,
     });
+}
+
+fn captureUnpackDiversions(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program_step: u32,
+) !?native_diversion.CachedRecords {
+    const session = execution.diversion_cache orelse return null;
+    const runtime = execution.recovery orelse return try session.cache.clone(allocator);
+    var path_buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackDiversionPath(program_step, &path_buffer);
+    var managed = try native_recovery.readManagedState(allocator, root);
+    defer managed.deinit();
+    if (!std.mem.eql(u8, &managed.document.intent_sha256, &runtime.intent_sha256) or
+        managed.document.transient != null)
+        return error.InvalidManagedState;
+    const kind = if (managed.document.stable) |snapshot| block: {
+        for (snapshot.entries) |entry|
+            if (std.mem.eql(u8, entry.path, path)) break :block entry.kind;
+        break :block null;
+    } else null;
+    if (kind == null) {
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidManagedState;
+        return try session.cache.clone(allocator);
+    }
+    if (kind.? == .regular) {
+        const bytes = (try native_recovery.readManagedFile(
+            allocator,
+            root,
+            runtime.intent_sha256,
+            path,
+            native_unpack_diversion.maximum_document_bytes,
+        )) orelse return error.InvalidManagedState;
+        defer allocator.free(bytes);
+        const decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, program_step);
+        return decoded.cache;
+    }
+    if (kind.? != .absent) return error.InvalidManagedState;
+    try native_recovery.validateStableManagedState(allocator, root, runtime.intent_sha256);
+    const bytes = try native_unpack_diversion.encode(allocator, session.cache, runtime.intent_sha256, program_step);
+    defer allocator.free(bytes);
+    try root.publishFile(try root_fs.Path.init(path), bytes, .{
+        .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
+        .overwrite = .fail_if_exists,
+        .durable = true,
+    });
+    _ = try checkpointManagedPaths(
+        allocator,
+        runtime,
+        nativeAction(.filesystem, program_step, 0, 0),
+        &.{},
+        &.{path},
+        false,
+    );
+    return try session.cache.clone(allocator);
 }
 
 fn refreshExecutionDiversions(
@@ -13038,6 +13096,7 @@ fn lifecycleDataStep(
     package: native_program.PackageIdentity,
     hooks: root_mutation.Hooks,
     mutation_database_step: ?*u32,
+    publication_diversions: ?[]const package_database.DiversionRecord,
 ) !MaterializationResult {
     const model_index = lifecycleArchiveIndex(models, package) orelse
         return .{ .outcome = .refused, .detail = "archive_missing" };
@@ -13067,6 +13126,7 @@ fn lifecycleDataStep(
     );
     request.hooks = hooks;
     request.mutation_database_step = mutation_database_step;
+    if (publication_diversions) |records| request.planning.diversion_records = records;
     return materialize(allocator, request);
 }
 
@@ -15354,6 +15414,29 @@ fn retainNativeEvidence(
             .document_sha256 = cached.digest_sha256,
         });
     }
+    if (managed.transient orelse managed.stable) |snapshot| {
+        for (snapshot.entries) |entry| {
+            const step = (try native_recovery.unpackDiversionStep(entry.path)) orelse continue;
+            if (entry.kind == .absent) continue;
+            if (entry.kind != .regular) return error.InvalidManagedState;
+            const bytes = (try native_recovery.readManagedFile(
+                scratch,
+                root,
+                intent.digest_sha256,
+                entry.path,
+                native_unpack_diversion.maximum_document_bytes,
+            )) orelse return error.InvalidManagedState;
+            var decoded = try native_unpack_diversion.decode(scratch, bytes, intent.digest_sha256, step);
+            defer decoded.deinit();
+            try sources.append(scratch, .{
+                .kind = .unpack_diversion_cache,
+                .source_path = entry.path,
+                .receipt_name = try std.fmt.allocPrint(scratch, "unpack-diversions/{d}.json", .{step}),
+                .document_sha256 = decoded.digest_sha256,
+                .action = nativeAction(.filesystem, step, 0, 0),
+            });
+        }
+    }
     try sources.append(scratch, .{
         .kind = .trigger_events,
         .source_path = native_recovery.trigger_events_path,
@@ -17038,10 +17121,20 @@ fn prepareNativeRecovery(
         intent.digest_sha256,
     );
     try writeDiversionCache(allocator, root, intent.digest_sha256, diversion_cache, .fail_if_exists);
-    const observed_paths = try allocator.alloc([]const u8, stat_overrides.observed_paths.len + 2);
+    var unpack_count: usize = 0;
+    for (program.steps) |step| if (step.operation == .unpack_package) {
+        unpack_count += 1;
+    };
+    const observed_paths = try allocator.alloc([]const u8, stat_overrides.observed_paths.len + 2 + unpack_count);
     @memcpy(observed_paths[0..stat_overrides.observed_paths.len], stat_overrides.observed_paths);
     observed_paths[stat_overrides.observed_paths.len] = native_diversion.database_path;
     observed_paths[stat_overrides.observed_paths.len + 1] = native_recovery.diversion_cache_path;
+    var observed_index = stat_overrides.observed_paths.len + 2;
+    for (program.steps) |step| if (step.operation == .unpack_package) {
+        var buffer: [128]u8 = undefined;
+        observed_paths[observed_index] = try allocator.dupe(u8, try native_recovery.unpackDiversionPath(step.sequence, &buffer));
+        observed_index += 1;
+    };
     _ = try native_recovery.updateManagedState(
         allocator,
         root,
@@ -17781,6 +17874,7 @@ fn orphanNativeEvidenceDetail(
             std.mem.eql(u8, name, "native-execution-progress-v1.log") or
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
             std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
+            std.mem.startsWith(u8, name, native_recovery.unpack_diversion_prefix) or
             std.mem.eql(u8, name, "native-trigger-events-v1.json") or
             std.mem.startsWith(
                 u8,
@@ -19598,10 +19692,14 @@ fn executeLifecycleProgramWithRequest(
                 intent.package,
                 .{},
                 null,
+                null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
         .unpack_package => |intent| {
+            // File triggers name the route used by publication, not a later script's cache.
+            var publication_diversions = try captureUnpackDiversions(execution, allocator, root, step.sequence);
+            defer if (publication_diversions) |*cache| cache.deinit();
             if (crossed_configure_barrier) {
                 status_old_baseline = try root.readFileAlloc(
                     scratch,
@@ -19655,6 +19753,7 @@ fn executeLifecycleProgramWithRequest(
                 intent.package,
                 hooks,
                 if (post_unpack != null) &hook_context.target_step else null,
+                if (publication_diversions) |cache| cache.records else null,
             );
             if (post_unpack != null) {
                 if (hook_context.diversion_failure) |err| return err;
@@ -19861,7 +19960,7 @@ fn executeLifecycleProgramWithRequest(
                     program.target_architecture,
                     &models[model_index],
                     &trigger_events,
-                    if (execution.diversion_cache) |cache| cache.cache.records else null,
+                    if (publication_diversions) |cache| cache.records else null,
                 );
                 try persistRuntimeTriggerEvents(
                     execution,
@@ -20961,6 +21060,41 @@ test "native_unpack.test.diversion cache distinguishes absence from an empty fil
     try testing.expect(cache.loaded == null and cache.bytes == null);
 }
 
+test "native_unpack.test.publication diversion snapshots outlive live cache reloads" {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    const loaded = testDiversionObservation(original, 3, 4);
+    const observed = testDiversionObservation(changed, 3, 4);
+    var publication = block: {
+        var cache = try native_diversion.CachedRecords.init(testing.allocator, original, loaded);
+        defer cache.deinit();
+        try testing.expect(!try cache.refresh(changed, observed));
+        var frozen = try cache.clone(testing.allocator);
+        errdefer frozen.deinit();
+        try testing.expect(frozen.bytes.?.ptr != cache.bytes.?.ptr);
+        try testing.expect(try cache.refresh(changed, testDiversionObservation(changed, 3, 5)));
+        try testing.expectEqualStrings("usr/bin/tool.changed", cache.index.physical("usr/bin/tool", "tool"));
+        break :block frozen;
+    };
+    defer publication.deinit();
+    try testing.expectEqualDeep(loaded, publication.loaded.?);
+    try testing.expectEqualDeep(observed, publication.observed.?);
+    try testing.expectEqualStrings(original, publication.bytes.?);
+    try testing.expectEqualStrings("usr/bin/tool.original", publication.index.physical("usr/bin/tool", "tool"));
+    for ([_]?[]const u8{ null, "" }) |contents| {
+        var empty = try native_diversion.CachedRecords.init(
+            testing.allocator,
+            contents,
+            if (contents) |bytes| testDiversionObservation(bytes, 3, 4) else null,
+        );
+        defer empty.deinit();
+        var frozen = try empty.clone(testing.allocator);
+        defer frozen.deinit();
+        try testing.expectEqualDeep(empty.loaded, frozen.loaded);
+        try testing.expectEqual(contents == null, frozen.bytes == null);
+    }
+}
+
 test "native_unpack.test.diversion cache refuses malformed live edits without advancing evidence" {
     const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
     const before = testDiversionObservation(original, 3, 4);
@@ -20994,8 +21128,11 @@ fn testDiversionCacheAllocations(allocator: std.mem.Allocator) !void {
     var cache = try native_diversion.CachedRecords.init(allocator, original, testDiversionObservation(original, 3, 4));
     defer cache.deinit();
     try testing.expect(!try cache.refresh(changed, testDiversionObservation(changed, 3, 4)));
+    var publication = try cache.clone(allocator);
+    defer publication.deinit();
     try testing.expect(try cache.refresh(changed, testDiversionObservation(changed, 3, 5)));
     try testing.expect(try cache.refresh(null, null));
+    try testing.expectEqualStrings("usr/bin/tool.original", publication.index.physical("usr/bin/tool", "tool"));
 }
 
 test "native_unpack.test.diversion cache preserves ownership on allocation failure" {
@@ -21049,6 +21186,86 @@ test "native_unpack.test.diversion cache evidence distinguishes absent and empty
         defer decoded.deinit();
         try testing.expectEqual(contents == null, decoded.cache.bytes == null);
         try testing.expectEqualDeep(cache.loaded, decoded.cache.loaded);
+    }
+}
+
+test "native_unpack.test.unpack diversion inputs bind immutable cache bytes to a program step" {
+    const original = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    const changed = "/usr/bin/tool\n/usr/bin/tool.changed\n:\n";
+    var cache = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        original,
+        testDiversionObservation(original, 3, 4),
+    );
+    defer cache.deinit();
+    try testing.expect(!try cache.refresh(changed, testDiversionObservation(changed, 3, 4)));
+    const bytes = try native_unpack_diversion.encode(testing.allocator, cache, @splat('0'), 7);
+    defer testing.allocator.free(bytes);
+    var decoded = try native_unpack_diversion.decode(testing.allocator, bytes, @splat('0'), 7);
+    defer decoded.deinit();
+    try testing.expectEqualDeep(cache.loaded, decoded.cache.loaded);
+    try testing.expectEqualDeep(cache.observed, decoded.cache.observed);
+    try testing.expect(try cache.refresh(changed, testDiversionObservation(changed, 3, 5)));
+    try testing.expectEqualStrings("usr/bin/tool.original", decoded.cache.index.physical("usr/bin/tool", "tool"));
+    try testing.expectError(
+        error.InvalidUnpackDiversionCache,
+        native_unpack_diversion.decode(testing.allocator, bytes, @splat('1'), 7),
+    );
+    try testing.expectError(
+        error.InvalidUnpackDiversionCache,
+        native_unpack_diversion.decode(testing.allocator, bytes, @splat('0'), 8),
+    );
+    const spaced = try std.fmt.allocPrint(testing.allocator, " {s}", .{bytes});
+    defer testing.allocator.free(spaced);
+    try testing.expectError(
+        error.InvalidUnpackDiversionCache,
+        native_unpack_diversion.decode(testing.allocator, spaced, @splat('0'), 7),
+    );
+    bytes[bytes.len - 3] = if (bytes[bytes.len - 3] == '0') '1' else '0';
+    try testing.expectError(
+        error.InvalidUnpackDiversionCache,
+        native_unpack_diversion.decode(testing.allocator, bytes, @splat('0'), 7),
+    );
+}
+
+fn testUnpackDiversionAllocations(allocator: std.mem.Allocator) !void {
+    const records = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    for ([_]?[]const u8{ null, "", records }) |contents| {
+        var cache = try native_diversion.CachedRecords.init(
+            allocator,
+            contents,
+            if (contents) |bytes| testDiversionObservation(bytes, 3, 4) else null,
+        );
+        defer cache.deinit();
+        const bytes = try native_unpack_diversion.encode(allocator, cache, @splat('0'), 7);
+        defer allocator.free(bytes);
+        var decoded = try native_unpack_diversion.decode(allocator, bytes, @splat('0'), 7);
+        defer decoded.deinit();
+        try testing.expectEqual(contents == null, decoded.cache.bytes == null);
+    }
+}
+
+test "native_unpack.test.unpack diversion inputs release partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, testUnpackDiversionAllocations, .{});
+}
+
+test "native_unpack.test.unpack diversion paths have an exact bounded program step" {
+    for ([_]u32{ 0, 7, std.math.maxInt(u32) }) |step| {
+        var buffer: [128]u8 = undefined;
+        const path = try native_recovery.unpackDiversionPath(step, &buffer);
+        try testing.expectEqual(step, (try native_recovery.unpackDiversionStep(path)).?);
+    }
+    try testing.expect(try native_recovery.unpackDiversionStep(native_recovery.diversion_cache_path) == null);
+    for ([_][]const u8{
+        "07.json", "-1.json", "+1.json", "4294967296.json", ".json", "7.json.extra", "7", "7/child.json",
+    }) |suffix| {
+        const path = try std.fmt.allocPrint(
+            testing.allocator,
+            root_operation.namespace_path ++ "/" ++ native_recovery.unpack_diversion_prefix ++ "{s}",
+            .{suffix},
+        );
+        defer testing.allocator.free(path);
+        try testing.expectError(error.InvalidUnpackDiversionPath, native_recovery.unpackDiversionStep(path));
     }
 }
 

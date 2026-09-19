@@ -64,6 +64,7 @@ EVIDENCE_SCHEMAS = {
     "progress": "native-execution-progress-v1",
     "managed_state": "native-managed-state-v1",
     "diversion_cache": "native-diversion-cache-v1",
+    "unpack_diversion_cache": "native-unpack-diversion-v1",
     "trigger_events": "native-trigger-events-v1",
     "script_outcome": "native-script-outcome-v1",
 }
@@ -257,6 +258,21 @@ def namespace_path(root: Path, name: str) -> Path:
     return path
 
 
+def assert_cached_diversion_contents(cached: dict) -> None:
+    if cached["loaded"] is None:
+        if cached["observed"] is not None or cached["contents_base64"] is not None:
+            raise AssertionError("absent diversion cache has inconsistent evidence")
+        return
+    raw = base64.b64decode(cached["contents_base64"], validate=True)
+    if base64.b64encode(raw).decode() != cached["contents_base64"]:
+        raise AssertionError("diversion cache bytes are not canonically encoded")
+    if hashlib.sha256(raw).digest() != bytes(cached["loaded"]["sha256"]):
+        raise AssertionError("cached diversion bytes differ from their loaded digest")
+    observed = cached["observed"]
+    if observed is None or any(cached["loaded"][key] != observed[key] for key in ("device", "inode")):
+        raise AssertionError("cached and observed diversion file identities differ")
+
+
 def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
     expected_root = f"var/lib/debz/native-receipts-v1/{proof['attempt_id']}"
     if proof["evidence_root"] != expected_root:
@@ -293,7 +309,9 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             if value["intent_sha256"] != proof["execution_intent_sha256"]:
                 raise AssertionError("retained evidence belongs to another execution intent")
         documents.setdefault(kind, []).append(value)
-    for kind in EVIDENCE_SCHEMAS.keys() - {"script_outcome", "execution_request", "diversion_cache"}:
+    for kind in EVIDENCE_SCHEMAS.keys() - {
+        "script_outcome", "execution_request", "diversion_cache", "unpack_diversion_cache",
+    }:
         if len(documents.get(kind, [])) != 1:
             raise AssertionError(f"missing or duplicated retained {kind}")
     managed = documents["managed_state"][0]
@@ -311,23 +329,58 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         if cache_entry["kind"] != "regular" or cache_entry["content_sha256"] != cache_file["sha256"]:
             raise AssertionError("retained diversion cache differs from its managed checkpoint")
         cached = caches[0]
+        assert_cached_diversion_contents(cached)
         live = managed_entries["var/lib/dpkg/diversions"]
         if cached["loaded"] is None:
-            if cached["observed"] is not None or cached["contents_base64"] is not None or live["kind"] != "absent":
+            if live["kind"] != "absent":
                 raise AssertionError("absent diversion cache has inconsistent evidence")
         else:
-            raw = base64.b64decode(cached["contents_base64"], validate=True)
-            if base64.b64encode(raw).decode() != cached["contents_base64"]:
-                raise AssertionError("diversion cache bytes are not canonically encoded")
-            if hashlib.sha256(raw).digest() != bytes(cached["loaded"]["sha256"]):
-                raise AssertionError("cached diversion bytes differ from their loaded digest")
             observed = cached["observed"]
-            if any(cached["loaded"][key] != observed[key] for key in ("device", "inode")):
-                raise AssertionError("cached and observed diversion file identities differ")
             if live["kind"] != "regular" or any(live[key] != observed[key] for key in ("device", "inode")):
                 raise AssertionError("diversion cache does not bind the managed live file")
             if live["content_sha256"] != bytes(observed["sha256"]).hex():
                 raise AssertionError("observed diversion bytes differ from the managed checkpoint")
+    unpack_steps = {
+        step["sequence"] for step in documents["program"][0]["steps"]
+        if "unpack_package" in step["operation"]
+    }
+    unpack_entries = {}
+    unpack_prefix = "var/lib/debz/native-unpack-diversion-v1-"
+    actions = {
+        tuple(record["action"][key] for key in ("kind", "program_step", "substep", "ordinal"))
+        for record in documents["progress"][0]["records"]
+    }
+    for path, entry in managed_entries.items():
+        if not path.startswith(unpack_prefix):
+            continue
+        step = int(path.removeprefix(unpack_prefix).removesuffix(".json"))
+        if path != f"{unpack_prefix}{step}.json" or step not in unpack_steps:
+            raise AssertionError("unpack cache does not bind an original unpack step")
+        if entry["kind"] not in ("absent", "regular"):
+            raise AssertionError("invalid managed unpack cache kind")
+        if entry["kind"] == "absent" and ("filesystem", step, 0, 0) in actions:
+            raise AssertionError("executed unpack step has no frozen cache")
+        unpack_entries[step] = entry
+    seen_unpack = set()
+    unpack_files = [entry for entry in proof["evidence_files"] if entry["kind"] == "unpack_diversion_cache"]
+    for envelope, evidence in zip(documents.get("unpack_diversion_cache", []), unpack_files, strict=True):
+        step = envelope["program_step"]
+        if step in seen_unpack or step not in unpack_entries:
+            raise AssertionError("unpack cache has a duplicate or absent managed binding")
+        seen_unpack.add(step)
+        if evidence["action"] != {"kind": "filesystem", "program_step": step, "substep": 0, "ordinal": 0}:
+            raise AssertionError("unpack cache has a different action binding")
+        entry = unpack_entries[step]
+        if entry["kind"] != "regular" or entry["content_sha256"] != evidence["sha256"] or entry["size"] != evidence["size"]:
+            raise AssertionError("unpack cache differs from its managed checkpoint")
+        cached = json.loads(envelope["cache_json"])
+        validator("native-diversion-cache-v1").validate(cached)
+        assert_digest(cached, "native-diversion-cache-v1")
+        assert_cached_diversion_contents(cached)
+        if canonical(cached).decode() != envelope["cache_json"] or cached["intent_sha256"] != proof["execution_intent_sha256"]:
+            raise AssertionError("unpack cache has noncanonical or foreign cached inputs")
+    if seen_unpack != {step for step, entry in unpack_entries.items() if entry["kind"] == "regular"}:
+        raise AssertionError("managed unpack cache has no retained evidence")
     request_blobs = [blob for blob in documents["intent"][0]["blobs"] if blob["kind"] == "request"]
     if len(request_blobs) != 1:
         raise AssertionError("intent did not retain exactly one request binding")
@@ -1435,6 +1488,11 @@ def exercise_diversion_recovery(
         ("install", "after_execution_intent", "cache-file-drift"),
         ("install", "after_execution_intent", "cache-mode-drift"),
         ("install", "after_execution_intent", "cache-missing-drift"),
+        ("install", "after_trigger_outcome", "unpack-cache-file-drift"),
+        ("install", "after_trigger_outcome", "unpack-cache-mode-drift"),
+        ("install", "after_trigger_outcome", "unpack-cache-missing-drift"),
+        ("install", "after_provenance", "unpack-retained-file-drift"),
+        ("install", "after_provenance", "unpack-retained-missing-drift"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
         current = Scenario(workspace, name, executable, helper, architecture, environment)
@@ -1442,9 +1500,12 @@ def exercise_diversion_recovery(
         for root in current.roots:
             if mutation != "created":
                 lifecycle.seed_diversions(root, records)
+        interests = (f"/{lifecycle.DIVERSION_BASE}",)
+        if mutation in ("postinst", "atomic-then-inplace"):
+            interests = (f"/{destination}", f"/{source}.changed", f"/{source}.atomic")
         receiver = m.make_package(
             current.directory / "receiver", environment, architecture, "1", package="diversion-receiver",
-            triggers=f"interest-noawait /{lifecycle.DIVERSION_BASE}\n".encode(),
+            triggers="".join(f"interest-noawait {path}\n" for path in interests).encode(),
             scripts=lifecycle.scripts("diversion-receiver", "1"),
         )
         target = reference_helper_package(
@@ -1515,6 +1576,28 @@ def exercise_diversion_recovery(
             (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").chmod(0o644)
         elif mutation == "cache-missing-drift":
             (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").unlink()
+        elif mutation and mutation.startswith("unpack-cache-"):
+            caches = list((current.candidate / NAMESPACE).glob("native-unpack-diversion-v1-*.json"))
+            assert len(caches) == 1, caches
+            if mutation == "unpack-cache-file-drift":
+                m.write(caches[0], b"external unpack cache drift\n")
+            elif mutation == "unpack-cache-mode-drift":
+                caches[0].chmod(0o644)
+            elif mutation == "unpack-cache-missing-drift":
+                caches[0].unlink()
+            else:
+                raise AssertionError(f"unknown unpack cache mutation: {mutation}")
+        elif mutation and mutation.startswith("unpack-retained-"):
+            proof = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+            files = [entry for entry in proof["evidence_files"] if entry["kind"] == "unpack_diversion_cache"]
+            assert len(files) == 1, files
+            path = namespace_path(current.candidate, files[0]["path"])
+            if mutation == "unpack-retained-file-drift":
+                m.write(path, b"external retained unpack cache drift\n")
+            elif mutation == "unpack-retained-missing-drift":
+                path.unlink()
+            else:
+                raise AssertionError(f"unknown retained unpack cache mutation: {mutation}")
         before = triggers.snapshot(current.candidate)
         report = current.recover(trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True)
         assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode

@@ -58,7 +58,9 @@ Updates during an in-progress unpack's old postrm remain explicitly blocked;
 their previous-route/backup semantics are tracked in
 [#192](https://github.com/cataggar/debz/issues/192).
 File-trigger matching uses the diversion destination spelling, including when
-that spelling resolves through a merged-/usr alias. See
+that spelling resolves through a merged-/usr alias. Each unpack retains its own
+effective cache for that matching, including across recovery after later script
+updates. See
 [diversion routing](native-unpack.md#diversion-routing).
 
 Purge deletes conffile bytes and recognized side files before `postrm purge`,

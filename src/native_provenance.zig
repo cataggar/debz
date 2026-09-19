@@ -42,6 +42,7 @@ pub const EvidenceKind = enum {
     progress,
     managed_state,
     diversion_cache,
+    unpack_diversion_cache,
     trigger_events,
     script_outcome,
     active_script,
@@ -366,10 +367,21 @@ pub fn validate(document: Document) !void {
         for (document.evidence_files[0..index]) |prior|
             if (std.mem.eql(u8, prior.path, file.path))
                 return error.InvalidEvidence;
-        if (file.kind == .script_outcome and file.action == null)
+        const indexed = file.kind == .script_outcome or file.kind == .unpack_diversion_cache;
+        if (indexed and file.action == null)
             return error.InvalidEvidence;
-        if (file.kind != .script_outcome and file.action != null)
+        if (!indexed and file.action != null)
             return error.InvalidEvidence;
+        if (file.kind == .unpack_diversion_cache) {
+            const action = file.action.?;
+            if (action.kind != .filesystem or action.substep != 0 or action.ordinal != 0)
+                return error.InvalidEvidence;
+            for (document.evidence_files[0..index]) |prior| {
+                if (prior.kind == .unpack_diversion_cache and
+                    prior.action != null and prior.action.?.program_step == action.program_step)
+                    return error.InvalidEvidence;
+            }
+        }
         switch (file.kind) {
             .execution_request,
             .authorization,
@@ -378,6 +390,7 @@ pub fn validate(document: Document) !void {
             .progress,
             .managed_state,
             .diversion_cache,
+            .unpack_diversion_cache,
             .trigger_events,
             .script_outcome,
             .root_operation,
@@ -389,7 +402,7 @@ pub fn validate(document: Document) !void {
             .root_mutation_progress,
             => {},
         }
-        if (file.kind != .script_outcome) {
+        if (!indexed) {
             if (evidence_kinds.contains(file.kind))
                 return error.InvalidEvidence;
             evidence_kinds.insert(file.kind);
