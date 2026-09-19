@@ -1173,6 +1173,12 @@ jobs:
         run: |
           work=".real-snapshot/${{ matrix.architecture }}"
           sudo mkdir -p "$work/evidence"
+          capture_status=0
+          sudo python3 tools/capture-vendor-state.py \
+            --reference-root "$PWD/$work/root" \
+            --architecture "${{ matrix.architecture }}" \
+            --output "$PWD/$work/evidence/vendor-state-inventory-v1.json" \
+            || capture_status=$?
           sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
           sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
           sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
@@ -1180,6 +1186,7 @@ jobs:
           sudo du -sh "$work" >"$work/evidence/disk-usage-final.txt" 2>/dev/null || true
           sudo rm -rf "$work/root" "$work/cache"
           sudo chown -R "$USER:$USER" .real-snapshot
+          exit "$capture_status"
       - name: Upload real acceptance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

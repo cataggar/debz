@@ -131,5 +131,24 @@ provenance, native architecture, failure-before-mutation for a tampered lock,
 and the absence of apt processes in the root. Metadata, package, total
 download, disk, retry, command, and workflow limits are bounded. Evidence is
 retained even on failure while package cache and staged root payloads are
-cleaned. The lane is manual because of bandwidth, but release acceptance
-requires dispatching it successfully; it does not replace deterministic PR CI.
+cleaned.
+
+Immediately before that cleanup, the workflow runs
+`tools/capture-vendor-state.py` against the explicitly named staged reference
+root. The architecture-tagged v1 JSON inventories every `var/lib/dpkg/info`
+member by classification and bounded metadata/hash, including `*.config`,
+`*.alternatives`, and all unclassified members. It also inventories bounded
+regular records under `var/lib/dpkg/alternatives` and the root-confined
+filesystem paths and symlink chains referenced by alternatives state. The
+capture never follows a link into the host, rejects traversal, special files,
+credential/private namespaces, malformed text, and every count or byte-limit
+overflow, and records no hostname, timestamp, environment, or absolute
+workspace path.
+
+The uploaded JSON is review evidence from a particular amd64 or arm64 run, not
+a repository-pinned support manifest. No current pinned vendor manifests are
+claimed; future reviewed runs may pin exact artifact digests separately.
+Native production feature guards for config scripts, alternatives, and
+unclassified vendor metadata remain unchanged. The lane is manual because of
+bandwidth, but release acceptance requires dispatching it successfully; it
+does not replace deterministic PR CI.

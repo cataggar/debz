@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/vendor-state-inventory-v1",
+  "title": "Vendor state inventory v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "architecture",
+    "limits",
+    "control_members",
+    "alternatives_database",
+    "linked_filesystem"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/vendor-state-inventory-v1"
+    },
+    "version": {
+      "const": 1
+    },
+    "architecture": {
+      "enum": ["amd64", "arm64"]
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_control_members",
+        "max_alternatives_records",
+        "max_metadata_file_bytes",
+        "max_total_metadata_bytes",
+        "max_referenced_paths",
+        "max_linked_entries",
+        "max_link_hops",
+        "max_link_target_bytes",
+        "max_linked_file_bytes",
+        "max_total_linked_bytes"
+      ],
+      "properties": {
+        "max_control_members": { "$ref": "#/$defs/positiveInteger" },
+        "max_alternatives_records": { "$ref": "#/$defs/positiveInteger" },
+        "max_metadata_file_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "max_total_metadata_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "max_referenced_paths": { "$ref": "#/$defs/positiveInteger" },
+        "max_linked_entries": { "$ref": "#/$defs/positiveInteger" },
+        "max_link_hops": { "$ref": "#/$defs/positiveInteger" },
+        "max_link_target_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "max_linked_file_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "max_total_linked_bytes": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "control_members": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification_counts", "entries"],
+      "properties": {
+        "classification_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "control",
+            "ownership-list",
+            "checksums",
+            "conffiles",
+            "triggers",
+            "maintainer-script",
+            "debconf-config",
+            "package-alternatives",
+            "retained-metadata",
+            "unclassified"
+          ],
+          "properties": {
+            "format": { "$ref": "#/$defs/count" },
+            "control": { "$ref": "#/$defs/count" },
+            "ownership-list": { "$ref": "#/$defs/count" },
+            "checksums": { "$ref": "#/$defs/count" },
+            "conffiles": { "$ref": "#/$defs/count" },
+            "triggers": { "$ref": "#/$defs/count" },
+            "maintainer-script": { "$ref": "#/$defs/count" },
+            "debconf-config": { "$ref": "#/$defs/count" },
+            "package-alternatives": { "$ref": "#/$defs/count" },
+            "retained-metadata": { "$ref": "#/$defs/count" },
+            "unclassified": { "$ref": "#/$defs/count" }
+          }
+        },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/controlMember" }
+        }
+      }
+    },
+    "alternatives_database": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metadataFile" }
+    },
+    "linked_filesystem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_paths", "entries"],
+      "properties": {
+        "requested_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/linkedEntry" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "mode": {
+      "type": "string",
+      "pattern": "^[0-7]{4}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "referencedPaths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relativePath" }
+    },
+    "fileMetadata": {
+      "type": "object",
+      "required": ["path", "mode", "uid", "gid"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "mode": { "$ref": "#/$defs/mode" },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "metadataFile": {
+      "allOf": [
+        { "$ref": "#/$defs/fileMetadata" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "mode",
+            "uid",
+            "gid",
+            "size",
+            "sha256",
+            "referenced_paths"
+          ],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "size": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/digest" },
+            "referenced_paths": { "$ref": "#/$defs/referencedPaths" }
+          }
+        }
+      ]
+    },
+    "controlMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "classification",
+        "mode",
+        "uid",
+        "gid",
+        "size",
+        "sha256",
+        "referenced_paths"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "classification": {
+          "enum": [
+            "format",
+            "control",
+            "ownership-list",
+            "checksums",
+            "conffiles",
+            "triggers",
+            "maintainer-script",
+            "debconf-config",
+            "package-alternatives",
+            "retained-metadata",
+            "unclassified"
+          ]
+        },
+        "mode": { "$ref": "#/$defs/mode" },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "size": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "referenced_paths": {
+          "$ref": "#/$defs/referencedPaths"
+        }
+      }
+    },
+    "linkedEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "kind": {
+          "enum": ["absent", "directory", "regular", "symlink"]
+        },
+        "mode": { "$ref": "#/$defs/mode" },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "size": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "regular" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["mode", "uid", "gid", "size", "sha256"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "symlink" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["mode", "uid", "gid", "target"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "directory" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["mode", "uid", "gid"]
+          }
+        }
+      ]
+    }
+  }
+}

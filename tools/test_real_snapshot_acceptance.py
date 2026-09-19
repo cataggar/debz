@@ -83,7 +83,11 @@ def fixture_cli() -> int:
 
 class RealSnapshotAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="debz-snapshot-driver-")
+        temporary_root = ROOT / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="debz-snapshot-driver-", dir=temporary_root
+        )
         self.addCleanup(self.temporary.cleanup)
         self.directory = pathlib.Path(self.temporary.name).resolve()
         self.workspace = self.directory / ".real-snapshot/fresh"
