@@ -23,6 +23,12 @@ assert SPEC and SPEC.loader
 lifecycle = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lifecycle)
 m = lifecycle.m
+SETTLEMENT_SPEC = importlib.util.spec_from_file_location(
+    "debz_diversion_settlement_oracle", ROOT / "tools/native_diversion_settlement_oracle.py",
+)
+assert SETTLEMENT_SPEC and SETTLEMENT_SPEC.loader
+settlement = importlib.util.module_from_spec(SETTLEMENT_SPEC)
+SETTLEMENT_SPEC.loader.exec_module(settlement)
 HELPER = Path("usr/bin/dpkg-trigger")
 RECEIVER = "debz-trigger-receiver"
 SOURCE = "debz-trigger-source"
@@ -669,11 +675,19 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument("--diversions-only", action="store_true")
+    parser.add_argument(
+        "--diversion-settlement-reference-only", action="store_true",
+        help="run the guarded mid-unpack reference specification only; requires --oracle-only",
+    )
     arguments = parser.parse_args()
     if arguments.oracle_only == bool(arguments.native_test):
         parser.error("provide a native test executable or --oracle-only, not both")
     if bool(arguments.native_helper) != bool(arguments.native_test):
         parser.error("native execution requires a native trigger-helper artifact")
+    if arguments.diversion_settlement_reference_only and (
+        not arguments.oracle_only or arguments.diversions_only
+    ):
+        parser.error("--diversion-settlement-reference-only requires --oracle-only and no other selector")
     if os.geteuid() != 0:
         raise RuntimeError("trigger acceptance requires root for actual chroot execution")
     for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd"):
@@ -705,10 +719,13 @@ def main() -> int:
         with context as temporary:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
-            if arguments.diversions_only:
+            if arguments.diversion_settlement_reference_only:
+                settlement.exercise(lifecycle, reference, workspace, environment, architecture)
+            elif arguments.diversions_only:
                 exercise_diversion_triggers(executable, helper, workspace, environment, architecture)
             else:
                 exercise(executable, helper, workspace, environment, architecture)
+                settlement.exercise(lifecycle, reference, workspace, environment, architecture)
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during trigger acceptance")
