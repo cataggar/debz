@@ -223,6 +223,14 @@ result after recovery.
 
 This partial rollback is required even when diversion records never change.
 It applies to a recorded old-postrm failure, not an arbitrary filesystem error.
+
+Known old-postrm and unwind outcomes can now resume while the payload journal
+is still active, including after the script marker is cleared and across an
+interrupted recovery rollback. The original outcome and post-invocation
+checkpoint remain mandatory; completed scripts are never re-executed.
+Recovery preserves recorded non-journal effects without enabling changed-route
+unpack behavior. See [native recovery](native-recovery.md) for the admission
+rules and conservative directory-membership boundary.
 Fresh-process recovery consumes authenticated completed script outcomes rather
 than publishing the unpack or rerunning those scripts again. Mid-unpack route
 changes remain guarded pending the full settlement/recovery work in #192.

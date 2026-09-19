@@ -206,12 +206,11 @@ fn checkpointManagedPathsAfterCacheValidation(
     );
 }
 
-fn checkpointRolledBackNativePhase(
+fn hasUnpackBackupInputs(
     allocator: std.mem.Allocator,
     runtime: *native_recovery.Runtime,
     action: native_recovery.Action,
-    steps: []const root_mutation.Step,
-) !?native_recovery.Digest {
+) !bool {
     var buffer: [128]u8 = undefined;
     const path = try native_recovery.unpackDiversionPath(action.program_step, &buffer);
     if (try runtime.root.entryIfExists(try root_fs.Path.init(path)) != null) {
@@ -225,9 +224,28 @@ fn checkpointRolledBackNativePhase(
         defer allocator.free(bytes);
         var decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, action.program_step);
         defer decoded.deinit();
-        if (decoded.backups != null)
-            return try native_recovery.checkpointRolledBackMutation(allocator, runtime.root, runtime.intent_sha256, action, steps);
+        return decoded.backups != null;
     }
+    return false;
+}
+
+fn checkpointRolledBackNativePhase(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    action: native_recovery.Action,
+    steps: []const root_mutation.Step,
+    journal_device: u64,
+) !?native_recovery.Digest {
+    if (try hasUnpackBackupInputs(allocator, runtime, action))
+        return try native_recovery.checkpointRolledBackMutation(
+            allocator,
+            runtime.root,
+            runtime.intent_sha256,
+            action,
+            steps,
+            journal_device,
+        );
+    try native_recovery.discardTransientManagedState(allocator, runtime.root, runtime.intent_sha256);
     try native_recovery.validateStableManagedState(allocator, runtime.root, runtime.intent_sha256);
     return null;
 }
@@ -8826,16 +8844,12 @@ fn materializePlanned(
                     false,
                 ),
                 .rolled_back => block: {
-                    try native_recovery.discardTransientManagedState(
-                        allocator,
-                        request.root,
-                        runtime.intent_sha256,
-                    );
                     break :block try checkpointRolledBackNativePhase(
                         allocator,
                         runtime,
                         action,
                         mutation_plan.steps,
+                        engine.journal().device,
                     ) orelse native_recovery.hexDigest(mutation_plan.steps_sha256);
                 },
                 .recovery_required => unreachable,
@@ -9240,16 +9254,12 @@ fn executePhaseMaterialization(
                     false,
                 ),
                 .rolled_back => block: {
-                    try native_recovery.discardTransientManagedState(
-                        allocator,
-                        request.root,
-                        runtime.intent_sha256,
-                    );
                     break :block try checkpointRolledBackNativePhase(
                         allocator,
                         runtime,
                         action,
                         mutation_plan.steps,
+                        engine.journal().device,
                     ) orelse native_recovery.hexDigest(phase_digest);
                 },
                 .recovery_required => unreachable,
@@ -16407,6 +16417,14 @@ fn runLifecycleScript(
             },
             native_outcome.?.digest_sha256,
         );
+        if (execution.phase_steps != null and arguments.len != 0) {
+            if (kind == .postrm and source == .installed_package and std.mem.eql(u8, arguments[0], "upgrade"))
+                runtime.crash.hit(.after_upgrade_postrm_outcome);
+            if (kind == .postrm and source == .new_package and std.mem.eql(u8, arguments[0], "failed-upgrade"))
+                runtime.crash.hit(.after_upgrade_unwind_outcome);
+            if (kind == .preinst and source == .installed_package and std.mem.eql(u8, arguments[0], "abort-upgrade"))
+                runtime.crash.hit(.after_upgrade_pre_rollback_compensation_outcome);
+        }
         runtime.crash.hit(.after_script_outcome);
         switch (report.outcome) {
             .exited => |code| if (code != 0)
@@ -16466,7 +16484,10 @@ fn runLifecycleScript(
         try attempt.requireRecovery(allocator, .script);
         return .recovery_required;
     };
-    if (execution.recovery) |runtime|
+    if (execution.recovery) |runtime| {
+        if (execution.phase_steps != null and kind == .postrm and source == .installed_package and
+            arguments.len != 0 and std.mem.eql(u8, arguments[0], "upgrade"))
+            runtime.crash.hit(.after_upgrade_postrm_marker_cleared);
         try runtime.append(
             recovery_action,
             .completed,
@@ -16474,6 +16495,15 @@ fn runLifecycleScript(
             managed_checkpoint_sha256 orelse
                 if (native_outcome) |value| value.digest_sha256 else null,
         );
+        if (execution.phase_steps != null and arguments.len != 0) {
+            if (kind == .postrm and source == .installed_package and std.mem.eql(u8, arguments[0], "upgrade"))
+                runtime.crash.hit(.after_upgrade_postrm_completed);
+            if (kind == .postrm and source == .new_package and std.mem.eql(u8, arguments[0], "failed-upgrade"))
+                runtime.crash.hit(.after_upgrade_unwind_completed);
+            if (kind == .preinst and source == .installed_package and std.mem.eql(u8, arguments[0], "abort-upgrade"))
+                runtime.crash.hit(.after_upgrade_pre_rollback_compensation_completed);
+        }
+    }
     if (!report.outcome.spawned()) return .not_started;
     return .{ .exited = code };
 }
@@ -17654,9 +17684,9 @@ fn pendingNativeMutationAction(
     return null;
 }
 
-const ActiveScriptRecovery = enum {
+const ActiveScriptRecovery = union(enum) {
     none,
-    known_outcome,
+    known_outcome: native_recovery.Action,
     outcome_unknown,
 };
 
@@ -17788,7 +17818,33 @@ fn classifyActiveScriptBeforeMutationRecovery(
     runtime: native_recovery.Runtime,
 ) !ActiveScriptRecovery {
     const record_path = try root_fs.Path.init(lifecycle_script_record_path);
-    if (try root.entryIfExists(record_path) == null) return .none;
+    if (try root.entryIfExists(record_path) == null) {
+        const action = try native_recovery.recordedTransientScriptAction(allocator, root, runtime.intent_sha256) orelse return .none;
+        var owned = (try native_recovery.readScriptOutcome(allocator, root, action)) orelse return error.InvalidScriptOutcome;
+        defer owned.deinit();
+        const outcome = owned.outcome;
+        const active: native_trigger.ActiveScript = .{
+            .program_sha256 = parseHex(32, &program.digest_sha256) orelse return error.InvalidLifecycleProgram,
+            .step = action.program_step,
+            .package = outcome.package,
+            .version = outcome.package_version,
+            .architecture = outcome.architecture,
+            .kind = outcome.kind,
+            .source = std.meta.stringToEnum(native_trigger.ScriptSource, outcome.source) orelse return error.InvalidScriptOutcome,
+            .script_sha256 = parseHex(32, &outcome.script_sha256) orelse return error.InvalidScriptOutcome,
+            .arguments = outcome.arguments,
+        };
+        if (!try activeScriptAuthorized(program, authorization, active, action) or
+            !nativeScriptOutcomeMatches(outcome, runtime, action, .{
+                .name = active.package,
+                .version = active.version,
+                .architecture = active.architecture,
+            }, active.kind, std.meta.stringToEnum(native_program.ScriptSource, outcome.source) orelse
+                return error.InvalidScriptOutcome, active.script_sha256, active.arguments))
+            return error.InvalidScriptOutcome;
+        if (nativeScriptDisposition(outcome) == .recovery_required) return .outcome_unknown;
+        return .{ .known_outcome = action };
+    }
     const bytes = try root.readFileAlloc(
         allocator,
         record_path,
@@ -17854,7 +17910,8 @@ fn classifyActiveScriptBeforeMutationRecovery(
             active.script.script_sha256,
             active.script.arguments,
         )) return error.InvalidScriptOutcome;
-        return .known_outcome;
+        if (nativeScriptDisposition(outcome.outcome) == .recovery_required) return .outcome_unknown;
+        return .{ .known_outcome = record.action };
     }
     if (record.stage != .in_flight) return error.InvalidScriptOutcome;
     return .outcome_unknown;
@@ -17867,6 +17924,8 @@ fn recoverNativeRootMutation(
     runtime: *native_recovery.Runtime,
     bounds: ?*RuntimeBounds,
     diversion_cache: *?native_diversion.Session,
+    program: native_program.Program,
+    script_recovery: ActiveScriptRecovery,
 ) !bool {
     try checkRuntimeBounds(bounds);
     if (try readManagedDiversionCache(allocator, root, runtime.intent_sha256)) |value| {
@@ -17877,11 +17936,20 @@ fn recoverNativeRootMutation(
             else => return err,
         };
     }
+    var rollback_crash = runtime.crash;
     var opened = try root_mutation.open(
         allocator,
         root,
         attempt,
-        .{ .deadline = if (bounds) |value| value.deadline else null },
+        .{
+            .deadline = if (bounds) |value| value.deadline else null,
+            .hooks = .{ .context = &rollback_crash, .beforeFn = struct {
+                fn before(context: ?*anyopaque, boundary: root_mutation.Boundary, _: u32) root_mutation.HookError!void {
+                    const crash: *native_recovery.CrashController = @ptrCast(@alignCast(context.?));
+                    if (boundary == .parent_sync) crash.hit(.during_known_unpack_rollback);
+                }
+            }.before },
+        },
     ) orelse {
         try validateManagedDiversionUpdate(allocator, runtime, false);
         try native_recovery.validateStableManagedState(
@@ -17893,6 +17961,12 @@ fn recoverNativeRootMutation(
     };
     defer opened.deinit();
     try validateManagedDiversionUpdate(allocator, runtime, true);
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    const action = pendingNativeMutationAction(progress.document) orelse {
+        try attempt.requireRecovery(allocator, .mutation);
+        return false;
+    };
     if (try native_recovery.managedStateHasTransient(
         allocator,
         root,
@@ -17903,15 +17977,31 @@ fn recoverNativeRootMutation(
             root,
             .{},
         ) orelse return error.InvalidManagedState;
-        if (stage.direction() != .finish_new)
-            return error.ManagedStateChanged;
+        if (stage.direction() != .finish_new) {
+            const rolling_back = stage == .rolling_back or stage == .releasing_rollback or stage == .rolled_back;
+            if ((stage != .applying and !rolling_back) or action.kind != .filesystem or action.program_step >= program.steps.len or
+                !try hasUnpackBackupInputs(allocator, runtime, action))
+                return error.ManagedStateChanged;
+            const operation = program.steps[action.program_step].operation;
+            if (operation != .unpack_package) return error.InvalidManagedState;
+            const script = postUnpackScript(program, action.program_step, operation.unpack_package.package) orelse
+                return error.InvalidManagedState;
+            const known = switch (script_recovery) {
+                .known_outcome => |known| known,
+                else => return error.ManagedStateChanged,
+            };
+            if (known.program_step != script.sequence) return error.InvalidManagedState;
+            try native_recovery.validateScriptMutationCheckpoint(
+                allocator,
+                root,
+                runtime.intent_sha256,
+                known,
+                opened.journal().steps,
+                opened.journal().device,
+                rolling_back,
+            );
+        }
     }
-    var progress = try native_recovery.readProgress(allocator, root);
-    defer progress.deinit();
-    const action = pendingNativeMutationAction(progress.document) orelse {
-        try attempt.requireRecovery(allocator, .mutation);
-        return false;
-    };
     const report = try root_mutation.recover(&opened);
     if (bounds) |value| value.observeMutation(report);
     switch (report.outcome) {
@@ -17935,12 +18025,14 @@ fn recoverNativeRootMutation(
             return true;
         },
         .rolled_back => {
-            try native_recovery.discardTransientManagedState(
+            runtime.crash.hit(.after_known_unpack_rollback);
+            const checkpoint = try checkpointRolledBackNativePhase(
                 allocator,
-                root,
-                runtime.intent_sha256,
+                runtime,
+                action,
+                opened.journal().steps,
+                opened.journal().device,
             );
-            const checkpoint = try checkpointRolledBackNativePhase(allocator, runtime, action, opened.journal().steps);
             try runtime.append(action, .completed, .rolled_back, checkpoint);
             try root_mutation.clear(&opened);
             return true;
@@ -19093,7 +19185,7 @@ pub const Runtime = struct {
 
     /// Recovery consumes only persisted evidence from the original attempt.
     pub fn recover(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
-        return recoverBounded(allocator, attempt, null);
+        return recoverBounded(allocator, attempt, null, null);
     }
 
     pub fn recoverWithDeadline(
@@ -19101,13 +19193,14 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         deadline: transaction_executor.Deadline,
     ) !Report {
-        return recoverBounded(allocator, attempt, deadline);
+        return recoverBounded(allocator, attempt, deadline, null);
     }
 
     fn recoverBounded(
         allocator: std.mem.Allocator,
         attempt: *root_operation.Attempt,
         deadline: ?transaction_executor.Deadline,
+        crash_at: ?native_recovery.CrashPoint,
     ) !Report {
         const root = try validateAttempt(attempt);
         var bounds: RuntimeBounds = .{ .deadline = deadline };
@@ -19119,7 +19212,7 @@ pub const Runtime = struct {
             root,
             attempt,
             attempt.coordinator.locks,
-            null,
+            crash_at,
             native_helper.bundled(),
             &bounds,
         ) catch |err| switch (err) {
@@ -20022,6 +20115,8 @@ fn executeLifecycleProgramWithRequest(
             &recovery_runtime,
             bounds,
             &diversion_session,
+            program.*,
+            script_recovery,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
             error.InvalidManagedState,
@@ -22857,10 +22952,7 @@ fn callerOwnedLifecycleFixture(
         });
         defer attempt.release();
         const result = if (external.isolated_helper) block: {
-            var report = if (deadline) |value|
-                try Runtime.recoverWithDeadline(allocator, &attempt, value)
-            else
-                try Runtime.recover(allocator, &attempt);
+            var report = try Runtime.recoverBounded(allocator, &attempt, deadline, external.crash_at);
             defer report.deinit();
             break :block typedRuntimeFixtureResult(report);
         } else try recoverPreparedNativeProgramWithHelper(
@@ -23045,6 +23137,11 @@ test "native_unpack.test.lifecycle external fixture" {
         if (external.archives.len != 0 or external.packages.len != 0 or
             external.ordered_actions != null or external.fault != null)
             return error.InvalidExternalLifecycleRequest;
+        if (external.crash_at) |point| {
+            if (!external.caller_owned or !external.isolated_helper or external.core_product or
+                (point != .during_known_unpack_rollback and point != .after_known_unpack_rollback))
+                return error.InvalidExternalLifecycleRequest;
+        }
         if (external.core_product) {
             const product = @import("production_backend.zig");
             const api = @import("product_api.zig");

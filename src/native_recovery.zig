@@ -68,6 +68,15 @@ pub const CrashPoint = enum {
     after_script_outcome,
     after_script_return_before_outcome,
     after_upgrade_postrm_return_before_outcome,
+    after_upgrade_postrm_outcome,
+    after_upgrade_unwind_outcome,
+    after_upgrade_pre_rollback_compensation_outcome,
+    after_upgrade_postrm_marker_cleared,
+    after_upgrade_postrm_completed,
+    after_upgrade_unwind_completed,
+    after_upgrade_pre_rollback_compensation_completed,
+    during_known_unpack_rollback,
+    after_known_unpack_rollback,
     after_failure_outcome,
     after_trigger_outcome,
     after_provenance,
@@ -1499,20 +1508,29 @@ pub fn checkpointRolledBackMutation(
     intent_sha256: Digest,
     action: Action,
     steps: []const @import("root_mutation.zig").Step,
+    journal_device: u64,
 ) !Digest {
     var current = try readManagedState(allocator, root);
     defer current.deinit();
-    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256) or current.document.transient != null)
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256))
         return error.InvalidManagedState;
     const snapshot = current.document.stable orelse return error.InvalidManagedState;
+    const script_snapshot = if (current.document.transient != null)
+        try recordedScriptSnapshot(allocator, root, current.document)
+    else
+        null;
     var originals: std.StringHashMapUnmanaged(ManagedEntry) = .empty;
     defer originals.deinit(allocator);
     for (snapshot.entries) |entry| try originals.put(allocator, entry.path, entry);
+    var targets: std.StringHashMapUnmanaged(@import("root_mutation.zig").Step) = .empty;
+    defer targets.deinit(allocator);
     var linked: std.AutoHashMapUnmanaged(u128, void) = .empty;
     defer linked.deinit(allocator);
     var restored: std.StringHashMapUnmanaged(bool) = .empty;
     defer restored.deinit(allocator);
     for (steps) |step| {
+        const target = try targets.getOrPut(allocator, step.path);
+        if (!target.found_existing) target.value_ptr.* = step;
         if (step.expected == .present) {
             const previous = step.expected.present;
             if (originals.get(step.path)) |entry| {
@@ -1536,9 +1554,20 @@ pub fn checkpointRolledBackMutation(
         }
     }
     var observed_bytes: u64 = 0;
-    for (snapshot.entries) |expected| {
-        const observed = try observeManagedEntry(allocator, root, expected.path, &observed_bytes);
+    for (if (script_snapshot) |script| script.entries else snapshot.entries) |entry| {
+        const observed = try observeManagedEntry(allocator, root, entry.path, &observed_bytes);
         defer if (observed.link_target) |target| allocator.free(target);
+        var expected = entry;
+        if (targets.get(entry.path)) |step| {
+            if (originals.get(entry.path)) |original| {
+                expected = original;
+            } else {
+                expected = try restoredJournalEntry(entry, observed, step, journal_device);
+            }
+        } else if (originals.get(entry.path)) |original| {
+            if (original.kind == .regular and linked.contains((@as(u128, original.device) << 64) | original.inode))
+                expected = original;
+        }
         if (managedEntryEqual(expected, observed)) continue;
         var adjusted = observed;
         if (expected.kind == .regular and linked.contains((@as(u128, expected.device) << 64) | expected.inode)) {
@@ -1551,6 +1580,165 @@ pub fn checkpointRolledBackMutation(
             return error.ManagedStateChanged;
     }
     return updateManagedState(allocator, root, intent_sha256, action, &.{}, false);
+}
+
+fn recordedScriptSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    document: ManagedStateDocument,
+) !ManagedSnapshot {
+    const snapshot = document.transient orelse return error.InvalidManagedState;
+    if (snapshot.action.kind != .script) return error.InvalidManagedState;
+    var outcome = (try readScriptOutcome(allocator, root, snapshot.action)) orelse return error.InvalidManagedState;
+    defer outcome.deinit();
+    if (!std.mem.eql(u8, &outcome.outcome.intent_sha256, &document.intent_sha256) or
+        !std.meta.eql(outcome.outcome.action, snapshot.action) or
+        (outcome.outcome.disposition != .exited and outcome.outcome.spawned))
+        return error.InvalidManagedState;
+    var progress = try readProgress(allocator, root);
+    defer progress.deinit();
+    if (!std.mem.eql(u8, &progress.document.intent_sha256, &document.intent_sha256))
+        return error.InvalidManagedState;
+    const latest_record = latest(progress.document, snapshot.action) orelse return error.InvalidManagedState;
+    var index = progress.document.records.len;
+    while (index != 0) {
+        index -= 1;
+        const record = progress.document.records[index];
+        if (record.action.kind != .script and record.action.kind != .compensation and record.action.kind != .trigger)
+            continue;
+        if (!std.meta.eql(record.action, snapshot.action)) return error.InvalidManagedState;
+        break;
+    }
+    const expected_evidence = switch (latest_record.stage) {
+        .in_flight => null,
+        .outcome => outcome.outcome.digest_sha256,
+        .completed => snapshot.digest_sha256,
+        else => return error.InvalidManagedState,
+    };
+    if (expected_evidence) |digest|
+        if (latest_record.evidence_sha256 == null or
+            !std.mem.eql(u8, &digest, &latest_record.evidence_sha256.?))
+            return error.InvalidManagedState;
+    for (progress.document.records) |record| {
+        if (std.mem.eql(u8, &record.digest_sha256, &snapshot.progress_head_sha256) and
+            record.stage == .in_flight and std.meta.eql(record.action, snapshot.action))
+            return snapshot;
+    }
+    return error.InvalidManagedState;
+}
+
+pub fn recordedTransientScriptAction(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+) !?Action {
+    if (try root.entryIfExists(try root_fs.Path.init(managed_state_path)) == null) return null;
+    var current = try readManagedState(allocator, root);
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256))
+        return error.InvalidManagedState;
+    if (current.document.transient == null) return null;
+    return (try recordedScriptSnapshot(allocator, root, current.document)).action;
+}
+
+pub fn validateScriptMutationCheckpoint(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    action: Action,
+    steps: []const @import("root_mutation.zig").Step,
+    journal_device: u64,
+    rolling_back: bool,
+) !void {
+    var current = try readManagedState(allocator, root);
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256))
+        return error.InvalidManagedState;
+    const snapshot = try recordedScriptSnapshot(allocator, root, current.document);
+    if (!std.meta.eql(snapshot.action, action)) return error.InvalidManagedState;
+    var paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer paths.deinit(allocator);
+    var parents: std.StringHashMapUnmanaged(void) = .empty;
+    defer parents.deinit(allocator);
+    var linked: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer linked.deinit(allocator);
+    if (rolling_back) {
+        for (steps) |step| {
+            try paths.put(allocator, step.path, {});
+            var path = step.path;
+            while (std.mem.lastIndexOfScalar(u8, path, '/')) |separator| {
+                path = path[0..separator];
+                try parents.put(allocator, path, {});
+            }
+            if (step.expected == .present and step.expected.present.kind == .regular)
+                try linked.put(allocator, step.expected.present.inode, {});
+        }
+    }
+    var observed_bytes: u64 = 0;
+    for (snapshot.entries) |entry| {
+        const observed = try observeManagedEntry(allocator, root, entry.path, &observed_bytes);
+        defer if (observed.link_target) |target| allocator.free(target);
+        if (managedEntryEqual(entry, observed)) continue;
+        if (!rolling_back) return error.ManagedStateChanged;
+        if (entry.kind == .directory and observed.kind == .directory and
+            (entry.directory_entries != observed.directory_entries or
+                entry.directory_sha256 == null or observed.directory_sha256 == null or
+                !std.mem.eql(u8, &entry.directory_sha256.?, &observed.directory_sha256.?)))
+            return error.ManagedStateChanged;
+        // The generic journal owns intermediate states of its paths. Other
+        // recorded script effects must remain unchanged during its rollback.
+        if (paths.contains(entry.path)) continue;
+        if (entry.kind == .directory and parents.contains(entry.path) and
+            observed.kind == .directory and observed.mode == entry.mode and
+            observed.uid == entry.uid and observed.gid == entry.gid and
+            observed.device == entry.device and observed.inode == entry.inode)
+            continue;
+        var adjusted = observed;
+        if (entry.kind == .regular and entry.device == journal_device and linked.contains(entry.inode))
+            adjusted.change_nanoseconds = entry.change_nanoseconds;
+        if (!managedEntryEqual(entry, adjusted)) return error.ManagedStateChanged;
+    }
+}
+
+fn restoredJournalEntry(
+    script_entry: ManagedEntry,
+    observed: ManagedEntry,
+    step: @import("root_mutation.zig").Step,
+    device: u64,
+) !ManagedEntry {
+    const previous = switch (step.expected) {
+        .absent => return .{ .path = step.path, .kind = .absent },
+        .present => |value| value,
+    };
+    if (previous.inode == 0) return error.InvalidManagedState;
+    var expected: ManagedEntry = .{
+        .path = step.path,
+        .kind = switch (previous.kind) {
+            .regular => .regular,
+            .symlink => .symlink,
+            .directory => .directory,
+        },
+        .mode = previous.metadata.mode,
+        .uid = previous.metadata.uid,
+        .gid = previous.metadata.gid,
+        .device = device,
+        .inode = if (previous.kind == .regular or step.kind == .set_metadata) previous.inode else observed.inode,
+        .link_count = previous.link_count,
+        .modified_nanoseconds = previous.metadata.modified_nanoseconds,
+        .change_nanoseconds = observed.change_nanoseconds,
+        .size = previous.size,
+        .content_sha256 = if (previous.content_sha256) |digest| hexDigest(digest) else null,
+        .link_target = previous.link_target,
+    };
+    if (previous.kind == .symlink) expected.size = (previous.link_target orelse return error.InvalidManagedState).len;
+    if (previous.kind == .directory) {
+        if (script_entry.kind != .directory or script_entry.inode != previous.inode)
+            return error.InvalidManagedState;
+        expected.size = script_entry.size;
+        expected.directory_sha256 = script_entry.directory_sha256;
+        expected.directory_entries = script_entry.directory_entries;
+    }
+    return expected;
 }
 
 test "native_recovery.test.verified rollback refreshes only journal-authorized identities" {
@@ -1589,12 +1777,12 @@ test "native_recovery.test.verified rollback refreshes only journal-authorized i
     const private = try root_fs.Path.init("private");
     try root.createHardLink(data, private);
     try root.removeFile(private);
-    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps);
+    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps, old.device);
     try validateStableManagedState(testing.allocator, root, intent);
     const before = try root.readFileAlloc(testing.allocator, try root_fs.Path.init(managed_state_path), maximum_managed_state_bytes);
     defer testing.allocator.free(before);
     try root.publishFile(unrelated, "external drift", .{ .overwrite = .replace });
-    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps));
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps, old.device));
     const after = try root.readFileAlloc(testing.allocator, try root_fs.Path.init(managed_state_path), maximum_managed_state_bytes);
     defer testing.allocator.free(after);
     try testing.expectEqualStrings(before, after);
@@ -1629,10 +1817,10 @@ test "native_recovery.test.verified rollback refreshes only journal-authorized i
     try root.removeFile(symbolic);
     try root.createSymbolicLink(symbolic, data.text);
     try root.applyMetadata(symbolic, .{ .modified_nanoseconds = 123 });
-    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, metadata_plan.steps));
-    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, link_plan.steps);
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, metadata_plan.steps, old.device));
+    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, link_plan.steps, old.device);
     try root.publishFile(data, "original", .{ .overwrite = .replace });
-    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps));
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps, old.device));
 }
 
 /// A null result means the checkpoint does not authorize this path, not that
@@ -2277,7 +2465,7 @@ fn checkIntentBinding() !void {
     try std.testing.expectError(error.DigestMismatch, validateIntent(intent));
 }
 
-fn checkScriptOutcomeBinding() !void {
+fn testScriptOutcome() ScriptOutcome {
     const empty_sha256 =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".*;
     var outcome: ScriptOutcome = .{
@@ -2314,12 +2502,233 @@ fn checkScriptOutcomeBinding() !void {
         .digest_sha256 = @splat('0'),
     };
     sealScriptOutcome(&outcome);
+    return outcome;
+}
+
+fn checkScriptOutcomeBinding() !void {
+    var outcome = testScriptOutcome();
     try validateScriptOutcome(outcome);
     outcome.exit_code = null;
     try std.testing.expectError(
         error.InvalidScriptOutcome,
         validateScriptOutcome(outcome),
     );
+}
+
+test "native_recovery.test.rollback preserves only authenticated script observations" {
+    try checkScriptRollback(null);
+    try checkScriptRollback("external drift");
+    try checkScriptRollback("recorded effect");
+}
+
+fn checkScriptRollback(drift: ?[]const u8) !void {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const mutation = @import("root_mutation.zig");
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const outcome = testScriptOutcome();
+    const intent = outcome.intent_sha256;
+    const action: Action = .{ .kind = .filesystem, .program_step = 6, .substep = 1, .ordinal = 0 };
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    const payload = try root_fs.Path.init("payload");
+    const script_effect = try root_fs.Path.init("script-effect");
+    const private_backup = try root_fs.Path.init("private-backup");
+    const introduced = try root_fs.Path.init("introduced");
+    try root.publishFile(payload, "original", .{});
+    try root.publishFile(script_effect, "before", .{});
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{ payload.text, script_effect.text }, false);
+    const original = try root.entry(payload);
+    var plan = switch (try mutation.preflight(testing.allocator, root, .{ .intents = &.{ .{ .file = .{
+        .path = payload.text,
+        .bytes = "incoming",
+        .mode = original.mode,
+        .uid = original.uid,
+        .gid = original.gid,
+        .modified_nanoseconds = original.modified_nanoseconds,
+    } }, .{ .file = .{
+        .path = introduced.text,
+        .bytes = "new file",
+        .mode = original.mode,
+        .uid = original.uid,
+        .gid = original.gid,
+        .modified_nanoseconds = original.modified_nanoseconds,
+    } } } })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer plan.deinit();
+    try root.createHardLink(payload, private_backup);
+    try root.publishFile(payload, "incoming", .{ .overwrite = .replace });
+    try root.publishFile(introduced, "new file", .{});
+    try root.publishFile(script_effect, "recorded effect", .{ .overwrite = .replace });
+    try appendProgress(testing.allocator, root, intent, outcome.action, .prepared, .none, null);
+    try publishScriptOutcome(testing.allocator, root, outcome);
+    _ = try updateManagedState(testing.allocator, root, intent, outcome.action, &.{}, true);
+    {
+        var current = try readManagedState(testing.allocator, root);
+        defer current.deinit();
+        try testing.expectError(error.InvalidManagedState, recordedScriptSnapshot(testing.allocator, root, current.document));
+    }
+    try appendProgress(testing.allocator, root, intent, outcome.action, .in_flight, .none, null);
+    const checkpoint = try updateManagedState(testing.allocator, root, intent, outcome.action, &.{introduced.text}, true);
+    try appendProgress(testing.allocator, root, intent, outcome.action, .outcome, .exited, outcome.digest_sha256);
+    {
+        var current = try readManagedState(testing.allocator, root);
+        defer current.deinit();
+        _ = try recordedScriptSnapshot(testing.allocator, root, current.document);
+    }
+    try appendProgress(testing.allocator, root, intent, outcome.action, .completed, .succeeded, checkpoint);
+    try root.rename(private_backup, payload, .replace);
+    try root.removeFile(introduced);
+    if (drift) |bytes| {
+        try root.publishFile(script_effect, bytes, .{ .overwrite = .replace });
+        try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(
+            testing.allocator,
+            root,
+            intent,
+            action,
+            plan.steps,
+            original.device,
+        ));
+        return;
+    }
+    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps, original.device);
+    try validateStableManagedState(testing.allocator, root, intent);
+    const effect = try root.readFileAlloc(testing.allocator, script_effect, 64);
+    defer testing.allocator.free(effect);
+    try testing.expectEqualStrings("recorded effect", effect);
+    try root.publishFile(script_effect, "external drift", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(
+        testing.allocator,
+        root,
+        intent,
+        action,
+        plan.steps,
+        original.device,
+    ));
+}
+
+test "native_recovery.test.script checkpoints bind outcome and latest invocation" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const Case = enum {
+        in_flight,
+        outcome,
+        completed,
+        missing,
+        wrong_intent,
+        wrong_action,
+        before_invocation,
+        wrong_head,
+        wrong_evidence,
+        wrong_completion,
+        newer_invocation,
+        cancelled,
+    };
+    for (std.enums.values(Case)) |case| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+        var outcome = testScriptOutcome();
+        const intent = outcome.intent_sha256;
+        const action = outcome.action;
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        try appendProgress(testing.allocator, root, intent, action, .prepared, .none, null);
+        if (case == .before_invocation)
+            _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, true);
+        try appendProgress(testing.allocator, root, intent, action, .in_flight, .none, null);
+        if (case == .wrong_head)
+            try appendProgress(testing.allocator, root, intent, .{
+                .kind = .filesystem,
+                .program_step = 8,
+                .substep = 0,
+                .ordinal = 0,
+            }, .prepared, .none, null);
+        const checkpoint = if (case != .before_invocation)
+            try updateManagedState(testing.allocator, root, intent, action, &.{}, true)
+        else
+            @as(Digest, @splat('0'));
+        if (case == .wrong_intent) outcome.intent_sha256 = @splat('2');
+        if (case == .wrong_action) outcome.action.ordinal += 1;
+        if (case == .cancelled) {
+            outcome.disposition = .cancelled;
+            outcome.exit_code = null;
+            outcome.terminated_process_group = true;
+        }
+        sealScriptOutcome(&outcome);
+        if (case != .missing) try publishScriptOutcome(testing.allocator, root, outcome);
+        if (case != .in_flight)
+            try appendProgress(testing.allocator, root, intent, action, .outcome, .exited, if (case == .wrong_evidence) @as(Digest, @splat('0')) else outcome.digest_sha256);
+        if (case == .completed or case == .wrong_completion)
+            try appendProgress(testing.allocator, root, intent, action, .completed, .succeeded, if (case == .wrong_completion) @as(Digest, @splat('0')) else checkpoint);
+        if (case == .newer_invocation) {
+            const newer: Action = .{
+                .kind = .script,
+                .program_step = 7,
+                .substep = 1,
+                .ordinal = 3,
+            };
+            try appendProgress(testing.allocator, root, intent, newer, .prepared, .none, null);
+            try appendProgress(testing.allocator, root, intent, newer, .in_flight, .none, null);
+        }
+        if (case == .in_flight or case == .outcome or case == .completed) {
+            try testing.expectEqual(action, (try recordedTransientScriptAction(testing.allocator, root, intent)).?);
+        } else try testing.expectError(error.InvalidManagedState, recordedTransientScriptAction(testing.allocator, root, intent));
+    }
+}
+
+test "native_recovery.test.partial rollback cannot excuse changed directory membership" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const mutation = @import("root_mutation.zig");
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path, "tracked" }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const payload = try root_fs.Path.init("tracked/payload");
+    try root.publishFile(payload, "original", .{});
+    const original = try root.entry(payload);
+    var plan = switch (try mutation.preflight(testing.allocator, root, .{ .intents = &.{.{ .file = .{
+        .path = payload.text,
+        .bytes = "incoming",
+        .mode = original.mode,
+        .uid = original.uid,
+        .gid = original.gid,
+        .modified_nanoseconds = original.modified_nanoseconds,
+    } }} })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer plan.deinit();
+    const outcome = testScriptOutcome();
+    const intent = outcome.intent_sha256;
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    try appendProgress(testing.allocator, root, intent, outcome.action, .prepared, .none, null);
+    try appendProgress(testing.allocator, root, intent, outcome.action, .in_flight, .none, null);
+    try publishScriptOutcome(testing.allocator, root, outcome);
+    _ = try updateManagedState(testing.allocator, root, intent, outcome.action, &.{ "tracked", payload.text }, true);
+    try appendProgress(testing.allocator, root, intent, outcome.action, .outcome, .exited, outcome.digest_sha256);
+    try validateScriptMutationCheckpoint(testing.allocator, root, intent, outcome.action, plan.steps, original.device, true);
+    try root.publishFile(try root_fs.Path.init("tracked/unrecorded"), "unexpected member", .{});
+    try testing.expectError(error.ManagedStateChanged, validateScriptMutationCheckpoint(
+        testing.allocator,
+        root,
+        intent,
+        outcome.action,
+        plan.steps,
+        original.device,
+        true,
+    ));
 }
 
 fn checkTriggerEventBinding() !void {

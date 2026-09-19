@@ -112,6 +112,7 @@ def native(
     isolated_helper: bool = False,
     core_product: bool = False,
     completion_crash: str | None = None,
+    recovery_crash: str | None = None,
     deadline_after_ms: int | None = None,
     policy: str | None = None,
 ) -> dict | None:
@@ -129,6 +130,12 @@ def native(
     }
     if crash_at is not None:
         request["crash_at"] = crash_at
+    if recovery_crash is not None:
+        if operation != "recover" or not caller_owned or not isolated_helper or core_product or recovery_crash not in (
+            "during_known_unpack_rollback", "after_known_unpack_rollback",
+        ):
+            raise ValueError("rollback crashes require a recovering helper-bound runtime caller")
+        request["crash_at"] = recovery_crash
     if policy is not None:
         request["policy"] = policy
     if caller_owned:
@@ -161,12 +168,13 @@ def native(
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
             timeout=120, check=False,
         )
-    expected_exit = CRASH_EXIT if crash_at is not None or completion_crash is not None else 0
+    crashing = crash_at is not None or completion_crash is not None or recovery_crash is not None
+    expected_exit = CRASH_EXIT if crashing else 0
     if result.returncode != expected_exit:
         raise AssertionError(
             f"native {operation}: exit {result.returncode}, expected {expected_exit}; {destination}"
         )
-    if crash_at is not None or completion_crash is not None:
+    if crashing:
         if report_path.exists():
             raise AssertionError("crash produced a normal completion report")
         return None
@@ -1574,8 +1582,28 @@ def exercise_diversion_recovery(
         ("upgrade", "during_unpack_backup_cleanup", "backup-probe"),
         ("upgrade", "during_failed_unpack_publication", "backup-failure"),
         ("upgrade", "during_unpack_backup_cleanup", "backup-failure"),
+        ("upgrade", "after_failure_outcome", "backup-failure"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-probe"),
+        ("upgrade", "after_upgrade_unwind_outcome", "backup-unwind"),
+        ("upgrade", "after_upgrade_unwind_outcome", "backup-failure"),
+        ("upgrade", "after_upgrade_pre_rollback_compensation_outcome", "backup-failure"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-probe-atomic"),
+        ("upgrade", "after_failure_outcome", "backup-failure-atomic"),
+        ("upgrade", "after_failure_outcome", "backup-failure-rollback-crash"),
+        ("upgrade", "after_failure_outcome", "backup-failure-rollback-finished"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-payload-drift"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-backup-drift"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-cache-drift"),
+        ("upgrade", "after_upgrade_postrm_marker_cleared", "backup-probe"),
+        ("upgrade", "after_upgrade_postrm_marker_cleared", "backup-failure"),
+        ("upgrade", "after_upgrade_postrm_completed", "backup-probe-atomic"),
+        ("upgrade", "after_upgrade_postrm_completed", "backup-failure"),
+        ("upgrade", "after_upgrade_unwind_completed", "backup-unwind"),
+        ("upgrade", "after_upgrade_unwind_completed", "backup-failure"),
+        ("upgrade", "after_upgrade_pre_rollback_compensation_completed", "backup-failure"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
+        backup_failure = bool(mutation and mutation.startswith("backup-failure"))
         current = Scenario(workspace, name, executable, helper, architecture, environment)
         if mutation and mutation.startswith("backup-"):
             archives = {
@@ -1606,6 +1634,9 @@ def exercise_diversion_recovery(
             current.directory / "helper", environment, architecture, package="diversion-helper-target",
         )
         current.seed(receiver, target, *([archives["1"]] if operation != "install" else []))
+        if mutation in ("backup-probe-atomic", "backup-failure-atomic"):
+            for root in current.roots:
+                lifecycle.seed_diversion_replacement(root, "postrm", records)
         if mutation in ("preinst", "created", "postinst"):
             for root in current.roots:
                 lifecycle.seed_diversion_replacement(
@@ -1640,13 +1671,15 @@ def exercise_diversion_recovery(
         if mutation == "inplace-postrm":
             for root in current.roots:
                 lifecycle.seed_diversion_inplace(root, "postrm", records.replace(b".distrib", b".changed"))
-        failure = boundary == "after_failure_outcome" or mutation == "backup-failure"
-        if failure:
+        failure = boundary == "after_failure_outcome" or backup_failure
+        if failure or mutation == "backup-unwind":
             for root in current.roots:
                 failures = (
                     f"{package}@1:postrm:upgrade\n{package}@2:postrm:failed-upgrade\n"
-                    if mutation == "backup-failure" else f"{package}@1:postinst:configure\n"
+                    if backup_failure else f"{package}@1:postinst:configure\n"
                 )
+                if mutation == "backup-unwind":
+                    failures = f"{package}@1:postrm:upgrade\n"
                 m.write(root / lifecycle.FAILURE, failures.encode())
                 os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
         helper_path = current.candidate / triggers.HELPER
@@ -1656,7 +1689,7 @@ def exercise_diversion_recovery(
         rollback_times = {
             f"{lifecycle.DIVERSION_BASE}/current":
                 (current.expected / lifecycle.DIVERSION_BASE / "current").lstat().st_mtime_ns,
-        } if mutation == "backup-failure" else {}
+        } if backup_failure else {}
         started = time.time_ns()
         binding = current.crash(
             operation, [archives[version]] if operation in ("install", "upgrade") else [], boundary,
@@ -1671,6 +1704,14 @@ def exercise_diversion_recovery(
             if archive.exists():
                 archive.unlink()
             assert not archive.exists()
+        if mutation in ("backup-failure-rollback-crash", "backup-failure-rollback-finished"):
+            destination_directory = current.directory / "interrupted-recovery"
+            destination_directory.mkdir()
+            native(
+                executable, current.candidate, architecture, "recover", [], environment, destination_directory,
+                trigger_execution=True, caller_owned=True, isolated_helper=True,
+                recovery_crash="during_known_unpack_rollback" if mutation.endswith("-crash") else "after_known_unpack_rollback",
+            )
         if mutation == "database-drift":
             lifecycle.seed_diversions(current.candidate, records.replace(b".distrib", b".changed"))
         elif mutation == "destination-drift":
@@ -1693,6 +1734,12 @@ def exercise_diversion_recovery(
                 path.unlink()
             elif mutation == "backup-source-drift":
                 m.write(path.with_name("data"), b"external original source bytes\n")
+            elif mutation == "backup-postrm-payload-drift":
+                m.write(path.with_name("data"), b"external published payload\n")
+            elif mutation == "backup-postrm-backup-drift":
+                m.write(path, b"external old backup\n")
+            elif mutation == "backup-postrm-cache-drift":
+                m.write(current.candidate / NAMESPACE / "native-diversion-cache-v1.json", b"external cached inputs\n")
             else:
                 raise AssertionError(f"unknown backup mutation: {mutation}")
         elif mutation and mutation.startswith("unpack-cache-"):
@@ -1751,7 +1798,7 @@ def exercise_diversion_recovery(
                 for version in ("1", "2")
             } if mutation and mutation.startswith("backup-") else None,
         )
-        if mutation == "backup-failure":
+        if backup_failure:
             proof = json.loads(proof_bytes)
             evidence = [entry for entry in proof["evidence_files"] if entry["kind"] == "unpack_diversion_cache"]
             assert len(evidence) == 1

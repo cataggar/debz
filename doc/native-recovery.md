@@ -109,6 +109,28 @@ owner, mtime, link count and other observations stay exact; unrelated drift and
 regular-inode replacement still block continuation. Legacy executions retain
 their previous strict checkpoint behavior.
 
+Backup-capable unpack journals may also recover an original old-postrm, unwind,
+or pre-rollback compensation whose known outcome was captured before the generic
+journal settled. Admission requires the original compiler authorization, the
+latest script action, its exact outcome, and a post-invocation managed snapshot
+whose progress head names that invocation's in-flight record. This also covers
+the active-marker-cleared and script-completed windows. A newer invocation,
+pre-invocation snapshot, mismatched evidence, or spawned unresolved outcome
+cannot authorize rollback.
+
+The generic journal still chooses and verifies rollback; native recovery does
+not force partially staged work forward. Reconciliation keeps original
+preimages for journal-owned paths and recorded script effects elsewhere,
+including same-byte atomic diversion replacement and its cache update.
+Journal-only paths use the journal's original preimages. Recovery interrupted
+during or immediately after rollback can resume with original archives absent;
+completed scripts are not replayed. Payload may be re-materialized for unfinished
+callbacks, so this is not a blanket no-payload-republication guarantee.
+Unrelated content, metadata and identity drift remains refused. Directory
+membership changes during interrupted rollback are conservatively refused;
+general membership rebasing and changed-route settlement remain outside this
+increment.
+
 Changes during old postrm still block resumed mutation before journal replay;
 the guard applies even if interruption causes the callback to resume outside
 the original in-memory mutation frame, or an identical atomic replacement would
