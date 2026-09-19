@@ -74,6 +74,14 @@ pub const CrashPoint = enum {
     after_active_clear,
     before_scriptless_trigger_completion,
     after_scriptless_trigger_completion,
+    after_unpack_backups,
+    during_unpack_backup_publication,
+    during_unpack_backup_cleanup,
+    during_failed_unpack_publication,
+    before_failed_unpack_publication,
+    after_failed_unpack_publication,
+    before_unpack_backup_cleanup,
+    after_unpack_backup_cleanup,
 };
 
 pub const CrashController = struct {
@@ -1480,6 +1488,151 @@ pub fn validateStableManagedState(
         if (!managedEntryEqual(expected, observed))
             return error.ManagedStateChanged;
     }
+}
+
+/// Only call after the mutation engine has verified its recorded rollback.
+/// Payload, ownership, times and link counts remain exact; restored nonregular
+/// identities and authorized hard-link ctime changes are checkpointed anew.
+pub fn checkpointRolledBackMutation(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    action: Action,
+    steps: []const @import("root_mutation.zig").Step,
+) !Digest {
+    var current = try readManagedState(allocator, root);
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256) or current.document.transient != null)
+        return error.InvalidManagedState;
+    const snapshot = current.document.stable orelse return error.InvalidManagedState;
+    var originals: std.StringHashMapUnmanaged(ManagedEntry) = .empty;
+    defer originals.deinit(allocator);
+    for (snapshot.entries) |entry| try originals.put(allocator, entry.path, entry);
+    var linked: std.AutoHashMapUnmanaged(u128, void) = .empty;
+    defer linked.deinit(allocator);
+    var restored: std.StringHashMapUnmanaged(bool) = .empty;
+    defer restored.deinit(allocator);
+    for (steps) |step| {
+        if (step.expected == .present) {
+            const previous = step.expected.present;
+            if (originals.get(step.path)) |entry| {
+                if (entry.kind == .regular and previous.kind == .regular and entry.inode == previous.inode)
+                    try linked.put(allocator, (@as(u128, entry.device) << 64) | entry.inode, {});
+                if ((entry.kind == .symlink and previous.kind == .symlink) or
+                    (entry.kind == .directory and previous.kind == .directory))
+                {
+                    const identity = try restored.getOrPut(allocator, step.path);
+                    if (!identity.found_existing) identity.value_ptr.* = false;
+                    identity.value_ptr.* = identity.value_ptr.* or step.kind != .set_metadata;
+                }
+            }
+        }
+        if (step.kind == .publish_hard_link) {
+            const source = step.source orelse return error.InvalidManagedState;
+            if (originals.get(source)) |entry| {
+                if (entry.kind == .regular)
+                    try linked.put(allocator, (@as(u128, entry.device) << 64) | entry.inode, {});
+            }
+        }
+    }
+    var observed_bytes: u64 = 0;
+    for (snapshot.entries) |expected| {
+        const observed = try observeManagedEntry(allocator, root, expected.path, &observed_bytes);
+        defer if (observed.link_target) |target| allocator.free(target);
+        if (managedEntryEqual(expected, observed)) continue;
+        var adjusted = observed;
+        if (expected.kind == .regular and linked.contains((@as(u128, expected.device) << 64) | expected.inode)) {
+            adjusted.change_nanoseconds = expected.change_nanoseconds;
+        } else if (restored.get(expected.path)) |recreated| {
+            if (recreated) adjusted.inode = expected.inode;
+            adjusted.change_nanoseconds = expected.change_nanoseconds;
+        } else return error.ManagedStateChanged;
+        if (!managedEntryEqual(expected, adjusted))
+            return error.ManagedStateChanged;
+    }
+    return updateManagedState(allocator, root, intent_sha256, action, &.{}, false);
+}
+
+test "native_recovery.test.verified rollback refreshes only journal-authorized identities" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const mutation = @import("root_mutation.zig");
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const intent: Digest = @splat('0');
+    const action: Action = .{ .kind = .filesystem, .program_step = 7, .substep = 1, .ordinal = 0 };
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    const data = try root_fs.Path.init("data");
+    const backup = try root_fs.Path.init("data.dpkg-tmp");
+    const unrelated = try root_fs.Path.init("unrelated");
+    try root.publishFile(data, "original", .{});
+    try root.createHardLink(data, backup);
+    try root.publishFile(unrelated, "protected", .{});
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{ data.text, backup.text, unrelated.text }, false);
+    const old = try root.entry(data);
+    var plan = switch (try mutation.preflight(testing.allocator, root, .{ .intents = &.{.{ .file = .{
+        .path = data.text,
+        .bytes = "incoming",
+        .mode = old.mode,
+        .uid = old.uid,
+        .gid = old.gid,
+        .modified_nanoseconds = old.modified_nanoseconds,
+    } }} })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer plan.deinit();
+    const private = try root_fs.Path.init("private");
+    try root.createHardLink(data, private);
+    try root.removeFile(private);
+    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps);
+    try validateStableManagedState(testing.allocator, root, intent);
+    const before = try root.readFileAlloc(testing.allocator, try root_fs.Path.init(managed_state_path), maximum_managed_state_bytes);
+    defer testing.allocator.free(before);
+    try root.publishFile(unrelated, "external drift", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps));
+    const after = try root.readFileAlloc(testing.allocator, try root_fs.Path.init(managed_state_path), maximum_managed_state_bytes);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
+    const symbolic = try root_fs.Path.init("symbolic");
+    try root.createSymbolicLink(symbolic, data.text);
+    try root.applyMetadata(symbolic, .{ .modified_nanoseconds = 123 });
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{symbolic.text}, false);
+    var metadata_plan = switch (try mutation.preflight(testing.allocator, root, .{ .intents = &.{.{ .metadata = .{
+        .path = symbolic.text,
+        .uid = old.uid,
+        .gid = old.gid,
+        .modified_nanoseconds = 456,
+    } }} })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer metadata_plan.deinit();
+    var link_plan = switch (try mutation.preflight(testing.allocator, root, .{ .intents = &.{.{ .symlink = .{
+        .path = symbolic.text,
+        .target = "different",
+        .uid = old.uid,
+        .gid = old.gid,
+        .modified_nanoseconds = 456,
+    } }} })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer link_plan.deinit();
+    var pinned = try root.pinSymbolicLink(symbolic);
+    defer pinned.close();
+    try root.removeFile(symbolic);
+    try root.createSymbolicLink(symbolic, data.text);
+    try root.applyMetadata(symbolic, .{ .modified_nanoseconds = 123 });
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, metadata_plan.steps));
+    _ = try checkpointRolledBackMutation(testing.allocator, root, intent, action, link_plan.steps);
+    try root.publishFile(data, "original", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, checkpointRolledBackMutation(testing.allocator, root, intent, action, plan.steps));
 }
 
 /// A null result means the checkpoint does not authorize this path, not that

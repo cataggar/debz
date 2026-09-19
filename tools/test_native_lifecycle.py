@@ -62,6 +62,20 @@ class LifecycleOracleTests(unittest.TestCase):
             self.assertIn(b"payload='<absent>'", body)
             self.assertIn(b"exit 23", body)
 
+    def test_backup_probe_uses_real_inode_and_metadata_observations_before_failure(self) -> None:
+        for version in ("1", "2"):
+            for body in acceptance.backup_probe_scripts(
+                version, data_suffix=".distrib", mode_suffix=".distrib",
+            ).values():
+                acceptance.subprocess.run(
+                    ["/bin/sh", "-n"], input=body, check=True, capture_output=True, timeout=10,
+                )
+                self.assertIn(b"/data.distrib.dpkg-tmp", body)
+                self.assertIn(b"/mode.distrib.dpkg-tmp", body)
+                self.assertIn(b'!= "$original_symlink"', body)
+                self.assertIn(b'/backup-probe-rm -f /backup-before', body)
+                self.assertLess(body.index(b"/backup-probe-rm -f /backup-before"), body.index(b"exit 23"))
+
     def test_script_and_bootstrap_payload_are_part_of_real_archive_source(self) -> None:
         def prepare(source: Path) -> None:
             m.write(source / "bin/sh", b"fixture interpreter\n", 0o755)

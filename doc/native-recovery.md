@@ -74,12 +74,40 @@ Re-entry uses these historical inputs for unpack routing and file-trigger
 selection rather than the invocation's later cache. This prevents a later
 postinst replacement from retargeting an earlier unpack during recovery.
 
-Retained `unpack_diversion_cache` evidence carries the same filesystem action
-identity. Completed-result verification checks the original program step,
+Retained `unpack_diversion_cache` evidence keeps its input anchor: filesystem,
+original unpack step, substep zero and ordinal zero, independently of later
+journal phase numbering. Completed-result verification checks the original program step,
 managed bytes and envelope binding; pending cleanup checks surviving files and
 rejects unbound extra names. Cleanup validates all cache inputs before removing
 any of them. Older executions without initial per-step observations never gain
 retrospectively reconstructed input files.
+
+The optional `backups` array extends this envelope without changing legacy
+canonical bytes. Omission selects the original cache-only phase protocol;
+an empty array selects the new protocol with no ordinary backups. Records are
+sorted and unique, reject backup/source collisions and contradictory inode
+metadata, and bind physical/logical names, original identity/content/metadata,
+and the recreated symlink timestamp. The envelope is bounded to 128 MiB;
+the nested cache bound is unchanged.
+
+For nonempty inventories, journalled backup creation precedes the existing
+payload/database phase. Success proceeds to cleanup. Known old-postrm rollback
+instead runs diverted-payload settlement, then cleanup retaining diverted
+backups, before remaining compensation callbacks. A completed rollback resumes
+only from matching original script outcomes; missing or unknown outcomes never
+authorize script replay as completed settlement. Auxiliary publication has its
+own crash boundaries and does not replace the existing database-publication seam.
+Actual caller-owned recovery covers interruption inside and around these phases,
+with original archives removed, immutable repeated completion, and backup/source
+drift refusals.
+
+After the generic engine verifies rollback, a new managed checkpoint may accept
+only journal-authorized identity effects: regular-inode ctime changes caused by
+hard links, and recreated symlink/directory inode/ctime changes at recorded paths.
+Regular identities are matched by both device and inode. Bytes, type, mode,
+owner, mtime, link count and other observations stay exact; unrelated drift and
+regular-inode replacement still block continuation. Legacy executions retain
+their previous strict checkpoint behavior.
 
 Changes during old postrm still block resumed mutation before journal replay;
 the guard applies even if interruption causes the callback to resume outside

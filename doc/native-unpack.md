@@ -199,6 +199,34 @@ publication during re-entry. This is a foundation for the full #192
 previous-route, retained-backup and partial-rollback semantics; it does not
 remove the mid-unpack guard.
 
+### Visible unpack backups
+
+New unpack inputs also bind the ordinary-file backup inventory before any
+backup mutation. Each existing publishing regular file gets a `.dpkg-tmp`
+hard link to its original inode; original hard-link groups use a single
+canonical source. Symlink backups are recreated with the old target/ownership
+and a persisted invocation-clock timestamp. Conffile staging, new paths and
+directories do not acquire these ordinary backups. Source/backup collisions
+are refused, and original paths and backup destinations are managed observations.
+
+Separate root-mutation journals create backups, publish payload/database state,
+and clean up. Only the payload phase runs old postrm. Successful unwind
+continues ordinary publication and cleanup. If old postrm and its failed-upgrade
+unwind fail, verified generic rollback is followed by a native settlement phase:
+incoming diverted files and introduced paths survive, old diverted backups
+remain, and diverted conffiles retain old live bytes plus incoming `.dpkg-new`.
+Selected diverted hard-link members remain linked to one another, not to
+restored nondiverted old members. Restored nondiverted symlinks use their bound
+backup timestamps. Compensation order, old installed control/status state and
+original-route file triggers remain observable, including the original failed
+result after recovery.
+
+This partial rollback is required even when diversion records never change.
+It applies to a recorded old-postrm failure, not an arbitrary filesystem error.
+Fresh-process recovery consumes authenticated completed script outcomes rather
+than publishing the unpack or rerunning those scripts again. Mid-unpack route
+changes remain guarded pending the full settlement/recovery work in #192.
+
 For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build
 targets. Their default workloads and CI still run all profiles.
