@@ -310,6 +310,17 @@ class SettlementOracleTests(unittest.TestCase):
         self.assertEqual(corpus, expected)
         self.assertEqual(len(corpus), 15)
 
+    def test_success_lowering_omits_only_the_successful_unwind_profile(self) -> None:
+        successful_outcomes = set(
+            acceptance.settlement.SUCCESSFUL_UPGRADE_CASES
+        )
+        self.assertEqual(len(successful_outcomes), 16)
+        self.assertEqual(
+            successful_outcomes -
+            set(acceptance.settlement.SUCCESSFUL_POSTRM_CASES),
+            {("unwind-success", "regular")},
+        )
+
     def test_failure_and_unwind_profiles_cannot_enter_success_lowering(self) -> None:
         for case in (
             ("unwind-success", "regular"),

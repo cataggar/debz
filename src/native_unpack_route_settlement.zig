@@ -228,12 +228,14 @@ pub const LoweredRoute = struct {
 
 pub const PathExpectation = enum {
     absent,
-    present,
+    present_regular,
+    backup,
 };
 
 pub const BoundPath = struct {
     path: []const u8,
     expectation: PathExpectation,
+    backup: ?native_unpack_diversion.Backup = null,
 };
 
 pub const Lowered = struct {
@@ -721,21 +723,19 @@ fn associationMatches(
 
 fn appendBoundPath(
     allocator: std.mem.Allocator,
-    index: *std.StringHashMapUnmanaged(PathExpectation),
+    index: *std.StringHashMapUnmanaged(void),
     paths: *std.ArrayList(BoundPath),
     path: []const u8,
     expectation: PathExpectation,
+    backup: ?native_unpack_diversion.Backup,
 ) !void {
     const result = try index.getOrPut(allocator, path);
-    if (result.found_existing) {
-        if (result.value_ptr.* != expectation)
-            return error.InvalidUnpackRouteSettlement;
-        return;
-    }
-    result.value_ptr.* = expectation;
+    if (result.found_existing)
+        return error.InvalidUnpackRouteSettlement;
     try paths.append(allocator, .{
         .path = path,
         .expectation = expectation,
+        .backup = backup,
     });
 }
 
@@ -849,10 +849,28 @@ fn rewriteStatusConffiles(
     if (document.paragraphs.len != expected_records)
         return error.InvalidUnpackRouteSettlement;
 
+    var field_count: usize = 0;
+    for (document.paragraphs) |paragraph|
+        field_count = std.math.add(
+            usize,
+            field_count,
+            paragraph.fields.len,
+        ) catch return error.InvalidUnpackRouteSettlement;
+    const maximum_output = std.math.add(
+        usize,
+        bytes.len,
+        field_count,
+    ) catch return error.InvalidUnpackRouteSettlement;
+    if (maximum_output > limits.max_status_bytes)
+        return error.InvalidUnpackRouteSettlement;
+
     var found: std.StringHashMapUnmanaged(void) = .empty;
     defer found.deinit(allocator);
     var target_count: usize = 0;
-    var output: std.Io.Writer.Allocating = .init(allocator);
+    var output: std.Io.Writer.Allocating = try .initCapacity(
+        allocator,
+        maximum_output,
+    );
     errdefer output.deinit();
     for (document.paragraphs) |paragraph| {
         const name = paragraph.get("Package") orelse
@@ -958,7 +976,7 @@ fn lowerInternal(
     const intents = try allocator.dupe(root_mutation.Intent, base_intents);
     var cleanup_intents: std.ArrayList(root_mutation.Intent) = .empty;
     var bound_paths: std.ArrayList(BoundPath) = .empty;
-    var bound_path_index: std.StringHashMapUnmanaged(PathExpectation) = .empty;
+    var bound_path_index: std.StringHashMapUnmanaged(void) = .empty;
     defer bound_path_index.deinit(allocator);
 
     const lowered_routes = try allocator.alloc(LoweredRoute, contract.routes.len);
@@ -1089,6 +1107,7 @@ fn lowerInternal(
                 &bound_paths,
                 post_script_route,
                 .absent,
+                null,
             );
         if (successful) {
             if (backup_path) |path| {
@@ -1097,7 +1116,8 @@ fn lowerInternal(
                     &bound_path_index,
                     &bound_paths,
                     path,
-                    .present,
+                    .backup,
+                    backup,
                 );
                 if (route.backup == .discard)
                     try cleanup_intents.append(allocator, .{ .remove = .{
@@ -1114,7 +1134,8 @@ fn lowerInternal(
                         &bound_path_index,
                         &bound_paths,
                         path,
-                        .present,
+                        .present_regular,
+                        null,
                     );
         }
 
@@ -1163,12 +1184,12 @@ fn lowerInternal(
                 .remove => |*value| {
                     value.path = destination;
                     if (successful and association.route == .post_script and route_changed)
-                        value.removal = .allow_absent;
+                        value.removal = .require_absent;
                 },
                 .remove_directory => |*value| {
                     value.path = destination;
                     if (successful and association.route == .post_script and route_changed)
-                        value.removal = .allow_absent;
+                        value.removal = .require_absent;
                 },
                 else => return error.InvalidUnpackRouteSettlement,
             }
@@ -1290,39 +1311,100 @@ pub fn lowerSuccess(
     );
 }
 
+fn validateBackupPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: root_fs.Path,
+    backup: native_unpack_diversion.Backup,
+) !void {
+    switch (backup.kind) {
+        .regular => {
+            var pinned = root.pinRegularFile(path) catch |err| switch (err) {
+                error.FileNotFound => return error.UnpackRouteArtifactMissing,
+                error.NotRegularFile, error.PathChanged => return error.UnpackRouteArtifactMismatch,
+                else => return err,
+            };
+            defer pinned.close();
+            const maximum = std.math.cast(usize, backup.size) orelse
+                return error.UnpackRouteArtifactMismatch;
+            const observed = pinned.observeStableAlloc(
+                allocator,
+                maximum,
+            ) catch |err| switch (err) {
+                error.FileTooLarge, error.PathChanged => return error.UnpackRouteArtifactMismatch,
+                else => return err,
+            };
+            defer allocator.free(observed.bytes);
+            const entry = observed.entry;
+            if (!entry.modeled or entry.mode != backup.mode or
+                entry.uid != backup.uid or entry.gid != backup.gid or
+                entry.size != backup.size or
+                entry.modified_nanoseconds != backup.backup_modified_nanoseconds or
+                entry.device != backup.device or
+                entry.inode != backup.inode)
+                return error.UnpackRouteArtifactMismatch;
+            const expected = native_recovery.parseDigest(
+                backup.content_sha256 orelse
+                    return error.UnpackRouteArtifactMismatch,
+            ) orelse return error.UnpackRouteArtifactMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(observed.bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &expected))
+                return error.UnpackRouteArtifactMismatch;
+        },
+        .symlink => {
+            var pinned = root.pinSymbolicLink(path) catch |err| switch (err) {
+                error.FileNotFound => return error.UnpackRouteArtifactMissing,
+                error.NotSymbolicLink, error.PathChanged => return error.UnpackRouteArtifactMismatch,
+                else => return err,
+            };
+            defer pinned.close();
+            var buffer: [root_fs.maximum_link_target_bytes]u8 = undefined;
+            const observed = pinned.observe(&buffer) catch |err| switch (err) {
+                error.FileNotFound, error.NotSymbolicLink, error.PathChanged => return error.UnpackRouteArtifactMismatch,
+                else => return err,
+            };
+            const entry = observed.entry;
+            if (!entry.modeled or !entry.isSymbolicLink() or
+                entry.mode != backup.mode or entry.uid != backup.uid or
+                entry.gid != backup.gid or entry.size != backup.size or
+                entry.modified_nanoseconds != backup.backup_modified_nanoseconds)
+                return error.UnpackRouteArtifactMismatch;
+            if (!std.mem.eql(
+                u8,
+                observed.target,
+                backup.link_target orelse
+                    return error.UnpackRouteArtifactMismatch,
+            ))
+                return error.UnpackRouteArtifactMismatch;
+        },
+    }
+}
+
 pub fn validateBoundPaths(
+    allocator: std.mem.Allocator,
     root: root_fs.Root,
     paths: []const BoundPath,
 ) !void {
     for (paths) |path| {
-        const entry = try root.entryIfExists(
-            try root_fs.Path.initPackage(path.path),
-        );
+        const resolved = try root_fs.Path.initPackage(path.path);
+        const entry = try root.entryIfExists(resolved);
         switch (path.expectation) {
             .absent => if (entry != null)
                 return error.UnexpectedUnpackRouteOccupant,
-            .present => if (entry == null)
-                return error.UnpackRouteArtifactMissing,
+            .present_regular => if (entry == null)
+                return error.UnpackRouteArtifactMissing
+            else if (!entry.?.isRegularFile())
+                return error.UnpackRouteArtifactMismatch,
+            .backup => try validateBackupPath(
+                allocator,
+                root,
+                resolved,
+                path.backup orelse
+                    return error.InvalidUnpackRouteSettlement,
+            ),
         }
     }
-}
-
-pub fn authenticateEffectiveCache(
-    allocator: std.mem.Allocator,
-    cache: native_diversion.CachedRecords,
-    intent_sha256: Digest,
-) !native_diversion_cache.Decoded {
-    const bytes = try native_diversion_cache.encode(
-        allocator,
-        cache,
-        intent_sha256,
-    );
-    defer allocator.free(bytes);
-    return native_diversion_cache.decode(
-        allocator,
-        bytes,
-        intent_sha256,
-    );
 }
 
 const testing = std.testing;
@@ -1528,7 +1610,7 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
         &cached,
     );
     try testing.expectEqual(
-        root_mutation.Removal.allow_absent,
+        root_mutation.Removal.require_absent,
         successful.intents[0].remove.removal,
     );
     try testing.expect(std.mem.indexOf(
@@ -2244,18 +2326,22 @@ test "native_unpack.test.effective diversion cache comparison ignores record ord
         testObservation(original, 9),
     );
     defer cache.deinit();
-    try testing.expect(!try cache.refreshRouteSettlement(
+    const reordered_refresh = try cache.refreshRouteSettlement(
         reordered,
         testObservation(reordered, 10),
-    ));
+    );
+    try testing.expect(reordered_refresh.observation_changed);
+    try testing.expect(!reordered_refresh.effective_routes_changed);
     try testing.expectEqualStrings(
         "usr/share/b.original",
         cache.index.physical("usr/share/b", "demo"),
     );
-    try testing.expect(try cache.refreshRouteSettlement(
+    const changed_refresh = try cache.refreshRouteSettlement(
         changed,
         testObservation(changed, 11),
-    ));
+    );
+    try testing.expect(changed_refresh.observation_changed);
+    try testing.expect(changed_refresh.effective_routes_changed);
     try testing.expectEqualStrings(
         "usr/share/b.changed",
         cache.index.physical("usr/share/b", "demo"),
@@ -2314,60 +2400,69 @@ test "native_unpack.test.success route settlement lowers every reference profile
         );
         defer cache.deinit();
 
-        var effective_changed: bool = undefined;
+        var refresh: native_diversion.RouteSettlementRefresh = undefined;
         if (std.mem.eql(u8, profile.update, "inplace")) {
-            effective_changed = try cache.refreshRouteSettlement(
+            refresh = try cache.refreshRouteSettlement(
                 changed,
                 testObservation(changed, 9),
             );
         } else if (std.mem.eql(u8, profile.update, "cached-activation")) {
-            try testing.expect(!try cache.refreshRouteSettlement(
+            const same_inode = try cache.refreshRouteSettlement(
                 changed,
                 testObservation(changed, 9),
-            ));
-            effective_changed = try cache.refreshRouteSettlement(
+            );
+            try testing.expect(same_inode.observation_changed);
+            try testing.expect(!same_inode.effective_routes_changed);
+            refresh = try cache.refreshRouteSettlement(
                 changed,
                 testObservation(changed, 10),
             );
         } else if (std.mem.eql(u8, profile.update, "unchanged")) {
-            effective_changed = try cache.refreshRouteSettlement(
+            refresh = try cache.refreshRouteSettlement(
                 original,
                 testObservation(original, 10),
             );
         } else if (std.mem.eql(u8, profile.update, "empty")) {
-            effective_changed = try cache.refreshRouteSettlement(
+            refresh = try cache.refreshRouteSettlement(
                 "",
                 testObservation("", 10),
             );
         } else if (std.mem.eql(u8, profile.update, "remove")) {
-            effective_changed = try cache.refreshRouteSettlement(null, null);
+            refresh = try cache.refreshRouteSettlement(null, null);
         } else if (std.mem.eql(u8, profile.update, "exempt")) {
-            effective_changed = try cache.refreshRouteSettlement(
+            refresh = try cache.refreshRouteSettlement(
                 exempt,
                 testObservation(exempt, 10),
             );
         } else {
-            effective_changed = try cache.refreshRouteSettlement(
+            refresh = try cache.refreshRouteSettlement(
                 changed,
                 testObservation(changed, 10),
             );
         }
+        try testing.expect(refresh.observation_changed);
         try testing.expectEqual(
             !std.mem.eql(
                 u8,
                 profile.payload_route,
                 profile.post_script_route,
             ),
-            effective_changed,
+            refresh.effective_routes_changed,
         );
         try testing.expectEqualStrings(
             profile.post_script_route,
             cache.index.physical(source, "diversion-lifecycle"),
         );
         const intent: Digest = @splat('1');
-        var authenticated = try authenticateEffectiveCache(
+        const authenticated_bytes = try native_diversion_cache.encode(
             testing.allocator,
             cache,
+            intent,
+        );
+        defer testing.allocator.free(authenticated_bytes);
+        var authenticated = try native_diversion_cache.decode(
+            testing.allocator,
+            authenticated_bytes,
             intent,
         );
         defer authenticated.deinit();
@@ -2479,6 +2574,10 @@ test "native_unpack.test.success route settlement lowers every reference profile
         );
         try testing.expectEqual(profile.backup, lowered.routes[0].backup);
         try testing.expectEqual(
+            profile.ownership,
+            lowered.routes[0].ownership,
+        );
+        try testing.expectEqual(
             @as(usize, @intFromBool(profile.backup == .discard)),
             lowered.cleanup_intents.len,
         );
@@ -2491,13 +2590,76 @@ test "native_unpack.test.success route settlement lowers every reference profile
             lowered.routes[0].trigger_paths,
         ) |expected, actual|
             try testing.expectEqualStrings(expected, actual);
+        const expected_bound_paths: usize =
+            @as(usize, @intFromBool(lowered.routes[0].route_changed)) +
+            @as(usize, @intFromBool(profile.backup != .none)) +
+            @as(usize, @intFromBool(profile.staging != .absent));
+        try testing.expectEqual(expected_bound_paths, lowered.bound_paths.len);
+        try testing.expectEqual(
+            lowered.bound_paths.len,
+            lowered.observed_paths.len,
+        );
+        for (lowered.bound_paths, lowered.observed_paths) |bound, observed|
+            try testing.expectEqualStrings(bound.path, observed);
+        if (lowered.routes[0].route_changed) {
+            const bound = lowered.bound_paths[0];
+            try testing.expectEqualStrings(profile.post_script_route, bound.path);
+            try testing.expectEqual(PathExpectation.absent, bound.expectation);
+        }
+        if (profile.backup != .none) {
+            const expected_backup_path = try std.fmt.allocPrint(
+                owned,
+                "{s}.dpkg-tmp",
+                .{profile.payload_route},
+            );
+            try testing.expectEqualStrings(
+                expected_backup_path,
+                lowered.routes[0].backup_path.?,
+            );
+            const bound = lowered.bound_paths[
+                @as(usize, @intFromBool(lowered.routes[0].route_changed))
+            ];
+            try testing.expectEqualStrings(expected_backup_path, bound.path);
+            try testing.expectEqual(PathExpectation.backup, bound.expectation);
+            try testing.expect(bound.backup != null);
+            if (profile.backup == .discard) {
+                try testing.expectEqualStrings(
+                    expected_backup_path,
+                    lowered.cleanup_intents[0].remove.path,
+                );
+                try testing.expectEqual(
+                    root_mutation.Removal.require_present,
+                    lowered.cleanup_intents[0].remove.removal,
+                );
+            }
+        }
+        if (profile.staging != .absent) {
+            const expected_staged_path = try std.fmt.allocPrint(
+                owned,
+                "{s}.dpkg-new",
+                .{profile.payload_route},
+            );
+            try testing.expectEqualStrings(
+                expected_staged_path,
+                lowered.routes[0].conffile.?.staged_path.?,
+            );
+            const bound = lowered.bound_paths[
+                @as(usize, @intFromBool(lowered.routes[0].route_changed)) +
+                    @as(usize, @intFromBool(profile.backup != .none))
+            ];
+            try testing.expectEqualStrings(expected_staged_path, bound.path);
+            try testing.expectEqual(
+                PathExpectation.present_regular,
+                bound.expectation,
+            );
+        }
         if (profile.removal_route != null) {
             try testing.expectEqualStrings(
                 profile.post_script_route,
                 lowered.intents[0].remove.path,
             );
             try testing.expectEqual(
-                root_mutation.Removal.allow_absent,
+                root_mutation.Removal.require_absent,
                 lowered.intents[0].remove.removal,
             );
         }
@@ -2517,6 +2679,18 @@ test "native_unpack.test.success route settlement lowers every reference profile
             &expected_sha256,
             &lowered.evidence.resulting_status.sha256,
         );
+        const original_evidence = try settlement.evidence();
+        try testing.expect(!std.mem.eql(
+            u8,
+            &original_evidence.digest,
+            &lowered.evidence.digest,
+        ));
+        const original_phase: [32]u8 = @splat(0x84);
+        try testing.expect(!std.mem.eql(
+            u8,
+            &original_phase,
+            &lowered.phase_sha256,
+        ));
     }
 }
 
@@ -2532,7 +2706,7 @@ test "native_unpack.test.success route settlement rejects unexpected occupants" 
         try root_fs.Path.init("usr/share"),
         .fromMode(0o755),
     );
-    try validateBoundPaths(root, &.{selected});
+    try validateBoundPaths(testing.allocator, root, &.{selected});
     try root.publishFile(
         try root_fs.Path.init(selected.path),
         "unexpected",
@@ -2540,19 +2714,119 @@ test "native_unpack.test.success route settlement rejects unexpected occupants" 
     );
     try testing.expectError(
         error.UnexpectedUnpackRouteOccupant,
-        validateBoundPaths(root, &.{selected}),
+        validateBoundPaths(testing.allocator, root, &.{selected}),
     );
     const retained = BoundPath{
         .path = selected.path,
-        .expectation = .present,
+        .expectation = .present_regular,
     };
-    try validateBoundPaths(root, &.{retained});
+    try validateBoundPaths(testing.allocator, root, &.{retained});
+    try root.removeFile(try root_fs.Path.init(selected.path));
+    try root.createSymbolicLink(
+        try root_fs.Path.init(selected.path),
+        "elsewhere",
+    );
+    try testing.expectError(
+        error.UnpackRouteArtifactMismatch,
+        validateBoundPaths(testing.allocator, root, &.{retained}),
+    );
     try testing.expectError(
         error.UnpackRouteArtifactMissing,
-        validateBoundPaths(root, &.{.{
+        validateBoundPaths(testing.allocator, root, &.{.{
             .path = "usr/share/missing.dpkg-tmp",
-            .expectation = .present,
+            .expectation = .present_regular,
         }}),
+    );
+}
+
+test "native_unpack.test.success route settlement authenticates retained backups" {
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init("usr/share"),
+        .fromMode(0o755),
+    );
+    const path = try root_fs.Path.init("usr/share/demo.dpkg-tmp");
+    try root.publishFile(path, "old\n", .{
+        .permissions = .fromMode(0o640),
+        .overwrite = .fail_if_exists,
+    });
+    try root.applyMetadata(path, .{
+        .mode = 0o640,
+        .modified_nanoseconds = 123456789,
+    });
+    const entry = try root.entry(path);
+    var content_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("old\n", &content_sha256, .{});
+    const backup: native_unpack_diversion.Backup = .{
+        .path = "usr/share/demo",
+        .logical_path = "usr/share/demo",
+        .kind = .regular,
+        .mode = entry.mode,
+        .uid = entry.uid,
+        .gid = entry.gid,
+        .size = entry.size,
+        .device = entry.device,
+        .inode = entry.inode,
+        .modified_nanoseconds = entry.modified_nanoseconds,
+        .backup_modified_nanoseconds = entry.modified_nanoseconds,
+        .content_sha256 = native_recovery.hexDigest(content_sha256),
+    };
+    const bound = BoundPath{
+        .path = path.text,
+        .expectation = .backup,
+        .backup = backup,
+    };
+    try validateBoundPaths(testing.allocator, root, &.{bound});
+    try root.publishFile(path, "old\n", .{ .overwrite = .replace });
+    try root.applyMetadata(path, .{
+        .mode = backup.mode,
+        .uid = backup.uid,
+        .gid = backup.gid,
+        .modified_nanoseconds = backup.backup_modified_nanoseconds,
+    });
+    try testing.expectError(
+        error.UnpackRouteArtifactMismatch,
+        validateBoundPaths(testing.allocator, root, &.{bound}),
+    );
+
+    const symlink_path = try root_fs.Path.init(
+        "usr/share/current.dpkg-tmp",
+    );
+    try root.createSymbolicLink(symlink_path, "data");
+    try root.applyMetadata(symlink_path, .{
+        .modified_nanoseconds = 223456789,
+    });
+    const symlink_entry = try root.entry(symlink_path);
+    const symlink_backup: native_unpack_diversion.Backup = .{
+        .path = "usr/share/current",
+        .logical_path = "usr/share/current",
+        .kind = .symlink,
+        .mode = symlink_entry.mode,
+        .uid = symlink_entry.uid,
+        .gid = symlink_entry.gid,
+        .size = symlink_entry.size,
+        .device = symlink_entry.device,
+        .inode = symlink_entry.inode,
+        .modified_nanoseconds = 123456789,
+        .backup_modified_nanoseconds = symlink_entry.modified_nanoseconds,
+        .link_target = "data",
+    };
+    const symlink_bound = BoundPath{
+        .path = symlink_path.text,
+        .expectation = .backup,
+        .backup = symlink_backup,
+    };
+    try validateBoundPaths(testing.allocator, root, &.{symlink_bound});
+    try root.removeFile(symlink_path);
+    try root.createSymbolicLink(symlink_path, "other");
+    try root.applyMetadata(symlink_path, .{
+        .modified_nanoseconds = symlink_backup.backup_modified_nanoseconds,
+    });
+    try testing.expectError(
+        error.UnpackRouteArtifactMismatch,
+        validateBoundPaths(testing.allocator, root, &.{symlink_bound}),
     );
 }
 

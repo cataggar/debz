@@ -43,6 +43,10 @@ SUCCESSFUL_POSTRM_CASES = tuple(
     case for case in CASES
     if case[0] not in ("unwind-success", "rollback", "postinst-failure")
 )
+SUCCESSFUL_UPGRADE_CASES = tuple(
+    case for case in CASES
+    if case[0] not in ("rollback", "postinst-failure")
+)
 
 
 def equal(actual, expected, label: str) -> None:

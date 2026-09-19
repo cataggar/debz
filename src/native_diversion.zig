@@ -22,6 +22,11 @@ pub const Observation = struct {
     }
 };
 
+pub const RouteSettlementRefresh = struct {
+    observation_changed: bool = false,
+    effective_routes_changed: bool = false,
+};
+
 /// Owns effective records separately from the most recently observed live bytes.
 /// The runtime must keep the loaded file pinned to prevent inode reuse.
 pub const CachedRecords = struct {
@@ -119,23 +124,23 @@ pub const CachedRecords = struct {
         return digest.finalResult();
     }
 
-    /// Inactive #192 helper: refresh valid live input while reporting semantic
-    /// route changes rather than live identity or byte changes.
+    /// Inactive #192 helper: refresh valid live input while reporting live
+    /// observation changes separately from semantic effective-route changes.
     pub fn refreshRouteSettlement(
         self: *CachedRecords,
         bytes: ?[]const u8,
         observation: ?Observation,
-    ) !bool {
+    ) !RouteSettlementRefresh {
         try validateObservedBytes(bytes, observation);
         const before = try self.effectiveDigest();
-        if (std.meta.eql(self.observed, observation)) return false;
+        if (std.meta.eql(self.observed, observation)) return .{};
         if (self.loaded != null and observation != null and
             !self.loaded.?.sameFile(observation.?) and self.bytes != null and
             bytes != null and std.mem.eql(u8, self.bytes.?, bytes.?))
         {
             self.loaded = observation;
             self.observed = observation;
-            return false;
+            return .{ .observation_changed = true };
         }
         var candidate = try CachedRecords.init(
             self.allocator,
@@ -147,14 +152,17 @@ pub const CachedRecords = struct {
         {
             candidate.deinit();
             self.observed = observation;
-            return false;
+            return .{ .observation_changed = true };
         }
         errdefer candidate.deinit();
         const after = try candidate.effectiveDigest();
         const changed = !std.mem.eql(u8, &before, &after);
         self.deinit();
         self.* = candidate;
-        return changed;
+        return .{
+            .observation_changed = true,
+            .effective_routes_changed = changed,
+        };
     }
 
     pub fn refresh(self: *CachedRecords, bytes: ?[]const u8, observation: ?Observation) !bool {
@@ -293,11 +301,11 @@ pub const Session = struct {
     pub fn refreshRouteSettlement(
         self: *Session,
         root: root_fs.Root,
-    ) !bool {
+    ) !RouteSettlementRefresh {
         var captured = try Capture.read(self.cache.allocator, root);
         defer captured.deinit();
         const previous_loaded = self.cache.loaded;
-        const changed = try self.cache.refreshRouteSettlement(
+        const result = try self.cache.refreshRouteSettlement(
             captured.bytes,
             captured.observation,
         );
@@ -306,7 +314,7 @@ pub const Session = struct {
             self.pinned = captured.pinned;
             captured.pinned = null;
         }
-        return changed;
+        return result;
     }
 };
 

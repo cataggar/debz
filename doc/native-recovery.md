@@ -130,14 +130,16 @@ increment after successful settlement and failure/recovery behavior are
 implemented.
 
 An inactive successful-settlement lowering/execution path now consumes an
-explicit contract and an authenticated refreshed effective cache. It derives
+explicit contract and a separately authenticated refreshed effective cache. It
+does not mint cache authority from live bytes. It derives
 new route-bound database/phase evidence, binds newly selected destinations
-before mutation, preserves changed-route backups and stranded conffile staging,
-cleans unchanged-route backups, and carries the prior conffile digest into the
-rewritten resulting status. Same-inode and cached-activation decisions compare
-effective records rather than only live content digests. The executor reuses
-the held operation, stable managed-state checks and generic journals; it never
-rewrites the live diversion database.
+before mutation, authenticates retained backup identity/content/metadata,
+preserves changed-route backups and stranded conffile staging, cleans
+unchanged-route backups, and carries the prior conffile digest into the
+rewritten resulting status. Same-inode and cached-activation decisions report
+live-observation changes separately from effective-route changes. The executor
+requires the held operation and stable managed recovery state and uses generic
+journals; it never rewrites the live diversion database.
 
 This remains test-only infrastructure for the successful reference profiles.
 Ordinary v1 and legacy envelopes do not gain a route contract, no capability is

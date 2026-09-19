@@ -8412,13 +8412,17 @@ fn executeSuccessfulRouteSettlement(
 ) !MaterializationResult {
     const execution = request.execution orelse
         return error.InvalidLifecycleProgram;
-    if (execution.recovery) |runtime|
-        try native_recovery.validateStableManagedState(
-            allocator,
-            request.root,
-            runtime.intent_sha256,
-        );
+    const runtime = execution.recovery orelse
+        return error.InvalidLifecycleProgram;
+    const attempt = request.borrowed_attempt orelse
+        return error.InvalidLifecycleProgram;
+    try native_recovery.validateStableManagedState(
+        allocator,
+        request.root,
+        runtime.intent_sha256,
+    );
     try native_unpack_route_settlement.validateBoundPaths(
+        allocator,
         request.root,
         lowered.bound_paths,
     );
@@ -8445,13 +8449,20 @@ fn executeSuccessfulRouteSettlement(
         null,
         true,
     );
-    if (settled.outcome != .applied)
-        return settled;
-    if (execution.recovery) |runtime|
-        runtime.crash.hit(.after_unpack_settlement);
+    if (settled.outcome != .applied) {
+        try attempt.requireRecovery(allocator, .mutation);
+        if (settled.outcome == .rolled_back)
+            runtime.crash.hit(.after_unpack_settlement_rollback);
+        return .{
+            .outcome = .recovery_required,
+            .detail = "route_settlement_incomplete",
+        };
+    }
+    runtime.crash.hit(.after_unpack_settlement);
     if (lowered.cleanup_intents.len == 0)
         return settled;
 
+    runtime.crash.hit(.before_unpack_backup_cleanup);
     var cleanup_request = request;
     cleanup_request.hooks = .{};
     cleanup_request.mutation_database_step = null;
@@ -8464,8 +8475,14 @@ fn executeSuccessfulRouteSettlement(
         lowered.cleanup_intents,
         "route-settlement-backup-cleanup",
     );
-    if (cleaned.outcome != .applied)
-        return cleaned;
+    if (cleaned.outcome != .applied) {
+        try attempt.requireRecovery(allocator, .mutation);
+        return .{
+            .outcome = .recovery_required,
+            .detail = "route_settlement_backup_cleanup_incomplete",
+        };
+    }
+    runtime.crash.hit(.after_unpack_backup_cleanup);
     return settled;
 }
 

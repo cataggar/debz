@@ -341,6 +341,8 @@ pub const Removal = enum {
     require_present,
     /// An already absent target satisfies the step without any mutation.
     allow_absent,
+    /// The target must already be absent; an occupant is never removed.
+    require_absent,
 };
 
 pub const StepKind = enum {
@@ -1326,6 +1328,13 @@ fn validateStepShape(step: Step) Error!void {
         },
         .remove_path, .remove_directory => {
             if (desired != null) return error.NonCanonicalDocument;
+            switch (step.removal) {
+                .require_present => if (step.expected == .absent)
+                    return error.NonCanonicalDocument,
+                .allow_absent => {},
+                .require_absent => if (step.expected != .absent)
+                    return error.NonCanonicalDocument,
+            }
         },
     }
     if (step.staging_entry) |name| {
@@ -2552,8 +2561,12 @@ fn buildStep(
             switch (expected) {
                 .absent => if (value.removal == .require_present)
                     return builder.fail(.preflight, .target_absent, path.text),
-                .present => |state| if (state.kind == .directory)
-                    return builder.fail(.preflight, .unsupported_kind, path.text),
+                .present => |state| {
+                    if (value.removal == .require_absent)
+                        return builder.fail(.preflight, .target_present, path.text);
+                    if (state.kind == .directory)
+                        return builder.fail(.preflight, .unsupported_kind, path.text);
+                },
             }
             step.desired = .absent;
         },
@@ -2564,6 +2577,8 @@ fn buildStep(
                 .absent => if (value.removal == .require_present)
                     return builder.fail(.preflight, .target_absent, path.text),
                 .present => |state| {
+                    if (value.removal == .require_absent)
+                        return builder.fail(.preflight, .target_present, path.text);
                     if (state.kind != .directory)
                         return builder.fail(.preflight, .unsupported_kind, path.text);
                     try requireEmptyDirectory(builder, path);
@@ -5953,6 +5968,41 @@ test "root_mutation.test.external modification and symlink swaps are refused" {
     );
 }
 
+test "root_mutation.test.require-absent removal rejects a late occupant" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(
+        try root_fs.Path.init("etc"),
+        .fromMode(0o755),
+    );
+    var plan = try planFor(&fixture, &.{.{ .remove = .{
+        .path = "etc/selected",
+        .removal = .require_absent,
+    } }});
+    defer plan.deinit();
+    var engine = try prepare(
+        testing.allocator,
+        root,
+        &fixture.attempt,
+        &plan,
+        .{},
+        .{},
+    );
+    defer engine.deinit();
+
+    try root.publishFile(
+        try root_fs.Path.init("etc/selected"),
+        "foreign\n",
+        .{ .overwrite = .fail_if_exists },
+    );
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.recovery_required, report.outcome);
+    try testing.expectEqual(Code.verification_failed, report.diagnostic.?.code);
+    try expectContent(root, "etc/selected", "foreign\n");
+}
+
 test "root_mutation.test.ambiguous state during recovery publishes a recovery requirement" {
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -6408,7 +6458,23 @@ test "root_mutation.test.preflight refuses every unsafe or ambiguous intent" {
         &.{.{ .file = .{ .path = "etc/keep", .bytes = "x", .overwrite = .require_absent } }},
         .target_present,
     );
+    try expectDiagnostic(
+        &fixture,
+        &.{.{ .remove = .{
+            .path = "etc/keep",
+            .removal = .require_absent,
+        } }},
+        .target_present,
+    );
     try expectDiagnostic(&fixture, &.{.{ .remove = .{ .path = "etc/missing" } }}, .target_absent);
+    var absent_assertion = try planFor(&fixture, &.{.{ .remove = .{
+        .path = "etc/missing",
+        .removal = .require_absent,
+    } }});
+    defer absent_assertion.deinit();
+    try testing.expectEqual(Removal.require_absent, absent_assertion.steps[0].removal);
+    try testing.expect(absent_assertion.steps[0].expected == .absent);
+    try testing.expect(absent_assertion.steps[0].desired == .absent);
     try expectDiagnostic(
         &fixture,
         &.{.{ .remove = .{ .path = "etc/empty" } }},
