@@ -301,6 +301,38 @@ This selector refuses native executable/helper arguments. The full #192
 runtime and fresh-process recovery implementation remains a separate
 requirement; legacy remains the default.
 
+### Route-settlement contract
+
+The first #192 implementation increment defines a separate
+`native-unpack-route-settlement-v1` evidence contract rather than extending
+`native-unpack-diversion-v1`. This preserves every existing v1 omission,
+canonical byte sequence and protocol selection. The new document is bound to
+the execution intent, unpack program step and exact v1 parent digest, and uses
+the existing bounded package/path rules. It also records the sorted, proven
+merged-`/usr` rewrites used by the original plan, so lowering can compare
+logical diversion-cache routes with canonical publication paths without
+consulting mutable live aliases.
+
+Each sorted route record names the logical package path, the route used for
+payload publication, and either the exact post-script route or an authenticated
+diversion-cache digest. It explicitly associates deferred removal/metadata
+writes with the publication or post-script route and records the file-trigger
+source, previous/resulting package ownership, `.dpkg-tmp` disposition, conffile
+staging disposition and exact recorded conffile MD5 expectation. Validation
+rejects duplicate routes, settlement indices, physical claims, trigger aliases,
+conflicting cache references and side-file collisions. JSON route and
+association counts are stopped while parsing, string tokens are bounded before
+copying, and the exact encoded size is checked before output allocation.
+
+Pure lowering checks that the parent v1 cache actually selected every recorded
+publication route, resolves authenticated cache references, verifies associated
+v1 settlement-write kinds and source paths, and emits only data: adjusted
+mutation intents, absolute trigger names and derived backup/conffile paths. It
+does not read or mutate the root, publish evidence, select a journal protocol,
+or change recovery. Production still rejects old-postrm diversion changes with
+`UnsupportedMidUnpackDiversionUpdate`; a later #192 increment must integrate
+the contract only after the corresponding success and recovery semantics exist.
+
 ## Package identity and ownership
 
 Package identity is always `(name, architecture)`. This prevents a foreign

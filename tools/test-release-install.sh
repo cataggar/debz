@@ -54,6 +54,7 @@ for schema in \
   native-execution-request-v2.json \
   native-diversion-cache-v1.json \
   native-unpack-diversion-v1.json \
+  native-unpack-route-settlement-v1.json \
   package-cache-error-v1.json \
   package-cache-fingerprint-v1.json \
   package-cache-fingerprint-v2.json \
