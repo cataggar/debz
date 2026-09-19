@@ -96,8 +96,30 @@ executions recorded before deferred removal was supported. Explicit false/null
 or a flag without backup inputs is refused; recovery never upgrades persisted
 inputs to a different ordering.
 
-For nonempty inventories, journalled backup creation precedes the existing
-payload/database phase. Success proceeds to cleanup. Known old-postrm rollback
+New inputs additionally bind a `settlement` recipe before backup or payload
+mutation. Its presence selects a separate successful post-script journal;
+omission preserves all earlier phase identities and canonical bytes. The
+recipe carries the original unpack/database evidence, ordered removals,
+directory metadata and exact incoming database publication. Binary control
+bytes use canonical lowercase hex with independent content hashes. The recipe
+is bounded to 200,000 unique paths and 64 MiB of decoded content within the
+unchanged 128 MiB outer envelope. Null, unbound, malformed or contradictory
+recipes are refused.
+Managed checkpoints permit an observed absent unpack input to become a regular
+file only at its original unpack anchor. Once bound, its bytes, identity and
+metadata cannot be changed or adopted by later script or journal checkpoints,
+even through same-byte replacement.
+
+For nonempty inventories, journalled backup creation precedes payload
+publication and the status-old copy. Old postrm and its immediate failure/unwind
+callbacks remain inside that payload journal. Success commits payload before
+the recipe's separate removal/control/status journal, then proceeds to backup
+cleanup. A committed payload is consumed without replanning staged conffiles
+or republishing payload; settlement rollback retries only its bound late work.
+A failed late phase remains recovery-required, not a claimed rollback of the
+already-committed payload. Stable managed observations outside that late journal
+are checked before replay, including exact non-journal directory membership.
+Known old-postrm rollback
 instead runs diverted-payload settlement, then cleanup retaining diverted
 backups, before remaining compensation callbacks. A completed rollback resumes
 only from matching original script outcomes; missing or unknown outcomes never
@@ -131,7 +153,8 @@ including same-byte atomic diversion replacement and its cache update.
 Journal-only paths use the journal's original preimages. Recovery interrupted
 during or immediately after rollback can resume with original archives absent;
 completed scripts are not replayed. Payload may be re-materialized for unfinished
-callbacks, so this is not a blanket no-payload-republication guarantee.
+callbacks, so this is not a blanket no-payload-republication guarantee. The
+no-republication boundary begins only after the payload journal commits.
 Unrelated content, metadata and identity drift remains refused. Legacy inputs
 conservatively refuse changed directory membership. With bound deferred-removal
 inputs, a completed known script may be followed by further journalled mutation

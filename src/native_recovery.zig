@@ -92,6 +92,12 @@ pub const CrashPoint = enum {
     before_unpack_backup_cleanup,
     after_unpack_backup_cleanup,
     during_unpack_obsolete_removal,
+    after_unpack_payload,
+    after_unpack_payload_commit,
+    during_unpack_settlement,
+    after_unpack_settlement,
+    after_unpack_settlement_commit,
+    after_unpack_settlement_rollback,
 };
 
 pub const CrashController = struct {
@@ -1388,6 +1394,24 @@ pub fn updateManagedState(
             &observed_bytes,
         );
         initialized += 1;
+        if (try unpackDiversionStep(path)) |program_step| {
+            const previous: ?ManagedEntry = if (base) |snapshot| block: {
+                const previous_index = managedEntryLowerBound(snapshot.entries, path);
+                break :block if (previous_index < snapshot.entries.len and std.mem.eql(u8, snapshot.entries[previous_index].path, path))
+                    snapshot.entries[previous_index]
+                else
+                    null;
+            } else null;
+            if (previous) |entry| {
+                if (managedEntryEqual(entry, entries[index])) continue;
+                // The initial unpack anchor may publish an observed absent
+                // input once; later scripts and journals cannot rebind it.
+                if (entry.kind != .absent or entries[index].kind != .regular or transient or
+                    action.kind != .filesystem or action.program_step != program_step or
+                    action.substep != 0 or action.ordinal != 0)
+                    return error.ManagedStateChanged;
+            } else if (entries[index].kind != .absent) return error.ManagedStateChanged;
+        }
     }
     var snapshot: ManagedSnapshot = .{
         .action = action,
@@ -1650,6 +1674,40 @@ pub fn validateScriptMutationCheckpoint(
         return error.InvalidManagedState;
     const snapshot = try recordedScriptSnapshot(allocator, root, current.document);
     if (!std.meta.eql(snapshot.action, action)) return error.InvalidManagedState;
+    try validateMutationSnapshot(allocator, root, snapshot, steps, journal_device, rolling_back, rebase_journal_directories);
+}
+
+pub fn validateStableMutationCheckpoint(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    steps: []const @import("root_mutation.zig").Step,
+    journal_device: u64,
+) !void {
+    var current = try readManagedState(allocator, root);
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.document.intent_sha256, &intent_sha256) or current.document.transient != null)
+        return error.InvalidManagedState;
+    try validateMutationSnapshot(
+        allocator,
+        root,
+        current.document.stable orelse return error.InvalidManagedState,
+        steps,
+        journal_device,
+        true,
+        true,
+    );
+}
+
+fn validateMutationSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    snapshot: ManagedSnapshot,
+    steps: []const @import("root_mutation.zig").Step,
+    journal_device: u64,
+    rolling_back: bool,
+    rebase_journal_directories: bool,
+) !void {
     var paths: std.StringHashMapUnmanaged(void) = .empty;
     defer paths.deinit(allocator);
     var parents: std.StringHashMapUnmanaged(void) = .empty;
@@ -2381,33 +2439,38 @@ pub fn cleanup(
 test "native_recovery.test.diversion cleanup validates every cache before deleting evidence" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
-    var temporary = testing.tmpDir(.{ .iterate = true });
-    defer temporary.cleanup();
-    const root = root_fs.Root.init(testing.io, temporary.dir);
-    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
-        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
-    const intent: Digest = @splat('0');
-    try initializeProgress(testing.allocator, root, intent);
-    try initializeManagedState(testing.allocator, root, intent);
-    var buffer: [128]u8 = undefined;
-    const unpack = try root_fs.Path.init(try unpackDiversionPath(7, &buffer));
-    const cache = try root_fs.Path.init(diversion_cache_path);
-    try root.publishFile(unpack, "bound unpack bytes", .{});
-    try root.publishFile(cache, "bound current bytes", .{});
-    const action: Action = .{ .kind = .verification, .program_step = 0, .substep = 0, .ordinal = 0 };
-    _ = try updateManagedState(testing.allocator, root, intent, action, &.{ unpack.text, cache.text }, false);
-    try root.publishFile(cache, "changed current bytes", .{ .overwrite = .replace });
-    try testing.expectError(error.ManagedStateChanged, cleanupDiversionEvidence(testing.allocator, root, intent));
-    try testing.expect(try root.entryIfExists(unpack) != null);
-    _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
-    try root.publishFile(unpack, "changed unpack bytes", .{ .overwrite = .replace });
-    try testing.expectError(error.ManagedStateChanged, cleanupDiversionEvidence(testing.allocator, root, intent));
-    try testing.expect(try root.entryIfExists(cache) != null);
-    _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
-    try cleanupDiversionEvidence(testing.allocator, root, intent);
-    try cleanupDiversionEvidence(testing.allocator, root, intent);
-    try testing.expect(try root.entryIfExists(unpack) == null);
-    try testing.expect(try root.entryIfExists(cache) == null);
+    for (0..3) |case| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+        const intent: Digest = @splat('0');
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        var buffer: [128]u8 = undefined;
+        const unpack = try root_fs.Path.init(try unpackDiversionPath(7, &buffer));
+        const cache = try root_fs.Path.init(diversion_cache_path);
+        const action: Action = .{ .kind = .verification, .program_step = 0, .substep = 0, .ordinal = 0 };
+        const publication: Action = .{ .kind = .filesystem, .program_step = 7, .substep = 0, .ordinal = 0 };
+        _ = try updateManagedState(testing.allocator, root, intent, action, &.{ unpack.text, cache.text }, false);
+        try root.publishFile(unpack, "bound unpack bytes", .{});
+        try root.publishFile(cache, "bound current bytes", .{});
+        _ = try updateManagedState(testing.allocator, root, intent, publication, &.{}, false);
+        try root.publishFile(cache, "legitimate cache refresh", .{ .overwrite = .replace });
+        _ = try updateManagedState(testing.allocator, root, intent, action, &.{}, false);
+        if (case != 0) {
+            try root.publishFile(if (case == 1) unpack else cache, "external drift", .{ .overwrite = .replace });
+            try testing.expectError(error.ManagedStateChanged, cleanupDiversionEvidence(testing.allocator, root, intent));
+            try testing.expect(try root.entryIfExists(unpack) != null);
+            try testing.expect(try root.entryIfExists(cache) != null);
+        } else {
+            try cleanupDiversionEvidence(testing.allocator, root, intent);
+            try cleanupDiversionEvidence(testing.allocator, root, intent);
+            try testing.expect(try root.entryIfExists(unpack) == null);
+            try testing.expect(try root.entryIfExists(cache) == null);
+        }
+    }
 }
 
 fn canonicalJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
@@ -2816,6 +2879,90 @@ test "native_recovery.test.directory membership recovery is limited to recorded 
         true,
         true,
     ));
+}
+
+test "native_recovery.test.unpack inputs cannot be rebound by script or publication checkpoints" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    for (0..4) |change| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+        const intent: Digest = @splat('1');
+        const initial: Action = .{ .kind = .verification, .program_step = 0, .substep = 0, .ordinal = 0 };
+        const publication: Action = .{ .kind = .filesystem, .program_step = 7, .substep = 0, .ordinal = 0 };
+        const script: Action = .{ .kind = .script, .program_step = 8, .substep = 0, .ordinal = 0 };
+        var buffer: [128]u8 = undefined;
+        const path = try root_fs.Path.init(try unpackDiversionPath(7, &buffer));
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        try root.publishFile(path, "unobserved input", .{});
+        try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, publication, &.{path.text}, false));
+        try root.removeFile(path);
+        _ = try updateManagedState(testing.allocator, root, intent, initial, &.{path.text}, false);
+        try root.publishFile(path, "original bound input", .{});
+        try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, script, &.{}, true));
+        for ([_]Action{
+            .{ .kind = .filesystem, .program_step = 8, .substep = 0, .ordinal = 0 },
+            .{ .kind = .filesystem, .program_step = 7, .substep = 1, .ordinal = 0 },
+            .{ .kind = .filesystem, .program_step = 7, .substep = 0, .ordinal = 1 },
+        }) |wrong_anchor|
+            try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, wrong_anchor, &.{}, false));
+        try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, publication, &.{}, true));
+        _ = try updateManagedState(testing.allocator, root, intent, publication, &.{}, false);
+        _ = try updateManagedState(testing.allocator, root, intent, script, &.{}, true);
+        try discardTransientManagedState(testing.allocator, root, intent);
+        switch (change) {
+            0 => try root.publishFile(path, "replacement recipe", .{ .overwrite = .replace }),
+            1 => try root.applyMetadata(path, .{ .mode = (try root.entry(path)).mode ^ 0o040 }),
+            2 => try root.removeFile(path),
+            3 => try root.publishFile(path, "original bound input", .{ .overwrite = .replace }),
+            else => unreachable,
+        }
+        for ([_]Action{ script, publication }) |action| {
+            for ([_]bool{ false, true }) |transient|
+                try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, action, &.{}, transient));
+        }
+    }
+}
+
+test "native_recovery.test.stable late-journal checkpoint rejects unrelated drift before replay" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const mutation = @import("root_mutation.zig");
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path, "tracked" }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const obsolete = try root_fs.Path.init("tracked/obsolete");
+    const payload = try root_fs.Path.init("payload");
+    try root.publishFile(obsolete, "old", .{});
+    try root.publishFile(payload, "committed", .{});
+    const device = (try root.entry(obsolete)).device;
+    var plan = switch (try mutation.preflight(testing.allocator, root, .{
+        .intents = &.{.{ .remove = .{ .path = obsolete.text } }},
+    })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer plan.deinit();
+    const intent: Digest = @splat('1');
+    const action: Action = .{ .kind = .filesystem, .program_step = 7, .substep = 1, .ordinal = 0 };
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    _ = try updateManagedState(testing.allocator, root, intent, action, &.{ "tracked", obsolete.text, payload.text }, false);
+    try root.removeFile(obsolete);
+    try validateStableMutationCheckpoint(testing.allocator, root, intent, plan.steps, device);
+    const drift = try root_fs.Path.init("tracked/unrecorded");
+    try root.publishFile(drift, "unrelated", .{});
+    try testing.expectError(error.ManagedStateChanged, validateStableMutationCheckpoint(testing.allocator, root, intent, plan.steps, device));
+    try root.removeFile(drift);
+    try validateStableMutationCheckpoint(testing.allocator, root, intent, plan.steps, device);
+    try root.publishFile(payload, "external payload", .{ .overwrite = .replace });
+    try testing.expectError(error.ManagedStateChanged, validateStableMutationCheckpoint(testing.allocator, root, intent, plan.steps, device));
 }
 
 fn checkTriggerEventBinding() !void {

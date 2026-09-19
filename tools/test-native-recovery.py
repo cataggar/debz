@@ -284,6 +284,31 @@ def assert_cached_diversion_contents(cached: dict) -> None:
 def assert_unpack_backup_contents(envelope: dict) -> None:
     if "deferred_removals" in envelope:
         assert envelope["deferred_removals"] is True and "backups" in envelope, "invalid deferred-removal protocol"
+    if "settlement" in envelope:
+        assert envelope.get("deferred_removals") is True and "backups" in envelope, "invalid settlement protocol"
+        settlement = envelope["settlement"]
+        assert isinstance(settlement, dict) and settlement["version"] == 1, "invalid settlement recipe"
+        writes = settlement["writes"]
+        assert 0 < len(writes) <= 200000
+        paths, size = set(), 0
+        for write in writes:
+            assert len(write) == 1
+            kind, value = next(iter(write.items()))
+            assert kind in ("file", "metadata", "remove", "remove_directory")
+            path = value["path"]
+            assert path not in paths and all(part not in ("", ".", "..") for part in path.split("/"))
+            paths.add(path)
+            if kind == "file":
+                assert path.startswith("var/lib/dpkg/")
+                contents = bytes.fromhex(value["bytes_hex"])
+                assert contents.hex() == value["bytes_hex"]
+                assert hashlib.sha256(contents).hexdigest() == value["sha256"]
+                size += len(contents)
+        assert size <= 64 * 1024 * 1024
+        final = writes[-1]["file"]
+        assert final["path"] == "var/lib/dpkg/status"
+        assert final["sha256"] == settlement["resulting_status_sha256"]
+        assert len(final["bytes_hex"]) // 2 == settlement["resulting_status_size"]
     if "backups" not in envelope:
         return
     backups = envelope["backups"]
@@ -1609,6 +1634,23 @@ def exercise_diversion_recovery(
         ("upgrade", "during_unpack_obsolete_removal", "backup-probe-rollback-crash"),
         ("upgrade", "during_unpack_obsolete_removal", "backup-probe-rollback-finished"),
         ("upgrade", "during_unpack_obsolete_removal", "backup-postrm-directory-drift"),
+        ("upgrade", "after_unpack_payload", "backup-probe"),
+        ("upgrade", "after_unpack_payload", "backup-probe-atomic"),
+        ("upgrade", "after_unpack_payload", "backup-unwind"),
+        ("upgrade", "after_unpack_payload_commit", "backup-probe"),
+        ("upgrade", "during_unpack_settlement", "backup-probe"),
+        ("upgrade", "during_unpack_settlement", "backup-probe-atomic"),
+        ("upgrade", "during_unpack_settlement", "backup-unwind"),
+        ("upgrade", "during_unpack_settlement", "backup-probe-rollback-crash"),
+        ("upgrade", "during_unpack_settlement", "backup-probe-rollback-finished"),
+        ("upgrade", "after_unpack_settlement", "backup-probe"),
+        ("upgrade", "after_unpack_settlement", "backup-unwind"),
+        ("upgrade", "after_unpack_settlement_commit", "backup-probe"),
+        ("upgrade", "after_unpack_settlement_rollback", "backup-probe"),
+        ("upgrade", "after_unpack_settlement_rollback", "backup-unwind"),
+        ("upgrade", "after_unpack_payload", "backup-postrm-payload-drift"),
+        ("upgrade", "after_unpack_payload", "backup-settlement-input-drift"),
+        ("upgrade", "during_unpack_settlement", "backup-postrm-directory-drift"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
         backup_failure = bool(mutation and mutation.startswith("backup-failure"))
@@ -1702,16 +1744,41 @@ def exercise_diversion_recovery(
             f"{lifecycle.DIVERSION_BASE}/current":
                 (current.expected / lifecycle.DIVERSION_BASE / "current").lstat().st_mtime_ns,
         } if backup_failure else {}
+        control_path = current.candidate / "var/lib/dpkg/info" / f"{package}.postrm"
+        original_control = control_path.read_bytes() if operation == "upgrade" else None
         started = time.time_ns()
         binding = current.crash(
             operation, [archives[version]] if operation in ("install", "upgrade") else [], boundary,
             failure=failure, trigger_execution=True, caller_owned=True,
             isolated_helper=True, core_product=True, policy="keep_existing", packages=(package,),
         )
-        if boundary == "after_unpack_backups":
+        committed_payload = None
+        if boundary in (
+            "after_unpack_payload", "during_unpack_settlement", "after_unpack_settlement",
+            "after_unpack_payload_commit", "after_unpack_settlement_commit", "after_unpack_settlement_rollback",
+        ):
+            payload = current.candidate / lifecycle.DIVERSION_BASE / "data"
+            staged = current.candidate / "etc/debz-native.conf.distrib.dpkg-new"
+            committed_payload = {
+                path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                for path in (payload, staged)
+            }
+        if boundary in (
+            "after_unpack_backups", "after_unpack_payload", "after_unpack_payload_commit",
+            "after_unpack_settlement_rollback",
+        ):
             caches = list((current.candidate / NAMESPACE).glob("native-unpack-diversion-v1-*.json"))
             assert len(caches) == 1
-            assert_visible_unpack_backups(current.candidate, document(caches[0], 128 * 1024 * 1024))
+            envelope = document(caches[0], 128 * 1024 * 1024)
+            assert "settlement" in envelope
+            assert_unpack_backup_contents(envelope)
+            if boundary == "after_unpack_backups":
+                assert_visible_unpack_backups(current.candidate, envelope)
+            else:
+                assert control_path.read_bytes() == original_control
+                status = (current.candidate / "var/lib/dpkg/status").read_bytes()
+                assert hashlib.sha256(status).hexdigest() == envelope["settlement"]["base_status_sha256"]
+                assert (current.candidate / lifecycle.DIVERSION_BASE / "obsolete").read_bytes() == b"only in 1\n"
         for archive in archives.values():
             if archive.exists():
                 archive.unlink()
@@ -1757,6 +1824,10 @@ def exercise_diversion_recovery(
                 m.write(current.candidate / NAMESPACE / "native-diversion-cache-v1.json", b"external cached inputs\n")
             elif mutation == "backup-postrm-directory-drift":
                 m.write(current.candidate / lifecycle.DIVERSION_BASE / "tracked/unrecorded", b"external directory member\n")
+            elif mutation == "backup-settlement-input-drift":
+                caches = list((current.candidate / NAMESPACE).glob("native-unpack-diversion-v1-*.json"))
+                assert len(caches) == 1
+                m.write(caches[0], b"external late settlement recipe\n")
             else:
                 raise AssertionError(f"unknown backup mutation: {mutation}")
         elif mutation and mutation.startswith("unpack-cache-"):
@@ -1804,6 +1875,14 @@ def exercise_diversion_recovery(
             print(f"{name}: diversion database and destination drift blocks mutation", flush=True)
             continue
         assert report["outcome"] == ("script_failed" if failure else "applied"), report
+        if committed_payload is not None:
+            payload = current.candidate / lifecycle.DIVERSION_BASE / "data"
+            assert (payload.read_bytes(), payload.stat().st_ino, payload.stat().st_mtime_ns) == committed_payload[payload]
+            staged = current.candidate / "etc/debz-native.conf.distrib.dpkg-new"
+            installed = staged.with_name("debz-native.conf.distrib")
+            assert (installed.read_bytes(), installed.stat().st_mtime_ns) == (
+                committed_payload[staged][0], committed_payload[staged][2],
+            )
         compare(
             current.expected, current.candidate, rollback_times=rollback_times,
             started=started, ended=time.time_ns(),

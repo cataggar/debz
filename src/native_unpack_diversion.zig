@@ -2,6 +2,7 @@ const std = @import("std");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_recovery = @import("native_recovery.zig");
+const native_unpack_settlement = @import("native_unpack_settlement.zig");
 const root_fs = @import("root_fs.zig");
 const root_mutation = @import("root_mutation.zig");
 
@@ -98,6 +99,7 @@ const Document = struct {
     cache_json: []const u8,
     backups: ?[]const Backup = null,
     deferred_removals: ?bool = null,
+    settlement: ?native_unpack_settlement.Plan = null,
     digest_sha256: Digest = @splat('0'),
 };
 
@@ -106,6 +108,7 @@ pub const Decoded = struct {
     digest_sha256: Digest,
     backups: ?[]const Backup,
     deferred_removals: bool,
+    settlement: ?native_unpack_settlement.Plan,
     parsed: std.json.Parsed(Document),
 
     pub fn deinit(self: *Decoded) void {
@@ -142,7 +145,7 @@ pub fn encodeWithBackups(
     program_step: u32,
     backups: ?[]const Backup,
 ) ![]u8 {
-    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, null);
+    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, null, null);
 }
 
 pub fn encodeWithDeferredRemovals(
@@ -152,7 +155,18 @@ pub fn encodeWithDeferredRemovals(
     program_step: u32,
     backups: []const Backup,
 ) ![]u8 {
-    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, true);
+    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, true, null);
+}
+
+pub fn encodeWithSettlement(
+    allocator: std.mem.Allocator,
+    cache: native_diversion.CachedRecords,
+    intent_sha256: Digest,
+    program_step: u32,
+    backups: []const Backup,
+    settlement: native_unpack_settlement.Plan,
+) ![]u8 {
+    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, true, settlement);
 }
 
 fn encodeInputs(
@@ -162,10 +176,15 @@ fn encodeInputs(
     program_step: u32,
     backups: ?[]const Backup,
     deferred_removals: ?bool,
+    settlement: ?native_unpack_settlement.Plan,
 ) ![]u8 {
     if (deferred_removals) |enabled|
         if (!enabled or backups == null) return error.InvalidUnpackDiversionCache;
     if (backups) |entries| try validateBackups(allocator, entries);
+    if (settlement) |recipe| {
+        if (deferred_removals != true or backups == null) return error.InvalidUnpackDiversionCache;
+        try native_unpack_settlement.validate(allocator, recipe);
+    }
     const cache_json = try native_diversion_cache.encode(allocator, cache, intent_sha256);
     defer allocator.free(cache_json);
     var document: Document = .{
@@ -174,6 +193,7 @@ fn encodeInputs(
         .cache_json = cache_json,
         .backups = backups,
         .deferred_removals = deferred_removals,
+        .settlement = settlement,
     };
     document.digest_sha256 = documentDigest(document);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -206,7 +226,7 @@ pub fn decode(
         return error.InvalidUnpackDiversionCache;
     var decoded = try native_diversion_cache.decode(allocator, document.cache_json, intent_sha256);
     errdefer decoded.deinit();
-    const canonical = try encodeInputs(allocator, decoded.cache, intent_sha256, program_step, document.backups, document.deferred_removals);
+    const canonical = try encodeInputs(allocator, decoded.cache, intent_sha256, program_step, document.backups, document.deferred_removals, document.settlement);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, bytes))
         return error.InvalidUnpackDiversionCache;
@@ -215,6 +235,7 @@ pub fn decode(
         .digest_sha256 = document.digest_sha256,
         .backups = document.backups,
         .deferred_removals = document.deferred_removals orelse false,
+        .settlement = document.settlement,
         .parsed = parsed,
     };
 }
