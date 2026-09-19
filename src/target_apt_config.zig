@@ -3379,6 +3379,99 @@ test "target_apt_config legacy v1 artifacts remain strict and canonical" {
     try std.testing.expectEqualStrings(canonical, round_trip);
 }
 
+test "target_apt_config v2 decoder rejects malformed policy documents within bounds" {
+    const allocator = std.testing.allocator;
+    const sources = [_]SourceRecord{.{
+        .logical_path = "/etc/apt/sources.list",
+        .sha256 = @splat(1),
+        .format = .legacy,
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = 86_400,
+        },
+    }};
+    const repositories = [_][64]u8{@splat('a')};
+    const repository_policies = [_]RepositoryPolicyRecord{.{
+        .repository_id = @splat('a'),
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = 86_400,
+        },
+    }};
+    var created = try createManifest(allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &sources,
+        .configuration_id = @splat('b'),
+        .repository_ids = &repositories,
+        .repository_policies = &repository_policies,
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    });
+    defer created.deinit();
+    const canonical = try created.manifest.canonicalJson(allocator);
+    defer allocator.free(canonical);
+
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        decodeManifest(allocator, canonical, canonical.len - 1),
+    );
+    const missing =
+        "{\"schema\":\"https://debz.dev/schema/apt-config-snapshot-v2\",\"version\":2}";
+    if (decodeManifest(allocator, missing, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const unknown = try std.mem.concat(allocator, u8, &.{
+        "{\"unknown\":0,",
+        canonical[1..],
+    });
+    defer allocator.free(unknown);
+    if (decodeManifest(allocator, unknown, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const duplicate = try std.mem.concat(allocator, u8, &.{
+        "{\"schema\":\"https://debz.dev/schema/apt-config-snapshot-v2\",",
+        canonical[1..],
+    });
+    defer allocator.free(duplicate);
+    if (decodeManifest(allocator, duplicate, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const valid_policy =
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+        "\"maximum_release_age_seconds\":86400";
+    const policy_offset = std.mem.indexOf(u8, canonical, valid_policy) orelse
+        return error.MissingPolicyFixture;
+    const invalid_policies = [_][]const u8{
+        "\"mode\":\"require_valid_until\",\"maximum_release_age_seconds\":86400",
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+            "\"maximum_release_age_seconds\":null",
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+            "\"maximum_release_age_seconds\":2678401",
+    };
+    for (invalid_policies) |invalid_policy| {
+        const malformed = try std.mem.concat(allocator, u8, &.{
+            canonical[0..policy_offset],
+            invalid_policy,
+            canonical[policy_offset + valid_policy.len ..],
+        });
+        defer allocator.free(malformed);
+        if (decodeManifest(allocator, malformed, maximum_document_bytes)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDecodeFailure;
+        } else |_| {}
+    }
+}
+
 test "target_apt_config logical path grammar is UTF-8 and traversal safe" {
     const valid_sources = [_]SourceRecord{.{
         .logical_path = "/etc/apt/sources.list.d/référence.sources",

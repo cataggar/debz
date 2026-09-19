@@ -41,12 +41,14 @@ time, accepted signature index, primary/signing fingerprints, public-key and
 hash algorithm identifiers, and signature creation/expiration. Cache snapshots
 bind that evidence, the signed Release digest, signed Date, original freshness
 verification time and observed age, configured expiry policy and maximum age,
-whether the missing-`Valid-Until` exception was exercised, future-skew policy,
-and index objects. Cache-only loading rechecks object integrity, reruns
-authentication, requires the same freshness policy, and evaluates the signed
-metadata at the current time. Changed policy evidence, stale metadata, or
-incompatible evidence fails closed. Repository snapshot v3 uses a new cache
-namespace, so older v2 cache objects are not reinterpreted under the exception.
+`Valid-Until` grace, whether the missing-`Valid-Until` exception was exercised,
+future-skew policy, and index objects. Cache-only loading rechecks object
+integrity, reruns authentication, rejects any changed freshness policy,
+revalidates the original decision, and evaluates the signed metadata at the
+current time. Changed policy evidence, historically invalid decisions, stale
+metadata, or incompatible evidence fails closed. Repository snapshot v3 uses a
+new cache namespace, so older v2 cache objects are not reinterpreted under the
+exception.
 
 The supported algorithms are exactly those documented in
 [`openpgp-verifier.md`](openpgp-verifier.md): OpenPGP v4 RSA (algorithms 1 and
