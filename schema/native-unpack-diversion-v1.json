@@ -45,7 +45,14 @@
     },
     "digest_sha256": {
       "$ref": "#/$defs/digest"
+    },
+    "deferred_removals": {
+      "description": "Bind payload-first obsolete-removal ordering. Omission preserves the original lowering order.",
+      "const": true
     }
+  },
+  "dependentRequired": {
+    "deferred_removals": ["backups"]
   },
   "$defs": {
     "backup": {

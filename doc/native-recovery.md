@@ -90,6 +90,12 @@ metadata, and bind physical/logical names, original identity/content/metadata,
 and the recreated symlink timestamp. The envelope is bounded to 128 MiB;
 the nested cache bound is unchanged.
 
+New inputs also bind `deferred_removals: true` with an explicit backup array.
+Omission preserves the original lowering order, including backup-capable
+executions recorded before deferred removal was supported. Explicit false/null
+or a flag without backup inputs is refused; recovery never upgrades persisted
+inputs to a different ordering.
+
 For nonempty inventories, journalled backup creation precedes the existing
 payload/database phase. Success proceeds to cleanup. Known old-postrm rollback
 instead runs diverted-payload settlement, then cleanup retaining diverted
@@ -126,10 +132,14 @@ Journal-only paths use the journal's original preimages. Recovery interrupted
 during or immediately after rollback can resume with original archives absent;
 completed scripts are not replayed. Payload may be re-materialized for unfinished
 callbacks, so this is not a blanket no-payload-republication guarantee.
-Unrelated content, metadata and identity drift remains refused. Directory
-membership changes during interrupted rollback are conservatively refused;
-general membership rebasing and changed-route settlement remain outside this
-increment.
+Unrelated content, metadata and identity drift remains refused. Legacy inputs
+conservatively refuse changed directory membership. With bound deferred-removal
+inputs, a completed known script may be followed by further journalled mutation
+before interruption. Recovery reconstructs a managed directory's recorded
+membership only for journal-owned child paths; all other names and kinds must
+match the original snapshot. The generic engine still validates those paths'
+actual intermediate states. This does not authorize arbitrary membership changes
+or changed-route settlement.
 
 Changes during old postrm still block resumed mutation before journal replay;
 the guard applies even if interruption causes the callback to resume outside

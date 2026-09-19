@@ -74,6 +74,8 @@ class LifecycleOracleTests(unittest.TestCase):
                 self.assertIn(b"/mode.distrib.dpkg-tmp", body)
                 self.assertIn(b'!= "$original_symlink"', body)
                 self.assertIn(b'/backup-probe-rm -f /backup-before', body)
+                self.assertIn(b'/obsolete ] || exit 42', body)
+                self.assertIn(b'"$obsolete" = \'only in 1\'', body)
                 self.assertLess(body.index(b"/backup-probe-rm -f /backup-before"), body.index(b"exit 23"))
 
     def test_script_and_bootstrap_payload_are_part_of_real_archive_source(self) -> None:

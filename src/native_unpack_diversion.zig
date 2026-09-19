@@ -97,6 +97,7 @@ const Document = struct {
     program_step: u32,
     cache_json: []const u8,
     backups: ?[]const Backup = null,
+    deferred_removals: ?bool = null,
     digest_sha256: Digest = @splat('0'),
 };
 
@@ -104,6 +105,7 @@ pub const Decoded = struct {
     cache: native_diversion.CachedRecords,
     digest_sha256: Digest,
     backups: ?[]const Backup,
+    deferred_removals: bool,
     parsed: std.json.Parsed(Document),
 
     pub fn deinit(self: *Decoded) void {
@@ -140,6 +142,29 @@ pub fn encodeWithBackups(
     program_step: u32,
     backups: ?[]const Backup,
 ) ![]u8 {
+    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, null);
+}
+
+pub fn encodeWithDeferredRemovals(
+    allocator: std.mem.Allocator,
+    cache: native_diversion.CachedRecords,
+    intent_sha256: Digest,
+    program_step: u32,
+    backups: []const Backup,
+) ![]u8 {
+    return encodeInputs(allocator, cache, intent_sha256, program_step, backups, true);
+}
+
+fn encodeInputs(
+    allocator: std.mem.Allocator,
+    cache: native_diversion.CachedRecords,
+    intent_sha256: Digest,
+    program_step: u32,
+    backups: ?[]const Backup,
+    deferred_removals: ?bool,
+) ![]u8 {
+    if (deferred_removals) |enabled|
+        if (!enabled or backups == null) return error.InvalidUnpackDiversionCache;
     if (backups) |entries| try validateBackups(allocator, entries);
     const cache_json = try native_diversion_cache.encode(allocator, cache, intent_sha256);
     defer allocator.free(cache_json);
@@ -148,6 +173,7 @@ pub fn encodeWithBackups(
         .program_step = program_step,
         .cache_json = cache_json,
         .backups = backups,
+        .deferred_removals = deferred_removals,
     };
     document.digest_sha256 = documentDigest(document);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -180,9 +206,15 @@ pub fn decode(
         return error.InvalidUnpackDiversionCache;
     var decoded = try native_diversion_cache.decode(allocator, document.cache_json, intent_sha256);
     errdefer decoded.deinit();
-    const canonical = try encodeWithBackups(allocator, decoded.cache, intent_sha256, program_step, document.backups);
+    const canonical = try encodeInputs(allocator, decoded.cache, intent_sha256, program_step, document.backups, document.deferred_removals);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, bytes))
         return error.InvalidUnpackDiversionCache;
-    return .{ .cache = decoded.cache, .digest_sha256 = document.digest_sha256, .backups = document.backups, .parsed = parsed };
+    return .{
+        .cache = decoded.cache,
+        .digest_sha256 = document.digest_sha256,
+        .backups = document.backups,
+        .deferred_removals = document.deferred_removals orelse false,
+        .parsed = parsed,
+    };
 }

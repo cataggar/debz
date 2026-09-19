@@ -44,6 +44,13 @@ class RecoveryOracleTests(unittest.TestCase):
         acceptance.assert_unpack_backup_contents({})
         acceptance.assert_unpack_backup_contents({"backups": []})
         acceptance.assert_unpack_backup_contents({"backups": [entry]})
+        acceptance.assert_unpack_backup_contents({"backups": [], "deferred_removals": True})
+        for envelope in (
+            {"deferred_removals": True}, {"backups": [], "deferred_removals": False},
+            {"backups": [], "deferred_removals": None},
+        ):
+            with self.subTest(envelope=envelope), self.assertRaisesRegex(AssertionError, "deferred-removal"):
+                acceptance.assert_unpack_backup_contents(envelope)
         link = {**entry, "path": "usr/share/link", "kind": "symlink", "mode": 511, "inode": 5,
                 "link_target": "data", "size": 4, "backup_modified_nanoseconds": 456}
         del link["content_sha256"]

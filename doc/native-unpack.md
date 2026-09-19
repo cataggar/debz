@@ -231,6 +231,18 @@ checkpoint remain mandatory; completed scripts are never re-executed.
 Recovery preserves recorded non-journal effects without enabling changed-route
 unpack behavior. See [native recovery](native-recovery.md) for the admission
 rules and conservative directory-membership boundary.
+
+New unpack inputs bind deferred obsolete removal. Payload-replacement
+prerequisites and conffile-specific staging keep their original ordering.
+Other obsolete removals remain deepest-first but follow the status-old copy
+where old postrm runs, before incoming control publication. Old postrm and its
+failure/unwind callbacks therefore observe the old obsolete files. Directory
+metadata is reapplied after deferred removal where the plan publishes it.
+The original plan remains descriptive; its execution ordering is selected by
+the immutable per-unpack protocol field, not inferred from live state.
+Recovery covers interruption after actual obsolete removal, including a second
+interruption during or after rollback, without replaying completed scripts.
+Rerouting removals after changed diversion records remains guarded under #192.
 Fresh-process recovery consumes authenticated completed script outcomes rather
 than publishing the unpack or rerunning those scripts again. Mid-unpack route
 changes remain guarded pending the full settlement/recovery work in #192.

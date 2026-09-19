@@ -765,6 +765,11 @@ if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = upgrade ]; then
     IFS= read -r previous < {data}.dpkg-tmp || exit 38
     [ "$previous" = 'data version {version}' ] || exit 39
     [ ! -e /etc/debz-native.conf.dpkg-tmp ] || exit 40
+    if [ '{version}' = 1 ]; then
+        [ -f /{DIVERSION_BASE}/obsolete ] || exit 42
+        IFS= read -r obsolete < /{DIVERSION_BASE}/obsolete || exit 43
+        [ "$obsolete" = 'only in 1' ] || exit 44
+    fi
     /backup-probe-rm -f /backup-before || exit 41
 fi
 """.encode()
