@@ -44,6 +44,7 @@ const native_statoverride = @import("native_statoverride.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_unpack_diversion = @import("native_unpack_diversion.zig");
+const native_unpack_route_settlement = @import("native_unpack_route_settlement.zig");
 const native_unpack_settlement = @import("native_unpack_settlement.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
@@ -58,6 +59,10 @@ const solver = @import("solver.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 const version_module = @import("debian_version.zig");
+
+test "native_unpack.test.route settlement contract module" {
+    _ = native_unpack_route_settlement;
+}
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 

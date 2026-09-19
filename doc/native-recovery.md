@@ -110,6 +110,22 @@ file only at its original unpack anchor. Once bound, its bytes, identity and
 metadata cannot be changed or adopted by later script or journal checkpoints,
 even through same-byte replacement.
 
+`native-unpack-route-settlement-v1.json` is a separate, inactive contract for
+the later #192 route-aware phases. It binds the original v1 unpack-input digest,
+package identity, logical and publication paths, a direct post-script route or
+an authenticated `native-diversion-cache-v1` digest, settlement-write
+associations, trigger origin, and backup/conffile expectations. Its codec is
+canonical and bounded, and pure lowering verifies the original publication
+cache and v1 settlement recipe before producing route-adjusted intents. The
+document is not embedded in or inferred from v1 evidence: existing v1 bytes,
+phase selection and recovery meaning remain unchanged.
+
+No production path writes or consumes this contract yet. In particular, it
+does not admit a mid-unpack diversion update, authorize journal replay, or
+weaken `UnsupportedMidUnpackDiversionUpdate`. Activation remains a later #192
+increment after successful settlement and failure/recovery behavior are
+implemented.
+
 For nonempty inventories, journalled backup creation precedes payload
 publication and the status-old copy. Old postrm and its immediate failure/unwind
 callbacks remain inside that payload journal. Success commits payload before
