@@ -129,6 +129,24 @@ weaken `UnsupportedMidUnpackDiversionUpdate`. Activation remains a later #192
 increment after successful settlement and failure/recovery behavior are
 implemented.
 
+An inactive successful-settlement lowering/execution path now consumes an
+explicit contract and a separately authenticated refreshed effective cache. It
+does not mint cache authority from live bytes. It derives
+new route-bound database/phase evidence, binds newly selected destinations
+before mutation, authenticates retained backup identity/content/metadata,
+preserves changed-route backups and stranded conffile staging, cleans
+unchanged-route backups, and carries the prior conffile digest into the
+rewritten resulting status. Same-inode and cached-activation decisions report
+live-observation changes separately from effective-route changes. The executor
+requires the held operation and stable managed recovery state and uses generic
+journals; it never rewrites the live diversion database.
+
+This remains test-only infrastructure for the successful reference profiles.
+Ordinary v1 and legacy envelopes do not gain a route contract, no capability is
+emitted, and the old-postrm guard still fires before this path can be selected.
+Unknown, failed and unwind outcomes and route-aware fresh-process recovery
+retain their previous guarded behavior.
+
 For nonempty inventories, journalled backup creation precedes payload
 publication and the status-old copy. Old postrm and its immediate failure/unwind
 callbacks remain inside that payload journal. Success commits payload before

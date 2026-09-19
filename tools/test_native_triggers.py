@@ -296,6 +296,42 @@ class SettlementOracleTests(unittest.TestCase):
         self.assertIn(("rollback", "conffile"), cases)
         self.assertIn(("rollback", "hardlink-source"), cases)
 
+    def test_success_lowering_corpus_is_derived_from_the_reference_profiles(self) -> None:
+        corpus = json.loads(
+            (
+                ROOT
+                / "src/fixtures/native-diversion-success-settlement-v1.json"
+            ).read_bytes()
+        )
+        expected = [
+            acceptance.settlement.successful_route_profile(update, member)
+            for update, member in acceptance.settlement.SUCCESSFUL_POSTRM_CASES
+        ]
+        self.assertEqual(corpus, expected)
+        self.assertEqual(len(corpus), 15)
+
+    def test_success_lowering_omits_only_the_successful_unwind_profile(self) -> None:
+        successful_outcomes = set(
+            acceptance.settlement.SUCCESSFUL_UPGRADE_CASES
+        )
+        self.assertEqual(len(successful_outcomes), 16)
+        self.assertEqual(
+            successful_outcomes -
+            set(acceptance.settlement.SUCCESSFUL_POSTRM_CASES),
+            {("unwind-success", "regular")},
+        )
+
+    def test_failure_and_unwind_profiles_cannot_enter_success_lowering(self) -> None:
+        for case in (
+            ("unwind-success", "regular"),
+            ("rollback", "regular"),
+            ("postinst-failure", "conffile"),
+        ):
+            with self.subTest(case=case), self.assertRaisesRegex(
+                ValueError, "not a successful old-postrm"
+            ):
+                acceptance.settlement.successful_route_profile(*case)
+
     def test_subsequent_directory_trigger_does_not_invent_an_obsolete_removal(self) -> None:
         oracle = acceptance.settlement
         self.assertEqual(
