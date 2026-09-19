@@ -77,6 +77,86 @@ pub const CachedRecords = struct {
         return result;
     }
 
+    pub fn effectiveDigest(self: CachedRecords) ![32]u8 {
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("debz-native-diversion-effective-cache-v1\x00");
+        var buffer: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buffer, @intCast(self.records.len), .big);
+        digest.update(&buffer);
+        const records = try self.allocator.dupe(
+            package_database.DiversionRecord,
+            self.records,
+        );
+        defer self.allocator.free(records);
+        std.mem.sort(
+            package_database.DiversionRecord,
+            records,
+            {},
+            struct {
+                fn lessThan(
+                    _: void,
+                    left: package_database.DiversionRecord,
+                    right: package_database.DiversionRecord,
+                ) bool {
+                    return std.mem.order(u8, left.from, right.from) == .lt;
+                }
+            }.lessThan,
+        );
+        for (records) |record| {
+            for ([_]?[]const u8{
+                record.from,
+                record.to,
+                record.package,
+            }) |field| {
+                if (field) |value| {
+                    digest.update(&.{1});
+                    std.mem.writeInt(u64, &buffer, value.len, .big);
+                    digest.update(&buffer);
+                    digest.update(value);
+                } else digest.update(&.{0});
+            }
+        }
+        return digest.finalResult();
+    }
+
+    /// Inactive #192 helper: refresh valid live input while reporting semantic
+    /// route changes rather than live identity or byte changes.
+    pub fn refreshRouteSettlement(
+        self: *CachedRecords,
+        bytes: ?[]const u8,
+        observation: ?Observation,
+    ) !bool {
+        try validateObservedBytes(bytes, observation);
+        const before = try self.effectiveDigest();
+        if (std.meta.eql(self.observed, observation)) return false;
+        if (self.loaded != null and observation != null and
+            !self.loaded.?.sameFile(observation.?) and self.bytes != null and
+            bytes != null and std.mem.eql(u8, self.bytes.?, bytes.?))
+        {
+            self.loaded = observation;
+            self.observed = observation;
+            return false;
+        }
+        var candidate = try CachedRecords.init(
+            self.allocator,
+            bytes,
+            observation,
+        );
+        if (self.loaded != null and observation != null and
+            self.loaded.?.sameFile(observation.?))
+        {
+            candidate.deinit();
+            self.observed = observation;
+            return false;
+        }
+        errdefer candidate.deinit();
+        const after = try candidate.effectiveDigest();
+        const changed = !std.mem.eql(u8, &before, &after);
+        self.deinit();
+        self.* = candidate;
+        return changed;
+    }
+
     pub fn refresh(self: *CachedRecords, bytes: ?[]const u8, observation: ?Observation) !bool {
         try validateObservedBytes(bytes, observation);
         if (std.meta.eql(self.observed, observation)) return false;
@@ -205,6 +285,28 @@ pub const Session = struct {
             captured.pinned = null;
         }
         return !std.meta.eql(previous, self.cache.observed);
+    }
+
+    /// This does not relax `refresh(..., true)`. It is reserved for an
+    /// authenticated successful route-settlement path that is not activated
+    /// by ordinary execution.
+    pub fn refreshRouteSettlement(
+        self: *Session,
+        root: root_fs.Root,
+    ) !bool {
+        var captured = try Capture.read(self.cache.allocator, root);
+        defer captured.deinit();
+        const previous_loaded = self.cache.loaded;
+        const changed = try self.cache.refreshRouteSettlement(
+            captured.bytes,
+            captured.observation,
+        );
+        if (!std.meta.eql(previous_loaded, self.cache.loaded)) {
+            if (self.pinned) |*pinned| pinned.close();
+            self.pinned = captured.pinned;
+            captured.pinned = null;
+        }
+        return changed;
     }
 };
 

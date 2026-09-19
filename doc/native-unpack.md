@@ -333,6 +333,31 @@ or change recovery. Production still rejects old-postrm diversion changes with
 `UnsupportedMidUnpackDiversionUpdate`; a later #192 increment must integrate
 the contract only after the corresponding success and recovery semantics exist.
 
+The second inactive increment adds a separate successful-old-`postrm` lowering
+mode and an internal executor, but ordinary lifecycle execution still cannot
+select either one. A valid refreshed cache is authenticated through the
+existing cache codec, and route changes are decided from its effective records
+rather than the live diversion file digest alone. This preserves cached routes
+for valid same-inode edits while recognizing same-byte atomic activation of a
+previously ignored edit.
+
+Successful lowering binds newly selected destinations as absent before any
+mutation, reroutes associated obsolete removals with an absent-safe removal
+that still rejects an unexpected occupant, retains publication-route
+`.dpkg-tmp` backups only when the effective route changed, and emits cleanup
+for unchanged effective routes. Trigger paths remain those selected for
+publication. A route-changing conffile keeps its publication-route
+`.dpkg-new` and rewrites only the authenticated package's recorded status MD5
+to the prior digest carried by the contract. The rewritten status, original
+database recipe and route contract derive new phase/database evidence.
+
+The internal executor retains the existing held operation, generic mutation
+journal, stable managed-state validation and pre-mutation path checkpointing.
+It does not synthesize or publish a diversion database. It is intentionally
+unreachable from normal requests: no ordinary execution emits this capability,
+the existing mid-unpack guard remains, and failure/unwind plus fresh-process
+route-settlement recovery are still later #192 work.
+
 ## Package identity and ownership
 
 Package identity is always `(name, architecture)`. This prevents a foreign

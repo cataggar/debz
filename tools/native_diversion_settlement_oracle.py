@@ -39,6 +39,10 @@ CASES = (
     ("atomic", "introduced"), ("rollback", "introduced"),
     ("rollback", "conffile"), ("postinst-failure", "conffile"),
 )
+SUCCESSFUL_POSTRM_CASES = tuple(
+    case for case in CASES
+    if case[0] not in ("unwind-success", "rollback", "postinst-failure")
+)
 
 
 def equal(actual, expected, label: str) -> None:
@@ -193,6 +197,49 @@ def current_route(update: str, source: str) -> str:
     if update == "unchanged":
         return source + ".original"
     return source if update in ("empty", "remove", "exempt") else source + ".changed"
+
+
+def successful_route_profile(update: str, member: str) -> dict:
+    if (update, member) not in SUCCESSFUL_POSTRM_CASES:
+        raise ValueError("profile is not a successful old-postrm transition")
+    source = MEMBERS[member]
+    payload_route = source if update == "create" else source + ".original"
+    post_script_route = (
+        source + ".original"
+        if update in ("unchanged", "inplace")
+        else current_route(update, source)
+    )
+    changed = payload_route != post_script_route
+    if member in ("regular", "symlink", "hardlink-source", "hardlink-member"):
+        backup = "retain" if changed else "discard"
+    else:
+        backup = "none"
+    staging = "retain" if member == "conffile" and changed else "absent"
+    if member == "obsolete":
+        ownership, triggers, removal = "previous", [], "post_script"
+    elif member == "introduced":
+        ownership, triggers, removal = "resulting", [f"/{payload_route}"], None
+    elif member == "directory":
+        ownership = "previous_and_resulting"
+        triggers, removal = [f"/{source}", f"/{payload_route}"], None
+    else:
+        ownership = "previous_and_resulting"
+        triggers, removal = [f"/{payload_route}"], None
+    conffile_version = "1" if member == "conffile" and changed else "2"
+    return {
+        "update": update,
+        "member": member,
+        "payload_route": payload_route,
+        "post_script_route": post_script_route,
+        "backup": backup,
+        "staging": staging,
+        "ownership": ownership,
+        "trigger_paths": triggers,
+        "removal_route": removal,
+        "recorded_md5": hashlib.md5(
+            f"configuration {conffile_version}\n".encode()
+        ).hexdigest(),
+    }
 
 
 def diversion_bytes(update: str, source: str) -> str | None:

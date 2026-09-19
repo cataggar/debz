@@ -1,4 +1,5 @@
 const std = @import("std");
+const deb822 = @import("deb822.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_program = @import("native_program.zig");
@@ -217,6 +218,7 @@ pub const LoweredRoute = struct {
     logical_path: []const u8,
     payload_route: []const u8,
     post_script_route: []const u8,
+    route_changed: bool,
     trigger_paths: []const []const u8,
     ownership: OwnershipExpectation,
     backup: BackupExpectation,
@@ -224,9 +226,24 @@ pub const LoweredRoute = struct {
     conffile: ?LoweredConffile,
 };
 
+pub const PathExpectation = enum {
+    absent,
+    present,
+};
+
+pub const BoundPath = struct {
+    path: []const u8,
+    expectation: PathExpectation,
+};
+
 pub const Lowered = struct {
     intents: []const root_mutation.Intent,
+    cleanup_intents: []const root_mutation.Intent,
     routes: []const LoweredRoute,
+    bound_paths: []const BoundPath,
+    observed_paths: []const []const u8,
+    evidence: native_unpack_settlement.DatabaseEvidence,
+    phase_sha256: [32]u8,
 };
 
 fn validateDigest(digest: Digest) !void {
@@ -544,6 +561,19 @@ fn documentDigest(document: Document) Digest {
     return native_recovery.hexDigest(sink.hasher.finalResult());
 }
 
+fn contractDocument(contract: Contract) Document {
+    return .{
+        .version = contract.version,
+        .capability = contract.capability,
+        .intent_sha256 = contract.intent_sha256,
+        .program_step = contract.program_step,
+        .unpack_input_sha256 = contract.unpack_input_sha256,
+        .package = contract.package,
+        .aliases = .{ .items = contract.aliases },
+        .routes = .{ .items = contract.routes },
+    };
+}
+
 fn documentSize(document: Document) !usize {
     var buffer: [4096]u8 = undefined;
     var counter: std.Io.Writer.Discarding = .init(&buffer);
@@ -558,16 +588,7 @@ fn documentSize(document: Document) !usize {
 
 pub fn encode(allocator: std.mem.Allocator, contract: Contract) ![]u8 {
     try validate(allocator, contract);
-    var document: Document = .{
-        .version = contract.version,
-        .capability = contract.capability,
-        .intent_sha256 = contract.intent_sha256,
-        .program_step = contract.program_step,
-        .unpack_input_sha256 = contract.unpack_input_sha256,
-        .package = contract.package,
-        .aliases = .{ .items = contract.aliases },
-        .routes = .{ .items = contract.routes },
-    };
+    var document = contractDocument(contract);
     document.digest_sha256 = documentDigest(document);
     var output: std.Io.Writer.Allocating = try .initCapacity(
         allocator,
@@ -698,13 +719,232 @@ fn associationMatches(
     };
 }
 
-/// Returned collections and derived paths use `allocator`; borrowed contract
-/// and unpack-input strings must outlive the result.
-pub fn lower(
+fn appendBoundPath(
+    allocator: std.mem.Allocator,
+    index: *std.StringHashMapUnmanaged(PathExpectation),
+    paths: *std.ArrayList(BoundPath),
+    path: []const u8,
+    expectation: PathExpectation,
+) !void {
+    const result = try index.getOrPut(allocator, path);
+    if (result.found_existing) {
+        if (result.value_ptr.* != expectation)
+            return error.InvalidUnpackRouteSettlement;
+        return;
+    }
+    result.value_ptr.* = expectation;
+    try paths.append(allocator, .{
+        .path = path,
+        .expectation = expectation,
+    });
+}
+
+fn fieldValue(field: *const deb822.Field) ?[]const u8 {
+    if (field.value_lines.len != 1)
+        return null;
+    return field.value_lines[0].text;
+}
+
+fn writeField(writer: *std.Io.Writer, field: deb822.Field) !void {
+    if (field.value_lines.len == 0 or field.value_lines[0].text.len == 0) {
+        try writer.print("{s}:\n", .{field.name});
+    } else {
+        try writer.print("{s}: {s}\n", .{
+            field.name,
+            field.value_lines[0].text,
+        });
+    }
+    for (field.value_lines[@min(1, field.value_lines.len)..]) |line|
+        try writer.print(" {s}\n", .{line.text});
+}
+
+fn rewriteConffileField(
+    writer: *std.Io.Writer,
+    field: deb822.Field,
+    expected: *const std.StringHashMapUnmanaged(native_program.Md5Digest),
+    found: *std.StringHashMapUnmanaged(void),
+    allocator: std.mem.Allocator,
+) !void {
+    if (field.value_lines.len == 0 or field.value_lines[0].text.len != 0)
+        return error.InvalidUnpackRouteSettlement;
+    try writer.print("{s}:\n", .{field.name});
+    for (field.value_lines[1..]) |line| {
+        const separator = std.mem.indexOfScalar(u8, line.text, ' ') orelse
+            return error.InvalidUnpackRouteSettlement;
+        const path = line.text[0..separator];
+        const digest_start = separator + 1;
+        if (digest_start >= line.text.len)
+            return error.InvalidUnpackRouteSettlement;
+        const digest_end = std.mem.indexOfScalarPos(
+            u8,
+            line.text,
+            digest_start,
+            ' ',
+        ) orelse line.text.len;
+        if (expected.get(path)) |digest| {
+            if (digest_end - digest_start != digest.len)
+                return error.InvalidUnpackRouteSettlement;
+            for (line.text[digest_start..digest_end]) |byte|
+                if (!(byte >= '0' and byte <= '9') and
+                    !(byte >= 'a' and byte <= 'f'))
+                    return error.InvalidUnpackRouteSettlement;
+            if ((try found.getOrPut(allocator, path)).found_existing)
+                return error.InvalidUnpackRouteSettlement;
+            try writer.print(" {s} {s}{s}\n", .{
+                path,
+                &digest,
+                line.text[digest_end..],
+            });
+        } else {
+            try writer.print(" {s}\n", .{line.text});
+        }
+    }
+}
+
+fn rewriteStatusConffiles(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected_records: usize,
+    contract: Contract,
+) ![]u8 {
+    var expected: std.StringHashMapUnmanaged(native_program.Md5Digest) = .empty;
+    defer {
+        var keys = expected.keyIterator();
+        while (keys.next()) |path| allocator.free(path.*);
+        expected.deinit(allocator);
+    }
+    for (contract.routes) |route| {
+        const conffile = route.conffile orelse continue;
+        const path = try std.fmt.allocPrint(allocator, "/{s}", .{
+            route.logical_path,
+        });
+        const result = expected.getOrPut(allocator, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
+        if (result.found_existing) {
+            allocator.free(path);
+            return error.InvalidUnpackRouteSettlement;
+        }
+        result.value_ptr.* = conffile.recorded_md5;
+    }
+    if (expected.count() == 0)
+        return allocator.dupe(u8, bytes);
+
+    const limits = package_database.Limits{};
+    const parsed = try deb822.parseBorrowed(allocator, bytes, .{
+        .limits = .{
+            .max_total_bytes = limits.max_status_bytes,
+            .max_paragraphs = limits.max_packages,
+            .max_fields_per_paragraph = limits.max_fields_per_package,
+            .max_field_bytes = limits.max_field_bytes,
+        },
+        .duplicate_policy = .reject,
+    });
+    var document = switch (parsed) {
+        .failure => return error.InvalidUnpackRouteSettlement,
+        .document => |value| value,
+    };
+    defer document.deinit();
+    if (document.paragraphs.len != expected_records)
+        return error.InvalidUnpackRouteSettlement;
+
+    var found: std.StringHashMapUnmanaged(void) = .empty;
+    defer found.deinit(allocator);
+    var target_count: usize = 0;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (document.paragraphs) |paragraph| {
+        const name = paragraph.get("Package") orelse
+            return error.InvalidUnpackRouteSettlement;
+        const architecture = paragraph.get("Architecture") orelse
+            return error.InvalidUnpackRouteSettlement;
+        const target = std.mem.eql(
+            u8,
+            fieldValue(name) orelse return error.InvalidUnpackRouteSettlement,
+            contract.package.name,
+        ) and std.mem.eql(
+            u8,
+            fieldValue(architecture) orelse
+                return error.InvalidUnpackRouteSettlement,
+            contract.package.architecture,
+        );
+        if (target) target_count += 1;
+        var conffiles_seen = false;
+        for (paragraph.fields) |field| {
+            if (target and std.ascii.eqlIgnoreCase(field.name, "Conffiles")) {
+                if (conffiles_seen)
+                    return error.InvalidUnpackRouteSettlement;
+                conffiles_seen = true;
+                try rewriteConffileField(
+                    &output.writer,
+                    field,
+                    &expected,
+                    &found,
+                    allocator,
+                );
+            } else try writeField(&output.writer, field);
+        }
+        if (target and !conffiles_seen)
+            return error.InvalidUnpackRouteSettlement;
+        output.writer.writeByte('\n') catch return error.OutOfMemory;
+    }
+    if (target_count != 1 or found.count() != expected.count())
+        return error.InvalidUnpackRouteSettlement;
+    const rewritten = try output.toOwnedSlice();
+    errdefer allocator.free(rewritten);
+    if (try package_database.verifySerializedStatus(
+        allocator,
+        rewritten,
+        expected_records,
+        .{},
+        .status,
+    ) != null)
+        return error.InvalidUnpackRouteSettlement;
+    return rewritten;
+}
+
+const SettlementDigests = struct {
+    evidence: [32]u8,
+    phase: [32]u8,
+};
+
+fn routeSettlementDigests(
+    contract: Contract,
+    settlement: native_unpack_settlement.Plan,
+    resulting_status_sha256: [32]u8,
+) !SettlementDigests {
+    const contract_digest = native_recovery.parseDigest(
+        documentDigest(contractDocument(contract)),
+    ) orelse return error.InvalidUnpackRouteSettlement;
+    const database_digest = native_recovery.parseDigest(
+        settlement.database_plan_sha256,
+    ) orelse return error.InvalidUnpackRouteSettlement;
+    const unpack_digest = native_recovery.parseDigest(
+        settlement.unpack_plan_sha256,
+    ) orelse return error.InvalidUnpackRouteSettlement;
+    var evidence = std.crypto.hash.sha2.Sha256.init(.{});
+    evidence.update("debz-native-route-settlement-database-v1\x00");
+    evidence.update(&database_digest);
+    evidence.update(&contract_digest);
+    evidence.update(&resulting_status_sha256);
+    var phase = std.crypto.hash.sha2.Sha256.init(.{});
+    phase.update("debz-native-route-settlement-phase-v1\x00");
+    phase.update(&unpack_digest);
+    phase.update(&contract_digest);
+    phase.update(&resulting_status_sha256);
+    return .{
+        .evidence = evidence.finalResult(),
+        .phase = phase.finalResult(),
+    };
+}
+
+fn lowerInternal(
     allocator: std.mem.Allocator,
     contract: Contract,
     unpack_input: *const native_unpack_diversion.Decoded,
     route_cache: ?*const native_diversion_cache.Decoded,
+    successful: bool,
 ) !Lowered {
     try validate(allocator, contract);
     if (!std.mem.eql(u8, &contract.unpack_input_sha256, &unpack_input.digest_sha256))
@@ -716,6 +956,10 @@ pub fn lower(
     const base_intents = try native_unpack_settlement.lower(allocator, settlement);
     defer allocator.free(base_intents);
     const intents = try allocator.dupe(root_mutation.Intent, base_intents);
+    var cleanup_intents: std.ArrayList(root_mutation.Intent) = .empty;
+    var bound_paths: std.ArrayList(BoundPath) = .empty;
+    var bound_path_index: std.StringHashMapUnmanaged(PathExpectation) = .empty;
+    defer bound_path_index.deinit(allocator);
 
     const lowered_routes = try allocator.alloc(LoweredRoute, contract.routes.len);
     var physical_routes: std.StringHashMapUnmanaged(usize) = .empty;
@@ -731,6 +975,10 @@ pub fn lower(
     @memset(associated, false);
 
     for (contract.routes, lowered_routes, 0..) |route, *lowered, route_index| {
+        if (successful) switch (route.post_script_route) {
+            .cache => {},
+            .path => return error.InvalidUnpackRouteSettlement,
+        };
         var payload_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const selected_payload = try canonicalPath(
             contract.aliases,
@@ -762,6 +1010,11 @@ pub fn lower(
             u8,
             selected_post_script.text,
         );
+        const route_changed = !std.mem.eql(
+            u8,
+            route.payload_route,
+            post_script_route,
+        );
         try claimCanonicalRoutePath(
             allocator,
             contract.aliases,
@@ -791,6 +1044,12 @@ pub fn lower(
         const backup = try backupForRoute(backups, route);
         if ((route.backup == .none) != (backup == null))
             return error.InvalidUnpackRouteSettlement;
+        if (successful and backup != null) {
+            const expected_backup: BackupExpectation =
+                if (route_changed) .retain else .discard;
+            if (route.backup != expected_backup)
+                return error.InvalidUnpackRouteSettlement;
+        }
         const backup_path = if (backup) |entry| block: {
             var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
             break :block try allocator.dupe(u8, try entry.backupPath(&buffer));
@@ -806,11 +1065,58 @@ pub fn lower(
                 .recorded_md5 = expectation.recorded_md5,
             };
         } else null;
+        if (successful) {
+            if (conffile) |expectation| {
+                const expected_staging: StagingExpectation =
+                    if (route_changed) .retain else .absent;
+                if (expectation.staging != expected_staging)
+                    return error.InvalidUnpackRouteSettlement;
+            }
+        }
+        if (successful and route_changed) switch (route.trigger_source) {
+            .post_script, .logical_and_post_script => return error.InvalidUnpackRouteSettlement,
+            else => {},
+        };
         if (backup_path) |path|
             try claimSidePath(allocator, &physical_routes, path, route_index);
         if (conffile) |expectation|
             if (expectation.staged_path) |path|
                 try claimSidePath(allocator, &physical_routes, path, route_index);
+        if (successful and route_changed)
+            try appendBoundPath(
+                allocator,
+                &bound_path_index,
+                &bound_paths,
+                post_script_route,
+                .absent,
+            );
+        if (successful) {
+            if (backup_path) |path| {
+                try appendBoundPath(
+                    allocator,
+                    &bound_path_index,
+                    &bound_paths,
+                    path,
+                    .present,
+                );
+                if (route.backup == .discard)
+                    try cleanup_intents.append(allocator, .{ .remove = .{
+                        .path = path,
+                        .removal = .require_present,
+                    } });
+            }
+        }
+        if (successful) {
+            if (conffile) |expectation|
+                if (expectation.staged_path) |path|
+                    try appendBoundPath(
+                        allocator,
+                        &bound_path_index,
+                        &bound_paths,
+                        path,
+                        .present,
+                    );
+        }
 
         var triggers: std.ArrayList([]const u8) = .empty;
         switch (route.trigger_source) {
@@ -831,6 +1137,7 @@ pub fn lower(
             .logical_path = route.logical_path,
             .payload_route = route.payload_route,
             .post_script_route = post_script_route,
+            .route_changed = route_changed,
             .trigger_paths = try triggers.toOwnedSlice(allocator),
             .ownership = route.ownership,
             .backup = route.backup,
@@ -853,10 +1160,21 @@ pub fn lower(
             };
             switch (intents[index]) {
                 .metadata => |*value| value.path = destination,
-                .remove => |*value| value.path = destination,
-                .remove_directory => |*value| value.path = destination,
+                .remove => |*value| {
+                    value.path = destination;
+                    if (successful and association.route == .post_script and route_changed)
+                        value.removal = .allow_absent;
+                },
+                .remove_directory => |*value| {
+                    value.path = destination;
+                    if (successful and association.route == .post_script and route_changed)
+                        value.removal = .allow_absent;
+                },
                 else => return error.InvalidUnpackRouteSettlement,
             }
+            if (successful and association.kind == .write and
+                association.route == .post_script and route_changed)
+                return error.InvalidUnpackRouteSettlement;
             associated[index] = true;
         }
     }
@@ -876,7 +1194,135 @@ pub fn lower(
         if (result.found_existing)
             return error.InvalidUnpackRouteSettlement;
     }
-    return .{ .intents = intents, .routes = lowered_routes };
+
+    const status_index = intents.len - 1;
+    if (intents[status_index] != .file or !std.mem.eql(
+        u8,
+        intents[status_index].file.path,
+        package_database.database_directory ++ "/" ++
+            package_database.status_path,
+    ))
+        return error.InvalidUnpackRouteSettlement;
+    const status_bytes = if (successful)
+        try rewriteStatusConffiles(
+            allocator,
+            intents[status_index].file.bytes,
+            settlement.resulting_status_package_count,
+            contract,
+        )
+    else
+        intents[status_index].file.bytes;
+    var resulting_status_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        status_bytes,
+        &resulting_status_sha256,
+        .{},
+    );
+    intents[status_index].file.bytes = status_bytes;
+    intents[status_index].file.expected_sha256 = resulting_status_sha256;
+    var evidence = try settlement.evidence();
+    evidence.resulting_status = .{
+        .sha256 = resulting_status_sha256,
+        .size = status_bytes.len,
+        .package_count = settlement.resulting_status_package_count,
+    };
+    const digests: SettlementDigests = if (successful)
+        try routeSettlementDigests(
+            contract,
+            settlement,
+            resulting_status_sha256,
+        )
+    else
+        .{
+            .evidence = evidence.digest,
+            .phase = native_recovery.parseDigest(
+                settlement.unpack_plan_sha256,
+            ) orelse return error.InvalidUnpackRouteSettlement,
+        };
+    if (successful) evidence.digest = digests.evidence;
+    const observations = try bound_paths.toOwnedSlice(allocator);
+    const observed_paths = try allocator.alloc([]const u8, observations.len);
+    for (observations, observed_paths) |observation, *path|
+        path.* = observation.path;
+    return .{
+        .intents = intents,
+        .cleanup_intents = try cleanup_intents.toOwnedSlice(allocator),
+        .routes = lowered_routes,
+        .bound_paths = observations,
+        .observed_paths = observed_paths,
+        .evidence = evidence,
+        .phase_sha256 = digests.phase,
+    };
+}
+
+/// Returned collections and derived paths use `allocator`; borrowed contract
+/// and unpack-input strings must outlive the result.
+pub fn lower(
+    allocator: std.mem.Allocator,
+    contract: Contract,
+    unpack_input: *const native_unpack_diversion.Decoded,
+    route_cache: ?*const native_diversion_cache.Decoded,
+) !Lowered {
+    return lowerInternal(
+        allocator,
+        contract,
+        unpack_input,
+        route_cache,
+        false,
+    );
+}
+
+/// Inactive successful old-postrm lowering. This adds route preconditions,
+/// rerouted-removal semantics, backup cleanup and conffile status settlement
+/// without activating the production capability.
+pub fn lowerSuccess(
+    allocator: std.mem.Allocator,
+    contract: Contract,
+    unpack_input: *const native_unpack_diversion.Decoded,
+    route_cache: ?*const native_diversion_cache.Decoded,
+) !Lowered {
+    return lowerInternal(
+        allocator,
+        contract,
+        unpack_input,
+        route_cache,
+        true,
+    );
+}
+
+pub fn validateBoundPaths(
+    root: root_fs.Root,
+    paths: []const BoundPath,
+) !void {
+    for (paths) |path| {
+        const entry = try root.entryIfExists(
+            try root_fs.Path.initPackage(path.path),
+        );
+        switch (path.expectation) {
+            .absent => if (entry != null)
+                return error.UnexpectedUnpackRouteOccupant,
+            .present => if (entry == null)
+                return error.UnpackRouteArtifactMissing,
+        }
+    }
+}
+
+pub fn authenticateEffectiveCache(
+    allocator: std.mem.Allocator,
+    cache: native_diversion.CachedRecords,
+    intent_sha256: Digest,
+) !native_diversion_cache.Decoded {
+    const bytes = try native_diversion_cache.encode(
+        allocator,
+        cache,
+        intent_sha256,
+    );
+    defer allocator.free(bytes);
+    return native_diversion_cache.decode(
+        allocator,
+        bytes,
+        intent_sha256,
+    );
 }
 
 const testing = std.testing;
@@ -888,7 +1334,13 @@ fn testObservation(bytes: []const u8, inode: u64) native_diversion.Observation {
 }
 
 fn testSettlement(allocator: std.mem.Allocator) !native_unpack_settlement.Plan {
-    const status = "Package: demo\nStatus: install ok unpacked\n\n";
+    const status =
+        "Package: demo\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2\n" ++
+        "Conffiles:\n" ++
+        " /etc/demo.conf 6d024d5096fe2159f397866c679590b6\n\n";
     var status_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(status, &status_digest, .{});
     return native_unpack_settlement.capture(allocator, &.{
@@ -970,7 +1422,9 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
         .{
             .logical_path = "etc/demo.conf",
             .payload_route = "etc/demo.conf.original",
-            .post_script_route = .{ .path = "etc/demo.conf.changed" },
+            .post_script_route = .{
+                .cache = .{ .digest_sha256 = cached.digest_sha256 },
+            },
             .settlement = &.{},
             .trigger_source = .payload,
             .ownership = .previous_and_resulting,
@@ -1065,6 +1519,74 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
     try testing.expectEqual(
         OwnershipExpectation.previous,
         lowered.routes[2].ownership,
+    );
+
+    const successful = try lowerSuccess(
+        arena.allocator(),
+        decoded.contract,
+        &parent,
+        &cached,
+    );
+    try testing.expectEqual(
+        root_mutation.Removal.allow_absent,
+        successful.intents[0].remove.removal,
+    );
+    try testing.expect(std.mem.indexOf(
+        u8,
+        successful.intents[successful.intents.len - 1].file.bytes,
+        "/etc/demo.conf bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ) != null);
+
+    var malformed_routes = routes;
+    malformed_routes[1].backup = .discard;
+    var malformed = contract;
+    malformed.routes = &malformed_routes;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        lowerSuccess(
+            rejected_arena.allocator(),
+            malformed,
+            &parent,
+            &cached,
+        ),
+    );
+    malformed_routes = routes;
+    malformed_routes[1].trigger_source = .post_script;
+    malformed.routes = &malformed_routes;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        lowerSuccess(
+            rejected_arena.allocator(),
+            malformed,
+            &parent,
+            &cached,
+        ),
+    );
+    malformed_routes = routes;
+    malformed_routes[0].post_script_route = .{
+        .path = "etc/demo.conf.changed",
+    };
+    malformed.routes = &malformed_routes;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        lowerSuccess(
+            rejected_arena.allocator(),
+            malformed,
+            &parent,
+            &cached,
+        ),
+    );
+    malformed_routes = routes;
+    malformed_routes[0].conffile.?.staging = .absent;
+    malformed.routes = &malformed_routes;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        lowerSuccess(
+            rejected_arena.allocator(),
+            malformed,
+            &parent,
+            &cached,
+        ),
     );
 }
 
@@ -1223,6 +1745,61 @@ test "native_unpack.test.route settlement contract enforces bounds and canonical
     try testing.expectError(
         error.InvalidUnpackRouteSettlement,
         encode(testing.allocator, invalid),
+    );
+}
+
+test "native_unpack.test.success settlement rejects malformed conffile status evidence" {
+    var route = testRoute("etc/demo.conf");
+    route.conffile = .{
+        .staging = .retain,
+        .recorded_md5 = @splat('a'),
+    };
+    const contract = testContract(&.{route});
+    const missing_field =
+        "Package: demo\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2\n\n";
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        rewriteStatusConffiles(
+            testing.allocator,
+            missing_field,
+            1,
+            contract,
+        ),
+    );
+    const missing_path =
+        "Package: demo\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2\n" ++
+        "Conffiles:\n" ++
+        " /etc/other.conf 6d024d5096fe2159f397866c679590b6\n\n";
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        rewriteStatusConffiles(
+            testing.allocator,
+            missing_path,
+            1,
+            contract,
+        ),
+    );
+    const malformed_digest =
+        "Package: demo\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2\n" ++
+        "Conffiles:\n" ++
+        " /etc/demo.conf zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n\n";
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        rewriteStatusConffiles(
+            testing.allocator,
+            malformed_digest,
+            1,
+            contract,
+        ),
     );
 }
 
@@ -1521,6 +2098,461 @@ test "native_unpack.test.route settlement contract leaves v1 evidence unchanged"
     try testing.expectError(
         error.UnknownField,
         native_unpack_diversion.decode(testing.allocator, current, @splat('1'), 7),
+    );
+}
+
+const SuccessProfile = struct {
+    update: []const u8,
+    member: []const u8,
+    payload_route: []const u8,
+    post_script_route: []const u8,
+    backup: BackupExpectation,
+    staging: StagingExpectation,
+    ownership: OwnershipExpectation,
+    trigger_paths: []const []const u8,
+    removal_route: ?RouteSource,
+    recorded_md5: []const u8,
+};
+
+fn successSource(member: []const u8) []const u8 {
+    if (std.mem.eql(u8, member, "regular"))
+        return "usr/share/diversion-lifecycle/mode";
+    if (std.mem.eql(u8, member, "symlink"))
+        return "usr/share/diversion-lifecycle/current";
+    if (std.mem.eql(u8, member, "hardlink-source"))
+        return "usr/share/diversion-lifecycle/data";
+    if (std.mem.eql(u8, member, "hardlink-member"))
+        return "usr/share/diversion-lifecycle/data.link";
+    if (std.mem.eql(u8, member, "conffile"))
+        return "etc/debz-native.conf";
+    if (std.mem.eql(u8, member, "directory"))
+        return "usr/share/diversion-lifecycle";
+    if (std.mem.eql(u8, member, "obsolete"))
+        return "usr/share/diversion-lifecycle/obsolete";
+    if (std.mem.eql(u8, member, "introduced"))
+        return "usr/share/diversion-lifecycle/introduced";
+    unreachable;
+}
+
+fn successDiversionBytes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    suffix: []const u8,
+    package: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "/{s}\n/{s}{s}\n{s}\n",
+        .{ source, source, suffix, package },
+    );
+}
+
+fn successStatus() []const u8 {
+    return "Package: diversion-lifecycle\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2\n" ++
+        "Conffiles:\n" ++
+        " /etc/debz-native.conf 6d024d5096fe2159f397866c679590b6\n\n";
+}
+
+fn successSettlement(
+    allocator: std.mem.Allocator,
+    removal_path: ?[]const u8,
+) !native_unpack_settlement.Plan {
+    const status = successStatus();
+    var status_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(status, &status_digest, .{});
+    const intents = try allocator.alloc(
+        root_mutation.Intent,
+        @as(usize, 1) + @intFromBool(removal_path != null),
+    );
+    var index: usize = 0;
+    if (removal_path) |path| {
+        intents[index] = .{ .remove = .{ .path = path } };
+        index += 1;
+    }
+    intents[index] = .{ .file = .{
+        .path = package_database.database_directory ++ "/" ++
+            package_database.status_path,
+        .bytes = status,
+        .expected_sha256 = status_digest,
+    } };
+    return native_unpack_settlement.capture(
+        allocator,
+        intents,
+        .{
+            .base_generation = .{
+                .sha256 = @splat(0x81),
+                .file_count = 3,
+                .total_bytes = 200,
+            },
+            .base_status = .{
+                .sha256 = @splat(0x82),
+                .size = 100,
+                .package_count = 1,
+            },
+            .resulting_status = .{
+                .sha256 = status_digest,
+                .size = status.len,
+                .package_count = 1,
+            },
+            .digest = @splat(0x83),
+        },
+        @splat(0x84),
+    );
+}
+
+fn successBackup(
+    profile: SuccessProfile,
+    source: []const u8,
+) native_unpack_diversion.Backup {
+    const symlink = std.mem.eql(u8, profile.member, "symlink");
+    return .{
+        .path = profile.payload_route,
+        .logical_path = source,
+        .kind = if (symlink) .symlink else .regular,
+        .mode = if (symlink) 0o777 else 0o640,
+        .uid = 0,
+        .gid = 0,
+        .size = if (symlink) 4 else 5,
+        .device = 7,
+        .inode = 11,
+        .modified_nanoseconds = 123456789,
+        .backup_modified_nanoseconds = if (symlink)
+            223456789
+        else
+            123456789,
+        .content_sha256 = if (symlink) null else @splat('a'),
+        .link_target = if (symlink) "data" else null,
+    };
+}
+
+test "native_unpack.test.effective diversion cache comparison ignores record order" {
+    const original =
+        "/usr/share/a\n/usr/share/a.original\n:\n" ++
+        "/usr/share/b\n/usr/share/b.original\n:\n";
+    const reordered =
+        "/usr/share/b\n/usr/share/b.original\n:\n" ++
+        "/usr/share/a\n/usr/share/a.original\n:\n";
+    const changed =
+        "/usr/share/b\n/usr/share/b.changed\n:\n" ++
+        "/usr/share/a\n/usr/share/a.original\n:\n";
+    var cache = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        original,
+        testObservation(original, 9),
+    );
+    defer cache.deinit();
+    try testing.expect(!try cache.refreshRouteSettlement(
+        reordered,
+        testObservation(reordered, 10),
+    ));
+    try testing.expectEqualStrings(
+        "usr/share/b.original",
+        cache.index.physical("usr/share/b", "demo"),
+    );
+    try testing.expect(try cache.refreshRouteSettlement(
+        changed,
+        testObservation(changed, 11),
+    ));
+    try testing.expectEqualStrings(
+        "usr/share/b.changed",
+        cache.index.physical("usr/share/b", "demo"),
+    );
+}
+
+test "native_unpack.test.success route settlement lowers every reference profile" {
+    var parsed = try std.json.parseFromSlice(
+        []const SuccessProfile,
+        testing.allocator,
+        @embedFile("fixtures/native-diversion-success-settlement-v1.json"),
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 15), parsed.value.len);
+
+    for (parsed.value) |profile| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const source = successSource(profile.member);
+        const original = try successDiversionBytes(
+            owned,
+            source,
+            ".original",
+            ":",
+        );
+        const changed = try successDiversionBytes(
+            owned,
+            source,
+            ".changed",
+            ":",
+        );
+        const exempt = try successDiversionBytes(
+            owned,
+            source,
+            ".original",
+            "diversion-lifecycle",
+        );
+        const initial_bytes: ?[]const u8 = if (std.mem.eql(
+            u8,
+            profile.update,
+            "create",
+        ))
+            null
+        else
+            original;
+        const initial_observation = if (initial_bytes) |bytes|
+            testObservation(bytes, 9)
+        else
+            null;
+        var cache = try native_diversion.CachedRecords.init(
+            testing.allocator,
+            initial_bytes,
+            initial_observation,
+        );
+        defer cache.deinit();
+
+        var effective_changed: bool = undefined;
+        if (std.mem.eql(u8, profile.update, "inplace")) {
+            effective_changed = try cache.refreshRouteSettlement(
+                changed,
+                testObservation(changed, 9),
+            );
+        } else if (std.mem.eql(u8, profile.update, "cached-activation")) {
+            try testing.expect(!try cache.refreshRouteSettlement(
+                changed,
+                testObservation(changed, 9),
+            ));
+            effective_changed = try cache.refreshRouteSettlement(
+                changed,
+                testObservation(changed, 10),
+            );
+        } else if (std.mem.eql(u8, profile.update, "unchanged")) {
+            effective_changed = try cache.refreshRouteSettlement(
+                original,
+                testObservation(original, 10),
+            );
+        } else if (std.mem.eql(u8, profile.update, "empty")) {
+            effective_changed = try cache.refreshRouteSettlement(
+                "",
+                testObservation("", 10),
+            );
+        } else if (std.mem.eql(u8, profile.update, "remove")) {
+            effective_changed = try cache.refreshRouteSettlement(null, null);
+        } else if (std.mem.eql(u8, profile.update, "exempt")) {
+            effective_changed = try cache.refreshRouteSettlement(
+                exempt,
+                testObservation(exempt, 10),
+            );
+        } else {
+            effective_changed = try cache.refreshRouteSettlement(
+                changed,
+                testObservation(changed, 10),
+            );
+        }
+        try testing.expectEqual(
+            !std.mem.eql(
+                u8,
+                profile.payload_route,
+                profile.post_script_route,
+            ),
+            effective_changed,
+        );
+        try testing.expectEqualStrings(
+            profile.post_script_route,
+            cache.index.physical(source, "diversion-lifecycle"),
+        );
+        const intent: Digest = @splat('1');
+        var authenticated = try authenticateEffectiveCache(
+            testing.allocator,
+            cache,
+            intent,
+        );
+        defer authenticated.deinit();
+
+        const settlement = try successSettlement(
+            owned,
+            if (profile.removal_route != null)
+                profile.payload_route
+            else
+                null,
+        );
+        const backup_entries: []const native_unpack_diversion.Backup =
+            if (profile.backup == .none)
+                &.{}
+            else
+                try owned.dupe(
+                    native_unpack_diversion.Backup,
+                    &.{successBackup(profile, source)},
+                );
+        var publication = try native_diversion.CachedRecords.init(
+            testing.allocator,
+            initial_bytes,
+            initial_observation,
+        );
+        defer publication.deinit();
+        const parent_bytes = try native_unpack_diversion.encodeWithSettlement(
+            testing.allocator,
+            publication,
+            intent,
+            7,
+            backup_entries,
+            settlement,
+        );
+        defer testing.allocator.free(parent_bytes);
+        var parent = try native_unpack_diversion.decode(
+            testing.allocator,
+            parent_bytes,
+            intent,
+            7,
+        );
+        defer parent.deinit();
+
+        var md5: native_program.Md5Digest = undefined;
+        try testing.expectEqual(md5.len, profile.recorded_md5.len);
+        @memcpy(&md5, profile.recorded_md5);
+        const associations: []const Association =
+            if (profile.removal_route) |route_source|
+                try owned.dupe(Association, &.{.{
+                    .write_index = 0,
+                    .kind = .removal,
+                    .route = route_source,
+                }})
+            else
+                &.{};
+        const trigger_source: TriggerSource =
+            if (profile.trigger_paths.len == 0)
+                .none
+            else if (profile.trigger_paths.len == 2)
+                .logical_and_payload
+            else
+                .payload;
+        const conffile: ?ConffileExpectation =
+            if (std.mem.eql(u8, profile.member, "conffile"))
+                .{
+                    .staging = profile.staging,
+                    .recorded_md5 = md5,
+                }
+            else
+                null;
+        const routes = [_]Route{.{
+            .logical_path = source,
+            .payload_route = profile.payload_route,
+            .post_script_route = .{ .cache = .{
+                .digest_sha256 = authenticated.digest_sha256,
+            } },
+            .settlement = associations,
+            .trigger_source = trigger_source,
+            .ownership = profile.ownership,
+            .backup = profile.backup,
+            .conffile = conffile,
+        }};
+        const contract: Contract = .{
+            .intent_sha256 = intent,
+            .program_step = 7,
+            .unpack_input_sha256 = parent.digest_sha256,
+            .package = .{
+                .name = "diversion-lifecycle",
+                .architecture = "amd64",
+            },
+            .routes = &routes,
+        };
+        const lowered = try lowerSuccess(
+            owned,
+            contract,
+            &parent,
+            &authenticated,
+        );
+        try testing.expectEqualStrings(
+            profile.post_script_route,
+            lowered.routes[0].post_script_route,
+        );
+        try testing.expectEqual(
+            !std.mem.eql(
+                u8,
+                profile.payload_route,
+                profile.post_script_route,
+            ),
+            lowered.routes[0].route_changed,
+        );
+        try testing.expectEqual(profile.backup, lowered.routes[0].backup);
+        try testing.expectEqual(
+            @as(usize, @intFromBool(profile.backup == .discard)),
+            lowered.cleanup_intents.len,
+        );
+        try testing.expectEqual(
+            profile.trigger_paths.len,
+            lowered.routes[0].trigger_paths.len,
+        );
+        for (
+            profile.trigger_paths,
+            lowered.routes[0].trigger_paths,
+        ) |expected, actual|
+            try testing.expectEqualStrings(expected, actual);
+        if (profile.removal_route != null) {
+            try testing.expectEqualStrings(
+                profile.post_script_route,
+                lowered.intents[0].remove.path,
+            );
+            try testing.expectEqual(
+                root_mutation.Removal.allow_absent,
+                lowered.intents[0].remove.removal,
+            );
+        }
+        const status = lowered.intents[lowered.intents.len - 1].file;
+        const expected_conffile = try std.fmt.allocPrint(
+            owned,
+            "/etc/debz-native.conf {s}",
+            .{profile.recorded_md5},
+        );
+        try testing.expect(
+            std.mem.indexOf(u8, status.bytes, expected_conffile) != null,
+        );
+        try testing.expectEqual(status.bytes.len, lowered.evidence.resulting_status.size);
+        const expected_sha256 = status.expected_sha256 orelse unreachable;
+        try testing.expectEqualSlices(
+            u8,
+            &expected_sha256,
+            &lowered.evidence.resulting_status.sha256,
+        );
+    }
+}
+
+test "native_unpack.test.success route settlement rejects unexpected occupants" {
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    const selected = BoundPath{
+        .path = "usr/share/demo.changed",
+        .expectation = .absent,
+    };
+    try root.createDirectoryPath(
+        try root_fs.Path.init("usr/share"),
+        .fromMode(0o755),
+    );
+    try validateBoundPaths(root, &.{selected});
+    try root.publishFile(
+        try root_fs.Path.init(selected.path),
+        "unexpected",
+        .{ .overwrite = .fail_if_exists },
+    );
+    try testing.expectError(
+        error.UnexpectedUnpackRouteOccupant,
+        validateBoundPaths(root, &.{selected}),
+    );
+    const retained = BoundPath{
+        .path = selected.path,
+        .expectation = .present,
+    };
+    try validateBoundPaths(root, &.{retained});
+    try testing.expectError(
+        error.UnpackRouteArtifactMissing,
+        validateBoundPaths(root, &.{.{
+            .path = "usr/share/missing.dpkg-tmp",
+            .expectation = .present,
+        }}),
     );
 }
 

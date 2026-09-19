@@ -8402,6 +8402,73 @@ fn materializeUnpackBackups(
     );
 }
 
+/// Inactive #192 success path. Ordinary lifecycle execution neither creates
+/// route-settlement evidence nor calls this helper while the mid-unpack guard
+/// remains active.
+fn executeSuccessfulRouteSettlement(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    lowered: native_unpack_route_settlement.Lowered,
+) !MaterializationResult {
+    const execution = request.execution orelse
+        return error.InvalidLifecycleProgram;
+    if (execution.recovery) |runtime|
+        try native_recovery.validateStableManagedState(
+            allocator,
+            request.root,
+            runtime.intent_sha256,
+        );
+    try native_unpack_route_settlement.validateBoundPaths(
+        request.root,
+        lowered.bound_paths,
+    );
+    var settlement_request = request;
+    settlement_request.hooks = .{};
+    settlement_request.mutation_database_step = null;
+    settlement_request.publication_crash_point = .during_unpack_settlement;
+    settlement_request.observed_paths = lowered.observed_paths;
+    settlement_request.deferred_removal_path = for (lowered.intents) |intent| {
+        if ((intent == .remove or intent == .remove_directory) and
+            !std.mem.startsWith(
+                u8,
+                intent.path(),
+                package_database.database_directory ++ "/",
+            ))
+            break intent.path();
+    } else null;
+    const settled = try executePhaseMaterialization(
+        allocator,
+        settlement_request,
+        lowered.intents,
+        lowered.evidence,
+        lowered.phase_sha256,
+        null,
+        true,
+    );
+    if (settled.outcome != .applied)
+        return settled;
+    if (execution.recovery) |runtime|
+        runtime.crash.hit(.after_unpack_settlement);
+    if (lowered.cleanup_intents.len == 0)
+        return settled;
+
+    var cleanup_request = request;
+    cleanup_request.hooks = .{};
+    cleanup_request.mutation_database_step = null;
+    cleanup_request.publication_crash_point =
+        .during_unpack_backup_cleanup;
+    cleanup_request.observed_paths = lowered.observed_paths;
+    const cleaned = try lifecycleAuxiliaryMutation(
+        allocator,
+        cleanup_request,
+        lowered.cleanup_intents,
+        "route-settlement-backup-cleanup",
+    );
+    if (cleaned.outcome != .applied)
+        return cleaned;
+    return settled;
+}
+
 fn unpackPathDiverted(request: MaterializationRequest, path: []const u8) !bool {
     const execution = request.execution orelse return error.InvalidLifecycleProgram;
     const cache = request.unpack_diversions orelse return error.InvalidLifecycleProgram;
